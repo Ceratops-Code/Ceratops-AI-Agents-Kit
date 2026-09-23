@@ -885,9 +885,21 @@ state/evidence paths are required. The caller's request has schema
 `ceratops-skill-update-request.v3` and fields `selected_skills`,
 `allowed_paths`, `change_groups` and non-test `checks`.
 
+The ordinary driver boundary is deterministic: `init` derives that closed
+request from repeated skill/path groups plus UTF-8 command files, and `run`
+performs only the needed verification or emits the recorded result and one
+next action. Governance proposals use the same boundary: `init` converts UTF-8
+context and replacement declarations into the existing proposal state machine,
+while `run` transports one explicit semantic assessment and decision. Neither
+driver chooses scope, edits governed sources, makes semantic judgments,
+commits, deploys, or weakens the lower-level recovery commands.
+
 From the source repository, using its managed Python runtime:
 
 ```text
+python skills/ceratops-skill-lifecycle/scripts/skill-update-workflow.py init --repo-root WORKTREE --selected-skill SKILL --group NAME PATH
+python skills/ceratops-skill-lifecycle/scripts/skill-update-workflow.py run --repo-root WORKTREE
+python skills/ceratops-skill-lifecycle/scripts/skill-update-workflow.py run --repo-root WORKTREE --caller-use-complete
 python skills/ceratops-skill-lifecycle/scripts/skill-update-workflow.py open_skill_change --repo-root WORKTREE --change-request REQUEST
 python skills/ceratops-skill-lifecycle/scripts/skill-update-workflow.py expand_skill_scope --repo-root WORKTREE --change-request REQUEST
 python skills/ceratops-skill-lifecycle/scripts/skill-update-workflow.py run_skill_checks --repo-root WORKTREE
@@ -895,14 +907,16 @@ python skills/ceratops-skill-lifecycle/scripts/skill-update-workflow.py replace_
 python skills/ceratops-skill-lifecycle/scripts/skill-update-workflow.py close_skill_change --repo-root WORKTREE
 ```
 
-`WORKTREE` is the selected task checkout; `REQUEST` is the caller's JSON file.
-Opening records approval and the original Git/dirty baseline; the caller,
-not this helper, edits source. Expansion adds approved scope before or after
-checks, using the original baseline even for newly added paths. Failed-request
+`WORKTREE` is the selected task checkout; `REQUEST` is the caller's JSON file
+for the lower-level request interface. `init` records the same approval and
+original Git/dirty baseline without caller-authored JSON; the caller, not this
+helper, edits source. Expansion adds approved scope before or after checks,
+using the original baseline even for newly added paths. Failed-request
 replacement may revise checks but cannot shrink scope or hide unrelated work.
 Source ownership, descendant-commit and whitespace gates remain. Tests still
 belong to the SDLC runner. Commit and explicitly requested promotion/deployment
-remain separate caller actions; closing follows their completed use.
+remain separate caller actions; `run --caller-use-complete` or the lower-level
+close command follows their completed use.
 
 The helper owns these direct-written records:
 

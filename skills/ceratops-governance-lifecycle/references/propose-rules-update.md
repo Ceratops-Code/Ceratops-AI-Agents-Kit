@@ -59,14 +59,28 @@ Route approved skill-source mutations through `$ceratops-skill-lifecycle`
 
 ## Iterative optimization
 
-- (D) Start with `python scripts/proposal-workflow.py construct --spec SPEC`;
-  for an existing complete request, use
-  `python scripts/proposal-workflow.py prepare --request REQUEST` instead.
+- (D) Start an ordinary proposal with `python
+  scripts/proposal-workflow.py init --task-temp-root ROOT --failure-file FILE
+  --regressions-file FILE --context RULES HISTORY RULE_IDS --replacement RULES
+  HISTORY EXPECTED_FILE REPLACEMENT_FILE`; repeat `--context` and
+  `--replacement` as needed and use `-` when a source has no history.
+- `init` reads exact current and replacement text from UTF-8 files, builds the
+  closed proposal request, prepares the first candidate, and returns its paths
+  and one next required action. Optional flags set the iteration limit,
+  mutation authority, and expected side effects.
+- For a caller-owned complete `ceratops-governance-proposal-spec.v1`, use
+  `python scripts/proposal-workflow.py construct --spec SPEC`. For a supplied
+  complete request with explicit paths or ownership, use `python
+  scripts/proposal-workflow.py prepare --request REQUEST`. Both lower-level
+  paths retain their existing ownership contracts.
 - For every issued iteration, complete workflow steps 5-7 and prepare the
   candidate's text, history decisions, and semantic assessment.
-- (D) Submit each iteration with
-  `python scripts/proposal-workflow.py advance --state STATE --outcome OUTCOME
-  --regressions RESULT`.
+- (D) Inspect or submit the current iteration with `python
+  scripts/proposal-workflow.py run --state STATE [--assessment-file FILE
+  --outcome OUTCOME --regressions RESULT]`. Without decision flags, `run`
+  returns the current next action. With all three decision flags, it writes the
+  UTF-8 assessment, validates and records the candidate, and returns the next
+  semantic action or finalization step.
 - Report one compact status after each submission; do not repeat iteration
   logs in the final answer.
 - (D) Before presenting the selected proposal, run

@@ -77,6 +77,56 @@ def _workflow(monkeypatch):
     return runpy.run_path(str(SKILL_UPDATE_WORKFLOW))
 
 
+def test_init_and_run_drive_update_without_caller_request_json(tmp_path):
+    root, scope, _ = prepare_skill_update_workflow_worktree(tmp_path)
+    command_file = scope / "command-arguments.txt"
+    command_file.write_text(
+        f"{sys.executable}\n-c\nassert 'מלא' == 'מלא'\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    initialized = run_skill_update_workflow(
+        "init",
+        "--repo-root",
+        str(root),
+        "--selected-skill",
+        "alpha-tool",
+        "--group",
+        "helper-runtime",
+        SOURCE,
+        "--command-check-file",
+        str(command_file),
+    )
+    assert initialized.returncode == 0, initialized.stderr
+    assert json.loads(initialized.stdout) == {
+        "status": "pending",
+        "next_action": "edit_declared_paths_then_run",
+    }
+    directory = _directory(root)
+    request = json.loads((directory / "update_request.json").read_text())
+    assert request["request"]["checks"][0]["argv"][-1] == "assert 'מלא' == 'מלא'"
+
+    _edit(root)
+    verified = run_skill_update_workflow("run", "--repo-root", str(root))
+    assert verified.returncode == 0, verified.stderr
+    payload = json.loads(verified.stdout)
+    assert payload["status"] == "passed"
+    assert payload["next_action"].startswith("complete_requested_caller_use")
+    retained = {path: path.read_bytes() for path in directory.rglob("*.json")}
+    repeated = run_skill_update_workflow("run", "--repo-root", str(root))
+    assert repeated.returncode == 0, repeated.stderr
+    assert json.loads(repeated.stdout)["status"] == "passed"
+    assert {path: path.read_bytes() for path in directory.rglob("*.json")} == retained
+
+    finalized = run_skill_update_workflow(
+        "run", "--repo-root", str(root), "--caller-use-complete"
+    )
+    assert finalized.returncode == 0, finalized.stderr
+    assert finalized.stdout.strip() == "OK"
+    assert not directory.exists()
+    assert command_file.is_file()
+
+
 def test_open_discovers_same_update_and_preserves_original_request(tmp_path):
     root, _, _, request, data = _case(tmp_path, dirty=True)
     _ok(root, "open_skill_change", request)

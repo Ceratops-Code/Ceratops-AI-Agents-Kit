@@ -145,7 +145,7 @@ without repository deduplication.
 | `skills/ceratops-repo-lifecycle/references/templates/skill-sections.json.tmpl` | Repository-neutral template for creating a target repository's live `skills/skill-sections.json`; never a live manifest. |
 | `skills/ceratops-skill-lifecycle/scripts/runtime/install-managed-skills.py` | Classifies exact affected sets, owns direct-manifest inventory and explicit prior-owner migration, and invokes one runtime transaction; emits commit-bound completion evidence and can finalize its saved promotion handoff without replaying deployment. |
 | `skills/ceratops-skill-lifecycle/scripts/runtime/managed_runtime_builder.py` | Stages, activates, rolls back, recovers, and cleans one locked selected-skill runtime transaction. |
-| `skills/ceratops-skill-lifecycle/scripts/skill-update-workflow.py` | Discovers one unfinished skill change per worktree, records approved scope against the original baseline, and saves immutable state/check generations. Supports approved scope expansion and failed-request replacement; reuses passed checks for exact inputs and closes from saved success without rechecking source. The caller edits, commits and requests promotion/deployment separately; this helper never runs repository tests. |
+| `skills/ceratops-skill-lifecycle/scripts/skill-update-workflow.py` | Initializes ordinary updates from repeated skill/path groups and UTF-8 command files, or opens caller-owned requests. It discovers one unfinished skill change per worktree, records approved scope against the original baseline, saves immutable state/check generations, and drives verification to one next action. Scope expansion and failed-request replacement preserve the original baseline; exact passed checks are reused, and close consumes saved success without rechecking source. The caller edits, commits and requests promotion/deployment separately; this helper never runs repository tests. |
 | `skills/ceratops-skill-lifecycle/scripts/skill_update_checks.py` | Runs declared checks without a shell, records deterministic search applicability for safe reuse, and carries failure evidence to the update workflow. Failed pytest checks print test identities and reported errors from the same run, preserve complete structured failure details before scratch cleanup, mark bounded output, and use the captured terminal diagnostic when the native report is unavailable. |
 | `skills/ceratops-skill-lifecycle/scripts/skill_update_scratch.py` | Supplies subprocess-only temporary-directory settings under the verified task-temp root and removes its unique check folder after success or failure; cleanup errors block verification while preserving check evidence, and recorded residue is retried before new checks. Explicit paths in check arguments remain caller-owned. |
 | `skills/ceratops-credit-savings-analysis/scripts/credit_analysis/session_evidence_collector.py` | Resolves current, named, indexed, and project-identified sessions and collects one complete prepared traversal per analysis, preserving formatted messages, canonical current-source references, bounded nested-command failure provenance, tool and process telemetry, fingerprints, usage, closure, and classification modes. |
@@ -160,8 +160,8 @@ without repository deduplication.
 | `skills/ceratops-governance-lifecycle/scripts/apply_rules_update.py` | Owns producer-side preparation of complete rule, history and TOML outputs; applies accepted bytes using identity comparisons and rollback, without rerunning content checks; cleans exact disposable inputs after success. |
 | `skills/ceratops-governance-lifecycle/scripts/validate_rule_candidate.py` | Checks new candidate text and formatter idempotence; `--accept` also freezes complete output and original check results for application, including history-only repairs. |
 | `skills/ceratops-governance-lifecycle/scripts/rule_candidate_source.py` | Owns exact UTF-8 source loading, encoding and line-ending preservation, shared candidate data, and input-integrity checks used by governance validation and application. |
-| `skills/ceratops-governance-lifecycle/scripts/proposal-workflow.py` | Constructs requests and seeds the first candidate from exact replacements, or prepares a supplied complete request; validates inputs, histories, target policies, and hashes; rejects untouched formatting errors before opening artifacts; records task-temp ownership; delegates validated controller transitions; and preserves any accepted champion while finalizing owned artifacts, including completed all-rejected runs. |
-| `skills/ceratops-governance-lifecycle/scripts/iteration_controller.py` | Accepts changed candidates once, carries original results for identical candidates, preserves improvement iterations until three consecutive non-improvements, and distinguishes an iteration cap from convergence. |
+| `skills/ceratops-governance-lifecycle/scripts/proposal-workflow.py` | Initializes proposals from repeated source declarations and UTF-8 text files, constructs requests and seeds the first candidate from exact replacements, or prepares a supplied complete request. Its driver reports or submits one semantic decision at a time; validation covers inputs, histories, target policies, hashes, untouched formatting, task-temp ownership, controller transitions, and accepted-champion retention. |
+| `skills/ceratops-governance-lifecycle/scripts/iteration_controller.py` | Opens structured candidates, invokes mechanical validation before recording, retains the exact validated champion, enforces stopping, and safely finalizes owned artifacts. |
 | `skills/ceratops-governance-lifecycle/scripts/rule_graph.py` | Parses canonical AGENTS rules and rejects structural syntax or rule-local explicit-user override escape clauses. |
 | `skills/ceratops-repo-lifecycle/scripts/github_contract_engine/` | Package CLI for compact local audit snapshots, contract evaluation, shared GitHub API access, sanitized evidence, and evidence-gated CodeQL disposition. |
 | `skills/ceratops-repo-lifecycle/scripts/github_pr_workflow/` | Package CLI for individual PR operations, opt-in scoped branch/stage/commit preparation and checked draft or fork PR publication in `ensure_pr.py`, bounded standalone review and CI inspectors with caller-owned evidence files, shared readiness-owned CI diagnostics, one-call retry-safe review replies and resolutions, decision-complete gate blockers, single-snapshot terminal Actions outage detection, exact-commit checkpointed shipping, four-proof obsolete-prepared-checkpoint cleanup before automatic resume, scoped pending-work checks, concurrent gates, integrated admin merge, reusable-branch restoration, and terminal cleanup. |
@@ -542,10 +542,18 @@ behavior remains unchanged.
 
 ### Governance proposal construction
 
-Run `uv run --project scripts --locked python
-skills/ceratops-governance-lifecycle/scripts/proposal-workflow.py
-construct --spec SPEC` from the repository root. The caller retains the UTF-8
-JSON spec, whose complete shape is:
+For an ordinary proposal, run `proposal-workflow.py init` with a verified task
+root, UTF-8 failure and regression files, repeated `--context RULES HISTORY
+RULE_IDS`, and repeated `--replacement RULES HISTORY EXPECTED_FILE
+REPLACEMENT_FILE`. Use `-` for a source without history. The helper constructs
+and prepares the closed request and emits the candidate paths plus one
+`next_action`. Run `proposal-workflow.py run --state STATE` to inspect that
+action, or add `--assessment-file FILE --outcome OUTCOME --regressions RESULT`
+to submit the semantic decision without writing workflow JSON by hand.
+
+For a caller-owned complete specification, run `uv run --project scripts
+--locked python skills/ceratops-governance-lifecycle/scripts/proposal-workflow.py
+construct --spec SPEC` from the repository root. The UTF-8 JSON shape is:
 
 ```json
 {
@@ -591,7 +599,7 @@ Inside the verified task-temp root, construction creates `proposal-request.json`
 `proposal-original.json`, `proposal-regressions.md`, `proposal-state.json`,
 `proposal-context.json` and `iterations/`. It refuses existing output paths.
 Stdout returns the pending iteration paths plus `state` and `champion_output`.
-Continue with the existing `advance` and `finalize` commands. Finalization
+Continue with `run` or the lower-level `advance`, then `finalize`. Finalization
 removes generated inputs and controller artifacts while retaining
 `validated-champion.json` and the caller's spec. A failure before state creation
 removes only unchanged generated inputs; a later failure reports the preserved

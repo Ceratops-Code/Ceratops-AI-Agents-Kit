@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Validate and orchestrate one governance proposal iteration run.
+"""Initialize, validate, and drive one governance proposal iteration run.
 
-``construct`` derives request artifacts and seeds the first candidate from a
-compact specification, then calls the same ``prepare`` path. The caller retains
-the specification; generated inputs belong to the workflow until finalization.
+``init`` derives a compact specification from UTF-8 text files and repeated
+source declarations, while ``construct`` accepts the equivalent caller-owned
+JSON. Both derive request artifacts, seed the first candidate, and call the same
+``prepare`` path. ``run`` reports one next action or writes the declared UTF-8
+assessment and advances the pending iteration.
 ``prepare`` validates a closed request against exact current rule text and the
 existing structured history lookup, rejects untouched Markdown errors before
 opening proposal artifacts, writes detailed context evidence, records
@@ -758,6 +760,130 @@ def command_construct(spec_path: pathlib.Path) -> str:
         raise
 
 
+def _read_utf8_input(value: pathlib.Path, label: str) -> str:
+    """Read one nonempty UTF-8 input without shell or JSON quoting."""
+
+    path = _input_path(str(value), label)
+    try:
+        text = path.read_bytes().decode("utf-8-sig")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ProposalWorkflowError(f"{label} is not readable UTF-8: {exc}") from exc
+    if not text.strip() or "\0" in text:
+        raise ProposalWorkflowError(f"{label} must be nonempty text without NUL")
+    return text
+
+
+def _annotated_status(payload: Mapping[str, object]) -> str:
+    """Add exactly one caller action to a controller-owned status payload."""
+
+    result = dict(payload)
+    if result.get("complete") is True:
+        result["next_action"] = "finalize"
+    elif result.get("interrupted") is True:
+        result["next_action"] = "report_iteration_limit_interruption"
+    elif isinstance(result.get("pending"), Mapping) or isinstance(
+        result.get("candidate"), str
+    ):
+        result["next_action"] = "assess_candidate_then_run"
+    else:
+        raise ProposalWorkflowError("proposal status has no pending or final action")
+    return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+
+
+def command_init(
+    task_temp_root: pathlib.Path,
+    failure_file: pathlib.Path,
+    regressions_file: pathlib.Path,
+    contexts: Sequence[Sequence[str]],
+    replacements: Sequence[Sequence[str]],
+    max_iterations: int,
+    mutation_authorized: bool,
+    expected_side_effects: Sequence[str],
+) -> str:
+    """Construct and prepare a proposal from simple, UTF-8-safe declarations."""
+
+    root = _verified_task_temp_root(str(task_temp_root))
+    sources: dict[tuple[str, str | None], dict[str, object]] = {}
+    history_by_rules: dict[str, str | None] = {}
+
+    def source_for(rules_value: str, history_value: str) -> dict[str, object]:
+        rules = str(_input_path(rules_value, "declared rules source"))
+        history = (
+            None
+            if history_value == "-"
+            else str(_input_path(history_value, "declared history source"))
+        )
+        prior_history = history_by_rules.setdefault(rules, history)
+        if prior_history != history:
+            raise ProposalWorkflowError(
+                f"rules source has conflicting histories: {rules}"
+            )
+        return sources.setdefault(
+            (rules, history),
+            {"rules": rules, "history": history, "rule_ids": [], "replacements": []},
+        )
+
+    for declaration in contexts:
+        rules_value, history_value, raw_ids = declaration
+        if history_value == "-":
+            raise ProposalWorkflowError("context source requires history")
+        ids = [value.strip() for value in raw_ids.split(",") if value.strip()]
+        if not ids or len(ids) != len(set(ids)):
+            raise ProposalWorkflowError(
+                "context RULE_IDS must be a unique comma-separated list"
+            )
+        source = source_for(rules_value, history_value)
+        target_ids = source["rule_ids"]
+        assert isinstance(target_ids, list)
+        for rule_id in ids:
+            if rule_id in target_ids:
+                raise ProposalWorkflowError(f"duplicate context rule ID: {rule_id}")
+            target_ids.append(rule_id)
+
+    for declaration in replacements:
+        rules_value, history_value, expected_file, replacement_file = declaration
+        source = source_for(rules_value, history_value)
+        edits = source["replacements"]
+        assert isinstance(edits, list)
+        edits.append(
+            {
+                "expected_old": _read_utf8_input(
+                    pathlib.Path(expected_file), "expected text file"
+                ),
+                "replacement": _read_utf8_input(
+                    pathlib.Path(replacement_file), "replacement text file"
+                ),
+            }
+        )
+
+    if not contexts or not replacements:
+        raise ProposalWorkflowError(
+            "init requires at least one context and one replacement declaration"
+        )
+    spec = {
+        "schema": SPEC_SCHEMA,
+        "task_temp_root": str(root),
+        "sources": list(sources.values()),
+        "failure": _read_utf8_input(failure_file, "failure file"),
+        "regressions": _read_utf8_input(regressions_file, "regressions file"),
+        "max_iterations": max_iterations,
+        "mutation_authorized": mutation_authorized,
+        "expected_side_effects": list(expected_side_effects)
+        or ["write proposal artifacts under the verified task-temp root"],
+    }
+    handle, temp_name = tempfile.mkstemp(
+        prefix=".proposal-init-", suffix=".json", dir=root
+    )
+    os.close(handle)
+    spec_path = pathlib.Path(temp_name)
+    spec_path.unlink()
+    try:
+        _write_json_atomic(spec_path, spec)
+        return _annotated_status(json.loads(command_construct(spec_path)))
+    finally:
+        spec_path.unlink(missing_ok=True)
+
+
 def command_prepare(request_path: pathlib.Path) -> str:
     request = _validated_request(request_path)
     sources = request["sources"]
@@ -971,6 +1097,65 @@ def command_advance(
     if not isinstance(parsed, Mapping):
         raise ProposalWorkflowError("iteration controller status payload is invalid")
     return json.dumps(parsed, separators=(",", ":"))
+
+
+def command_run(
+    state: pathlib.Path,
+    assessment_file: pathlib.Path | None,
+    outcome: str | None,
+    regressions: str | None,
+) -> str:
+    """Report one next action or submit one complete semantic decision."""
+
+    supplied = (assessment_file is not None, outcome is not None, regressions is not None)
+    if any(supplied) and not all(supplied):
+        raise ProposalWorkflowError(
+            "assessment-file, outcome, and regressions must be supplied together"
+        )
+    resolved_state = _input_path(str(state), "state")
+    status_raw = _run_helper(
+        "iteration_controller.py", ["status", "--state", str(resolved_state)]
+    )
+    try:
+        status = json.loads(status_raw)
+    except json.JSONDecodeError as exc:
+        raise ProposalWorkflowError(
+            "iteration_controller.py returned invalid status JSON"
+        ) from exc
+    if not isinstance(status, Mapping):
+        raise ProposalWorkflowError("iteration controller status payload is invalid")
+    controller = _read_json(resolved_state, "controller state")
+    pending = controller.get("pending")
+    if not any(supplied):
+        return _annotated_status(
+            {**status, **({"pending": pending} if isinstance(pending, Mapping) else {})}
+        )
+    if status.get("complete") is True or not isinstance(pending, Mapping):
+        raise ProposalWorkflowError("proposal has no pending iteration")
+    cleanup = controller.get("proposal_cleanup")
+    if not isinstance(cleanup, Mapping):
+        raise ProposalWorkflowError("proposal cleanup ownership is missing")
+    root = _verified_task_temp_root(cleanup.get("task_temp_root"))
+    assessment_value = pending.get("assessment")
+    if not isinstance(assessment_value, str) or not assessment_value:
+        raise ProposalWorkflowError("pending assessment path is invalid")
+    assessment = _task_file(
+        pathlib.Path(assessment_value), root, "pending assessment", must_exist=False
+    )
+    assert assessment_file is not None and outcome is not None and regressions is not None
+    assessment_text = _read_utf8_input(assessment_file, "assessment file")
+    assessment_bytes = assessment_text.encode("utf-8")
+    if assessment.exists():
+        if assessment.read_bytes() != assessment_bytes:
+            raise ProposalWorkflowError(
+                f"pending assessment differs from supplied file: {assessment}"
+            )
+    else:
+        _write_bytes_atomic(assessment, assessment_bytes)
+    advanced = json.loads(command_advance(resolved_state, outcome, regressions))
+    if not isinstance(advanced, Mapping):
+        raise ProposalWorkflowError("proposal advance payload is invalid")
+    return _annotated_status(advanced)
 
 
 def _validated_cleanup(
@@ -1218,6 +1403,21 @@ def command_finalize(state: pathlib.Path) -> str:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
+    init = commands.add_parser("init", help="Initialize from UTF-8 files and declarations")
+    init.add_argument("--task-temp-root", required=True, type=pathlib.Path)
+    init.add_argument("--failure-file", required=True, type=pathlib.Path)
+    init.add_argument("--regressions-file", required=True, type=pathlib.Path)
+    init.add_argument(
+        "--context", action="append", nargs=3, required=True,
+        metavar=("RULES", "HISTORY", "RULE_IDS"),
+    )
+    init.add_argument(
+        "--replacement", action="append", nargs=4, required=True,
+        metavar=("RULES", "HISTORY", "EXPECTED_FILE", "REPLACEMENT_FILE"),
+    )
+    init.add_argument("--max-iterations", type=int, default=200)
+    init.add_argument("--mutation-authorized", action="store_true")
+    init.add_argument("--expected-side-effect", action="append", default=[])
     construct = commands.add_parser("construct", help="Construct and prepare from exact replacements")
     construct.add_argument("--spec", required=True, type=pathlib.Path)
     prepare = commands.add_parser("prepare")
@@ -1234,6 +1434,11 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         choices=("passed", "failed"),
     )
+    run = commands.add_parser("run", help="Inspect or submit the pending iteration")
+    run.add_argument("--state", required=True, type=pathlib.Path)
+    run.add_argument("--assessment-file", type=pathlib.Path)
+    run.add_argument("--outcome", choices=("improved", "no-improvement"))
+    run.add_argument("--regressions", choices=("passed", "failed"))
     finalize = commands.add_parser("finalize")
     finalize.add_argument("--state", required=True, type=pathlib.Path)
     return parser
@@ -1242,12 +1447,29 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        if args.command == "construct":
+        if args.command == "init":
+            if args.max_iterations < 1:
+                raise ProposalWorkflowError("max-iterations must be positive")
+            output = command_init(
+                args.task_temp_root,
+                args.failure_file,
+                args.regressions_file,
+                args.context,
+                args.replacement,
+                args.max_iterations,
+                args.mutation_authorized,
+                args.expected_side_effect,
+            )
+        elif args.command == "construct":
             output = command_construct(args.spec)
         elif args.command == "prepare":
             output = command_prepare(args.request)
         elif args.command == "advance":
             output = command_advance(args.state, args.outcome, args.regressions)
+        elif args.command == "run":
+            output = command_run(
+                args.state, args.assessment_file, args.outcome, args.regressions
+            )
         else:
             output = command_finalize(args.state)
     except (ProposalWorkflowError, OSError, ValueError) as exc:
