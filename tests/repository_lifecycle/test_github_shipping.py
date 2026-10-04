@@ -1131,6 +1131,45 @@ def test_dependency_finalization_delegates_admin_to_shared_merge(
     assert "enforce_admins" not in " ".join(command)
 
 
+@pytest.mark.parametrize("prefix", ["build(deps): ", "build(deps-dev): "])
+def test_dependabot_bump_title_accepts_configured_prefixes(
+    monkeypatch: pytest.MonkeyPatch,
+    prefix: str,
+) -> None:
+    dependency = load_pr_workflow_module(monkeypatch, "dependency_evidence")
+
+    update = dependency.parse_update(
+        f"{prefix}bump ruff from 0.16.8 to 0.16.9 in /scripts",
+        [{"path": "scripts/uv.lock"}],
+        [],
+    )
+
+    assert update == {
+        "package": "ruff",
+        "current_version": "0.16.8",
+        "target_version": "0.16.9",
+        "path_hint": "/scripts",
+        "ecosystem": "pip",
+        "update_type": "patch",
+    }
+
+
+def test_dependabot_bump_title_rejects_unconfigured_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dependency = load_pr_workflow_module(monkeypatch, "dependency_evidence")
+
+    update = dependency.parse_update(
+        "chore(deps): bump ruff from 0.16.8 to 0.16.9 in /scripts",
+        [{"path": "scripts/uv.lock"}],
+        [],
+    )
+
+    assert update["package"] is None
+    assert update["current_version"] is None
+    assert update["target_version"] is None
+
+
 def test_dependabot_requirement_range_title_projects_concrete_minimum(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
