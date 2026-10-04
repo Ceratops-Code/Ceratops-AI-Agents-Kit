@@ -38,6 +38,7 @@ def child_environment(layout: Layout, temporary: Path) -> dict[str, str]:
     env = {k: v for k, v in os.environ.items() if k.upper() in {"SYSTEMROOT", "WINDIR", "COMSPEC"}}
     env.update({
         "PATH": str(Path(sys.executable).parent),
+        "USERPROFILE": str(Path.home()),
         "TEMP": str(temporary), "TMP": str(temporary),
         "UV_CACHE_DIR": str(layout.directory("cache")),
         "UV_PYTHON_DOWNLOADS": "never", "UV_NO_CONFIG": "1",

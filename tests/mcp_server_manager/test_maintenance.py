@@ -39,6 +39,21 @@ def test_default_install_root_is_user_codex_mcp():
     assert storage.INSTALL_ROOT == Path.home() / ".codex" / "mcp"
 
 
+def test_child_environment_retains_profile_for_user_owned_install_root(tmp_path, monkeypatch):
+    monkeypatch.setattr(storage, "INSTALL_ROOT", tmp_path / "installed")
+    environment = engine_module.child_environment(storage.Layout("fixture"), tmp_path / "temporary")
+    probe = subprocess.run(
+        [sys.executable, "-I", "-B", "-c", "from pathlib import Path; print(Path.home())"],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert probe.returncode == 0, probe.stderr
+    assert Path(probe.stdout.strip()) == Path.home()
+    assert "HOME" not in environment
+
+
 def test_legacy_catalog_import_rehydrates_without_copying_environments(
     deployment, tmp_path, monkeypatch
 ):
