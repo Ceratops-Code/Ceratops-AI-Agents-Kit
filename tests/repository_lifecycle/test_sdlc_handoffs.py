@@ -3545,10 +3545,12 @@ def test_registered_skill_executor_uses_installed_authorized_source_bundle(
 
 
 @pytest.mark.parametrize("failure", [None, "candidate", "missing_manager"])
+@pytest.mark.parametrize("selected_mcp_server", [None, "sample-mcp-server"])
 def test_tool_install_binding_uses_checkout_metadata_and_propagates_failures(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
     failure: str | None,
+    selected_mcp_server: str | None,
 ) -> None:
     handoffs = runner
     skill = tmp_path / "skills/ceratops-mcp-server-lifecycle/references"
@@ -3573,9 +3575,21 @@ def test_tool_install_binding_uses_checkout_metadata_and_propagates_failures(
         )
 
     monkeypatch.setattr(handoffs.subprocess, "run", run)
-    result = handoffs.execute_handoff("ceratops-mcp-server-lifecycle/install", repo)
+    inputs = (
+        {
+            "mcp-server": selected_mcp_server,
+            "prerequisite-packages": [],
+        }
+        if selected_mcp_server is not None
+        else None
+    )
+    result = handoffs.execute_handoff(
+        "ceratops-mcp-server-lifecycle/install",
+        repo,
+        inputs=inputs,
+    )
     assert result["status"] == ("operation_failed" if failure else "completed")
-    assert calls[0][0] == [
+    expected = [
         sys.executable,
         "-I",
         "-B",
@@ -3583,8 +3597,49 @@ def test_tool_install_binding_uses_checkout_metadata_and_propagates_failures(
         "--repo-root",
         str(repo),
     ]
+    if selected_mcp_server is not None:
+        expected.extend(["--mcp-server-name", selected_mcp_server])
+    assert calls[0][0] == expected
     assert calls[0][1]["cwd"] == repo
     assert not calls[0][1].get("shell", False)
+
+
+def test_tool_install_binding_rejects_unknown_structured_inputs(
+    tmp_path: pathlib.Path,
+) -> None:
+    result = runner.execute_handoff(
+        "ceratops-mcp-server-lifecycle/install",
+        tmp_path,
+        inputs={"mcp-server": "sample-mcp-server", "unexpected": "value"},
+    )
+
+    assert result == {
+        "status": "handoff_required",
+        "handoff": "ceratops-mcp-server-lifecycle/install",
+        "message": "No deterministic binding for these lifecycle inputs.",
+    }
+
+
+def test_tool_install_binding_defers_package_backed_selection(
+    tmp_path: pathlib.Path,
+) -> None:
+    result = runner.execute_handoff(
+        "ceratops-mcp-server-lifecycle/install",
+        tmp_path,
+        inputs={
+            "mcp-server": "sample-mcp-server",
+            "prerequisite-packages": ["sample-package"],
+        },
+    )
+
+    assert result == {
+        "status": "handoff_required",
+        "handoff": "ceratops-mcp-server-lifecycle/install",
+        "message": (
+            "Package-backed MCP server installation requires lifecycle "
+            "artifact resolution."
+        ),
+    }
 
 
 def test_tool_install_helper_attests_existing_manager_result_without_reinstall(

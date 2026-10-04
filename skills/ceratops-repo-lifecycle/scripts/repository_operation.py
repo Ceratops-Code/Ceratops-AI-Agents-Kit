@@ -317,10 +317,10 @@ def execute_handoff(
     SDLC names only a skill and action. The installed binding authorizes an
     identical source binding when one exists; CI callers never invoke this
     function. Installed Python steps use their pinned immutable runtime.
-    Structured skill inputs adapt only the registered lifecycle's existing
-    selection flags. Unknown inputs or commands remain pending rather than
-    broadening a selected skill to a repository-wide deployment. Package names
-    are validated SDLC prerequisites; this adapter never builds them implicitly.
+    Structured inputs adapt only registered skill and MCP-server selection
+    flags. Unknown inputs or commands remain pending rather than broadening a
+    selected deployment. Package names are validated SDLC prerequisites; this
+    adapter never builds them implicitly.
     """
 
     if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*/[a-z0-9]+(?:-[a-z0-9]+)*", route):
@@ -331,26 +331,60 @@ def execute_handoff(
         }
     skill, action = route.split("/")
     selected_skill = None
+    selected_mcp_server = None
     if inputs is not None:
-        selected_skill = inputs.get("skill")
         packages = inputs.get("prerequisite-packages", [])
-        if (
-            skill != "ceratops-skill-lifecycle"
-            or action not in {"source-validate", "deploy"}
-            or set(inputs) - {"skill", "prerequisite-packages"}
-            or not isinstance(selected_skill, str)
-            or not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", selected_skill)
-            or not isinstance(packages, list)
-            or not all(
-                isinstance(name, str)
-                and re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", name)
-                for name in packages
+        if skill == "ceratops-skill-lifecycle" and action in {
+            "source-validate",
+            "deploy",
+        }:
+            selected_skill = inputs.get("skill")
+            valid_inputs = (
+                not set(inputs) - {"skill", "prerequisite-packages"}
+                and isinstance(selected_skill, str)
+                and re.fullmatch(
+                    r"[a-z0-9]+(?:-[a-z0-9]+)*", selected_skill
+                )
+                is not None
+                and isinstance(packages, list)
+                and all(
+                    isinstance(name, str)
+                    and re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", name)
+                    for name in packages
+                )
             )
-        ):
+        elif skill == "ceratops-mcp-server-lifecycle" and action == "install":
+            selected_mcp_server = inputs.get("mcp-server")
+            valid_inputs = (
+                not set(inputs) - {"mcp-server", "prerequisite-packages"}
+                and isinstance(selected_mcp_server, str)
+                and re.fullmatch(
+                    r"[a-z0-9]+(?:-[a-z0-9]+)*", selected_mcp_server
+                )
+                is not None
+                and isinstance(packages, list)
+                and all(
+                    isinstance(name, str)
+                    and re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", name)
+                    for name in packages
+                )
+            )
+        else:
+            valid_inputs = False
+        if not valid_inputs:
             return {
                 "status": "handoff_required",
                 "handoff": route,
                 "message": "No deterministic binding for these lifecycle inputs.",
+            }
+        if selected_mcp_server is not None and packages:
+            return {
+                "status": "handoff_required",
+                "handoff": route,
+                "message": (
+                    "Package-backed MCP server installation requires lifecycle "
+                    "artifact resolution."
+                ),
             }
     skills = (
         pathlib.Path(os.environ.get("CODEX_HOME", str(pathlib.Path.home() / ".codex")))
@@ -472,6 +506,19 @@ def execute_handoff(
                         "message": "Binding command does not support structured skill selection.",
                     }
                 argv.extend(["--skill", selected_skill])
+            if selected_mcp_server is not None:
+                script = step["run"][3] if len(step["run"]) > 3 else ""
+                if (
+                    script
+                    != "{skill_root}/scripts/install-mcp-server.py"
+                    or "--mcp-server-name" in argv
+                ):
+                    return {
+                        **evidence,
+                        "status": "handoff_required",
+                        "message": "Binding command does not support structured MCP server selection.",
+                    }
+                argv.extend(["--mcp-server-name", selected_mcp_server])
             if step["run"][0] == "{python}" and not uses_source_bundle:
                 uv = shutil.which("uv")
                 metadata = installed_root / ".runtime-manifest.json"

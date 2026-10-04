@@ -23,6 +23,10 @@ from .dependency_common import (
     run_command,
 )
 
+DEPENDABOT_TITLE_PREFIX_RE = re.compile(
+    r"^build\(deps(?:-dev)?\):\s*",
+    re.IGNORECASE,
+)
 GROUPED_BODY_UPDATE_RE = re.compile(
     r"^Updates `(?P<package>[^`\r\n]+)` from (?P<current>\S+) to "
     r"(?P<target>\S+)\s*$",
@@ -334,14 +338,15 @@ def inclusive_lower_bound(specifier: str | None) -> str | None:
 def parse_update(title: str, files: list[dict[str, Any]], alerts: list[dict[str, Any]]) -> dict[str, Any]:
     """Parse one exact or safely projectable Dependabot title update."""
 
-    match = BUMP_RE.match(title.strip())
+    normalized_title = DEPENDABOT_TITLE_PREFIX_RE.sub("", title.strip(), count=1)
+    match = BUMP_RE.match(normalized_title)
     if match:
         package = match.group("package")
         current = match.group("current")
         target = match.group("target")
         path_hint = match.group("path")
     else:
-        requirement_match = REQUIREMENT_TITLE_UPDATE_RE.match(title.strip())
+        requirement_match = REQUIREMENT_TITLE_UPDATE_RE.match(normalized_title)
         package = requirement_match.group("package") if requirement_match else None
         current = (
             inclusive_lower_bound(requirement_match.group("current"))
