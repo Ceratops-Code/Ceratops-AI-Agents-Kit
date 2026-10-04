@@ -356,12 +356,18 @@ def execute_handoff(
         elif skill == "ceratops-mcp-server-lifecycle" and action == "install":
             selected_mcp_server = inputs.get("mcp-server")
             valid_inputs = (
-                set(inputs) == {"mcp-server"}
+                not set(inputs) - {"mcp-server", "prerequisite-packages"}
                 and isinstance(selected_mcp_server, str)
                 and re.fullmatch(
                     r"[a-z0-9]+(?:-[a-z0-9]+)*", selected_mcp_server
                 )
                 is not None
+                and isinstance(packages, list)
+                and all(
+                    isinstance(name, str)
+                    and re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", name)
+                    for name in packages
+                )
             )
         else:
             valid_inputs = False
@@ -370,6 +376,15 @@ def execute_handoff(
                 "status": "handoff_required",
                 "handoff": route,
                 "message": "No deterministic binding for these lifecycle inputs.",
+            }
+        if selected_mcp_server is not None and packages:
+            return {
+                "status": "handoff_required",
+                "handoff": route,
+                "message": (
+                    "Package-backed MCP server installation requires lifecycle "
+                    "artifact resolution."
+                ),
             }
     skills = (
         pathlib.Path(os.environ.get("CODEX_HOME", str(pathlib.Path.home() / ".codex")))

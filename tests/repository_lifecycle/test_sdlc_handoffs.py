@@ -3576,7 +3576,10 @@ def test_tool_install_binding_uses_checkout_metadata_and_propagates_failures(
 
     monkeypatch.setattr(handoffs.subprocess, "run", run)
     inputs = (
-        {"mcp-server": selected_mcp_server}
+        {
+            "mcp-server": selected_mcp_server,
+            "prerequisite-packages": [],
+        }
         if selected_mcp_server is not None
         else None
     )
@@ -3614,6 +3617,28 @@ def test_tool_install_binding_rejects_unknown_structured_inputs(
         "status": "handoff_required",
         "handoff": "ceratops-mcp-server-lifecycle/install",
         "message": "No deterministic binding for these lifecycle inputs.",
+    }
+
+
+def test_tool_install_binding_defers_package_backed_selection(
+    tmp_path: pathlib.Path,
+) -> None:
+    result = runner.execute_handoff(
+        "ceratops-mcp-server-lifecycle/install",
+        tmp_path,
+        inputs={
+            "mcp-server": "sample-mcp-server",
+            "prerequisite-packages": ["sample-package"],
+        },
+    )
+
+    assert result == {
+        "status": "handoff_required",
+        "handoff": "ceratops-mcp-server-lifecycle/install",
+        "message": (
+            "Package-backed MCP server installation requires lifecycle "
+            "artifact resolution."
+        ),
     }
 
 
