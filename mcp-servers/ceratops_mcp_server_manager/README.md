@@ -14,14 +14,14 @@ maps these modules into the installed Python package; the standalone launcher
 stays outside the wheel.
 
 Editable source belongs in the MCP server's owning repository. Each MCP server
-owns a separate directory under `C:\AI-Agents-MCP-Servers`, including its
+owns a separate directory under `%USERPROFILE%\.codex\mcp`, including its
 packages, environments, version selection, registry, cache, and locks. The
 manager's directory is
-`C:\AI-Agents-MCP-Servers\ceratops_mcp_server_manager`. Skills and Codex
-configuration stay in `.codex`; the skill installer owns skill deployment.
+`%USERPROFILE%\.codex\mcp\ceratops_mcp_server_manager`. The skill installer
+separately owns skill deployment.
 
 ```text
-C:\AI-Agents-MCP-Servers\<mcp-server-name>\
+%USERPROFILE%\.codex\mcp\<mcp-server-name>\
   bin\                              stable launcher for this MCP server
   artifacts\<version>\<manifest-sha256>\
   versions\<version>\<instance>\environment\
@@ -49,7 +49,7 @@ From an active Ceratops-AI-Agents-Kit source checkout:
 
 ```powershell
 uv run --locked scripts/deploy-mcp-server-manager.py
-C:\AI-Agents-MCP-Servers\ceratops_mcp_server_manager\bin\ceratops_mcp_server_manager.cmd versions
+%USERPROFILE%\.codex\mcp\ceratops_mcp_server_manager\bin\ceratops_mcp_server_manager.cmd versions
 ```
 
 The deployment script installs the source checkout's declared manager version,
@@ -61,6 +61,18 @@ storage on success or failure; no libraries need to be installed globally.
 It changes no Codex
 configuration. An incompatible or missing prerequisite fails before deployment
 writes installation files.
+
+For a one-time move from a previous manager root, name that exact source
+explicitly:
+
+```powershell
+uv run --locked scripts/deploy-mcp-server-manager.py --import-root <legacy-root>
+```
+
+The migration validates and imports only registered immutable artifacts, then
+rebuilds each selected environment under the current root. It never copies an
+old virtual environment or changes the legacy root, which remains available as
+rollback state until it is deliberately removed.
 
 | CLI command | MCP tool | Inputs |
 | --- | --- | --- |
@@ -94,7 +106,7 @@ still determines its name and version; YAML does not supply a version override.
 For example, from a repository root:
 
 ```powershell
-C:\AI-Agents-MCP-Servers\ceratops_mcp_server_manager\bin\ceratops_mcp_server_manager.cmd install --mcp-server-name example_mcp_server
+%USERPROFILE%\.codex\mcp\ceratops_mcp_server_manager\bin\ceratops_mcp_server_manager.cmd install --mcp-server-name example_mcp_server
 ```
 
 Public CLI and MCP results identify the MCP server with `mcp_server_name`. MCP returns
@@ -152,8 +164,8 @@ After the manager's first installation, use its public launcher from any
 directory; a Ceratops-AI-Agents-Kit checkout is not required:
 
 ```powershell
-C:\AI-Agents-MCP-Servers\ceratops_mcp_server_manager\bin\ceratops_mcp_server_manager.cmd package --source <mcp-server-source> --lock
-C:\AI-Agents-MCP-Servers\ceratops_mcp_server_manager\bin\ceratops_mcp_server_manager.cmd package --source <mcp-server-source>
+%USERPROFILE%\.codex\mcp\ceratops_mcp_server_manager\bin\ceratops_mcp_server_manager.cmd package --source <mcp-server-source> --lock
+%USERPROFILE%\.codex\mcp\ceratops_mcp_server_manager\bin\ceratops_mcp_server_manager.cmd package --source <mcp-server-source>
 ```
 
 The first command writes a standard `pylock.toml` for review and commit. The

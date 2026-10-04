@@ -304,7 +304,11 @@ def test_proposal_workflow_validates_context_and_owns_iteration_transition(
         assert not state.exists() and not evidence.exists() and not iterations.exists()
         assert not list(task_temp_root.glob(".rule-candidate-*"))
         # Keeping only the in-range error is permitted; advance repairs it.
-        target.write_text(valid_text.replace("Current exact target.", broken), encoding="utf-8")
+        target.write_text(
+            valid_text.replace("Current exact target.", broken),
+            encoding="utf-8",
+            newline="\n",
+        )
     target_before_prepare = target.read_bytes()
     prepared = prepare_proposal()
     assert prepared.returncode == 0, prepared.stderr
@@ -393,15 +397,51 @@ def test_proposal_workflow_validates_context_and_owns_iteration_transition(
     assert failed_state["records"] == []
     assert failed_state["pending"]["iteration"] == 1
     assert candidate_path.read_bytes() == candidate_before_failure
-    candidate_value["targets"][0]["replacements"][0]["replacement"] = (
-        "Validated candidate prose is safely wrapped before the controller "
-        "records its exact post-validation hash."
+    replacement = (
+        "Validated candidate prose is rejected when it needs automatic "
+        "wrapping before the controller records its exact submitted hash."
     )
+    candidate_value["targets"][0]["replacements"][0]["replacement"] = replacement
     candidate_path.write_text(
         json.dumps(candidate_value, indent=2) + "\n",
         encoding="utf-8",
         newline="\n",
     )
+    if not is_toml:
+        unwrapped_candidate = candidate_path.read_bytes()
+        formatting_failure = subprocess.run(
+            [
+                sys.executable,
+                str(PROPOSAL_WORKFLOW),
+                "advance",
+                "--state",
+                str(state),
+                "--outcome",
+                "improved",
+                "--regressions",
+                "passed",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert formatting_failure.returncode == 2
+        assert "MD013" in formatting_failure.stderr
+        assert candidate_path.read_bytes() == unwrapped_candidate
+        failed_state = json.loads(state.read_text(encoding="utf-8"))
+        assert failed_state["records"] == []
+        replacement = (
+            "Validated candidate prose is accepted only when its exact\n"
+            "submitted formatting already satisfies the governing policy."
+        )
+        candidate_value["targets"][0]["replacements"][0]["replacement"] = (
+            replacement
+        )
+        candidate_path.write_text(
+            json.dumps(candidate_value, indent=2) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
     advanced = subprocess.run(
         [
             sys.executable,
@@ -442,9 +482,11 @@ def test_proposal_workflow_validates_context_and_owns_iteration_transition(
     assert record["candidate_sha256"] == hashlib.sha256(
         candidate_path.read_bytes()
     ).hexdigest()
-    fixed_candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
-    replacement = fixed_candidate["targets"][0]["replacements"][0]["replacement"]
-    assert ("\n" in replacement) is not is_toml
+    recorded_candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+    recorded_replacement = recorded_candidate["targets"][0]["replacements"][0][
+        "replacement"
+    ]
+    assert recorded_replacement == replacement
     assert pathlib.Path(record["validation_evidence"]).is_file()
     champion_bytes = candidate_path.read_bytes()
     completed_state_text = state.read_text(encoding="utf-8")

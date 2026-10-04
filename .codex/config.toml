@@ -1,11 +1,11 @@
 # Development repository only; do not expose this service to Forms.
 [mcp_servers.ceratops_mcp_server_manager]
-command = 'python'
+command = 'cmd.exe'
 args = [
-  '-I',
-  '-B',
-  'C:\AI-Agents-MCP-Servers\ceratops_mcp_server_manager\bin\ceratops_mcp_server_manager.py',
-  '--mcp',
+  '/d',
+  '/s',
+  '/c',
+  '""%USERPROFILE%\.codex\mcp\ceratops_mcp_server_manager\bin\ceratops_mcp_server_manager.cmd" --mcp"',
 ]
 enabled_tools = ['install', 'update', 'versions']
 startup_timeout_sec = 20

@@ -26,8 +26,8 @@ repository.
 5. Use the installed manager's public CLI:
 
    ```powershell
-   C:\AI-Agents-MCP-Servers\ceratops_mcp_server_manager\bin\ceratops_mcp_server_manager.cmd package --source <mcp-server-source> --lock
-   C:\AI-Agents-MCP-Servers\ceratops_mcp_server_manager\bin\ceratops_mcp_server_manager.cmd package --source <mcp-server-source>
+   %USERPROFILE%\.codex\mcp\ceratops_mcp_server_manager\bin\ceratops_mcp_server_manager.cmd package --source <mcp-server-source> --lock
+   %USERPROFILE%\.codex\mcp\ceratops_mcp_server_manager\bin\ceratops_mcp_server_manager.cmd package --source <mcp-server-source>
    ```
 
    Review `pylock.toml` between these commands. The first records locked

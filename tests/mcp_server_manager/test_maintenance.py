@@ -35,6 +35,76 @@ def load(name):
     return module
 
 
+def test_default_install_root_is_user_codex_mcp():
+    assert storage.INSTALL_ROOT == Path.home() / ".codex" / "mcp"
+
+
+def test_legacy_catalog_import_rehydrates_without_copying_environments(
+    deployment, tmp_path, monkeypatch
+):
+    """Import immutable inputs, then rebuild the old active selection."""
+    legacy = tmp_path / "legacy"
+    target = tmp_path / "current"
+    legacy.mkdir()
+    bundle = make_release(legacy, "1.0.0", mcp_server="fixture")
+    manifest_sha256 = bundle.name
+    selection = {
+        "schema": 1,
+        "mcp_server_id": "fixture",
+        "version": "1.0.0",
+        "manifest_sha256": manifest_sha256,
+        "instance": "a" * 32,
+        "module": "fixture",
+    }
+    server = legacy / "fixture"
+    (server / "current.json").write_text(json.dumps(selection), encoding="utf-8")
+    legacy_environment = (
+        server
+        / "versions"
+        / "1.0.0"
+        / selection["instance"]
+        / "environment"
+    )
+    legacy_environment.mkdir(parents=True)
+    (legacy_environment / "legacy-marker.txt").write_text("do not copy")
+    monkeypatch.setattr(storage, "INSTALL_ROOT", target)
+    engine = engine_module.Engine()
+    module = load("deploy-mcp-server-manager")
+
+    selections, imported = module.import_catalogs(legacy)
+    assert imported == [
+        {"mcp_server_name": "fixture", "available_versions": ["1.0.0"]}
+    ]
+    assert selections == [selection]
+    assert (target / "fixture/registry.json").is_file()
+    assert not (target / "fixture/current.json").exists()
+    assert not (target / "fixture/versions").exists()
+
+    rebuilt = module.rehydrate_selected(engine, selections)
+    assert rebuilt[0]["status"] == "installed"
+    assert engine.selected("fixture")["manifest_sha256"] == manifest_sha256
+    assert not list(target.glob("**/legacy-marker.txt"))
+    assert (legacy_environment / "legacy-marker.txt").read_text() == "do not copy"
+
+    repeated_selections, repeated_import = module.import_catalogs(legacy)
+    assert repeated_import == imported
+    assert module.rehydrate_selected(engine, repeated_selections)[0]["status"] == "reused"
+
+
+def test_legacy_catalog_import_rejects_tampering_before_writes(tmp_path, monkeypatch):
+    legacy = tmp_path / "legacy"
+    target = tmp_path / "current"
+    legacy.mkdir()
+    bundle = make_release(legacy, "1.0.0", mcp_server="fixture")
+    next(bundle.glob("*.whl")).write_bytes(b"tampered")
+    monkeypatch.setattr(storage, "INSTALL_ROOT", target)
+    module = load("deploy-mcp-server-manager")
+
+    with pytest.raises(contracts.DeploymentError, match="wheel digest mismatch"):
+        module.import_catalogs(legacy)
+    assert not target.exists()
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="Global runtime prerequisites require Windows")
 @pytest.mark.parametrize("case", ["valid", "missing-python", "missing-uv", "private-runtime", "old-python", "old-uv", "invalid-probe"])
 def test_deploy_completes_launchers_after_runtime_record(tmp_path, monkeypatch, case):

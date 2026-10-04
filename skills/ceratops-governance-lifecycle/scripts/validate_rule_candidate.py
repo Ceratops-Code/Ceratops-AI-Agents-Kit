@@ -1392,12 +1392,13 @@ def validate_rule_candidate(
             json.dumps(candidate, ensure_ascii=False, indent=2).encode("utf-8")
             + b"\n"
         )
-        artifact_changed = changed or rendered != original_bytes
-        if not fix and artifact_changed:
+        serialization_changed = rendered != original_bytes
+        if not fix and changed:
             raise RuleCandidateValidationError(
                 "target=all replacement=all rule=approved-artifact could not be "
                 "fixed safely: check-only validation would change the candidate"
             )
+        artifact_changed = changed or (fix and serialization_changed)
         if fix and artifact_changed:
             descriptor, name = tempfile.mkstemp(
                 prefix=f".{candidate_path.name}.",

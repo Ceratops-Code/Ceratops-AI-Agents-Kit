@@ -13,7 +13,7 @@ Select an exact release for an already installed MCP server.
 2. Call MCP `update` with `mcp_server_name` and `version`, or run:
 
    ```powershell
-   C:\AI-Agents-MCP-Servers\ceratops_mcp_server_manager\bin\ceratops_mcp_server_manager.cmd update <mcp-server-name> <version>
+   %USERPROFILE%\.codex\mcp\ceratops_mcp_server_manager\bin\ceratops_mcp_server_manager.cmd update <mcp-server-name> <version>
    ```
 
    Explicitly selecting a previous release uses this same operation.

@@ -9,7 +9,7 @@ Inspect exact installed and registered versions without executing MCP server cod
 1. Call MCP `versions` with optional `mcp_server_name`, or run:
 
    ```powershell
-   C:\AI-Agents-MCP-Servers\ceratops_mcp_server_manager\bin\ceratops_mcp_server_manager.cmd versions [mcp-server-name]
+   %USERPROFILE%\.codex\mcp\ceratops_mcp_server_manager\bin\ceratops_mcp_server_manager.cmd versions [mcp-server-name]
    ```
 
    Omitting the MCP server name inspects the deployment manager.

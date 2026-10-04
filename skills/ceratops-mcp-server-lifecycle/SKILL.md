@@ -34,7 +34,7 @@ through one manager.
 
 - Keep editable source in its owning repository and each MCP server's
   deployments and state in
-  `C:\AI-Agents-MCP-Servers\<mcp-server-name>`. Use validated global Python
+  `%USERPROFILE%\.codex\mcp\<mcp-server-name>`. Use validated global Python
   and uv with dependencies isolated in each installed version's environment.
 - Call deployable processes MCP servers and reserve MCP tool for callable
   functions that a server exposes.

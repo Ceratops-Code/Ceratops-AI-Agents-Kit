@@ -608,7 +608,6 @@ class GHContractStateEngineTests(unittest.TestCase):
                         f'PROGRAMS_X86 = "C:{slash}Program Files (x86){slash}Tool"',
                         f'WINDOWS = "C:{slash}WINDOWS{slash}System32{slash}tool.exe"',
                         f'PROJECTS = "c:{escaped_slash}CODEXPROJECTS{escaped_slash}repo"',
-                        f'MCP_SERVERS = "C:{slash}AI-Agents-MCP-Servers{slash}server"',
                         f'CODEX = "C:{slash}Users{slash}runner{slash}.codex{slash}skills"',
                     ]
                 ),
@@ -620,6 +619,7 @@ class GHContractStateEngineTests(unittest.TestCase):
                     [
                         f'NEAR_PREFIX = "C:{slash}ReposBackup{slash}project"',
                         f'OTHER_DRIVE_ROOT = "D:{slash}work{slash}project"',
+                        f'OLD_MCP_ROOT = "C:{slash}AI-Agents-MCP-Servers{slash}server"',
                     ]
                 ),
                 encoding="utf-8",

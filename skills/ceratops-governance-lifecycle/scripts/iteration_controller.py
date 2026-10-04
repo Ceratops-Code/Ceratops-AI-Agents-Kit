@@ -239,7 +239,7 @@ def record_iteration(
     try:
         accept_candidate(
             candidate, validation_evidence,
-            expected_context=state["validation_context"]["value"], fix=True,
+            expected_context=state["validation_context"]["value"], fix=False,
         )
     except RuleCandidateValidationError as error:
         raise ValueError(str(error)) from error

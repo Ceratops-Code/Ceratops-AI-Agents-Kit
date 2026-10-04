@@ -27,7 +27,7 @@ or another governing contract.
 
 The independent [MCP server deployment manager](mcp-servers/ceratops_mcp_server_manager/README.md)
 keeps its editable source under `mcp-servers/`. Every deployed MCP server owns
-`C:\AI-Agents-MCP-Servers\<mcp-server-name>` with its packages, environments,
+`%USERPROFILE%\.codex\mcp\<mcp-server-name>` with its packages, environments,
 and state; Python and uv are validated global prerequisites. Its CLI and local
 MCP adapters share
 one engine. The MCP server lifecycle skill contains instructions only; the existing

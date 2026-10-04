@@ -12,12 +12,12 @@ Install the first manager using the same engine as its CLI and MCP interfaces.
    This validates existing global CPython 3.14 and uv 0.12.10 or newer 0.12.x,
    provisions locked libraries in disposable storage, packages the first release
    using the manager's own code, and validates its isolated installation inside
-   `C:\AI-Agents-MCP-Servers\ceratops_mcp_server_manager`. It installs no
+   `%USERPROFILE%\.codex\mcp\ceratops_mcp_server_manager`. It installs no
    Python or uv copy and changes no global Python libraries.
 2. Inspect the manager with its CLI:
 
    ```powershell
-   C:\AI-Agents-MCP-Servers\ceratops_mcp_server_manager\bin\ceratops_mcp_server_manager.cmd versions
+   %USERPROFILE%\.codex\mcp\ceratops_mcp_server_manager\bin\ceratops_mcp_server_manager.cmd versions
    ```
 
 3. When registration is requested, register only this stdio service in the
