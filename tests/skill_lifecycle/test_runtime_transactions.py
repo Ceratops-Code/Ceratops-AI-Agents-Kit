@@ -3,6 +3,7 @@ from __future__ import annotations
 import errno
 import json
 import pathlib
+import runpy
 import shutil
 import subprocess
 import sys
@@ -128,6 +129,75 @@ def test_installed_repo_lifecycle_helpers_use_regular_runtime(
     assert (
         install_root / "ceratops-skill-lifecycle" / "scripts" / "manage_checkpoints.py"
     ).is_file()
+
+
+@pytest.mark.parametrize("implementation", ["bootstrap", "managed"])
+def test_runtime_pruning_preserves_every_live_version_class(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    implementation: str,
+) -> None:
+    if implementation == "bootstrap":
+        runtime = runpy.run_path(str(ROOT / "scripts" / "deploy-skills.py"))
+        interpreter_name = "runtime_interpreter_path"
+        process_probe = "running_process_paths"
+    else:
+        runtime = load_runtime_builder()
+        interpreter_name = "_runtime_interpreter_path"
+        process_probe = "_running_process_paths"
+
+    install_root = tmp_path / "installed"
+    versions = tmp_path / "runtime" / "versions"
+    names = {
+        "selected": "a" * 24,
+        "predecessor_one": "b" * 24,
+        "predecessor_two": "c" * 24,
+        "manifest": "d" * 24,
+        "running": "e" * 24,
+        "stale": "f" * 24,
+    }
+    interpreter_path = runtime[interpreter_name]
+    interpreters: dict[str, pathlib.Path] = {}
+    for role, name in names.items():
+        interpreter = interpreter_path(versions / name)
+        interpreter.parent.mkdir(parents=True)
+        interpreter.write_bytes(b"")
+        interpreters[role] = interpreter
+
+    (versions.parent / "current.json").write_text(
+        json.dumps(
+            {
+                "version": names["selected"],
+                "predecessors": [
+                    names["predecessor_one"],
+                    names["predecessor_two"],
+                ],
+            }
+        ),
+        encoding="utf-8",
+        newline="\n",
+    )
+    consumer = install_root / "consumer"
+    consumer.mkdir(parents=True)
+    (consumer / RUNTIME_MANIFEST).write_text(
+        json.dumps({"python_runtime": str(interpreters["manifest"])}),
+        encoding="utf-8",
+        newline="\n",
+    )
+    monkeypatch.setitem(
+        runtime["prune_python_runtime_versions"].__globals__,
+        process_probe,
+        lambda: str(interpreters["running"]),
+    )
+
+    runtime["prune_python_runtime_versions"](
+        install_root,
+        interpreters["selected"],
+    )
+
+    assert {
+        path.name for path in versions.iterdir()
+    } == set(names.values()) - {names["stale"]}
 
 
 def test_full_install_removes_only_same_source_stale_skills(tmp_path: pathlib.Path) -> None:
