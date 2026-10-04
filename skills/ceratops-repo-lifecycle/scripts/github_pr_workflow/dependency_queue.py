@@ -15,12 +15,14 @@ from typing import Any
 from .dependency_common import (
     WorkflowError,
     as_object,
+    blocker_scope,
     compact_error,
     default_workspace_root,
     emit_result,
     parse_checkout_overrides,
     refresh_snapshot,
     resolve_checkout,
+    scoped_blocker,
     utc_now,
     write_json,
 )
@@ -190,14 +192,36 @@ def preflight(args: argparse.Namespace) -> int:
     live_details, rebase_blockers = wait_for_dependabot_rebases(live_details)
     blockers.extend(rebase_blockers)
     if snapshot_blocked:
-        blockers.extend(
-            {
-                "check": str(item.get("check") or "snapshot"),
-                "message": str(item.get("actual") or item.get("message") or compact_error(snapshot_process)),
-            }
-            for item in snapshot.get("blockers", [])
-            if isinstance(item, dict)
-        )
+        snapshot_blockers = []
+        for item in snapshot.get("blockers", []):
+            if not isinstance(item, dict):
+                continue
+            blocker = dict(item)
+            blocker["check"] = str(item.get("check") or "snapshot")
+            blocker["message"] = str(
+                item.get("actual")
+                or item.get("message")
+                or (
+                    compact_error(snapshot_process)
+                    if snapshot_process.returncode != 0
+                    else "snapshot result is blocked"
+                )
+            )
+            snapshot_blockers.append(scoped_blocker(blocker))
+        if not snapshot_blockers:
+            snapshot_blockers.append(
+                scoped_blocker(
+                    {
+                        "check": "snapshot",
+                        "message": (
+                            compact_error(snapshot_process)
+                            if snapshot_process.returncode != 0
+                            else "snapshot result is blocked"
+                        ),
+                    }
+                )
+            )
+        blockers.extend(snapshot_blockers)
 
     alerts_by_repo: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for alert in snapshot.get("open_dependabot_alerts", []):
@@ -418,7 +442,8 @@ def preflight(args: argparse.Namespace) -> int:
                     },
                 }
             )
-        blockers.extend(repo_blockers)
+        scoped_repo_blockers = [scoped_blocker(item) for item in repo_blockers]
+        blockers.extend(scoped_repo_blockers)
         repositories.append(
             {
                 "repo": full_name,
@@ -428,10 +453,11 @@ def preflight(args: argparse.Namespace) -> int:
                 "alerts": enriched_alerts,
                 "pull_requests": enriched_prs,
                 "exact_ci": ci,
-                "blockers": repo_blockers,
+                "blockers": scoped_repo_blockers,
             }
         )
 
+    blockers = [scoped_blocker(item) for item in blockers]
     summary = {
         **{
             key: snapshot.get("summary", {}).get(key)
@@ -446,6 +472,12 @@ def preflight(args: argparse.Namespace) -> int:
             )
         },
         "preflight_blockers": len(blockers),
+        "global_preflight_blockers": sum(
+            blocker_scope(item) == "global" for item in blockers
+        ),
+        "scoped_preflight_blockers": sum(
+            blocker_scope(item) != "global" for item in blockers
+        ),
     }
     queue_present = bool(snapshot.get("outcome", {}).get("queue_present"))
     blocked = snapshot_blocked or bool(blockers)

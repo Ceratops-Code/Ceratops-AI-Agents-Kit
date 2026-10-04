@@ -96,6 +96,63 @@
     "artifact_type_system": { "$ref": "#/$defs/artifactTypeSystem" }
   },
   "$defs": {
+    "artifactIdentity": {
+      "description": "External-artifact publication identity consumed by deterministic validation. ND.artifact.identity-contract-fit reviews whether the declared text matches the real artifact.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifact_type",
+        "registry",
+        "package_or_image_name",
+        "version_source",
+        "release_policy",
+        "tag_style",
+        "changelog_source",
+        "post_publish_consumer_check"
+      ],
+      "properties": {
+        "artifact_type": {
+          "description": "Artifact type declared by the lifecycle artifact type system.",
+          "type": "string",
+          "minLength": 1
+        },
+        "registry": {
+          "description": "Registry host or lifecycle target such as github_release or pages.",
+          "type": "string",
+          "minLength": 1
+        },
+        "package_or_image_name": {
+          "description": "External package, image, release asset, module, chart, or site name.",
+          "type": "string",
+          "minLength": 1
+        },
+        "version_source": {
+          "description": "Manifest, Git tag, release tag, package metadata, or another explicitly approved version source.",
+          "type": "string",
+          "minLength": 1
+        },
+        "release_policy": {
+          "description": "Publication policy such as manual, tag-driven, workflow-driven, no-artifact, or another explicitly approved value.",
+          "type": "string",
+          "minLength": 1
+        },
+        "tag_style": {
+          "description": "Tag format such as semver, v-prefix-semver, calendar, SHA, digest, or another explicitly approved value.",
+          "type": "string",
+          "minLength": 1
+        },
+        "changelog_source": {
+          "description": "CHANGELOG.md, GitHub release notes, package metadata, or another explicitly approved changelog source.",
+          "type": "string",
+          "minLength": 1
+        },
+        "post_publish_consumer_check": {
+          "description": "Command or endpoint used to verify consumers can fetch and use the published artifact.",
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
     "parameter": {
       "type": "object",
       "additionalProperties": false,

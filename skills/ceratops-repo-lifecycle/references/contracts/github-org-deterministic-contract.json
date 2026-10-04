@@ -360,15 +360,11 @@
       "endpoint": "/orgs/${org_login}",
       "method": "GET",
       "desired": {
-        "advanced_security_enabled_for_new_repositories": false,
         "billing_email": "${billing_email}",
         "blog": null,
         "company": null,
         "default_repository_branch": "main",
         "default_repository_permission": "read",
-        "dependabot_alerts_enabled_for_new_repositories": true,
-        "dependabot_security_updates_enabled_for_new_repositories": true,
-        "dependency_graph_enabled_for_new_repositories": true,
         "deploy_keys_enabled_for_repositories": false,
         "description": "",
         "display_commenter_full_name_setting_enabled": false,
@@ -376,7 +372,6 @@
         "has_organization_projects": true,
         "has_repository_projects": true,
         "location": null,
-        "members_allowed_repository_creation_type": "all",
         "members_can_change_repo_visibility": true,
         "members_can_create_internal_repositories": false,
         "members_can_create_pages": true,
@@ -393,10 +388,8 @@
         "members_can_view_dependency_insights": true,
         "name": null,
         "readers_can_create_discussions": true,
-        "secret_scanning_enabled_for_new_repositories": true,
         "secret_scanning_push_protection_custom_link": null,
         "secret_scanning_push_protection_custom_link_enabled": null,
-        "secret_scanning_push_protection_enabled_for_new_repositories": true,
         "secret_scanning_validity_checks_enabled": false,
         "twitter_username": null,
         "two_factor_requirement_enabled": false,
@@ -784,11 +777,34 @@
       "id": "code_security.configuration_defaults",
       "endpoint": "/orgs/${org_login}/code-security/configurations/defaults",
       "method": "GET",
-      "desired": [],
+      "desired": [
+        {
+          "default_for_new_repos": "public",
+          "configuration": {
+            "advanced_security": "enabled",
+            "dependency_graph": "enabled",
+            "dependabot_alerts": "enabled",
+            "dependabot_security_updates": "enabled",
+            "secret_scanning": "enabled",
+            "secret_scanning_push_protection": "enabled"
+          }
+        },
+        {
+          "default_for_new_repos": "private_and_internal",
+          "configuration": {
+            "advanced_security": "disabled",
+            "dependency_graph": "enabled",
+            "dependabot_alerts": "enabled",
+            "dependabot_security_updates": "enabled",
+            "secret_scanning": "disabled",
+            "secret_scanning_push_protection": "disabled"
+          }
+        }
+      ],
       "assertions": [
         {
           "path": "/api/code_security.configuration_defaults/data",
-          "operator": "equal",
+          "operator": "subset_equal",
           "desired_path": "/desired"
         }
       ]

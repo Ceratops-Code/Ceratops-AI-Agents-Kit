@@ -10,7 +10,7 @@ opening proposal artifacts, writes detailed context evidence, records
 exact task-temp cleanup ownership, and opens iteration one through
 ``iteration_controller.py``. ``advance`` delegates the controller's validated
 atomic submit-and-open operation. After a completed run, ``finalize`` preserves
-the exact champion at the declared protected output, preflights every recorded
+any accepted champion, creates none for all-rejected runs, preflights every recorded
 disposable artifact, delegates controller cleanup, and removes the remaining
 owned request, inputs, and evidence. User-owned or undeclared inputs are
 preserved. This helper never edits a governed source or makes semantic
@@ -1157,17 +1157,30 @@ def command_finalize(state: pathlib.Path) -> str:
     assert isinstance(iterations, pathlib.Path)
     _preflight_iteration_artifacts(controller_state, iterations)
     champion = controller_state.get("champion")
-    if not isinstance(champion, Mapping):
-        raise ProposalWorkflowError("completed proposal lacks a champion")
-    champion_path_value = champion.get("candidate")
-    champion_hash = champion.get("candidate_sha256")
-    if not isinstance(champion_path_value, str) or not _valid_sha256(champion_hash):
-        raise ProposalWorkflowError("controller champion record is invalid")
-    champion_path = _absolute(pathlib.Path(champion_path_value))
-    if champion_path.parent != iterations or not champion_path.is_file():
-        raise ProposalWorkflowError("controller champion artifact is unavailable")
-    if _file_hash(champion_path) != champion_hash:
-        raise ProposalWorkflowError("controller champion changed after submission")
+    champion_path: pathlib.Path | None = None
+    champion_hash = None
+    if champion is None:
+        # Rejection is a valid completed controller outcome, not an accepted
+        # artifact. Require its recorded decisions before allowing cleanup.
+        records = controller_state.get("records")
+        if not isinstance(records, list) or not records or any(
+            record.get("outcome") != "no-improvement"
+            or record.get("regressions") not in {"passed", "failed"}
+            for record in records
+        ):
+            raise ProposalWorkflowError("missing champion for accepted or invalid records")
+    else:
+        if not isinstance(champion, Mapping):
+            raise ProposalWorkflowError("controller champion record is invalid")
+        champion_path_value = champion.get("candidate")
+        champion_hash = champion.get("candidate_sha256")
+        if not isinstance(champion_path_value, str) or not _valid_sha256(champion_hash):
+            raise ProposalWorkflowError("controller champion record is invalid")
+        champion_path = _absolute(pathlib.Path(champion_path_value))
+        if champion_path.parent != iterations or not champion_path.is_file():
+            raise ProposalWorkflowError("controller champion artifact is unavailable")
+        if _file_hash(champion_path) != champion_hash:
+            raise ProposalWorkflowError("controller champion changed after submission")
     champion_output = cleanup["champion_output"]
     assert isinstance(champion_output, pathlib.Path)
     for artifact in artifacts:
@@ -1181,11 +1194,12 @@ def command_finalize(state: pathlib.Path) -> str:
             raise ProposalWorkflowError(f"owned {role} is not a regular file: {path}")
         if _file_hash(path) != artifact["sha256"]:
             raise ProposalWorkflowError(f"owned {role} changed after prepare")
-    if champion_output.exists():
-        if not champion_output.is_file() or _file_hash(champion_output) != champion_hash:
-            raise ProposalWorkflowError("champion_output already contains other content")
-    else:
-        _write_bytes_atomic(champion_output, champion_path.read_bytes())
+    if champion_path is not None:
+        if champion_output.exists():
+            if not champion_output.is_file() or _file_hash(champion_output) != champion_hash:
+                raise ProposalWorkflowError("champion_output already contains other content")
+        else:
+            _write_bytes_atomic(champion_output, champion_path.read_bytes())
     for artifact in artifacts:
         if artifact["role"] in {"state", "iterations"}:
             continue

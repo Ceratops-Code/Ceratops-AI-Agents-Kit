@@ -1,0 +1,6 @@
+interface:
+  display_name: "Ceratops MCP Server Lifecycle"
+  short_description: "Create MCP servers, install releases, and inspect versions"
+  icon_small: "./assets/ceratops-logo-500.png"
+  icon_large: "./assets/ceratops-logo-500.png"
+  default_prompt: "Use $ceratops-mcp-server-lifecycle and select create, bootstrap, install, update, or versions."

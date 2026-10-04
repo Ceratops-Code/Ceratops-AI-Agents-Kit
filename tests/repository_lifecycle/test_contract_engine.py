@@ -16,7 +16,7 @@ SCRIPTS = ROOT / "skills" / "ceratops-repo-lifecycle" / "scripts"
 REFERENCES = SCRIPTS.parent / "references" / "contracts"
 sys.path.insert(0, str(SCRIPTS))
 
-from github_contract_engine import (  # noqa: E402
+from github_contract_engine import (
     audit_snapshot,
     codeql_disposition,
     collect_non_deterministic_evidence,
@@ -27,55 +27,55 @@ from github_contract_engine import (  # noqa: E402
     repository_validator,
     schema_validation,
 )
-from github_contract_engine.collect_observed_states import (  # noqa: E402
+from github_contract_engine.collect_observed_states import (
     _artifact_categories,
     _artifact_state,
     _fetch_all,
     _registry_confirmed_artifact_types,
     state_producer,
 )
-from github_contract_engine.collectors import registries  # noqa: E402
-from github_contract_engine.collectors.local_repository import (  # noqa: E402
+from github_contract_engine.collectors import registries
+from github_contract_engine.collectors.local_repository import (
     _manifest_facts,
     classify_repository,
     collect_local_repository,
 )
-from github_contract_engine.collectors.repository import (  # noqa: E402
+from github_contract_engine.collectors.repository import (
     _latest_completed_runs_per_workflow,
     _latest_stable_release_assets_count,
     stale_branch_candidates,
     stale_pull_request_candidates,
     stale_release_candidates,
 )
-from github_contract_engine.compare_states import (  # noqa: E402
+from github_contract_engine.compare_states import (
     OPERATORS,
     compare_states,
     condition_matches,
     pointer_get,
 )
-from github_contract_engine.compose_desired_state import (  # noqa: E402
+from github_contract_engine.compose_desired_state import (
     _request_plan,
     compose_desired_state,
     parameter_definitions,
     repo_subset_ids,
     validate_contract_identity,
 )
-from github_contract_engine.format_report import (  # noqa: E402
+from github_contract_engine.format_report import (
     build_report,
     build_summary_report,
     sanitize_for_output,
     write_json,
 )
-from github_contract_engine.github_api import ApiResult, load_json  # noqa: E402
-from github_contract_engine.operations import (  # noqa: E402
+from github_contract_engine.github_api import ApiResult, load_json
+from github_contract_engine.operations import (
     TOP_LEVEL_COMMANDS,
     VALIDATION_TARGETS,
 )
-from github_contract_engine.remediations import HANDLERS  # noqa: E402
-from github_pr_workflow import cli as pr_cli  # noqa: E402
-from github_pr_workflow import codex_review as pr_codex_review  # noqa: E402
-from github_pr_workflow import merge as pr_merge  # noqa: E402
-from github_pr_workflow import readiness as pr_validator  # noqa: E402
+from github_contract_engine.remediations import HANDLERS
+from github_pr_workflow import cli as pr_cli
+from github_pr_workflow import codex_review as pr_codex_review
+from github_pr_workflow import merge as pr_merge
+from github_pr_workflow import readiness as pr_validator
 
 
 class GHContractStateEngineTests(unittest.TestCase):
@@ -95,9 +95,7 @@ class GHContractStateEngineTests(unittest.TestCase):
 
     def test_levels_use_explicit_agent_review_name(self):
         selected_levels = levels.parse_levels("ERROR,WARN,NEEDS_AI_AGENT_REVIEW")
-        self.assertEqual(
-            selected_levels, ["ERROR", "WARN", "NEEDS_AI_AGENT_REVIEW"]
-        )
+        self.assertEqual(selected_levels, ["ERROR", "WARN", "NEEDS_AI_AGENT_REVIEW"])
         with self.assertRaises(ValueError):
             levels.parse_levels("NEEDS_" + "REVIEW")
 
@@ -106,9 +104,7 @@ class GHContractStateEngineTests(unittest.TestCase):
         self.assertEqual(
             snapshot["schema"], "ceratops-github-contract-audit-snapshot.v1"
         )
-        self.assertEqual(
-            snapshot["commands"]["top_level"], list(TOP_LEVEL_COMMANDS)
-        )
+        self.assertEqual(snapshot["commands"]["top_level"], list(TOP_LEVEL_COMMANDS))
         self.assertEqual(
             snapshot["commands"]["validation_targets"],
             list(VALIDATION_TARGETS),
@@ -138,11 +134,11 @@ class GHContractStateEngineTests(unittest.TestCase):
 
     def test_audit_snapshot_reports_a_compact_incompatible_root_blocker(self):
         stream = io.StringIO()
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            with contextlib.redirect_stdout(stream):
-                status = audit_snapshot.main(
-                    ["--repo-root", temporary_directory]
-                )
+        with (
+            tempfile.TemporaryDirectory() as temporary_directory,
+            contextlib.redirect_stdout(stream),
+        ):
+            status = audit_snapshot.main(["--repo-root", temporary_directory])
         self.assertEqual(status, 1)
         self.assertEqual(
             json.loads(stream.getvalue()),
@@ -163,6 +159,13 @@ class GHContractStateEngineTests(unittest.TestCase):
             slash = chr(92)
             fixture.write_text(
                 f'USES_RE = re.compile(r"^{slash}s*uses:{slash}s*")\n',
+                encoding="utf-8",
+            )
+            local = collect_local_repository(temporary_directory, [rule])
+            self.assertEqual(local["scans"][rule["id"]]["matches"], [])
+
+            fixture.write_text(
+                f'TIMESTAMP_RE = r"^{slash}d{{4}}-{slash}d{slash}dT{slash}d{slash}d:{slash}d{slash}d$"\n',
                 encoding="utf-8",
             )
             local = collect_local_repository(temporary_directory, [rule])
@@ -196,16 +199,20 @@ class GHContractStateEngineTests(unittest.TestCase):
             contract.write_text(
                 json.dumps(
                     {
-                        "version": 2,
+                        "version": 4,
                         "kind": "ceratops-sdlc",
                         "repository": {
-                            "validate": {
-                                "invalid": {
-                                    "steps": [
-                                        {"id": "invalid", "run": "python -V"}
-                                    ]
-                                }
-                            }
+                            "capabilities": {},
+                            "actions": {
+                                "validate": {
+                                    "requires": {"capabilities": []},
+                                    "steps": [{"run": "python -V"}],
+                                },
+                                "test": {
+                                    "requires": {"capabilities": []},
+                                    "no-op": "No tests in this fixture.",
+                                },
+                            },
                         },
                     }
                 ),
@@ -225,9 +232,18 @@ class GHContractStateEngineTests(unittest.TestCase):
             contract.write_text(
                 json.dumps(
                     {
-                        "version": 2,
+                        "version": 4,
                         "kind": "ceratops-sdlc",
-                        "repository": {"validate": {}},
+                        "repository": {
+                            "capabilities": {},
+                            "actions": {
+                                action: {
+                                    "requires": {"capabilities": []},
+                                    "no-op": f"No {action} in this fixture.",
+                                }
+                                for action in ("validate", "test")
+                            },
+                        },
                     }
                 ),
                 encoding="utf-8",
@@ -265,8 +281,7 @@ class GHContractStateEngineTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (root / "README.md").write_text(
-                "# Compatible\n\n## Skills\n\n"
-                "| Skill | Purpose |\n| --- | --- |\n",
+                "# Compatible\n\n## Skills\n\n| Skill | Purpose |\n| --- | --- |\n",
                 encoding="utf-8",
             )
             validator = root / "scripts" / "validate-repository.py"
@@ -296,7 +311,9 @@ class GHContractStateEngineTests(unittest.TestCase):
             )
             self.assertTrue(valid["compatibility"]["applicable"])
             self.assertFalse(valid["compatibility"]["valid"])
-            self.assertIn("missing scripts/pyproject.toml", valid["compatibility"]["errors"])
+            self.assertIn(
+                "missing scripts/pyproject.toml", valid["compatibility"]["errors"]
+            )
 
             value = json.loads(manifest.read_text(encoding="utf-8"))
             value["runtime_source_id"] = ""
@@ -310,67 +327,96 @@ class GHContractStateEngineTests(unittest.TestCase):
                 )
             )
 
-    def test_local_health_runs_repository_validator_once(self):
-        with tempfile.TemporaryDirectory() as repository_directory:
-            with tempfile.TemporaryDirectory() as evidence_directory:
-                root = pathlib.Path(repository_directory)
-                evidence = pathlib.Path(evidence_directory) / "health.log"
-                validator = root / "scripts" / "validate-repository.py"
-                validator.parent.mkdir()
-                validator.write_text(
-                    "import argparse, pathlib\n"
-                    "parser = argparse.ArgumentParser()\n"
-                    "parser.add_argument('--evidence-file', required=True)\n"
-                    "args = parser.parse_args()\n"
-                    "path = pathlib.Path(args.evidence_file)\n"
-                    "path.write_text('once', encoding='utf-8')\n"
-                    "print('OK')\n",
-                    encoding="utf-8",
-                )
-                workflow = root / ".github" / "workflows" / "validate.yml"
-                workflow.parent.mkdir(parents=True)
-                workflow.write_text(
-                    "jobs:\n"
-                    "  validate:\n"
-                    "    steps:\n"
-                    "      - run: python scripts/validate-repository.py "
-                    "--evidence-file evidence.log\n",
-                    encoding="utf-8",
-                )
+    def test_local_health_reports_validation_readiness_without_running_checks(self):
+        with (
+            tempfile.TemporaryDirectory() as repository_directory,
+            tempfile.TemporaryDirectory() as evidence_directory,
+        ):
+            root = pathlib.Path(repository_directory)
+            evidence = pathlib.Path(evidence_directory) / "health.log"
+            validator = root / "scripts" / "validate-repository.py"
+            validator.parent.mkdir()
+            validator.write_text(
+                "raise SystemExit('health must not run this validator')\n",
+                encoding="utf-8",
+            )
+            workflow = root / ".github" / "workflows" / "validate.yml"
+            workflow.parent.mkdir(parents=True)
+            workflow.write_text(
+                "jobs:\n"
+                "  validate:\n"
+                "    steps:\n"
+                "      - run: python scripts/validate-repository.py "
+                "--evidence-file evidence.log\n",
+                encoding="utf-8",
+            )
+            contract = root / "sdlc" / "sdlc.yml"
+            contract.parent.mkdir()
+            contract.write_text(
+                json.dumps(
+                    {
+                        "version": 4,
+                        "kind": "ceratops-sdlc",
+                        "repository": {
+                            "capabilities": {},
+                            "actions": {
+                                action: {
+                                    "requires": {"capabilities": []},
+                                    "no-op": f"No {action} in this fixture.",
+                                }
+                                for action in ("validate", "test")
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
 
+            real_run = subprocess.run
+
+            def run_git_only(*args, **kwargs):
+                self.assertEqual(args[0][0], "git")
+                return real_run(*args, **kwargs)
+
+            with mock.patch(
+                "github_contract_engine.collectors.local_repository.subprocess.run",
+                side_effect=run_git_only,
+            ):
                 local = collect_local_repository(
                     repository_directory,
                     [{"id": "content.repository_validation"}],
                     repository_validation_evidence_file=str(evidence),
                 )
 
-                self.assertEqual(evidence.read_text(encoding="utf-8"), "once")
-                self.assertEqual(
-                    local["repository_validation"],
-                    {
-                        "applicable": True,
-                        "validator_present": True,
-                        "workflow_present": True,
-                        "valid": True,
-                        "errors": [],
-                    },
-                )
+            self.assertFalse(evidence.exists())
+            self.assertEqual(
+                local["repository_validation"],
+                {
+                    "applicable": True,
+                    "validator_present": True,
+                    "workflow_present": True,
+                    "valid": True,
+                    "errors": [],
+                },
+            )
 
     def test_local_health_reports_missing_repository_validation(self):
-        with tempfile.TemporaryDirectory() as repository_directory:
-            with tempfile.TemporaryDirectory() as evidence_directory:
-                evidence = pathlib.Path(evidence_directory) / "health.log"
-                local = collect_local_repository(
-                    repository_directory,
-                    [{"id": "content.repository_validation"}],
-                    repository_validation_evidence_file=str(evidence),
-                )
+        with (
+            tempfile.TemporaryDirectory() as repository_directory,
+            tempfile.TemporaryDirectory() as evidence_directory,
+        ):
+            evidence = pathlib.Path(evidence_directory) / "health.log"
+            local = collect_local_repository(
+                repository_directory,
+                [{"id": "content.repository_validation"}],
+                repository_validation_evidence_file=str(evidence),
+            )
 
-                facts = local["repository_validation"]
-                self.assertFalse(facts["valid"])
-                self.assertFalse(facts["validator_present"])
-                self.assertFalse(facts["workflow_present"])
-                self.assertFalse(evidence.exists())
+            facts = local["repository_validation"]
+            self.assertFalse(facts["valid"])
+            self.assertFalse(facts["validator_present"])
+            self.assertFalse(facts["workflow_present"])
+            self.assertFalse(evidence.exists())
 
     def test_local_health_external_only_runs_no_repository_validator(self):
         local = collect_local_repository(
@@ -401,18 +447,19 @@ class GHContractStateEngineTests(unittest.TestCase):
             code_contract=self.paths["code"],
             artifact_contract=self.paths["artifact"],
         )
-        with mock.patch.object(
-            collect_non_deterministic_evidence,
-            "compose_desired_state",
-            return_value={"rules": []},
-        ) as compose, mock.patch.object(
-            collect_non_deterministic_evidence,
-            "collect_observed_states",
-            return_value=[],
+        with (
+            mock.patch.object(
+                collect_non_deterministic_evidence,
+                "compose_desired_state",
+                return_value={"rules": []},
+            ) as compose,
+            mock.patch.object(
+                collect_non_deterministic_evidence,
+                "collect_observed_states",
+                return_value=[],
+            ),
         ):
-            collect_non_deterministic_evidence.repo_or_artifact_evidence(
-                args, "code"
-            )
+            collect_non_deterministic_evidence.repo_or_artifact_evidence(args, "code")
 
         selected = compose.call_args.args[2]
         self.assertEqual(selected["repo"], set())
@@ -423,7 +470,7 @@ class GHContractStateEngineTests(unittest.TestCase):
             - {"content.repository_validation"},
         )
 
-    def test_repository_release_contract_owns_artifact_identity(self):
+    def test_explicit_artifact_contract_owns_publication_identity(self):
         record = {
             "artifact_type": "installer_or_cli_binary",
             "registry": "github_release",
@@ -441,12 +488,18 @@ class GHContractStateEngineTests(unittest.TestCase):
             (sdlc_root / "sdlc.yml").write_text(
                 json.dumps(
                     {
-                        "version": 2,
+                        "version": 4,
                         "kind": "ceratops-sdlc",
-                        "deliverables": {"tools": {
-                            "artifacts": [record],
-                            "publish": {},
-                        }},
+                        "repository": {
+                            "capabilities": {},
+                            "actions": {
+                                action: {
+                                    "requires": {"capabilities": []},
+                                    "no-op": f"No {action} in this fixture.",
+                                }
+                                for action in ("validate", "test")
+                            },
+                        },
                     }
                 )
                 + "\n",
@@ -464,6 +517,13 @@ class GHContractStateEngineTests(unittest.TestCase):
                 args, self.contracts
             )
 
+            self.assertEqual(parameters["artifact_contracts"], [])
+            self.assertEqual(evidence_parameters["artifact_contracts"], [])
+            args.param = ["artifact_contracts=" + json.dumps([record])]
+            parameters = repository_validator._parameters(args, self.contracts)
+            evidence_parameters = collect_non_deterministic_evidence._repo_parameters(
+                args, self.contracts
+            )
             self.assertEqual(parameters["artifact_contracts"], [record])
             self.assertEqual(evidence_parameters["artifact_contracts"], [record])
             args.param = [
@@ -471,9 +531,6 @@ class GHContractStateEngineTests(unittest.TestCase):
                 + json.dumps([{**record, "artifact_id": "bootstrap-installer"}])
             ]
             with self.assertRaisesRegex(ValueError, "artifact_id"):
-                repository_validator._parameters(args, self.contracts)
-            args.param = ["artifact_contracts=" + json.dumps([record])]
-            with self.assertRaisesRegex(ValueError, "declared both"):
                 repository_validator._parameters(args, self.contracts)
 
     def test_organization_parameter_precedence_is_cli_only(self):
@@ -551,6 +608,7 @@ class GHContractStateEngineTests(unittest.TestCase):
                         f'PROGRAMS_X86 = "C:{slash}Program Files (x86){slash}Tool"',
                         f'WINDOWS = "C:{slash}WINDOWS{slash}System32{slash}tool.exe"',
                         f'PROJECTS = "c:{escaped_slash}CODEXPROJECTS{escaped_slash}repo"',
+                        f'MCP_SERVERS = "C:{slash}AI-Agents-MCP-Servers{slash}server"',
                         f'CODEX = "C:{slash}Users{slash}runner{slash}.codex{slash}skills"',
                     ]
                 ),
@@ -608,15 +666,9 @@ class GHContractStateEngineTests(unittest.TestCase):
             (root / "ignored" / "nested.txt").write_text(
                 f"D:{slash}ignored", encoding="utf-8"
             )
-            (root / "ignored.txt").write_text(
-                f"D:{slash}ignored", encoding="utf-8"
-            )
-            (root / "visible.txt").write_text(
-                f"D:{slash}visible", encoding="utf-8"
-            )
-            (root / "tracked.txt").write_text(
-                f"D:{slash}tracked", encoding="utf-8"
-            )
+            (root / "ignored.txt").write_text(f"D:{slash}ignored", encoding="utf-8")
+            (root / "visible.txt").write_text(f"D:{slash}visible", encoding="utf-8")
+            (root / "tracked.txt").write_text(f"D:{slash}tracked", encoding="utf-8")
             subprocess.run(
                 ["git", "-C", str(root), "add", "-f", "tracked.txt"],
                 check=True,
@@ -653,9 +705,7 @@ class GHContractStateEngineTests(unittest.TestCase):
             root = pathlib.Path(temporary_directory)
             slash = chr(92)
             (root / ".git").mkdir()
-            (root / "visible.txt").write_text(
-                f"D:{slash}visible", encoding="utf-8"
-            )
+            (root / "visible.txt").write_text(f"D:{slash}visible", encoding="utf-8")
             failed_inventory = subprocess.CompletedProcess(
                 args=["git", "ls-files"],
                 returncode=1,
@@ -711,9 +761,7 @@ class GHContractStateEngineTests(unittest.TestCase):
             ],
             "texts": {
                 ".github/workflows/publish.yml": (
-                    "uses: docker/build-push-action@sha\n"
-                    "with:\n"
-                    "  push: true\n"
+                    "uses: docker/build-push-action@sha\nwith:\n  push: true\n"
                 ),
                 "Dockerfile": "FROM node:24\n",
                 "package.json": json.dumps(
@@ -945,9 +993,7 @@ class GHContractStateEngineTests(unittest.TestCase):
             )
         )
 
-        org_contract = load_json(
-            REFERENCES / "github-org-deterministic-contract.json"
-        )
+        org_contract = load_json(REFERENCES / "github-org-deterministic-contract.json")
         unknown_api_check = json.loads(json.dumps(org_contract))
         unknown_api_check["checks"][0]["assertions"][0]["path"] = (
             "/api/not.a.declared.check/data"
@@ -1040,7 +1086,15 @@ class GHContractStateEngineTests(unittest.TestCase):
         for visibility, owner_plan, expected_call_count in cases:
             calls: list[str] = []
 
-            def fake_run_gh_api(method, endpoint, *, paginate=False, calls=calls, visibility=visibility, owner_plan=owner_plan):
+            def fake_run_gh_api(
+                method,
+                endpoint,
+                *,
+                paginate=False,
+                calls=calls,
+                visibility=visibility,
+                owner_plan=owner_plan,
+            ):
                 calls.append(endpoint)
                 if endpoint == "/repos/owner/repo":
                     return ApiResult(
@@ -1282,7 +1336,9 @@ class GHContractStateEngineTests(unittest.TestCase):
                 }
             },
         }
-        local = {"workflows": {"publish_detected": False, "attestation_detected": False}}
+        local = {
+            "workflows": {"publish_detected": False, "attestation_detected": False}
+        }
         artifact = _artifact_state({}, repository, local, {})
         states = {
             "artifact_type": repository["types"]["artifact_surface"],
@@ -1337,9 +1393,7 @@ class GHContractStateEngineTests(unittest.TestCase):
                 "artifact_type": "pypi_python_package",
                 "files": ["pyproject.toml"],
                 "texts": {
-                    "pyproject.toml": (
-                        '[project]\nname = "demo"\nversion = "1.0.0"\n'
-                    )
+                    "pyproject.toml": ('[project]\nname = "demo"\nversion = "1.0.0"\n')
                 },
                 "workflow": "uses: pypa/gh-action-pypi-publish@release/v1\n",
             },
@@ -1365,15 +1419,16 @@ class GHContractStateEngineTests(unittest.TestCase):
                     )
                 },
                 "workflow": (
-                    "registry-url: https://npm.pkg.github.com\n"
-                    "run: npm publish\n"
+                    "registry-url: https://npm.pkg.github.com\nrun: npm publish\n"
                 ),
             },
             {
                 "name": "maven",
                 "artifact_type": "maven_package",
                 "files": ["pom.xml"],
-                "texts": {"pom.xml": "<project><artifactId>demo</artifactId></project>"},
+                "texts": {
+                    "pom.xml": "<project><artifactId>demo</artifactId></project>"
+                },
                 "workflow": "run: ./mvnw deploy\n",
             },
             {
@@ -1570,18 +1625,10 @@ class GHContractStateEngineTests(unittest.TestCase):
         )
         maven_state = {"artifact_type": ["maven_package"]}
         gradle_state = {"artifact_type": ["gradle_maven_package"]}
-        self.assertTrue(
-            condition_matches(maven_rule["applies_when"], maven_state)
-        )
-        self.assertFalse(
-            condition_matches(maven_rule["applies_when"], gradle_state)
-        )
-        self.assertTrue(
-            condition_matches(gradle_rule["applies_when"], gradle_state)
-        )
-        self.assertFalse(
-            condition_matches(gradle_rule["applies_when"], maven_state)
-        )
+        self.assertTrue(condition_matches(maven_rule["applies_when"], maven_state))
+        self.assertFalse(condition_matches(maven_rule["applies_when"], gradle_state))
+        self.assertTrue(condition_matches(gradle_rule["applies_when"], gradle_state))
+        self.assertFalse(condition_matches(gradle_rule["applies_when"], maven_state))
 
         weak_workflows = [
             {
@@ -1589,9 +1636,7 @@ class GHContractStateEngineTests(unittest.TestCase):
                 "files": ["Dockerfile", ".github/workflows/publish.yml"],
                 "texts": {
                     "Dockerfile": "FROM alpine:3.22\n",
-                    ".github/workflows/publish.yml": (
-                        "uses: docker/login-action@v3\n"
-                    ),
+                    ".github/workflows/publish.yml": ("uses: docker/login-action@v3\n"),
                 },
                 "candidate": "docker_oci_image",
             },
@@ -1626,9 +1671,7 @@ class GHContractStateEngineTests(unittest.TestCase):
                     [],
                     self.contracts["artifact"]["artifact_type_system"],
                 )
-                self.assertEqual(
-                    weak["artifact_candidates"], [weak_case["candidate"]]
-                )
+                self.assertEqual(weak["artifact_candidates"], [weak_case["candidate"]])
                 self.assertEqual(weak["artifact_surface"], ["no_artifact"])
 
         registry_confirmed = _registry_confirmed_artifact_types(
@@ -1672,9 +1715,7 @@ class GHContractStateEngineTests(unittest.TestCase):
                 [{"assertions": [{"path": "/artifact/live_metadata/all_resolved"}]}],
             )
             self.assertEqual(
-                typed_registry["maven"]["packages"]["example:demo"][
-                    "artifact_types"
-                ],
+                typed_registry["maven"]["packages"]["example:demo"]["artifact_types"],
                 ["maven_package"],
             )
             self.assertEqual(
@@ -1753,9 +1794,7 @@ class GHContractStateEngineTests(unittest.TestCase):
                 self.assertEqual(metadata["ok"], expected)
                 self.assertTrue(metadata["query_succeeded"])
                 self.assertEqual(metadata["entry_present"], expected)
-                self.assertEqual(
-                    state["powershell_gallery"]["all_resolved"], expected
-                )
+                self.assertEqual(state["powershell_gallery"]["all_resolved"], expected)
                 artifact = _artifact_state(
                     parameters,
                     {"types": {"artifact_surface": ["powershell_gallery_module"]}},
@@ -1918,45 +1957,6 @@ class GHContractStateEngineTests(unittest.TestCase):
         self.assertNotIn("body", release)
         self.assertEqual(summary["findings"][0]["level"], "NEEDS_AI_AGENT_REVIEW")
 
-    def test_community_profile_requires_and_reports_one_hundred_percent(self):
-        rule = next(
-            item
-            for item in self.contracts["repo"]["checks"]
-            if item["id"] == "content.community_profile_public"
-        )
-        score_assertion = next(
-            item
-            for item in rule["assertions"]
-            if item["path"]
-            == "/repository/content/community_profile/health_percentage"
-        )
-        self.assertEqual(score_assertion["expected"], 100)
-
-        desired_state = {
-            "parameters": {"owner": "owner", "repo": "repo"},
-            "contract_paths": {},
-            "selected_ids": {"repo": [rule["id"]]},
-            "rules": [rule],
-        }
-        observed = {
-            "repository": {
-                "content": {"community_profile": {"health_percentage": 87}}
-            },
-            "local": {"available": True, "root": ".", "errors": []},
-        }
-        report = build_report(
-            desired_state,
-            observed,
-            {"findings": [], "approved_drift": []},
-        )
-        summary = build_summary_report(
-            report, ["ERROR", "WARN", "NEEDS_AI_AGENT_REVIEW"]
-        )
-        self.assertEqual(
-            summary["community_profile"],
-            {"health_percentage": 87, "target_percentage": 100},
-        )
-
     def test_machine_output_removes_sensitive_and_raw_collected_content(self):
         report = {
             "private": True,
@@ -2004,9 +2004,7 @@ class GHContractStateEngineTests(unittest.TestCase):
             safe["observed_states"]["api"]["repo.settings"]["raw_stdout"],
             "<omitted>",
         )
-        self.assertTrue(
-            safe["observed_states"]["api"]["secret_scanning"]["enabled"]
-        )
+        self.assertTrue(safe["observed_states"]["api"]["secret_scanning"]["enabled"])
         self.assertEqual(safe["findings"][0]["actual"], "<redacted>")
         stream = io.StringIO()
         with contextlib.redirect_stdout(stream):
@@ -2118,6 +2116,65 @@ class GHContractStateEngineTests(unittest.TestCase):
                 disposition="suppression",
             )
 
+    def test_codeql_capture_generates_sentinels_and_closes_evidence(self):
+        commit = "b" * 40
+        alert = {
+            "number": 42,
+            "tool": {"name": "CodeQL"},
+            "rule": {"id": "py/clear-text-logging-sensitive-data"},
+            "most_recent_instance": {
+                "state": "open",
+                "commit_sha": commit,
+                "location": {"path": "safe.py", "start_line": 10},
+            },
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            contract = root / "command.json"
+            evidence_path = root / "evidence.json"
+            command = [
+                sys.executable,
+                "-c",
+                (
+                    "import json,os,pathlib;"
+                    "assert os.environ['CODEQL_SENTINEL_TOKEN'].startswith('CODEQL_SENTINEL_');"
+                    "assert 'REAL_API_TOKEN' not in os.environ;"
+                    "path=pathlib.Path(os.environ['CODEQL_TRACE_OUTPUT']);"
+                    "path.write_text(json.dumps({'exercised':True,'trace':["
+                    "{'role':'source','path':'test_safe.py','line':5},"
+                    "{'role':'sink','path':'safe.py','line':10}]}),encoding='utf-8');"
+                    "print('token=<redacted>')"
+                ),
+            ]
+            contract.write_text(
+                json.dumps({"command": command, "sentinel_names": ["token"]}),
+                encoding="utf-8",
+            )
+            args = argparse.Namespace(
+                repo="owner/repo",
+                alert_number=42,
+                commit=commit,
+                action="dismissal",
+                test_command_json=contract,
+                evidence=evidence_path,
+            )
+            with (
+                mock.patch.object(codeql_disposition, "fetch_alert", return_value=alert),
+                mock.patch.object(codeql_disposition, "run_gh_api") as mutate,
+                mock.patch.dict(os.environ, {"REAL_API_TOKEN": "real-secret"}),
+            ):
+                result = codeql_disposition.capture(args)
+
+            self.assertEqual(result["status"], "evidence_captured")
+            self.assertFalse(result["mutated"])
+            mutate.assert_not_called()
+            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+            sentinel = evidence["execution"]["sentinel_credentials"]["token"]
+            self.assertTrue(sentinel.startswith("CODEQL_SENTINEL_TOKEN_"))
+            self.assertNotIn(sentinel, evidence["execution"]["captured_output"])
+            self.assertIn("<redacted>", evidence["execution"]["captured_output"])
+            self.assertEqual(evidence["source_to_sink"]["trace"][-1]["path"], "safe.py")
+
     def test_codeql_dismissal_requires_explicit_authorization_before_patch(self):
         commit = "a" * 40
         alert = {
@@ -2148,9 +2205,7 @@ class GHContractStateEngineTests(unittest.TestCase):
             "execution": {
                 "command": ["python", "-m", "unittest"],
                 "exit_code": 0,
-                "sentinel_credentials": {
-                    "password": "CODEQL_SENTINEL_password_value"
-                },
+                "sentinel_credentials": {"password": "CODEQL_SENTINEL_password_value"},
                 "captured_output": '{"password":"<redacted>"}',
             },
         }
@@ -2166,9 +2221,7 @@ class GHContractStateEngineTests(unittest.TestCase):
         )
         with (
             mock.patch.object(codeql_disposition, "load_json", return_value=evidence),
-            mock.patch.object(
-                codeql_disposition, "fetch_alert", return_value=alert
-            ),
+            mock.patch.object(codeql_disposition, "fetch_alert", return_value=alert),
             mock.patch.object(codeql_disposition, "run_gh_api") as patch_alert,
         ):
             pending = codeql_disposition.disposition(args)
@@ -2182,9 +2235,7 @@ class GHContractStateEngineTests(unittest.TestCase):
         updated["dismissed_reason"] = "false positive"
         with (
             mock.patch.object(codeql_disposition, "load_json", return_value=evidence),
-            mock.patch.object(
-                codeql_disposition, "fetch_alert", return_value=alert
-            ),
+            mock.patch.object(codeql_disposition, "fetch_alert", return_value=alert),
             mock.patch.object(
                 codeql_disposition,
                 "run_gh_api",
@@ -2504,9 +2555,7 @@ class GHContractStateEngineTests(unittest.TestCase):
                 [
                     {
                         **rule,
-                        "_mismatch_paths": [
-                            "/repository/repo/allow_merge_commit"
-                        ],
+                        "_mismatch_paths": ["/repository/repo/allow_merge_commit"],
                     }
                 ],
                 {"owner": "owner", "repo": "repo"},
@@ -2531,6 +2580,7 @@ class GHContractStateEngineTests(unittest.TestCase):
             cwd=SCRIPTS,
             text=True,
             capture_output=True,
+            check=False,
         )
         self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
         schema = load_json(
@@ -2596,43 +2646,37 @@ class GHContractStateEngineTests(unittest.TestCase):
             )
         )
         unused_parameter_metadata = json.loads(json.dumps(self.contracts["artifact"]))
-        unused_parameter_metadata["parameters"]["artifact_contracts"][
-            "item_shape"
-        ] = {}
+        unused_parameter_metadata["parameters"]["artifact_contracts"]["item_shape"] = {}
         unused_metadata_errors = schema_validation.validate_contract_document(
             unused_parameter_metadata,
             schema,
             document_name="unused-parameter-metadata.json",
             schema_name="github-lifecycle-deterministic-contract.schema.json",
         )
-        self.assertTrue(
-            any("item_shape" in error for error in unused_metadata_errors)
-        )
-        sdlc_schema = load_json(
+        self.assertTrue(any("item_shape" in error for error in unused_metadata_errors))
+        artifact_identity_schema = load_json(
             SCRIPTS.parent
             / "references"
             / "schemas"
-            / "sdlc.yml.schema.json"
+            / "github-lifecycle-deterministic-contract.schema.json"
         )
         self.assertIn(
             "ND.artifact.identity-contract-fit",
-            sdlc_schema["$defs"]["artifact"]["description"],
+            artifact_identity_schema["$defs"]["artifactIdentity"]["description"],
         )
-        undocumented_sdlc_schema = json.loads(json.dumps(sdlc_schema))
-        del undocumented_sdlc_schema["$defs"]["artifact"]["properties"][
+        undocumented_identity_schema = json.loads(json.dumps(artifact_identity_schema))
+        del undocumented_identity_schema["$defs"]["artifactIdentity"]["properties"][
             "artifact_type"
         ]["description"]
         self.assertTrue(
             any(
                 "need descriptions: artifact_type" in error
                 for error in consistency._validate_artifact_contract_schema(
-                    self.contracts["artifact"], undocumented_sdlc_schema
+                    self.contracts["artifact"], undocumented_identity_schema
                 )
             )
         )
-        drifted_artifact_contract = json.loads(
-            json.dumps(self.contracts["artifact"])
-        )
+        drifted_artifact_contract = json.loads(json.dumps(self.contracts["artifact"]))
         identity_check = next(
             check
             for check in drifted_artifact_contract["checks"]
@@ -2641,9 +2685,9 @@ class GHContractStateEngineTests(unittest.TestCase):
         identity_check["desired"]["required_per_artifact_fields"].pop()
         self.assertTrue(
             any(
-                "must match sdlc.yml schema" in error
+                "must match the artifact identity schema" in error
                 for error in consistency._validate_artifact_contract_schema(
-                    drifted_artifact_contract, sdlc_schema
+                    drifted_artifact_contract, artifact_identity_schema
                 )
             )
         )
@@ -2834,9 +2878,7 @@ class GHContractStateEngineTests(unittest.TestCase):
             )
 
         review = next(
-            finding
-            for finding in findings
-            if finding.check == "pr.review_decision"
+            finding for finding in findings if finding.check == "pr.review_decision"
         )
         self.assertEqual(review.level, "WARN")
         self.assertEqual(review.actual, "REVIEW_REQUIRED")
@@ -2986,9 +3028,7 @@ class GHContractStateEngineTests(unittest.TestCase):
                 2,
             )
             self.assertTrue(
-                pr_validator.review_thread_resolution_required(
-                    "release/1.x", cwd
-                )
+                pr_validator.review_thread_resolution_required("release/1.x", cwd)
             )
 
     def test_pr_rule_graphql_reports_no_policy_as_zero_requirements(self):
@@ -3062,9 +3102,7 @@ class GHContractStateEngineTests(unittest.TestCase):
             ),
             self.assertRaisesRegex(pr_validator.CommandError, "forbidden"),
         ):
-            pr_validator.applicable_branch_rule_parameters(
-                "main", pathlib.Path.cwd()
-            )
+            pr_validator.applicable_branch_rule_parameters("main", pathlib.Path.cwd())
 
     def test_pr_rule_graphql_fails_closed_when_pagination_does_not_advance(self):
         response = {
@@ -3104,9 +3142,7 @@ class GHContractStateEngineTests(unittest.TestCase):
                 pr_validator.CommandError, "pagination did not advance"
             ),
         ):
-            pr_validator.applicable_branch_rule_parameters(
-                "main", pathlib.Path.cwd()
-            )
+            pr_validator.applicable_branch_rule_parameters("main", pathlib.Path.cwd())
 
     def test_merge_helper_revalidates_after_review_wait(self):
         head = "a" * 40
@@ -3200,20 +3236,22 @@ class GHContractStateEngineTests(unittest.TestCase):
 
         self.assertEqual(result["head_oid"], head)
 
-        with mock.patch.object(
-            pr_merge.readiness,
-            "validate_readiness",
-            return_value=({"head_oid": head}, [pending]),
-        ):
-            with self.assertRaisesRegex(
+        with (
+            mock.patch.object(
+                pr_merge.readiness,
+                "validate_readiness",
+                return_value=({"head_oid": head}, [pending]),
+            ),
+            self.assertRaisesRegex(
                 pr_merge.WorkflowError,
                 "Status checks are still pending",
-            ):
-                pr_merge._validate_readiness(
-                    "17",
-                    ROOT,
-                    allow_admin_review_bypass=False,
-                )
+            ),
+        ):
+            pr_merge._validate_readiness(
+                "17",
+                ROOT,
+                allow_admin_review_bypass=False,
+            )
 
 
 if __name__ == "__main__":

@@ -1,29 +1,35 @@
 #!/usr/bin/env python3
-"""Run repository-owned Python tests in the scripts project's locked environment.
+"""Run repository Python tests, optionally retaining an exact reusable result.
 
-Run with ``uv run --locked scripts/run-tests.py`` to select the scripts project's
-environment. Edit this generated runner when the repository's suites need different
-behavior; compatibility never replaces an existing test implementation. Each run
-owns and removes its pytest temporary directories after the child exits, including
-when tests fail.
+Use the locked scripts environment: uv run --locked scripts/run-tests.py.
+The caller owns result identities, serialization, storage and retention. Without
+result arguments this remains a disposable test invocation. With them, the runner
+writes only the chosen final file, never a sibling staging file. The running
+record is completed only by its owning invocation; a fresh invocation never
+overwrites a valid failed or interrupted attempt. Pytest scratch is disposable.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import pathlib
 import shlex
 import subprocess
 import sys
 import tempfile
+from typing import Any
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 DEFAULT_TARGETS = __TEST_TARGETS__
+RESULT_SCHEMA = "ceratops-repository-check-result.v1"
+CONTRACT_SCHEMA = "ceratops-test-result-contract.v1"
+IDENTITY_FIELDS = ("result_id", "candidate_id", "check_id", "check_version")
 
 
 def without_basetemp(arguments: list[str]) -> list[str]:
-    """Remove outer-run locations before pytest validates every occurrence."""
+    """Remove inherited locations before pytest validates every occurrence."""
     options = iter(arguments)
     retained = []
     for option in options:
@@ -34,39 +40,165 @@ def without_basetemp(arguments: list[str]) -> list[str]:
     return retained
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("targets", nargs="*", help="Repository-relative test files or directories.")
-    parser.add_argument("--pytest-arg", action="append", default=[], help="One pytest argument; repeat using --pytest-arg=VALUE.")
-    args = parser.parse_args()
-    targets = args.targets or DEFAULT_TARGETS
-    for target in targets:
-        path = (ROOT / target.split("::", 1)[0]).resolve()
-        if not path.is_relative_to(ROOT) or not path.exists():
-            parser.error(f"test target must exist inside this repository: {target}")
+def canonical(value: Any) -> bytes:
+    return (json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
+
+
+def _object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON field")
+        value[key] = item
+    return value
+
+
+def _nonfinite(value: str) -> Any:
+    raise ValueError("nonfinite JSON value: " + value)
+
+
+def result_path(value: pathlib.Path) -> pathlib.Path:
+    """Reject redirected output; the caller already owns this exact final path."""
+    path = value.absolute()
+    for part in (path, *path.parents):
+        if part.is_symlink() or part.is_junction():
+            raise ValueError("result path must not contain a link")
+    if path.exists() and (not path.is_file() or path.stat().st_nlink != 1):
+        raise ValueError("result path must be a single regular file")
+    return path
+
+
+def read_result(path: pathlib.Path) -> tuple[bool, Any]:
+    """Only unparsable/unaccepted bytes can be recreated; I/O errors propagate."""
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return False, None
+    try:
+        value = json.loads(raw, object_pairs_hook=_object, parse_constant=_nonfinite)
+        canonical(value)
+    except (ValueError, UnicodeError, RecursionError):
+        return True, None
+    return True, value
+
+
+def write_result(path: pathlib.Path, value: dict[str, Any], *, exclusive: bool) -> None:
+    """Flush and verify the final file; no rename, duplicate or write-side cache."""
+    raw = canonical(value)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("xb" if exclusive else "wb") as stream:
+        stream.write(raw)
+        stream.flush()
+        os.fsync(stream.fileno())
+    if path.read_bytes() != raw or read_result(path)[1] != value:
+        raise ValueError("result changed during writing")
+
+
+def prepare_result(path: pathlib.Path, expected: dict[str, Any], *, repair_unaccepted: bool) -> bool:
+    """Return True for exact acceptance; otherwise claim an unaccepted output."""
+    exists, saved = read_result(path)
+    if saved is not None:
+        passed = {**expected, "status": "passed", "exit_code": 0}
+        if (saved == passed and type(saved.get("exit_code")) is int
+                and path.read_bytes() == canonical(passed)):
+            return True
+        if isinstance(saved, dict) and all(saved.get(key) == value for key, value in expected.items()):
+            raise ValueError("saved result is not acceptance; use a new result ID and path")
+        raise ValueError("result identity or content conflicts with the request")
+    if exists and not repair_unaccepted:
+        raise ValueError("malformed result requires caller confirmation that it was never accepted: --repair-unaccepted-result")
+    write_result(path, {**expected, "status": "running", "exit_code": None}, exclusive=not exists)
+    return False
+
+
+def execute_check(args: argparse.Namespace, targets: list[str], inherited: list[str]) -> int:
+    """Both the observable probe and pytest use the same result lifecycle."""
+    if args.probe_command is None:
+        for target in targets:
+            path = (ROOT / target.split("::", 1)[0]).resolve()
+            if not path.is_relative_to(ROOT) or not path.exists():
+                raise ValueError(f"test target must exist inside this repository: {target}")
     with tempfile.TemporaryDirectory(prefix="repository-tests-") as directory:
         temporary = pathlib.Path(directory)
         environment = os.environ.copy()
         environment["PYTHONPYCACHEPREFIX"] = str(temporary / "python-cache")
-        # Pytest validates inherited basetemp values even when later CLI values
-        # override them. An outer pytest location is an invalid ancestor here.
-        try:
-            environment["PYTEST_ADDOPTS"] = shlex.join(without_basetemp(
-                shlex.split(environment.get("PYTEST_ADDOPTS", ""))
-            ))
-        except ValueError as exc:
-            parser.error(f"invalid PYTEST_ADDOPTS: {exc}")
-        try:
-            result = subprocess.run(
-                [sys.executable, "-m", "pytest", *targets, *without_basetemp(args.pytest_arg),
-                 "--basetemp", str(temporary / "pytest"),
-                 "-o", "cache_dir=" + str(temporary / "pytest-cache")],
-                cwd=ROOT, env=environment, check=False,
-            )
-        except OSError as exc:
-            print(str(exc), file=sys.stderr)
-            return 1
+        environment["PYTEST_ADDOPTS"] = shlex.join(inherited)
+        command = args.probe_command or [
+            sys.executable, "-m", "pytest", *targets, *without_basetemp(args.pytest_arg),
+            "--basetemp", str(temporary / "pytest"),
+            "-o", "cache_dir=" + str(temporary / "pytest-cache"),
+        ]
+        result = subprocess.run(command, cwd=ROOT, env=environment, check=False)
     return result.returncode if result.returncode >= 0 else 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("targets", nargs="*", help="Repository-relative test files or directories.")
+    parser.add_argument("--pytest-arg", action="append", default=[], help="Repeat using --pytest-arg=VALUE.")
+    parser.add_argument("--result-file", type=pathlib.Path, help="Caller-owned final JSON file.")
+    for field in IDENTITY_FIELDS:
+        parser.add_argument("--" + field.replace("_", "-"))
+    parser.add_argument("--describe-test-results", action="store_true", help="Print the supported result contract.")
+    parser.add_argument("--repair-unaccepted-result", action="store_true", help="Caller confirms a malformed owned result was never accepted.")
+    parser.add_argument("--probe-command", help="JSON argv for a controlled compatibility probe; uses the real result writer.")
+    args = parser.parse_args(argv)
+    if args.describe_test_results:
+        print(json.dumps({"schema": CONTRACT_SCHEMA, "result_schema": RESULT_SCHEMA}, sort_keys=True))
+        return 0
+    supplied = [args.result_file is not None, *(getattr(args, field) is not None for field in IDENTITY_FIELDS)]
+    if any(supplied) and not all(supplied):
+        parser.error("result-file, result-id, candidate-id, check-id and check-version must be supplied together")
+    if args.repair_unaccepted_result and not all(supplied):
+        parser.error("repair-unaccepted-result requires result arguments")
+    if all(supplied) and any(not getattr(args, field).strip() for field in IDENTITY_FIELDS):
+        parser.error("result identities must not be empty")
+    path = None
+    expected: dict[str, Any] = {}
+    try:
+        if args.probe_command is not None:
+            if not all(supplied):
+                raise ValueError("probe-command requires result arguments")
+            args.probe_command = json.loads(args.probe_command)
+            if (not isinstance(args.probe_command, list) or not args.probe_command
+                    or any(not isinstance(item, str) or "\0" in item for item in args.probe_command)
+                    or not args.probe_command[0]):
+                raise ValueError("probe-command must be a nonempty JSON argv")
+        inherited = without_basetemp(shlex.split(os.environ.get("PYTEST_ADDOPTS", "")))
+        targets = args.targets or DEFAULT_TARGETS
+        expected = {
+            "schema": RESULT_SCHEMA,
+            **{field: getattr(args, field) for field in IDENTITY_FIELDS},
+            "invocation": {
+                "targets": [] if args.probe_command else targets,
+                "pytest_args": [] if args.probe_command else without_basetemp(args.pytest_arg),
+                "pytest_addopts": [] if args.probe_command else inherited,
+                "probe_command": args.probe_command,
+            },
+        }
+        if args.result_file is not None:
+            path = result_path(args.result_file)
+            if prepare_result(path, expected, repair_unaccepted=args.repair_unaccepted_result):
+                print("OK")
+                return 0
+        status = "failed"
+        try:
+            code = execute_check(args, targets, inherited)
+            status = "passed" if code == 0 else "failed"
+        except KeyboardInterrupt:
+            code, status = 130, "interrupted"
+        except (OSError, ValueError) as exc:
+            print(str(exc), file=sys.stderr)
+            code = 1
+        if path is not None:
+            running = {**expected, "status": "running", "exit_code": None}
+            if read_result(path)[1] != running:
+                raise ValueError("running result changed; refusing to overwrite it")
+            write_result(path, {**expected, "status": status, "exit_code": code}, exclusive=False)
+        return code
+    except (OSError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

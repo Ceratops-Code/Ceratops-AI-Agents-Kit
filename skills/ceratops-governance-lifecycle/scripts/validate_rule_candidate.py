@@ -53,10 +53,10 @@ from rule_graph import (
     validate_rule_stack,
 )
 
-CANDIDATE_SCHEMA = "ceratops-rule-candidate.v1"
+CANDIDATE_SCHEMA = "ceratops-rule-candidate.v2"
 CONTEXT_SCHEMA = "ceratops-rule-candidate-context.v1"
 EVIDENCE_SCHEMA = "ceratops-rule-candidate-validation.v1"
-CANDIDATE_FIELDS = {"schema", "rule_stack", "targets"}
+CANDIDATE_FIELDS = {"schema", "rule_stack", "targets", "history_operations", "acceptance"}
 CONTEXT_FIELDS = {"schema", "rule_stack", "targets"}
 TARGET_FIELDS = {
     "rules",
@@ -251,6 +251,8 @@ def build_candidate_template(context: Mapping[str, object]) -> dict[str, Any]:
         )
     return {
         "schema": CANDIDATE_SCHEMA,
+        "history_operations": [],
+        "acceptance": None,
         "rule_stack": list(stack),
         "targets": candidate_targets,
     }
@@ -1466,6 +1468,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--evidence", type=Path, required=True)
     parser.add_argument("--context", type=Path)
     parser.add_argument("--check-only", action="store_true")
+    parser.add_argument("--accept", action="store_true", help="Freeze complete outputs for application")
     return parser
 
 
@@ -1475,7 +1478,10 @@ def main() -> int:
     try:
         args = build_parser().parse_args()
         context = _load_context(args.context) if args.context else None
-        validate_rule_candidate(
+        from apply_rules_update import accept_candidate
+
+        operation = accept_candidate if args.accept else validate_rule_candidate
+        operation(
             args.candidate,
             args.evidence,
             expected_context=context,
@@ -1483,7 +1489,7 @@ def main() -> int:
         )
         print("OK")
         return 0
-    except RuleCandidateValidationError as exc:
+    except (RuleCandidateValidationError, OSError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 

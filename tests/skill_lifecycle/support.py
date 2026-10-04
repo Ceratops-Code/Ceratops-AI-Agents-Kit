@@ -25,7 +25,7 @@ FAST_CHANGE = LIFECYCLE_SOURCE / "scripts" / "fast-change.py"
 SKILL_UPDATE_WORKFLOW = LIFECYCLE_SOURCE / "scripts" / "skill-update-workflow.py"
 RUNTIME_MANIFEST = ".runtime-manifest.json"
 RUNTIME_MANIFEST_SCHEMA = "ceratops-runtime-skill.v3"
-INSTALLER_VERSION = 16
+INSTALLER_VERSION = 17
 
 
 def prepare_fast_change_repo(tmp_path: pathlib.Path) -> pathlib.Path:
@@ -324,24 +324,24 @@ def install_bundle_manifest(bundle_root: pathlib.Path) -> None:
         bundle_root / "skills" / "sections",
         dirs_exist_ok=True,
     )
-    installed_schema = (
+    installed_schemas = (
         bundle_root
         / "skills"
         / "ceratops-repo-lifecycle"
         / "references"
         / "schemas"
-        / "sdlc.yml.schema.json"
     )
-    installed_schema.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(
-        ROOT
-        / "skills"
-        / "ceratops-repo-lifecycle"
-        / "references"
-        / "schemas"
-        / "sdlc.yml.schema.json",
-        installed_schema,
-    )
+    installed_schemas.mkdir(parents=True, exist_ok=True)
+    for schema_name in ("sdlc.v4.schema.json", "sdlc.v5.schema.json"):
+        shutil.copy2(
+            ROOT
+            / "skills"
+            / "ceratops-repo-lifecycle"
+            / "references"
+            / "schemas"
+            / schema_name,
+            installed_schemas / schema_name,
+        )
 
     (bundle_root / RUNTIME_MANIFEST).write_text(
         json.dumps(

@@ -1,6 +1,6 @@
 interface:
   display_name: "Ceratops Codex Desktop Upgrade"
-  short_description: "Assess and reconcile Codex desktop upgrades"
+  short_description: "Check or reconcile Codex desktop upgrades"
   icon_small: "./assets/ceratops-logo-500.png"
   icon_large: "./assets/ceratops-logo-500.png"
-  default_prompt: "Use $codex-desktop-upgrade to assess this official app release against the selected patched build."
+  default_prompt: "Use $codex-desktop-upgrade to check for a newer official Codex desktop release and recommend whether any current patch merits upgrade assessment."

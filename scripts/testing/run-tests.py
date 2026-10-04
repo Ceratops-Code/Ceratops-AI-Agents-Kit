@@ -25,7 +25,6 @@ import pathlib
 import re
 import subprocess
 import sys
-import tempfile
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -36,11 +35,11 @@ from runner_requests import TEST_CONTEXT_ENV, parse_request, validate_execution_
 pytest_diagnostics = importlib.import_module("pytest-diagnostics")
 pytest_environment = importlib.import_module("pytest-environment")
 
-SCHEMA = "ai-agent-skills-test-impact-result.v1"
-COLLECTION_SCHEMA = "ai-agent-skills-pytest-collection.v1"
-NODE_MAP_SCHEMA = "ai-agent-skills-pytest-node-map.v1"
-PYTEST_DIAGNOSTIC_SCHEMA = "ai-agent-skills-pytest-diagnostic.v1"
-RUNNER_DIAGNOSTIC_SCHEMA = "ai-agent-skills-test-runner-diagnostic.v1"
+SCHEMA = "ceratops-ai-agents-kit-test-impact-result.v1"
+COLLECTION_SCHEMA = "ceratops-ai-agents-kit-pytest-collection.v1"
+NODE_MAP_SCHEMA = "ceratops-ai-agents-kit-pytest-node-map.v1"
+PYTEST_DIAGNOSTIC_SCHEMA = "ceratops-ai-agents-kit-pytest-diagnostic.v1"
+RUNNER_DIAGNOSTIC_SCHEMA = "ceratops-ai-agents-kit-test-runner-diagnostic.v1"
 DEFAULT_DIAGNOSTIC_PATH = pathlib.Path(
     ".build", "test-diagnostics", "pytest-failure.json"
 )
@@ -735,50 +734,41 @@ def resolve_data_path(repo_root: pathlib.Path, value: pathlib.Path) -> pathlib.P
     return (expanded if expanded.is_absolute() else repo_root / expanded).resolve()
 
 
-def write_json_atomic(path: pathlib.Path, payload: Mapping[str, object]) -> None:
-    """Atomically replace one caller-selected JSON artifact and clean its temp file."""
+def write_json(path: pathlib.Path, payload: Mapping[str, object]) -> bytes:
+    """Write canonical JSON directly at the selected path and verify its bytes."""
 
     if not path.parent.is_dir():
         raise ImpactError(f"JSON output parent does not exist: {path.parent}")
-    temporary: pathlib.Path | None = None
+    expected = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
     try:
-        with tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
-            newline="\n",
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as handle:
-            temporary = pathlib.Path(handle.name)
-            json.dump(payload, handle, indent=2, sort_keys=True)
-            handle.write("\n")
+        try:
+            existing = path.read_bytes()
+        except FileNotFoundError:
+            existing = None
+        if existing == expected:
+            return expected
+        with path.open("wb") as handle:
+            handle.write(expected)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        temporary = None
+        written = path.read_bytes()
     except OSError as exc:
         raise ImpactError(f"cannot write JSON artifact: {exc}") from exc
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
+    if written != expected:
+        raise ImpactError(f"written JSON artifact does not match: {path}")
+    return written
 
 
 def write_failure_diagnostic(
     path: pathlib.Path, payload: Mapping[str, object],
 ) -> dict[str, object]:
-    """Persist a failure atomically and return bounded evidence for its caller."""
+    """Persist a failure at its final path and return bounded evidence."""
 
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         raise ImpactError(f"cannot create diagnostic output parent: {exc}") from exc
-    write_json_atomic(path, payload)
-    try:
-        content = path.read_bytes()
-    except OSError as exc:
-        raise ImpactError(f"cannot read written diagnostic output: {exc}") from exc
+    content = write_json(path, payload)
     return {
         "bytes": len(content),
         "path": str(path),
@@ -1318,7 +1308,7 @@ def execute(
             if args.write_collection is not None:
                 destination = resolve_data_path(root, args.write_collection)
                 snapshot = collection_snapshot(nodeids, targets)
-                write_json_atomic(destination, snapshot)
+                write_json(destination, snapshot)
                 payload["collection"] = {
                     "count": len(nodeids),
                     "path": str(destination),

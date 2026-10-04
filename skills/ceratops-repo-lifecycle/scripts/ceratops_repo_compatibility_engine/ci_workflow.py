@@ -8,6 +8,7 @@ its availability remains a CI execution precondition, not structural evidence.
 
 from __future__ import annotations
 
+import json
 import pathlib
 import re
 import subprocess
@@ -17,6 +18,37 @@ from collections.abc import Mapping
 from typing import Any
 
 import yaml
+
+
+def source_repository_local_action(
+    workflow: pathlib.Path, value: object, action: Mapping[str, Any]
+) -> bool:
+    """Accept the checked-out action only in its declared source repository."""
+
+    uses = action.get("uses")
+    if not isinstance(value, str) or not isinstance(uses, str):
+        return False
+    identity = uses.split("/", 2)
+    if len(identity) != 3 or value != "./" + identity[2]:
+        return False
+    root = workflow.parents[2]
+    action_file = root.joinpath(*pathlib.PurePosixPath(identity[2]).parts) / "action.yml"
+    manifest = root / "skills" / "skill-sections.json"
+    if (
+        action_file.is_symlink()
+        or not action_file.is_file()
+        or manifest.is_symlink()
+        or not manifest.is_file()
+    ):
+        return False
+    try:
+        declaration = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    return (
+        isinstance(declaration, Mapping)
+        and declaration.get("runtime_source_id") == "/".join(identity[:2])
+    )
 
 
 def pinned_action(value: object, action: Mapping[str, Any]) -> bool:
@@ -72,10 +104,15 @@ def workflow_errors(path: pathlib.Path, action: Mapping[str, Any]) -> list[str]:
         if not isinstance(job, Mapping) or not isinstance(job.get("steps"), list):
             continue
         for step in job["steps"]:
-            if not isinstance(step, Mapping) or not str(step.get("uses", "")).startswith(action["uses"] + "@"):
+            if not isinstance(step, Mapping):
+                continue
+            value = step.get("uses", "")
+            remote_action = str(value).startswith(action["uses"] + "@")
+            local_source_action = source_repository_local_action(path, value, action)
+            if not remote_action and not local_source_action:
                 continue
             found = True
-            if not pinned_action(step["uses"], action):
+            if remote_action and not pinned_action(value, action):
                 errors.append("CI lifecycle action must use a full commit pin")
             inputs = step.get("with", {})
             if not isinstance(inputs, Mapping) or any(

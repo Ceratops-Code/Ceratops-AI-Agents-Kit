@@ -14,6 +14,16 @@
       "template": "validate.yml.tmpl",
       "required": "always"
     },
+    "issue_template": {
+      "path": ".github/ISSUE_TEMPLATE/bug_report.yml",
+      "template": "issue-template-bug-report.yml.tmpl",
+      "required": "always"
+    },
+    "pull_request_template": {
+      "path": ".github/pull_request_template.md",
+      "template": "pull-request-template.md.tmpl",
+      "required": "always"
+    },
     "sdlc": {
       "path": "sdlc/sdlc.yml",
       "template": "sdlc.yml.tmpl",
@@ -130,7 +140,7 @@
     }
   },
   "ci_action": {
-    "uses": "Ceratops-Code/AI-Agent-Skills/skills/ceratops-repo-lifecycle/scripts",
+    "uses": "Ceratops-Code/Ceratops-AI-Agents-Kit/skills/ceratops-repo-lifecycle/scripts",
     "ref": "refs/heads/main",
     "inputs": {
       "repo-root": "${{ github.workspace }}",

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Renamed the deployable `tool` lifecycle to `mcp-server` across SDLC
+  categories, manager packages, manifests, configuration, helpers, tests, and
+  documentation while preserving MCP tool terminology for callable functions.
+
 - Renamed compatibility application and validation interfaces, and removed
   validation-contract package requirements and fallback installation.
 

@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/Ceratops-Code/AI-Agent-Skills/schemas/sdlc.v4.schema.json",
+  "$id": "https://github.com/Ceratops-Code/Ceratops-AI-Agents-Kit/schemas/sdlc.v4.schema.json",
   "title": "Ceratops repository SDLC v4 contract",
   "type": "object",
   "additionalProperties": false,
@@ -459,7 +459,7 @@
         "$ref": "#/$defs/identifier"
       }
     },
-    "tool": {
+    "mcpServer": {
       "type": "object",
       "additionalProperties": false,
       "required": [
@@ -559,14 +559,14 @@
         "$ref": "#/$defs/package"
       }
     },
-    "namedTools": {
+    "namedMcpServers": {
       "type": "object",
       "minProperties": 1,
       "propertyNames": {
         "$ref": "#/$defs/identifier"
       },
       "additionalProperties": {
-        "$ref": "#/$defs/tool"
+        "$ref": "#/$defs/mcpServer"
       }
     },
     "namedApps": {
@@ -629,8 +629,8 @@
         "packages": {
           "$ref": "#/$defs/namedPackages"
         },
-        "tools": {
-          "$ref": "#/$defs/namedTools"
+        "mcp-servers": {
+          "$ref": "#/$defs/namedMcpServers"
         },
         "apps": {
           "$ref": "#/$defs/namedApps"

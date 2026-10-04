@@ -1,27 +1,35 @@
-"""Validate exact CodeQL evidence before suppression or authorized dismissal.
+"""Capture and validate CodeQL evidence before disposition.
 
-The evidence document is intentionally small and test-produced. It binds one
-live CodeQL alert to one full commit, records a successful source-to-sink
-exercise with sentinel credentials, and supplies captured output that proves
-the sentinel values were replaced by the contract engine's redaction marker.
-Only the dismissal action mutates GitHub, and only with an explicit CLI gate.
+Capture runs one caller-declared argument-vector test with generated sentinel
+credentials and a helper-owned trace path. The resulting evidence binds one
+live alert to one full commit and proves the output was redacted. Only the
+dismissal gate mutates GitHub, and only with explicit CLI authorization.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
 import re
-from typing import Any
+import secrets
+import subprocess
+import sys
+import tempfile
+from typing import Any, cast
 
 from .format_report import REDACTED, write_json
 from .github_api import load_json, run_gh_api
 
-
 FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SENTINEL_PREFIX = "CODEQL_SENTINEL_"
 DISMISSAL_REASONS = ("false positive", "won't fix", "used in tests")
+SENTINEL_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+SENSITIVE_ENV_RE = re.compile(
+    r"(?:TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTHORIZATION|API_KEY|COOKIE|PRIVATE_KEY)",
+    re.IGNORECASE,
+)
 
 
 class DispositionError(RuntimeError):
@@ -59,6 +67,53 @@ def _location(value: Any, label: str) -> dict[str, Any]:
     return value
 
 
+def _request_identity(repository: str, commit: str) -> tuple[str, str]:
+    """Normalize one repository/commit request before network or test work."""
+
+    normalized_repository = repository.strip()
+    _require(normalized_repository.count("/") == 1, "--repo must use OWNER/REPO.")
+    normalized_commit = commit.lower()
+    _require(
+        bool(FULL_SHA_RE.fullmatch(normalized_commit)),
+        "--commit must be a full 40-character Git commit SHA.",
+    )
+    return normalized_repository, normalized_commit
+
+
+def _alert_binding(
+    alert: dict[str, Any], *, alert_number: int, commit: str
+) -> tuple[str, dict[str, Any]]:
+    """Validate current CodeQL identity and return its rule and sink location."""
+
+    _require(alert.get("number") == alert_number, "Live alert number drifted.")
+    tool = alert.get("tool") or {}
+    _require(
+        isinstance(tool, dict)
+        and str(tool.get("name", "")).casefold() == "codeql",
+        "The current alert was not produced by CodeQL.",
+    )
+    rule = alert.get("rule") or {}
+    rule_id = rule.get("id") if isinstance(rule, dict) else None
+    _require(isinstance(rule_id, str) and bool(rule_id), "The current CodeQL rule is missing.")
+    instance = alert.get("most_recent_instance") or {}
+    _require(
+        isinstance(instance, dict) and instance.get("state") == "open",
+        "The current CodeQL alert instance must still be open for disposition.",
+    )
+    _require(
+        isinstance(instance, dict) and instance.get("commit_sha") == commit,
+        "The current alert instance is not tied to the requested commit.",
+    )
+    location = instance.get("location") or {}
+    _require(
+        isinstance(location, dict)
+        and isinstance(location.get("path"), str)
+        and isinstance(location.get("start_line"), int),
+        "The current alert instance has no source location.",
+    )
+    return cast(str, rule_id), cast(dict[str, Any], location)
+
+
 def validate_evidence(
     evidence: dict[str, Any],
     alert: dict[str, Any],
@@ -88,32 +143,12 @@ def validate_evidence(
         "Evidence disposition does not match the requested action.",
     )
 
-    _require(alert.get("number") == alert_number, "Live alert number drifted.")
-    tool = alert.get("tool") or {}
-    _require(
-        isinstance(tool, dict)
-        and str(tool.get("name", "")).casefold() == "codeql",
-        "The current alert was not produced by CodeQL.",
+    rule_id, alert_location = _alert_binding(
+        alert, alert_number=alert_number, commit=commit
     )
-    rule = alert.get("rule") or {}
-    rule_id = rule.get("id") if isinstance(rule, dict) else None
     _require(
-        isinstance(rule_id, str) and evidence.get("rule_id") == rule_id,
+        evidence.get("rule_id") == rule_id,
         "Evidence rule does not match the current CodeQL alert.",
-    )
-    instance = alert.get("most_recent_instance") or {}
-    _require(
-        isinstance(instance, dict) and instance.get("state") == "open",
-        "The current CodeQL alert instance must still be open for disposition.",
-    )
-    _require(
-        isinstance(instance, dict) and instance.get("commit_sha") == commit,
-        "The current alert instance is not tied to the requested commit.",
-    )
-    alert_location = instance.get("location") or {}
-    _require(
-        isinstance(alert_location, dict),
-        "The current alert instance has no source location.",
     )
 
     source_to_sink = evidence.get("source_to_sink") or {}
@@ -191,16 +226,131 @@ def validate_evidence(
     }
 
 
+def _test_contract(path: pathlib.Path) -> tuple[list[str], list[str]]:
+    """Load the closed argument-vector and sentinel-name test contract."""
+
+    value = load_json(path)
+    _require(isinstance(value, dict), "Test command JSON must be one object.")
+    _require(
+        set(value) == {"command", "sentinel_names"},
+        "Test command JSON fields must be command and sentinel_names.",
+    )
+    command = value.get("command")
+    _require(
+        isinstance(command, list)
+        and bool(command)
+        and all(isinstance(item, str) and bool(item) and "\0" not in item for item in command),
+        "Test command must be a non-empty argument list.",
+    )
+    names = value.get("sentinel_names")
+    _require(
+        isinstance(names, list)
+        and bool(names)
+        and all(isinstance(name, str) and SENTINEL_NAME_RE.fullmatch(name) for name in names),
+        "Sentinel names must be safe non-empty identifiers.",
+    )
+    normalized = [name.upper() for name in names]
+    _require(len(set(normalized)) == len(normalized), "Sentinel names must be unique.")
+    return list(command), normalized
+
+
+def _new_evidence_path(path: pathlib.Path) -> pathlib.Path:
+    """Require a new evidence file below an existing directory."""
+
+    target = path.expanduser().resolve()
+    _require(not target.exists() and not target.is_symlink(), "Evidence output already exists.")
+    _require(target.parent.is_dir(), "Evidence output parent is unavailable.")
+    return target
+
+
+def capture(args: argparse.Namespace) -> dict[str, Any]:
+    """Run one sentinel test and atomically close its validated evidence object."""
+
+    repository, commit = _request_identity(args.repo, args.commit)
+    target = _new_evidence_path(args.evidence)
+    command, names = _test_contract(args.test_command_json)
+    alert = fetch_alert(repository, args.alert_number)
+    rule_id, _location_value = _alert_binding(
+        alert, alert_number=args.alert_number, commit=commit
+    )
+    sentinels = {
+        name.lower(): f"{SENTINEL_PREFIX}{name}_{secrets.token_hex(16)}"
+        for name in names
+    }
+    with tempfile.TemporaryDirectory(prefix="codeql-evidence-") as temporary:
+        trace_path = pathlib.Path(temporary) / "source-to-sink.json"
+        # Evidence tests receive generated sentinels, never ambient credentials.
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if SENSITIVE_ENV_RE.search(key) is None
+        }
+        environment["CODEQL_TRACE_OUTPUT"] = str(trace_path)
+        for name, value in sentinels.items():
+            environment[f"CODEQL_SENTINEL_{name.upper()}"] = value
+        try:
+            result = subprocess.run(
+                command,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                timeout=120,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise DispositionError("CodeQL evidence test was unavailable or timed out.") from exc
+        _require(trace_path.is_file(), "Evidence test did not write CODEQL_TRACE_OUTPUT.")
+        source_to_sink = load_json(trace_path)
+        _require(
+            isinstance(source_to_sink, dict)
+            and set(source_to_sink) == {"exercised", "trace"},
+            "Evidence trace must contain only exercised and trace.",
+        )
+        captured_output = result.stdout
+        if result.stderr:
+            captured_output += ("\n" if captured_output else "") + result.stderr
+        evidence = {
+            "version": 1,
+            "repository": repository,
+            "alert_number": args.alert_number,
+            "commit_sha": commit,
+            "disposition": args.action,
+            "rule_id": rule_id,
+            "source_to_sink": source_to_sink,
+            "execution": {
+                "command": command,
+                "exit_code": result.returncode,
+                "sentinel_credentials": sentinels,
+                "captured_output": captured_output,
+            },
+        }
+        summary = validate_evidence(
+            evidence,
+            alert,
+            repository=repository,
+            alert_number=args.alert_number,
+            commit=commit,
+            disposition=args.action,
+        )
+        with target.open("x", encoding="utf-8", newline="\n") as stream:
+            json.dump(evidence, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+    return {
+        "status": "evidence_captured",
+        "action": args.action,
+        "mutated": False,
+        "evidence_path": str(target),
+        "evidence": summary,
+    }
+
+
 def disposition(args: argparse.Namespace) -> dict[str, Any]:
     """Validate evidence and optionally perform an authorized dismissal."""
 
-    repository = args.repo.strip()
-    _require(repository.count("/") == 1, "--repo must use OWNER/REPO.")
-    commit = args.commit.lower()
-    _require(
-        bool(FULL_SHA_RE.fullmatch(commit)),
-        "--commit must be a full 40-character Git commit SHA.",
-    )
+    repository, commit = _request_identity(args.repo, args.commit)
     evidence = load_json(args.evidence)
     _require(isinstance(evidence, dict), "Evidence must be one JSON object.")
     alert = fetch_alert(repository, args.alert_number)
@@ -296,12 +446,36 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
-    """Run the evidence gate and emit one sanitized compact JSON document."""
+def build_capture_parser() -> argparse.ArgumentParser:
+    """Create the deterministic evidence-capture parser."""
 
-    args = build_parser().parse_args(argv)
+    parser = argparse.ArgumentParser(
+        prog="python -m github_contract_engine codeql-disposition capture",
+        description="Capture exact sentinel evidence for one live CodeQL alert.",
+    )
+    parser.add_argument("--repo", required=True, help="OWNER/REPO")
+    parser.add_argument("--alert-number", required=True, type=int)
+    parser.add_argument("--commit", required=True, help="full alert-instance SHA")
+    parser.add_argument(
+        "--action", required=True, choices=("suppression", "dismissal")
+    )
+    parser.add_argument("--test-command-json", required=True, type=pathlib.Path)
+    parser.add_argument("--evidence", required=True, type=pathlib.Path)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run evidence capture or the disposition gate."""
+
+    arguments = list(sys.argv[1:] if argv is None else argv)
     try:
-        write_json(disposition(args), compact=True)
+        if arguments and arguments[0] == "capture":
+            args = build_capture_parser().parse_args(arguments[1:])
+            result = capture(args)
+        else:
+            args = build_parser().parse_args(arguments)
+            result = disposition(args)
+        write_json(result, compact=True)
         return 0
     except (DispositionError, OSError, ValueError, json.JSONDecodeError) as exc:
         write_json({"status": "error", "message": str(exc)}, compact=True)

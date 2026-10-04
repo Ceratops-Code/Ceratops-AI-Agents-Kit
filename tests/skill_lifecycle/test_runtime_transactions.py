@@ -3,6 +3,7 @@ from __future__ import annotations
 import errno
 import json
 import pathlib
+import runpy
 import shutil
 import subprocess
 import sys
@@ -83,7 +84,7 @@ def test_runtime_installer_releases_installed_working_directory(
 
 
 @pytest.mark.skipif(shutil.which("uv") is None, reason="uv is required for the installed Python runtime")
-def test_installed_repo_lifecycle_cleanup_helper_uses_regular_runtime(
+def test_installed_repo_lifecycle_helpers_use_regular_runtime(
     tmp_path: pathlib.Path,
 ) -> None:
     install_root = tmp_path / "installed"
@@ -92,16 +93,111 @@ def test_installed_repo_lifecycle_cleanup_helper_uses_regular_runtime(
 
     skill = install_root / "ceratops-repo-lifecycle"
     assert (skill / "scripts" / "pending-work-cleanup.py").is_file()
+    assert (skill / "scripts" / "store_artifacts.py").is_file()
+    assert (skill / "scripts" / "manage_checkpoints.py").is_file()
     runtime = json.loads((skill / RUNTIME_MANIFEST).read_text(encoding="utf-8"))
     interpreter = pathlib.Path(runtime["python_runtime"])
     assert interpreter.is_file() and not interpreter.is_symlink()
-    command = subprocess.run(
-        [str(interpreter), str(skill / "scripts" / "manage-pending-work.py"), "--help"],
-        capture_output=True,
-        text=True,
-        check=False,
+    for script in ("manage-pending-work.py", "repository_operation.py"):
+        command = subprocess.run(
+            [str(interpreter), str(skill / "scripts" / script), "--help"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert command.returncode == 0, command.stderr
+
+    repo = tmp_path / "checkpoint-repository"
+    repo.mkdir()
+    assert run_git(repo, "init", "-b", "main").returncode == 0
+    isolated = subprocess.run(
+        [str(interpreter), "-I", "-c",
+         "import pathlib,sys; sys.path.insert(0,sys.argv[1]); import store_artifacts; "
+         "cp=store_artifacts._checkpoint_storage(); "
+         "assert pathlib.Path(cp.__file__).parent==pathlib.Path(sys.argv[1]);\n"
+         "with cp.open_checkpoints(pathlib.Path(sys.argv[2]),'artifact-versions') as context:\n"
+         " cp.write_checkpoint(context,'request.json',{'request':'installed'})\n"
+         " assert cp.read_checkpoint(context,'request.json')=={'request':'installed'}\n"
+         " cp.finish_checkpoints(context)\n",
+         str(skill / "scripts"), str(repo)],
+        cwd=tmp_path, capture_output=True, text=True, check=False,
     )
-    assert command.returncode == 0, command.stderr
+    assert isolated.returncode == 0, isolated.stderr
+
+    result = run_builder(ROOT, install_root, "--skill", "ceratops-skill-lifecycle")
+    assert result.returncode == 0, result.stderr
+    assert (
+        install_root / "ceratops-skill-lifecycle" / "scripts" / "manage_checkpoints.py"
+    ).is_file()
+
+
+@pytest.mark.parametrize("implementation", ["bootstrap", "managed"])
+def test_runtime_pruning_preserves_every_live_version_class(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    implementation: str,
+) -> None:
+    if implementation == "bootstrap":
+        runtime = runpy.run_path(str(ROOT / "scripts" / "deploy-skills.py"))
+        interpreter_name = "runtime_interpreter_path"
+        process_probe = "running_process_paths"
+    else:
+        runtime = load_runtime_builder()
+        interpreter_name = "_runtime_interpreter_path"
+        process_probe = "_running_process_paths"
+
+    install_root = tmp_path / "installed"
+    versions = tmp_path / "runtime" / "versions"
+    names = {
+        "selected": "a" * 24,
+        "predecessor_one": "b" * 24,
+        "predecessor_two": "c" * 24,
+        "manifest": "d" * 24,
+        "running": "e" * 24,
+        "stale": "f" * 24,
+    }
+    interpreter_path = runtime[interpreter_name]
+    interpreters: dict[str, pathlib.Path] = {}
+    for role, name in names.items():
+        interpreter = interpreter_path(versions / name)
+        interpreter.parent.mkdir(parents=True)
+        interpreter.write_bytes(b"")
+        interpreters[role] = interpreter
+
+    (versions.parent / "current.json").write_text(
+        json.dumps(
+            {
+                "version": names["selected"],
+                "predecessors": [
+                    names["predecessor_one"],
+                    names["predecessor_two"],
+                ],
+            }
+        ),
+        encoding="utf-8",
+        newline="\n",
+    )
+    consumer = install_root / "consumer"
+    consumer.mkdir(parents=True)
+    (consumer / RUNTIME_MANIFEST).write_text(
+        json.dumps({"python_runtime": str(interpreters["manifest"])}),
+        encoding="utf-8",
+        newline="\n",
+    )
+    monkeypatch.setitem(
+        runtime["prune_python_runtime_versions"].__globals__,
+        process_probe,
+        lambda: str(interpreters["running"]),
+    )
+
+    runtime["prune_python_runtime_versions"](
+        install_root,
+        interpreters["selected"],
+    )
+
+    assert {
+        path.name for path in versions.iterdir()
+    } == set(names.values()) - {names["stale"]}
 
 
 def test_full_install_removes_only_same_source_stale_skills(tmp_path: pathlib.Path) -> None:
@@ -167,6 +263,72 @@ def test_targeted_install_keeps_stale_and_rejects_other_source_collision(tmp_pat
     legacy_collision = run_builder(repo_b, install_root, "--skill", "legacy-tool")
     assert legacy_collision.returncode == 1
     assert "unsupported ownership manifest" in legacy_collision.stderr
+
+
+def test_explicit_runtime_source_identity_migration_is_scoped(
+    tmp_path: pathlib.Path,
+) -> None:
+    repo = tmp_path / "source"
+    install_root = tmp_path / "installed"
+    old_source = "example/old-source"
+    new_source = "example/new-source"
+    create_compatible_repo(
+        repo,
+        old_source,
+        ["alpha-tool", "beta-tool", "retired-tool"],
+    )
+    assert run_builder(repo, install_root, "--all-managed").returncode == 0
+    shutil.rmtree(repo / "skills" / "retired-tool")
+    write_manifest(repo, new_source)
+
+    rejected = run_builder(repo, install_root, "--skill", "alpha-tool")
+    assert rejected.returncode == 1
+    assert f"owned by {old_source!r}" in rejected.stderr
+
+    migrated = run_builder(
+        repo,
+        install_root,
+        "--skill",
+        "alpha-tool",
+        "--previous-runtime-source-id",
+        old_source,
+    )
+    assert migrated.returncode == 0, migrated.stderr
+    assert runtime_owner(install_root, "alpha-tool") == new_source
+    assert runtime_owner(install_root, "beta-tool") == old_source
+    assert runtime_owner(install_root, "retired-tool") == old_source
+
+    public = subprocess.run(
+        [
+            sys.executable,
+            str(RUNTIME_INSTALLER),
+            "--repo-root",
+            str(repo),
+            "--install-root",
+            str(install_root),
+            "--skill",
+            "beta-tool",
+            "--previous-runtime-source-id",
+            old_source,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert public.returncode == 0, public.stderr
+    assert runtime_owner(install_root, "beta-tool") == new_source
+
+    converged = run_builder(
+        repo,
+        install_root,
+        "--all-managed",
+        "--previous-runtime-source-id",
+        old_source,
+    )
+    assert converged.returncode == 0, converged.stderr
+    assert not (install_root / "retired-tool").exists()
+    assert runtime_owner(install_root, "alpha-tool") == new_source
+    assert runtime_owner(install_root, "beta-tool") == new_source
 
 
 def test_transaction_stages_complete_batch_before_canonical_mutation(

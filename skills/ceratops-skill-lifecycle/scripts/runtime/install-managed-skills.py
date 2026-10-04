@@ -657,19 +657,34 @@ def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def _promotion_binding(args: argparse.Namespace, repo_root: pathlib.Path, commit: str | None) -> dict[str, Any] | None:
-    """Bind new transaction evidence to one existing, unchanged handoff record.
+def _promotion_bindings(
+    args: argparse.Namespace,
+    repo_root: pathlib.Path,
+    commit: str | None,
+) -> list[dict[str, Any]] | None:
+    """Bind one transaction to all selected handoffs in an unchanged record.
 
     Preflight does not complete, rewrite, or delete the old record. Only the
     caller-selected repository lifecycle helper owns its eventual finalization.
     """
-    options = (args.promotion_result, args.operation, args.task_temp_root, args.finalize_promotion_with)
+    options = (
+        args.promotion_result,
+        args.operation,
+        args.task_temp_root,
+        args.finalize_promotion_with,
+    )
     if not any(options):
         return None
     if not all(options):
-        raise InstallerError("promotion cleanup requires promotion-result, operation, task-temp-root, and finalize-promotion-with")
+        raise InstallerError(
+            "promotion cleanup requires promotion-result, operation, "
+            "task-temp-root, and finalize-promotion-with"
+        )
     if commit is None:
         raise InstallerError("promotion deployment requires an exact clean source commit")
+    selected_operations = list(args.operation)
+    if len(selected_operations) != len(set(selected_operations)):
+        raise InstallerError("promotion operations must be unique")
     path = _plain_path(args.promotion_result)
     task = _plain_path(args.task_temp_root)
     helper = _plain_path(args.finalize_promotion_with)
@@ -694,27 +709,57 @@ def _promotion_binding(args: argparse.Namespace, repo_root: pathlib.Path, commit
         raise InstallerError("promotion record has incomplete repository operations")
     if not isinstance(operations.get("results"), list):
         raise InstallerError("promotion operation results are missing")
-    matches = [item for item in operations["results"] if isinstance(item, dict) and item.get("operation") == args.operation]
-    if len(matches) != 1 or matches[0].get("handoff") != "ceratops-skill-lifecycle/deploy" or matches[0].get("handoff_completed"):
-        raise InstallerError("promotion record does not contain the selected pending skill deployment")
-    if (matches[0].get("status") not in {"completed", "advisory"} or matches[0].get("commit") != commit
-            or (matches[0].get("status") == "advisory" and matches[0].get("steps"))):
-        raise InstallerError("promotion handoff has not completed its repository phase")
-    return {"result_file": str(path), "sha256": hashlib.sha256(data).hexdigest(),
-            "identity": identity, "operation": args.operation}
+    bindings: list[dict[str, Any]] = []
+    for operation in selected_operations:
+        matches = [
+            item
+            for item in operations["results"]
+            if isinstance(item, dict) and item.get("operation") == operation
+        ]
+        if (
+            len(matches) != 1
+            or matches[0].get("handoff") != "ceratops-skill-lifecycle/deploy"
+            or matches[0].get("handoff_completed")
+        ):
+            raise InstallerError(
+                "promotion record does not contain the selected pending skill deployment"
+            )
+        if (
+            matches[0].get("status") not in {"completed", "advisory"}
+            or matches[0].get("commit") != commit
+            or (
+                matches[0].get("status") == "advisory"
+                and matches[0].get("steps")
+            )
+        ):
+            raise InstallerError(
+                "promotion handoff has not completed its repository phase"
+            )
+        bindings.append(
+            {
+                "result_file": str(path),
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "identity": list(identity),
+                "operation": operation,
+            }
+        )
+    return bindings
 
 
 def _completion_receipt(result: runtime_builder.TransactionResult, repo_root: pathlib.Path,
                         install_root: pathlib.Path, commit: str | None,
-                        promotion: dict[str, Any] | None) -> dict[str, Any]:
+                        promotion: list[dict[str, Any]] | None) -> dict[str, Any]:
     """Serialize the transaction's actual result, never inferred runtime state."""
+    serialized_promotion: object = None
+    if promotion is not None:
+        serialized_promotion = promotion[0] if len(promotion) == 1 else promotion
     return {
         "schema": "ceratops-deployment-completion.v1", "producer": "ceratops-skill-lifecycle/deploy",
         "status": "completed" if result.status == "ok" else result.status,
         "repo_root": str(repo_root), "commit": commit, "install_root": str(install_root),
         "deployed": list(result.deployed), "removed": list(result.removed),
         "transaction_id": result.transaction_id, "cleanup_debt": list(result.retained_retired),
-        "promotion": promotion,
+        "promotion": serialized_promotion,
     }
 
 
@@ -729,9 +774,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skill", action="append")
     parser.add_argument("--remove-skill", action="append")
     parser.add_argument("--base-revision")
+    parser.add_argument(
+        "--previous-runtime-source-id",
+        help="Exact prior owner accepted only for this transactional migration.",
+    )
     parser.add_argument("--inventory-output", type=pathlib.Path)
     parser.add_argument("--promotion-result", type=pathlib.Path)
-    parser.add_argument("--operation", help="Exact pending SDLC deployment location.")
+    parser.add_argument(
+        "--operation",
+        action="append",
+        help="Exact pending SDLC deployment location; repeat for one batch.",
+    )
     parser.add_argument("--task-temp-root", type=pathlib.Path)
     parser.add_argument("--finalize-promotion-with", type=pathlib.Path,
                         help="Caller-selected promotion helper; invoked only for cleanup, never deployment.")
@@ -750,7 +803,8 @@ def main(argv: list[str] | None = None) -> int:
                 args.repo_root,
                 args.skill,
                 args.remove_skill,
-                args.base_revision, args.promotion_result, args.operation,
+                args.base_revision, args.previous_runtime_source_id,
+                args.promotion_result, args.operation,
                 args.task_temp_root, args.finalize_promotion_with,
             )
         ):
@@ -787,7 +841,7 @@ def main(argv: list[str] | None = None) -> int:
         # The required source repository is outside every runtime target.
         os.chdir(repo_root)
         commit = _source_commit(repo_root)
-        promotion = _promotion_binding(args, repo_root, commit)
+        promotion = _promotion_bindings(args, repo_root, commit)
         if args.base_revision is not None:
             affected = affected_from_base(repo_root, args.base_revision)
         elif args.skill is not None or args.remove_skill is not None:
@@ -808,6 +862,7 @@ def main(argv: list[str] | None = None) -> int:
             selected=() if affected.all_managed else affected.deploy,
             remove=affected.remove,
             all_managed=affected.all_managed,
+            previous_runtime_source_id=args.previous_runtime_source_id,
         )
     except (
         DecisionRequired,
@@ -834,9 +889,10 @@ def main(argv: list[str] | None = None) -> int:
         # Pass the actual receipt directly. No additional temp file is needed.
         # A failed cleanup returns the receipt for finalizer-only retries.
         try:
+            first_binding = promotion[0]
             finalized = subprocess.run(
                 [sys.executable, str(args.finalize_promotion_with), "--repo-root", str(repo_root),
-                 "--finalize-result", "--result-file", promotion["result_file"],
+                 "--finalize-result", "--result-file", first_binding["result_file"],
                  "--task-temp-root", str(args.task_temp_root), "--expected-commit", str(commit),
                  "--deployment-evidence", "-"], input=json.dumps(receipt), cwd=repo_root,
                 capture_output=True, text=True, check=False,

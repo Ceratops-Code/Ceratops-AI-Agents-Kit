@@ -1,30 +1,29 @@
 """Resolve repository-owned artifact identities for contract checks.
 
-Repository-specific artifact identity belongs under its owning deliverable in
-``sdlc/sdlc.yml``. Explicit checker parameters remain available only for
-repositories that have not declared artifact identities locally; accepting two
-owners for the same facts would reintroduce configuration drift.
+Publication identity is supplied explicitly to the artifact contract. SDLC v4
+and v5 describe build outputs, not external registry or release identity.
 """
 
 from __future__ import annotations
 
+import json
 import pathlib
 from collections.abc import Mapping
+from functools import lru_cache
 from typing import Any
 
+import jsonschema
 from ceratops_repo_compatibility_engine.sdlc_contract_validation import (
     SdlcContractError,
-    artifact_entries,
     load_contract,
-    validation_errors,
 )
 
 SDLC_CONTRACT = pathlib.Path("sdlc/sdlc.yml")
-SDLC_SCHEMA = (
+ARTIFACT_IDENTITY_SCHEMA = (
     pathlib.Path(__file__).resolve().parents[2]
     / "references"
     / "schemas"
-    / "sdlc.yml.schema.json"
+    / "github-lifecycle-deterministic-contract.schema.json"
 )
 
 
@@ -40,23 +39,39 @@ def _records(value: object) -> list[dict[str, Any]]:
     return [dict(item) for item in value]
 
 
+@lru_cache(maxsize=1)
+def _artifact_identity_validator() -> jsonschema.Draft202012Validator:
+    """Load the publication-identity shape from its existing contract schema."""
+
+    try:
+        schema = json.loads(ARTIFACT_IDENTITY_SCHEMA.read_text(encoding="utf-8"))
+        identity = schema["$defs"]["artifactIdentity"]
+        jsonschema.Draft202012Validator.check_schema(identity)
+    except (
+        KeyError,
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        jsonschema.SchemaError,
+    ) as exc:
+        raise ValueError(f"invalid artifact identity schema: {exc}") from exc
+    return jsonschema.Draft202012Validator(identity)
+
+
 def _validated_explicit_records(value: object) -> list[dict[str, Any]]:
-    """Validate explicit artifact records through the SDLC schema owner."""
+    """Validate explicit publication identities through their contract owner."""
 
     records = _records(value)
-    if not records:
-        return records
-    document = {
-        "version": 2,
-        "kind": "ceratops-sdlc",
-        "deliverables": {"explicit": {"artifacts": records}},
-    }
-    try:
-        errors = validation_errors(document, schema_path=SDLC_SCHEMA)
-    except SdlcContractError as exc:
-        raise ValueError(f"invalid artifact_contracts schema: {exc}") from exc
-    if errors:
-        raise ValueError("invalid artifact_contracts: " + "; ".join(errors))
+    validator = _artifact_identity_validator()
+    for index, record in enumerate(records):
+        errors = list(validator.iter_errors(record))
+        if errors:
+            error = jsonschema.exceptions.best_match(errors) or errors[0]
+            location = ".".join(str(part) for part in error.absolute_path)
+            suffix = f".{location}" if location else ""
+            raise ValueError(
+                f"invalid artifact_contracts[{index}]{suffix}: {error.message}"
+            )
     return records
 
 
@@ -64,7 +79,7 @@ def resolve_repository_artifact_contracts(
     local_repo_path: object,
     explicit_contracts: object,
 ) -> list[dict[str, Any]]:
-    """Prefer validated repository SDLC identity over caller configuration."""
+    """Validate explicit publication identity and any present SDLC contract."""
 
     explicit = _validated_explicit_records(explicit_contracts)
     if not isinstance(local_repo_path, str) or not local_repo_path.strip():
@@ -78,15 +93,7 @@ def resolve_repository_artifact_contracts(
     if contract_path.is_symlink() or not contract_path.is_file():
         raise ValueError("sdlc/sdlc.yml must be a regular file")
     try:
-        contract = load_contract(contract_path, schema_path=SDLC_SCHEMA)
+        load_contract(contract_path)
     except SdlcContractError as exc:
         raise ValueError(f"invalid sdlc/sdlc.yml: {exc}") from exc
-    repository_contracts = artifact_entries(contract)
-    if not repository_contracts:
-        return explicit
-    if explicit:
-        raise ValueError(
-            "artifact identity is declared both in sdlc/sdlc.yml and "
-            "artifact_contracts"
-        )
-    return repository_contracts
+    return explicit

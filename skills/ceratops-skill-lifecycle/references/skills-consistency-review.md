@@ -11,6 +11,10 @@ installed-runtime surface.
 
 ### Script Bundle
 
+- (D) Review packet helper, run from the skill-lifecycle bundle's `scripts`
+  folder: `python skills-consistency-review-packet.py --skill <skill-name>
+  --repo-root <repo-root> --installed-skill <path> --output <evidence-file>
+  [--automation-root <path>]`.
 - (D) Source consistency validator, run from the skill-lifecycle bundle's
   `scripts` folder: `python skills-consistency-source-validator.py --repo-root
   <repo-root> --mode skill --skill <skill-name>`.
@@ -114,26 +118,20 @@ installed-runtime surface.
 
 ### 1. Resolve the selected skill surface
 
-- Read the selected direct runtime manifest and resolve its source repository,
-  source skill, section-manifest assignment, action references, metadata,
-  runtime payloads, relevant helpers and callers, installer, validator, and
-  public documentation.
-- Find repo-owned automation templates and installed automation prompts that
-  explicitly invoke the selected skill or its actions.
-- Build an identity map for the selected skill through metadata, action lists,
-  docs, runtime payloads, its installed manifest, and automation consumers.
+- (D) Run `python scripts/skills-consistency-review-packet.py --skill
+  <skill-name> --repo-root <repo-root> --installed-skill <path> --output
+  <evidence-file> [--automation-root <path>]` through the skill's required `uv`
+  invocation.
+- The helper resolves the direct manifest, source skill, section assignments,
+  actions, metadata, payloads, helpers and callers, installer, validator,
+  documentation, and explicit automation consumers; it builds the identity map
+  and runs the source or installed validator in skill-scoped mode.
 
-### 2. Run deterministic contract checks
+### 2. Review nondeterministic consistency
 
-- Resolve the validator from the target source checkout when present, otherwise
-  from the installed lifecycle bundle.
-- Run `--mode skill --skill <skill-name> --repo-root <repo-root>` so common and
-  profile-specific source checks execute only for the selected skill.
-- Map every validator finding to its deterministic contract check ID and owning
-  source repair. Do not treat a passing validator as evidence for any
-  non-deterministic check.
-- Run declared Markdown lint or Python type checks only when their governed
-  files are in the review scope.
+- Deep-read only packet-named surfaces required for nondeterministic contract
+  review. Treat packet blockers as coverage limits rather than semantic
+  failures.
 
 ### 3. Validate installer and runtime coherence
 

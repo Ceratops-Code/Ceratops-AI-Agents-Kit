@@ -1,32 +1,23 @@
 #!/usr/bin/env python3
-"""Apply approved rule/TOML edits or an exact history-ID repair.
+"""Prepare complete proposal outputs and apply accepted bytes without revalidation.
 
-The UTF-8 JSON request has the closed top-level fields ``version``,
-``task_temp_root``, ownership flags, ``rule_stack``, the exact validated
-candidate path and hash, caller-selected validation evidence, and
-``history_operations``.
-``rule_stack`` lists the global source first and every source in one complete
-project scope after it, including TOML targets, with hashes in
-``rule_stack_sha256``. A validated
-candidate owns exact rule and TOML replacement text; it is null for a
-history-only ID repair. TOML targets use null history and Markdown policy;
-only TOML-only edits permit empty history operations. History operations
-support approved ``append`` entries and simultaneous one-to-one ``rename``
-migrations. Mixed target formats share the same rollback transaction.
+The producer accepts candidate text and history operations together. Its immutable
+candidate contains exact output bytes, destination base identities and the original
+check results. Application requests (version 5) name only that candidate, its hash,
+and cleanup ownership. Application never calls a content validator, reconstructs
+replacements, or consults a newer policy. Hash comparisons protect the accepted
+artifact and prevent overwriting another writer's edits.
 
-This helper owns stale-text detection, structural validation, change coverage,
-rollback-protected writes, and successful-request cleanup. It deletes the exact
-unchanged artifacts only when the request declares workflow ownership beneath a
-verified task-temp root and the transaction, reopen, and validation all pass.
-Every failure preserves them for diagnosis. It invokes the shared candidate
-validator in check-only mode, applies the approved replacement text unchanged,
-and never reformats it. Semantic equivalence remains the calling workflow's
-responsibility.
+Candidate/evidence files belong to the proposal's bounded iteration directory;
+finalization retains only the champion. Successful application removes only exact
+declared disposable inputs. Same-directory staging and backups exist only during
+the transaction and are removed after success or a completed rollback.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import copy
 import hashlib
 import json
@@ -36,7 +27,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import tomllib
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Never, cast
@@ -44,6 +35,7 @@ from typing import Any, Never, cast
 from rule_candidate_source import (
     RuleCandidateValidationError,
     TextSource,
+    ValidationResult,
     read_source,
 )
 from rule_graph import (
@@ -56,12 +48,17 @@ from rule_graph import (
     parse_history_text,
 )
 from validate_rule_candidate import (
+    _write_json_atomic,
     validate_rule_candidate,
     validate_stack_texts,
 )
 
-REQUEST_VERSION = 4
+REQUEST_VERSION = 5
 ROOT_FIELDS = {
+    "version", "task_temp_root", "request_disposable", "validated_candidate",
+    "validated_candidate_sha256", "candidate_disposable",
+}
+PRODUCER_FIELDS = {
     "version",
     "task_temp_root",
     "request_disposable",
@@ -98,10 +95,10 @@ class CompactParser(argparse.ArgumentParser):
 
 @dataclass
 class PreparedUpdate:
-    """Fully validated candidates and evidence needed for commit/reopen checks."""
+    """Prepared bytes and immutable input identities for one write transaction."""
 
     stack_paths: list[Path]
-    originals: dict[Path, TextSource]
+    originals: dict[Path, bytes]
     candidates: dict[Path, bytes]
     toml_paths: set[Path]
     baseline_reviews: set[str]
@@ -471,11 +468,17 @@ def load_request(path: Path) -> dict[str, Any]:
     return require_fields(data, ROOT_FIELDS, "request")
 
 
-def prepare(request: dict[str, Any]) -> PreparedUpdate:
-    """Build and validate every candidate before any durable target write."""
-    if request["version"] != REQUEST_VERSION:
-        raise ApplicationError(f"request version must be {REQUEST_VERSION}")
-    task_temp_root = verified_task_temp_root(request["task_temp_root"])
+def prepare(
+    request: dict[str, Any], *, validation: ValidationResult | None = None,
+) -> PreparedUpdate:
+    """Producer-only assembly of rule, history and TOML outputs before acceptance.
+
+    The internal request groups the existing history migration/coverage inputs.
+    Callers with a fresh candidate validation pass its result, never rerun it.
+    This function is not the application request handler.
+    """
+    require_fields(request, PRODUCER_FIELDS, "producer request")
+    task_temp_root = require_path(request["task_temp_root"], "task_temp_root")
     request_disposable = request["request_disposable"]
     if not isinstance(request_disposable, bool):
         raise ApplicationError("request_disposable must be boolean")
@@ -519,6 +522,7 @@ def prepare(request: dict[str, Any]) -> PreparedUpdate:
     expected_candidate_hash: str | None = None
     history_by_rules: dict[Path, Path] = {}
     toml_sources: dict[Path, TextSource] = {}
+    plain_sources: dict[Path, TextSource] = {}
     policy_hashes: dict[Path, str] = {}
     candidate_rule_texts = {
         path: source.text for path, source in rule_sources.items()
@@ -554,14 +558,13 @@ def prepare(request: dict[str, Any]) -> PreparedUpdate:
             raise ApplicationError("validation_evidence must differ from candidate")
         if candidate_disposable:
             workflow_artifact(candidate_path, task_temp_root, "candidate")
-        try:
-            validation = validate_rule_candidate(
-                candidate_path,
-                validation_evidence,
-                fix=False,
-            )
-        except RuleCandidateValidationError as error:
-            raise ApplicationError(str(error)) from error
+        if validation is None:
+            try:
+                validation = validate_rule_candidate(
+                    candidate_path, validation_evidence, fix=False,
+                )
+            except RuleCandidateValidationError as error:
+                raise ApplicationError(str(error)) from error
         if validation.candidate_sha256 != expected_candidate_hash:
             raise ApplicationError(
                 "validated candidate changed during check-only validation"
@@ -602,9 +605,12 @@ def prepare(request: dict[str, Any]) -> PreparedUpdate:
                 toml_sources[rules] = source
                 continue
             if target["history"] is None:
-                raise ApplicationError(
-                    f"candidate target lacks companion history: {rules}"
-                )
+                if rules.name.casefold() == "agents.md":
+                    raise ApplicationError(
+                        f"candidate target lacks companion history: {rules}"
+                    )
+                plain_sources[rules] = validation.sources[rules]
+                continue
             history = require_path(
                 target["history"],
                 f"candidate target {index}.history",
@@ -673,7 +679,7 @@ def prepare(request: dict[str, Any]) -> PreparedUpdate:
     operation_values = request["history_operations"]
     if not isinstance(operation_values, list):
         raise ApplicationError("history_operations must be a list")
-    if not operation_values and (not toml_sources or history_by_rules):
+    if not operation_values and (not (toml_sources or plain_sources) or history_by_rules):
         raise ApplicationError(
             "history_operations must be non-empty unless all edits are TOML-only"
         )
@@ -749,7 +755,7 @@ def prepare(request: dict[str, Any]) -> PreparedUpdate:
     if candidate_path is None and not rename_by_history:
         raise ApplicationError("history-only request requires an ID migration")
 
-    originals = dict(toml_sources)
+    originals = {**toml_sources, **plain_sources}
     originals.update(
         {rules: rule_sources[rules] for rules in history_by_rules}
     )
@@ -861,16 +867,9 @@ def prepare(request: dict[str, Any]) -> PreparedUpdate:
         )
     validation_evidence_sha256 = file_hash(validation_evidence)
 
-    for governed_path in {*stack_paths, *originals}:
-        try:
-            governed_path.relative_to(task_temp_root)
-        except ValueError:
-            continue
-        raise ApplicationError("task_temp_root must not contain a governed target")
-
     return PreparedUpdate(
         stack_paths=stack_paths,
-        originals=originals,
+        originals={path: source.raw for path, source in originals.items()},
         candidates=candidates,
         toml_paths=set(toml_sources),
         baseline_reviews=baseline_reviews,
@@ -885,6 +884,135 @@ def prepare(request: dict[str, Any]) -> PreparedUpdate:
         validation_evidence_disposable=evidence_disposable,
         policy_hashes=policy_hashes,
         rule_stack_sha256=expected_stack_hashes,
+    )
+
+
+def candidate_identity(candidate: dict[str, Any]) -> str:
+    """Identify the proposed work independently of its attached acceptance."""
+    inputs = {key: value for key, value in candidate.items() if key != "acceptance"}
+    return hashlib.sha256(
+        json.dumps(inputs, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+
+def accept_candidate(
+    candidate_path: Path, evidence_path: Path, *,
+    expected_context: Mapping[str, object] | None = None, fix: bool = True,
+) -> None:
+    """Validate new work once and freeze its complete output before selection.
+
+    An identical accepted candidate carries its original results. A changed
+    candidate starts new producer work; the old acceptance never approves it.
+    No governed source is written here.
+    """
+    candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+    acceptance = candidate.get("acceptance")
+    if acceptance and acceptance["input_sha256"] == candidate_identity(candidate):
+        _write_json_atomic(evidence_path, acceptance["validation"])
+        return
+    if acceptance is not None:
+        candidate["acceptance"] = None
+        _write_json_atomic(candidate_path, candidate)
+    sources = [require_path(value, "rule_stack") for value in candidate["rule_stack"]]
+    bases = {str(path): file_hash(path) for path in sources}
+    histories = {target["history"] for target in candidate["targets"] if target["history"]}
+    histories.update(operation["history"] for operation in candidate["history_operations"])
+    bases.update({str(require_path(path, "history")): file_hash(require_path(path, "history"))
+                  for path in histories})
+    history_only = not candidate["targets"]
+    validation = None if history_only else validate_rule_candidate(
+        candidate_path, evidence_path, expected_context=expected_context, fix=fix,
+    )
+    if validation is not None:
+        candidate = validation.candidate
+    request = {
+        "version": 4, "task_temp_root": str(candidate_path.parent),
+        "request_disposable": False, "rule_stack": [str(path) for path in sources],
+        "rule_stack_sha256": {str(path): bases[str(path)] for path in sources},
+        "validated_candidate": None if history_only else str(candidate_path),
+        "validated_candidate_sha256": None if history_only else file_hash(candidate_path),
+        "candidate_disposable": False, "validation_evidence": str(evidence_path),
+        "validation_evidence_disposable": False,
+        "history_operations": candidate["history_operations"],
+    }
+    update = prepare(request, validation=validation)
+    # Bind every output (including history) to the exact source snapshot used
+    # by the producer. An intervening edit is different work, not a new check.
+    for path, raw in update.originals.items():
+        if bases[str(path)] != hashlib.sha256(raw).hexdigest():
+            raise ApplicationError(f"source changed during candidate production: {path}")
+    for source_name, digest in bases.items():
+        if file_hash(Path(source_name)) != digest:
+            raise ApplicationError(f"source changed during candidate production: {source_name}")
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    candidate["acceptance"] = {
+        "schema": "ceratops-rule-acceptance.v1",
+        "input_sha256": candidate_identity(candidate),
+        "base_sha256": bases,
+        "outputs": {
+            str(path): base64.b64encode(raw).decode("ascii")
+            for path, raw in update.candidates.items()
+        },
+        "validation": evidence,
+        "check_versions": {
+            name: file_hash(Path(__file__).with_name(name))
+            for name in ("apply_rules_update.py", "validate_rule_candidate.py",
+                         "rule_candidate_source.py", "rule_graph.py")
+        },
+    }
+    _write_json_atomic(candidate_path, candidate)
+    # The public evidence references the full frozen artifact; its embedded
+    # original validation still identifies the input it actually checked.
+    evidence = {**evidence, "candidate_sha256": file_hash(candidate_path)}
+    _write_json_atomic(evidence_path, evidence)
+
+
+def load_accepted_update(request: dict[str, Any]) -> PreparedUpdate:
+    """Load frozen bytes after identity checks, without invoking producer code."""
+    if request["version"] != REQUEST_VERSION:
+        raise ApplicationError(f"request version must be {REQUEST_VERSION}")
+    root = verified_task_temp_root(request["task_temp_root"])
+    for field in ("request_disposable", "candidate_disposable"):
+        if not isinstance(request[field], bool):
+            raise ApplicationError(f"{field} must be boolean")
+    path = require_path(request["validated_candidate"], "validated_candidate")
+    reject_link_chain(path, "candidate")
+    digest = require_sha256(request["validated_candidate_sha256"], "candidate hash")
+    if file_hash(path) != digest:
+        raise ApplicationError("validated_candidate_sha256 is stale")
+    candidate = json.loads(path.read_text(encoding="utf-8"))
+    acceptance = candidate.get("acceptance")
+    if not isinstance(acceptance, dict) or acceptance.get("schema") != "ceratops-rule-acceptance.v1":
+        raise ApplicationError("candidate has no producer acceptance")
+    if acceptance["input_sha256"] != candidate_identity(candidate):
+        raise ApplicationError("candidate differs from its accepted input")
+    bases = {require_path(value, "base"): digest
+             for value, digest in acceptance["base_sha256"].items()}
+    outputs = {require_path(value, "output"): base64.b64decode(raw, validate=True)
+               for value, raw in acceptance["outputs"].items()}
+    if not outputs or not set(outputs).issubset(bases):
+        raise ApplicationError("accepted outputs lack destination base identities")
+    originals = {}
+    for destination, expected in bases.items():
+        reject_link_chain(destination, "destination")
+        if destination == root or root in destination.parents:
+            raise ApplicationError("task_temp_root must not contain a governed target")
+        raw = destination.read_bytes()
+        if hashlib.sha256(raw).hexdigest() != expected:
+            raise ApplicationError(f"source changed since acceptance: {destination}")
+        if destination in outputs:
+            originals[destination] = raw
+    if request["candidate_disposable"]:
+        workflow_artifact(path, root, "candidate")
+    return PreparedUpdate(
+        stack_paths=list(bases), originals=originals, candidates=outputs,
+        toml_paths=set(), baseline_reviews=set(), expected_history_entries={},
+        task_temp_root=root, request_disposable=request["request_disposable"],
+        candidate_path=path, candidate_sha256=digest,
+        candidate_disposable=request["candidate_disposable"],
+        validation_evidence=path, validation_evidence_sha256=digest,
+        validation_evidence_disposable=False, policy_hashes={},
+        rule_stack_sha256=bases,
     )
 
 
@@ -906,7 +1034,7 @@ def staged_copy(path: Path, payload: bytes, suffix: str) -> Path:
 def rollback(
     applied: list[Path],
     backups: dict[Path, Path],
-    originals: dict[Path, TextSource],
+    originals: dict[Path, bytes],
 ) -> list[str]:
     """Restore every replaced target and verify its exact original bytes."""
     failures: list[str] = []
@@ -919,7 +1047,7 @@ def rollback(
     # rollback owns only writes attempted by this transaction.
     for path in applied:
         try:
-            if path.read_bytes() != originals[path].raw and str(path) not in failures:
+            if path.read_bytes() != originals[path] and str(path) not in failures:
                 failures.append(str(path))
         except OSError:
             if str(path) not in failures:
@@ -928,56 +1056,24 @@ def rollback(
 
 
 def verify_application_inputs(update: PreparedUpdate) -> None:
-    """Recheck the exact approved artifact and skill-owned Markdown policy."""
-
+    """Compare only the immutable candidate identity, never its old check version."""
     if update.candidate_path is not None:
         if file_hash(update.candidate_path) != update.candidate_sha256:
             raise ApplicationError("validated candidate changed before application")
-    for configuration, expected_hash in update.policy_hashes.items():
-        if file_hash(configuration) != expected_hash:
-            raise ApplicationError(
-                f"Markdown policy changed before application: {configuration}"
-            )
 
 
 def verify_rule_stack_inputs(update: PreparedUpdate) -> None:
-    """Reject rule-source drift before any transaction write."""
-
+    """Prevent an accepted proposal from overwriting a different destination base."""
     for path, expected_hash in update.rule_stack_sha256.items():
         if file_hash(path) != expected_hash:
             raise ApplicationError(f"rule source changed before application: {path}")
 
 
-def revalidate(update: PreparedUpdate) -> None:
-    """Reopen committed targets and repeat shared validation and byte checks."""
+def verify_written_identity(update: PreparedUpdate) -> None:
+    """Check write integrity only; acceptance belongs to the original producer."""
     for path, expected in update.candidates.items():
-        if path.read_bytes() != expected:
+        if file_hash(path) != hashlib.sha256(expected).hexdigest():
             raise ApplicationError(f"post-write bytes differ: {path}")
-    verify_application_inputs(update)
-    for path, expected_hash in update.rule_stack_sha256.items():
-        if path not in update.candidates and file_hash(path) != expected_hash:
-            raise ApplicationError(f"unchanged rule source drifted: {path}")
-    reopened_rules = {
-        path: read_source(path, "rules source").text
-        for path in update.stack_paths
-    }
-    _, _, reviews = validate_stack_texts(
-        update.stack_paths,
-        reopened_rules,
-        label="invalid reopened rule stack",
-    )
-    if reviews - update.baseline_reviews:
-        raise ApplicationError("reopened rule stack adds a semantic review")
-    for path in update.toml_paths:
-        try:
-            tomllib.loads(read_source(path, "TOML source").text)
-        except tomllib.TOMLDecodeError as error:
-            raise ApplicationError(
-                f"invalid reopened TOML: {path}: {error}"
-            ) from error
-    for history, expected_entries in update.expected_history_entries.items():
-        if load_history_source(history) != expected_entries:
-            raise ApplicationError(f"reopened history differs: {history}")
 
 
 def commit(update: PreparedUpdate) -> None:
@@ -990,19 +1086,19 @@ def commit(update: PreparedUpdate) -> None:
         verify_application_inputs(update)
         verify_rule_stack_inputs(update)
         for path in targets:
-            backups[path] = staged_copy(path, update.originals[path].raw, ".bak")
+            backups[path] = staged_copy(path, update.originals[path], ".bak")
             staged[path] = staged_copy(path, update.candidates[path], ".new")
         for path in targets:
             verify_application_inputs(update)
-            if path.read_bytes() != update.originals[path].raw:
+            if path.read_bytes() != update.originals[path]:
                 raise ApplicationError(f"source changed before commit: {path}")
         for path in targets:
             verify_application_inputs(update)
-            if path.read_bytes() != update.originals[path].raw:
+            if path.read_bytes() != update.originals[path]:
                 raise ApplicationError(f"source changed during commit: {path}")
             applied.append(path)
             os.replace(staged[path], path)
-        revalidate(update)
+        verify_written_identity(update)
     except (Exception, KeyboardInterrupt) as error:
         failures = rollback(applied, backups, update.originals)
         if failures:
@@ -1034,14 +1130,14 @@ def main() -> int:
         if not request_path.is_file():
             raise ApplicationError(f"request does not exist: {request_path}")
         request_sha256 = file_hash(request_path)
-        update = prepare(load_request(request_path))
+        update = load_accepted_update(load_request(request_path))
         if update.request_disposable:
             request_path = workflow_artifact(
                 request_path,
                 update.task_temp_root,
                 "request",
             )
-        protected_inputs = {update.validation_evidence}
+        protected_inputs: set[Path] = set()
         if update.candidate_path is not None:
             protected_inputs.add(update.candidate_path)
         if request_path in protected_inputs:

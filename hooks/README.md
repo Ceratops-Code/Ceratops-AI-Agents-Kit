@@ -137,10 +137,11 @@ Successful annotated commands emit no helper message. When execution fails or
 PowerShell records a new error, the helper preserves the native error and
 appends one compact hint for each matched finding.
 
-Wrapped commands and module preflights disable PowerShell progress in their
-child process, including module-preparation progress. Native output, warnings,
-errors, and exit codes remain visible; no output stream is filtered and no
-user-global preference is changed.
+Wrapped commands and module preflights disable PowerShell progress and set the
+child process's console input, console output, and native-pipeline encoding to
+UTF-8 without a BOM before command execution. Native output, warnings, errors,
+and exit codes remain visible; no output stream is filtered and no user-global
+preference is changed.
 
 When direct mode launches Windows PowerShell, it removes inherited
 `PSModulePath` so that the process reconstructs compatible defaults. Commands

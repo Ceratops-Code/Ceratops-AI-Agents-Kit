@@ -9,14 +9,12 @@ import pathlib
 import posixpath
 import re
 import subprocess
-import sys
-import tomllib
 import xml.etree.ElementTree as ET
 from typing import Any
 
+import tomllib
 import yaml
 from ceratops_repo_compatibility_engine.sdlc_contract_validation import (
-    migration_proposal,
     read_contract,
 )
 from ceratops_repo_compatibility_engine.validate_ceratops_compatibility import (
@@ -35,12 +33,8 @@ PUBLISH_RE = re.compile(
     r"goreleaser release|wingetcreate submit)",
     re.IGNORECASE,
 )
-DOCKER_BUILD_PUSH_ACTION_RE = re.compile(
-    r"docker/build-push-action@", re.IGNORECASE
-)
-DOCKER_PUSH_ENABLED_RE = re.compile(
-    r"(?im)^\s*push\s*:\s*['\"]?true['\"]?\s*(?:#.*)?$"
-)
+DOCKER_BUILD_PUSH_ACTION_RE = re.compile(r"docker/build-push-action@", re.IGNORECASE)
+DOCKER_PUSH_ENABLED_RE = re.compile(r"(?im)^\s*push\s*:\s*['\"]?true['\"]?\s*(?:#.*)?$")
 SITE_PUBLISH_RE = re.compile(
     r"(actions/deploy-pages@|peaceiris/actions-gh-pages@|"
     r"github-pages-deploy-action@|mkdocs\s+gh-deploy\b|"
@@ -139,6 +133,8 @@ WINDOWS_PATH_PREFIX_DEFAULTS = {
     "%SystemRoot%": ("SystemRoot", r"C:\Windows"),
 }
 WINDOWS_PATH_BOUNDARIES = frozenset("\\/\"'`,;)]}\r\n\t")
+
+
 def path_matches(paths: list[str], patterns: list[str]) -> bool:
     """Return whether any normalized repository path matches any glob."""
 
@@ -159,15 +155,21 @@ def matching_paths(paths: list[str], patterns: list[str]) -> list[str]:
 
 
 def _dependabot_ecosystems(
-    paths: list[str], texts: dict[str, str] | None = None,
+    paths: list[str],
+    texts: dict[str, str] | None = None,
 ) -> dict[str, list[str]]:
     """Infer Dependabot ecosystems without double-counting uv projects as pip."""
 
     # Dependency manifests may live under a tooling or application directory.
     # Keep workflow patterns anchored, while basename patterns cover any depth.
     patterns_by_ecosystem = {
-        name: [item for pattern in patterns for item in
-               ([pattern, "**/" + pattern] if "/" not in pattern else [pattern])]
+        name: [
+            item
+            for pattern in patterns
+            for item in (
+                [pattern, "**/" + pattern] if "/" not in pattern else [pattern]
+            )
+        ]
         for name, patterns in DEPENDABOT_PATTERNS.items()
     }
     ecosystems = {
@@ -187,14 +189,16 @@ def _dependabot_ecosystems(
         members, excluded = _workspace_patterns("uv", manifest, texts or {})
         root = pathlib.PurePosixPath(manifest).parent
         uv_manifests.update(
-            path for path in paths if path.endswith("/pyproject.toml")
-            and _workspace_member(root, pathlib.PurePosixPath(path).parent, members, excluded)
+            path
+            for path in paths
+            if path.endswith("/pyproject.toml")
+            and _workspace_member(
+                root, pathlib.PurePosixPath(path).parent, members, excluded
+            )
         )
     ecosystems["uv"] = sorted({*ecosystems["uv"], *uv_manifests})
 
-    pip_paths = [
-        path for path in ecosystems.get("pip", []) if path not in uv_manifests
-    ]
+    pip_paths = [path for path in ecosystems.get("pip", []) if path not in uv_manifests]
     if pip_paths:
         ecosystems["pip"] = pip_paths
     else:
@@ -203,7 +207,9 @@ def _dependabot_ecosystems(
 
 
 def _workspace_patterns(
-    ecosystem: str, manifest: str, texts: dict[str, str],
+    ecosystem: str,
+    manifest: str,
+    texts: dict[str, str],
 ) -> tuple[list[str], list[str]]:
     """Read declared workspace membership without executing project code."""
     try:
@@ -213,38 +219,63 @@ def _workspace_patterns(
             members = document.get("workspaces", [])
             if isinstance(members, dict):
                 members = members.get("packages", [])
-            pnpm = (pathlib.PurePosixPath(manifest).parent / "pnpm-workspace.yaml").as_posix()
+            pnpm = (
+                pathlib.PurePosixPath(manifest).parent / "pnpm-workspace.yaml"
+            ).as_posix()
             if pnpm in texts:
                 members = yaml.safe_load(texts[pnpm]).get("packages", [])
             excluded: Any = []
         else:
             document = tomllib.loads(content)
-            workspace = (document.get("tool", {}).get("uv", {})
-                         if ecosystem == "uv" else document).get("workspace", {})
-            members, excluded = workspace.get("members", []), workspace.get("exclude", [])
+            workspace = (
+                document.get("tool", {}).get("uv", {})
+                if ecosystem == "uv"
+                else document
+            ).get("workspace", {})
+            members, excluded = (
+                workspace.get("members", []),
+                workspace.get("exclude", []),
+            )
         if not isinstance(members, list) or not isinstance(excluded, list):
             return [], []
-        return ([item for item in members if isinstance(item, str) and not item.startswith("!")],
-                [item for item in excluded if isinstance(item, str)]
-                + [item[1:] for item in members if isinstance(item, str) and item.startswith("!")])
+        return (
+            [
+                item
+                for item in members
+                if isinstance(item, str) and not item.startswith("!")
+            ],
+            [item for item in excluded if isinstance(item, str)]
+            + [
+                item[1:]
+                for item in members
+                if isinstance(item, str) and item.startswith("!")
+            ],
+        )
     except (ValueError, TypeError, AttributeError, yaml.YAMLError):
         # Invalid project metadata cannot prove membership; keep child coverage explicit.
         return [], []
 
 
 def _workspace_member(
-    root: pathlib.PurePosixPath, candidate: pathlib.PurePosixPath,
-    members: list[str], excluded: list[str],
+    root: pathlib.PurePosixPath,
+    candidate: pathlib.PurePosixPath,
+    members: list[str],
+    excluded: list[str],
 ) -> bool:
     if candidate == root or not candidate.is_relative_to(root):
         return False
     relative = candidate.relative_to(root)
-    return (any(relative.full_match(pattern, case_sensitive=True) for pattern in members)
-            and not any(relative.full_match(pattern, case_sensitive=True) for pattern in excluded))
+    return any(
+        relative.full_match(pattern, case_sensitive=True) for pattern in members
+    ) and not any(
+        relative.full_match(pattern, case_sensitive=True) for pattern in excluded
+    )
 
 
 def _dependabot_project_links(
-    ecosystem: str, manifests: list[str], texts: dict[str, str],
+    ecosystem: str,
+    manifests: list[str],
+    texts: dict[str, str],
 ) -> dict[str, set[str]]:
     """Map project directories to statically declared child projects.
 
@@ -252,39 +283,68 @@ def _dependabot_project_links(
     Dynamic build declarations that cannot be resolved remain explicit coverage
     candidates. This is a configuration check, not execution of Dependabot.
     """
-    directories = {"/" + (str(parent) if str(parent) != "." else "")
-                   for path in manifests for parent in [pathlib.PurePosixPath(path).parent]}
+    directories = {
+        "/" + (str(parent) if str(parent) != "." else "")
+        for path in manifests
+        for parent in [pathlib.PurePosixPath(path).parent]
+    }
     links: dict[str, set[str]] = {directory: set() for directory in directories}
     for manifest in manifests:
         parent = pathlib.PurePosixPath(manifest).parent
         directory = "/" + (parent.as_posix() if parent.as_posix() != "." else "")
         name = pathlib.PurePosixPath(manifest).name
-        if (ecosystem, name) in {("npm", "package.json"), ("uv", "pyproject.toml"), ("cargo", "Cargo.toml")}:
+        if (ecosystem, name) in {
+            ("npm", "package.json"),
+            ("uv", "pyproject.toml"),
+            ("cargo", "Cargo.toml"),
+        }:
             members, excluded = _workspace_patterns(ecosystem, manifest, texts)
             links[directory].update(
-                candidate for candidate in directories
-                if _workspace_member(parent, pathlib.PurePosixPath(candidate.lstrip("/")), members, excluded)
+                candidate
+                for candidate in directories
+                if _workspace_member(
+                    parent,
+                    pathlib.PurePosixPath(candidate.lstrip("/")),
+                    members,
+                    excluded,
+                )
             )
         references = []
         if ecosystem == "maven":
             try:
                 document = ET.fromstring(texts.get(manifest, ""))
-                references = [element.text.strip() for element in document.iter()
-                              if element.tag.split("}")[-1] == "module" and element.text]
+                references = [
+                    element.text.strip()
+                    for element in document.iter()
+                    if element.tag.split("}")[-1] == "module" and element.text
+                ]
             except ET.ParseError:
                 pass
         elif ecosystem == "gradle":
             # Dependabot resolves Gradle's literal include/includeBuild declarations.
-            settings = "\n".join(texts.get((parent / filename).as_posix(), "")
-                                 for filename in ("settings.gradle", "settings.gradle.kts"))
-            for declaration in re.findall(r"(?m)^\s*include(?:Build)?\s*(?:\(([^)]*)\)|([^\n]+))", settings):
-                references.extend(value.replace(":", "/").lstrip("/")
-                                  for value in re.findall(r"['\"]([^'\"]+)['\"]", "".join(declaration)))
+            settings = "\n".join(
+                texts.get((parent / filename).as_posix(), "")
+                for filename in ("settings.gradle", "settings.gradle.kts")
+            )
+            for declaration in re.findall(
+                r"(?m)^\s*include(?:Build)?\s*(?:\(([^)]*)\)|([^\n]+))", settings
+            ):
+                references.extend(
+                    value.replace(":", "/").lstrip("/")
+                    for value in re.findall(
+                        r"['\"]([^'\"]+)['\"]", "".join(declaration)
+                    )
+                )
             if (parent / "buildSrc" / name).as_posix() in manifests:
                 references.append("buildSrc")
         elif ecosystem == "nuget" and name.endswith(".sln"):
-            references = [posixpath.dirname(value.replace("\\", "/"))
-                          for value in re.findall(r'Project\([^\n]+?=\s*"[^"\n]*",\s*"([^"\n]+\.(?:csproj|fsproj|vbproj))"', texts.get(manifest, ""))]
+            references = [
+                posixpath.dirname(value.replace("\\", "/"))
+                for value in re.findall(
+                    r'Project\([^\n]+?=\s*"[^"\n]*",\s*"([^"\n]+\.(?:csproj|fsproj|vbproj))"',
+                    texts.get(manifest, ""),
+                )
+            ]
         for reference in references:
             candidate = posixpath.normpath(posixpath.join(directory, reference))
             if candidate in directories and candidate != directory:
@@ -292,7 +352,9 @@ def _dependabot_project_links(
     return links
 
 
-def dependabot_coverage(local: dict[str, Any], default_branch: str = "") -> dict[str, Any]:
+def dependabot_coverage(
+    local: dict[str, Any], default_branch: str = ""
+) -> dict[str, Any]:
     """Validate parsed update entries against detected manifest directories.
 
     GitHub's singular directory is literal; directories may contain globs.
@@ -304,10 +366,14 @@ def dependabot_coverage(local: dict[str, Any], default_branch: str = "") -> dict
     text = local.get("texts", {}).get(metadata.get("config_path"), "")
     result: dict[str, Any] = {
         "config_present": bool(metadata.get("config_path")),
-        "text_available": bool(text), "ecosystems": sorted(ecosystems),
-        "missing_ecosystems": [], "missing_manifest_directories": [],
-        "unmatched_configured_directories": [], "config_errors": [],
-        "updates_present": False, "schedule_present": False,
+        "text_available": bool(text),
+        "ecosystems": sorted(ecosystems),
+        "missing_ecosystems": [],
+        "missing_manifest_directories": [],
+        "unmatched_configured_directories": [],
+        "config_errors": [],
+        "updates_present": False,
+        "schedule_present": False,
     }
     errors = result["config_errors"]
     try:
@@ -324,8 +390,11 @@ def dependabot_coverage(local: dict[str, Any], default_branch: str = "") -> dict
     result["updates_present"] = bool(updates)
     schedules = []
     projects: dict[str, dict[str, set[str]]] = {
-        name: ({"/": set()} if name == "github-actions" else
-               _dependabot_project_links(name, paths, local.get("texts", {})))
+        name: (
+            {"/": set()}
+            if name == "github-actions"
+            else _dependabot_project_links(name, paths, local.get("texts", {}))
+        )
         for name, paths in ecosystems.items()
     }
     covered: dict[str, set[str]] = {name: set() for name in ecosystems}
@@ -347,24 +416,37 @@ def dependabot_coverage(local: dict[str, Any], default_branch: str = "") -> dict
         configured.add(ecosystem)
         plural = "directories" in update
         if plural == ("directory" in update):
-            errors.append(f"{label} must specify exactly one of directory or directories")
+            errors.append(
+                f"{label} must specify exactly one of directory or directories"
+            )
             continue
         directories = update.get("directories") if plural else [update.get("directory")]
         if not isinstance(directories, list) or not directories:
             errors.append(f"{label}.directories must be a nonempty list")
             continue
         for pattern in directories:
-            if (not isinstance(pattern, str) or not pattern.startswith("/")
-                    or pattern.startswith("//") or "\\" in pattern
-                    or any(part in {".", ".."} for part in pattern.split("/"))
-                    or (not plural and any(char in pattern for char in "*?[]"))):
+            if (
+                not isinstance(pattern, str)
+                or not pattern.startswith("/")
+                or pattern.startswith("//")
+                or "\\" in pattern
+                or any(part in {".", ".."} for part in pattern.split("/"))
+                or (not plural and any(char in pattern for char in "*?[]"))
+            ):
                 errors.append(f"{label} has an invalid manifest directory: {pattern!r}")
                 continue
             pattern = pattern.rstrip("/") or "/"
-            matched = {directory for directory in projects.get(ecosystem, {})
-                       if pathlib.PurePosixPath(directory).full_match(pattern, case_sensitive=True)}
+            matched = {
+                directory
+                for directory in projects.get(ecosystem, {})
+                if pathlib.PurePosixPath(directory).full_match(
+                    pattern, case_sensitive=True
+                )
+            }
             if not matched and ecosystem in ecosystems:
-                result["unmatched_configured_directories"].append(f"{ecosystem}: {pattern}")
+                result["unmatched_configured_directories"].append(
+                    f"{ecosystem}: {pattern}"
+                )
             # Follow declared workspace/module edges, including nested workspaces.
             pending = list(matched)
             while pending:
@@ -376,10 +458,13 @@ def dependabot_coverage(local: dict[str, Any], default_branch: str = "") -> dict
     result["schedule_present"] = bool(schedules) and all(schedules)
     result["missing_ecosystems"] = sorted(set(ecosystems) - configured)
     result["missing_manifest_directories"] = sorted(
-        f"{name}: {directory}" for name, directories in projects.items()
+        f"{name}: {directory}"
+        for name, directories in projects.items()
         for directory in set(directories) - covered[name]
     )
-    result["unmatched_configured_directories"] = sorted(set(result["unmatched_configured_directories"]))
+    result["unmatched_configured_directories"] = sorted(
+        set(result["unmatched_configured_directories"])
+    )
     return result
 
 
@@ -502,12 +587,17 @@ def _has_ignored_windows_prefix(
 ) -> bool:
     candidate = _collapse_source_backslashes(text[start:]).casefold()
     for configured in configured_prefixes:
-        prefix = _collapse_source_backslashes(
-            _expanded_windows_path_prefix(configured)
-        ).rstrip("\\/").casefold()
+        prefix = (
+            _collapse_source_backslashes(_expanded_windows_path_prefix(configured))
+            .rstrip("\\/")
+            .casefold()
+        )
         if not prefix or not candidate.startswith(prefix):
             continue
-        if len(candidate) == len(prefix) or candidate[len(prefix)] in WINDOWS_PATH_BOUNDARIES:
+        if (
+            len(candidate) == len(prefix)
+            or candidate[len(prefix)] in WINDOWS_PATH_BOUNDARIES
+        ):
             return True
     return False
 
@@ -599,6 +689,7 @@ def _git_state(local: dict[str, Any], default_branch: str | None) -> dict[str, A
             encoding="utf-8",
             errors="replace",
             capture_output=True,
+            check=False,
         )
         return process.returncode, process.stdout.strip()
 
@@ -890,9 +981,7 @@ def _manifest_facts(local: dict[str, Any]) -> dict[str, Any]:
     )
     # MavenPublication inherits artifactId from the project name, while group and
     # version remain unusable defaults unless the build declares them.
-    gradle_publication_present = bool(
-        re.search(r"\bMavenPublication\b", gradle_text)
-    )
+    gradle_publication_present = bool(re.search(r"\bMavenPublication\b", gradle_text))
     cargo = texts.get("Cargo.toml", "")
     gemspec_text = "\n".join(
         texts.get(path, "") for path in matching_paths(files, ["*.gemspec"])
@@ -1050,10 +1139,6 @@ def _sdlc_contract_facts(local: dict[str, Any]) -> dict[str, Any]:
         "valid": contract is not None and not errors,
         "errors": errors,
     }
-    if contract is not None:
-        proposal = migration_proposal(contract, local["root"])
-        if proposal is not None:
-            facts["migration_proposal"] = proposal
     return facts
 
 
@@ -1068,15 +1153,9 @@ def _compatibility_facts(local: dict[str, Any]) -> CompatibilityResult:
 def _repository_validation_facts(
     local: dict[str, Any],
     rules: list[dict[str, Any]],
-    evidence_file: str | None,
+    _evidence_file: str | None,
 ) -> dict[str, Any]:
-    """Run SDLC validation and tests once, retaining the separate gate results.
-
-    Targets use this skill bundle's engine. Without a validation-capable SDLC,
-    retain the repository validator.
-    The selected health action may execute deterministic skill bindings. CI has
-    its own --ci boundary and never dispatches them.
-    """
+    """Report repository-validation readiness without running repository checks."""
 
     selected = any(rule.get("id") == "content.repository_validation" for rule in rules)
     if not selected or not local["available"] or not local["root"]:
@@ -1092,65 +1171,18 @@ def _repository_validation_facts(
         errors.append("scripts/validate-repository.py must be a regular file")
     if not workflow_present:
         errors.append(".github/workflows/validate.yml must be a regular file")
-    if not evidence_file:
-        errors.append("--evidence-file is required for local repository validation")
-        resolved_evidence = None
-    else:
-        resolved_evidence = pathlib.Path(evidence_file).expanduser().resolve()
-        if resolved_evidence.is_relative_to(root):
-            errors.append("--evidence-file must be outside --local-repo-path")
-    if errors:
-        return {
-            "applicable": True,
-            "validator_present": validator_present,
-            "workflow_present": workflow_present,
-            "valid": False,
-            "errors": errors,
-        }
-
-    assert resolved_evidence is not None
-    command = [sys.executable, str(validator)]
     contract_path = root / "sdlc/sdlc.yml"
-    uses_sdlc = False
-    if contract_path.exists() or contract_path.is_symlink():
-        contract, contract_errors = read_contract(contract_path)
-        if contract_path.is_symlink() or contract_errors:
-            return {"applicable": True, "validator_present": True, "workflow_present": True,
-                    "valid": False, "errors": contract_errors or ["SDLC must be a regular repository file"]}
-        if contract and contract["version"] >= 2:
-            uses_sdlc = True
-            command = [
-                sys.executable, str(pathlib.Path(__file__).resolve().parents[2] / "repository_operation.py"),
-                "--repo-root", str(root), "--validate", "--tests",
-            ]
-    command.extend(("--evidence-file", str(resolved_evidence)))
-    gate_results: dict[str, Any] = {}
-    try:
-        result = subprocess.run(command, cwd=root, capture_output=True, text=True, check=False)
-    except OSError as exc:
-        return {"applicable": True, "validator_present": True, "workflow_present": True,
-                "valid": False, "errors": [str(exc)]}
-    if result.returncode:
-        message = (result.stdout or result.stderr).strip()
-        errors = [message[-4096:] or f"repository checks exited {result.returncode}"]
-    if uses_sdlc:
-        try:
-            payload = json.loads(result.stderr if result.returncode else result.stdout)
-            if not isinstance(payload, dict):
-                raise ValueError("SDLC result must be an object")
-            gate_results = {"gate_results": payload.get("results", []),
-                            "pending_operations": payload.get("pending_operations", [])}
-        except ValueError:
-            # uv can fail before Python starts; preserve that setup diagnostic.
-            if not result.returncode:
-                errors = ["SDLC returned no structured validation/test result"]
+    if contract_path.is_symlink():
+        errors.append("SDLC must be a regular repository file")
+    elif contract_path.exists():
+        _, contract_errors = read_contract(contract_path)
+        errors.extend(contract_errors)
     return {
         "applicable": True,
-        "validator_present": True,
-        "workflow_present": True,
-        "valid": result.returncode == 0 and not errors,
+        "validator_present": validator_present,
+        "workflow_present": workflow_present,
+        "valid": not errors,
         "errors": errors,
-        **gate_results,
     }
 
 
@@ -1172,9 +1204,7 @@ def collect_local_repository(
         if not patterns:
             continue
         ignored = list(collection.get("ignore_paths", []))
-        ignored_windows_prefixes = collection.get(
-            "ignore_windows_path_prefixes", []
-        )
+        ignored_windows_prefixes = collection.get("ignore_windows_path_prefixes", [])
         matches: list[dict[str, str]] = []
         for pattern in patterns:
             regex = re.compile(pattern)

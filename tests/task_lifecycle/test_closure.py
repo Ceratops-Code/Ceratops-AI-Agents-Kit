@@ -11,6 +11,13 @@ import pytest
 from tests.support.repositories import ROOT, run_git
 
 CLOSURE_SNAPSHOT = ROOT / "skills" / "ceratops-task-lifecycle" / "scripts" / "closure_snapshot.py"
+REPOSITORY_STATUS_SNAPSHOT = (
+    ROOT
+    / "skills"
+    / "ceratops-task-lifecycle"
+    / "scripts"
+    / "repository-status-snapshot.py"
+)
 CREDIT_SKILL = ROOT / "skills" / "ceratops-credit-savings-analysis" / "SKILL.md"
 CREDIT_CONTRACT = (
     ROOT
@@ -171,6 +178,108 @@ def test_closure_snapshot_composes_only_named_local_state(
     )
     assert invalid.returncode == 2
     assert "must be provided together" in invalid.stderr
+
+
+def test_repository_status_snapshot_enumerates_and_binds_fresh_shipping_state(
+    tmp_path: pathlib.Path,
+) -> None:
+    remote = tmp_path / "remote.git"
+    repo = tmp_path / "repo"
+    feature = tmp_path / "feature-worktree"
+    repo.mkdir()
+    assert run_git(tmp_path, "init", "--bare", str(remote)).returncode == 0
+    assert run_git(repo, "init", "-b", "main").returncode == 0
+    assert run_git(repo, "config", "user.name", "Status Test").returncode == 0
+    assert run_git(repo, "config", "user.email", "status@example.invalid").returncode == 0
+    (repo / "README.md").write_text("base\n", encoding="utf-8", newline="\n")
+    assert run_git(repo, "add", "README.md").returncode == 0
+    assert run_git(repo, "commit", "-m", "base status").returncode == 0
+    assert run_git(repo, "branch", "release/local").returncode == 0
+    assert run_git(repo, "branch", "dormant").returncode == 0
+    assert run_git(repo, "remote", "add", "origin", str(remote)).returncode == 0
+    assert run_git(repo, "push", "-u", "origin", "main").returncode == 0
+    assert (
+        run_git(
+            repo,
+            "worktree",
+            "add",
+            "-b",
+            "codex/status-feature",
+            str(feature),
+            "main",
+        ).returncode
+        == 0
+    )
+    (feature / "feature.txt").write_text("feature\n", encoding="utf-8", newline="\n")
+    assert run_git(feature, "add", "feature.txt").returncode == 0
+    assert run_git(feature, "commit", "-m", "implement feature").returncode == 0
+
+    stale_output = tmp_path / "stale.json"
+    stale = subprocess.run(
+        [
+            sys.executable,
+            str(REPOSITORY_STATUS_SNAPSHOT),
+            "--repo",
+            str(repo),
+            "--release-ref",
+            "release/local",
+            "--remote-base-ref",
+            "origin/main",
+            "--output",
+            str(stale_output),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert stale.returncode == 0, stale.stderr
+    stale_packet = json.loads(stale_output.read_text(encoding="utf-8"))
+    assert stale.stdout.strip() == "OK"
+    assert stale_packet["remote_base"]["fresh"] is False
+    assert {record["shipped"] for record in stale_packet["records"]} == {
+        "Unavailable"
+    }
+
+    fresh_output = tmp_path / "fresh.json"
+    fresh = subprocess.run(
+        [
+            sys.executable,
+            str(REPOSITORY_STATUS_SNAPSHOT),
+            "--repo",
+            str(repo),
+            "--release-ref",
+            "release/local",
+            "--remote-base-ref",
+            "origin/main",
+            "--fetch",
+            "--output",
+            str(fresh_output),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert fresh.returncode == 0, fresh.stderr
+    packet = json.loads(fresh_output.read_text(encoding="utf-8"))
+    assert packet["schema"] == "ceratops-repository-status-snapshot.v1"
+    records = packet["records"]
+    keys = {(record["branch"], record["worktree"]) for record in records}
+    assert ("main", str(repo.resolve())) in keys
+    assert ("codex/status-feature", str(feature.resolve())) in keys
+    assert ("dormant", "-") in keys
+    assert ("release/local", "-") in keys
+    assert ("origin/main", "-") in keys
+    feature_record = next(
+        record for record in records if record["branch"] == "codex/status-feature"
+    )
+    assert feature_record["promoted"] == "No"
+    assert feature_record["shipped"] == "No"
+    assert feature_record["release_evidence"]["unique_commits"]["items"] == [
+        "implement feature"
+    ]
+    assert feature_record["release_evidence"]["diff"]["paths"]["items"] == [
+        "feature.txt"
+    ]
 
 
 def test_explicit_credit_analysis_routes_to_deep_thread_analysis() -> None:

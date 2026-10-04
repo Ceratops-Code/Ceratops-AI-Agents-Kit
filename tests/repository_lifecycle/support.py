@@ -17,8 +17,15 @@ REPOSITORY_LIFECYCLE_SOURCE = ROOT / "skills" / "ceratops-repo-lifecycle"
 REPOSITORY_LIFECYCLE_SCRIPTS = REPOSITORY_LIFECYCLE_SOURCE / "scripts"
 if str(REPOSITORY_LIFECYCLE_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_LIFECYCLE_SCRIPTS))
-SDLC_CONTRACT_TEMPLATE = REPOSITORY_LIFECYCLE_SOURCE / "references" / "templates" / "sdlc.yml.tmpl"
-SECTION_MANIFEST_TEMPLATE = REPOSITORY_LIFECYCLE_SOURCE / "references" / "templates" / "skill-sections.json.tmpl"
+SDLC_CONTRACT_TEMPLATE = (
+    REPOSITORY_LIFECYCLE_SOURCE / "references" / "templates" / "sdlc.yml.tmpl"
+)
+SECTION_MANIFEST_TEMPLATE = (
+    REPOSITORY_LIFECYCLE_SOURCE
+    / "references"
+    / "templates"
+    / "skill-sections.json.tmpl"
+)
 OPERATION_RUNNER = REPOSITORY_LIFECYCLE_SCRIPTS / "repository_operation.py"
 PROMOTE_REPOSITORY = REPOSITORY_LIFECYCLE_SOURCE / "scripts" / "promote-repository.py"
 MANAGE_PENDING_WORK = REPOSITORY_LIFECYCLE_SOURCE / "scripts" / "manage-pending-work.py"
@@ -27,9 +34,7 @@ PR_WORKFLOW_SCRIPTS = REPOSITORY_LIFECYCLE_SOURCE / "scripts"
 PR_WORKFLOW_ENTRYPOINT = PR_WORKFLOW_SCRIPTS / "github_pr_workflow" / "__main__.py"
 
 
-def load_pr_workflow_module(
-    monkeypatch: pytest.MonkeyPatch, name: str
-) -> Any:
+def load_pr_workflow_module(monkeypatch: pytest.MonkeyPatch, name: str) -> Any:
     """Load one source workflow module without using the installed runtime."""
 
     monkeypatch.syspath_prepend(str(PR_WORKFLOW_SCRIPTS))
@@ -75,6 +80,7 @@ def run_operation_cli(
     parameters_if_declared: tuple[str, ...] = (),
     if_declared: bool = False,
     prepare_only: bool = False,
+    ci: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     """Run an isolated ordered capability selection."""
 
@@ -84,9 +90,7 @@ def run_operation_cli(
         "--repo-root",
         str(repo),
     ]
-    for operation_id in (
-        (operation,) if isinstance(operation, str) else operation
-    ):
+    for operation_id in (operation,) if isinstance(operation, str) else operation:
         command.extend(("--operation", operation_id))
     if contract is not None:
         command.extend(("--sdlc-contract", str(contract)))
@@ -98,6 +102,8 @@ def run_operation_cli(
         command.append("--if-declared")
     if prepare_only:
         command.append("--prepare-only")
+    if ci:
+        command.append("--ci")
     return subprocess.run(
         command,
         capture_output=True,
@@ -132,7 +138,8 @@ def prepare_repository_lifecycle_repo(
         encoding="utf-8",
         newline="\n",
     )
-    operation: dict[str, object] = {
+    operation: dict[str, Any] = {
+        "requires": {"capabilities": []},
         "steps": [
             {
                 "run": [
@@ -141,15 +148,35 @@ def prepare_repository_lifecycle_repo(
                     *(["{base_revision}"] if declares_base_revision else []),
                 ],
             }
-        ]
+        ],
     }
     if declares_base_revision:
         operation["parameters"] = ["base_revision"]
     if handoff is not None:
-        operation["handoff"] = handoff
+        lifecycle, action = handoff.split("/", 1)
+        operation["steps"].append(
+            {
+                "handoff": {"lifecycle": lifecycle, "action": action, "inputs": {}},
+            }
+        )
     write_sdlc_contract(
         repo,
-        deliverables={"sample": {"deploy-local": {"deploy": operation}}},
+        deliverables={
+            "apps": {
+                "sample": {
+                    "source": ".",
+                    "manifest": "README.md",
+                    "prerequisites": [],
+                    "actions": {
+                        "validate": {
+                            "requires": {"capabilities": []},
+                            "no-op": "Repository validation covers this fixture.",
+                        },
+                        "install": operation,
+                    },
+                }
+            }
+        },
     )
     if managed_skills:
         (repo / "skills").mkdir()

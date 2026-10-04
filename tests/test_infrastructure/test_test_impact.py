@@ -142,10 +142,10 @@ def test_agents_history_selects_full_suite_from_repository_manifest(
 
 
 @pytest.mark.parametrize("path", [
-    "tools/ceratops_tool_manager/packaging.py",
-    "scripts/deploy-tool-manager.py",
+    "mcp-servers/ceratops_mcp_server_manager/packaging.py",
+    "scripts/deploy-mcp-server-manager.py",
 ])
-def test_tool_manager_paths_select_their_underscore_named_suite(
+def test_mcp_server_manager_paths_select_their_underscore_named_suite(
     test_runner_module: Any, path: str,
 ) -> None:
     runner = test_runner_module
@@ -154,8 +154,8 @@ def test_tool_manager_paths_select_their_underscore_named_suite(
     selection = runner.selection_from_changes(
         manifest, (runner.ChangedFile("M", (path,)),),
     )
-    assert selection.suites == ("tool_manager",)
-    assert selection.pytest_targets == ("tests/tool_manager",)
+    assert selection.suites == ("mcp_server_manager",)
+    assert selection.pytest_targets == ("tests/mcp_server_manager",)
     assert not selection.mapping_gaps
 
 

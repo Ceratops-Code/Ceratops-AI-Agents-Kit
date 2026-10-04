@@ -7,7 +7,6 @@ while preparing a tree for removal.
 
 from __future__ import annotations
 
-import json
 import os
 import pathlib
 import shutil
@@ -16,10 +15,6 @@ import stat
 
 class PendingWorkError(RuntimeError):
     """Raised when selected-scope persistence or cleanup is unsafe."""
-
-
-SKILL_UPDATE_RETENTION_MARKER = ".ceratops-skill-update-active.json"
-SKILL_UPDATE_RETENTION_SCHEMA = "ceratops-skill-update-retention.v1"
 
 
 def _inside(path: pathlib.Path, parent: pathlib.Path) -> bool:
@@ -154,64 +149,6 @@ def _remove_tree(root: pathlib.Path) -> None:
     shutil.rmtree(root)
 
 
-def _active_skill_update_state(candidate: pathlib.Path) -> pathlib.Path | None:
-    """Return the state protected by a valid active-update retention marker.
-
-    The marker is a non-executable handoff owned by the skill-update helper.
-    Invalid marker or state paths block destructive cleanup instead of turning
-    missing verification evidence into successful finalization.
-    """
-
-    marker = candidate / SKILL_UPDATE_RETENTION_MARKER
-    attributes = _lstat(marker)
-    if attributes is None:
-        return None
-    if not stat.S_ISREG(attributes.st_mode) or _is_reparse(marker, attributes):
-        raise PendingWorkError(
-            f"Skill-update retention marker is not a regular file: {marker}"
-        )
-    try:
-        value = json.loads(marker.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise PendingWorkError(
-            f"Could not read skill-update retention marker {marker}: {exc}"
-        ) from exc
-    if not isinstance(value, dict) or set(value) != {"schema", "state"}:
-        raise PendingWorkError(f"Skill-update retention marker is invalid: {marker}")
-    if value.get("schema") != SKILL_UPDATE_RETENTION_SCHEMA:
-        raise PendingWorkError(
-            f"Skill-update retention marker has an unsupported schema: {marker}"
-        )
-    raw_state = value.get("state")
-    if not isinstance(raw_state, str) or not raw_state:
-        raise PendingWorkError(f"Skill-update retention marker has no state: {marker}")
-    state_path = pathlib.Path(raw_state)
-    if not state_path.is_absolute():
-        raise PendingWorkError(
-            f"Skill-update retention state escapes its task-temp directory: {state_path}"
-        )
-    try:
-        resolved_state = state_path.resolve(strict=True)
-    except OSError as exc:
-        raise PendingWorkError(
-            f"Could not resolve skill-update retention state {state_path}: {exc}"
-        ) from exc
-    if resolved_state != state_path or not _inside(resolved_state, candidate):
-        raise PendingWorkError(
-            f"Skill-update retention state escapes its task-temp directory: {state_path}"
-        )
-    state_attributes = _lstat(state_path)
-    if (
-        state_attributes is None
-        or not stat.S_ISREG(state_attributes.st_mode)
-        or _is_reparse(state_path, state_attributes)
-    ):
-        raise PendingWorkError(
-            f"Skill-update retention state is not a regular file: {state_path}"
-        )
-    return state_path
-
-
 def _remove_matching_task_temp_directories(
     repo_root: pathlib.Path,
     task_temp_root: pathlib.Path,
@@ -219,13 +156,12 @@ def _remove_matching_task_temp_directories(
     worktree_name: str,
     thread_id: str | None,
 ) -> None:
-    """Remove unambiguous task directories without consuming active updates.
+    """Remove unambiguous task directories after selected worktree retirement.
 
     A worktree name owns only an exact directory name. A canonical thread UUID
     may own its exact name or a ``UUID-`` suffix because the full UUID plus the
-    delimiter cannot collide with another worktree-name prefix. A valid
-    helper-owned retention marker preserves its matching directory for the
-    required post-deployment skill-update finalizer.
+    delimiter cannot collide with another worktree-name prefix. Skill-update
+    checkpoints have their own owner beneath Git's common directory.
     """
 
     canonical_root = (repo_root.parent / "tmp" / repo_root.name).resolve()
@@ -250,7 +186,6 @@ def _remove_matching_task_temp_directories(
             thread_prefix is not None and folded_name.startswith(thread_prefix)
         )
 
-    retained: set[pathlib.Path] = set()
     for candidate in sorted(task_temp_root.iterdir(), key=lambda item: item.name.casefold()):
         if not matches_recorded_identity(candidate):
             continue
@@ -261,16 +196,11 @@ def _remove_matching_task_temp_directories(
             raise PendingWorkError(f"Matching task-temp directory is a reparse point: {candidate}")
         if not stat.S_ISDIR(candidate_attributes.st_mode):
             continue
-        if _active_skill_update_state(candidate) is not None:
-            retained.add(candidate)
-            continue
         _remove_tree(candidate)
         if _lstat(candidate) is not None:
             raise PendingWorkError(f"Task-temp directory still exists after cleanup: {candidate}")
     for candidate in task_temp_root.iterdir():
         if not matches_recorded_identity(candidate):
-            continue
-        if candidate in retained:
             continue
         candidate_attributes = _lstat(candidate)
         if candidate_attributes is not None and (

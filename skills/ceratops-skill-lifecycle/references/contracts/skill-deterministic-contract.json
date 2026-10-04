@@ -6,35 +6,35 @@
   "captured_on": "2026-07-31",
   "source_files": [
     {
-      "path": "$AI_AGENT_SKILLS_ROOT/skills/ceratops-skill-lifecycle/references/contracts/skill-contract-source-docs.json",
+      "path": "$CERATOPS_AI_AGENTS_KIT_ROOT/skills/ceratops-skill-lifecycle/references/contracts/skill-contract-source-docs.json",
       "lines": "source-doc registry, skill standards, and installed skill references"
     },
     {
-      "path": "$AI_AGENT_SKILLS_ROOT/skills/ceratops-skill-lifecycle/scripts/skills-consistency-source-validator.py",
+      "path": "$CERATOPS_AI_AGENTS_KIT_ROOT/skills/ceratops-skill-lifecycle/scripts/skills-consistency-source-validator.py",
       "lines": "deterministic skill source, metadata, runtime, contract, and portability checks"
     },
     {
-      "path": "$AI_AGENT_SKILLS_ROOT/skills/ceratops-skill-lifecycle/scripts/runtime/install-managed-skills.py",
+      "path": "$CERATOPS_AI_AGENTS_KIT_ROOT/skills/ceratops-skill-lifecycle/scripts/runtime/install-managed-skills.py",
       "lines": "affected-set classification, direct-manifest inventory, and one transactional builder invocation"
     },
     {
-      "path": "$AI_AGENT_SKILLS_ROOT/skills/ceratops-skill-lifecycle/scripts/fast-change.py",
+      "path": "$CERATOPS_AI_AGENTS_KIT_ROOT/skills/ceratops-skill-lifecycle/scripts/fast-change.py",
       "lines": "classified direct-release patch, declared Markdown lint, exact tests, installation, commit, and compensation"
     },
     {
-      "path": "$AI_AGENT_SKILLS_ROOT/skills/ceratops-skill-lifecycle/scripts/runtime/managed_runtime_builder.py",
+      "path": "$CERATOPS_AI_AGENTS_KIT_ROOT/skills/ceratops-skill-lifecycle/scripts/runtime/managed_runtime_builder.py",
       "lines": "selected-batch staging, activation, rollback, locking, ownership, and stale cleanup"
     },
     {
-      "path": "$AI_AGENT_SKILLS_ROOT/scripts/deploy-skills.py",
+      "path": "$CERATOPS_AI_AGENTS_KIT_ROOT/scripts/deploy-skills.py",
       "lines": "versioned independent skill installer"
     },
     {
-      "path": "$AI_AGENT_SKILLS_ROOT/skills/skill-sections.json",
+      "path": "$CERATOPS_AI_AGENTS_KIT_ROOT/skills/skill-sections.json",
       "lines": "shared section and runtime payload ownership"
     },
     {
-      "path": "$AI_AGENT_SKILLS_ROOT/AGENTS.md",
+      "path": "$CERATOPS_AI_AGENTS_KIT_ROOT/AGENTS.md",
       "lines": "skill maintenance and source-of-truth rules"
     }
   ],
@@ -164,7 +164,7 @@
         "skill top-level files and directories",
         "skills/<skill-name>/references/"
       ],
-      "pass_condition": "Each skill folder contains `SKILL.md` as the only top-level file and uses only profile-supported resource directories; the compatible profile may include `tests/`, while the ceratops profile allows `agents/`, `assets/`, `scripts/`, and `references/`. Reference files remain at the reference root or in the supported contracts, schemas, and templates collections. Multi-skill executable sources remain under `skills/sections/scripts`, separate from repository-maintenance scripts."
+      "pass_condition": "Each skill folder contains `SKILL.md` and may contain `README.md` as its only top-level files and uses only profile-supported resource directories; the compatible profile may include `tests/`, while the ceratops profile allows `agents/`, `assets/`, `scripts/`, and `references/`. Reference files remain at the reference root or in the supported contracts, schemas, and templates collections. Multi-skill executable sources remain under `skills/sections/scripts`, separate from repository-maintenance scripts."
     },
     {
       "id": "skill.runtime_payload_portability",
@@ -187,7 +187,7 @@
         "installed .runtime-manifest.json ownership",
         "transaction behavior tests"
       ],
-      "pass_condition": "The installer resolves an explicit, base-revision, or all-managed affected set before mutation and invokes one locked batch transaction. Every selected present skill stages and validates before canonical mutation; existing targets retire, the complete staged batch activates, and pre-commit failures restore the prior batch. Targeted installs remove only declared absent skills; all-managed installs include same-source stale skills. Inventory reads direct manifests only and does not claim runtime validation."
+      "pass_condition": "The installer resolves an explicit, base-revision, or all-managed affected set before mutation and invokes one locked batch transaction. Every selected present skill stages and validates before canonical mutation; existing targets retire, the complete staged batch activates, and pre-commit failures restore the prior batch. Targeted installs remove only declared absent skills; all-managed installs include same-source stale skills. For an authorized source-identity rename, an exact previous identity admits only current or previous ownership and the transaction persists only the current identity. Inventory reads direct manifests only and does not claim runtime validation."
     },
     {
       "id": "skill.public_doc_alignment",

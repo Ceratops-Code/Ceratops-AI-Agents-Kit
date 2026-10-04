@@ -79,40 +79,31 @@ repo docs, then update the narrowest correct source that exists.
 
 #### 3. Apply updates at the real source
 
-- Before the first edit of helper-runtime code or a multi-file contract
-  update, create one request declaring selected skills, allowed paths, cohesive
-  change groups, non-test checks, the verified task-temp root, the exact
-  evidence
-  output, disposable request/state/evidence roles, and a helper-owned
-  active-update retention marker.
-- (D) Before editing, run `python scripts/skill-update-workflow.py prepare
-  --request REQUEST --state STATE`.
-- (D) After editing, run `python scripts/skill-update-workflow.py verify
-  --state STATE --evidence-output EVIDENCE`.
-- Preserve the recorded pre-existing worktree baseline, reject undeclared new
-  changes or source drift, and reject Git whitespace errors in changed tracked
-  and new files before running each declared non-test check once for its
-  applicable input. Treat declared zero-match searches as success, write
-  detailed evidence, and emit only `OK` or one compact actionable error.
-- Repository-declared SDLC tests own test selection, collection, and execution.
-  Do not put test checks or test-runner commands in an update request.
-- (D) For a monotonic expansion after failed verification, replace the request
-  and run `python scripts/skill-update-workflow.py amend --request REQUEST
-  --state STATE`.
-- Amendment must preserve the original HEAD and dirty baselines, branch,
-  correction generation, artifact ownership, and existing scope; accept only
-  added selected skills, allowed paths, group paths or groups, and non-test
-  checks that pass the original ownership, path, link, and committed-scope
-  gates. Reuse an earlier successful check only when its hashed failed evidence
-  and deterministic declared inputs still match. Failed, invalidated,
-  non-deterministic, and added checks must run on the next `verify`.
-- After passed verification, `verify` may start one correction generation only
-  when the current task HEAD or complete prepared scope snapshot differs from
-  the passed evidence. Atomically make the earlier success non-finalizable
-  before correction checks, accept only the prepared HEAD or a descendant whose
-  committed paths stay declared, rerun declared checks, preserve retryable
-  pending state on failure, reject unchanged retries and scope broadening, and
-  permanently invalidate state changed after the correction generation.
+- Before editing helper-runtime code or a multi-file contract, create a
+  caller-owned request with schema `ceratops-skill-update-request.v3`,
+  selected skills, allowed paths, cohesive change groups and non-test checks.
+  `WORKTREE` is the selected task worktree; `REQUEST` is that JSON file.
+  Run these commands with the skill's managed Python runtime.
+- (D) Before editing, run `python scripts/skill-update-workflow.py
+  open_skill_change --repo-root WORKTREE --change-request REQUEST`.
+- The calling task applies the requested source edits. This helper records
+  approved scope and checks; it does not edit, commit, promote or deploy source.
+- (D) After editing, run `python scripts/skill-update-workflow.py
+  run_skill_checks --repo-root WORKTREE`.
+- Preserve the original Git and dirty-file baselines, explicit approved scope,
+  shared-source ownership and Git whitespace gates. Tests remain owned by the
+  repository-declared SDLC test phase; requests contain only non-test checks.
+- (D) For approved additional scope, update the caller's request and run
+  `python scripts/skill-update-workflow.py expand_skill_scope
+  --repo-root WORKTREE --change-request REQUEST` before editing added paths.
+- Scope expansion preserves existing approvals and the original baseline.
+  Changed inputs create a pending generation before checks. Reuse saved passed
+  commands for unchanged complete inputs and saved searches for unchanged
+  declared inputs; an identical successful retry does no check work.
+- The helper discovers one unfinished update per worktree beneath the Git
+  common directory and holds its producer lock. Immutable states and check
+  results recover interrupted recording; caller request files remain owned by
+  the caller. Do not supply state, evidence or operation-ID paths.
 - Do not use the workflow for skill-local text-only updates.
 - The update helper must count manifest-declared shared sources as ownership
   for their selected skill consumers and reject selected skills without an
@@ -134,13 +125,11 @@ repo docs, then update the narrowest correct source that exists.
 - If runtime generation or validation flow no longer matches the section model,
   fix the scripts instead of working around them in skill text.
 
-- (D) For an explicitly revised request after failed verification, run
-  `python scripts/skill-update-workflow.py supersede --state OLD --request REQUEST
-  --new-state STATE` before editing newly declared paths. Preserve the original
-  source baseline and failed records, transfer the active marker to the successor,
-  and remove the inherited disposable records only after the successor passes
-  and is finalized. Reject scope removal, changed evidence, completed or
-  invalidated state, and artifact collisions before changing ownership.
+- (D) For an explicitly revised request after failed checks, run
+  `python scripts/skill-update-workflow.py replace_failed_request
+  --repo-root WORKTREE --change-request REQUEST` before editing added paths.
+  Preserve the original baseline, existing scope and saved successful checks;
+  the new request may revise failed checks without concealing unrelated work.
 
 #### 4. Run needed checks
 
@@ -157,15 +146,14 @@ repo docs, then update the narrowest correct source that exists.
   command and exact existing behavior tests.
 - If runtime generation, installer, or transaction code changed, run the
   affected transaction tests and one all-managed temporary installation.
-- (D) After successful verification and the final requested commit,
-  deployment, or other caller use completes, run `python
-  scripts/skill-update-workflow.py finalize --state STATE`. This invocation is
-  the explicit completion trigger. The helper must reject incomplete or changed
-  ownership state, links, path escapes, repository files, and failed
-  verification; preserve undeclared inputs; remove only the exact owned
-  request, state, evidence, and retention-marker files; and remove the verified
-  task-temp root only when empty afterward. A successful update run is not complete
-  until finalization returns `OK`; do not finalize failed or incomplete runs.
+- (D) After successful checks and the final requested commit, deployment or
+  other caller use, run `python scripts/skill-update-workflow.py
+  close_skill_change --repo-root WORKTREE`.
+- Closing consumes saved success without rechecking the checkout, writes
+  `completion_receipt.json`, and removes the operation's checkpoints.
+  It preserves caller inputs and unrelated work. Interrupted cleanup resumes
+  from that receipt; successful close also sweeps removed-worktree checkpoints
+  for the same producer. Do not close failed or incomplete changes.
 - After committing, use `$ceratops-repo-lifecycle` `promote` when only local
   release staging is requested, `promote-and-deploy` when the repository's
   declared deployment should run, or `ship` when the staged release should be

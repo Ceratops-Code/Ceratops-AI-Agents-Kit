@@ -1,16 +1,22 @@
-"""Read-only generic repository compatibility postconditions.
+"""Structural compatibility and explicit repository test-result probes.
 
-The checker never runs the repository aggregate and never mutates the target.
+The structural checker never runs the repository aggregate or tests. Optional
+result probes run controlled commands only in a caller-owned result directory;
+structural success alone is not acceptance of reusable test results.
 Callers receive only the stable ``applicable``, ``valid``, and ``errors``
 mapping; repository health owns aggregate execution separately.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import pathlib
 import runpy
+import subprocess
+import sys
+import tempfile
 import tomllib
 from collections.abc import Mapping
 from typing import Any, TypedDict
@@ -19,7 +25,7 @@ import yaml
 
 from .ci_workflow import workflow_errors
 from .compatibility_contract import load_compatibility_contract, template_path
-from .python_tests import discover_python_tests
+from .generate_test_script import discover_python_tests
 from .repository_validation_contract import load_validation_contract
 from .sdlc_contract_validation import (
     operation_category,
@@ -74,6 +80,7 @@ def _validation_coverage_errors(
     """Require detected repository types to have one declared non-test validator."""
 
     entries = operation_entries(sdlc)
+    version = int(sdlc["version"])
     errors: list[str] = []
     for requirement in validation_contract["coverage_requirements"]:
         active = any(
@@ -87,7 +94,8 @@ def _validation_coverage_errors(
         required_capabilities = set(requirement["required_capabilities"])
         required_prerequisites = set(requirement["required_prerequisites"])
         matched = any(
-            operation_category(location) == requirement["operation_category"]
+            operation_category(location, version=version)
+            == requirement["operation_category"]
             and required_capabilities.issubset(
                 operation.get("validation-capabilities", [])
             )
@@ -232,7 +240,10 @@ def _manifest_errors(
         or len(declared_python) != len({item for item in declared_python if isinstance(item, str)})
         or not all(isinstance(item, str) and item in source_skills for item in declared_python)
     ):
-        errors.append("section manifest python_runtime_skills must list unique source skills")
+        errors.append(
+            "section manifest python_runtime_skills must be an array of unique "
+            "source skill names; use [] when no skill needs the managed Python runtime"
+        )
     else:
         python_skills = set(declared_python)
     for field in ("maintenance_workflows", "runtime_payloads"):
@@ -365,8 +376,11 @@ def _skill_runtime_errors(
     return errors
 
 
-def validate_ceratops_compatibility(repo_root: pathlib.Path) -> CompatibilityResult:
-    """Return read-only compatibility status for one repository root."""
+def validate_ceratops_compatibility(
+    repo_root: pathlib.Path, *, result_directory: pathlib.Path | None = None,
+    runner_command: list[str] | None = None,
+) -> CompatibilityResult:
+    """Check structure; explicitly supplied probe arguments also gate result reuse."""
 
     root = repo_root.resolve()
     try:
@@ -397,11 +411,12 @@ def validate_ceratops_compatibility(repo_root: pathlib.Path) -> CompatibilityRes
         sdlc, sdlc_errors = read_contract(root / paths["sdlc"])
         if sdlc:
             entries = operation_entries(sdlc)
+    sdlc_version = int(sdlc["version"]) if sdlc else int(contract["sdlc_version"])
     test_runner_relative = surfaces["python_test_runner"]["path"]
     test_runner_selected = any(
         test_runner_relative in step.get("run", [])
         for name, operation in entries.items()
-        if operation_category(name) == "tests"
+        if operation_category(name, version=sdlc_version) == "tests"
         for step in operation.get("steps", [])
     )
     for name, surface in surfaces.items():
@@ -424,9 +439,9 @@ def validate_ceratops_compatibility(repo_root: pathlib.Path) -> CompatibilityRes
         errors.extend(manifest_errors)
     if "sdlc" in present and not _regular_file_error(root, paths["sdlc"]):
         errors.extend(sdlc_errors)
-        if sdlc and sdlc["version"] != contract["sdlc_version"]:
-            errors.append("current Ceratops compatibility requires SDLC version " + str(contract["sdlc_version"]))
-        elif sdlc:
+        if sdlc:
+            # The shared loader has already accepted a schema-valid supported
+            # v4 or v5 contract; compatibility requirements are version-neutral.
             errors.extend(_validation_coverage_errors(root, sdlc, validation_contract))
             expected = load_compatibility_contract()["runtime"]["project"]
             # uv supports project discovery from the script path and explicit
@@ -438,7 +453,7 @@ def validate_ceratops_compatibility(repo_root: pathlib.Path) -> CompatibilityRes
             commands = [
                 step["run"]
                 for name, entry in entries.items()
-                if operation_category(name) == "validate"
+                if operation_category(name, version=sdlc_version) == "validate"
                 for step in entry.get("steps", [])
                 if "run" in step
             ]
@@ -447,7 +462,7 @@ def validate_ceratops_compatibility(repo_root: pathlib.Path) -> CompatibilityRes
             tests = [
                 entry
                 for name, entry in entries.items()
-                if operation_category(name) == "tests"
+                if operation_category(name, version=sdlc_version) == "tests"
             ]
             if not tests:
                 errors.append("SDLC must declare repository tests or an explicit no-op")
@@ -459,9 +474,143 @@ def validate_ceratops_compatibility(repo_root: pathlib.Path) -> CompatibilityRes
         if error := _regular_file_error(root, pathlib.Path(relative)):
             errors.append(error)
 
+    if (result_directory is None) != (runner_command is None):
+        errors.append("test-result probing requires both runner_command and result_directory")
+    elif not errors and result_directory is not None and runner_command is not None:
+        errors.extend(probe_test_results(root, runner_command, result_directory))
     unique_errors = list(dict.fromkeys(error for error in errors if error))
     return {
         "applicable": True,
         "valid": not unique_errors,
         "errors": unique_errors,
     }
+
+
+def probe_test_results(root: pathlib.Path, command: list[str], result_directory: pathlib.Path) -> list[str]:
+    """Exercise the observable result protocol without running repository tests.
+
+    The caller owns result_directory. Only an isolated child is created/deleted;
+    probe results never become repository acceptance. This checks actual command
+    executions and saved bytes, not a custom runner's source implementation.
+    """
+    expected_declaration = {
+        "schema": "ceratops-test-result-contract.v1",
+        "result_schema": "ceratops-repository-check-result.v1",
+    }
+    if not command or any(not isinstance(item, str) or not item or "\0" in item for item in command):
+        return ["test-result runner must be a nonempty argv"]
+
+    def invoke(arguments: list[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [*command, *arguments], cwd=root, capture_output=True, text=True,
+            check=False, timeout=30,
+        )
+
+    def require(condition: bool, message: str) -> None:
+        if not condition:
+            raise ValueError(message)
+
+    try:
+        directory = result_directory.absolute()
+        require(directory.is_dir(), "caller-owned result directory must exist")
+        require(not any(path.is_symlink() or path.is_junction() for path in (directory, *directory.parents)),
+                "probe result directory must not be linked")
+        declared = invoke(["--describe-test-results"])
+        require(declared.returncode == 0 and json.loads(declared.stdout) == expected_declaration,
+                "runner does not declare the test-result contract")
+        with tempfile.TemporaryDirectory(prefix="test-result-probe-", dir=directory) as scratch:
+            probe = pathlib.Path(scratch)
+            results = probe / "results"
+            results.mkdir()
+            counter = probe / "executions"
+            program = (
+                "import json, pathlib, sys; "
+                "record=json.loads(pathlib.Path(sys.argv[1]).read_text()); "
+                "assert record['status']=='running'; "
+                "p=pathlib.Path(sys.argv[2]); "
+                "p.write_text(str(int(p.read_text())+1) if p.exists() else '1'); "
+                "raise SystemExit(int(sys.argv[3]))"
+            )
+
+            def request(name: str, exit_code: int = 0) -> tuple[pathlib.Path, list[str], dict[str, Any]]:
+                path = results / (name + ".json")
+                argv = [sys.executable, "-c", program, str(path), str(counter), str(exit_code)]
+                expected = {
+                    "schema": expected_declaration["result_schema"], "result_id": name,
+                    "candidate_id": "compatibility-probe", "check_id": "controlled-command",
+                    "check_version": "1",
+                    "invocation": {"targets": [], "pytest_args": [], "pytest_addopts": [], "probe_command": argv},
+                    "status": "passed" if exit_code == 0 else "failed", "exit_code": exit_code,
+                }
+                arguments = [
+                    "--result-file", str(path), "--result-id", name,
+                    "--candidate-id", "compatibility-probe", "--check-id", "controlled-command",
+                    "--check-version", "1", "--probe-command", json.dumps(argv),
+                ]
+                return path, arguments, expected
+
+            def encoded(value: Mapping[str, Any]) -> bytes:
+                return (json.dumps(dict(value), sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode()
+
+            def count() -> int:
+                return int(counter.read_text()) if counter.is_file() else 0
+
+            path, args, expected = request("success")
+            require(invoke(args).returncode == 0, "runner did not complete the controlled check")
+            accepted = path.read_bytes()
+            require(accepted == encoded(expected) and count() == 1, "runner did not write canonical final acceptance")
+            modified = path.stat().st_mtime_ns
+            require(invoke(args).returncode == 0 and count() == 1 and path.read_bytes() == accepted
+                    and path.stat().st_mtime_ns == modified, "exact accepted result was not reused")
+            conflict = args.copy()
+            conflict[conflict.index("--candidate-id") + 1] = "different-candidate"
+            require(invoke(conflict).returncode != 0 and path.read_bytes() == accepted and count() == 1,
+                    "runner overwrote or executed a conflicting result")
+
+            malformed, malformed_args, recovered = request("malformed")
+            malformed.write_text("{", encoding="utf-8")
+            require(invoke(malformed_args).returncode != 0 and malformed.read_text() == "{" and count() == 1,
+                    "runner repaired a result without unaccepted ownership")
+            malformed_args.append("--repair-unaccepted-result")
+            require(invoke(malformed_args).returncode == 0 and malformed.read_bytes() == encoded(recovered)
+                    and count() == 2, "runner did not recover its malformed unaccepted output")
+
+            failed, failed_args, rejected = request("failed", 3)
+            require(invoke(failed_args).returncode != 0 and failed.read_bytes() == encoded(rejected)
+                    and count() == 3, "runner did not preserve a failed result")
+            require(invoke(failed_args).returncode != 0 and failed.read_bytes() == encoded(rejected)
+                    and count() == 3, "runner reused or overwrote failed execution identity")
+
+            interrupted, interrupted_args, pending = request("interrupted")
+            pending.update(status="running", exit_code=None)
+            interrupted.write_bytes(encoded(pending))
+            require(invoke(interrupted_args).returncode != 0 and interrupted.read_bytes() == encoded(pending)
+                    and count() == 3, "runner overwrote an interrupted execution identity")
+            require({p.name for p in results.iterdir()} == {
+                "success.json", "malformed.json", "failed.json", "interrupted.json",
+            }, "runner left sibling result files")
+            require({p.name for p in probe.iterdir()} == {"results", "executions"}, "runner left probe-side files")
+    except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError) as exc:
+        return ["test-result contract probe failed: " + str(exc)]
+    return []
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Check a custom or generated runner's result contract, not its test suite."""
+    parser = argparse.ArgumentParser(description="Probe a repository runner's reusable test results.")
+    parser.add_argument("--repo-root", required=True, type=pathlib.Path)
+    parser.add_argument("--runner-command", required=True, help="JSON argv using the runner's declared environment.")
+    parser.add_argument("--result-directory", required=True, type=pathlib.Path, help="Existing caller-owned probe directory.")
+    args = parser.parse_args(argv)
+    try:
+        command = json.loads(args.runner_command)
+        if not isinstance(command, list):
+            raise ValueError("runner-command must be a JSON argv")
+        errors = probe_test_results(args.repo_root, command, args.result_directory)
+    except ValueError as exc:
+        errors = [str(exc)]
+    if errors:
+        print(errors[0], file=sys.stderr)
+        return 1
+    print("OK")
+    return 0

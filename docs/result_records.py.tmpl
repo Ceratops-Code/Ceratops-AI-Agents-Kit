@@ -1,0 +1,361 @@
+#!/usr/bin/env python3
+"""Own portable, bounded repository validation, test, and build records.
+
+Repository runners may import this helper after copying the template to
+``scripts/result_records.py``. Tracked JSON records bind outcomes to current
+source bytes and the latest commit that changed non-result files. Raw evidence
+is ignored and bounded to the current run plus two predecessors. Candidate
+build records use an immutable source tag as the version and bind the exact
+artifact bytes stored under ``.build/artifacts``.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import pathlib
+import re
+import subprocess
+import tempfile
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
+
+VALIDATION_SCHEMA = "ceratops-repository-validation.v1"
+RESULT_SCHEMA = "ceratops-repository-tests.v1"
+GROUP_SCHEMA = "ceratops-test-group-result.v1"
+BUILD_SCHEMA = "ceratops-build-record.v1"
+_EXCLUDED_SOURCE_PREFIXES = (".build/", ".test-results/")
+_SAFE_TAG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
+
+
+def _git(
+    repo_root: pathlib.Path,
+    *arguments: str,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    """Run Git without a shell and return UTF-8 text output."""
+
+    return subprocess.run(
+        ["git", "-C", str(repo_root), *arguments],
+        check=check,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+
+def _sha256(path: pathlib.Path) -> str:
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def _digest_json(value: object) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _portable_files(repo_root: pathlib.Path) -> list[str]:
+    listing = _git(repo_root, "ls-files", "-z").stdout.split("\0")
+    return sorted(
+        path
+        for path in listing
+        if path
+        and not path.replace("\\", "/").startswith(_EXCLUDED_SOURCE_PREFIXES)
+    )
+
+
+def source_digest(
+    repo_root: pathlib.Path,
+    relative_paths: Iterable[str] | None = None,
+) -> str:
+    """Hash stable relative paths and bytes while excluding owned outputs."""
+
+    paths = sorted(set(relative_paths or _portable_files(repo_root)))
+    digest = hashlib.sha256()
+    for relative in paths:
+        normalized = relative.replace("\\", "/")
+        if normalized.startswith(_EXCLUDED_SOURCE_PREFIXES):
+            continue
+        path = repo_root / relative
+        digest.update(normalized.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes() if path.is_file() else b"<missing>")
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _source_dirty_paths(repo_root: pathlib.Path) -> list[str]:
+    """Return non-result working-tree paths that prevent portable recording."""
+
+    output = _git(
+        repo_root, "status", "--porcelain=v1", "--untracked-files=all"
+    ).stdout
+    dirty: list[str] = []
+    for line in output.splitlines():
+        if len(line) < 4:
+            continue
+        relative = line[3:].split(" -> ")[-1].replace("\\", "/")
+        if not relative.startswith(_EXCLUDED_SOURCE_PREFIXES):
+            dirty.append(relative)
+    return sorted(set(dirty))
+
+
+@dataclass(frozen=True)
+class SourceIdentity:
+    """Exact source state tested by one runner invocation."""
+
+    commit: str
+    digest: str
+    exact_tags: tuple[str, ...]
+    dirty_paths: tuple[str, ...]
+
+    def portable(self) -> dict[str, object]:
+        return {
+            "commit": self.commit,
+            "digest": self.digest,
+            "exactTags": list(self.exact_tags),
+            "dirty": bool(self.dirty_paths),
+        }
+
+
+@dataclass(frozen=True)
+class ArtifactIdentity:
+    """Immutable-tag version and exact package bytes for delivery reuse."""
+
+    version: str
+    source_commit: str
+    path: str
+    sha256: str
+    length: int
+
+    def portable(self) -> dict[str, object]:
+        return {
+            "schema": BUILD_SCHEMA,
+            "version": self.version,
+            "sourceCommit": self.source_commit,
+            "artifactPath": self.path,
+            "artifactSha256": self.sha256,
+            "artifactLength": self.length,
+        }
+
+
+def resolve_source_identity(repo_root: pathlib.Path) -> SourceIdentity:
+    """Resolve current bytes, latest source commit, exact tags, and dirtiness."""
+
+    repo_root = repo_root.resolve(strict=True)
+    commit = _git(
+        repo_root,
+        "log",
+        "-1",
+        "--format=%H",
+        "--",
+        ".",
+        ":(exclude).build/**",
+        ":(exclude).test-results/**",
+    ).stdout.strip()
+    if not commit:
+        raise ValueError("The repository has no source commit outside result directories.")
+    tags = tuple(
+        sorted(
+            filter(
+                None,
+                _git(repo_root, "tag", "--points-at", commit).stdout.splitlines(),
+            )
+        )
+    )
+    return SourceIdentity(
+        commit=commit,
+        digest=source_digest(repo_root),
+        exact_tags=tags,
+        dirty_paths=tuple(_source_dirty_paths(repo_root)),
+    )
+
+
+def resolve_artifact_identity(
+    repo_root: pathlib.Path,
+    source: SourceIdentity,
+    source_tag: str | None,
+    artifact: pathlib.Path | None,
+) -> ArtifactIdentity | None:
+    """Validate an optional artifact against an immutable source tag."""
+
+    if (source_tag is None) != (artifact is None):
+        raise ValueError("source tag and artifact must be supplied together")
+    if source_tag is None or artifact is None:
+        return None
+    if not _SAFE_TAG.fullmatch(source_tag):
+        raise ValueError("source tag contains unsupported characters")
+    tagged_commit = _git(repo_root, "rev-list", "-n", "1", source_tag).stdout.strip()
+    if tagged_commit != source.commit:
+        comparison = _git(
+            repo_root,
+            "diff",
+            "--quiet",
+            tagged_commit,
+            "--",
+            ".",
+            ":(exclude).build/**",
+            ":(exclude).test-results/**",
+            check=False,
+        )
+        if comparison.returncode:
+            raise ValueError("current source bytes differ from the source tag")
+    artifact = artifact.expanduser().resolve(strict=True)
+    artifact_root = (repo_root / ".build" / "artifacts").resolve()
+    try:
+        relative = artifact.relative_to(artifact_root).as_posix()
+    except ValueError as error:
+        raise ValueError("artifact must be stored under .build/artifacts") from error
+    return ArtifactIdentity(
+        version=source_tag,
+        source_commit=tagged_commit,
+        path=f".build/artifacts/{relative}",
+        sha256=_sha256(artifact),
+        length=artifact.stat().st_size,
+    )
+
+
+class ResultStore:
+    """Atomic, bounded owner for tracked records and ignored evidence."""
+
+    def __init__(
+        self,
+        repo_root: pathlib.Path,
+        source: SourceIdentity,
+        *,
+        record: bool,
+    ) -> None:
+        self.repo_root = repo_root.resolve(strict=True)
+        self.source = source
+        self.record = record
+        self.result_root = self.repo_root / ".test-results"
+        self.group_root = self.result_root / "groups"
+        self.evidence_root = self.result_root / "evidence"
+        if record and source.dirty_paths:
+            shown = ", ".join(source.dirty_paths[:8])
+            suffix = " ..." if len(source.dirty_paths) > 8 else ""
+            raise ValueError(
+                f"portable results require committed source: {shown}{suffix}"
+            )
+
+    def atomic_json(self, path: pathlib.Path, value: object) -> None:
+        """Replace one JSON record and remove its owned staging file."""
+
+        if not self.record:
+            return
+        try:
+            path.resolve().relative_to(self.repo_root)
+        except ValueError as error:
+            raise ValueError("portable records must remain inside the repository") from error
+        path.parent.mkdir(parents=True, exist_ok=True)
+        staging: pathlib.Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                newline="\n",
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as stream:
+                staging = pathlib.Path(stream.name)
+                json.dump(value, stream, indent=2, sort_keys=True)
+                stream.write("\n")
+            staging.replace(path)
+        finally:
+            if staging is not None:
+                staging.unlink(missing_ok=True)
+
+    def begin_evidence_run(self, run_id: str) -> pathlib.Path:
+        """Create an ignored evidence run and retain at most three runs."""
+
+        run_root = self.evidence_root / run_id
+        run_root.mkdir(parents=True, exist_ok=True)
+        self.prune_evidence(keep={run_id})
+        return run_root
+
+    def prune_evidence(self, *, keep: set[str] | None = None) -> None:
+        """Retain the current evidence run and at most two predecessors."""
+
+        if not self.evidence_root.is_dir():
+            return
+        retained = set(keep or ())
+        directories = sorted(
+            (path for path in self.evidence_root.iterdir() if path.is_dir()),
+            key=lambda path: (path.stat().st_mtime_ns, path.name),
+            reverse=True,
+        )
+        for path in directories:
+            if path.name in retained:
+                continue
+            if len(retained) < 3:
+                retained.add(path.name)
+                continue
+            for child in sorted(path.rglob("*"), reverse=True):
+                if child.is_file() or child.is_symlink():
+                    child.unlink()
+                elif child.is_dir():
+                    child.rmdir()
+            path.rmdir()
+
+    def write_group(self, group_id: str, value: Mapping[str, object]) -> pathlib.Path:
+        path = self.group_root / f"{group_id}.json"
+        self.atomic_json(path, dict(value))
+        return path
+
+    def write_tests(self, value: Mapping[str, object]) -> pathlib.Path:
+        path = self.result_root / "tests.json"
+        self.atomic_json(path, dict(value))
+        return path
+
+    def write_validation(self, value: Mapping[str, object]) -> pathlib.Path:
+        path = self.result_root / "validation.json"
+        self.atomic_json(path, dict(value))
+        return path
+
+    def build_path(self, artifact: ArtifactIdentity) -> pathlib.Path:
+        safe_version = re.sub(r"[^A-Za-z0-9._-]", "_", artifact.version)
+        return self.repo_root / ".build" / "builds" / f"{safe_version}.json"
+
+    def write_build(
+        self,
+        artifact: ArtifactIdentity,
+        source_digest_value: str,
+    ) -> pathlib.Path:
+        path = self.build_path(artifact)
+        self.atomic_json(
+            path,
+            {
+                **artifact.portable(),
+                "sourceDigest": source_digest_value,
+                "approval": None,
+            },
+        )
+        return path
+
+
+def group_fingerprint(
+    repo_root: pathlib.Path,
+    group_id: str,
+    owned_paths: Iterable[str],
+    environment: Mapping[str, object],
+    artifact: ArtifactIdentity | None,
+) -> str:
+    """Bind reuse to group-owned bytes, environment, and optional artifact."""
+
+    return _digest_json(
+        {
+            "group": group_id,
+            "sourceDigest": source_digest(repo_root, owned_paths),
+            "environment": dict(environment),
+            "artifact": artifact.portable() if artifact else None,
+        }
+    )
+
+
+def compact_failure(check_id: str, expected: object, actual: object) -> str:
+    """Return the common compact assertion-difference format."""
+
+    return f"{check_id} expected={expected} actual={actual}"

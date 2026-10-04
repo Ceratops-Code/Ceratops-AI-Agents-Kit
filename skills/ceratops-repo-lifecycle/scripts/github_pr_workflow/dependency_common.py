@@ -64,6 +64,7 @@ FAILED_CHECK_RESULTS = {
 }
 SUCCESS_CHECK_RESULTS = {"NEUTRAL", "SKIPPED", "SUCCESS"}
 TERMINAL_MERGE_STATES = {"BEHIND", "BLOCKED", "DIRTY", "DRAFT", "UNKNOWN", "UNSTABLE"}
+BLOCKER_SCOPES = frozenset({"global", "repository", "pull_request", "alert"})
 
 
 class WorkflowError(RuntimeError):
@@ -139,6 +140,73 @@ def as_list(value: Any) -> list[Any]:
     return cast(list[Any], value) if isinstance(value, list) else []
 
 
+def blocker_scope(value: Any) -> str:
+    """Return the smallest validated blocker scope, failing closed globally."""
+
+    if not isinstance(value, dict):
+        return "global"
+    repo = value.get("repo")
+    has_repo = isinstance(repo, str) and bool(repo.strip())
+    if not has_repo or ("pr" in value and "alert" in value):
+        inferred = "global"
+    elif "pr" in value:
+        number = value.get("pr")
+        inferred = (
+            "pull_request"
+            if isinstance(number, int) and not isinstance(number, bool) and number > 0
+            else "global"
+        )
+    elif "alert" in value:
+        number = value.get("alert")
+        inferred = (
+            "alert"
+            if isinstance(number, int) and not isinstance(number, bool) and number > 0
+            else "global"
+        )
+    else:
+        inferred = "repository"
+    explicit = value.get("scope")
+    if explicit is None:
+        return inferred
+    if (
+        not isinstance(explicit, str)
+        or explicit not in BLOCKER_SCOPES
+        or explicit != inferred
+    ):
+        return "global"
+    return explicit
+
+
+def scoped_blocker(value: Any) -> dict[str, Any]:
+    """Copy one blocker and record its validated action scope."""
+
+    if not isinstance(value, dict):
+        return {
+            "scope": "global",
+            "check": "preflight_blocker",
+            "message": "invalid blocker record",
+        }
+    result = dict(value)
+    result["scope"] = blocker_scope(result)
+    return result
+
+
+def blocker_applies_to_pr(value: Any, repo: str, number: int) -> bool:
+    """Return whether a validated preflight blocker gates one PR merge."""
+
+    scope = blocker_scope(value)
+    if scope == "global":
+        return True
+    if scope == "alert" or not isinstance(value, dict):
+        return False
+    blocker_repo = str(value.get("repo") or "").lower()
+    if blocker_repo != repo.lower():
+        return False
+    if scope == "repository":
+        return True
+    return scope == "pull_request" and value.get("pr") == number
+
+
 def write_json(path: pathlib.Path, value: dict[str, Any]) -> None:
     """Atomically replace a result so interrupted runs cannot leave partial JSON."""
 
@@ -156,8 +224,10 @@ def emit_result(status: str, output: pathlib.Path, summary: dict[str, Any], bloc
 
     projected_blockers = [
         {
+            "scope": item.get("scope"),
             "repo": item.get("repo"),
             "pr": item.get("pr"),
+            "alert": item.get("alert"),
             "check": item.get("check"),
             "message": str(item.get("message") or "")[:180],
         }

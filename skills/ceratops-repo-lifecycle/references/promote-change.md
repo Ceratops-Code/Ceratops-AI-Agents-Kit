@@ -2,13 +2,13 @@
 
 ## Goal
 
-Fast-forward selected committed task branches into a local promotion branch and
-validate the assembled commit. Use `release/local` by default. When the
-repository already has an authoritative `release` branch, use `promote/local`
-because Git cannot store both `release` and `release/local`. For
-`promote-and-deploy`, run selected `deploy-local`
-entries in order. Composed shipping validates again at its own boundary and
-owns selected post-merge publication, deployment and cleanup.
+Fast-forward selected committed task branches into local `release/local` and
+apply the lifecycle helper's promotion gate to the assembled commit. If
+`refs/heads/release` occupies that branch namespace, stop and report the
+repository as incompatible; never substitute another promotion branch. For
+`promote-and-deploy`, run selected `deploy-local` entries in order. Composed
+shipping validates again at its own boundary and owns selected post-merge
+publication, deployment and cleanup.
 
 ## Context
 
@@ -19,6 +19,8 @@ owns selected post-merge publication, deployment and cleanup.
   `<skill-root>/scripts/promote-repository.py` once before the first call.
   Invoke that exact path with the working directory equal to its `--repo-root`
   value; stop if it is absent and never resolve it relative to that repository.
+  A linked-worktree `--repo-root` is routed automatically to the primary
+  checkout, including an absolute repo-owned `--sdlc-contract` path.
 - (D) Promotion helper:
   `python
   "<skill-root>/scripts/promote-repository.py" --repo-root PATH
@@ -31,9 +33,9 @@ owns selected post-merge publication, deployment and cleanup.
   --release-branch release/local --remote-name origin
   --run-operation ID [--run-operation ID...]
   [--parameter name=value ...]`.
-- When `refs/heads/release` exists, use the same exact command with
-  `--release-branch promote/local`; use that same branch argument when
-  finalizing its saved result.
+- When `refs/heads/release` exists, stop before mutation and report that the
+  repository must free the `release/local` branch namespace; never substitute a
+  different promotion branch.
 - (D) Promotion followed by terminal shipping uses the same command with
   `--ship-after-promotion` as its complete operation choice. Do not add
   `--run-operation` or `--no-run-operation`; shipping alone publishes or
@@ -49,8 +51,8 @@ owns selected post-merge publication, deployment and cleanup.
 ### Inputs To Capture
 
 - Repository checkout, selected committed source branches, main branch, local
-  promotion branch, and remote. Use `promote/local` only when
-  `refs/heads/release` already exists; otherwise use `release/local`.
+  `release/local` branch, and remote. Treat an existing `refs/heads/release` as
+  an incompatible repository state requiring an explicit repository repair.
 - Whether the selected action is `promote`, `promote-and-deploy`, or composed
   promotion and shipping.
 - Optional PR `--title` and `--body` require `--ship-after-promotion` and pass
@@ -80,38 +82,41 @@ owns selected post-merge publication, deployment and cleanup.
 
 ### Workflow
 
-1. Require clean selected worktrees. Through the promotion helper, establish
-   Git ancestry with the eligible automatic rebase and run `git diff --check`.
-   When `refs/heads/release` exists, pass `--release-branch promote/local` to
-   execution and result finalization; otherwise retain `release/local`.
+1. Require clean selected worktrees. Through the promotion helper, reject an
+   existing `refs/heads/release`, establish Git ancestry with the eligible
+   automatic rebase, run `git diff --check`, and pass
+   `--release-branch release/local` to execution and result finalization.
 2. For `promote`, run the helper with `--no-run-operation`.
 3. For `promote-and-deploy`, repeat `--run-operation LOCATION` in order.
    Repeat `--parameter name=value` for required operation inputs; it is invalid
    without `--run-operation`.
-   The helper accepts only `deliverables.<name>.deploy-local.<operation>`,
-   prepares the entire selection before commands, runs applicable validation
-   and tests once, and executes the prepared operations only while the checked
+   The helper accepts only `deliverables.<kind>.<name>.actions.install`,
+   prepares the entire selection before commands, applies its promotion gate,
+   and executes the prepared operations only while the checked
    commit stays clean and unchanged. Explicit missing locations are errors;
-   version-3 tests require declared commands, handoffs, or reasoned no-ops.
+   v4/v5 tests require declared commands, handoffs, or reasoned no-ops.
 4. For composed shipping, use `--ship-after-promotion`, one optional
    `--sdlc-contract PATH`, and repeated `--publish-operation LOCATION` or
    `--deploy-operation LOCATION` for requested post-merge work. Omitted mutation
-   selections do nothing. The helper records the exact head and scope, runs
-   promotion validation and tests, then invokes shipping with the same inputs.
+   selections do nothing. The helper records the exact head and scope, applies
+   its promotion gate, then invokes shipping with the same inputs.
 5. Let the SDLC engine execute registered deterministic skill actions for
-   version-3 handoffs. Resolve any returned judgment-required route within the
-   selected skill action; dependent mutation remains blocked. Preserve advisory
-   routing for older contracts and never claim a route alone completed work.
+   v4/v5 structured handoffs. Resolve any returned judgment-required route
+   within the selected skill action; dependent mutation remains blocked. SDLC
+   v1-v3 contracts are rejected before this workflow executes.
 6. Atomically normalize an exact version-1 pending-work scope to version 2
    before reuse. Retire a missing legacy source, keep a clean source contained
    in the legacy target as `retained`, and mark a dirty, unavailable, or
    advanced source `preserved` so stale cleanup cannot block the new promotion
    or delete evolved work. Treat the normalized version-2 scope as the only
    source scope later passed to ship. Persist each selected source's exact tip
-   and helper-owned state. Advance a reusable scope only when its recorded
-   target is an ancestor of the new target. Recover a missing source
-   automatically only when its `deleting` state and recorded commit ancestry
-   prove an interrupted helper deletion; a missing `retained` source blocks.
+   and helper-owned state. When a recorded target diverges from the new target,
+   preserve every prior unselected source without cleanup authority and begin
+   the new scope; a same-name source explicitly selected at the new target may
+   replace its old record after the normal containment checks. Recover a
+   missing source automatically only when its `deleting` state and recorded
+   commit ancestry prove an interrupted helper deletion; a missing `retained`
+   source blocks.
 7. On a shipping blocker, retain the scope, branches, worktrees, and checkpoints
    for resume. Terminal shipping owns finalization and selected-work cleanup;
    it leaves a worktree and branch untouched when the worktree's parent chain
@@ -127,7 +132,7 @@ ancestry, task merge commits, conflicts, and failed Git queries
 block. A failed attempt must restore the original branch head and
 clean worktree before it reports the failure and conflicting paths. The helper
 then runs `git diff --check`, fast-forwards each selected branch, records the
-scope and validates the final commit. A failed check returns its YAML location,
+scope, and applies its promotion gate. A failed check returns its YAML location,
 checked commit and bounded diagnostics while preserving the scope for repair.
 In composed mode, shipping repeats validation before remote mutation; successful
 promotion checks never suppress that boundary. Check results cannot authorize a
@@ -156,13 +161,16 @@ branches, and pending-work scope before finalization. The helper requires a
 ready result for the expected commit with no deployment operations or evidence.
 Without `--promotion-only`, deployment completion checks still apply.
 
-For a completed handoff, add `--deployment-evidence FILE` or pass its JSON on
-stdin with `--deployment-evidence -`. Bound evidence permits omission of the
-caller digest when every outcome uses this protocol. The receipt must bind the
-original record digest and operation to its producer, repository, clean commit,
-installation destination, exact deployed and removed skills, transaction, and
-cleanup debt. Finalization validates these fields and requires completed status
-with no debt; a handoff or `OK` alone cannot establish completion.
+For completed handoffs, add `--deployment-evidence FILE` or pass JSON on
+stdin with `--deployment-evidence -`. One receipt may bind one operation or a
+nonempty ordered list of operations from the same unchanged promotion record.
+Bound evidence permits omission of the caller digest when every outcome uses
+this protocol. The receipt must bind the original record digest and operations
+to its producer, repository, clean commit, installation destination, exact
+deployed and removed skills, transaction, and cleanup debt. Finalization maps
+the receipt to every bound operation, rejects duplicate or unselected
+operations, and requires completed status with no debt; a handoff or `OK` alone
+cannot establish completion.
 
 Finalization deletes only the named promotion record. It preserves failed,
 incomplete, mismatched, changed, linked, and out-of-scope records, other task

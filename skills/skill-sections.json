@@ -1,5 +1,5 @@
 {
-  "runtime_source_id": "Ceratops-Code/AI-Agent-Skills",
+  "runtime_source_id": "Ceratops-Code/Ceratops-AI-Agents-Kit",
   "validation_profile": "ceratops",
   "sections": {
     "core": "skills/sections/core.md",
@@ -29,13 +29,32 @@
   },
   "runtime_payloads": {
     "ceratops-repo-lifecycle": [
-      "skills/sections/*.md"
+      {
+        "source": "skills/sections/core.md",
+        "target": "references/templates/sections/core.md"
+      },
+      {
+        "source": "skills/sections/multi-action-skill.md",
+        "target": "references/templates/sections/multi-action-skill.md"
+      },
+      {
+        "source": "skills/sections/scripts/manage_checkpoints.py",
+        "target": "scripts/manage_checkpoints.py"
+      }
     ],
     "ceratops-skill-lifecycle": [
-      "skills/sections/*.md"
-    ],
-    "ceratops-openai-docs-managed": [
-      "skills/ceratops-openai-docs-managed/scripts/openai_docs_retrieval.py"
+      {
+        "source": "skills/sections/core.md",
+        "target": "references/templates/sections/core.md"
+      },
+      {
+        "source": "skills/sections/multi-action-skill.md",
+        "target": "references/templates/sections/multi-action-skill.md"
+      },
+      {
+        "source": "skills/sections/scripts/manage_checkpoints.py",
+        "target": "scripts/manage_checkpoints.py"
+      }
     ],
     "*": []
   },
@@ -46,12 +65,14 @@
     "ceratops-repo-lifecycle",
     "ceratops-skill-lifecycle",
     "ceratops-task-lifecycle",
+    "ceratops-mcp-server-lifecycle",
     "ceratops-design-document-lifecycle",
     "ceratops-openai-docs-managed"
   ],
   "skills": {
     "codex-desktop-upgrade": [
-      "core"
+      "core",
+      "multi-action-skill"
     ],
     "ceratops-design-document-lifecycle": [
       "core",
@@ -94,7 +115,7 @@
       "core",
       "multi-action-skill"
     ],
-    "ceratops-tool-lifecycle": [
+    "ceratops-mcp-server-lifecycle": [
       "core",
       "multi-action-skill"
     ]

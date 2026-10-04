@@ -1,0 +1,31 @@
+name: Bug report
+description: Report a reproducible problem.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not report security vulnerabilities, exploit details, or bypass
+        techniques in this public form. Follow this repository's SECURITY.md
+        and use GitHub private vulnerability reporting instead.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What happened, and what should have happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Include a minimal command, input, or repository state when possible.
+    validations:
+      required: true
+  - type: textarea
+    id: safety
+    attributes:
+      label: Safety notes
+      description: Do not include secrets, tokens, private endpoints, or personal data.
+    validations:
+      required: false

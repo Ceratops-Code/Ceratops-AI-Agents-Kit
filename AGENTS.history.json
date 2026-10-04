@@ -302,6 +302,62 @@
       "decision": "Name the release-entry gate SKILLS-PROMOTE-01, call the transition promotion, and update its two override relations. This supersedes the wording of the earlier 'Express local release staging as a positive authorization gate' decision.",
       "reason": "Repository lifecycle calls the move into release/local promotion; staging describes the assembled release batch.",
       "regression": "Continue requiring explicit promotion, shipping, or local-preview-sync intent before promoting skill-source changes; preserve the fast-change override, new-skill default-promotion exception, prior history decisions, and release/local shipping."
+    },
+    {
+      "rules": [
+        "SKILLS-RUNTIME-01"
+      ],
+      "decision": "Replace helper-location mechanics with repository ownership of alignment between the skill-runtime execution contract, its producers and consumers, and its behavioral tests.",
+      "reason": "Runtime selection and child execution belong to the executable contract; repeating those mechanics in repository and skill instructions creates source-of-truth drift.",
+      "regression": "Preserve portable installed-runtime use and keep interpreter and helper paths out of skill and action instructions."
+    },
+    {
+      "rules": [
+        "SKILLS-DESIGN-01"
+      ],
+      "decision": "Place prevention-first process design under Design and prohibit using its detection fallback to revalidate unchanged accepted work.",
+      "reason": "This narrows the earlier decision adding the prevention-first rule while preserving its narrowest-producer ownership and impossible-prevention fallback. The user explicitly requested matching portable project rules as well as global rules.",
+      "regression": "Keep original tests and prevention-first remediation; do not equate earlier rejection with prevention or repeat acceptance checks on unchanged accepted work."
+    },
+    {
+      "rules": [
+        "SKILLS-DESIGN-02"
+      ],
+      "decision": "Require produced processes to bind accepted work and original test/validation results to stable non-reused identities and consume that acceptance at later stages.",
+      "reason": "Repeated acceptance checks compensate for mutable or incomplete handoffs; the intended fix is the producer and immutable handoff, not a model-context restriction. The user explicitly requested matching portable project rules as well as global rules.",
+      "regression": "Preserve first-time tests and acceptance, integrity checks against malicious tampering, and the assistant's own reasoning/evidence obligations; do not change helper iteration behavior."
+    },
+    {
+      "rules": [
+        "SKILLS-DESIGN-03"
+      ],
+      "decision": "Preserve an unchanged artifact's accepted status when test or validator versions change; that change alone must not schedule the artifact for testing again.",
+      "reason": "Acceptance describes the exact check versions originally passed; newer checks do not retroactively revoke it. The user explicitly requested matching portable project rules as well as global rules.",
+      "regression": "An artifact that passed earlier checks remains accepted under them, does not claim passage of newer checks, and modified work still receives its own original checks."
+    },
+    {
+      "rules": [
+        "SKILLS-DESIGN-04"
+      ],
+      "decision": "Require a user decision before implementing or running extra validation of unchanged accepted work that appears necessary during normal process operation.",
+      "reason": "An apparent need for revalidation should trigger a producer/handoff design explanation and prevention proposal instead of silently adding another validation stage. The user explicitly requested matching portable project rules as well as global rules.",
+      "regression": "Keep the consultation gate scoped to produced processes; preserve original acceptance, useful improvement iterations for changed candidates, and independent model context handling."
+    },
+    {
+      "rules": [
+        "SKILLS-STORAGE-01"
+      ],
+      "decision": "Add SKILLS-STORAGE-01 to apply the global bounded-retention rules to every repository-owned generated-output producer through its producing helper and behavior tests, and prohibit delegating that retention to generic cleanup automation.",
+      "reason": "The Ceratops repository owns tool, runtime, and deployment producers whose semantic record and version retention can be decided safely only at the producer boundary.",
+      "regression": "Preserve SKILLS-HELP-01 and global retention limits; do not duplicate global policy text, move producer retention into a PC-cleanup automation, or weaken live and unrelated-file protection."
+    },
+    {
+      "rules": [
+        "SKILLS-RUNTIME-01"
+      ],
+      "decision": "Replace the blanket path prohibition from the earlier 'Replace helper-location mechanics with repository ownership of alignment between the skill-runtime execution contract, its producers and consumers, and its behavioral tests' decision with deterministic helper invocation requirements: helper-using skill and action instructions must name the exact helper command, every required argument, and each runtime value's source.",
+      "reason": "Installed skill workflows need a complete portable invocation contract; forbidding path construction makes executable instructions incomplete even when runtime paths are resolved portably.",
+      "regression": "Preserve producer-consumer-test alignment, portable runtime resolution, repository-owned helper behavior, and the ban on user-local absolute paths; do not permit vague, partial, or divergent helper invocations."
     }
   ]
 }

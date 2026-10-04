@@ -47,21 +47,21 @@ repository:
         - run: [uv, run, --locked, scripts/testing/run-tests.py, --auto]
 
 deliverables:
-  tools:
-    ceratops-tool-manager:
-      source: tools/ceratops_tool_manager
-      manifest: tools/ceratops_tool_manager/tool.json
+  mcp-servers:
+    ceratops-mcp-server-manager:
+      source: mcp-servers/ceratops_mcp_server_manager
+      manifest: mcp-servers/ceratops_mcp_server_manager/mcp-server.json
       prerequisites: []
       actions:
         validate:
           requires:
             capabilities: []
-          no-op: Repository validation covers the tool manager source and manifest.
+          no-op: Repository validation covers the MCP server manager source and manifest.
         install:
           requires:
             capabilities: [uv]
           steps:
-            - run: [uv, run, --locked, scripts/deploy-tool-manager.py]
+            - run: [uv, run, --locked, scripts/deploy-mcp-server-manager.py]
 
   skills:
     ceratops-automation-run:
@@ -176,16 +176,16 @@ deliverables:
         install:
           requires: {capabilities: []}
           steps: [{handoff: {lifecycle: ceratops-skill-lifecycle, action: deploy, inputs: {skill: ceratops-task-lifecycle}}}]
-    ceratops-tool-lifecycle:
-      source: skills/ceratops-tool-lifecycle
+    ceratops-mcp-server-lifecycle:
+      source: skills/ceratops-mcp-server-lifecycle
       prerequisites: []
       actions:
         validate:
           requires: {capabilities: []}
-          steps: [{handoff: {lifecycle: ceratops-skill-lifecycle, action: source-validate, inputs: {skill: ceratops-tool-lifecycle}}}]
+          steps: [{handoff: {lifecycle: ceratops-skill-lifecycle, action: source-validate, inputs: {skill: ceratops-mcp-server-lifecycle}}}]
         install:
           requires: {capabilities: []}
-          steps: [{handoff: {lifecycle: ceratops-skill-lifecycle, action: deploy, inputs: {skill: ceratops-tool-lifecycle}}}]
+          steps: [{handoff: {lifecycle: ceratops-skill-lifecycle, action: deploy, inputs: {skill: ceratops-mcp-server-lifecycle}}}]
     codex-desktop-upgrade:
       source: skills/codex-desktop-upgrade
       prerequisites: []

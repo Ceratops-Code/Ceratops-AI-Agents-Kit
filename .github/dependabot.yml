@@ -38,7 +38,7 @@ updates:
       - dependencies
       - python
   - package-ecosystem: pip
-    directory: /tools/ceratops_tool_manager
+    directory: /mcp-servers/ceratops_mcp_server_manager
     schedule:
       interval: weekly
     labels:

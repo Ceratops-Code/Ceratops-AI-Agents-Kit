@@ -70,9 +70,12 @@ first.
   credentials.
 - Build an update queue from live dependency-bot PRs, alerts, alert-linked
   update PRs, and local manifests; classify each update by risk.
-- When a caller supplies a complete queue-snapshot adapter, use queue
-  preflight as the queue and pre-edit evidence gate; a blocked, missing, or
-  invalid result blocks repository edits and approved-PR finalization.
+- When a caller supplies a complete queue-snapshot adapter, use its preflight
+  as the queue and evidence gate for repository edits and PR finalization.
+- Block only actions whose required evidence is missing, invalid, or failed;
+  continue authorized independent actions whose evidence passes. When the
+  helper cannot establish the affected scope, block all edits and merges.
+  Keep unresolved alerts visible, including those with no patched version.
 - Treat Dependabot or Renovate PRs as first-class queue items even when no
   security alert is open.
 - For each queued PR or alert, capture whether it is security-linked or routine,

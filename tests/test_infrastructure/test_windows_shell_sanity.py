@@ -439,6 +439,24 @@ exit 7
 
 
 @pytest.mark.parametrize("shell", ["powershell", "pwsh"])
+def test_real_shell_pipes_json_to_native_process_as_utf8_without_bom(shell: str) -> None:
+    executable = shutil.which(shell)
+    if executable is None:
+        pytest.skip(f"{shell} is not installed")
+    python = sys.executable.replace("'", "''")
+    command = (
+        "$payload = '{\"schema\":\"utf8\"}'\n"
+        f"$payload | & '{python}' -c 'import json,sys; print(next(iter(json.load(sys.stdin).values())))'"
+    )
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "--powershell", executable, "--command", command],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == "utf8"
+
+
+@pytest.mark.parametrize("shell", ["powershell", "pwsh"])
 @pytest.mark.parametrize("command", ["Write-Error 'error-only'; exit 9", "throw 'error-only'"])
 def test_real_shell_preserves_powershell_errors(shell: str, command: str) -> None:
     executable = shutil.which(shell)
@@ -857,7 +875,7 @@ class ProjectPythonRedirectionTests(unittest.TestCase):
         if shutil.which("pwsh") is None:
             self.skipTest("PowerShell 7 is required for native argument tests")
         cwd = self.project_paths["Docs-and-Claims"]["main"]
-        values = ['probe="value"', "", "two words", 'C:\\folder\\"quoted"\\', "O'Brien", "$(literal)"]
+        values = ['probe="value"', "", "two words", 'C:\\repo\\folder\\"quoted"\\', "O'Brien", "$(literal)"]
         code = "import json,sys; print(json.dumps(sys.argv[1:]))"
         arguments = " ".join(SANITY.powershell_quote(value) for value in values)
         for executable in ("python", "& " + SANITY.powershell_quote(sys.executable)):

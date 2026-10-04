@@ -196,7 +196,7 @@ def test_bootstrap_never_calls_installed_lifecycle(
     assert not marker.exists()
     assert runtime_owner(
         install_root, "ceratops-skill-lifecycle"
-    ) == "Ceratops-Code/AI-Agent-Skills"
+    ) == "Ceratops-Code/Ceratops-AI-Agents-Kit"
 
 
 def test_bootstrap_updates_existing_installations_and_cleans_owned_state(
@@ -234,7 +234,7 @@ def test_bootstrap_updates_existing_installations_and_cleans_owned_state(
 
     assert result.returncode == 0, result.stderr
     assert runtime_owner(install_root, "ceratops-skill-lifecycle") == (
-        "Ceratops-Code/AI-Agent-Skills"
+        "Ceratops-Code/Ceratops-AI-Agents-Kit"
     )
     installed_skill = install_root / "ceratops-skill-lifecycle"
     skill_text = (installed_skill / "SKILL.md").read_text(encoding="utf-8")
@@ -430,7 +430,7 @@ def test_bootstrap_full_install_materializes_lifecycle_bundle_with_source_runtim
     )
 
     assert result.returncode == 0, result.stderr
-    assert runtime_owner(install_root, "ceratops-repo-lifecycle") == "Ceratops-Code/AI-Agent-Skills"
+    assert runtime_owner(install_root, "ceratops-repo-lifecycle") == "Ceratops-Code/Ceratops-AI-Agents-Kit"
     installed_lifecycle = install_root / "ceratops-repo-lifecycle"
     assert (
         installed_lifecycle
@@ -438,20 +438,63 @@ def test_bootstrap_full_install_materializes_lifecycle_bundle_with_source_runtim
         / "templates"
         / "skill-sections.json.tmpl"
     ).is_file()
-    assert (installed_lifecycle / "skills" / "sections" / "core.md").is_file()
-    assert not (installed_lifecycle / "skills" / "sections" / "python").exists()
+    for lifecycle_name in (
+        "ceratops-repo-lifecycle",
+        "ceratops-skill-lifecycle",
+    ):
+        installed_skill = install_root / lifecycle_name
+        installed_sections = (
+            installed_skill / "references" / "templates" / "sections"
+        )
+        assert (installed_sections / "core.md").is_file()
+        assert (installed_sections / "multi-action-skill.md").is_file()
+        assert not (installed_skill / "skills" / "sections").exists()
+    installed_openai_docs = install_root / "ceratops-openai-docs-managed"
     assert (
-        installed_lifecycle / "skills" / "sections" / "multi-action-skill.md"
+        installed_openai_docs / "scripts" / "openai_docs_retrieval.py"
+    ).is_file()
+    assert not (
+        installed_openai_docs
+        / "skills"
+        / "ceratops-openai-docs-managed"
+        / "scripts"
+        / "openai_docs_retrieval.py"
+    ).exists()
+    assert (
+        installed_lifecycle
+        / "references"
+        / "schemas"
+        / "sdlc.v4.schema.json"
     ).is_file()
     assert (
         installed_lifecycle
         / "references"
         / "schemas"
-        / "sdlc.yml.schema.json"
+        / "sdlc.v5.schema.json"
     ).is_file()
     assert (
         installed_lifecycle / "scripts" / COMPATIBILITY_ENGINE / "__main__.py"
     ).is_file()
+    installed_validator = (
+        install_root
+        / "ceratops-skill-lifecycle"
+        / "scripts"
+        / "skills-consistency-source-validator.py"
+    )
+    validated = subprocess.run(
+        [
+            sys.executable,
+            str(installed_validator),
+            "--repo-root",
+            str(ROOT),
+            "--mode",
+            "sections",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert validated.returncode == 0, validated.stderr
     target_repo = tmp_path / "installed-bundle-target"
     create_compatible_repo(target_repo, "stale/source", ["alpha-tool"])
     prepare_script_environment(target_repo)
@@ -1185,9 +1228,18 @@ def test_shared_skill_python_environment_reuses_lock_and_repairs_missing_package
     )
     (repository / "sdlc").mkdir()
     (repository / "sdlc/sdlc.yml").write_text(json.dumps({
-        "version": 3, "kind": "ceratops-sdlc", "repository": {
-            "validate": {"target": {"steps": [{"run": [uv, "run", "--locked", "scripts/probe.py"]}]}},
-            "tests": {"none": {"no-op": "Environment boundary fixture."}},
+        "version": 4, "kind": "ceratops-sdlc", "repository": {
+            "capabilities": {},
+            "actions": {
+                "validate": {
+                    "requires": {"capabilities": []},
+                    "steps": [{"run": [uv, "run", "--locked", "scripts/probe.py"]}],
+                },
+                "test": {
+                    "requires": {"capabilities": []},
+                    "no-op": "Environment boundary fixture.",
+                },
+            },
         },
     }))
     through_skill = subprocess.run([
@@ -1230,7 +1282,7 @@ def test_shared_skill_python_environment_reuses_lock_and_repairs_missing_package
 
 @pytest.mark.skipif(shutil.which("uv") is None, reason="uv is required for the deployed runtime integration")
 def test_runtime_update_preserves_an_active_helper_environment(tmp_path: pathlib.Path) -> None:
-    """A lock change creates a new venv while an old helper still imports."""
+    """Retention bounds completed versions without deleting a live helper."""
 
     repo = tmp_path / "source"
     create_compatible_repo(repo, "example/versioned-runtime", ["alpha-tool"])
@@ -1257,6 +1309,9 @@ def test_runtime_update_preserves_an_active_helper_environment(tmp_path: pathlib
     assert first.returncode == 0, first.stderr
     manifest = installed / "alpha-tool/.runtime-manifest.json"
     old_python = pathlib.Path(json.loads(manifest.read_text())["python_runtime"])
+    versions = old_python.parents[3]
+    damaged = versions / ("f" * 24)
+    (damaged / ".venv").mkdir(parents=True)
     ready, release = tmp_path / "ready", tmp_path / "release"
     uv = shutil.which("uv")
     assert uv is not None
@@ -1270,20 +1325,39 @@ def test_runtime_update_preserves_an_active_helper_environment(tmp_path: pathlib
             time.sleep(0.05)
         assert ready.exists()
         pyproject = project / "pyproject.toml"
-        pyproject.write_text(pyproject.read_text().replace(
-            'dependencies = ["jsonschema", "markdown-it-py", "PyYAML", "tzdata"]',
-            "dependencies = []",
-        ))
-        locked = subprocess.run([uv, "lock", "--project", str(project)], capture_output=True, text=True, check=False)
-        assert locked.returncode == 0, locked.stderr
-        second = subprocess.run(command, capture_output=True, text=True, check=False)
-        assert second.returncode == 0, second.stderr
-        new_python = pathlib.Path(json.loads(manifest.read_text())["python_runtime"])
-        assert new_python != old_python and new_python.is_file() and old_python.is_file()
+        selected = [old_python]
+        for revision in range(1, 5):
+            pyproject.write_text(re.sub(
+                r'version = "0\.0\.\d+"',
+                f'version = "0.0.{revision}"',
+                pyproject.read_text(encoding="utf-8"),
+            ), encoding="utf-8", newline="\n")
+            locked = subprocess.run(
+                [uv, "lock", "--project", str(project)],
+                capture_output=True, text=True, check=False,
+            )
+            assert locked.returncode == 0, locked.stderr
+            updated = subprocess.run(command, capture_output=True, text=True, check=False)
+            assert updated.returncode == 0, updated.stderr
+            selected.append(pathlib.Path(json.loads(manifest.read_text())["python_runtime"]))
+            assert selected[-1] != selected[-2] and selected[-1].is_file()
+            assert old_python.is_file()
+            assert not damaged.exists()
+
+        retained_while_active = {path.name for path in versions.iterdir() if path.is_dir()}
+        assert retained_while_active == {
+            old_python.parents[2].name,
+            *(path.parents[2].name for path in selected[-3:]),
+        }
         release.write_text("go")
         stdout, stderr = helper.communicate(timeout=10)
         assert helper.returncode == 0, stderr
         assert stdout.strip() == "old runtime survived"
+        pruned = subprocess.run(command, capture_output=True, text=True, check=False)
+        assert pruned.returncode == 0, pruned.stderr
+        assert {path.name for path in versions.iterdir() if path.is_dir()} == {
+            path.parents[2].name for path in selected[-3:]
+        }
     finally:
         release.write_text("go")
         if helper.poll() is None:

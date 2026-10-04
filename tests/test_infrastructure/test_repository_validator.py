@@ -44,12 +44,13 @@ def test_build_checks_owns_order_both_platforms_and_space_safe_paths(
 
     assert [(check.name, check.platform) for check in checks] == [
         ("markdown-lint", None),
+        ("actionlint", None),
         ("yaml-lint", None),
         ("ruff", None),
         ("mypy", "linux"),
         ("mypy", "win32"),
     ]
-    yaml_check = VALIDATOR.build_checks(ROOT, python_executable=sys.executable)[1]
+    yaml_check = VALIDATOR.build_checks(ROOT, python_executable=sys.executable)[2]
     yaml_inventory = subprocess.run(
         [*yaml_check.command[:3], "--list-files", *yaml_check.command[3:]],
         cwd=ROOT, capture_output=True, text=True, check=False,
@@ -63,7 +64,11 @@ def test_build_checks_owns_order_both_platforms_and_space_safe_paths(
     ).resolve() in yaml_paths
     assert (ROOT / "sdlc/sdlc.yml").resolve() in yaml_paths
     assert all(".venv" not in path.parts and "node_modules" not in path.parts for path in yaml_paths)
-    assert checks[2].command == (
+    assert checks[1].command == (
+        "python executable",
+        "scripts/run-actionlint.py",
+    )
+    assert checks[3].command == (
         "python executable",
         "-m",
         "ruff",
@@ -71,15 +76,15 @@ def test_build_checks_owns_order_both_platforms_and_space_safe_paths(
         "--config",
         "scripts/pyproject.toml",
         "scripts",
-        "tools",
+        "mcp-servers",
         "skills/ceratops-repo-lifecycle/references/templates/"
         "deploy-skills.py.tmpl",
     )
-    assert checks[3].command[-2:] == ("--platform", "linux")
-    assert checks[4].command[-2:] == ("--platform", "win32")
+    assert checks[4].command[-2:] == ("--platform", "linux")
+    assert checks[5].command[-2:] == ("--platform", "win32")
     assert checks[0].command == ("npm executable", "--prefix", "scripts", "run", "lint:markdown")
     assert all(check.cwd == repo_root for check in checks)
-    assert all(check.command[3:5] == ("--config-file", "scripts/pyproject.toml") for check in checks[3:])
+    assert all(check.command[3:5] == ("--config-file", "scripts/pyproject.toml") for check in checks[4:])
 
 
 def test_ci_runs_repository_validator_that_owns_both_mypy_platforms() -> None:
@@ -173,7 +178,7 @@ def test_success_prints_exactly_ok_and_suppresses_child_output(
     assert result == 0
     assert captured.out == "OK\n"
     assert captured.err == ""
-    assert len(calls) == 5
+    assert len(calls) == 6
     assert not evidence_file.exists()
     assert not temporary.exists()
 
@@ -188,7 +193,7 @@ def test_failure_is_fail_fast_compact_and_writes_complete_evidence(
     ) -> subprocess.CompletedProcess[str]:
         del cwd
         calls.append(command)
-        if len(calls) == 5:
+        if len(calls) == 6:
             return completed(
                 command,
                 returncode=7,
@@ -206,7 +211,7 @@ def test_failure_is_fail_fast_compact_and_writes_complete_evidence(
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
     assert result == 7
-    assert len(calls) == 5
+    assert len(calls) == 6
     assert payload == {
         "check": "mypy",
         "platform": "win32",
@@ -234,7 +239,7 @@ def test_validation_has_no_test_mode_or_test_side_effects(tmp_path: pathlib.Path
 
     evidence = tmp_path / "validation.log"
     assert VALIDATOR.main(["--evidence-file", str(evidence)], process_runner=run) == 0
-    assert len(calls) == 5
+    assert len(calls) == 6
     assert capsys.readouterr().out == "OK\n"
     calls.clear()
     assert VALIDATOR.main(["--without-tests"], process_runner=run) == 2
@@ -344,7 +349,7 @@ def test_wrong_python_stops_before_checks_and_succeeds_after_correction(
     monkeypatch.setattr(VALIDATOR.platform, "python_version", lambda: "3.14.7")
     assert VALIDATOR.main(["--evidence-file", str(evidence)], process_runner=runner) == 0
     assert capsys.readouterr().out == "OK\n"
-    assert len(calls) == 5
+    assert len(calls) == 6
     assert not evidence.exists()
 
 
@@ -365,10 +370,13 @@ def test_repository_entrypoints_run_through_uv(
     assert metadata["tool"]["uv"]["package"] is False
     assert "python_version" not in tool_settings["tool"]["mypy"]
     assert tool_settings["tool"]["ruff"]["target-version"] == f"py{sys.version_info.major}{sys.version_info.minor}"
-    tool_metadata = tomllib.loads(
-        (ROOT / "tools" / "ceratops_tool_manager" / "pyproject.toml").read_text(encoding="utf-8")
+    mcp_server_metadata = tomllib.loads(
+        (ROOT / "mcp-servers" / "ceratops_mcp_server_manager" / "pyproject.toml").read_text(encoding="utf-8")
     )
-    assert metadata["project"]["requires-python"] == tool_metadata["project"]["requires-python"]
+    assert (
+        metadata["project"]["requires-python"]
+        == mcp_server_metadata["project"]["requires-python"]
+    )
     monkeypatch.delenv("UV_PROJECT_ENVIRONMENT", raising=False)
     script = ROOT / entrypoint
     if script.suffix == ".tmpl":

@@ -29,9 +29,6 @@ from rule_graph import (
 )
 
 D_RULE_CHAR_LIMIT = 220
-MEDIUM_REASONING_AUTOMATION_IDS = frozenset(
-    {"diskfinventorycheck", "pc-cleanup"}
-)
 RESERVED_PROJECT_TREE_NAMES = frozenset({"tmp", "worktrees"})
 D_RULE_RE = re.compile(r"^\s*(?:-\s+)?\(D\)\s+(.+)$")
 ALL_BULLETS_FORCE_RE = re.compile(
@@ -212,9 +209,9 @@ def automations_inventory(automation_root: pathlib.Path) -> dict[str, object]:
     }
 
 
-def expected_automation_reasoning_effort(automation_id: str) -> str:
-    """Return the closed governance policy for one automation identifier."""
-    return "medium" if automation_id in MEDIUM_REASONING_AUTOMATION_IDS else "max"
+def expected_automation_reasoning_effort() -> str:
+    """Return the uniform maximum-effort automation policy."""
+    return "max"
 
 
 def automation_reasoning_effort_inventory(
@@ -231,7 +228,7 @@ def automation_reasoning_effort_inventory(
         for item in cast(list[dict[str, object]], inventory["items"]):
             automation_id = str(item.get("id") or "")
             actual = item.get("reasoning_effort")
-            expected = expected_automation_reasoning_effort(automation_id)
+            expected = expected_automation_reasoning_effort()
             checked_count += 1
             if actual == expected:
                 continue
@@ -247,7 +244,7 @@ def automation_reasoning_effort_inventory(
             )
     return {
         "policy": {
-            "medium_ids": sorted(MEDIUM_REASONING_AUTOMATION_IDS),
+            "medium_ids": [],
             "default": "max",
         },
         "checked_count": checked_count,

@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "actions": {
+    "install": {
+      "run": [
+        "{python}",
+        "-I",
+        "-B",
+        "{skill_root}/scripts/install-mcp-server.py",
+        "--repo-root",
+        "{repo_root}"
+      ]
+    }
+  }
+}

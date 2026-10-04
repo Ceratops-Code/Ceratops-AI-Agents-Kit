@@ -7,9 +7,9 @@
       ],
       "depends_on": []
     },
-    "tool_manager": {
+    "mcp_server_manager": {
       "pytest": [
-        "tests/tool_manager"
+        "tests/mcp_server_manager"
       ],
       "depends_on": []
     },
@@ -67,20 +67,20 @@
       ]
     },
     {
-      "id": "tool_manager_source",
+      "id": "mcp_server_manager_source",
       "paths": [
         ".codex/config.toml",
-        "tools/**",
-        "scripts/deploy-tool-manager.py"
+        "mcp-servers/**",
+        "scripts/deploy-mcp-server-manager.py"
       ],
       "suites": [
-        "tool_manager"
+        "mcp_server_manager"
       ]
     },
     {
-      "id": "tool-lifecycle-source",
-      "paths": ["skills/ceratops-tool-lifecycle/**"],
-      "suites": ["tool_manager", "repository-lifecycle"]
+      "id": "mcp-server-lifecycle-source",
+      "paths": ["skills/ceratops-mcp-server-lifecycle/**"],
+      "suites": ["mcp_server_manager", "repository-lifecycle"]
     },
     {
       "id": "credit-analysis-source",
@@ -113,6 +113,7 @@
     {
       "id": "repository-lifecycle-source",
       "paths": [
+        "docs/result_records.py.tmpl",
         "skills/ceratops-repo-lifecycle/**",
         "sdlc/**"
       ],
@@ -165,6 +166,7 @@
     "scripts/testing/runner_requests.py",
     "scripts/testing/pytest-diagnostics.py",
     "scripts/testing/pytest-environment.py",
+    "scripts/run-actionlint.py",
     "scripts/validate-repository.py",
     "skills/ceratops-automation-run/**",
     "skills/ceratops-code-consistency-audit/**",

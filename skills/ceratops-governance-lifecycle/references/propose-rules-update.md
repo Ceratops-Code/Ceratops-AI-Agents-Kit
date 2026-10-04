@@ -57,93 +57,28 @@ Route approved skill-source mutations through `$ceratops-skill-lifecycle`
    evidence and tradeoffs; include the regression result and remaining
    uncertainty.
 
-## Applying an approved change
-
-Before applying an approved rule mutation, complete workflow step 6 against the
-exact current text. The deterministic helper validates mechanical application;
-it does not prove semantic equivalence. The model remains responsible for
-mapping every operative part of the old text, including commands and examples,
-to preserved behavior or an explicitly approved change.
-
-- (D) For every approved rule or TOML edit or history-only ID repair,
-  create one request naming the complete rule stack, any exact validated
-  champion and hash, every approved history append or ID migration, caller-selected
-  validation evidence, the verified task-temp root, and exact request,
-  champion, and evidence ownership; then run `python
-  scripts/apply_rules_update.py --request <path>`.
-- TOML targets require null history and Markdown policy; apply their exact
-  approved text and parse the reopened file without reformatting. An empty
-  history-operation list is allowed only for TOML-only edits. Mixed rule,
-  history, and TOML writes share one rollback transaction.
-- (D) The helper must verify current source and policy hashes and, when a
-  champion is present, its hash, expected-old uniqueness, and mechanical
-  validity through `validate_rule_candidate.py` with fixing disabled; apply
-  approved rule replacement text unchanged and without reformatting; reuse
-  rule-graph and history validation; preserve encoding and line endings; cover
-  every changed current rule ID in history; protect coupled writes with
-  rollback; reopen and revalidate exact bytes; remove only unchanged explicitly
-  disposable artifacts after success; preserve them on failure; and emit only
-  `OK` or one compact actionable error.
-- (D) For an ID migration, the helper must apply approved one-to-one mappings
-  simultaneously to exact rule-ID tokens in every history field,
-  stable-deduplicate `rules` arrays, require approved exact semantic
-  replacements where substitution would change meaning, preserve all other
-  content and entry order, and prove no old ID remains. It may perform a
-  history-only ID repair only when each old ID is absent and each new ID is
-  present in the current rule stack.
-
-Append one decision per approved rule change and apply any approved ID migration
-under the history contract in [rule-design.md](rule-design.md).
-
 ## Iterative optimization
 
-- (D) Construct each proposal with
-  `python scripts/proposal-workflow.py construct --spec SPEC`.
+- (D) Start with `python scripts/proposal-workflow.py construct --spec SPEC`;
+  for an existing complete request, use
+  `python scripts/proposal-workflow.py prepare --request REQUEST` instead.
+- For every issued iteration, complete workflow steps 5-7 and prepare the
+  candidate's text, history decisions, and semantic assessment.
+- (D) Submit each iteration with
+  `python scripts/proposal-workflow.py advance --state STATE --outcome OUTCOME
+  --regressions RESULT`.
+- Report one compact status after each submission; do not repeat iteration
+  logs in the final answer.
+- (D) Before presenting the selected proposal, run
+  `python scripts/proposal-workflow.py finalize --state STATE`.
 
-Use `ceratops-governance-proposal-spec.v1` with the complete ordered rule sources,
-histories, selected rule IDs, exact replacements, failure and regression
-evidence, mutation authority, expected side effects, iteration limit, and
-verified task-temp root. Use null history only when none exists and include one
-history-backed source. Context-only sources have no replacements and require
-history and selected rule IDs.
+## Applying an approved change
 
-The helper derives request paths and disposable ownership, captures current
-context rule text, and seeds the first candidate. It preserves the caller's
-spec; finalization removes generated inputs and retains the validated champion.
-For a supplied complete request with explicit paths or ownership, use
-`python scripts/proposal-workflow.py prepare --request REQUEST` instead.
-
-Both paths set `markdown_policy` to null in requests. The helper must resolve
-and hash the skill-owned `references/.markdownlint.json` for Markdown targets;
-TOML targets retain null policy and must parse without reformatting. It must
-verify current source and skill-policy hashes, write compact context evidence,
-initialize candidate-validation state, and open iteration 1 without mutating a
-governed target. Before writing context or opening an iteration, reject existing
-Markdown errors outside the declared replacement ranges. Errors within those
-ranges may be repaired by the proposal; final whole-target validation still
-applies.
-
-- (D) After writing each pending structured candidate and semantic assessment,
-  run `python scripts/proposal-workflow.py advance --state STATE --outcome
-  OUTCOME --regressions RESULT`. Before hashing or recording, the controller
-  must call the validator's shared implementation. The validator must repair
-  only permitted whitespace in candidate artifacts, validate every complete
-  prospective target and applicable rule stack and history, prove idempotence,
-  atomically replace the candidate only after all targets pass, and write
-  detailed evidence to the pending caller-selected path. Mechanical failure
-  must leave the candidate recoverable and the same iteration pending without
-  recording a semantic rejection; success records the fixed artifact,
-  assessment, outcome, evidence, hashes, and state before opening a successor.
-- (D) Before final output, run `python scripts/proposal-workflow.py finalize
-  --state STATE`. The helper must reject incomplete runs, path escapes, links,
-  repository or governed targets, undeclared artifacts, and changed owned
-  inputs; copy the exact validated champion to the declared protected output;
-  preserve user-owned or undeclared inputs; delegate controller cleanup; and
-  remove every owned request, original/regression input, context evidence,
-  state, and iteration artifact. Emit only `OK` or one compact actionable
-  error.
-- For each issued iteration, complete steps 5-7. After submission, post one
-  compact commentary status; do not repeat iteration logs in the final answer.
+- (D) For an approved history-only ID repair, first prepare its candidate with
+  `python scripts/validate_rule_candidate.py --candidate CANDIDATE
+  --evidence EVIDENCE --accept`.
+- (D) After approval, apply the exact exported candidate with
+  `python scripts/apply_rules_update.py --request REQUEST`.
 
 ## Done When
 

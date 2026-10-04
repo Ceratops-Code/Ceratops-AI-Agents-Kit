@@ -10,6 +10,10 @@ and proves the emitted output is sanitized.
 
 ### Script Bundle
 
+- (D) Evidence capture:
+  `python -m github_contract_engine codeql-disposition capture --repo OWNER/REPO
+  --alert-number NUMBER --commit FULL_SHA --action suppression|dismissal
+  --test-command-json ARGV --evidence PATH`.
 - (D) Evidence gate:
   `python -m github_contract_engine codeql-disposition --repo OWNER/REPO
   --alert-number NUMBER --commit FULL_SHA --evidence PATH
@@ -27,6 +31,10 @@ and proves the emitted output is sanitized.
 - `execution` with a non-empty argument-list command, zero exit code, unique
   sentinel credential values prefixed `CODEQL_SENTINEL_`, and captured output.
 - Captured output contains `<redacted>` and none of the sentinel values.
+- The test-command JSON is one closed object with a non-empty string-array
+  `command` and non-empty unique `sentinel_names`. Capture exposes each value as
+  `CODEQL_SENTINEL_<NAME>` and provides `CODEQL_TRACE_OUTPUT`; the test writes
+  `source_to_sink` with `exercised: true` and its source-to-sink `trace` there.
 
 ### Inputs To Capture
 
@@ -55,13 +63,15 @@ Infer alert identity and location from the live API. Do not infer authorization.
 
 ## Workflow
 
-1. Fetch the live alert and confirm it is produced by CodeQL and its most recent
-   instance is open at the requested full commit.
-2. Run the narrow test that exercises the reported source-to-sink path with
-   unique sentinel credentials and capture the sanitized output.
-3. Write the compact evidence object and run the helper without a dismissal
-   authorization flag; dismissal evidence must return `authorization_required`
-   without mutating GitHub.
+1. (D) Run `python -m github_contract_engine codeql-disposition capture
+   --repo OWNER/REPO --alert-number NUMBER --commit FULL_SHA
+   --action suppression|dismissal --test-command-json ARGV --evidence PATH`
+   through the skill's required `uv` invocation. Capture binds the live alert,
+   generates sentinel credentials, runs the argument-vector test, validates the
+   trace and redaction, and writes the closed evidence object.
+2. Run the existing disposition gate without dismissal authorization; dismissal
+   evidence must return `authorization_required` without mutating GitHub.
+3. Use only the captured evidence for the action-specific steps below.
 4. For suppression, require `evidence_accepted` before adding or retaining the
    narrow CodeQL annotation.
 5. For dismissal, obtain explicit user authorization after the evidence passes,

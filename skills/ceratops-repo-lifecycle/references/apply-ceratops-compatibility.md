@@ -48,8 +48,10 @@ Infer the source identity from stable repository evidence before asking.
   The generator and checker consume the deterministic contract; review uses
   the companion rubric and local repository evidence. Keep both in this skill.
 - Missing validator check definitions come from
-  `references/contracts/repository-validation-contract.json`; the compatibility
-  contract owns destination paths, template mappings, and skill routing defaults.
+  `references/contracts/repository-validation-contract.json`. The compatibility
+  contract owns destination paths and template mappings, including required issue
+  and pull request templates, plus skill routing defaults. Applying compatibility
+  creates missing required templates and preserves existing target-owned files.
 
 ## Constraints
 
@@ -136,6 +138,11 @@ Infer the source identity from stable repository evidence before asking.
 
 ### 2. Establish compatible source surfaces
 
+- Treat `.github/ISSUE_TEMPLATE/bug_report.yml` and
+  `.github/pull_request_template.md` as one community-template group owned by the
+  compatibility contract. On every apply, create only missing group members from
+  the bundled templates, preserve existing regular files, and include generated
+  files in the transaction rollback boundary.
 - Run the compatibility apply helper so it loads the lifecycle-owned
   `references/templates/skill-sections.json.tmpl`, derives or accepts the
   stable source identity, inventories source skills and multi-action markers,

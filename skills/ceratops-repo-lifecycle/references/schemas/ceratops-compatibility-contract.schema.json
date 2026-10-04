@@ -46,6 +46,8 @@
       "required": [
         "validator",
         "workflow",
+        "issue_template",
+        "pull_request_template",
         "sdlc",
         "skill_manifest",
         "skill_bootstrap",
@@ -58,6 +60,12 @@
           "$ref": "#/$defs/surface"
         },
         "workflow": {
+          "$ref": "#/$defs/surface"
+        },
+        "issue_template": {
+          "$ref": "#/$defs/surface"
+        },
+        "pull_request_template": {
           "$ref": "#/$defs/surface"
         },
         "sdlc": {

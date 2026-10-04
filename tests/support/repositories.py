@@ -9,7 +9,14 @@ import subprocess
 import yaml
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-INSTALLER_TEMPLATE = ROOT / "skills" / "ceratops-repo-lifecycle" / "references" / "templates" / "deploy-skills.py.tmpl"
+INSTALLER_TEMPLATE = (
+    ROOT
+    / "skills"
+    / "ceratops-repo-lifecycle"
+    / "references"
+    / "templates"
+    / "deploy-skills.py.tmpl"
+)
 
 
 def prepare_script_environment(repo: pathlib.Path) -> None:
@@ -18,12 +25,18 @@ def prepare_script_environment(repo: pathlib.Path) -> None:
     scripts = repo / "scripts"
     scripts.mkdir(exist_ok=True)
     (scripts / "pyproject.toml").write_text(
-        (templates / "validation-pyproject.toml.tmpl").read_text(encoding="utf-8").replace(
-            "__DEPENDENCIES__", '["jsonschema", "PyYAML", "ruff", "mypy"]'
-        ), encoding="utf-8",
+        (templates / "validation-pyproject.toml.tmpl")
+        .read_text(encoding="utf-8")
+        .replace("__DEPENDENCIES__", '["jsonschema", "PyYAML", "ruff", "mypy"]'),
+        encoding="utf-8",
     )
     (scripts / ".gitignore").write_text(".venv/\n__pycache__/\n", encoding="utf-8")
-    result = subprocess.run(["uv", "lock", "--project", str(scripts)], capture_output=True, text=True, check=False)
+    result = subprocess.run(
+        ["uv", "lock", "--project", str(scripts)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
     assert result.returncode == 0, result.stderr
 
 
@@ -35,25 +48,32 @@ def prepare_skill_python_project(repo: pathlib.Path) -> None:
     (project / "pyproject.toml").write_text(
         '[project]\nname = "target-skill-runtime"\nversion = "0.0.0"\n'
         'requires-python = ">=3.14,<3.15"\ndependencies = []\n\n'
-        '[tool.uv]\npackage = false\n\n[tool.uv.workspace]\nmembers = []\n',
+        "[tool.uv]\npackage = false\n\n[tool.uv.workspace]\nmembers = []\n",
         encoding="utf-8",
         newline="\n",
     )
     result = subprocess.run(
         ["uv", "lock", "--project", str(project)],
-        capture_output=True, text=True, check=False,
+        capture_output=True,
+        text=True,
+        check=False,
     )
     assert result.returncode == 0, result.stderr
 
 
 def run_ci_action(
-    repo: pathlib.Path, evidence: pathlib.Path, bundle: pathlib.Path,
+    repo: pathlib.Path,
+    evidence: pathlib.Path,
+    bundle: pathlib.Path,
 ) -> subprocess.CompletedProcess[str]:
     """Execute the real composite action in a caller-owned isolated action checkout."""
     action_root = bundle / "skills/ceratops-repo-lifecycle"
     if not action_root.exists():
-        shutil.copytree(ROOT / "skills/ceratops-repo-lifecycle", action_root,
-                        ignore=shutil.ignore_patterns(".venv", "__pycache__"))
+        shutil.copytree(
+            ROOT / "skills/ceratops-repo-lifecycle",
+            action_root,
+            ignore=shutil.ignore_patterns(".venv", "__pycache__"),
+        )
         # The action checkout carries its own project; target repositories own theirs separately.
         project = bundle / "skills/sections/python"
         project.mkdir(parents=True)
@@ -62,19 +82,30 @@ def run_ci_action(
     action_root = action_root / "scripts"
     action = yaml.safe_load((action_root / "action.yml").read_text(encoding="utf-8"))
     assert action["runs"]["using"] == "composite"
-    step, = action["runs"]["steps"]
+    (step,) = action["runs"]["steps"]
     assert step["shell"] == "bash"
-    values = {"${{ github.action_path }}": str(action_root),
-              "${{ inputs.repo-root }}": str(repo),
-              "${{ inputs.evidence-file }}": str(evidence)}
+    values = {
+        "${{ github.action_path }}": str(action_root),
+        "${{ inputs.repo-root }}": str(repo),
+        "${{ inputs.evidence-file }}": str(evidence),
+    }
     environment = dict(os.environ)
     environment.pop("UV_PROJECT_ENVIRONMENT", None)
     environment.update({key: values[value] for key, value in step["env"].items()})
     # Git Bash is also the Windows runner's Bash; avoid an unrelated WSL launcher.
-    bash = (pathlib.Path(shutil.which("git") or "git").resolve().parents[1] / "bin/bash.exe"
-            if os.name == "nt" else pathlib.Path(shutil.which("bash") or "bash"))
-    return subprocess.run([str(bash), "--noprofile", "--norc", "-c", step["run"]],
-                          cwd=repo, env=environment, capture_output=True, text=True, check=False)
+    bash = (
+        pathlib.Path(shutil.which("git") or "git").resolve().parents[1] / "bin/bash.exe"
+        if os.name == "nt"
+        else pathlib.Path(shutil.which("bash") or "bash")
+    )
+    return subprocess.run(
+        [str(bash), "--noprofile", "--norc", "-c", step["run"]],
+        cwd=repo,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
 
 
 def run_git(repo: pathlib.Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -94,18 +125,36 @@ def write_sdlc_contract(
     repository: dict[str, object] | None = None,
     deliverables: dict[str, object] | None = None,
 ) -> pathlib.Path:
-    """Write or extend the current capability contract without format conversion."""
+    """Write or extend one native v4 capability contract."""
 
     contract = repo / "sdlc" / "sdlc.yml"
     contract.parent.mkdir(parents=True, exist_ok=True)
-    document: dict[str, object] = {"version": 2, "kind": "ceratops-sdlc"}
+    document: dict[str, object] = {
+        "version": 4,
+        "kind": "ceratops-sdlc",
+        "repository": {
+            "capabilities": {},
+            "actions": {
+                "validate": {
+                    "requires": {"capabilities": []},
+                    "no-op": "No repository validation in this fixture.",
+                },
+                "test": {
+                    "requires": {"capabilities": []},
+                    "no-op": "No repository tests in this fixture.",
+                },
+            },
+        },
+    }
     if contract.exists():
         document = json.loads(contract.read_text(encoding="utf-8"))
     for name, group in (("repository", repository), ("deliverables", deliverables)):
         if group is not None:
             document[name] = group
     contract.write_text(
-        json.dumps(document, indent=2) + "\n", encoding="utf-8", newline="\n",
+        json.dumps(document, indent=2) + "\n",
+        encoding="utf-8",
+        newline="\n",
     )
     return contract
 
@@ -160,7 +209,11 @@ def add_skill(repo: pathlib.Path, name: str) -> None:
 
 
 def create_compatible_repo(
-    repo: pathlib.Path, source_id: str, skill_names: list[str], *, skill_runtime: bool = False,
+    repo: pathlib.Path,
+    source_id: str,
+    skill_names: list[str],
+    *,
+    skill_runtime: bool = False,
 ) -> None:
     """Create the smallest complete Ceratops-compatible source repository."""
 
@@ -173,10 +226,33 @@ def create_compatible_repo(
         prepare_skill_python_project(repo)
     write_sdlc_contract(
         repo,
-        deliverables={"skills": {"deploy-local": {
-            "managed": {"handoff": "ceratops-skill-lifecycle/deploy"},
-            "standalone": {"steps": [{"run": ["python", "scripts/deploy-skills.py"]}]},
-        }}},
+        deliverables={
+            "skills": {
+                name: {
+                    "source": f"skills/{name}",
+                    "prerequisites": [],
+                    "actions": {
+                        action: {
+                            "requires": {"capabilities": []},
+                            "steps": [
+                                {
+                                    "handoff": {
+                                        "lifecycle": "ceratops-skill-lifecycle",
+                                        "action": lifecycle_action,
+                                        "inputs": {"skill": name},
+                                    }
+                                }
+                            ],
+                        }
+                        for action, lifecycle_action in (
+                            ("validate", "source-validate"),
+                            ("install", "deploy"),
+                        )
+                    },
+                }
+                for name in skill_names
+            }
+        },
     )
     (repo / "scripts").mkdir()
     shutil.copy2(
@@ -200,7 +276,9 @@ def create_compatible_repo(
 def write_manifest(repo: pathlib.Path, source_id: str) -> None:
     """Rewrite assignments after a test adds or removes source skills."""
 
-    skill_names = sorted(path.parent.name for path in (repo / "skills").glob("*/SKILL.md"))
+    skill_names = sorted(
+        path.parent.name for path in (repo / "skills").glob("*/SKILL.md")
+    )
     manifest = {
         "runtime_source_id": source_id,
         "validation_profile": "ceratops-compatible",

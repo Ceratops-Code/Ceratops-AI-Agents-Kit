@@ -883,12 +883,53 @@ def _preserve_evolved_sources(
     return _scope_with_sources(scope, updated_sources), preserved_sources
 
 
+def _preserve_divergent_target_sources(
+    scope: dict[str, Any],
+    requested_sources: list[dict[str, str]],
+    *,
+    target_branch: str,
+) -> tuple[list[dict[str, str]], list[dict[str, object]]]:
+    """Carry prior unselected sources forward without cleanup authority."""
+
+    requested_branches = {str(source["branch"]) for source in requested_sources}
+    retained: list[dict[str, str]] = []
+    preserved_sources: list[dict[str, object]] = []
+    for source in scope["sources"]:
+        branch = str(source["branch"])
+        if branch in requested_branches:
+            continue
+        retained.append(
+            {
+                "branch": branch,
+                "commit": str(source["commit"]),
+                "state": "preserved",
+            }
+        )
+        preserved_sources.append(
+            {
+                "branch": branch,
+                "findings": [
+                    {
+                        "kind": "target_history_diverged",
+                        "subject": branch,
+                        "detail": (
+                            f"prior target for {target_branch} is not an ancestor "
+                            "of the new target; source excluded from cleanup"
+                        ),
+                    }
+                ],
+            }
+        )
+    return retained, preserved_sources
+
+
 def record_scope(
     repo_root: pathlib.Path,
     *,
     target_branch: str,
     target_commit: str,
     source_branches: list[str],
+    preserve_divergent_target: bool = False,
 ) -> dict[str, object]:
     """Atomically advance one integration target's selected source scope."""
 
@@ -960,6 +1001,7 @@ def record_scope(
             target_commit=recorded_target.lower(),
         )
         old_target = str(existing["target_commit"])
+        target_history_diverged = False
         if old_target != target_commit:
             if not _commit_exists(repo_root, old_target):
                 return {
@@ -974,21 +1016,33 @@ def record_scope(
                     ],
                 }
             if not _is_ancestor(repo_root, old_target, target_commit):
-                return {
-                    "status": "pending_work",
-                    "remote_mutation": False,
-                    "findings": [
-                        {
-                            "kind": "target_history_diverged",
-                            "subject": target_branch,
-                            "detail": "recorded target is not an ancestor of new target",
-                        }
-                    ],
-                }
-        recovered_existing = _recover_completed_deletions(
-            repo_root, path, existing
-        )
-        if recovered_existing is not None:
+                if not preserve_divergent_target:
+                    return {
+                        "status": "pending_work",
+                        "remote_mutation": False,
+                        "findings": [
+                            {
+                                "kind": "target_history_diverged",
+                                "subject": target_branch,
+                                "detail": (
+                                    "recorded target is not an ancestor of new target"
+                                ),
+                            }
+                        ],
+                    }
+                target_history_diverged = True
+        recovered_existing = None
+        if target_history_diverged:
+            retained, preserved_sources = _preserve_divergent_target_sources(
+                existing,
+                requested_sources,
+                target_branch=target_branch,
+            )
+        else:
+            recovered_existing = _recover_completed_deletions(
+                repo_root, path, existing
+            )
+        if not target_history_diverged and recovered_existing is not None:
             existing = recovered_existing
             candidate_existing = {**existing, "target_commit": target_commit}
             candidate_findings = ship._pending_work_findings(
@@ -1393,6 +1447,7 @@ def build_parser() -> argparse.ArgumentParser:
     record.add_argument("--target-branch", required=True)
     record.add_argument("--target-commit", required=True)
     record.add_argument("--source-branch", action="append", required=True)
+    record.add_argument("--preserve-divergent-target", action="store_true")
 
     check = subparsers.add_parser("check")
     check.add_argument("--scope", required=True, type=pathlib.Path)
@@ -1435,6 +1490,7 @@ def main(argv: list[str] | None = None) -> int:
                 target_branch=args.target_branch,
                 target_commit=args.target_commit.lower(),
                 source_branches=args.source_branch,
+                preserve_divergent_target=args.preserve_divergent_target,
             )
         elif args.command == "check":
             result = check_scope(

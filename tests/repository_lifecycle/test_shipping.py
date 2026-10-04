@@ -18,8 +18,8 @@ from tests.repository_lifecycle.support import (
 )
 from tests.support.repositories import run_git, write_sdlc_contract
 
-LOCAL = "deliverables.tools.deploy-local.standalone"
-PUBLIC = "deliverables.tools.publish.public"
+LOCAL = "deliverables.apps.fixture.actions.install"
+PUBLIC = "deliverables.apps.fixture.actions.publish"
 
 
 def _commit(repo: pathlib.Path) -> str:
@@ -29,7 +29,10 @@ def _commit(repo: pathlib.Path) -> str:
 
 
 def _setup(
-    tmp_path: pathlib.Path, *, contract: bool = True, head_branch: str = "release/local",
+    tmp_path: pathlib.Path,
+    *,
+    contract: bool = True,
+    head_branch: str = "release/local",
 ) -> tuple[Any, ...]:
     """Use real SDLC execution and Git identity, simulating only GitHub and cleanup."""
 
@@ -65,30 +68,47 @@ def _setup(
         write_sdlc_contract(
             repo,
             repository={
-                "validate": {
-                    "repository": {
-                        "steps": [{"run": [sys.executable, "quality-check.py"]}]
+                "capabilities": {},
+                "actions": {
+                    "validate": {
+                        "requires": {"capabilities": []},
+                        "steps": [{"run": [sys.executable, "quality-check.py"]}],
                     },
-                }
+                    "test": {
+                        "requires": {"capabilities": []},
+                        "no-op": "No repository tests in this fixture.",
+                    },
+                },
             },
             deliverables={
-                "tools": {
-                    "publish": {
-                        "public": {
-                            "steps": [{"run": [sys.executable, "publish-package.py"]}]
-                        }
-                    },
-                    "deploy-local": {
-                        "standalone": {
-                            "steps": [{"run": [sys.executable, "install-local.py"]}]
-                        }
-                    },
-                }
+                "apps": {
+                    "fixture": {
+                        "source": ".",
+                        "manifest": "code.txt",
+                        "prerequisites": [],
+                        "actions": {
+                            "validate": {
+                                "requires": {"capabilities": []},
+                                "no-op": "Repository validation covers this fixture.",
+                            },
+                            "install": {
+                                "requires": {"capabilities": []},
+                                "steps": [
+                                    {"run": [sys.executable, "install-local.py"]}
+                                ],
+                            },
+                            "publish": {
+                                "requires": {"capabilities": []},
+                                "steps": [
+                                    {"run": [sys.executable, "publish-package.py"]}
+                                ],
+                            },
+                        },
+                    }
+                },
             },
         )
     _commit(repo)
-    if head_branch == "promote/local":
-        assert run_git(repo, "branch", "release", "HEAD").returncode == 0
     loaded = runpy.run_path(str(SHIP_REPOSITORY))
     original = loaded["_run_json"]
     commands: list[list[str]] = []
@@ -183,7 +203,9 @@ def _setup(
     ],
 )
 def test_repository_ship_metadata_reaches_shared_pr_producer(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, metadata: list[str],
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    metadata: list[str],
 ) -> None:
     loaded = runpy.run_path(str(SHIP_REPOSITORY))
     ship = load_pr_workflow_module(monkeypatch, "ship")
@@ -195,8 +217,11 @@ def test_repository_ship_metadata_reaches_shared_pr_producer(
     parsed = ship.build_parser().parse_args(command[3:])
     if not metadata:
         smoke = subprocess.run(
-            [*command[:3], "--help"], cwd=tmp_path, capture_output=True,
-            text=True, check=False,
+            [*command[:3], "--help"],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=False,
         )
         assert smoke.returncode == 0, smoke.stderr
     events: list[str] = []
@@ -205,10 +230,15 @@ def test_repository_ship_metadata_reaches_shared_pr_producer(
     monkeypatch.setattr(ship, "_resolve_commit", lambda *args: "a" * 40)
     monkeypatch.setattr(ship, "_load_pending_work_scope", lambda *args: (None, None))
     monkeypatch.setattr(
-        ship, "_load_or_create_checkpoint",
+        ship,
+        "_load_or_create_checkpoint",
         lambda *args: (tmp_path / "checkpoint.json", {"phase": "prepared"}),
     )
-    monkeypatch.setattr(ship, "_enforce_actions_availability", lambda *args: events.append("availability"))
+    monkeypatch.setattr(
+        ship,
+        "_enforce_actions_availability",
+        lambda *args: events.append("availability"),
+    )
 
     class ProducerReached(Exception):
         pass
@@ -251,7 +281,9 @@ def test_repository_ship_absent_default_contract_is_no_op_and_finalizes(
     assert log.read_text().splitlines() == (
         ["remote", "finalize"] if scope_present else ["remote"]
     )
-    remote = next(command for command in commands if str(PR_WORKFLOW_ENTRYPOINT) in command)
+    remote = next(
+        command for command in commands if str(PR_WORKFLOW_ENTRYPOINT) in command
+    )
     assert ("--pending-work-check" in remote) is scope_present
     assert ("--no-pending-work-check" in remote) is not scope_present
     args.review_replies_request = tmp_path / "review-replies.json"
@@ -261,32 +293,35 @@ def test_repository_ship_absent_default_contract_is_no_op_and_finalizes(
     )
 
 
-def test_repository_ship_uses_conflict_free_promotion_branch(
+def test_repository_ship_rejects_release_namespace_conflict(
     tmp_path: pathlib.Path,
 ) -> None:
-    repo, loaded, args, _, _, commands = _setup(
-        tmp_path, contract=False, head_branch="promote/local",
+    repo, loaded, args, log, state, _ = _setup(
+        tmp_path,
+        contract=False,
+        head_branch="release",
     )
-    release_head = run_git(repo, "rev-parse", "release").stdout.strip()
-
-    result = loaded["ship_repository"](args)
-
-    assert result["status"] == "shipped"
-    assert run_git(repo, "rev-parse", "release").stdout.strip() == release_head
-    remote = next(command for command in commands if str(PR_WORKFLOW_ENTRYPOINT) in command)
-    assert remote[remote.index("--head-branch") + 1] == "promote/local"
-
-
-def test_repository_ship_rejects_promote_branch_without_release(
-    tmp_path: pathlib.Path,
-) -> None:
-    repo, loaded, args, _, _, _ = _setup(tmp_path, contract=False)
-    assert run_git(repo, "branch", "-m", "promote/local").returncode == 0
-    args.head_branch = "promote/local"
+    args.head_branch = "release/local"
 
     with pytest.raises(
         loaded["RepositoryShipError"],
-        match="reserved for repositories with an existing release branch",
+        match="refs/heads/release blocks the required release/local branch namespace",
+    ):
+        loaded["ship_repository"](args)
+    assert state["calls"] == 0 and not log.exists()
+
+
+def test_repository_ship_rejects_noncanonical_legacy_promotion_branch(
+    tmp_path: pathlib.Path,
+) -> None:
+    repo, loaded, args, _, _, _ = _setup(tmp_path, contract=False)
+    legacy_branch = "/".join(("promote", "local"))
+    assert run_git(repo, "branch", "-m", legacy_branch).returncode == 0
+    args.head_branch = legacy_branch
+
+    with pytest.raises(
+        loaded["RepositoryShipError"],
+        match="Head branch must be release/local",
     ):
         loaded["ship_repository"](args)
 
@@ -326,24 +361,29 @@ def test_repository_ship_prevalidates_and_executes_ordered_phase_selections(
 
 @pytest.mark.parametrize("gate", ["validate", "tests"])
 def test_failed_checks_prevent_remote_work_and_succeed_after_committed_repair(
-    tmp_path: pathlib.Path, gate: str,
+    tmp_path: pathlib.Path,
+    gate: str,
 ) -> None:
     repo, loaded, args, log, state, _ = _setup(tmp_path)
     if gate == "tests":
         import yaml
+
         path = repo / "sdlc/sdlc.yml"
         document = yaml.safe_load(path.read_text())
-        document["version"] = 3
-        document["repository"]["tests"] = document["repository"].pop("validate")
-        document["repository"]["validate"] = {"none": {"no-op": "Fixture has no validation command."}}
-        for deliverable in document["deliverables"].values():
-            deliverable["tests"] = {"none": {"no-op": "Shared repository test covers this deliverable."}}
+        actions = document["repository"]["actions"]
+        actions["test"] = actions["validate"]
+        actions["validate"] = {
+            "requires": {"capabilities": []},
+            "no-op": "Fixture has no validation command.",
+        }
         path.write_text(yaml.safe_dump(document))
     (repo / "code.txt").write_text("broken", encoding="utf-8")
     broken = _commit(repo)
     with pytest.raises(loaded["RepositoryShipError"]) as failure:
         loaded["ship_repository"](args)
-    assert failure.value.payload["status"] == ("validation_failed" if gate == "validate" else "tests_failed")
+    assert failure.value.payload["status"] == (
+        "validation_failed" if gate == "validate" else "tests_failed"
+    )
     assert failure.value.payload["phase"] == "before_remote"
     assert failure.value.payload["commit"] == broken
     assert failure.value.payload["diagnostic"]["stderr_tail"] == [
@@ -455,7 +495,9 @@ def test_repository_ship_checkpoints_each_operation_before_the_next(
     phase = "release_publication" if category == "publish" else "deployment"
     label = "publish" if category == "publish" else "deploy"
     receipt = {"schema": "test.operation-receipt.v1", "status": "OK", "kind": label}
-    script = repo / ("publish-package.py" if category == "publish" else "install-local.py")
+    script = repo / (
+        "publish-package.py" if category == "publish" else "install-local.py"
+    )
     if capture_receipt:
         with script.open("a", encoding="utf-8") as stream:
             stream.write(f"print({json.dumps(receipt)!r})\n")
@@ -473,8 +515,12 @@ def test_repository_ship_checkpoints_each_operation_before_the_next(
         if prepared.category == category:
             count += 1
             if count == 2:
-                records = [json.loads(path.read_text()) for path in
-                           loaded["_operation_checkpoint_directory"](repo).glob("*.json")]
+                records = [
+                    json.loads(path.read_text())
+                    for path in loaded["_operation_checkpoint_directory"](repo).glob(
+                        "*.json"
+                    )
+                ]
                 selected = [record for record in records if record["phase"] == phase]
                 assert len(selected) == 1
                 assert selected[0]["position"] == 1
@@ -494,7 +540,12 @@ def test_repository_ship_checkpoints_each_operation_before_the_next(
     resumed = loaded["ship_repository"](args)
     assert resumed["status"] == "already_shipped"
     assert log.read_text().splitlines().count(label) == 2
-    assert log.read_text().splitlines().count("deploy" if label == "publish" else "publish") == 1
+    assert (
+        log.read_text()
+        .splitlines()
+        .count("deploy" if label == "publish" else "publish")
+        == 1
+    )
     for operation in resumed[phase]["results"]:
         assert operation.get("step_results", []) == expected_results
 
@@ -517,7 +568,7 @@ def test_repository_ship_rejects_noncanonical_release_branch_before_remote_proce
     _, loaded, args, log, state, _ = _setup(tmp_path)
     args.head_branch = "release/task"
     with pytest.raises(
-        loaded["RepositoryShipError"], match="Head branch must be one of"
+        loaded["RepositoryShipError"], match="Head branch must be release/local"
     ):
         loaded["ship_repository"](args)
     assert state["calls"] == 0 and not log.exists()
@@ -622,6 +673,7 @@ def test_repository_ship_blocks_selected_worktree_caller_before_remote_process(
     ship_repository = loaded["ship_repository"]
     ship_repository.__globals__["_branch_worktree"] = branch_worktree
     ship_repository.__globals__["_run_json"] = run_json
+    ship_repository.__globals__["_local_branch_exists"] = lambda *_args: False
     ship_repository.__globals__["_prepare_operation_batch"] = lambda *args, **kwargs: (
         None
     )
@@ -730,13 +782,15 @@ def test_repository_ship_child_runs_from_repository(
     with pytest.raises(loaded["RepositoryShipError"]) as failure:
         loaded["_run_json"](
             [
-                sys.executable, "-c",
+                sys.executable,
+                "-c",
                 (
                     "import sys; print('not json'); "
                     "print('x' * 2500 + ' child import failed', file=sys.stderr); "
                     "raise SystemExit(7)"
                 ),
-                "--body", "private PR body",
+                "--body",
+                "private PR body",
             ],
             cwd=repo,
         )
@@ -757,7 +811,9 @@ def test_repository_ship_child_runs_from_repository(
     )
 
 
-def _publish_pr_setup(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Any, ...]:
+def _publish_pr_setup(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Any, ...]:
     """Exercise real Git preparation/push, replacing only remote GitHub responses."""
 
     module = load_pr_workflow_module(monkeypatch, "ensure_pr")
@@ -766,20 +822,40 @@ def _publish_pr_setup(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -
     remote.mkdir()
     assert run_git(repo, "init", "-b", "main").returncode == 0
     assert run_git(remote, "init", "--bare", "-b", "main").returncode == 0
-    for key, value in (("user.name", "Tests"), ("user.email", "tests@example.invalid"), ("core.autocrlf", "false")):
+    for key, value in (
+        ("user.name", "Tests"),
+        ("user.email", "tests@example.invalid"),
+        ("core.autocrlf", "false"),
+    ):
         assert run_git(repo, "config", key, value).returncode == 0
     (repo / "code.txt").write_text("before\n", encoding="utf-8")
     (repo / "removed.txt").write_text("old\n", encoding="utf-8")
     _commit(repo)
     assert run_git(repo, "remote", "add", "origin", str(remote)).returncode == 0
     assert run_git(repo, "push", "origin", "main").returncode == 0
-    args = module.build_parser().parse_args([
-        "--repo-root", str(repo), "--head-branch", "codex/publish", "--prepare",
-        "--path", "code.txt", "--commit-message", "Publish selected change", "--draft",
-    ])
+    args = module.build_parser().parse_args(
+        [
+            "--repo-root",
+            str(repo),
+            "--head-branch",
+            "codex/publish",
+            "--prepare",
+            "--path",
+            "code.txt",
+            "--commit-message",
+            "Publish selected change",
+            "--draft",
+        ]
+    )
     state: dict[str, Any] = {
-        "commands": [], "api": [], "pr": None, "creates": 0, "fail": None,
-        "urls": {}, "repo": "example/repository", "push_repo": "example/repository",
+        "commands": [],
+        "api": [],
+        "pr": None,
+        "creates": 0,
+        "fail": None,
+        "urls": {},
+        "repo": "example/repository",
+        "push_repo": "example/repository",
         "extra_records": [],
     }
     original = module.require_output
@@ -789,10 +865,13 @@ def _publish_pr_setup(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -
         head = run_git(remote, "rev-parse", f"refs/heads/{args.head_branch}")
         assert head.returncode == 0
         return {
-            "number": 24, "url": "https://github.com/example/repository/pull/24",
+            "number": 24,
+            "url": "https://github.com/example/repository/pull/24",
             "headRefOid": state.get("head_override", head.stdout.strip()),
-            "changedFiles": 1, "state": state.get("pr_state", "OPEN"),
-            "isDraft": state["pr"]["draft"], "statusCheckRollup": [],
+            "changedFiles": 1,
+            "state": state.get("pr_state", "OPEN"),
+            "isDraft": state["pr"]["draft"],
+            "statusCheckRollup": [],
         }
 
     def create(metadata: dict[str, Any]) -> None:
@@ -824,7 +903,9 @@ def _publish_pr_setup(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -
             if "--title" in command:
                 metadata["title"] = command[command.index("--title") + 1]
             if "--body-file" in command:
-                metadata["body"] = pathlib.Path(command[command.index("--body-file") + 1]).read_text(encoding="utf-8")
+                metadata["body"] = pathlib.Path(
+                    command[command.index("--body-file") + 1]
+                ).read_text(encoding="utf-8")
             if command[2] == "create":
                 create({**metadata, "draft": "--draft" in command})
             else:
@@ -833,7 +914,9 @@ def _publish_pr_setup(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -
         assert command[0] != "gh", command
         return original(command, cwd=cwd)
 
-    def api(method: str, endpoint: str, body: Any = None, **kwargs: Any) -> argparse.Namespace:
+    def api(
+        method: str, endpoint: str, body: Any = None, **kwargs: Any
+    ) -> argparse.Namespace:
         state["api"].append((method, endpoint, body))
         if method == "POST":
             create(body)
@@ -841,40 +924,67 @@ def _publish_pr_setup(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -
         elif "/pulls?" in endpoint:
             data = list(state["extra_records"])
             if state["pr"]:
-                data.append({
-                    "number": 24,
-                    "head": {"ref": args.head_branch, "repo": {"full_name": state["push_repo"]}},
-                    "base": {"ref": args.base_branch, "repo": {"full_name": state["repo"]}},
-                })
+                data.append(
+                    {
+                        "number": 24,
+                        "head": {
+                            "ref": args.head_branch,
+                            "repo": {"full_name": state["push_repo"]},
+                        },
+                        "base": {
+                            "ref": args.base_branch,
+                            "repo": {"full_name": state["repo"]},
+                        },
+                    }
+                )
         else:
             data = {"full_name": state["repo"]}
         return argparse.Namespace(ok=True, data=data, message=None)
 
     monkeypatch.setattr(module, "require_output", output)
-    monkeypatch.setattr(module, "require_success", lambda command, **kwargs: output(command, **kwargs))
+    monkeypatch.setattr(
+        module, "require_success", lambda command, **kwargs: output(command, **kwargs)
+    )
     monkeypatch.setattr(module, "run_gh_api", api)
     monkeypatch.setattr(module.time, "sleep", lambda seconds: None)
     return module, args, repo, remote, state
 
 
 def test_publish_pr_prepares_literal_files_validates_and_reuses_draft(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module, args, repo, remote, state = _publish_pr_setup(tmp_path, monkeypatch)
     (repo / "code.txt").write_text("after\n", encoding="utf-8")
     (repo / "removed.txt").rename(repo / " [new].txt")
     args.path += ["removed.txt", " [new].txt"]
     args.title, args.body = "Selected change", "Why it matters.\n\nChecked locally.\n"
-    args.check_command = [[sys.executable, "-c", "from pathlib import Path; assert Path('code.txt').read_text() == 'after\\n'"]]
+    args.check_command = [
+        [
+            sys.executable,
+            "-c",
+            "from pathlib import Path; assert Path('code.txt').read_text() == 'after\\n'",
+        ]
+    ]
     result = module.ensure_pr(args)
     head = run_git(repo, "rev-parse", "HEAD").stdout.strip()
-    assert result["status"] == "pr_ready" and result["head"] == head and result["draft"] is True
+    assert (
+        result["status"] == "pr_ready"
+        and result["head"] == head
+        and result["draft"] is True
+    )
     assert run_git(remote, "rev-parse", args.head_branch).stdout.strip() == head
     assert run_git(repo, "status", "--porcelain").stdout == ""
     assert run_git(repo, "rev-list", "--count", "main..HEAD").stdout.strip() == "1"
     assert state["pr"] == {"title": args.title, "body": args.body, "draft": True}
-    check = next(i for i, command in enumerate(state["commands"]) if command == args.check_command[0])
-    push = next(i for i, command in enumerate(state["commands"]) if command[3:4] == ["push"])
+    check = next(
+        i
+        for i, command in enumerate(state["commands"])
+        if command == args.check_command[0]
+    )
+    push = next(
+        i for i, command in enumerate(state["commands"]) if command[3:4] == ["push"]
+    )
     assert check < push
     args.title = args.body = None
     # Retrying with the original deleted filename must not create another commit.
@@ -883,9 +993,27 @@ def test_publish_pr_prepares_literal_files_validates_and_reuses_draft(
     assert run_git(repo, "rev-list", "--count", "main..HEAD").stdout.strip() == "1"
 
 
-@pytest.mark.parametrize("kind", ["dirty", "staged", "unknown", "directory", "escape", "ignored", "message", "base", "detached", "operation", "existing", "auth"])
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "dirty",
+        "staged",
+        "unknown",
+        "directory",
+        "escape",
+        "ignored",
+        "message",
+        "base",
+        "detached",
+        "operation",
+        "existing",
+        "auth",
+    ],
+)
 def test_publish_pr_rejects_unsafe_preparation_before_local_writes(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, kind: str,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
 ) -> None:
     module, args, repo, remote, state = _publish_pr_setup(tmp_path, monkeypatch)
     (repo / "code.txt").write_text("after\n", encoding="utf-8")
@@ -900,7 +1028,9 @@ def test_publish_pr_rejects_unsafe_preparation_before_local_writes(
     elif kind == "escape":
         args.path.append("../outside.txt")
     elif kind == "ignored":
-        (repo / ".git" / "info" / "exclude").write_text("ignored.txt\n", encoding="utf-8")
+        (repo / ".git" / "info" / "exclude").write_text(
+            "ignored.txt\n", encoding="utf-8"
+        )
         (repo / "ignored.txt").write_text("keep", encoding="utf-8")
         args.path.append("ignored.txt")
     elif kind == "message":
@@ -910,28 +1040,63 @@ def test_publish_pr_rejects_unsafe_preparation_before_local_writes(
     elif kind == "detached":
         assert run_git(repo, "checkout", "--detach").returncode == 0
     elif kind == "operation":
-        (repo / ".git" / "CHERRY_PICK_HEAD").write_text(run_git(repo, "rev-parse", "HEAD").stdout, encoding="utf-8")
+        (repo / ".git" / "CHERRY_PICK_HEAD").write_text(
+            run_git(repo, "rev-parse", "HEAD").stdout, encoding="utf-8"
+        )
     elif kind == "existing":
         assert run_git(repo, "branch", args.head_branch).returncode == 0
     elif kind == "auth":
         state["fail"] = "auth"
-    before = [run_git(repo, *command).stdout for command in (
-        ("rev-parse", "HEAD"), ("branch", "--show-current"), ("status", "--porcelain"), ("diff", "--cached"),
-    )]
+    before = [
+        run_git(repo, *command).stdout
+        for command in (
+            ("rev-parse", "HEAD"),
+            ("branch", "--show-current"),
+            ("status", "--porcelain"),
+            ("diff", "--cached"),
+        )
+    ]
     with pytest.raises((module.EnsurePrError, module.CommandError)):
         module.ensure_pr(args)
-    after = [run_git(repo, *command).stdout for command in (
-        ("rev-parse", "HEAD"), ("branch", "--show-current"), ("status", "--porcelain"), ("diff", "--cached"),
-    )]
+    after = [
+        run_git(repo, *command).stdout
+        for command in (
+            ("rev-parse", "HEAD"),
+            ("branch", "--show-current"),
+            ("status", "--porcelain"),
+            ("diff", "--cached"),
+        )
+    ]
     assert before == after
-    assert run_git(remote, "show-ref", "--verify", f"refs/heads/{args.head_branch}").returncode != 0 or kind == "base"
-    assert not any(command[3:4] in (["switch"], ["commit"], ["push"]) for command in state["commands"])
+    assert (
+        run_git(
+            remote, "show-ref", "--verify", f"refs/heads/{args.head_branch}"
+        ).returncode
+        != 0
+        or kind == "base"
+    )
+    assert not any(
+        command[3:4] in (["switch"], ["commit"], ["push"])
+        for command in state["commands"]
+    )
     assert state["creates"] == 0
 
 
-@pytest.mark.parametrize("failure,phase", [("commit", "preparation_pending"), ("validation", "prepared"), ("push", "validated"), ("create", "pushed"), ("create-after-write", "pushed")])
+@pytest.mark.parametrize(
+    "failure,phase",
+    [
+        ("commit", "preparation_pending"),
+        ("validation", "prepared"),
+        ("push", "validated"),
+        ("create", "pushed"),
+        ("create-after-write", "pushed"),
+    ],
+)
 def test_publish_pr_failure_retains_work_and_retry_does_not_duplicate(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, failure: str, phase: str,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+    phase: str,
 ) -> None:
     module, args, repo, remote, state = _publish_pr_setup(tmp_path, monkeypatch)
     (repo / "code.txt").write_text("after\n", encoding="utf-8")
@@ -944,12 +1109,20 @@ def test_publish_pr_failure_retains_work_and_retry_does_not_duplicate(
     assert (repo / "code.txt").read_text() == "after\n"
     assert run_git(repo, "branch", "--show-current").stdout.strip() == args.head_branch
     if failure == "commit":
-        assert run_git(repo, "diff", "--cached", "--name-only").stdout.strip() == "code.txt"
+        assert (
+            run_git(repo, "diff", "--cached", "--name-only").stdout.strip()
+            == "code.txt"
+        )
         assert run_git(repo, "rev-list", "--count", "main..HEAD").stdout.strip() == "0"
     else:
         assert run_git(repo, "rev-list", "--count", "main..HEAD").stdout.strip() == "1"
     if failure in {"commit", "validation", "push"}:
-        assert run_git(remote, "show-ref", "--verify", f"refs/heads/{args.head_branch}").returncode != 0
+        assert (
+            run_git(
+                remote, "show-ref", "--verify", f"refs/heads/{args.head_branch}"
+            ).returncode
+            != 0
+        )
     state["fail"] = None
     args.check_command = []
     assert module.ensure_pr(args)["status"] == "pr_ready"
@@ -959,23 +1132,38 @@ def test_publish_pr_failure_retains_work_and_retry_does_not_duplicate(
 
 @pytest.mark.parametrize("mutation", ["worktree", "head", "branch"])
 def test_publish_pr_validation_drift_blocks_push(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, mutation: str,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
 ) -> None:
     module, args, repo, remote, _ = _publish_pr_setup(tmp_path, monkeypatch)
     (repo / "code.txt").write_text("after\n", encoding="utf-8")
     args.check_command = {
-        "worktree": [[sys.executable, "-c", "from pathlib import Path; Path('code.txt').write_text('drift')"]],
+        "worktree": [
+            [
+                sys.executable,
+                "-c",
+                "from pathlib import Path; Path('code.txt').write_text('drift')",
+            ]
+        ],
         "head": [["git", "commit", "--allow-empty", "-m", "Drift"]],
         "branch": [["git", "switch", "-c", "other"]],
     }[mutation]
     with pytest.raises(module.EnsurePrError, match="Validation changed"):
         module.ensure_pr(args)
-    assert run_git(remote, "show-ref", "--verify", f"refs/heads/{args.head_branch}").returncode != 0
+    assert (
+        run_git(
+            remote, "show-ref", "--verify", f"refs/heads/{args.head_branch}"
+        ).returncode
+        != 0
+    )
 
 
 @pytest.mark.parametrize("fork", [False, True])
 def test_publish_pr_explicit_target_and_organization_fork_identity(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, fork: bool,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fork: bool,
 ) -> None:
     module, args, repo, remote, state = _publish_pr_setup(tmp_path, monkeypatch)
     (repo / "code.txt").write_text("after\n", encoding="utf-8")
@@ -985,12 +1173,20 @@ def test_publish_pr_explicit_target_and_organization_fork_identity(
         assert run_git(repo, "remote", "add", "upstream", str(remote)).returncode == 0
         args.base_remote = "upstream"
         state["push_repo"] = "example/fork"
-        state["urls"] = {"origin": "https://github.com/example/fork.git", "upstream": "git@github.com:example/repository.git"}
-        state["extra_records"] = [{
-            "number": 19,
-            "head": {"ref": args.head_branch, "repo": {"full_name": "example/other-fork"}},
-            "base": {"ref": args.base_branch, "repo": {"full_name": args.repo}},
-        }]
+        state["urls"] = {
+            "origin": "https://github.com/example/fork.git",
+            "upstream": "git@github.com:example/repository.git",
+        }
+        state["extra_records"] = [
+            {
+                "number": 19,
+                "head": {
+                    "ref": args.head_branch,
+                    "repo": {"full_name": "example/other-fork"},
+                },
+                "base": {"ref": args.base_branch, "repo": {"full_name": args.repo}},
+            }
+        ]
     result = module.ensure_pr(args)
     assert result["status"] == "pr_ready"
     post = next(call for call in state["api"] if call[0] == "POST")
@@ -999,11 +1195,16 @@ def test_publish_pr_explicit_target_and_organization_fork_identity(
     assert post[2].get("head_repo") == ("fork" if fork else None)
     assert module.ensure_pr(args)["head"] == result["head"]
     assert state["creates"] == 1
-    assert all("--repo" in command for command in state["commands"] if command[:3] == ["gh", "pr", "view"])
+    assert all(
+        "--repo" in command
+        for command in state["commands"]
+        if command[:3] == ["gh", "pr", "view"]
+    )
 
 
 def test_publish_pr_target_mismatch_blocks_before_preparation(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module, args, repo, _, state = _publish_pr_setup(tmp_path, monkeypatch)
     (repo / "code.txt").write_text("after\n", encoding="utf-8")
@@ -1016,7 +1217,8 @@ def test_publish_pr_target_mismatch_blocks_before_preparation(
 
 
 def test_publish_pr_existing_ready_pr_is_not_downgraded_or_rewritten(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module, args, repo, _, state = _publish_pr_setup(tmp_path, monkeypatch)
     (repo / "code.txt").write_text("after\n", encoding="utf-8")
@@ -1027,33 +1229,56 @@ def test_publish_pr_existing_ready_pr_is_not_downgraded_or_rewritten(
 
 
 def test_publish_pr_head_readback_failure_reports_retained_push(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     module, args, repo, remote, state = _publish_pr_setup(tmp_path, monkeypatch)
     (repo / "code.txt").write_text("after\n", encoding="utf-8")
     state["head_override"] = "0" * 40
-    assert module.main([
-        "--repo-root", str(repo), "--head-branch", args.head_branch,
-        "--prepare", "--path", "code.txt", "--commit-message", "Change", "--draft",
-    ]) == 1
+    assert (
+        module.main(
+            [
+                "--repo-root",
+                str(repo),
+                "--head-branch",
+                args.head_branch,
+                "--prepare",
+                "--path",
+                "code.txt",
+                "--commit-message",
+                "Change",
+                "--draft",
+            ]
+        )
+        == 1
+    )
     result = json.loads(capsys.readouterr().err)
     assert result["status"] == "error" and result["phase"] == "pushed"
-    assert result["head"] == run_git(remote, "rev-parse", args.head_branch).stdout.strip()
+    assert (
+        result["head"] == run_git(remote, "rev-parse", args.head_branch).stdout.strip()
+    )
     assert state["creates"] == 1
 
 
-@pytest.mark.parametrize("value", ["not-json", "[]", '[""]', '["git", 2]', '{}'])
+@pytest.mark.parametrize("value", ["not-json", "[]", '[""]', '["git", 2]', "{}"])
 def test_publish_pr_validation_requires_shell_free_argv(
-    monkeypatch: pytest.MonkeyPatch, value: str,
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
 ) -> None:
     module = load_pr_workflow_module(monkeypatch, "ensure_pr")
     with pytest.raises(argparse.ArgumentTypeError):
         module._check_argv(value)
-    assert module._check_argv('["python", "check.py", "two words"]') == ["python", "check.py", "two words"]
+    assert module._check_argv('["python", "check.py", "two words"]') == [
+        "python",
+        "check.py",
+        "two words",
+    ]
 
 
 def test_publish_pr_preparation_flags_are_opt_in(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module, args, repo, _, state = _publish_pr_setup(tmp_path, monkeypatch)
     args.prepare = False
@@ -1062,9 +1287,25 @@ def test_publish_pr_preparation_flags_are_opt_in(
     assert run_git(repo, "branch", "--show-current").stdout.strip() == "main"
     assert state["creates"] == 0
 
-@pytest.mark.parametrize("case", ["passed", "selection-failed", "fetch-failed", "missing-argument", "source-changed", "post-merge-resume", "post-merge-resume-unreused", "post-merge-resume-without-checkpoint", "unverified-resume"])
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "passed",
+        "selection-failed",
+        "fetch-failed",
+        "missing-argument",
+        "source-changed",
+        "post-merge-resume",
+        "post-merge-resume-unreused",
+        "post-merge-resume-without-checkpoint",
+        "unverified-resume",
+    ],
+)
 def test_repository_ship_checks_declared_test_selection_before_remote_work(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, case: str,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
 ) -> None:
     repo, loaded, args, _log, state, commands = _setup(tmp_path)
     remote = tmp_path / "remote.git"
@@ -1073,19 +1314,35 @@ def test_repository_ship_checks_declared_test_selection_before_remote_work(
     args.base_branch = "target"
     assert run_git(repo, "remote", "add", args.remote_name, str(remote)).returncode == 0
     stale_base = run_git(repo, "rev-parse", "HEAD").stdout.strip()
-    assert run_git(repo, "push", args.remote_name, "HEAD:refs/heads/target").returncode == 0
+    assert (
+        run_git(repo, "push", args.remote_name, "HEAD:refs/heads/target").returncode
+        == 0
+    )
     (repo / "base-advance.txt").write_text("fresh base", encoding="utf-8")
     base = _commit(repo)
-    assert run_git(repo, "push", args.remote_name, "HEAD:refs/heads/target").returncode == 0
-    assert run_git(repo, "update-ref", "refs/remotes/ci-test/target", stale_base).returncode == 0
+    assert (
+        run_git(repo, "push", args.remote_name, "HEAD:refs/heads/target").returncode
+        == 0
+    )
+    assert (
+        run_git(
+            repo, "update-ref", "refs/remotes/ci-test/target", stale_base
+        ).returncode
+        == 0
+    )
     selection_log = tmp_path / "selection.json"
     script = repo / "selection.py"
     script.write_text(
         "import json, pathlib, sys\n"
         f"pathlib.Path({str(selection_log)!r}).write_text(json.dumps(sys.argv[1:]))\n"
-        + ("pathlib.Path('code.txt').write_text('dirty')\n" if case == "source-changed" else "")
+        + (
+            "pathlib.Path('code.txt').write_text('dirty')\n"
+            if case == "source-changed"
+            else ""
+        )
         + "print(json.dumps({'schema':'selection.fixture.v1','status':'"
-        + ("mapping-gap" if case == "selection-failed" else "selection-valid") + "'}))\n"
+        + ("mapping-gap" if case == "selection-failed" else "selection-valid")
+        + "'}))\n"
         + ("raise SystemExit(3)\n" if case == "selection-failed" else ""),
         encoding="utf-8",
     )
@@ -1093,25 +1350,48 @@ def test_repository_ship_checks_declared_test_selection_before_remote_work(
     command = [sys.executable, "selection.py", "{base}", "{head}"]
     if case == "missing-argument":
         command.pop()
-    contract["repository"]["test-selection"] = {
-        "ci": {"parameters": ["base", "head"], "steps": [{"run": command}]},
+    contract["repository"]["actions"]["test-selection"] = {
+        "requires": {"capabilities": []},
+        "parameters": ["base", "head"],
+        "steps": [{"run": command}],
     }
-    write_sdlc_contract(repo, repository=contract["repository"], deliverables=contract["deliverables"])
+    write_sdlc_contract(
+        repo, repository=contract["repository"], deliverables=contract["deliverables"]
+    )
     head = _commit(repo)
     if case == "fetch-failed":
-        assert run_git(repo, "remote", "set-url", args.remote_name, str(tmp_path / "absent")).returncode == 0
+        assert (
+            run_git(
+                repo, "remote", "set-url", args.remote_name, str(tmp_path / "absent")
+            ).returncode
+            == 0
+        )
     original = loaded["ship_repository"].__globals__["_run_json"]
 
     def checked_remote(command: list[str], **kwargs: Any) -> tuple[int, dict[str, Any]]:
         if str(PR_WORKFLOW_ENTRYPOINT) in command:
             assert json.loads(selection_log.read_text()) == [base, head]
         code, payload = original(command, **kwargs)
-        if case in {"post-merge-resume", "post-merge-resume-unreused", "post-merge-resume-without-checkpoint"} and state["calls"] == 2 and str(PR_WORKFLOW_ENTRYPOINT) in command:
+        if (
+            case
+            in {
+                "post-merge-resume",
+                "post-merge-resume-unreused",
+                "post-merge-resume-without-checkpoint",
+            }
+            and state["calls"] == 2
+            and str(PR_WORKFLOW_ENTRYPOINT) in command
+        ):
             payload = {**payload, "commit": head}
         return code, payload
 
     loaded["ship_repository"].__globals__["_run_json"] = checked_remote
-    if case in {"post-merge-resume", "post-merge-resume-unreused", "post-merge-resume-without-checkpoint", "unverified-resume"}:
+    if case in {
+        "post-merge-resume",
+        "post-merge-resume-unreused",
+        "post-merge-resume-without-checkpoint",
+        "unverified-resume",
+    }:
         state["scope"] = True
         state["late_block"] = "post_sync"
         args.repo = "example/repository"
@@ -1124,40 +1404,68 @@ def test_repository_ship_checks_declared_test_selection_before_remote_work(
         (repo / "merged.txt").write_text("merged", encoding="utf-8")
         synchronized = _commit(repo)
         if args.reusable_head:
-            assert run_git(repo, "branch", "-f", "release/local", synchronized).returncode == 0
+            assert (
+                run_git(repo, "branch", "-f", "release/local", synchronized).returncode
+                == 0
+            )
         state["late_block"] = None
         state["target_commit_override"] = head
         if case in {"post-merge-resume-without-checkpoint", "unverified-resume"}:
+
             def merged_pr(
-                _args: argparse.Namespace, _root: pathlib.Path,
-                repository: str, commit: str, _pending: dict[str, Any],
+                _args: argparse.Namespace,
+                _root: pathlib.Path,
+                repository: str,
+                commit: str,
+                _pending: dict[str, Any],
             ) -> dict[str, Any] | None:
                 assert repository == args.repo and commit == head
                 if case == "unverified-resume":
                     return None
                 return {
-                    "repository": repository, "commit": commit,
-                    "head_branch": args.head_branch, "base_branch": args.base_branch,
-                    "phase": "merged", "merge_commit": synchronized,
+                    "repository": repository,
+                    "commit": commit,
+                    "head_branch": args.head_branch,
+                    "base_branch": args.base_branch,
+                    "phase": "merged",
+                    "merge_commit": synchronized,
                 }
-            monkeypatch.setattr(loaded["github_ship"], "_merged_pr_checkpoint", merged_pr)
-        if case in {"post-merge-resume", "post-merge-resume-unreused", "post-merge-resume-without-checkpoint"}:
+
+            monkeypatch.setattr(
+                loaded["github_ship"], "_merged_pr_checkpoint", merged_pr
+            )
+        if case in {
+            "post-merge-resume",
+            "post-merge-resume-unreused",
+            "post-merge-resume-without-checkpoint",
+        }:
             checkpoint = loaded["github_ship"]._checkpoint_path(repo, args.repo, head)
             if case == "post-merge-resume-without-checkpoint":
                 assert not checkpoint.exists()
             else:
                 checkpoint.parent.mkdir(parents=True, exist_ok=True)
-                checkpoint.write_text(json.dumps({
-                    "repository": args.repo, "commit": head, "head_branch": args.head_branch,
-                    "base_branch": args.base_branch, "phase": "synchronized",
-                    "merge_commit": synchronized, "synchronized_head": synchronized,
-                }), encoding="utf-8")
+                checkpoint.write_text(
+                    json.dumps(
+                        {
+                            "repository": args.repo,
+                            "commit": head,
+                            "head_branch": args.head_branch,
+                            "base_branch": args.base_branch,
+                            "phase": "synchronized",
+                            "merge_commit": synchronized,
+                            "synchronized_head": synchronized,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
             resumed = loaded["ship_repository"](args)
             assert resumed["status"] == "already_shipped"
             assert "test_selection" not in resumed
             assert state["calls"] == 2
         else:
-            with pytest.raises(loaded["RepositoryShipError"], match="Repository HEAD changed"):
+            with pytest.raises(
+                loaded["RepositoryShipError"], match="Repository HEAD changed"
+            ):
                 loaded["ship_repository"](args)
             assert state["calls"] == 1
     elif case == "passed":
@@ -1180,9 +1488,12 @@ def test_repository_ship_checks_declared_test_selection_before_remote_work(
             assert failure.value.payload["head"] == head
 
 
-def _saved_stage_fixture(root: pathlib.Path) -> tuple[pathlib.Path, str]:
+def _saved_stage_fixture(
+    root: pathlib.Path,
+    repository_name: str = "stage repository",
+) -> tuple[pathlib.Path, str]:
     """Use real subprocesses and Git identities without any remote or app effects."""
-    repo = root / "stage repository"
+    repo = root / repository_name
     (repo / "sdlc").mkdir(parents=True)
     (repo / ".gitignore").write_text(".build/\n", encoding="utf-8")
     (repo / "probe.py").write_text(
@@ -1198,54 +1509,168 @@ def _saved_stage_fixture(root: pathlib.Path) -> tuple[pathlib.Path, str]:
 
     # Deliberately put tests before validation in the data: execution must order
     # the phases by their responsibility, while preserving each phase's order.
-    contract = {"version": 3, "kind": "ceratops-sdlc", "repository": {
-        "tests": {"behavior": command("tests")}, "validate": {"source": command("validation")},
-    }, "deliverables": {"fixture": {
-        "tests": {"covered": {"no-op": "Repository tests cover this deliverable."}},
-        "deploy-local": {"install": command("deploy")},
-    }}}
+    contract = {
+        "version": 4,
+        "kind": "ceratops-sdlc",
+        "repository": {
+            "capabilities": {},
+            "actions": {
+                "test": {**command("tests"), "requires": {"capabilities": []}},
+                "validate": {**command("validation"), "requires": {"capabilities": []}},
+            },
+        },
+        "deliverables": {
+            "apps": {
+                "fixture": {
+                    "source": "apps/fixture",
+                    "manifest": "apps/fixture/app.json",
+                    "prerequisites": [],
+                    "actions": {
+                        "test": {
+                            "requires": {"capabilities": []},
+                            "no-op": "Repository tests cover this deliverable.",
+                        },
+                        "validate": {
+                            "requires": {"capabilities": []},
+                            "no-op": "Repository validation covers this deliverable.",
+                        },
+                        "install": {
+                            **command("deploy"),
+                            "requires": {"capabilities": []},
+                        },
+                    },
+                }
+            }
+        },
+    }
     (repo / "sdlc/sdlc.yml").write_text(json.dumps(contract), encoding="utf-8")
     assert run_git(repo, "init", "--quiet").returncode == 0
     assert run_git(repo, "add", ".").returncode == 0
-    assert run_git(repo, "-c", "user.name=Fixture", "-c", "user.email=fixture@invalid",
-                   "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null",
-                   "commit", "--quiet", "-m", "stage fixture").returncode == 0
-    return repo, "deliverables.fixture.deploy-local.install"
+    assert (
+        run_git(
+            repo,
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "commit",
+            "--quiet",
+            "-m",
+            "stage fixture",
+        ).returncode
+        == 0
+    )
+    return repo, "deliverables.apps.fixture.actions.install"
+
+
+@pytest.mark.parametrize(
+    "repository_name",
+    ["Codex-Desktop-App-Code", "Codex-Desktop-App-Patcher"],
+)
+def test_promotion_skips_rechecks_only_for_codex_desktop_repositories(
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture[str],
+    repository_name: str,
+) -> None:
+    import importlib
+
+    runner = importlib.import_module("repository_operation")
+    repo, _deploy = _saved_stage_fixture(tmp_path, repository_name)
+    head = run_git(repo, "rev-parse", "HEAD").stdout.strip()
+    base = ["--repo-root", str(repo)]
+
+    assert runner.main(
+        [
+            *base,
+            "--validate",
+            "--tests",
+            "--commit",
+            head,
+            "--test-trigger",
+            "promotion",
+        ]
+    ) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == "completed"
+    assert result["results"] == []
+    assert not (repo / ".build/events").exists()
+
+    assert runner.main([*base, "--validate"]) == 0
+    capsys.readouterr()
+    assert (repo / ".build/events").read_text().splitlines() == ["validation"]
 
 
 @pytest.mark.parametrize("repository_ignores_build", [False, True])
 def test_delivery_uses_saved_stages_without_running_checks(
-    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str],
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture[str],
     repository_ignores_build: bool,
 ) -> None:
     """Repository scripts may reuse results; the lifecycle still invokes them."""
     import importlib
+
     runner = importlib.import_module("repository_operation")
     repo, deploy = _saved_stage_fixture(tmp_path)
     if not repository_ignores_build:
         (repo / ".gitignore").write_text(".build/events\n.build/fail\n")
         assert run_git(repo, "add", "-u").returncode == 0
-        assert run_git(repo, "-c", "user.name=Fixture", "-c", "user.email=fixture@invalid",
-                       "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null",
-                       "commit", "--quiet", "-m", "only repository-owned exclusions").returncode == 0
+        assert (
+            run_git(
+                repo,
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "commit",
+                "--quiet",
+                "-m",
+                "only repository-owned exclusions",
+            ).returncode
+            == 0
+        )
     base = ["--repo-root", str(repo)]
     assert runner.main([*base, "--validate"]) == 0
     assert runner.main([*base, "--tests"]) == 0
     assert runner.main([*base, "--tests"]) == 0
-    assert (repo / ".build/events").read_text().splitlines() == ["validation", "tests", "tests"]
+    assert (repo / ".build/events").read_text().splitlines() == [
+        "validation",
+        "tests",
+        "tests",
+    ]
     assert runner.main([*base, "--operation", deploy]) == 0
-    assert (repo / ".build/events").read_text().splitlines() == ["validation", "tests", "tests", "validation", "tests", "deploy"]
+    assert (repo / ".build/events").read_text().splitlines() == [
+        "validation",
+        "tests",
+        "tests",
+        "validation",
+        "tests",
+        "deploy",
+    ]
     assert not (repo / ".build/sdlc").exists()
     assert run_git(repo, "status", "--porcelain").stdout == ""
     capsys.readouterr()
 
 
-@pytest.mark.parametrize("change", ["missing", "failed", "corrupt", "running", "source", "commit", "environment"])
+@pytest.mark.parametrize(
+    "change",
+    ["missing", "failed", "corrupt", "running", "source", "commit", "environment"],
+)
 def test_delivery_rejects_inapplicable_latest_stage_without_retesting(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, change: str,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
 ) -> None:
     """The repository owns stale-result policy; its nonzero exit stops delivery."""
     import importlib
+
     runner = importlib.import_module("repository_operation")
     repo, deploy = _saved_stage_fixture(tmp_path)
     base = ["--repo-root", str(repo)]
@@ -1253,14 +1678,26 @@ def test_delivery_rejects_inapplicable_latest_stage_without_retesting(
     if change == "source":
         (repo / "probe.py").write_text("changed source")
         assert runner.main([*base, "--operation", deploy]) == 1
-        assert (repo / ".build/events").read_text().splitlines() == ["validation", "tests"]
+        assert (repo / ".build/events").read_text().splitlines() == [
+            "validation",
+            "tests",
+        ]
         return
     # Model the repository deciding that its saved result is unusable. Generic
     # orchestration receives only the exit code, never the result schema.
     (repo / ".build/fail").write_text(change)
     assert runner.main([*base, "--operation", deploy]) == 1
-    assert (repo / ".build/events").read_text().splitlines() == ["validation", "tests", "validation", "tests"]
+    assert (repo / ".build/events").read_text().splitlines() == [
+        "validation",
+        "tests",
+        "validation",
+        "tests",
+    ]
     (repo / ".build/fail").unlink()
     assert runner.main([*base, "--operation", deploy]) == 0
-    assert (repo / ".build/events").read_text().splitlines()[-3:] == ["validation", "tests", "deploy"]
+    assert (repo / ".build/events").read_text().splitlines()[-3:] == [
+        "validation",
+        "tests",
+        "deploy",
+    ]
     assert not (repo / ".build/sdlc").exists()

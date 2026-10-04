@@ -20,14 +20,26 @@ BASE = "1" * 40
 HEAD = "2" * 40
 
 
-@pytest.mark.parametrize("target", [
-    "tests/test_infrastructure/test_repository_validator.py::test_runtime_dependencies_supply_timezones_without_an_os_database",
-    "tests/test_infrastructure/test_repository_validator.py",
-])
-def test_explicit_targets_collect_and_run_only_requested_cases(test_runner_module: Any, capsys: Any, target: str) -> None:
+@pytest.mark.parametrize(
+    "target",
+    [
+        "tests/test_infrastructure/test_repository_validator.py::test_runtime_dependencies_supply_timezones_without_an_os_database",
+        "tests/test_infrastructure/test_repository_validator.py",
+    ],
+)
+def test_explicit_targets_collect_and_run_only_requested_cases(
+    test_runner_module: Any, capsys: Any, target: str
+) -> None:
     execution = DeterministicExecution(test_runner_module, b"")
-    assert test_runner_module.execute([target, target], repo_root=ROOT,
-                                     text_runner=execution.text, bytes_runner=execution.bytes) == 0
+    assert (
+        test_runner_module.execute(
+            [target, target],
+            repo_root=ROOT,
+            text_runner=execution.text,
+            bytes_runner=execution.bytes,
+        )
+        == 0
+    )
     result = payload(capsys)
     assert result["mode"] == "targets"
     assert result["pytest_targets"] == [target]
@@ -35,45 +47,89 @@ def test_explicit_targets_collect_and_run_only_requested_cases(test_runner_modul
     assert execution.final_pytest == [(sys.executable, "-m", "pytest", "-q", target)]
 
 
-@pytest.mark.parametrize("arguments", [
-    ["tests/missing.py"], ["../outside.py"],
-    ["tests/test_infrastructure/test_repository_validator.py::missing_node"],
-    ["tests/test_infrastructure", "--all"], ["--auto", "--worktree"], ["--", "-q"],
-])
-def test_invalid_explicit_selection_never_runs_tests(test_runner_module: Any, tmp_path: pathlib.Path,
-                                                   capsys: Any, arguments: list[str]) -> None:
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["tests/missing.py"],
+        ["../outside.py"],
+        ["tests/test_infrastructure/test_repository_validator.py::missing_node"],
+        ["tests/test_infrastructure", "--all"],
+        ["--auto", "--worktree"],
+        ["--", "-q"],
+    ],
+)
+def test_invalid_explicit_selection_never_runs_tests(
+    test_runner_module: Any, tmp_path: pathlib.Path, capsys: Any, arguments: list[str]
+) -> None:
     execution = DeterministicExecution(test_runner_module, b"")
-    assert test_runner_module.execute(["--diagnostic-output", str(tmp_path / "failure.json"), *arguments],
-                                     repo_root=ROOT, text_runner=execution.text,
-                                     bytes_runner=execution.bytes) != 0
+    assert (
+        test_runner_module.execute(
+            ["--diagnostic-output", str(tmp_path / "failure.json"), *arguments],
+            repo_root=ROOT,
+            text_runner=execution.text,
+            bytes_runner=execution.bytes,
+        )
+        != 0
+    )
     assert not execution.final_pytest
     assert payload(capsys)["pytest"]["outcome"] == "not-run"
 
 
-@pytest.mark.parametrize("context", ["local", "push", "pull_request", "malformed", "unsupported", "missing_branch"])
+@pytest.mark.parametrize(
+    "context",
+    ["local", "push", "pull_request", "malformed", "unsupported", "missing_branch"],
+)
 def test_auto_uses_explicit_ci_context_and_preserves_local_full_selection(
-    test_runner_module: Any, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, capsys: Any, context: str,
+    test_runner_module: Any,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: Any,
+    context: str,
 ) -> None:
-    execution = DeterministicExecution(test_runner_module, b"M\0tools/ceratops_tool_manager/cli.py\0")
+    execution = DeterministicExecution(
+        test_runner_module, b"M\0mcp-servers/ceratops_mcp_server_manager/cli.py\0"
+    )
     monkeypatch.delenv("CERATOPS_SDLC_TEST_CONTEXT", raising=False)
     monkeypatch.setenv("GITHUB_ACTIONS", "false" if context == "local" else "true")
-    monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request" if context in {"malformed", "missing_branch"} else context)
+    monkeypatch.setenv(
+        "GITHUB_EVENT_NAME",
+        "pull_request" if context in {"malformed", "missing_branch"} else context,
+    )
     monkeypatch.setenv("GITHUB_REF_NAME", "main")
     event = tmp_path / "event.json"
-    event.write_text(json.dumps({"pull_request": {
-        "base": {"sha": BASE, "ref": "" if context == "missing_branch" else "main"},
-        "head": {"sha": HEAD, "ref": "codex/task"},
-    }})
-                     if context != "malformed" else "{}", encoding="utf-8")
+    event.write_text(
+        json.dumps(
+            {
+                "pull_request": {
+                    "base": {
+                        "sha": BASE,
+                        "ref": "" if context == "missing_branch" else "main",
+                    },
+                    "head": {"sha": HEAD, "ref": "codex/task"},
+                }
+            }
+        )
+        if context != "malformed"
+        else "{}",
+        encoding="utf-8",
+    )
     monkeypatch.setenv("GITHUB_EVENT_PATH", str(event))
+
     # Real selection, bounded collection fixture: the execution contract under test
     # is argv selection, not a second collection of the entire repository.
     def commands(command, cwd):
         if "--collect-only" in command:
-            return subprocess.CompletedProcess(command, 0, "tests/fixture.py::test_value\n", "")
+            return subprocess.CompletedProcess(
+                command, 0, "tests/fixture.py::test_value\n", ""
+            )
         return execution.text(command, cwd)
-    code = test_runner_module.execute(["--auto", "--diagnostic-output", str(tmp_path / "failure.json")],
-                                      repo_root=ROOT, text_runner=commands, bytes_runner=execution.bytes)
+
+    code = test_runner_module.execute(
+        ["--auto", "--diagnostic-output", str(tmp_path / "failure.json")],
+        repo_root=ROOT,
+        text_runner=commands,
+        bytes_runner=execution.bytes,
+    )
     result = payload(capsys)
     if context in {"malformed", "unsupported", "missing_branch"}:
         assert code != 0 and not execution.final_pytest
@@ -82,22 +138,38 @@ def test_auto_uses_explicit_ci_context_and_preserves_local_full_selection(
         assert code == 0
         assert (result["base"], result["head"]) == (BASE, HEAD)
         assert result["context"] == {
-            "trigger": "pull_request", "source_branch": "codex/task", "target_branch": "main",
+            "trigger": "pull_request",
+            "source_branch": "codex/task",
+            "target_branch": "main",
         }
-        assert result["pytest_targets"] == ["tests/tool_manager"]
+        assert result["pytest_targets"] == ["tests/mcp_server_manager"]
     else:
         assert code == 0 and result["full_suite"]
         assert result["context"]["trigger"] == context
-        assert result["pytest_targets"] == list(test_runner_module.all_selection(
-            test_runner_module.load_manifest(ROOT / "tests/test-impact.json")).pytest_targets)
+        assert result["pytest_targets"] == list(
+            test_runner_module.all_selection(
+                test_runner_module.load_manifest(ROOT / "tests/test-impact.json")
+            ).pytest_targets
+        )
 
 
-@pytest.mark.parametrize("condition", [
-    "matched", "wrong-commit", "wrong-branch", "missing-branch", "malformed", "ci-conflict",
-])
+@pytest.mark.parametrize(
+    "condition",
+    [
+        "matched",
+        "wrong-commit",
+        "wrong-branch",
+        "missing-branch",
+        "malformed",
+        "ci-conflict",
+    ],
+)
 def test_auto_promotion_context_is_bound_before_collection(
-    test_runner_module: Any, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
-    capsys: Any, condition: str,
+    test_runner_module: Any,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: Any,
+    condition: str,
 ) -> None:
     context = {"trigger": "promotion", "branch": "release/local", "commit": BASE}
     if condition == "wrong-commit":
@@ -106,8 +178,13 @@ def test_auto_promotion_context_is_bound_before_collection(
         context["branch"] = "codex/task"
     if condition == "missing-branch":
         del context["branch"]
-    monkeypatch.setenv("CERATOPS_SDLC_TEST_CONTEXT", "{" if condition == "malformed" else json.dumps(context))
-    monkeypatch.setenv("GITHUB_ACTIONS", "true" if condition == "ci-conflict" else "false")
+    monkeypatch.setenv(
+        "CERATOPS_SDLC_TEST_CONTEXT",
+        "{" if condition == "malformed" else json.dumps(context),
+    )
+    monkeypatch.setenv(
+        "GITHUB_ACTIONS", "true" if condition == "ci-conflict" else "false"
+    )
     execution = DeterministicExecution(test_runner_module, b"")
     calls = []
 
@@ -116,12 +193,16 @@ def test_auto_promotion_context_is_bound_before_collection(
         if command == ["git", "branch", "--show-current"]:
             return subprocess.CompletedProcess(command, 0, "release/local\n", "")
         if "--collect-only" in command:
-            return subprocess.CompletedProcess(command, 0, "tests/fixture.py::test_value\n", "")
+            return subprocess.CompletedProcess(
+                command, 0, "tests/fixture.py::test_value\n", ""
+            )
         return execution.text(command, cwd)
 
     code = test_runner_module.execute(
         ["--auto", "--diagnostic-output", str(tmp_path / "failure.json")],
-        repo_root=ROOT, text_runner=commands, bytes_runner=execution.bytes,
+        repo_root=ROOT,
+        text_runner=commands,
+        bytes_runner=execution.bytes,
     )
     result = payload(capsys)
     if condition == "matched":
@@ -134,11 +215,21 @@ def test_auto_promotion_context_is_bound_before_collection(
         assert not any("--collect-only" in command for command in calls)
 
 
-@pytest.mark.parametrize("context", [
-    "ordinary", "promotion", "missing-commit", "missing-tests", "ci", "detached",
-])
+@pytest.mark.parametrize(
+    "context",
+    [
+        "ordinary",
+        "promotion",
+        "missing-commit",
+        "missing-tests",
+        "ci",
+        "detached",
+    ],
+)
 def test_promotion_hands_context_through_sdlc_only_to_tests(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, context: str,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    context: str,
 ) -> None:
     """Use real Git and the real SDLC CLI; the declared probe records its context."""
     scripts = ROOT / "skills/ceratops-repo-lifecycle/scripts"
@@ -151,29 +242,66 @@ def test_promotion_hands_context_through_sdlc_only_to_tests(
     (repo / "sdlc").mkdir()
     record = tmp_path / "test-context.json"
     contract = {
-        "version": 3, "kind": "ceratops-sdlc",
+        "version": 4,
+        "kind": "ceratops-sdlc",
         "repository": {
-            "validate": {"probe": {"steps": [{"run": [
-                sys.executable, "-c", "import os; assert 'CERATOPS_SDLC_TEST_CONTEXT' not in os.environ",
-            ]}]}},
-            "tests": {"probe": {"steps": [{"run": [
-                sys.executable, "-c",
-                "import os,pathlib; "
-                f"pathlib.Path({str(record)!r}).write_text(os.environ.get('CERATOPS_SDLC_TEST_CONTEXT', 'null'))",
-            ]}]}},
+            "capabilities": {},
+            "actions": {
+                "validate": {
+                    "requires": {"capabilities": []},
+                    "steps": [
+                        {
+                            "run": [
+                                sys.executable,
+                                "-c",
+                                "import os; assert 'CERATOPS_SDLC_TEST_CONTEXT' not in os.environ",
+                            ]
+                        }
+                    ],
+                },
+                "test": {
+                    "requires": {"capabilities": []},
+                    "steps": [
+                        {
+                            "run": [
+                                sys.executable,
+                                "-c",
+                                (
+                                    "import os,pathlib; "
+                                    f"pathlib.Path({str(record)!r}).write_text("
+                                    "os.environ.get('CERATOPS_SDLC_TEST_CONTEXT', 'null'))"
+                                ),
+                            ]
+                        }
+                    ],
+                },
+            },
         },
     }
     (repo / "sdlc/sdlc.yml").write_text(json.dumps(contract), encoding="utf-8")
     for command in (
         ["git", "init", "-b", "release/local"],
         ["git", "add", "."],
-        ["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "fixture"],
+        [
+            "git",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-m",
+            "fixture",
+        ],
     ):
         subprocess.run(command, cwd=repo, check=True, capture_output=True)
-    commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    commit = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=repo, text=True
+    ).strip()
     args = argparse.Namespace(
-        sdlc_contract=pathlib.Path("sdlc/sdlc.yml"), validation_operation=None,
-        run_operation=None, parameter=[],
+        sdlc_contract=pathlib.Path("sdlc/sdlc.yml"),
+        validation_operation=None,
+        run_operation=None,
+        parameter=[],
     )
     command = workflow["_validation_command"](args, repo, commit)
     assert command[-2:] == ["--test-trigger", "promotion"]
@@ -181,29 +309,43 @@ def test_promotion_hands_context_through_sdlc_only_to_tests(
         command = command[:-2]
     elif context == "missing-commit":
         index = command.index("--commit")
-        del command[index:index + 2]
+        del command[index : index + 2]
     elif context == "missing-tests":
         command.remove("--tests")
     elif context == "ci":
         command.append("--ci")
     elif context == "detached":
-        subprocess.run(["git", "checkout", "--detach"], cwd=repo, check=True, capture_output=True)
-    result = subprocess.run(command, cwd=repo, capture_output=True, text=True, check=False)
+        subprocess.run(
+            ["git", "checkout", "--detach"], cwd=repo, check=True, capture_output=True
+        )
+    result = subprocess.run(
+        command, cwd=repo, capture_output=True, text=True, check=False
+    )
     if context not in {"ordinary", "promotion"}:
         assert result.returncode != 0
         assert not record.exists()
-        assert "test context requires" in result.stderr or "require a checked-out release branch" in result.stderr
+        assert (
+            "test context requires" in result.stderr
+            or "require a checked-out release branch" in result.stderr
+        )
         return
     assert result.returncode == 0, result.stderr
-    expected = {"trigger": "promotion", "branch": "release/local", "commit": commit} if context == "promotion" else None
+    expected = (
+        {"trigger": "promotion", "branch": "release/local", "commit": commit}
+        if context == "promotion"
+        else None
+    )
     assert json.loads(record.read_text()) == expected
     assert "CERATOPS_SDLC_TEST_CONTEXT" not in os.environ
 
 
 def test_runner_does_not_leak_promotion_context_into_pytest(
-    test_runner_module: Any, monkeypatch: pytest.MonkeyPatch,
+    test_runner_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    value = json.dumps({"trigger": "promotion", "branch": "release/local", "commit": BASE})
+    value = json.dumps(
+        {"trigger": "promotion", "branch": "release/local", "commit": BASE}
+    )
     monkeypatch.setenv("CERATOPS_SDLC_TEST_CONTEXT", value)
     environments = []
     original_run = test_runner_module.subprocess.run
@@ -243,9 +385,7 @@ class DeterministicExecution:
         self.commands: list[tuple[str, ...]] = []
         self.final_pytest: list[tuple[str, ...]] = []
 
-    def text(
-        self, command: Any, cwd: pathlib.Path
-    ) -> subprocess.CompletedProcess[str]:
+    def text(self, command: Any, cwd: pathlib.Path) -> subprocess.CompletedProcess[str]:
         argv = tuple(command)
         self.commands.append(argv)
         if argv[:3] == ("git", "rev-parse", "--verify"):
@@ -291,9 +431,7 @@ class CollectionExecution:
         self.nodes = nodes
         self.commands: list[tuple[str, ...]] = []
 
-    def text(
-        self, command: Any, cwd: pathlib.Path
-    ) -> subprocess.CompletedProcess[str]:
+    def text(self, command: Any, cwd: pathlib.Path) -> subprocess.CompletedProcess[str]:
         argv = tuple(command)
         self.commands.append(argv)
         assert argv[:5] == (
@@ -319,21 +457,62 @@ def payload(capsys: pytest.CaptureFixture[str]) -> dict[str, Any]:
 
 
 def assert_pretest_diagnostic(
-    path: pathlib.Path, result: dict[str, Any], exit_code: int,
+    path: pathlib.Path,
+    result: dict[str, Any],
+    exit_code: int,
 ) -> dict[str, Any]:
     """Check the persisted failure and the exact evidence reference returned."""
     content = path.read_bytes()
     complete = json.loads(content)
-    assert complete["schema"] == "ai-agent-skills-test-runner-diagnostic.v1"
+    assert complete["schema"] == "ceratops-ai-agents-kit-test-runner-diagnostic.v1"
     assert complete["exit_code"] == exit_code
-    assert complete["result"] == {key: value for key, value in result.items() if key != "diagnostic"}
+    assert complete["result"] == {
+        key: value for key, value in result.items() if key != "diagnostic"
+    }
     assert complete["result"]["pytest"] == {"exit_code": None, "outcome": "not-run"}
     assert result["diagnostic"] == {
-        "bytes": len(content), "path": str(path.resolve()),
+        "bytes": len(content),
+        "path": str(path.resolve()),
         "sha256": hashlib.sha256(content).hexdigest(),
     }
     assert not list(path.parent.glob(f".{path.name}.*.tmp"))
     return complete
+
+
+def test_json_output_writes_only_final_path_and_reuses_matching_bytes(
+    test_runner_module: Any,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = test_runner_module
+    destination = tmp_path / "output.json"
+    destination.write_text("{interrupted", encoding="utf-8")
+    expected = b'{\n  "value": 7\n}\n'
+    modes: list[str] = []
+    original_open = pathlib.Path.open
+
+    def guarded_open(
+        path: pathlib.Path, mode: str = "r", *args: Any, **kwargs: Any
+    ) -> Any:
+        if path.parent == tmp_path:
+            assert path == destination
+            modes.append(mode)
+        return original_open(path, mode, *args, **kwargs)
+
+    def reject_replace(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("JSON output must not be published through replacement")
+
+    monkeypatch.setattr(runner.pathlib.Path, "open", guarded_open)
+    monkeypatch.setattr(runner.os, "replace", reject_replace)
+
+    assert runner.write_json(destination, {"value": 7}) == expected
+    assert destination.read_bytes() == expected
+    assert list(tmp_path.iterdir()) == [destination]
+    assert "wb" in modes
+
+    modes.clear()
+    assert runner.write_json(destination, {"value": 7}) == expected
+    assert not any("w" in mode or "a" in mode or "x" in mode for mode in modes)
 
 
 def test_committed_diff_mode_collects_and_invokes_only_selected_suite(
@@ -377,15 +556,16 @@ def test_committed_diff_mode_collects_and_invokes_only_selected_suite(
         )
     ]
     assert all(
-        command[0] == "git"
-        or command[:3] == (sys.executable, "-m", "pytest")
+        command[0] == "git" or command[:3] == (sys.executable, "-m", "pytest")
         for command in execution.commands
     )
 
 
 @pytest.mark.parametrize("shared_value", ["short", "shared" * 200])
 def test_failure_summary_matches_real_long_pytest_titles(
-    test_runner_module: Any, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+    test_runner_module: Any,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
     shared_value: str,
 ) -> None:
     # This fixture owns its pytest arguments and output format; the enclosing
@@ -406,19 +586,40 @@ def test_failure_summary_matches_real_long_pytest_titles(
         source.append("")
     path.write_text("\n".join(source), encoding="utf-8")
     result = subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", "--color=no", "-o", "addopts=", path.name],
-        cwd=tmp_path, capture_output=True, text=True, check=False,
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "--color=no",
+            "-o",
+            "addopts=",
+            path.name,
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
     )
     assert result.returncode == 1, result.stderr
-    summary = test_runner_module.pytest_diagnostics.pytest_failure_summary(result.stdout, result.stderr)
+    summary = test_runner_module.pytest_diagnostics.pytest_failure_summary(
+        result.stdout, result.stderr
+    )
     assert summary["failed_tests"] == [f"{path.name}::{name}" for name in names]
     for index, failure in enumerate(summary["failures"]):
         assert failure["source_location"] == f"{path.name}:{assertion_lines[index]}"
         assert f"{index}-only" in failure["excerpt"]
-        assert f"At index 1 diff: 'actual-{index}' != 'expected-{index}'" in failure["excerpt"]
+        assert (
+            f"At index 1 diff: 'actual-{index}' != 'expected-{index}'"
+            in failure["excerpt"]
+        )
         assert "assert 0 == 0" not in failure["excerpt"]
         assert len(failure["excerpt"].encode("utf-8")) <= 800
-        assert all(f"{other}-only" not in failure["excerpt"] for other in range(3) if other != index)
+        assert all(
+            f"{other}-only" not in failure["excerpt"]
+            for other in range(3)
+            if other != index
+        )
     assert "At index 1 diff: 'actual-0' != 'expected-0'" in summary["decisive_excerpt"]
     assert "assert 0 == 0" not in summary["decisive_excerpt"]
 
@@ -427,8 +628,14 @@ def test_failure_summary_matches_real_long_pytest_titles(
     ("title", "identity"),
     [
         ("test_prefix_longer", "tests/test_a.py::test_prefix_longer"),
-        ("TestExample.test_same[a::b]", "tests/test_a.py::TestExample::test_same[a::b]"),
-        ("ERROR at setup of TestExample.test_same[value]", "tests/test_a.py::TestExample::test_same[value]"),
+        (
+            "TestExample.test_same[a::b]",
+            "tests/test_a.py::TestExample::test_same[a::b]",
+        ),
+        (
+            "ERROR at setup of TestExample.test_same[value]",
+            "tests/test_a.py::TestExample::test_same[value]",
+        ),
         ("ERROR at teardown of test_same", "tests/test_a.py::test_same"),
         ("ERROR collecting tests/test_a.py", "tests/test_a.py"),
     ],
@@ -442,8 +649,11 @@ def test_failure_summary_matches_real_long_pytest_titles(
     ],
 )
 def test_failure_summary_matches_exact_identities_without_order_fallback(
-    test_runner_module: Any, title: str, identity: str,
-    traceback_line: str, expected_excerpt: str,
+    test_runner_module: Any,
+    title: str,
+    identity: str,
+    traceback_line: str,
+    expected_excerpt: str,
 ) -> None:
     output = (
         "___ test_prefix ___\nE       wrong-prefix\ntests/test_a.py:10: AssertionError\n"
@@ -457,9 +667,21 @@ def test_failure_summary_matches_exact_identities_without_order_fallback(
     )
     summary = test_runner_module.pytest_diagnostics.pytest_failure_summary(output, "")
     assert summary["failures"] == [
-        {"test": "tests/test_a.py::test_missing", "source_location": None, "excerpt": "missing-reason"},
-        {"test": identity, "source_location": "tests/test_a.py:40", "excerpt": expected_excerpt},
-        {"test": "tests/test_a.py::test_prefix", "source_location": "tests/test_a.py:10", "excerpt": "E       wrong-prefix"},
+        {
+            "test": "tests/test_a.py::test_missing",
+            "source_location": None,
+            "excerpt": "missing-reason",
+        },
+        {
+            "test": identity,
+            "source_location": "tests/test_a.py:40",
+            "excerpt": expected_excerpt,
+        },
+        {
+            "test": "tests/test_a.py::test_prefix",
+            "source_location": "tests/test_a.py:10",
+            "excerpt": "E       wrong-prefix",
+        },
     ]
     assert "wrong-class" not in summary["decisive_excerpt"]
     assert "wrong-parameter" not in summary["decisive_excerpt"]
@@ -483,22 +705,32 @@ def test_failure_summary_requires_evidence_for_duplicate_titles(
     assert summary["failures"] == [
         {
             "test": f"tests/test_{module}.py::test_same",
-            "source_location": f"tests/test_{module}.py:10" if with_locations and module in reported_sections else None,
-            "excerpt": f"E       failure-{module}" if with_locations and module in reported_sections else f"reason-{module}",
+            "source_location": f"tests/test_{module}.py:10"
+            if with_locations and module in reported_sections
+            else None,
+            "excerpt": f"E       failure-{module}"
+            if with_locations and module in reported_sections
+            else f"reason-{module}",
         }
         for module in ("a", "b")
     ]
 
 
 @pytest.mark.parametrize("error_lines", [1, 6])
-def test_failure_summary_bounds_multibyte_fields(test_runner_module: Any, error_lines: int) -> None:
+def test_failure_summary_bounds_multibyte_fields(
+    test_runner_module: Any, error_lines: int
+) -> None:
     diagnostics = test_runner_module.pytest_diagnostics
     identity = "tests/" + "界" * 250 + ".py::test_long"
     output = (
         "_ test_long _\n"
-        + "\n".join(f"E       {index}: " + "界" * 1_000 for index in range(error_lines)) + "\n"
-        + identity.partition("::")[0] + ":10: AssertionError\n"
-        + "=== short test summary info ===\nFAILED " + identity + "\n"
+        + "\n".join(f"E       {index}: " + "界" * 1_000 for index in range(error_lines))
+        + "\n"
+        + identity.partition("::")[0]
+        + ":10: AssertionError\n"
+        + "=== short test summary info ===\nFAILED "
+        + identity
+        + "\n"
     )
     summary = diagnostics.pytest_failure_summary(output, "")
     failure = summary["failures"][0]
@@ -516,7 +748,9 @@ def test_pytest_failure_writes_full_diagnostic_and_emits_bounded_summary(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     runner = test_runner_module
-    assert runner.DEFAULT_DIAGNOSTIC_PATH == pathlib.Path(".build/test-diagnostics/pytest-failure.json")
+    assert runner.DEFAULT_DIAGNOSTIC_PATH == pathlib.Path(
+        ".build/test-diagnostics/pytest-failure.json"
+    )
     stdout = (
         "___________________________ test_contract ____________________________\n"
         ">       assert 1 == 2\n"
@@ -693,7 +927,9 @@ def test_committed_diff_treats_deleted_test_as_intentional_full_suite(
         "scripts/pyproject.toml",
     ],
 )
-@pytest.mark.parametrize("unmapped_path", ["src/unmapped.py", "tests/unmapped/test_new.py"])
+@pytest.mark.parametrize(
+    "unmapped_path", ["src/unmapped.py", "tests/unmapped/test_new.py"]
+)
 def test_mapping_gap_returns_before_pytest_collection_or_execution(
     test_runner_module: Any,
     capsys: pytest.CaptureFixture[str],
@@ -708,7 +944,9 @@ def test_mapping_gap_returns_before_pytest_collection_or_execution(
         diff += f"M\0{mapped_path}\0"
     execution = DeterministicExecution(runner, diff.encode())
     diagnostic = tmp_path / "selection failure.json"
-    arguments = ["--worktree"] if mode == "worktree" else ["--base", BASE, "--head", HEAD]
+    arguments = (
+        ["--worktree"] if mode == "worktree" else ["--base", BASE, "--head", HEAD]
+    )
 
     exit_code = runner.execute(
         [*arguments, "--diagnostic-output", str(diagnostic)],
@@ -802,8 +1040,11 @@ def test_explicit_worktree_mode_selects_tracked_and_untracked_changes(
 
 @pytest.mark.parametrize("output_kind", ["explicit", "default", "unwritable"])
 def test_revision_mode_requires_two_full_commit_shas(
-    test_runner_module: Any, capsys: pytest.CaptureFixture[str],
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, output_kind: str,
+    test_runner_module: Any,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    output_kind: str,
 ) -> None:
     runner = test_runner_module
     diagnostic = tmp_path / "runner failure.json"
@@ -812,7 +1053,9 @@ def test_revision_mode_requires_two_full_commit_shas(
         blocked_parent.write_text("existing file", encoding="utf-8")
         diagnostic = blocked_parent / "failure.json"
     monkeypatch.setattr(runner, "DEFAULT_DIAGNOSTIC_PATH", diagnostic)
-    output_arguments = [] if output_kind == "default" else ["--diagnostic-output", str(diagnostic)]
+    output_arguments = (
+        [] if output_kind == "default" else ["--diagnostic-output", str(diagnostic)]
+    )
 
     missing_head = runner.execute(["--base", BASE, *output_arguments], repo_root=ROOT)
     first = payload(capsys)
@@ -830,7 +1073,10 @@ def test_revision_mode_requires_two_full_commit_shas(
     assert "full 40-character SHA" in second["manifest_errors"][0]
     if output_kind == "unwritable":
         for result in (first, second):
-            assert "cannot create diagnostic output parent" in result["diagnostic"]["error"]
+            assert (
+                "cannot create diagnostic output parent"
+                in result["diagnostic"]["error"]
+            )
             assert result["diagnostic"]["path"] == str(diagnostic.resolve())
         assert not diagnostic.exists()
         assert blocked_parent.read_text(encoding="utf-8") == "existing file"
@@ -838,17 +1084,28 @@ def test_revision_mode_requires_two_full_commit_shas(
         assert_pretest_diagnostic(diagnostic, second, short_sha)
 
 
-@pytest.mark.parametrize("failure", [
-    "manifest-load", "manifest-validation", "selected-collection", "full-collection",
-    "revision-resolution", "worktree-resolution",
-])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "manifest-load",
+        "manifest-validation",
+        "selected-collection",
+        "full-collection",
+        "revision-resolution",
+        "worktree-resolution",
+    ],
+)
 def test_pretest_failures_preserve_report_and_full_command_output(
-    test_runner_module: Any, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str], failure: str,
+    test_runner_module: Any,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    failure: str,
 ) -> None:
     runner = test_runner_module
     execution = DeterministicExecution(
-        runner, b"M\0skills/ceratops-credit-savings-analysis/SKILL.md\0",
+        runner,
+        b"M\0skills/ceratops-credit-savings-analysis/SKILL.md\0",
     )
     diagnostic = tmp_path / "runner failure.json"
     stdout = "ImportError: decisive detail\n" + "later noise\n" * 100
@@ -860,28 +1117,38 @@ def test_pretest_failures_preserve_report_and_full_command_output(
         (root / "tests").mkdir(parents=True)
         (root / "tests/test-impact.json").write_text("{invalid json", encoding="utf-8")
     elif failure == "manifest-validation":
-        monkeypatch.setattr(runner, "validate_manifest", lambda *_args, **_kwargs: ["invalid ownership"])
+        monkeypatch.setattr(
+            runner, "validate_manifest", lambda *_args, **_kwargs: ["invalid ownership"]
+        )
     elif failure == "full-collection":
         arguments = ["--write-collection", str(tmp_path / "collection.json")]
     elif failure == "worktree-resolution":
         arguments = ["--worktree"]
 
-    def failing_command(command: Any, cwd: pathlib.Path) -> subprocess.CompletedProcess[str]:
+    def failing_command(
+        command: Any, cwd: pathlib.Path
+    ) -> subprocess.CompletedProcess[str]:
         if "--collect-only" in command or (
-            failure in {"revision-resolution", "worktree-resolution"} and command[0] == "git"
+            failure in {"revision-resolution", "worktree-resolution"}
+            and command[0] == "git"
         ):
             return subprocess.CompletedProcess(command, 2, stdout, stderr)
         return execution.text(command, cwd)
 
     exit_code = runner.execute(
-        [*arguments, "--diagnostic-output", str(diagnostic)], repo_root=root,
-        text_runner=failing_command, bytes_runner=execution.bytes,
+        [*arguments, "--diagnostic-output", str(diagnostic)],
+        repo_root=root,
+        text_runner=failing_command,
+        bytes_runner=execution.bytes,
     )
     result = payload(capsys)
     assert exit_code == runner.CONFIGURATION_EXIT_CODE
     assert result["status"] == (
-        "manifest-invalid" if failure.startswith("manifest-") else
-        "configuration-error" if failure.endswith("resolution") else "collection-invalid"
+        "manifest-invalid"
+        if failure.startswith("manifest-")
+        else "configuration-error"
+        if failure.endswith("resolution")
+        else "collection-invalid"
     )
     complete = assert_pretest_diagnostic(diagnostic, result, exit_code)
     assert complete["cwd"] == str(root.resolve())
@@ -890,8 +1157,10 @@ def test_pretest_failures_preserve_report_and_full_command_output(
         assert complete["commands"] == []
     else:
         assert complete["commands"]
-        assert all(command["stdout"] == stdout and command["stderr"] == stderr
-                   for command in complete["commands"])
+        assert all(
+            command["stdout"] == stdout and command["stderr"] == stderr
+            for command in complete["commands"]
+        )
         assert "ImportError: decisive detail" not in json.dumps(result)
     assert not (tmp_path / "collection.json").exists()
 
@@ -901,7 +1170,11 @@ def test_manifest_validation_mode_collects_every_declared_target(
 ) -> None:
     """The nested entrypoint resolves its repository and adjacent diagnostics."""
     process = subprocess.run(
-        [sys.executable, str(ROOT / "scripts" / "testing" / "run-tests.py"), "--validate-manifest"],
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "testing" / "run-tests.py"),
+            "--validate-manifest",
+        ],
         cwd=tmp_path,
         capture_output=True,
         text=True,
@@ -981,12 +1254,15 @@ def test_collection_node_map_resolves_ambiguous_identity(
     baseline_path = tmp_path / "collection.json"
     old = "tests/legacy/test_flow.py::test_case[value]"
     writer = CollectionExecution(runner, (old,))
-    assert runner.execute(
-        ["--write-collection", str(baseline_path)],
-        repo_root=ROOT,
-        text_runner=writer.text,
-        bytes_runner=writer.bytes,
-    ) == 0
+    assert (
+        runner.execute(
+            ["--write-collection", str(baseline_path)],
+            repo_root=ROOT,
+            text_runner=writer.text,
+            bytes_runner=writer.bytes,
+        )
+        == 0
+    )
     payload(capsys)
 
     candidates = (
@@ -996,7 +1272,12 @@ def test_collection_node_map_resolves_ambiguous_identity(
     ambiguous = CollectionExecution(runner, candidates)
     diagnostic = tmp_path / "collection failure.json"
     mismatch_exit = runner.execute(
-        ["--reconcile-collection", str(baseline_path), "--diagnostic-output", str(diagnostic)],
+        [
+            "--reconcile-collection",
+            str(baseline_path),
+            "--diagnostic-output",
+            str(diagnostic),
+        ],
         repo_root=ROOT,
         text_runner=ambiguous.text,
         bytes_runner=ambiguous.bytes,
@@ -1052,8 +1333,10 @@ def test_collection_node_map_resolves_ambiguous_identity(
     )
     assert changed_identity["ok"] is False
     assert changed_identity["mapping_errors"] == [
-        "node map changes pytest identity: "
-        f"{old} -> tests/beta/test_flow.py::test_case[changed]"
+        (
+            "node map changes pytest identity: "
+            f"{old} -> tests/beta/test_flow.py::test_case[changed]"
+        )
     ]
 
 
@@ -1081,7 +1364,8 @@ def test_committed_diff_maps_retired_and_current_lifecycle_configuration(
         runner.load_manifest(ROOT / "tests" / "test-impact.json").suites
     )
     assert {item["path"] for item in result["selections"]} == {
-        "deploy/deploy.yml", "sdlc/sdlc.yml"
+        "deploy/deploy.yml",
+        "sdlc/sdlc.yml",
     }
 
 
@@ -1089,9 +1373,7 @@ def test_release_documentation_changes_need_no_executable_suite(
     test_runner_module: Any, capsys: pytest.CaptureFixture[str]
 ) -> None:
     runner = test_runner_module
-    execution = DeterministicExecution(
-        runner, b"M\0CHANGELOG.md\0M\0CONTRIBUTING.md\0"
-    )
+    execution = DeterministicExecution(runner, b"M\0CHANGELOG.md\0M\0CONTRIBUTING.md\0")
     exit_code = runner.execute(
         ["--base", BASE, "--head", HEAD],
         repo_root=ROOT,
@@ -1107,7 +1389,8 @@ def test_release_documentation_changes_need_no_executable_suite(
 
 
 def test_pytest_environment_isolates_peers_and_nested_runs_and_cleans_up(
-    test_runner_module: Any, tmp_path: pathlib.Path,
+    test_runner_module: Any,
+    tmp_path: pathlib.Path,
 ) -> None:
     environment = test_runner_module.pytest_environment
     sentinel = tmp_path / "keep.txt"
@@ -1115,22 +1398,33 @@ def test_pytest_environment_isolates_peers_and_nested_runs_and_cleans_up(
     caller = {**os.environ, "PYTEST_DEBUG_TEMPROOT": str(tmp_path)}
     before = caller.copy()
     process_before = dict(os.environ)
-    with environment.isolated_environment(tmp_path, environ=caller, windows=False) as first:
+    with environment.isolated_environment(
+        tmp_path, environ=caller, windows=False
+    ) as first:
         root = pathlib.Path(first["TMP"])
         assert root.parent == tmp_path
-        assert all(first[key] == str(root) for key in ("TEMP", "TMPDIR", "PYTEST_DEBUG_TEMPROOT"))
+        assert all(
+            first[key] == str(root)
+            for key in ("TEMP", "TMPDIR", "PYTEST_DEBUG_TEMPROOT")
+        )
         readonly = root / "readonly"
         readonly.write_text("git object", encoding="utf-8")
         readonly.chmod(stat.S_IREAD)
-        with environment.isolated_environment(tmp_path, environ=caller, windows=False) as peer:
+        with environment.isolated_environment(
+            tmp_path, environ=caller, windows=False
+        ) as peer:
             peer_root = pathlib.Path(peer["TMP"])
             assert peer_root != root and peer_root.parent == tmp_path
         assert not peer_root.exists() and root.is_dir()
-        with pytest.raises(RuntimeError, match="interrupted work"):
-            with environment.isolated_environment(tmp_path, environ=first, windows=False) as nested:
-                nested_root = pathlib.Path(nested["TMP"])
-                assert nested_root.parent == root
-                raise RuntimeError("interrupted work")
+        with (
+            pytest.raises(RuntimeError, match="interrupted work"),
+            environment.isolated_environment(
+                tmp_path, environ=first, windows=False
+            ) as nested,
+        ):
+            nested_root = pathlib.Path(nested["TMP"])
+            assert nested_root.parent == root
+            raise RuntimeError("interrupted work")
         assert not nested_root.exists() and root.is_dir()
     assert not root.exists()
     assert list(tmp_path.iterdir()) == [sentinel]
@@ -1138,37 +1432,54 @@ def test_pytest_environment_isolates_peers_and_nested_runs_and_cleans_up(
 
 
 def test_non_windows_environment_keeps_git_and_explicit_pytest_options(
-    test_runner_module: Any, tmp_path: pathlib.Path,
+    test_runner_module: Any,
+    tmp_path: pathlib.Path,
 ) -> None:
     caller = {
-        "PYTEST_DEBUG_TEMPROOT": str(tmp_path), "PYTEST_ADDOPTS": "--color=no",
-        "GIT_CONFIG_COUNT": "untouched", "GIT_TEMPLATE_DIR": "custom-template",
+        "PYTEST_DEBUG_TEMPROOT": str(tmp_path),
+        "PYTEST_ADDOPTS": "--color=no",
+        "GIT_CONFIG_COUNT": "untouched",
+        "GIT_TEMPLATE_DIR": "custom-template",
         "UNRELATED": "preserved",
     }
     with test_runner_module.pytest_environment.isolated_environment(
-        tmp_path, environ=caller, windows=False,
+        tmp_path,
+        environ=caller,
+        windows=False,
     ) as child:
-        for key in ("GIT_CONFIG_COUNT", "GIT_TEMPLATE_DIR", "PYTEST_ADDOPTS", "UNRELATED"):
+        for key in (
+            "GIT_CONFIG_COUNT",
+            "GIT_TEMPLATE_DIR",
+            "PYTEST_ADDOPTS",
+            "UNRELATED",
+        ):
             assert child[key] == caller[key]
     assert list(tmp_path.iterdir()) == []
 
 
 @pytest.mark.parametrize("selection", ["environment", "configuration", "empty"])
 def test_windows_environment_preserves_selected_git_template_and_caller_config(
-    test_runner_module: Any, tmp_path: pathlib.Path, selection: str,
+    test_runner_module: Any,
+    tmp_path: pathlib.Path,
+    selection: str,
 ) -> None:
     template = tmp_path / "custom template"
     (template / "info").mkdir(parents=True)
     (template / "hooks").mkdir()
     (template / "info" / "exclude").write_text("custom-ignore\n", encoding="utf-8")
-    (template / "hooks" / "pre-commit.sample").write_text("sample hook\n", encoding="utf-8")
+    (template / "hooks" / "pre-commit.sample").write_text(
+        "sample hook\n", encoding="utf-8"
+    )
     config = template / "config"
     original = b"[custom]\n\tsetting = preserved\n[core]\n\tlongpaths = false\n"
     config.write_bytes(original)
     caller = {
-        **os.environ, "PYTEST_DEBUG_TEMPROOT": str(tmp_path),
-        "GIT_CONFIG_COUNT": "2", "GIT_CONFIG_KEY_0": "test.preserved",
-        "GIT_CONFIG_VALUE_0": "caller-value", "GIT_CONFIG_KEY_1": "init.templateDir",
+        **os.environ,
+        "PYTEST_DEBUG_TEMPROOT": str(tmp_path),
+        "GIT_CONFIG_COUNT": "2",
+        "GIT_CONFIG_KEY_0": "test.preserved",
+        "GIT_CONFIG_VALUE_0": "caller-value",
+        "GIT_CONFIG_KEY_1": "init.templateDir",
         "GIT_CONFIG_VALUE_1": str(template),
     }
     if selection == "configuration":
@@ -1179,7 +1490,9 @@ def test_windows_environment_preserves_selected_git_template_and_caller_config(
         caller["GIT_CONFIG_VALUE_1"] = str(tmp_path / "unselected-missing-template")
     before = caller.copy()
     with test_runner_module.pytest_environment.isolated_environment(
-        tmp_path, environ=caller, windows=True,
+        tmp_path,
+        environ=caller,
+        windows=True,
     ) as child:
         copied = pathlib.Path(child["GIT_TEMPLATE_DIR"])
         assert copied != template
@@ -1187,20 +1500,40 @@ def test_windows_environment_preserves_selected_git_template_and_caller_config(
         assert child["GIT_CONFIG_VALUE_0"] == "caller-value"
         repo = pathlib.Path(child["TMP"]) / "repo"
         result = subprocess.run(
-            ["git", "init", "-q", str(repo)], env=child, capture_output=True, text=True, check=False,
+            ["git", "init", "-q", str(repo)],
+            env=child,
+            capture_output=True,
+            text=True,
+            check=False,
         )
         assert result.returncode == 0, result.stderr
         local = subprocess.run(
             ["git", "-C", str(repo), "config", "--local", "--get", "core.longpaths"],
-            env=child, capture_output=True, text=True, check=False,
+            env=child,
+            capture_output=True,
+            text=True,
+            check=False,
         )
         assert local.returncode == 0 and local.stdout.strip() == "true"
         if selection != "empty":
             assert (repo / ".git" / "info" / "exclude").read_text() == "custom-ignore\n"
-            assert (repo / ".git" / "hooks" / "pre-commit.sample").read_text() == "sample hook\n"
+            assert (
+                repo / ".git" / "hooks" / "pre-commit.sample"
+            ).read_text() == "sample hook\n"
             preserved = subprocess.run(
-                ["git", "-C", str(repo), "config", "--local", "--get", "custom.setting"],
-                env=child, capture_output=True, text=True, check=False,
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "config",
+                    "--local",
+                    "--get",
+                    "custom.setting",
+                ],
+                env=child,
+                capture_output=True,
+                text=True,
+                check=False,
             )
             assert preserved.stdout.strip() == "preserved"
         else:
@@ -1211,24 +1544,33 @@ def test_windows_environment_preserves_selected_git_template_and_caller_config(
 
 @pytest.mark.skipif(os.name != "nt", reason="requires Windows Git long-path handling")
 def test_windows_environment_supports_long_paths_and_local_bare_push(
-    test_runner_module: Any, tmp_path: pathlib.Path,
+    test_runner_module: Any,
+    tmp_path: pathlib.Path,
 ) -> None:
     caller = {
-        **os.environ, "PYTEST_DEBUG_TEMPROOT": str(tmp_path),
-        "GIT_CONFIG_COUNT": "0", "GIT_CONFIG_GLOBAL": os.devnull,
+        **os.environ,
+        "PYTEST_DEBUG_TEMPROOT": str(tmp_path),
+        "GIT_CONFIG_COUNT": "0",
+        "GIT_CONFIG_GLOBAL": os.devnull,
         "GIT_CONFIG_NOSYSTEM": "1",
     }
     caller.pop("GIT_TEMPLATE_DIR", None)
     caller.pop("GIT_CONFIG_PARAMETERS", None)
     with test_runner_module.pytest_environment.isolated_environment(
-        tmp_path, environ=caller,
+        tmp_path,
+        environ=caller,
     ) as child:
         root = pathlib.Path(child["TMP"])
 
         def git(*arguments: str) -> str:
             result = subprocess.run(
-                ["git", *arguments], cwd=root, env=child, capture_output=True,
-                text=True, encoding="utf-8", check=False,
+                ["git", *arguments],
+                cwd=root,
+                env=child,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
             )
             assert result.returncode == 0, result.stderr
             return result.stdout.strip()
@@ -1244,72 +1586,140 @@ def test_windows_environment_supports_long_paths_and_local_bare_push(
         tracked.write_text("first\n", encoding="utf-8")
         git("-C", str(repo), "add", ".")
         commit = (
-            "-C", str(repo), "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
-            "-c", "commit.gpgsign=false", "commit", "-q", "-m",
+            "-C",
+            str(repo),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
         )
         git(*commit, "first")
         tracked.write_text("second\n", encoding="utf-8")
         git("-C", str(repo), "add", ".")
         git(*commit, "second")
-        assert git("-C", str(repo), "diff", "HEAD~1", "HEAD", "--name-only") == relative.as_posix()
+        assert (
+            git("-C", str(repo), "diff", "HEAD~1", "HEAD", "--name-only")
+            == relative.as_posix()
+        )
         # Keep repository discovery below Git's separate startup path limit.
         # Quarantined loose objects still exceed MAX_PATH during the real push.
         remote = root / ("remote-" + "x" * max(1, 210 - len(str(root)) - 8))
         assert len(str(remote)) < 260
-        assert len(str(remote / "objects" / "tmp_objdir-incoming-XXXXXX" / "ab" / ("0" * 38))) > 260
+        assert (
+            len(
+                str(
+                    remote
+                    / "objects"
+                    / "tmp_objdir-incoming-XXXXXX"
+                    / "ab"
+                    / ("0" * 38)
+                )
+            )
+            > 260
+        )
         git("init", "-q", "--bare", str(remote))
-        assert git("-C", str(remote), "config", "--local", "--get", "core.longpaths") == "true"
+        assert (
+            git("-C", str(remote), "config", "--local", "--get", "core.longpaths")
+            == "true"
+        )
         # Counterfactual: the same push fails when only command-scoped config is
         # available, because receive-pack discards that inherited setting.
         git("-C", str(remote), "config", "core.longpaths", "false")
         blocked = subprocess.run(
-            ["git", "-C", str(repo), "push", "--quiet", str(remote), "HEAD:refs/heads/main"],
-            cwd=root, env=child, capture_output=True, text=True, check=False,
+            [
+                "git",
+                "-C",
+                str(repo),
+                "push",
+                "--quiet",
+                str(remote),
+                "HEAD:refs/heads/main",
+            ],
+            cwd=root,
+            env=child,
+            capture_output=True,
+            text=True,
+            check=False,
         )
-        assert blocked.returncode != 0 and "temporary object directory" in blocked.stderr
+        assert (
+            blocked.returncode != 0 and "temporary object directory" in blocked.stderr
+        )
         git("-C", str(remote), "config", "core.longpaths", "true")
         git("-C", str(repo), "push", "--quiet", str(remote), "HEAD:refs/heads/main")
-        assert git("-C", str(remote), "rev-parse", "refs/heads/main") == git("-C", str(repo), "rev-parse", "HEAD")
+        assert git("-C", str(remote), "rev-parse", "refs/heads/main") == git(
+            "-C", str(repo), "rev-parse", "HEAD"
+        )
     assert not root.exists()
 
 
 @pytest.mark.parametrize("invalid_count", ["invalid", "-1"])
 def test_windows_environment_rejects_invalid_setup_and_cleans_owned_directory(
-    test_runner_module: Any, tmp_path: pathlib.Path, invalid_count: str,
+    test_runner_module: Any,
+    tmp_path: pathlib.Path,
+    invalid_count: str,
 ) -> None:
     environment = test_runner_module.pytest_environment
-    caller = {**os.environ, "PYTEST_DEBUG_TEMPROOT": str(tmp_path), "GIT_CONFIG_COUNT": invalid_count}
-    with pytest.raises(environment.PytestEnvironmentError, match="GIT_CONFIG_COUNT"):
-        with environment.isolated_environment(tmp_path, environ=caller, windows=True):
-            pytest.fail("invalid environment reached pytest")
+    caller = {
+        **os.environ,
+        "PYTEST_DEBUG_TEMPROOT": str(tmp_path),
+        "GIT_CONFIG_COUNT": invalid_count,
+    }
+    with (
+        pytest.raises(environment.PytestEnvironmentError, match="GIT_CONFIG_COUNT"),
+        environment.isolated_environment(tmp_path, environ=caller, windows=True),
+    ):
+        pytest.fail("invalid environment reached pytest")
     assert list(tmp_path.iterdir()) == []
 
 
 @pytest.mark.parametrize("failure", [False, True])
 def test_pytest_cleanup_error_preserves_output_and_test_exit_code(
-    test_runner_module: Any, tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch, failure: bool,
+    test_runner_module: Any,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: bool,
 ) -> None:
     monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
     runner = test_runner_module
     test = tmp_path / "test_example.py"
     test.write_text(
         "def test_example():\n    print('complete-output-marker')\n"
-        + ("    assert False, 'test-failure-marker'\n" if failure else ""), encoding="utf-8",
+        + ("    assert False, 'test-failure-marker'\n" if failure else ""),
+        encoding="utf-8",
     )
     original = runner.pytest_environment.isolated_environment
     roots = []
 
     @contextmanager
     def cleanup_error(cwd: pathlib.Path) -> Iterator[dict[str, str]]:
-        with original(cwd, environ={**os.environ, "PYTEST_DEBUG_TEMPROOT": str(tmp_path)}) as child:
+        with original(
+            cwd, environ={**os.environ, "PYTEST_DEBUG_TEMPROOT": str(tmp_path)}
+        ) as child:
             roots.append(pathlib.Path(child["TMP"]))
             yield child
         raise PermissionError("simulated cleanup failure")
 
-    monkeypatch.setattr(runner.pytest_environment, "isolated_environment", cleanup_error)
+    monkeypatch.setattr(
+        runner.pytest_environment, "isolated_environment", cleanup_error
+    )
     result = runner.run_text(
-        [sys.executable, "-m", "pytest", "-q", "-s", "--color=no", "-o", "addopts=", test.name], tmp_path,
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-s",
+            "--color=no",
+            "-o",
+            "addopts=",
+            test.name,
+        ],
+        tmp_path,
     )
     assert result.returncode == (1 if failure else runner.CONFIGURATION_EXIT_CODE)
     assert "complete-output-marker" in result.stdout
@@ -1320,7 +1730,9 @@ def test_pytest_cleanup_error_preserves_output_and_test_exit_code(
 
 
 def test_pytest_setup_failure_returns_diagnostic_before_launch(
-    test_runner_module: Any, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+    test_runner_module: Any,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runner = test_runner_module
 
@@ -1330,19 +1742,39 @@ def test_pytest_setup_failure_returns_diagnostic_before_launch(
         yield {}  # pragma: no cover
 
     monkeypatch.setattr(runner.pytest_environment, "isolated_environment", rejected)
-    result = runner.run_text([sys.executable, "-m", "pytest", "--collect-only", "-q"], tmp_path)
+    result = runner.run_text(
+        [sys.executable, "-m", "pytest", "--collect-only", "-q"], tmp_path
+    )
     assert result.returncode == runner.CONFIGURATION_EXIT_CODE
     assert result.stdout == "" and "unavailable template" in result.stderr
-    ordinary = runner.run_text([sys.executable, "-c", "print('ordinary command')"], tmp_path)
+    ordinary = runner.run_text(
+        [sys.executable, "-c", "print('ordinary command')"], tmp_path
+    )
     assert ordinary.returncode == 0 and ordinary.stdout.strip() == "ordinary command"
+
 
 @pytest.mark.parametrize(
     ("arguments", "diff", "expected", "exit_code"),
     [
-        (["--base", BASE, "--head", HEAD], b"M\0skills/ceratops-repo-lifecycle/SKILL.md\0", "selection-valid", 0),
+        (
+            ["--base", BASE, "--head", HEAD],
+            b"M\0skills/ceratops-repo-lifecycle/SKILL.md\0",
+            "selection-valid",
+            0,
+        ),
         (["--base", BASE, "--head", HEAD], b"", "selection-valid", 0),
-        (["--worktree"], b"M\0skills/ceratops-repo-lifecycle/SKILL.md\0", "selection-valid", 0),
-        (["--base", BASE, "--head", HEAD], b"R100\0retired/old.py\0skills/ceratops-repo-lifecycle/SKILL.md\0", "selection-valid", 0),
+        (
+            ["--worktree"],
+            b"M\0skills/ceratops-repo-lifecycle/SKILL.md\0",
+            "selection-valid",
+            0,
+        ),
+        (
+            ["--base", BASE, "--head", HEAD],
+            b"R100\0retired/old.py\0skills/ceratops-repo-lifecycle/SKILL.md\0",
+            "selection-valid",
+            0,
+        ),
         (["--base", BASE, "--head", HEAD], b"A\0unknown/new.py\0", "mapping-gap", 3),
         (["--all"], b"", "configuration-error", 2),
         (["--validate-manifest"], b"", "configuration-error", 2),
@@ -1350,15 +1782,22 @@ def test_pytest_setup_failure_returns_diagnostic_before_launch(
     ],
 )
 def test_selection_only_reuses_diff_mapping_without_starting_pytest(
-    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str],
-    test_runner_module: Any, arguments: list[str], diff: bytes, expected: str, exit_code: int,
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture[str],
+    test_runner_module: Any,
+    arguments: list[str],
+    diff: bytes,
+    expected: str,
+    exit_code: int,
 ) -> None:
     execution = DeterministicExecution(test_runner_module, diff)
     diagnostic = tmp_path / "selection.json"
     diagnostic.write_text("retained pytest failure", encoding="utf-8")
     code = test_runner_module.execute(
         [*arguments, "--select-only", "--diagnostic-output", str(diagnostic)],
-        repo_root=ROOT, text_runner=execution.text, bytes_runner=execution.bytes,
+        repo_root=ROOT,
+        text_runner=execution.text,
+        bytes_runner=execution.bytes,
     )
     result = payload(capsys)
     assert code == exit_code

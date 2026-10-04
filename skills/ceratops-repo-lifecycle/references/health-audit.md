@@ -13,8 +13,7 @@ credential-bound fixes precisely.
 
 - (D) Full GitHub, code, and artifact contract check, run from the lifecycle
   skill's `scripts` folder: `python -m github_contract_engine validate repo
-  --repo OWNER/REPO --surface all --subset health --local-repo-path PATH
-  --evidence-file EVIDENCE`
+  --repo OWNER/REPO --surface all --subset health --local-repo-path PATH`
 - (D) Optional org contract check when org posture is in scope, run from the
   same folder: `python -m github_contract_engine validate org
   --org ORG [--params-file PATH] [--billing-email EMAIL]
@@ -24,13 +23,10 @@ credential-bound fixes precisely.
   scoped findings.
 - (D) Prefer `--summary-json` for agent-readable repo-health output; use
   `--json` only when a parser needs the full report.
-- Local health records structural compatibility separately, then uses the
-  repository's SDLC to run applicable validation and tests. Version 3 uses the
-  locked uv runtime and skill-owned action bindings; version 4 uses declared
-  commands and returns structured lifecycle handoffs. Repositories without SDLC
-  retain direct validator execution. Missing or invalid required files remain
-  findings; external-only health runs no local commands. Keep failure evidence
-  outside the target repository.
+- Local health records structural compatibility and repository-validation
+  readiness without running repository validators or tests. It checks the SDLC
+  contract and required validation files; missing or invalid required files
+  remain findings. External-only health runs no local commands.
 - When the local repository declares artifact identities in a supported
   `sdlc/sdlc.yml`, the repo checker validates that contract and uses its
   artifact identities automatically. Caller-supplied
@@ -125,9 +121,9 @@ credential-bound fixes precisely.
 
 #### 5. Validate and close
 
-- For local health, run the repository validator once after the last content
-  change and before a broad health claim; do not rerun its checks. External-only
-  health runs no local validator.
+- For local health, use existing repository validation and test evidence when
+  available; the health collector does not run those checks. External-only
+  health runs no local commands.
 - Verify live GitHub and registry state when not already proven by
   command-result evidence or when asynchronous external state matters.
 - Re-run relevant contract checks only for unresolved audit scope or broad
@@ -141,7 +137,8 @@ credential-bound fixes precisely.
   `python -m github_contract_engine validate repo` or equivalent command-result
   evidence.
 - Every applicable `validate_ceratops_compatibility` result is valid with no
-  errors; every local health run's repository validator also passes.
+  errors; repository-validator and test execution remain outside the health
+  collector.
 - Actions hardening claims are backed by a fresh local workflow scan when repo
   files were available.
 - Local state is verified for every touched repo, worktree, generated file,

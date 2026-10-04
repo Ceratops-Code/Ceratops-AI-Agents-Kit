@@ -12,19 +12,20 @@ from unittest import mock
 import pytest
 
 from tests.governance_lifecycle.support import (
-    ITERATION_CONTROLLER,
     PROPOSAL_WORKFLOW,
     target_repository_markdown_policy,
 )
 from tests.support.repositories import ROOT
 
 
+@pytest.mark.parametrize("accepted", [True, False])
 @pytest.mark.parametrize("target_name", ["contract.md", "automation.toml"])
 @pytest.mark.parametrize("prepare_mode", ["request", "construct"])
 def test_proposal_workflow_validates_context_and_owns_iteration_transition(
     tmp_path: pathlib.Path,
     target_name: str,
     prepare_mode: str,
+    accepted: bool,
 ) -> None:
     constructing = prepare_mode == "construct"
     task_temp_root = tmp_path / "task-temp"
@@ -92,7 +93,7 @@ def test_proposal_workflow_validates_context_and_owns_iteration_transition(
         "regressions": str(regressions),
         "evidence_output": str(evidence),
         "champion_output": str(champion_output),
-        "max_iterations": 1,
+        "max_iterations": 200,
         "mutation_authorized": False,
         "expected_side_effects": [
             "write context evidence",
@@ -106,7 +107,7 @@ def test_proposal_workflow_validates_context_and_owns_iteration_transition(
         "task_temp_root": str(task_temp_root),
         "failure": "Observed failure",
         "regressions": "Preserve current scope",
-        "max_iterations": 1,
+        "max_iterations": 200,
         "mutation_authorized": False,
         "expected_side_effects": request["expected_side_effects"],
         "sources": [
@@ -270,9 +271,9 @@ def test_proposal_workflow_validates_context_and_owns_iteration_transition(
             "--state",
             str(state),
             "--outcome",
-            "improved",
+            "improved" if accepted else "no-improvement",
             "--regressions",
-            "passed",
+            "passed" if accepted else "failed",
         ],
         capture_output=True,
         text=True,
@@ -280,7 +281,22 @@ def test_proposal_workflow_validates_context_and_owns_iteration_transition(
     )
     assert advanced.returncode == 0, advanced.stderr
     status = json.loads(advanced.stdout)
-    assert status["complete"] is True
+    assert status["complete"] is False
+    # Passing is eligibility, not convergence. Finish three non-improving reviews.
+    while not status["complete"]:
+        pending_review = status["pending"]
+        pathlib.Path(pending_review["candidate"]).write_bytes(candidate_path.read_bytes())
+        pathlib.Path(pending_review["assessment"]).write_text(
+            "No supported improvement over the best candidate.\n", encoding="utf-8",
+        )
+        continued = subprocess.run(
+            [sys.executable, str(PROPOSAL_WORKFLOW), "advance", "--state", str(state),
+             "--outcome", "no-improvement", "--regressions", "passed" if accepted else "failed"],
+            capture_output=True, text=True, check=False,
+        )
+        assert continued.returncode == 0, continued.stderr
+        status = json.loads(continued.stdout)
+    assert status["stop_reason"] == "patience" and status["no_improvement_streak"] == 3
     assert status["pending"] is None
     completed_state = json.loads(state.read_text(encoding="utf-8"))
     record = completed_state["records"][0]
@@ -293,6 +309,19 @@ def test_proposal_workflow_validates_context_and_owns_iteration_transition(
     assert pathlib.Path(record["validation_evidence"]).is_file()
     champion_bytes = candidate_path.read_bytes()
     completed_state_text = state.read_text(encoding="utf-8")
+    assert (completed_state["champion"] is not None) is accepted
+    if accepted:
+        # A missing accepted record must not be mistaken for all-rejected work.
+        missing_champion = {**completed_state, "champion": None}
+        state.write_text(json.dumps(missing_champion) + "\n", encoding="utf-8")
+        refused = subprocess.run(
+            [sys.executable, str(PROPOSAL_WORKFLOW), "finalize", "--state", str(state)],
+            capture_output=True, text=True, check=False,
+        )
+        assert refused.returncode == 2 and "missing champion" in refused.stderr
+        assert request_path.is_file() and candidate_path.is_file()
+        assert not champion_output.exists()
+        state.write_text(completed_state_text, encoding="utf-8", newline="\n")
     escaped_state = json.loads(completed_state_text)
     outside_evidence = tmp_path / "outside-evidence.json"
     outside_evidence.write_text("Preserve\n", encoding="utf-8", newline="\n")
@@ -341,11 +370,13 @@ def test_proposal_workflow_validates_context_and_owns_iteration_transition(
     )
     assert finalized.returncode == 0, finalized.stderr
     assert finalized.stdout.strip() == "OK"
-    assert champion_output.is_file()
-    assert champion_output.read_bytes() == champion_bytes
-    assert hashlib.sha256(champion_output.read_bytes()).hexdigest() == record[
-        "candidate_sha256"
-    ]
+    if accepted:
+        assert champion_output.read_bytes() == champion_bytes
+        assert hashlib.sha256(champion_output.read_bytes()).hexdigest() == record[
+            "candidate_sha256"
+        ]
+    else:
+        assert not champion_output.exists()
     assert not state.exists()
     assert not iterations.exists()
     assert not request_path.exists()
@@ -435,7 +466,11 @@ def test_proposal_workflow_validates_context_and_owns_iteration_transition(
         recovery_candidate.write_text(json.dumps(value) + "\n", encoding="utf-8")
         pathlib.Path(recovery_pending["assessment"]).write_text("Preserved scope\n", encoding="utf-8")
         result = json.loads(workflow["command_advance"](recovery_state, "improved", "passed"))
-        assert result["complete"] is True
+        assert result["complete"] is False
+        while not result["complete"]:
+            review = result["pending"]
+            pathlib.Path(review["assessment"]).write_text("No supported improvement.\n", encoding="utf-8")
+            result = json.loads(workflow["command_advance"](recovery_state, "no-improvement", "passed"))
         assert workflow["command_finalize"](recovery_state) == "OK"
         assert set(recovery_root.iterdir()) == {recovery_root / "validated-champion.json"}
         assert spec_path.is_file() and target.read_bytes() == target_before_prepare
@@ -444,128 +479,97 @@ def test_proposal_workflow_validates_context_and_owns_iteration_transition(
 def test_iteration_controller_direct_commands_record_validated_candidate(
     tmp_path: pathlib.Path,
 ) -> None:
-    original = tmp_path / "original.md"
-    state = tmp_path / "state.json"
+    import argparse
+
+    with mock.patch.object(sys, "path", [str(PROPOSAL_WORKFLOW.parent), *sys.path]):
+        import apply_rules_update as application
+        import iteration_controller as controller
+
     repository = tmp_path / "repository"
     repository.mkdir()
-    target = repository / "AGENTS.md"
-    target.write_text("Old target.\n", encoding="utf-8", newline="\n")
-    validation_context = tmp_path / "validation-context.json"
-    validation_context.write_text(
-        json.dumps(
-            {
-                "schema": "ceratops-rule-candidate-context.v1",
-                "rule_stack": [str(target.resolve())],
-                "targets": [
-                    {
-                        "rules": str(target.resolve()),
-                        "history": None,
-                        "source_sha256": hashlib.sha256(
-                            target.read_bytes()
-                        ).hexdigest(),
-                        "markdown_policy": None,
-                        "expected_old": ["Old target."],
-                    }
-                ],
-            },
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
-        newline="\n",
-    )
-    original.write_text("Original\n", encoding="utf-8", newline="\n")
-    initialized = subprocess.run(
-        [
-            sys.executable,
-            str(ITERATION_CONTROLLER),
-            "init",
-            "--state",
-            str(state),
-            "--original",
-            str(original),
-            "--validation-context",
-            str(validation_context),
-            "--max-iterations",
-            "1",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert initialized.returncode == 0, initialized.stderr
-    assert initialized.stdout.strip() == "OK"
-    opened = subprocess.run(
-        [sys.executable, str(ITERATION_CONTROLLER), "next", "--state", str(state)],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert opened.returncode == 0, opened.stderr
-    pending = json.loads(opened.stdout)
-    candidate_path = pathlib.Path(pending["candidate"])
-    candidate_value = json.loads(candidate_path.read_text(encoding="utf-8"))
-    candidate_value["targets"][0]["replacements"][0]["replacement"] = (
-        "Controller submit automatically wraps and validates this candidate "
-        "before hashing it."
-    )
-    candidate_path.write_text(
-        json.dumps(candidate_value, indent=2) + "\n",
-        encoding="utf-8",
-        newline="\n",
-    )
-    pathlib.Path(pending["assessment"]).write_text(
-        "Assessment\n", encoding="utf-8", newline="\n"
-    )
-    submitted = subprocess.run(
-        [
-            sys.executable,
-            str(ITERATION_CONTROLLER),
-            "submit",
-            "--state",
-            str(state),
-            "--iteration",
-            str(pending["iteration"]),
-            "--token",
-            pending["token"],
-            "--outcome",
-            "improved",
-            "--regressions",
-            "passed",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert submitted.returncode == 0, submitted.stderr
-    assert json.loads(submitted.stdout)["complete"] is True
-    recorded_state = json.loads(state.read_text(encoding="utf-8"))
-    assert recorded_state["records"][0]["candidate_sha256"] == hashlib.sha256(
-        candidate_path.read_bytes()
-    ).hexdigest()
-    assert pathlib.Path(
-        recorded_state["records"][0]["validation_evidence"]
-    ).is_file()
-    status = subprocess.run(
-        [sys.executable, str(ITERATION_CONTROLLER), "status", "--state", str(state)],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert status.returncode == 0, status.stderr
-    assert json.loads(status.stdout)["champion_iteration"] == 1
-    finalized = subprocess.run(
-        [
-            sys.executable,
-            str(ITERATION_CONTROLLER),
-            "finalize",
-            "--state",
-            str(state),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert finalized.returncode == 0, finalized.stderr
-    assert finalized.stdout.strip() == "OK"
-    assert original.is_file() and validation_context.is_file() and not state.exists()
+    target = repository / "automation.toml"
+    target.write_text('prompt = "Original"\n', encoding="utf-8")
+    original = tmp_path / "original.md"
+    original.write_text("Original failure\n", encoding="utf-8")
+    context = tmp_path / "validation-context.json"
+    context.write_text(json.dumps({
+        "schema": "ceratops-rule-candidate-context.v1", "rule_stack": [str(target)],
+        "targets": [{"rules": str(target), "history": None,
+                     "source_sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
+                     "markdown_policy": None, "expected_old": ["Original"]}],
+    }), encoding="utf-8")
+    state = tmp_path / "state.json"
+    controller.command_init(argparse.Namespace(
+        state=state, original=original, regressions=None,
+        validation_context=context, max_iterations=20,
+    ))
+    controller.command_next(argparse.Namespace(state=state))
+    outcomes = ["improved", "no-improvement", "no-improvement", "improved",
+                "no-improvement", "no-improvement", "no-improvement"]
+    with mock.patch.object(application, "validate_rule_candidate",
+                           wraps=application.validate_rule_candidate) as validator:
+        for index, outcome in enumerate(outcomes):
+            before = controller.load_state(state)
+            pending = before["pending"]
+            candidate = pathlib.Path(pending["candidate"])
+            value = json.loads(candidate.read_text(encoding="utf-8"))
+            pathlib.Path(pending["assessment"]).write_text(
+                f"Review {index}: compared original, best and previous candidates.\n",
+                encoding="utf-8",
+            )
+            if outcome == "improved":
+                value["targets"][0]["replacements"][0]["replacement"] = (
+                    "First improvement" if index == 0 else "Better improvement"
+                )
+                candidate.write_text(json.dumps(value), encoding="utf-8")
+            elif index == 1:
+                # A technical failure is not a completed unsuccessful review.
+                candidate.write_text("{broken", encoding="utf-8")
+                with pytest.raises(ValueError):
+                    controller.command_advance(argparse.Namespace(
+                        state=state, outcome=outcome, regressions="passed",
+                    ))
+                assert controller.load_state(state) == before
+                candidate.write_text(json.dumps(value), encoding="utf-8")
+            controller.command_advance(argparse.Namespace(
+                state=state, outcome=outcome, regressions="passed",
+            ))
+            after = controller.load_state(state)
+            recorded = after["records"][-1]
+            evidence = json.loads(pathlib.Path(recorded["validation_evidence"]).read_text(encoding="utf-8"))
+            assert evidence["candidate_sha256"] == recorded["candidate_sha256"]
+            assert after["complete"] is (index == 6)
+            if index == 3:
+                assert after["no_improvement_streak"] == 0
+            if index >= 4:
+                assert after["no_improvement_streak"] == index - 3
+        assert validator.call_count == 2
+    result = controller.load_state(state)
+    assert len(result["records"]) == 7 and result["champion"]["iteration"] == 4
+    assert result["stop_reason"] == "patience" and not result["interrupted"]
+    champion = json.loads(pathlib.Path(result["champion"]["candidate"]).read_text(encoding="utf-8"))
+    assert champion["acceptance"]["regressions"] == "passed"
+    assert "Review 3" in champion["acceptance"]["assessment"]
+    assert target.read_text(encoding="utf-8") == 'prompt = "Original"\n'
+    controller.command_finalize(argparse.Namespace(state=state))
+    assert not state.exists() and not (tmp_path / "iterations").exists()
+    assert original.is_file() and context.is_file()
+
+    # An administrative cap is an interruption, never successful convergence.
+    controller.command_init(argparse.Namespace(
+        state=state, original=original, regressions=None,
+        validation_context=context, max_iterations=1,
+    ))
+    controller.command_next(argparse.Namespace(state=state))
+    pending = controller.load_state(state)["pending"]
+    candidate = pathlib.Path(pending["candidate"])
+    value = json.loads(candidate.read_text(encoding="utf-8"))
+    value["targets"][0]["replacements"][0]["replacement"] = "Capped improvement"
+    candidate.write_text(json.dumps(value), encoding="utf-8")
+    pathlib.Path(pending["assessment"]).write_text("Improved, not converged.\n", encoding="utf-8")
+    controller.command_advance(argparse.Namespace(state=state, outcome="improved", regressions="passed"))
+    capped = controller.load_state(state)
+    assert capped["interrupted"] and not capped["complete"]
+    assert capped["pending"] is None and capped["stop_reason"] == "max_iterations"
+    with pytest.raises(ValueError, match="incomplete"):
+        controller.command_finalize(argparse.Namespace(state=state))

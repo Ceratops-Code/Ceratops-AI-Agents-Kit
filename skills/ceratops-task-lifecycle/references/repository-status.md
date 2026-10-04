@@ -14,16 +14,14 @@ evidence.
 
 ## Rules
 
-- Inspect repository state without changing branches, worktrees, or tasks.
-- Refresh remote refs when current shipping status is required and the remote
-  is available; label unavailable evidence instead of guessing.
-- Emit one row for every registered worktree, then one row for every remaining
-  local or non-symbolic remote branch not represented by a worktree. Use `-`
-  for a detached worktree or a branch without a worktree.
-- `Is promoted?` is `Yes` only when the row's commit is contained in the local
-  release branch. `Is shipped?` is `Yes` only when it is contained in the
-  remote-tracking base branch. Report `Unavailable` when the required ref is
-  missing or stale and cannot be refreshed.
+- (D) Run `python scripts/repository-status-snapshot.py --repo <repo>
+  --release-ref <ref> --remote-base-ref <ref> [--fetch] --output <file>` through
+  the skill's required `uv` invocation.
+- The helper emits one record for every worktree and remaining branch, uses `-`
+  for detached or absent worktrees, refreshes only with `--fetch`, returns
+  `Yes`, `No`, or `Unavailable` from ref freshness and commit containment, and
+  supplies unique-commit, patch-equivalence, and diff evidence without changing
+  branches, worktrees, or tasks.
 - Resolve active task titles from available Codex task or session evidence. Do
   not infer a task solely from a branch or folder name; report `None` or
   `Unverified` when appropriate.

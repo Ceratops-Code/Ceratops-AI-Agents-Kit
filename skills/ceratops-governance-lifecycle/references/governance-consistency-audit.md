@@ -67,18 +67,21 @@ domain audits owned by other lifecycle actions.
 ### Skill-Specific Rules
 
 - Keep the audit report-only. When invoked by the
-  `global-governance-consistency-audit` automation, updating a stale installed
-  automation `model` field to the latest officially verified model is the only
-  pre-authorized mutation; otherwise report it.
+  `global-governance-consistency-audit` automation, updating an installed
+  automation `model` field that is neither the latest nor the immediately
+  previous officially verified Codex model to the corresponding source model is
+  the only pre-authorized mutation, and only when that source model is one of
+  those two; otherwise report it.
 - Do not mutate AGENTS files, skills, helpers, repository configuration, Git
   state, managed runtime, or external services during the audit.
 - Compare every inspected automation prompt with each helper it directly
   invokes; keep outcome, blocker, cleanup, alert, and memory paths aligned.
 - Prefer local evidence and helper contracts. Use official OpenAI sources only
-  to identify the latest model or resolve a concrete prompt-guidance ambiguity.
-- Enforce `medium` reasoning effort for `diskfinventorycheck` and `pc-cleanup`
-  and `max` for every other automation in both source and installed runtime;
-  report each mismatch with its scope, automation ID, expected, and actual value.
+  to identify the latest and immediately previous Codex models or resolve a
+  concrete prompt-guidance ambiguity.
+- Enforce `max` reasoning effort for every automation in both source and
+  installed runtime; report each mismatch with its scope, automation ID,
+  expected, and actual value.
 - Review config- and prompt-level credit waste without inferring actual usage or
   billing when saved local evidence is absent.
 - Do not treat portable variables or relative paths alone as contradictions.
@@ -163,8 +166,10 @@ domain audits owned by other lifecycle actions.
 ### 5. Apply the model-only exception
 
 - When the automation-specific mutation exception applies, verify the latest
-  model from an official source, update only stale automation `model` fields,
-  and record each automation id with its old and new values.
+  and immediately previous Codex models from official sources and treat either
+  as current. Update only installed automation `model` fields outside that pair
+  to the corresponding source model, and only when the source model belongs to
+  the pair; record each automation id with its old and new values.
 - Do not apply any recommendation beyond that exact exception.
 
 ### 6. Close from aligned evidence

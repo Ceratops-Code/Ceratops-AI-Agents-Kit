@@ -13,7 +13,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "command",
-        choices=("apply", "synchronize-bootstrap"),
+        choices=("apply", "synchronize-bootstrap", "check-test-results"),
         help="Compatibility operation to run.",
     )
     return parser
@@ -31,6 +31,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         from .bootstrap_installer_synchronization import main as synchronize
 
         return synchronize(args[1:])
+    if args and args[0] == "check-test-results":
+        from .validate_ceratops_compatibility import main as check_results
+
+        return check_results(args[1:])
     _parser().parse_args(args)
     return 2
 

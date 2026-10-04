@@ -464,22 +464,30 @@ def test_admin_enforcement_restores_exact_state_on_every_exit(
     head = "a" * 40
     state = {"enabled": initial}
     commands: list[tuple[str, ...]] = []
+    stale_after_restore = False
+    sleeps: list[float] = []
 
     def require_output(command: list[str], *, cwd: pathlib.Path) -> str:
+        nonlocal stale_after_restore
         commands.append(tuple(command))
         if command[:2] == ["gh", "api"]:
+            if stale_after_restore:
+                stale_after_restore = False
+                return json.dumps({"enabled": False})
             return json.dumps({"url": "https://api.invalid", **state})
         if command[:3] == ["gh", "pr", "view"]:
             return merged_pr_state(head)
         raise AssertionError(command)
 
     def require_success(command: list[str], *, cwd: pathlib.Path) -> None:
+        nonlocal stale_after_restore
         commands.append(tuple(command))
         if command[:4] == ["gh", "api", "--method", "DELETE"]:
             state["enabled"] = False
             return
         if command[:4] == ["gh", "api", "--method", "POST"]:
             state["enabled"] = True
+            stale_after_restore = True
             return
         if command[:3] == ["gh", "pr", "merge"]:
             if merge_fails:
@@ -490,6 +498,7 @@ def test_admin_enforcement_restores_exact_state_on_every_exit(
     monkeypatch.setattr(merge, "require_output", require_output)
     monkeypatch.setattr(merge, "require_success", require_success)
     monkeypatch.setattr(merge, "_checkpoint_directory", lambda _: checkpoints)
+    monkeypatch.setattr(merge.time, "sleep", sleeps.append)
     summary = {
         "base": "main",
         "head_oid": head,
@@ -534,7 +543,10 @@ def test_admin_enforcement_restores_exact_state_on_every_exit(
     if initial:
         expected.append("restore")
     expected.append("read")
+    if initial:
+        expected.append("read")
     assert labels == expected
+    assert sleeps == ([2.0] if initial else [])
     assert state["enabled"] is initial
     assert not list(checkpoints.glob("*.json"))
     protection_calls = [command for command in commands if command[:2] == ("gh", "api")]
@@ -643,6 +655,7 @@ def test_restore_failure_is_critical_and_retains_checkpoint(
     checkpoints = tmp_path / "checkpoints"
     head = "a" * 40
     state = {"enabled": True}
+    sleeps: list[float] = []
 
     def require_output(command: list[str], *, cwd: pathlib.Path) -> str:
         if command[:2] == ["gh", "api"]:
@@ -662,6 +675,7 @@ def test_restore_failure_is_critical_and_retains_checkpoint(
     monkeypatch.setattr(merge, "require_output", require_output)
     monkeypatch.setattr(merge, "require_success", require_success)
     monkeypatch.setattr(merge, "_checkpoint_directory", lambda _: checkpoints)
+    monkeypatch.setattr(merge.time, "sleep", sleeps.append)
 
     with pytest.raises(merge.CriticalRestoreError) as raised:
         merge.merge_verified_pr(
@@ -685,6 +699,7 @@ def test_restore_failure_is_critical_and_retains_checkpoint(
     assert "--method POST" in payload["recovery"]
     retained = list(checkpoints.glob("*.json"))
     assert len(retained) == 1
+    assert sleeps == [2.0, 5.0]
     assert set(json.loads(retained[0].read_text(encoding="utf-8"))) == {
         "version",
         "repository",
@@ -712,10 +727,17 @@ def test_interrupted_checkpoint_recovers_before_later_merge(
     merge._write_restore_checkpoint(path, checkpoint)
     state = {"enabled": False}
     commands: list[tuple[str, ...]] = []
+    verification_reads = 0
+    sleeps: list[float] = []
 
     def require_output(command: list[str], *, cwd: pathlib.Path) -> str:
+        nonlocal verification_reads
         commands.append(tuple(command))
         if command[:2] == ["gh", "api"]:
+            if state["enabled"]:
+                verification_reads += 1
+                if verification_reads == 1:
+                    raise merge.CommandError("transient verification failure")
             return json.dumps(state)
         return merged_pr_state(head)
 
@@ -726,6 +748,7 @@ def test_interrupted_checkpoint_recovers_before_later_merge(
 
     monkeypatch.setattr(merge, "require_output", require_output)
     monkeypatch.setattr(merge, "require_success", require_success)
+    monkeypatch.setattr(merge.time, "sleep", sleeps.append)
 
     merge.merge_verified_pr(
         merge_args(repo, admin=False),
@@ -736,7 +759,8 @@ def test_interrupted_checkpoint_recovers_before_later_merge(
         "api" if command[:2] == ("gh", "api") else command[2]
         for command in commands
     ]
-    assert labels == ["api", "api", "api", "merge", "view"]
+    assert labels == ["api", "api", "api", "api", "merge", "view"]
+    assert sleeps == [2.0]
     assert "%2F" in commands[0][-1]
     assert state["enabled"] is True
     assert not path.exists()

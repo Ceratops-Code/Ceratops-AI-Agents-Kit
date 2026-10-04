@@ -125,8 +125,9 @@ detected before merge.
 - (D) Before disabling, the helper persists the minimum repo-scoped restore
   checkpoint. It DELETEs only the dedicated admin-enforcement endpoint
   immediately before the exact-head merge, restores the initial state in
-  `finally`, reads it back on every exit, and removes the checkpoint only after
-  verified restoration. Later merge work restores unfinished checkpoints first.
+  `finally`, reads it back on the fixed 0-, 2-, and 5-second schedule, and
+  removes the checkpoint only after an exact Boolean match. Later merge work
+  restores unfinished checkpoints first.
 - If disabling fails, do not attempt merge. If restoration cannot be verified,
   treat the result as critical and retain repository, base branch, PR, exact
   head, observed merge state, and the dedicated-endpoint recovery action.

@@ -1,8 +1,9 @@
 [project]
-name = "ai-agent-skills-tooling"
+name = "ceratops-ai-agents-kit-tooling"
 version = "0.0.0"
 requires-python = ">=3.14,<3.15"
 dependencies = [
+  "filelock==4.0.1",
   "PyYAML==6.0.3",
   "jsonschema==4.26.0",
   "markdown-it-py==4.2.0",
@@ -32,7 +33,7 @@ ignore = ["E501"]
 files = [
   "skills",
   "tests",
-  "tools",
+  "mcp-servers",
   "skills/ceratops-repo-lifecycle/references/templates/deploy-skills.py.tmpl",
 ]
 ignore_missing_imports = true

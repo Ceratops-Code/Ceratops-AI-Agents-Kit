@@ -8,6 +8,7 @@ import json
 import os
 import pathlib
 import sys
+import time
 from typing import Any
 from urllib.parse import quote
 
@@ -241,6 +242,32 @@ def _read_admin_enforcement(endpoint: str, *, cwd: pathlib.Path) -> bool:
     return enabled
 
 
+_ADMIN_ENFORCEMENT_VERIFY_DELAYS = (0.0, 2.0, 5.0)
+
+
+def _verify_admin_enforcement(
+    endpoint: str, *, expected: bool, cwd: pathlib.Path
+) -> bool:
+    """Return whether bounded read-back observed the exact expected state."""
+
+    for delay in _ADMIN_ENFORCEMENT_VERIFY_DELAYS:
+        if delay:
+            time.sleep(delay)
+        try:
+            observed = _read_admin_enforcement(endpoint, cwd=cwd)
+        except (
+            CommandError,
+            WorkflowError,
+            OSError,
+            ValueError,
+            json.JSONDecodeError,
+        ):
+            continue
+        if observed is expected:
+            return True
+    return False
+
+
 def _observe_merge_state(
     checkpoint: dict[str, Any], *, cwd: pathlib.Path
 ) -> str:
@@ -319,16 +346,9 @@ def _restore_after_attempt(
             # A transport failure can follow a committed API mutation. The
             # dedicated read-back below is authoritative.
             pass
-    try:
-        restored = _read_admin_enforcement(endpoint, cwd=cwd)
-    except (CommandError, WorkflowError, OSError, ValueError, json.JSONDecodeError):
-        raise _critical_restore_error(
-            checkpoint,
-            expected=expected,
-            merge_state=merge_state,
-            cwd=cwd,
-        )
-    if restored is not expected:
+    if not _verify_admin_enforcement(
+        endpoint, expected=expected, cwd=cwd
+    ):
         raise _critical_restore_error(
             checkpoint,
             expected=expected,

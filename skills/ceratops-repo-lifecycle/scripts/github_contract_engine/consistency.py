@@ -58,7 +58,13 @@ CONTRACTS = REFERENCES / "contracts"
 SCRIPTS = SKILL_DIR / "scripts"
 SOURCE_DOCS = CONTRACTS / "github-contract-source-docs.json"
 SCHEMAS = REFERENCES / "schemas"
-SDLC_SCHEMA = SCHEMAS / "sdlc.yml.schema.json"
+SDLC_SCHEMAS = (
+    SCHEMAS / "sdlc.v4.schema.json",
+    SCHEMAS / "sdlc.v5.schema.json",
+)
+ARTIFACT_IDENTITY_SCHEMA = (
+    SCHEMAS / "github-lifecycle-deterministic-contract.schema.json"
+)
 STATE_SCHEMA = SCHEMAS / "github-lifecycle-deterministic-contract.schema.json"
 PR_SCHEMA = SCHEMAS / "github-pr-readiness-deterministic-contract.schema.json"
 VALIDATION_SCHEMA = SCHEMAS / "repository-validation-contract.schema.json"
@@ -85,7 +91,9 @@ REQUIRED_FILES = [
     SCHEMAS / "ceratops-compatibility-contract.schema.json",
     SCRIPTS / "ceratops_repo_compatibility_engine" / "compatibility_contract.py",
     VALIDATION_SCHEMA,
-    SCRIPTS / "ceratops_repo_compatibility_engine" / "repository_validation_contract.py",
+    SCRIPTS
+    / "ceratops_repo_compatibility_engine"
+    / "repository_validation_contract.py",
     *STATE_CONTRACT_PATHS.values(),
     PR_CONTRACT,
     *ND_CONTRACT_PATHS.values(),
@@ -112,7 +120,7 @@ REQUIRED_FILES = [
     SCHEMAS / "github-pr-readiness-deterministic-contract.schema.json",
     SCHEMAS / "nondeterministic-contract.schema.json",
     SCHEMAS / "github-contract-source-docs.schema.json",
-    SDLC_SCHEMA,
+    *SDLC_SCHEMAS,
 ]
 
 # The loader owns identity, schema and provenance references; compatibility
@@ -120,18 +128,32 @@ REQUIRED_FILES = [
 VALIDATION_ANNOTATION_FIELDS = frozenset({"root.captured_on", "root.source_doc_scopes"})
 VALIDATION_EXECUTABLE_FIELDS = frozenset(
     {
-        "root.contract_format_version", "root.kind", "root.name",
-        "root.source_docs_ref", "root.coverage_requirements", "root.checks",
-        "def:coverageRequirement.id", "def:coverageRequirement.when",
+        "root.contract_format_version",
+        "root.kind",
+        "root.name",
+        "root.source_docs_ref",
+        "root.coverage_requirements",
+        "root.checks",
+        "def:coverageRequirement.id",
+        "def:coverageRequirement.when",
         "def:coverageRequirement.operation_category",
         "def:coverageRequirement.required_capabilities",
         "def:coverageRequirement.required_prerequisites",
         "def:coverageRequirement.require_repository_entrypoint",
-        "def:check.id", "def:check.when", "def:check.unless",
-        "def:check.command", "def:check.cwd", "def:check.exclusive",
-        "def:packageScript.kind", "def:packageScript.manager", "def:packageScript.value",
-        "def:pathAny.kind", "def:pathAny.value",
-        "def:fileContains.kind", "def:fileContains.path", "def:fileContains.value",
+        "def:check.id",
+        "def:check.when",
+        "def:check.unless",
+        "def:check.command",
+        "def:check.cwd",
+        "def:check.exclusive",
+        "def:packageScript.kind",
+        "def:packageScript.manager",
+        "def:packageScript.value",
+        "def:pathAny.kind",
+        "def:pathAny.value",
+        "def:fileContains.kind",
+        "def:fileContains.path",
+        "def:fileContains.value",
     }
 )
 
@@ -257,6 +279,14 @@ STATE_EXECUTABLE_FIELDS = frozenset(
         "def:artifactDetector.and_when_workflow_contains_all",
         "def:artifactDetector.when_release_assets_count_gt",
         "def:artifactDetector.when",
+        "def:artifactIdentity.artifact_type",
+        "def:artifactIdentity.registry",
+        "def:artifactIdentity.package_or_image_name",
+        "def:artifactIdentity.version_source",
+        "def:artifactIdentity.release_policy",
+        "def:artifactIdentity.tag_style",
+        "def:artifactIdentity.changelog_source",
+        "def:artifactIdentity.post_publish_consumer_check",
     }
 )
 PR_ANNOTATION_FIELDS = frozenset(
@@ -409,7 +439,11 @@ def _condition_names(value: Any) -> set[str]:
                 names.update(_condition_names(child))
         return names
     if isinstance(value, list):
-        return set().union(*(_condition_names(child) for child in value)) if value else set()
+        return (
+            set().union(*(_condition_names(child) for child in value))
+            if value
+            else set()
+        )
     return set()
 
 
@@ -464,7 +498,9 @@ def _dynamic_state_path_errors(
     if state_path.startswith("/registries/"):
         parts = state_path.split("/")
         registry = parts[2] if len(parts) > 2 else ""
-        implemented_registries = {specification[0] for specification in FETCHERS.values()}
+        implemented_registries = {
+            specification[0] for specification in FETCHERS.values()
+        }
         if registry not in implemented_registries | {"github_packages"} or parts[
             3:
         ] != ["all_resolved"]:
@@ -475,11 +511,13 @@ def _dynamic_state_path_errors(
 
 
 def _validate_artifact_contract_schema(
-    contract: dict[str, Any], sdlc_schema: dict[str, Any]
+    contract: dict[str, Any], contract_schema: dict[str, Any]
 ) -> list[str]:
-    """Keep executable artifact identity fields aligned with SDLC release input."""
+    """Keep executable artifact checks aligned with publication identity input."""
 
-    schema_fields = pointer_get(sdlc_schema, "/$defs/artifact/required", None)
+    schema_fields = pointer_get(
+        contract_schema, "/$defs/artifactIdentity/required", None
+    )
     identity_checks = [
         check
         for check in contract.get("checks", [])
@@ -487,14 +525,16 @@ def _validate_artifact_contract_schema(
     ]
     if len(identity_checks) != 1:
         return [
-            f"{rel(STATE_CONTRACT_PATHS['artifact'])}: expected one "
-            "common.identity_contract check"
+            (
+                f"{rel(STATE_CONTRACT_PATHS['artifact'])}: expected one "
+                "common.identity_contract check"
+            )
         ]
     contract_fields = pointer_get(
         identity_checks[0], "/desired/required_per_artifact_fields", None
     )
     for label, fields in (
-        ("sdlc.yml artifact required fields", schema_fields),
+        ("artifact identity schema required fields", schema_fields),
         ("common.identity_contract required fields", contract_fields),
     ):
         if (
@@ -504,15 +544,19 @@ def _validate_artifact_contract_schema(
             or len(fields) != len(set(fields))
         ):
             return [
-                f"{rel(STATE_CONTRACT_PATHS['artifact'])}: {label} must be a "
-                "nonempty unique string list"
+                (
+                    f"{rel(STATE_CONTRACT_PATHS['artifact'])}: {label} must be a "
+                    "nonempty unique string list"
+                )
             ]
     assert isinstance(schema_fields, list)
     assert isinstance(contract_fields, list)
-    properties = pointer_get(sdlc_schema, "/$defs/artifact/properties", None)
+    properties = pointer_get(
+        contract_schema, "/$defs/artifactIdentity/properties", None
+    )
     if not isinstance(properties, dict):
         return [
-            f"{rel(SDLC_SCHEMA)}: artifact properties must be an object"
+            f"{rel(ARTIFACT_IDENTITY_SCHEMA)}: artifact properties must be an object"
         ]
     undocumented: list[str] = []
     for field in schema_fields:
@@ -526,7 +570,7 @@ def _validate_artifact_contract_schema(
             undocumented.append(field)
     if undocumented:
         return [
-            f"{rel(SDLC_SCHEMA)}: required artifact fields need descriptions: "
+            f"{rel(ARTIFACT_IDENTITY_SCHEMA)}: required artifact fields need descriptions: "
             + ", ".join(sorted(undocumented))
         ]
     schema_set = set(schema_fields)
@@ -542,8 +586,7 @@ def _validate_artifact_contract_schema(
         details.append("extra " + ", ".join(extra))
     return [
         f"{rel(STATE_CONTRACT_PATHS['artifact'])}: common.identity_contract "
-        "required fields must match sdlc.yml schema artifact requirements: "
-        + "; ".join(details)
+        "required fields must match the artifact identity schema: " + "; ".join(details)
     ]
 
 
@@ -753,11 +796,7 @@ def _validate_artifact_detectors(
     errors.extend(
         f"{rel(path)}: artifact type belongs to multiple categories: {item}"
         for item in sorted(
-            {
-                item
-                for item in categorized_types
-                if categorized_types.count(item) > 1
-            }
+            {item for item in categorized_types if categorized_types.count(item) > 1}
         )
     )
     explanations = type_system.get("behavior_explanations", [])
@@ -825,8 +864,7 @@ def _validate_state_contract(path: pathlib.Path, contract: dict[str, Any]) -> li
         errors.append(f"{rel(path)}: state contract format must be 2")
     if contract.get("source_docs_ref") != "github-contract-source-docs.json":
         errors.append(
-            f"{rel(path)}: source_docs_ref must be "
-            "github-contract-source-docs.json"
+            f"{rel(path)}: source_docs_ref must be github-contract-source-docs.json"
         )
     ids = check_ids(contract)
     for duplicate in sorted({check_id for check_id in ids if ids.count(check_id) > 1}):
@@ -929,9 +967,7 @@ def _validate_state_contract(path: pathlib.Path, contract: dict[str, Any]) -> li
                 )
             elif isinstance(state_path, str):
                 errors.extend(
-                    _dynamic_state_path_errors(
-                        path, check_id, state_path, checks
-                    )
+                    _dynamic_state_path_errors(path, check_id, state_path, checks)
                 )
             operator = assertion.get("operator")
             if operator not in OPERATORS:
@@ -1071,7 +1107,10 @@ def _validate_nd_coverage() -> list[str]:
         if path.is_file() and surface in deterministic_names:
             try:
                 contract = load_json(path)
-                if contract.get("deterministic_contract") != deterministic_names[surface]:
+                if (
+                    contract.get("deterministic_contract")
+                    != deterministic_names[surface]
+                ):
                     errors.append(
                         f"{rel(path)}: deterministic_contract must be "
                         f"{deterministic_names[surface]}"
@@ -1091,7 +1130,7 @@ def _validate_nd_coverage() -> list[str]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m github_contract_engine validate consistency",
-        description="Validate GH lifecycle contract and state-engine consistency."
+        description="Validate GH lifecycle contract and state-engine consistency.",
     )
     parser.parse_args(argv)
     errors = [
@@ -1132,15 +1171,15 @@ def main(argv: list[str] | None = None) -> int:
             errors.append(
                 f"{rel(path)}: non_deterministic_review_file must be {expected_review}"
             )
-    if "artifact" in contracts and SDLC_SCHEMA.is_file():
+    if "artifact" in contracts and ARTIFACT_IDENTITY_SCHEMA.is_file():
         try:
-            sdlc_schema = load_json(SDLC_SCHEMA)
+            artifact_identity_schema = load_json(ARTIFACT_IDENTITY_SCHEMA)
         except json.JSONDecodeError as exc:
-            errors.append(f"{rel(SDLC_SCHEMA)}: invalid JSON: {exc}")
+            errors.append(f"{rel(ARTIFACT_IDENTITY_SCHEMA)}: invalid JSON: {exc}")
         else:
             errors.extend(
                 _validate_artifact_contract_schema(
-                    contracts["artifact"], sdlc_schema
+                    contracts["artifact"], artifact_identity_schema
                 )
             )
     if all(surface in contracts for surface in STATE_CONTRACT_PATHS):
@@ -1209,7 +1248,9 @@ def main(argv: list[str] | None = None) -> int:
             errors.append(f"{rel(PR_CONTRACT)}: invalid JSON: {exc}")
     if (
         all(path.is_file() for path in ND_CONTRACT_PATHS.values())
-        and (SCRIPTS / "github_contract_engine" / "collect_non_deterministic_evidence.py").is_file()
+        and (
+            SCRIPTS / "github_contract_engine" / "collect_non_deterministic_evidence.py"
+        ).is_file()
     ):
         errors.extend(_validate_nd_coverage())
     if errors:

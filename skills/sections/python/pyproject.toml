@@ -2,7 +2,7 @@
 name = "ceratops-skill-runtime"
 version = "0.0.0"
 requires-python = ">=3.14,<3.15"
-dependencies = ["jsonschema", "markdown-it-py", "PyYAML", "tzdata"]
+dependencies = ["filelock==4.0.1", "jsonschema", "markdown-it-py", "PyYAML", "tzdata"]
 
 [tool.uv]
 package = false

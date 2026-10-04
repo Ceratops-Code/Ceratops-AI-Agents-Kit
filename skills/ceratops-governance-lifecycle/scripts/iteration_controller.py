@@ -4,8 +4,8 @@
 The controller makes no model calls and makes no semantic quality judgment. It
 owns numbering, source hashes, pending submissions, validator orchestration,
 artifact records, and stop conditions so the agent cannot legitimately claim
-unrecorded work. Every submit invokes the shared candidate validator before any
-candidate hash or record is accepted. Mechanical failure leaves the same
+unrecorded work. New work is accepted once with complete prepared outputs;
+identical candidates carry their original results. Mechanical failure leaves the same
 iteration pending. State is written atomically and existing state is never
 overwritten by `init`. `finalize` removes only a completed run's verified
 controller artifacts and state while preserving its inputs.
@@ -23,12 +23,12 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from apply_rules_update import accept_candidate, candidate_identity
 from rule_candidate_source import (
     RuleCandidateValidationError,
 )
 from validate_rule_candidate import (
     build_candidate_template,
-    validate_rule_candidate,
 )
 
 VERSION = 2
@@ -92,6 +92,7 @@ def public_status(state: dict[str, Any]) -> dict[str, Any]:
     return {
         "complete": state["complete"],
         "stop_reason": state["stop_reason"],
+        "interrupted": state.get("interrupted", False),
         "completed_iterations": len(state["records"]),
         "next_iteration": state["next_iteration"],
         "no_improvement_streak": state["no_improvement_streak"],
@@ -116,7 +117,16 @@ def open_iteration(
         if path.exists():
             raise ValueError(f"refusing to overwrite iteration artifact: {path}")
     context = state["validation_context"]["value"]
-    template = build_candidate_template(context)
+    champion = state.get("champion")
+    # Copy the best accepted candidate without consulting any current policy.
+    # Its identity and original results survive a new review iteration.
+    if champion:
+        source = Path(champion["candidate"])
+        if file_hash(source) != champion["candidate_sha256"]:
+            raise ValueError("champion changed after acceptance")
+        template = json.loads(source.read_text(encoding="utf-8"))
+    else:
+        template = build_candidate_template(context)
     save_state(candidate, template)
     pending = {
         "iteration": iteration,
@@ -169,6 +179,7 @@ def command_init(args: argparse.Namespace) -> None:
         "champion": None,
         "records": [],
         "complete": False,
+        "interrupted": False,
         "stop_reason": None,
     }
     save_state(state_path, state)
@@ -180,7 +191,7 @@ def command_next(args: argparse.Namespace) -> None:
     state_path = args.state.resolve()
     state = load_state(state_path)
     verify_sources(state)
-    if state["complete"]:
+    if state["complete"] or state.get("interrupted"):
         print(json.dumps(public_status(state), separators=(",", ":")))
         return
     if state["pending"]:
@@ -210,17 +221,38 @@ def record_iteration(
     validation_evidence = Path(pending["validation_evidence"])
     read_nonempty(candidate, "candidate")
     read_nonempty(assessment, "assessment")
+    if outcome == "improved" and regressions != "passed":
+        raise ValueError("an improved candidate must pass regressions")
+    identity = candidate_identity(json.loads(candidate.read_text(encoding="utf-8")))
+    previous = None
+    for item in reversed(state["records"]):
+        source = Path(item["candidate"])
+        if file_hash(source) != item["candidate_sha256"]:
+            raise ValueError("recorded candidate changed after acceptance")
+        accepted = json.loads(source.read_text(encoding="utf-8"))
+        if candidate_identity(accepted) == identity:
+            previous = item
+            candidate.write_bytes(source.read_bytes())
+            break
+    if previous and outcome == "improved":
+        raise ValueError("an unchanged candidate cannot count as an improvement")
     try:
-        validate_rule_candidate(
-            candidate,
-            validation_evidence,
-            expected_context=state["validation_context"]["value"],
-            fix=True,
+        accept_candidate(
+            candidate, validation_evidence,
+            expected_context=state["validation_context"]["value"], fix=True,
         )
     except RuleCandidateValidationError as error:
         raise ValueError(str(error)) from error
-    if outcome == "improved" and regressions != "passed":
-        raise ValueError("an improved candidate must pass regressions")
+    if previous:
+        regressions = previous["regressions"]
+    accepted = json.loads(candidate.read_text(encoding="utf-8"))
+    if not previous:
+        accepted["acceptance"]["assessment"] = assessment.read_text(encoding="utf-8")
+        accepted["acceptance"]["regressions"] = regressions
+        save_state(candidate, accepted)
+    evidence = json.loads(validation_evidence.read_text(encoding="utf-8"))
+    evidence["candidate_sha256"] = file_hash(candidate)
+    save_state(validation_evidence, evidence)
     record = {
         "iteration": iteration,
         "outcome": outcome,
@@ -244,7 +276,7 @@ def record_iteration(
         state["complete"] = True
         state["stop_reason"] = "patience"
     elif len(state["records"]) >= state["max_iterations"]:
-        state["complete"] = True
+        state["interrupted"] = True
         state["stop_reason"] = "max_iterations"
 
 
@@ -281,7 +313,10 @@ def command_advance(args: argparse.Namespace) -> None:
         outcome=args.outcome,
         regressions=args.regressions,
     )
-    next_pending = None if state["complete"] else open_iteration(state_path, state)
+    next_pending = (
+        None if state["complete"] or state.get("interrupted")
+        else open_iteration(state_path, state)
+    )
     save_state(state_path, state)
     result = public_status(state)
     result["pending"] = next_pending

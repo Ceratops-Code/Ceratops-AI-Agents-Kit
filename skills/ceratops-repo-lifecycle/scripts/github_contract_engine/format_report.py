@@ -71,9 +71,7 @@ def _sanitize_text(value: str) -> str:
 
     result = PRIVATE_KEY_RE.sub(REDACTED, value)
     result = URL_CREDENTIAL_RE.sub(rf"\1{REDACTED}@", result)
-    result = AUTH_VALUE_RE.sub(
-        lambda match: f"{match.group(1)} {REDACTED}", result
-    )
+    result = AUTH_VALUE_RE.sub(lambda match: f"{match.group(1)} {REDACTED}", result)
     result = GITHUB_TOKEN_RE.sub(REDACTED, result)
     return CREDENTIAL_ASSIGNMENT_RE.sub(
         lambda match: f"{match.group(1)}{match.group(2)}{REDACTED}", result
@@ -106,11 +104,12 @@ def sanitize_for_output(value: Any, path: tuple[str, ...] = ()) -> Any:
             }
         elif normalized == "text" and path[-1:] == ("workflows",):
             result[key] = OMITTED
-        elif _sensitive_key(normalized) and not isinstance(
-            item, (bool, int, float, type(None))
+        elif (
+            _sensitive_key(normalized)
+            and not isinstance(item, (bool, int, float, type(None)))
+            or sensitive_finding
+            and normalized in {"actual", "expected"}
         ):
-            result[key] = REDACTED
-        elif sensitive_finding and normalized in {"actual", "expected"}:
             result[key] = REDACTED
         else:
             result[key] = sanitize_for_output(item, child_path)
@@ -235,31 +234,6 @@ def build_report(
     """Compose the full machine-readable report."""
 
     findings = list(comparison["findings"])
-    proposal = (
-        observed_states.get("local", {}).get("sdlc_contract", {})
-        .get("migration_proposal")
-    )
-    if proposal is not None:
-        # The existing automation forwards these nonblocking review findings.
-        # No repair dispatcher or operation executor consumes this annotation.
-        repository = (
-            f"{desired_state['parameters'].get('owner')}/"
-            f"{desired_state['parameters'].get('repo')}"
-        )
-        proposal = {**proposal, "repository": repository}
-        findings.append({
-            "level": "NEEDS_AI_AGENT_REVIEW",
-            "check_id": "content.sdlc_migration",
-            "kind": "advisory_migration",
-            "path": "/local/sdlc_contract/migration_proposal",
-            "message": (
-                f"Optional SDLC migration for {repository}: "
-                f"version {proposal['current_version']} to "
-                f"{proposal['recommended_version']}. {proposal['reason']} "
-                "Proposal only; do not automatically migrate or interrupt supported operations."
-            ),
-            "actual": proposal,
-        })
     approved = comparison["approved_drift"]
     result = {
         "target": desired_state["parameters"].get("org_login")

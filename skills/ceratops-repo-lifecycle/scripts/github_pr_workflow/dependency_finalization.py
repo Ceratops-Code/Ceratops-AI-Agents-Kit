@@ -19,11 +19,13 @@ from .dependency_common import (
     WorkflowError,
     as_list,
     as_object,
+    blocker_applies_to_pr,
     compact_error,
     emit_result,
     load_json,
     refresh_snapshot,
     run_command,
+    scoped_blocker,
     snapshot_failure_message,
     utc_now,
     write_json,
@@ -437,21 +439,26 @@ def finalize(args: argparse.Namespace) -> int:
 
     workspace_root = args.workspace_root.resolve()
     preflight_result = load_json(args.preflight)
-    preflight_blocked = bool(preflight_result.get("outcome", {}).get("blocked"))
+    preflight_blockers = [
+        scoped_blocker(item)
+        for item in as_list(preflight_result.get("blockers"))
+    ]
+    if (
+        bool(as_object(preflight_result.get("outcome")).get("blocked"))
+        and not preflight_blockers
+    ):
+        preflight_blockers.append(
+            scoped_blocker(
+                {
+                    "check": "preflight_gate",
+                    "message": "blocked preflight has no scoped blocker records",
+                }
+            )
+        )
     preflight_index = preflight_pr_index(preflight_result)
     previous = prior_fingerprints(args.output)
     approved: list[tuple[str, int]] = []
-    blockers: list[dict[str, Any]] = []
-    if preflight_blocked:
-        blockers.append(
-            {
-                "check": "preflight_gate",
-                "message": (
-                    f"preflight is blocked with {len(preflight_result.get('blockers', []))} "
-                    "recorded blocker(s); no approved PR may be merged"
-                ),
-            }
-        )
+    blockers: list[dict[str, Any]] = list(preflight_blockers)
     seen: set[tuple[str, int]] = set()
     for raw in args.approved_pr:
         parsed = parse_pr_identifier(raw)
@@ -480,14 +487,25 @@ def finalize(args: argparse.Namespace) -> int:
 
     for repo, number in approved:
         key = (repo.lower(), number)
-        if preflight_blocked:
+        applicable_preflight_blockers = [
+            item
+            for item in preflight_blockers
+            if blocker_applies_to_pr(item, repo, number)
+        ]
+        if applicable_preflight_blockers:
+            scopes = sorted(
+                {str(item.get("scope") or "global") for item in applicable_preflight_blockers}
+            )
             blocker = {
+                "scope": "pull_request",
                 "repo": repo,
                 "pr": number,
                 "check": "preflight_gate",
-                "message": "current preflight result is blocked",
+                "message": (
+                    f"{len(applicable_preflight_blockers)} applicable preflight "
+                    f"blocker(s): {', '.join(scopes)}"
+                ),
             }
-            blockers.append(blocker)
             results.append({**blocker, "status": "blocked"})
             continue
         approved_item = preflight_index.get(key)

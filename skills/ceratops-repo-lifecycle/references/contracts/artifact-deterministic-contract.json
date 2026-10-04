@@ -5,7 +5,7 @@
   "captured_on": "2026-05-02",
   "source_files": [
     {
-      "path": "$AI_AGENT_SKILLS_ROOT/skills/ceratops-repo-lifecycle/references/create-or-publish.md",
+      "path": "$CERATOPS_AI_AGENTS_KIT_ROOT/skills/ceratops-repo-lifecycle/references/create-or-publish.md",
       "lines": "1-6"
     }
   ],
@@ -30,7 +30,7 @@
     "artifact_contracts": {
       "type": "array",
       "required": false,
-      "description": "Annotation-only external-artifact identity records loaded from the owning deliverables in local sdlc/sdlc.yml when declared, otherwise supplied explicitly. Every non-no_artifact record declares publication intent even when no workflow is present; it is not evidence of a completed publication."
+      "description": "Annotation-only external-artifact identity records supplied explicitly; SDLC build-artifact declarations do not define publication identity. Every non-no_artifact record declares publication intent even when no workflow is present; it is not evidence of a completed publication."
     },
     "publish_requested": {
       "type": "boolean",

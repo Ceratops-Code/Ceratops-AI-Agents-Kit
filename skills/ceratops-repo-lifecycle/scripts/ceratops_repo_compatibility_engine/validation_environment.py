@@ -64,6 +64,19 @@ def runtime_files(
     if not runner.is_file():
         template = bundle / "references/templates" / surface["template"]
         files[runner] = template.read_text(encoding="utf-8")
+    for surface_name, label in (
+        ("issue_template", "issue template"),
+        ("pull_request_template", "pull request template"),
+    ):
+        surface = contract["surfaces"][surface_name]
+        destination = root / surface["path"]
+        if destination.is_symlink() or (
+            destination.exists() and not destination.is_file()
+        ):
+            raise RuntimeError(f"existing {label} must be a regular file")
+        if not destination.is_file():
+            template = bundle / "references/templates" / surface["template"]
+            files[destination] = template.read_text(encoding="utf-8")
     ignore = root / runtime["project"] / ".gitignore"
     existing_ignore = ignore.read_text(encoding="utf-8") if ignore.is_file() else ""
     missing_ignore = [value for value in runtime["ignored_paths"] if value not in existing_ignore.splitlines()]

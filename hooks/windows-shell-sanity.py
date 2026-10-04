@@ -1276,10 +1276,13 @@ def _module_preflight_failure(
 
 
 def _without_progress(command: str) -> str:
-    """Suppress progress in this child only, without filtering any output stream.
+    """Suppress progress and use BOM-free UTF-8 in this child process.
 
     A dot-sourced script block preserves top-level ``using``/``param`` syntax
-    while the preference is set before module autoloading or command execution.
+    while the preferences are set before module autoloading or command execution.
+    The global pipeline and console encodings make native-process stdin
+    deterministic without changing the parent session or filtering any output
+    stream.
     Single-quote escaping keeps the supplied command literal until PowerShell
     parses it. Capture failure inside the block: Windows PowerShell can reset
     ``$?`` when the block returns. Match ``-Command`` failure semantics without
@@ -1288,7 +1291,11 @@ def _without_progress(command: str) -> str:
 
     literal = (command + "\nif (-not $?) { exit 1 }").replace("'", "''")
     return (
-        "$ProgressPreference = 'SilentlyContinue'\n. ([scriptblock]::Create('"
+        "$ProgressPreference = 'SilentlyContinue'\n"
+        "$global:OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n"
+        "[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)\n"
+        "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n"
+        ". ([scriptblock]::Create('"
         + literal + "'))"
     )
 

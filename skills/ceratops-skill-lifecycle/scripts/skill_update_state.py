@@ -1,84 +1,41 @@
-"""State, filesystem boundaries and cleanup records for skill updates.
+"""Immutable skill-change records and filesystem boundaries.
 
-All file ownership is confined to the verified task temp directory. This module
-does not decide update scope or execute checks; the workflow owns those steps.
+The shared checkpoint helper owns locking and the producer/worktree directory.
+This module owns numbered skill-change states, their original approval/baseline,
+and check-result retention. The caller's request file is never cleanup-owned.
 """
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import os
 import pathlib
 import re
 import subprocess
-import tempfile
-from collections.abc import Mapping, Sequence
+import sys
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from functools import lru_cache
+from typing import Any
 
 from skill_update_checks import UpdateExecutionError, _run
 
-REQUEST_SCHEMA = "ceratops-skill-update-request.v2"
-STATE_SCHEMA = "ceratops-skill-update-state.v2"
-EVIDENCE_SCHEMA = "ceratops-skill-update-evidence.v3"
-CLEANUP_SCHEMA = "ceratops-skill-update-cleanup.v1"
-RETENTION_SCHEMA = "ceratops-skill-update-retention.v1"
-RETENTION_MARKER = ".ceratops-skill-update-active.json"
-REQUEST_FIELDS = {
-    "schema",
-    "repo_root",
-    "task_temp_root",
-    "evidence_output",
-    "disposable_artifacts",
-    "selected_skills",
-    "allowed_paths",
-    "change_groups",
-    "checks",
-}
+REQUEST_SCHEMA = "ceratops-skill-update-request.v3"
+STATE_SCHEMA = "ceratops-skill-update-state.v3"
+RESULT_SCHEMA = "ceratops-skill-check-result.v1"
+UPDATE_SCHEMA = "ceratops-skill-update.v1"
+COMPLETION_SCHEMA = "ceratops-skill-update-completion.v1"
+REQUEST_FIELDS = {"schema", "selected_skills", "allowed_paths", "change_groups", "checks"}
 GROUP_FIELDS = {"name", "paths"}
 CHECK_FIELDS = {
     "command": {"kind", "argv"},
     "search": {"kind", "pattern", "paths", "expected_matches"},
 }
-STATE_FIELDS = {
-    "schema",
-    "repo_root",
-    "branch",
-    "head",
-    "selected_skills",
-    "allowed_paths",
-    "change_groups",
-    "checks",
-    "baseline_dirty",
-    "baseline_targets",
-    "cleanup",
-    "verification",
-}
-STATE_OPTIONAL_FIELDS = {"failure_evidence_sha256", "superseded_artifacts"}
-CLEANUP_FIELDS = {
-    "schema",
-    "task_temp_root",
-    "owned_artifacts",
-    "protected_artifacts",
-}
-OWNED_ARTIFACT_FIELDS = {"role", "path", "sha256"}
-VERIFICATION_FIELDS = {"status", "evidence_sha256", "input_sha256", "generation"}
-EVIDENCE_FIELDS = {
-    "schema",
-    "status",
-    "branch",
-    "head",
-    "generation",
-    "input_sha256",
-    "selected_skills",
-    "changed_paths",
-    "change_groups",
-    "checks",
-    "failures",
-}
-DISPOSABLE_ROLES = {"request", "state", "evidence"}
-OWNED_ROLES = DISPOSABLE_ROLES | {"retention"}
-SKILL_NAME_RE = re.compile(
-    r"^(?![a-z0-9-]*--)[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$"
-)
+SKILL_NAME_RE = re.compile(r"^(?![a-z0-9-]*--)[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$")
+OWNER = "skill-updates"
+
+
 def _run_bytes(
     arguments: Sequence[str],
     *,
@@ -98,7 +55,6 @@ def _run_bytes(
             f"could not start {arguments[0]}: {exc}"
         ) from exc
 
-
 def _git(repo_root: pathlib.Path, *arguments: str) -> str:
     result = _run(["git", "-C", str(repo_root), *arguments], cwd=repo_root)
     if result.returncode:
@@ -106,7 +62,6 @@ def _git(repo_root: pathlib.Path, *arguments: str) -> str:
         message = f"git {' '.join(arguments)} failed"
         raise UpdateExecutionError(f"{message}: {detail}" if detail else message)
     return result.stdout
-
 
 def _read_json(path: pathlib.Path, label: str) -> Mapping[str, object]:
     try:
@@ -116,7 +71,6 @@ def _read_json(path: pathlib.Path, label: str) -> Mapping[str, object]:
     if not isinstance(value, Mapping):
         raise UpdateExecutionError(f"{label} must be a JSON object")
     return value
-
 
 def _closed_fields(
     value: Mapping[str, object],
@@ -135,15 +89,6 @@ def _closed_fields(
         details.append("unknown " + ", ".join(extra))
     raise UpdateExecutionError(f"{label} fields are invalid: {'; '.join(details)}")
 
-
-def _validate_state_fields(raw: Mapping[str, object]) -> None:
-    """Optional provenance is absent until an attempt records it."""
-    _closed_fields(raw, STATE_FIELDS | (STATE_OPTIONAL_FIELDS & set(raw)), "state")
-    failure_hash = raw.get("failure_evidence_sha256")
-    if failure_hash is not None and not _valid_sha256(failure_hash):
-        raise UpdateExecutionError("failed evidence hash is invalid")
-
-
 def _string_list(value: object, label: str, *, unique: bool = True) -> list[str]:
     """Preserve ordered strings; identity lists also require unique entries."""
 
@@ -158,7 +103,6 @@ def _string_list(value: object, label: str, *, unique: bool = True) -> list[str]
     if unique and len(result) != len(set(result)):
         raise UpdateExecutionError(f"{label} values must be unique")
     return result
-
 
 def _safe_relative(value: str, label: str) -> pathlib.PurePosixPath:
     pure = pathlib.PurePosixPath(value)
@@ -175,7 +119,6 @@ def _safe_relative(value: str, label: str) -> pathlib.PurePosixPath:
         raise UpdateExecutionError(f"{label} is not a safe repo-relative path: {value}")
     return pure
 
-
 def _target(repo_root: pathlib.Path, value: str) -> pathlib.Path:
     pure = _safe_relative(value, "path")
     target = repo_root.joinpath(*pure.parts)
@@ -185,20 +128,10 @@ def _target(repo_root: pathlib.Path, value: str) -> pathlib.Path:
         raise UpdateExecutionError(f"path escapes the repository: {value}") from exc
     return target
 
-
-def _outside_repo(path: pathlib.Path, repo_root: pathlib.Path, label: str) -> None:
-    try:
-        path.relative_to(repo_root)
-    except ValueError:
-        return
-    raise UpdateExecutionError(f"{label} must be outside the repository")
-
-
 def _absolute(path: pathlib.Path) -> pathlib.Path:
     """Return a lexical absolute path without resolving links."""
 
     return pathlib.Path(os.path.abspath(path.expanduser()))
-
 
 def _is_link(path: pathlib.Path) -> bool:
     """Treat symbolic links and Windows junctions as cleanup escapes."""
@@ -206,56 +139,12 @@ def _is_link(path: pathlib.Path) -> bool:
     junction = getattr(path, "is_junction", None)
     return path.is_symlink() or bool(junction and junction())
 
-
 def _reject_link_chain(path: pathlib.Path, label: str) -> None:
     """Reject any existing link component from a path through its anchor."""
 
     for candidate in (path, *path.parents):
         if _is_link(candidate):
             raise UpdateExecutionError(f"{label} uses a symlink or junction: {candidate}")
-
-
-def _task_artifact(
-    path: pathlib.Path,
-    task_temp_root: pathlib.Path,
-    label: str,
-    *,
-    must_exist: bool,
-) -> pathlib.Path:
-    """Validate one exact file path inside the declared task temp root."""
-
-    lexical = _absolute(path)
-    try:
-        relative = lexical.relative_to(task_temp_root)
-    except ValueError as exc:
-        raise UpdateExecutionError(f"{label} escapes task_temp_root") from exc
-    if not relative.parts:
-        raise UpdateExecutionError(f"{label} must be a file beneath task_temp_root")
-    current = task_temp_root
-    for part in relative.parts:
-        current = current / part
-        if _is_link(current):
-            raise UpdateExecutionError(f"{label} uses a symlink or junction: {current}")
-    if not lexical.parent.is_dir():
-        raise UpdateExecutionError(f"{label} directory does not exist: {lexical.parent}")
-    repository_probe = _run(
-        ["git", "-C", str(lexical.parent), "rev-parse", "--show-toplevel"],
-        cwd=lexical.parent,
-    )
-    if repository_probe.returncode == 0:
-        raise UpdateExecutionError(f"{label} must not be a repository file")
-    if must_exist:
-        if not lexical.is_file():
-            raise UpdateExecutionError(f"{label} must be a regular file: {lexical}")
-    elif lexical.exists() and not lexical.is_file():
-        raise UpdateExecutionError(f"{label} must be a regular file target: {lexical}")
-    resolved = lexical.resolve(strict=must_exist)
-    try:
-        resolved.relative_to(task_temp_root)
-    except ValueError as exc:
-        raise UpdateExecutionError(f"{label} resolves outside task_temp_root") from exc
-    return lexical
-
 
 def _file_sha256(path: pathlib.Path) -> str:
     """Hash one recorded cleanup artifact without loading it all at once."""
@@ -266,120 +155,11 @@ def _file_sha256(path: pathlib.Path) -> str:
             digest.update(chunk)
     return digest.hexdigest()
 
-
-def _write_json_atomic(
-    path: pathlib.Path,
-    value: Mapping[str, object],
-    label: str,
-) -> None:
-    """Atomically write workflow state or evidence and clean its staging file."""
-
-    if not path.parent.is_dir():
-        raise UpdateExecutionError(f"{label} directory does not exist: {path.parent}")
-    if _is_link(path) or (path.exists() and not path.is_file()):
-        raise UpdateExecutionError(f"{label} must be a regular file target: {path}")
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.skill-update.",
-        dir=path.parent,
-    )
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
-            json.dump(value, handle, separators=(",", ":"))
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary_name, path)
-    except OSError as exc:
-        raise UpdateExecutionError(f"could not write {label}: {exc}") from exc
-    finally:
-        if os.path.exists(temporary_name):
-            os.unlink(temporary_name)
-
-
 def _git_path(repo_root: pathlib.Path, value: str) -> pathlib.Path:
     path = pathlib.Path(value.strip())
     if not path.is_absolute():
         path = repo_root / path
     return path.resolve()
-
-
-def _verified_task_temp_root(
-    value: object,
-    repo_root: pathlib.Path,
-) -> pathlib.Path:
-    """Verify the repository-declared task-temp location and its boundaries."""
-
-    if not isinstance(value, str) or not value:
-        raise UpdateExecutionError("task_temp_root must be nonempty text")
-    raw = pathlib.Path(value).expanduser()
-    if not raw.is_absolute():
-        raise UpdateExecutionError("task_temp_root must be absolute")
-    lexical = _absolute(raw)
-    _reject_link_chain(lexical, "task_temp_root")
-    if not lexical.is_dir():
-        raise UpdateExecutionError("task_temp_root must be an existing directory")
-    resolved = lexical.resolve(strict=True)
-    _outside_repo(resolved, repo_root, "task_temp_root")
-    inside_git = _run(
-        ["git", "-C", str(resolved), "rev-parse", "--show-toplevel"],
-        cwd=resolved,
-    )
-    if inside_git.returncode == 0:
-        raise UpdateExecutionError("task_temp_root must not be inside a Git worktree")
-    common_dir = _git_path(
-        repo_root,
-        _git(repo_root, "rev-parse", "--git-common-dir"),
-    )
-    primary_root = common_dir.parent
-    expected_parent = primary_root.parent / "tmp" / primary_root.name
-    if resolved.parent != expected_parent.resolve(strict=True):
-        raise UpdateExecutionError(
-            f"task_temp_root must be one task directory under {expected_parent}"
-        )
-    return resolved
-
-
-def _finalize_primary_root(cleanup: object) -> pathlib.Path:
-    """Recover the live primary checkout after a task worktree was removed.
-
-    Finalization uses this checkout only to revalidate the recorded task-temp
-    boundary. The path is derived from the required sibling ``tmp/<repo>``
-    layout and must resolve to the primary checkout of that Git repository.
-    """
-
-    if not isinstance(cleanup, Mapping):
-        raise UpdateExecutionError("state cleanup must be an object")
-    value = cleanup.get("task_temp_root")
-    if not isinstance(value, str) or not value:
-        raise UpdateExecutionError("state task_temp_root is invalid")
-    raw = pathlib.Path(value).expanduser()
-    if not raw.is_absolute():
-        raise UpdateExecutionError("state task_temp_root must be absolute")
-    task_temp_root = _absolute(raw)
-    _reject_link_chain(task_temp_root, "task_temp_root")
-    repository_temp_root = task_temp_root.parent
-    temp_root = repository_temp_root.parent
-    if temp_root.name != "tmp":
-        raise UpdateExecutionError("state task_temp_root lacks the required tmp layout")
-    primary_candidate = temp_root.parent / repository_temp_root.name
-    _reject_link_chain(primary_candidate, "derived primary checkout")
-    if not primary_candidate.is_dir():
-        raise UpdateExecutionError("derived primary checkout is unavailable")
-    primary_root = primary_candidate.resolve(strict=True)
-    if _git(primary_root, "rev-parse", "--is-inside-work-tree").strip() != "true":
-        raise UpdateExecutionError("derived primary checkout is not a Git worktree")
-    top = pathlib.Path(
-        _git(primary_root, "rev-parse", "--show-toplevel").strip()
-    ).resolve(strict=True)
-    git_dir = _git_path(primary_root, _git(primary_root, "rev-parse", "--git-dir"))
-    common_dir = _git_path(
-        primary_root,
-        _git(primary_root, "rev-parse", "--git-common-dir"),
-    )
-    if top != primary_root or git_dir != common_dir or common_dir.parent != primary_root:
-        raise UpdateExecutionError("derived checkout is not the repository primary")
-    return primary_root
-
 
 def _verify_task_worktree(repo_root: pathlib.Path) -> tuple[str, str]:
     if _git(repo_root, "rev-parse", "--is-inside-work-tree").strip() != "true":
@@ -401,7 +181,6 @@ def _verify_task_worktree(repo_root: pathlib.Path) -> tuple[str, str]:
         raise UpdateExecutionError(f"protected branch is not a task branch: {branch}")
     return branch, _git(repo_root, "rev-parse", "HEAD").strip()
 
-
 def _dirty_paths(repo_root: pathlib.Path) -> set[str]:
     commands = (
         ("diff", "--name-only", "--no-renames", "-z"),
@@ -414,7 +193,6 @@ def _dirty_paths(repo_root: pathlib.Path) -> set[str]:
         paths.update(path.replace("\\", "/") for path in output.split("\0") if path)
     return paths
 
-
 def _is_tracked(repo_root: pathlib.Path, path: str) -> bool:
     """Allow existing ancillary files without permitting undeclared new surfaces."""
 
@@ -423,7 +201,6 @@ def _is_tracked(repo_root: pathlib.Path, path: str) -> bool:
         cwd=repo_root,
     )
     return result.returncode == 0
-
 
 def _content_snapshot(target: pathlib.Path) -> dict[str, object]:
     if target.is_symlink():
@@ -445,7 +222,6 @@ def _content_snapshot(target: pathlib.Path) -> dict[str, object]:
         "sha256": hashlib.sha256(content).hexdigest(),
     }
 
-
 def _snapshot(repo_root: pathlib.Path, path: str) -> dict[str, object]:
     target = repo_root.joinpath(*pathlib.PurePosixPath(path).parts)
     return {
@@ -462,7 +238,6 @@ def _snapshot(repo_root: pathlib.Path, path: str) -> dict[str, object]:
         ),
     }
 
-
 def _valid_sha256(value: object) -> bool:
     return (
         isinstance(value, str)
@@ -471,209 +246,184 @@ def _valid_sha256(value: object) -> bool:
     )
 
 
-def _validated_cleanup(
-    raw: object,
-    *,
-    state_path: pathlib.Path,
-    repo_root: pathlib.Path,
-) -> dict[str, object]:
-    """Validate the exact cleanup ownership recorded during prepare."""
-
-    if not isinstance(raw, Mapping):
-        raise UpdateExecutionError("state cleanup must be an object")
-    _closed_fields(raw, CLEANUP_FIELDS, "state cleanup")
-    if raw.get("schema") != CLEANUP_SCHEMA:
-        raise UpdateExecutionError(f"state cleanup schema must be {CLEANUP_SCHEMA}")
-    task_temp_root = _verified_task_temp_root(raw["task_temp_root"], repo_root)
-    artifacts = raw["owned_artifacts"]
-    if (
-        not isinstance(artifacts, Sequence)
-        or isinstance(artifacts, (str, bytes))
-        or not artifacts
-    ):
-        raise UpdateExecutionError("state owned_artifacts must be a nonempty list")
-    owned: list[dict[str, object]] = []
-    roles: set[str] = set()
-    paths: set[pathlib.Path] = set()
-    for index, artifact in enumerate(artifacts, start=1):
-        if not isinstance(artifact, Mapping):
-            raise UpdateExecutionError(f"owned artifact {index} must be an object")
-        _closed_fields(artifact, OWNED_ARTIFACT_FIELDS, f"owned artifact {index}")
-        role = artifact["role"]
-        if not isinstance(role, str) or role not in OWNED_ROLES:
-            raise UpdateExecutionError(f"owned artifact {index} role is invalid")
-        if role in roles:
-            raise UpdateExecutionError(f"duplicate owned artifact role: {role}")
-        raw_path = artifact["path"]
-        if not isinstance(raw_path, str) or not raw_path:
-            raise UpdateExecutionError(f"owned artifact {index} path is invalid")
-        path = _task_artifact(
-            pathlib.Path(raw_path),
-            task_temp_root,
-            f"owned {role}",
-            must_exist=role == "state",
-        )
-        if path in paths:
-            raise UpdateExecutionError("owned artifact paths must be unique")
-        expected_hash = artifact["sha256"]
-        if role in {"request", "retention"}:
-            if not _valid_sha256(expected_hash):
-                raise UpdateExecutionError(f"owned {role} hash is invalid")
-        elif expected_hash is not None:
-            raise UpdateExecutionError(f"owned {role} hash must be null")
-        roles.add(role)
-        paths.add(path)
-        owned.append({"role": role, "path": path, "sha256": expected_hash})
-    if not {"state", "evidence"}.issubset(roles):
-        raise UpdateExecutionError("state cleanup lacks owned workflow outputs")
-    state_record = next(item for item in owned if item["role"] == "state")
-    if state_record["path"] != state_path:
-        raise UpdateExecutionError("state cleanup path does not match loaded state")
-    protected = raw["protected_artifacts"]
-    if (
-        not isinstance(protected, Sequence)
-        or isinstance(protected, (str, bytes))
-        or not all(isinstance(item, str) and item for item in protected)
-    ):
-        raise UpdateExecutionError("state protected_artifacts must be a string list")
-    protected_paths = [_absolute(pathlib.Path(item)) for item in protected]
-    if len(protected_paths) != len(set(protected_paths)):
-        raise UpdateExecutionError("state protected_artifacts must be unique")
-    overlap = paths.intersection(protected_paths)
-    if overlap:
-        raise UpdateExecutionError("owned and protected artifact paths overlap")
-    return {
-        "schema": CLEANUP_SCHEMA,
-        "task_temp_root": task_temp_root,
-        "owned_artifacts": owned,
-        "protected_artifacts": protected_paths,
-    }
+@lru_cache(maxsize=1)
+def checkpoint_storage() -> Any:
+    """Import the mapped runtime sibling, or the declared source for development."""
+    skill = pathlib.Path(__file__).resolve().parent.parent
+    if not (skill / ".runtime-manifest.json").is_file():
+        source = str(skill.parent / "sections" / "scripts")
+        if source not in sys.path:
+            sys.path.insert(0, source)
+    return importlib.import_module("manage_checkpoints")
 
 
-def _validated_verification(value: object) -> dict[str, object] | None:
-    if value is None:
+@contextmanager
+def update_context(repo_root: pathlib.Path) -> Iterator[Any]:
+    """Hold the single skill-update producer lock for the entire command."""
+    storage = checkpoint_storage()
+    try:
+        with storage.open_checkpoints(repo_root, OWNER) as context:
+            yield context
+    except storage.CheckpointError as exc:
+        raise UpdateExecutionError(str(exc)) from exc
+
+
+def record_hash(value: Mapping[str, Any]) -> str:
+    """Bind records by canonical bytes, independently of dict insertion order."""
+    raw = (json.dumps(dict(value), sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode()
+    return hashlib.sha256(raw).hexdigest()
+
+
+def read_record(context: Any, name: str, *, repair_tail: bool = False) -> dict[str, Any] | None:
+    """Only a syntactically unreadable, unreferenced final write is replaceable."""
+    storage = checkpoint_storage()
+    try:
+        return storage.read_checkpoint(context, name)
+    except storage.CheckpointError as exc:
+        if (not repair_tail or not str(exc).startswith("Unreadable checkpoint:")
+                or isinstance(exc.__cause__, OSError)):
+            raise
+        # read_checkpoint already checked all path components. Never remove a
+        # directory, link, valid conflicting object, or a referenced record.
+        path = context.directory / name
+        storage._plain(path)
+        if path.is_file():
+            path.unlink()
+            return None
+        raise
+
+
+def write_record(context: Any, name: str, value: Mapping[str, Any]) -> None:
+    """The shared helper provides exclusive direct writes and identical retries."""
+    storage = checkpoint_storage()
+    storage.write_checkpoint(context, name, value)
+    if storage.read_checkpoint(context, name) != value:
+        raise UpdateExecutionError(f"checkpoint changed during write: {name}")
+
+
+def _generations(context: Any, folder: str) -> list[int]:
+    directory = context.directory / folder
+    checkpoint_storage()._plain(directory)
+    if not directory.exists():
+        return []
+    generations = []
+    for path in directory.iterdir():
+        if not re.fullmatch(r"[1-9][0-9]*\.json", path.name):
+            raise UpdateExecutionError(f"unexpected skill-update record: {path.name}")
+        generations.append(int(path.stem))
+    return sorted(generations)
+
+
+def read_result(context: Any, state: Mapping[str, Any]) -> dict[str, Any] | None:
+    reference = state.get("last_result")
+    if reference is None:
         return None
-    if not isinstance(value, Mapping):
-        raise UpdateExecutionError("state verification must be null or an object")
-    _closed_fields(value, VERIFICATION_FIELDS, "state verification")
-    status = value.get("status")
-    if status not in {"passed", "pending", "invalidated"}:
-        raise UpdateExecutionError("state verification status is invalid")
-    evidence_sha256 = value.get("evidence_sha256")
-    if status == "passed":
-        if not _valid_sha256(evidence_sha256):
-            raise UpdateExecutionError("state verification evidence hash is invalid")
-    elif status == "pending":
-        if evidence_sha256 is not None and not _valid_sha256(evidence_sha256):
-            raise UpdateExecutionError("pending verification evidence hash is invalid")
-    elif evidence_sha256 is not None:
-        raise UpdateExecutionError("invalidated verification has an evidence hash")
-    if not _valid_sha256(value.get("input_sha256")):
-        raise UpdateExecutionError("state verification input hash is invalid")
-    generation = value.get("generation")
-    if (
-        not isinstance(generation, int)
-        or isinstance(generation, bool)
-        or generation not in {0, 1}
-        or (status == "invalidated" and generation != 1)
-    ):
-        raise UpdateExecutionError("state verification generation is invalid")
-    return dict(value)
+    if not isinstance(reference, dict) or set(reference) != {"generation", "sha256"}:
+        raise UpdateExecutionError("check-result reference is invalid")
+    generation = reference["generation"]
+    if type(generation) is not int or generation < 1:
+        raise UpdateExecutionError("check-result generation is invalid")
+    value = read_record(context, f"check_results/{generation}.json")
+    if (value is None or record_hash(value) != reference["sha256"]
+            or value.get("schema") != RESULT_SCHEMA or value.get("generation") != generation):
+        raise UpdateExecutionError("recorded check result changed or is missing")
+    if value.get("status") not in {"passed", "failed"}:
+        raise UpdateExecutionError("recorded check-result status is invalid")
+    return value
 
 
-def _cleanup_payload(cleanup: Mapping[str, object]) -> dict[str, object]:
-    """Convert validated cleanup paths back to the closed JSON contract."""
+def prune_generations(context: Any) -> None:
+    """Keep the current state, two predecessors, and only their referenced results."""
+    numbers = _generations(context, "states")
+    retained = numbers[-3:]
+    needed = set()
+    for number in retained:
+        state = read_record(context, f"states/{number}.json")
+        if state is None:
+            raise UpdateExecutionError("state disappeared during retention")
+        reference = state.get("last_result")
+        if reference is not None:
+            read_result(context, state)
+            needed.add(reference["generation"])
+        if state.get("status") == "checking":
+            needed.add(number)
+    # Preserve a dangling final result until its state reference is recovered.
+    if numbers:
+        needed.add(numbers[-1])
+    for number in numbers[:-3]:
+        (context.directory / "states" / f"{number}.json").unlink()
+    for number in _generations(context, "check_results"):
+        if number not in needed:
+            read_record(context, f"check_results/{number}.json")
+            (context.directory / "check_results" / f"{number}.json").unlink()
 
-    owned = cleanup["owned_artifacts"]
-    protected = cleanup["protected_artifacts"]
-    assert isinstance(owned, list)
-    assert isinstance(protected, list)
-    return {
-        "schema": CLEANUP_SCHEMA,
-        "task_temp_root": str(cleanup["task_temp_root"]),
-        "owned_artifacts": [
-            {
-                "role": artifact["role"],
-                "path": str(artifact["path"]),
-                "sha256": artifact["sha256"],
-            }
-            for artifact in owned
-        ],
-        "protected_artifacts": [str(path) for path in protected],
+
+def append_state(context: Any, state: Mapping[str, Any], previous: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Publish a complete new state; the previous accepted record never changes."""
+    number = previous["generation"] + 1 if previous else 1
+    original = read_record(context, "update_request.json")
+    if original is None:
+        raise UpdateExecutionError("original update request is missing")
+    value = {
+        **state, "schema": STATE_SCHEMA, "generation": number,
+        "previous_sha256": record_hash(previous) if previous else None,
+        "update_request_sha256": record_hash(original),
     }
+    write_record(context, f"states/{number}.json", value)
+    prune_generations(context)
+    return value
 
 
-def _inherited_artifacts(
-    state: Mapping[str, object], cleanup: Mapping[str, object], *, required: bool = False,
-) -> list[dict[str, object]]:
-    """Preflight all superseded records before transfer or any deletion.
+def load_update(context: Any) -> dict[str, Any]:
+    """Discover the last state, recovering only an incomplete final JSON write.
 
-    Missing files are accepted only for resumable finalization, after a previous
-    attempt may have removed some records. Transfer requires every record intact.
+    The original snapshot can recreate state 1 if opening was interrupted.
+    Hash links protect the retained predecessor chain and recorded check results;
+    retention never discards an accepted result still needed by a retained state.
     """
-    raw = state.get("superseded_artifacts", [])
-    if not isinstance(raw, list):
-        raise UpdateExecutionError("superseded_artifacts must be a list")
-    owned = cleanup["owned_artifacts"]
-    protected = cleanup["protected_artifacts"]
-    assert isinstance(owned, list) and isinstance(protected, list)
-    paths = {item["path"] for item in owned} | set(protected)
-    root = pathlib.Path(str(cleanup["task_temp_root"]))
-    records = []
-    for item in raw:
-        if not isinstance(item, Mapping):
-            raise UpdateExecutionError("superseded artifact must be an object")
-        _closed_fields(item, {"path", "sha256"}, "superseded artifact")
-        if not isinstance(item["path"], str) or not _valid_sha256(item["sha256"]):
-            raise UpdateExecutionError("superseded artifact identity is invalid")
-        path = _task_artifact(pathlib.Path(item["path"]), root, "superseded artifact", must_exist=required)
-        if path in paths:
-            raise UpdateExecutionError("superseded artifact paths overlap")
-        paths.add(path)
-        if path.exists() and _file_sha256(path) != item["sha256"]:
-            raise UpdateExecutionError(f"superseded artifact changed: {path}")
-        records.append({"role": "superseded", "path": path, "sha256": item["sha256"]})
-    return records
-
-def _prepared_request_path(cleanup: Mapping[str, object]) -> pathlib.Path:
-    """Return the one prepared request path without changing its ownership."""
-
-    owned = cleanup["owned_artifacts"]
-    protected = cleanup["protected_artifacts"]
-    assert isinstance(owned, list)
-    assert isinstance(protected, list)
-    owned_request = [item["path"] for item in owned if item["role"] == "request"]
-    if owned_request:
-        assert len(owned_request) == 1
-        path = owned_request[0]
-        assert isinstance(path, pathlib.Path)
-        return path
-    if len(protected) != 1 or not isinstance(protected[0], pathlib.Path):
-        raise UpdateExecutionError("state does not identify one protected request")
-    return protected[0]
+    original = read_record(context, "update_request.json")
+    if (original is None or original.get("schema") != UPDATE_SCHEMA
+            or original.get("worktree_id") != context.worktree_id
+            or not isinstance(original.get("initial_state"), dict)):
+        raise UpdateExecutionError("no intact unfinished skill change was found")
+    numbers = _generations(context, "states")
+    previous = None
+    for number in numbers:
+        dependent = number < numbers[-1] or (context.directory / "check_results" / f"{number}.json").exists()
+        state = read_record(context, f"states/{number}.json", repair_tail=not dependent)
+        if state is None:
+            if dependent:
+                raise UpdateExecutionError("a dependent state generation is missing")
+            continue
+        if (state.get("schema") != STATE_SCHEMA or state.get("generation") != number
+                or state.get("update_request_sha256") != record_hash(original)
+                or state.get("status") not in {"pending", "checking", "passed", "failed"}
+                or not isinstance(state.get("baseline_targets"), dict)
+                or not isinstance(state.get("baseline_dirty"), dict)):
+            raise UpdateExecutionError("conflicting state generation")
+        if previous is not None and (
+            number != previous["generation"] + 1
+            or state.get("previous_sha256") != record_hash(previous)
+        ):
+            raise UpdateExecutionError("state generation chain changed")
+        for key in ("head", "branch", "baseline_dirty", "repo_root"):
+            if state.get(key) != original["initial_state"].get(key):
+                raise UpdateExecutionError(f"original {key} changed")
+        for path, baseline in original["initial_state"]["baseline_targets"].items():
+            if state["baseline_targets"].get(path) != baseline:
+                raise UpdateExecutionError("original target baseline changed")
+        read_result(context, state)
+        previous = state
+    if previous is None:
+        previous = append_state(context, original["initial_state"], None)
+    prune_generations(context)
+    return previous
 
 
-
-def _validated_evidence(
-    path: pathlib.Path,
-    expected_sha256: str,
-) -> dict[str, object]:
-    """Validate one exact helper-written evidence record before reuse."""
-
-    if not path.is_file() or _file_sha256(path) != expected_sha256:
-        raise UpdateExecutionError("recorded verification evidence changed")
-    raw = _read_json(path, "verification evidence")
-    _closed_fields(raw, EVIDENCE_FIELDS, "verification evidence")
-    if raw.get("schema") != EVIDENCE_SCHEMA:
-        raise UpdateExecutionError(
-            f"verification evidence schema must be {EVIDENCE_SCHEMA}"
-        )
-    if raw.get("status") not in {"failed", "passed"}:
-        raise UpdateExecutionError("verification evidence status is invalid")
-    if not _valid_sha256(raw.get("input_sha256")):
-        raise UpdateExecutionError("verification evidence input hash is invalid")
-    if not isinstance(raw.get("checks"), list) or not isinstance(
-        raw.get("failures"), list
-    ):
-        raise UpdateExecutionError("verification evidence results are invalid")
-    return dict(raw)
+def scratch_root(repo_root: pathlib.Path) -> pathlib.Path:
+    """Derive disposable check scratch under the repository's task-temp boundary."""
+    common = _git_path(repo_root, _git(repo_root, "rev-parse", "--git-common-dir"))
+    root = common.parent.parent / "tmp" / common.parent.name / repo_root.name
+    _reject_link_chain(root, "check scratch")
+    root.mkdir(parents=True, exist_ok=True)
+    return root

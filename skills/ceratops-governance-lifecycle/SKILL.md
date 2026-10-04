@@ -1,6 +1,6 @@
 ---
 name: ceratops-governance-lifecycle
-description: Route Ceratops governance work across prompt optimization, advisory skill optimization, regression-safe instruction updates, and cross-scope governance consistency audits. Use when Codex should rewrite a rough prompt as the requested deliverable or an execution preflight, recommend exact changes to existing skills without applying them, diagnose and route approved instruction changes, or audit alignment across AGENTS files, automations, directly referenced helpers, and governance owners.
+description: Route Ceratops governance work across prompt optimization, advisory skill optimization, regression-safe instruction updates, and cross-scope governance consistency audits. Use when Codex should rewrite a rough prompt as the requested deliverable, recommend exact changes to existing skills without applying them, diagnose and route approved instruction changes, or audit alignment across AGENTS files, automations, directly referenced helpers, and governance owners.
 ---
 
 # Ceratops Governance Lifecycle
@@ -14,7 +14,7 @@ skill, instruction, and cross-scope audit decisions in one capability surface.
 
 ### Action References
 
-- Optimize a raw prompt as a deliverable or execution preflight:
+- Optimize a raw prompt as a requested deliverable:
   `references/optimize-prompt.md`
 - Propose advisory-only improvements to existing skills:
   `references/optimize-skill.md`
@@ -40,8 +40,6 @@ skill, instruction, and cross-scope audit decisions in one capability surface.
   change.
 - Use only the action-scoped work and evidence needed to satisfy the selected
   action's completion gate; do not inspect or change unrelated surfaces.
-- In `execution-preflight` mode, keep the optimized prompt internal and resume
-  the calling task.
 - For skill optimization, rule updates, and governance audits, inspect companion
   artifacts only when they govern the same behavior, evidence, or output
   contract.

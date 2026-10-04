@@ -22,6 +22,80 @@ from tests.support.repositories import (
     create_compatible_repo,
 )
 
+CONSISTENCY_REVIEW_PACKET = (
+    ROOT
+    / "skills"
+    / "ceratops-skill-lifecycle"
+    / "scripts"
+    / "skills-consistency-review-packet.py"
+)
+
+
+def test_consistency_review_packet_resolves_one_installed_skill(
+    tmp_path: pathlib.Path,
+) -> None:
+    skill = "ceratops-task-lifecycle"
+    installed = tmp_path / "installed" / skill
+    installed.mkdir(parents=True)
+    source_manifest = json.loads(
+        (ROOT / "skills" / "skill-sections.json").read_text(encoding="utf-8")
+    )
+    (installed / ".runtime-manifest.json").write_text(
+        json.dumps(
+            {
+                "schema": "ceratops-runtime-skill.v3",
+                "skill": skill,
+                "runtime_source_id": source_manifest["runtime_source_id"],
+                "source_path": f"skills/{skill}",
+                "source_repository_root": str(ROOT),
+                "validation_profile": source_manifest["validation_profile"],
+                "payload_patterns": [],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    automations = tmp_path / "automations" / "status-review"
+    automations.mkdir(parents=True)
+    consumer = automations / "automation.toml"
+    consumer.write_text(
+        'name = "Status review"\nprompt = "Use $ceratops-task-lifecycle repository-status."\n',
+        encoding="utf-8",
+        newline="\n",
+    )
+    output = tmp_path / "packet.json"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(CONSISTENCY_REVIEW_PACKET),
+            "--skill",
+            skill,
+            "--repo-root",
+            str(ROOT),
+            "--installed-skill",
+            str(installed),
+            "--automation-root",
+            str(tmp_path / "automations"),
+            "--output",
+            str(output),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "OK"
+    packet = json.loads(output.read_text(encoding="utf-8"))
+    assert packet["schema"] == "ceratops-skills-consistency-review-packet.v1"
+    assert packet["identity"]["skill"] == skill
+    assert packet["validator"]["status"] == "passed"
+    assert "scripts/repository-status-snapshot.py" in packet["surfaces"]["helpers"]
+    assert packet["surfaces"]["automation_consumers"] == [str(consumer.resolve())]
+    assert packet["blockers"] == []
+
 
 @pytest.mark.parametrize(
     ("command", "error"),

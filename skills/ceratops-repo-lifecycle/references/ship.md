@@ -14,8 +14,8 @@ selected-source cleanup. YAML declares capabilities; this action owns timing.
   `python "<skill-root>/scripts/ship-repository.py" --repo-root PATH
   --head-branch release/local --base-branch main --remote-name origin
   --reusable-head`.
-  Use `--head-branch promote/local` when an authoritative local `release`
-  branch occupies that Git ref namespace.
+  If `refs/heads/release` exists, stop before mutation and report that the
+  repository must free the `release/local` branch namespace.
   `<skill-root>` is the installed `ceratops-repo-lifecycle` directory.
   The CI wait defaults to 30 minutes; `--ci-wait-seconds` overrides it.
 - Run the helper before manual readiness or implementation inspection, without
@@ -59,9 +59,9 @@ selected-source cleanup. YAML declares capabilities; this action owns timing.
 
 ### Boundaries
 
-- Ship only the clean promotion branch selected during promotion:
-  `release/local` by default, or `promote/local` when an authoritative local
-  `release` branch exists.
+- Ship only the clean `release/local` branch selected during promotion; an
+  existing `refs/heads/release` is an incompatible repository state, not an
+  alternate branch selection.
 - Repair ordinary check failures under the parent's repair/retry rule without
   expanding the selected change scope; restart shipping after committing the
   fix.
@@ -144,10 +144,8 @@ selected-source cleanup. YAML declares capabilities; this action owns timing.
    verifies that the path is unregistered and remains below the recorded root
    before deleting it. When elevated, it may take ownership only of that
    validated path, without a public flag or second confirmation. Before
-   retiring the record, it preserves any matching task-temp directory that
-   contains the valid helper-owned `.ceratops-skill-update-active.json` marker
-   for required post-deployment finalization. Otherwise it deletes matching
-   task-temp subdirectories under `<repo-parent>/tmp/<repo-name>` only when a
+   retiring the record, it deletes matching task-temp subdirectories under
+   `<repo-parent>/tmp/<repo-name>` only when a
    name exactly matches the recorded worktree name, exactly matches the thread
    ID, or starts with the thread ID followed by `-`; it preserves every other
    name. It removes empty worktree and task-temp parents

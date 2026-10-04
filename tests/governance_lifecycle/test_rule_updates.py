@@ -172,7 +172,7 @@ def test_rule_candidate_repairs_multiple_targets_and_is_idempotent(
         ("automation.TOML", "\r\n", b"\xef\xbb\xbf"),
     ):
         target = first_repo / name
-        prompt = 'Run "helper.py" with C:\\old-evidence\\snapshot.json.\n' + "word " * 60
+        prompt = 'Run "helper.py" with C:\\repo\\old-evidence\\snapshot.json.\n' + "word " * 60
         document = 'name = "Audit"\nprompt = ' + json.dumps(prompt) + '\nstatus = "ACTIVE"\n'
         original = bom + document.replace("\n", newline).encode("utf-8")
         target.write_bytes(original)

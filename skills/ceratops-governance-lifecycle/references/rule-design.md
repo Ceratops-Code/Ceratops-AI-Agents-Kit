@@ -94,17 +94,16 @@ Validate IDs and relations inside each complete scope, then validate behavioral
 compatibility across the applicable global-to-local instruction stack.
 
 Store local history beside its local rule source and query every applicable
-history separately in a multi-scope change. Revalidate current global and all
-project-local rules directly; do not store dates, hashes, source snapshots,
-current rule inventories, or gate inventories in history.
+history separately in a multi-scope change. During candidate design,
+review behavioral compatibility across the complete applicable instruction
+stack; keep current-state metadata out of decision history.
 
 Use a JSON history object with `version: 2` and an `entries` array. Each entry
 uses the decision-only schema owned by `scripts/rule_graph.py`: `rules`,
 `decision`, `reason`, and `regression`. `rules` records the current IDs of rules
-affected by the decision. On an approved rule rename, migrate every exact old-ID
-token in all existing history fields to the new ID, stable-deduplicate each
-`rules` array, and preserve entry order and every other value except approved
-semantic replacements required to preserve meaning. Use `*` only when the
+affected by the decision. For a rule rename, propose the exact ID mapping and
+any semantic replacements needed to preserve
+decision meaning. Use `*` only when the
 cross-cutting grouping is itself part of the decision.
 
 History is append-only except for an approved exact rule-ID migration. For each
@@ -112,10 +111,7 @@ rule change, append a decision that states what changed, why, what behavior
 remains intentional, what behavior is retired when applicable, and which
 earlier decisions it supersedes or narrows when their rationale was
 intentionally replaced. Identify any such earlier decision unambiguously in the
-new decision text. A rename migration must use the deterministic application
-helper, preserve pre-existing entry count, order, and decision meaning, require
-exact semantic text replacements wherever token substitution would make an
-entry inaccurate, and leave no old-ID token in the companion history. Do not
+new decision text. Do not
 otherwise rewrite, delete, merge, or compact earlier entries.
 
 Every entry must record rationale, a regression or failure boundary, behavior a

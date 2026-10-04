@@ -5,19 +5,19 @@
   "captured_on": "2026-05-02",
   "source_files": [
     {
-      "path": "$AI_AGENT_SKILLS_ROOT/skills/ceratops-repo-lifecycle/references/contracts/github-contract-source-docs.json",
+      "path": "$CERATOPS_AI_AGENTS_KIT_ROOT/skills/ceratops-repo-lifecycle/references/contracts/github-contract-source-docs.json",
       "lines": "source-doc registry"
     },
     {
-      "path": "$AI_AGENT_SKILLS_ROOT/skills/ceratops-repo-lifecycle/references/health-audit.md",
+      "path": "$CERATOPS_AI_AGENTS_KIT_ROOT/skills/ceratops-repo-lifecycle/references/health-audit.md",
       "lines": "contract owner"
     },
     {
-      "path": "$AI_AGENT_SKILLS_ROOT/skills/ceratops-repo-lifecycle/scripts/ceratops_repo_compatibility_engine/sdlc_contract_validation.py",
+      "path": "$CERATOPS_AI_AGENTS_KIT_ROOT/skills/ceratops-repo-lifecycle/scripts/ceratops_repo_compatibility_engine/sdlc_contract_validation.py",
       "lines": "shared SDLC schema validation"
     },
     {
-      "path": "$AI_AGENT_SKILLS_ROOT/skills/ceratops-repo-lifecycle/scripts/ceratops_repo_compatibility_engine/validate_ceratops_compatibility.py",
+      "path": "$CERATOPS_AI_AGENTS_KIT_ROOT/skills/ceratops-repo-lifecycle/scripts/ceratops_repo_compatibility_engine/validate_ceratops_compatibility.py",
       "lines": "shared repository compatibility checker"
     }
   ],
@@ -249,6 +249,18 @@
           "operator": "glob_present",
           "expected": ".github/CODEOWNERS",
           "when": "repo.visibility == public && repo.fork == false"
+        },
+        {
+          "path": "/repository/paths",
+          "operator": "glob_present",
+          "expected": ".github/ISSUE_TEMPLATE/**",
+          "when": "repo.visibility == public && repo.fork == false"
+        },
+        {
+          "path": "/repository/paths",
+          "operator": "glob_present",
+          "expected": ".github/pull_request_template.md",
+          "when": "repo.visibility == public && repo.fork == false"
         }
       ]
     },
@@ -362,7 +374,7 @@
       ],
       "collection": {
         "regex_patterns": [
-          "(?<![A-Za-z0-9_])[A-Za-z]:\\\\",
+          "(?<![A-Za-z0-9_\\\\])[A-Za-z]:\\\\",
           "(?<![A-Za-z0-9._-])/Users/",
           "(?<![A-Za-z0-9._-])/home/[^/]+/"
         ],
@@ -373,7 +385,8 @@
           "%ProgramFiles(x86)%",
           "%SystemRoot%",
           "$CODEX_HOME",
-          "C:\\CodexProjects"
+          "C:\\CodexProjects",
+          "C:\\AI-Agents-MCP-Servers"
         ],
         "ignore_paths": [
           "exports/**",

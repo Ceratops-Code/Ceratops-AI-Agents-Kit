@@ -45,7 +45,9 @@ def write_rule_candidate(
     path.write_text(
         json.dumps(
             {
-                "schema": "ceratops-rule-candidate.v1",
+"schema": "ceratops-rule-candidate.v2",
+                "history_operations": [],
+                "acceptance": None,
                 "rule_stack": [str(item.resolve()) for item in rule_stack],
                 "targets": targets,
             },

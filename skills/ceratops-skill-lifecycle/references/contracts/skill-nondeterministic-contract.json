@@ -82,7 +82,7 @@
     {
       "id": "ND.skill.deterministic-placement",
       "applies_when": "The skill has commands, scripts, generated artifacts, validators, or repeatable cleanup.",
-      "review_required": "Confirm deterministic behavior lives in executable helpers when practical and prompt text retains high-level intent, routing, exceptions, and result handling. Confirm bundled Python helpers use the shared launcher, their declared runtime covers their dependencies and required Python version, and external tool runtimes retain their own installer. Recreate environments at the destination; share only identical project/lock pairs.",
+      "review_required": "Confirm deterministic behavior lives in executable helpers when practical and prompt text retains high-level intent, routing, exceptions, and result handling. Confirm bundled Python helpers are invoked through uv run --no-project --python <python_runtime> using python_runtime from their direct runtime manifest, their declared runtime covers their dependencies and required Python version, and external MCP server runtimes retain their own installer. Recreate environments at the destination; share only identical project/lock pairs.",
       "evidence_keys": [
         "skill.SKILL.md",
         "skill.scripts",

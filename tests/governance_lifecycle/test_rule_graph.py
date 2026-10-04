@@ -20,7 +20,15 @@ SCRIPTS = (
 sys.path.insert(0, str(SCRIPTS))
 
 import validate_rule_candidate as rule_candidate  # noqa: E402
-from apply_rules_update import ApplicationError, commit, prepare  # noqa: E402
+from apply_rules_update import (  # noqa: E402
+    ApplicationError,
+    accept_candidate,
+    commit,
+    file_hash,
+    load_accepted_update,
+    prepare,
+    rule_stack_hashes,
+)
 from rule_graph import (  # noqa: E402
     parse_rule_text,
     rule_source_summary,
@@ -121,7 +129,14 @@ class RuleGraphTests(unittest.TestCase):
             mismatches = snapshot["automation_reasoning_effort"]["mismatches"]
             self.assertEqual(
                 {(item["scope"], item["id"]) for item in mismatches},
-                {("source", "diskfinventorycheck"), ("runtime", "routine-audit")},
+                {
+                    ("runtime", "diskfinventorycheck"),
+                    ("runtime", "routine-audit"),
+                },
+            )
+            self.assertEqual(
+                snapshot["automation_reasoning_effort"]["policy"],
+                {"medium_ids": [], "default": "max"},
             )
             self.assertEqual(
                 snapshot["d_rule_brevity"]["sources_checked"],
@@ -181,7 +196,9 @@ class RuleGraphTests(unittest.TestCase):
         candidate_path = task_temp_root / "validated-candidate.json"
         evidence_path = task_temp_root / "application-validation.json"
         candidate = {
-            "schema": "ceratops-rule-candidate.v1",
+"schema": "ceratops-rule-candidate.v2",
+            "history_operations": [],
+            "acceptance": None,
             "rule_stack": [str(global_rules.resolve()), str(local_rules.resolve())],
             "targets": [
                 {
@@ -329,23 +346,49 @@ class RuleGraphTests(unittest.TestCase):
         return request, rules, history
 
     @staticmethod
-    def run_rules_update(request: dict, request_path: pathlib.Path):
-        request_path.write_text(
-            json.dumps(request) + "\n",
-            encoding="utf-8",
-            newline="\n",
+    def accept_update_request(request: dict) -> dict:
+        """Produce acceptance first; the application receives no history operations."""
+        rule_stack_hashes(request["rule_stack_sha256"],
+                          [pathlib.Path(path) for path in request["rule_stack"]])
+        source = request["validated_candidate"]
+        if source:
+            candidate_path = pathlib.Path(source)
+            if file_hash(candidate_path) != request["validated_candidate_sha256"]:
+                raise ApplicationError("validated_candidate_sha256 is stale")
+            candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+        else:
+            candidate_path = pathlib.Path(request["task_temp_root"]) / "accepted-history.json"
+            candidate = {"schema": "ceratops-rule-candidate.v2",
+                         "rule_stack": request["rule_stack"], "targets": [],
+                         "acceptance": None}
+        candidate["history_operations"] = request["history_operations"]
+        candidate_path.write_text(json.dumps(candidate, ensure_ascii=False, indent=2) + "\n",
+                                  encoding="utf-8")
+        accept_candidate(candidate_path, pathlib.Path(request["validation_evidence"]))
+        return {
+            "version": 5, "task_temp_root": request["task_temp_root"],
+            "request_disposable": request["request_disposable"],
+            "validated_candidate": str(candidate_path),
+            "validated_candidate_sha256": file_hash(candidate_path),
+            "candidate_disposable": True,
+        }
+
+    @classmethod
+    def run_rules_update(cls, request: dict, request_path: pathlib.Path):
+        request_path.write_text(json.dumps(request) + "\n", encoding="utf-8")
+        try:
+            accepted = cls.accept_update_request(request)
+        except (OSError, ValueError) as error:
+            return subprocess.CompletedProcess([], 1, "", str(error))
+        request_path.write_text(json.dumps(accepted) + "\n", encoding="utf-8")
+        result = subprocess.run(
+            [sys.executable, str(SCRIPTS / "apply_rules_update.py"),
+             "--request", str(request_path)],
+            capture_output=True, text=True, check=False,
         )
-        return subprocess.run(
-            [
-                sys.executable,
-                str(SCRIPTS / "apply_rules_update.py"),
-                "--request",
-                str(request_path),
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        if result.returncode == 0:
+            pathlib.Path(request["validation_evidence"]).unlink()
+        return result
 
     def test_rule_local_user_override_is_rejected_case_insensitively(self):
         parsed = parse_rule_text(
@@ -745,17 +788,7 @@ class RuleGraphTests(unittest.TestCase):
                 encoding="utf-8",
                 newline="\n",
             )
-            applied = subprocess.run(
-                [
-                    sys.executable,
-                    str(SCRIPTS / "apply_rules_update.py"),
-                    "--request",
-                    str(request_path),
-                ],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
+            applied = self.run_rules_update(request, request_path)
 
             failed_root = root / "failed"
             failed_root.mkdir()
@@ -779,17 +812,7 @@ class RuleGraphTests(unittest.TestCase):
                 encoding="utf-8",
                 newline="\n",
             )
-            failed = subprocess.run(
-                [
-                    sys.executable,
-                    str(SCRIPTS / "apply_rules_update.py"),
-                    "--request",
-                    str(failed_path),
-                ],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
+            failed = self.run_rules_update(failed_request, failed_path)
 
             escaped_root = root / "escaped"
             escaped_root.mkdir()
@@ -802,17 +825,7 @@ class RuleGraphTests(unittest.TestCase):
                 encoding="utf-8",
                 newline="\n",
             )
-            escaped = subprocess.run(
-                [
-                    sys.executable,
-                    str(SCRIPTS / "apply_rules_update.py"),
-                    "--request",
-                    str(escaped_path),
-                ],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
+            escaped = self.run_rules_update(escaped_request, escaped_path)
 
             user_root = root / "user-owned"
             user_root.mkdir()
@@ -826,17 +839,7 @@ class RuleGraphTests(unittest.TestCase):
                 encoding="utf-8",
                 newline="\n",
             )
-            user_applied = subprocess.run(
-                [
-                    sys.executable,
-                    str(SCRIPTS / "apply_rules_update.py"),
-                    "--request",
-                    str(user_path),
-                ],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
+            user_applied = self.run_rules_update(user_request, user_path)
 
             self.assertEqual(
                 update.candidates[local_rules.resolve()],
@@ -1033,8 +1036,8 @@ class RuleGraphTests(unittest.TestCase):
             rollback_before = rollback_history.read_bytes()
             rollback_update = prepare(rollback_request)
             with mock.patch(
-                "apply_rules_update.revalidate",
-                side_effect=ApplicationError("forced revalidation failure"),
+                "apply_rules_update.verify_written_identity",
+                side_effect=ApplicationError("forced integrity failure"),
             ):
                 with self.assertRaisesRegex(ApplicationError, "update rolled back"):
                     commit(rollback_update)
@@ -1112,7 +1115,7 @@ class RuleGraphTests(unittest.TestCase):
     def test_rules_update_toml_and_rules_share_history_and_rollback(self):
         import apply_rules_update as application
 
-        for failure in (None, "write", "parse"):
+        for failure in (None, "write"):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
                 root = pathlib.Path(directory)
                 request, rules, automation, expected = self.toml_update_request(root, mixed=True)
@@ -1131,18 +1134,15 @@ class RuleGraphTests(unittest.TestCase):
                     if failure == "write":
                         original_replace = application.os.replace
 
-                        def fail_after_toml(source, target):
+                        def fail_after_toml(source, target, history=history,
+                                            automation=automation, expected=expected,
+                                            original_replace=original_replace):
                             if target == history and pathlib.Path(source).suffix == ".new":
                                 self.assertEqual(automation.read_bytes(), expected)
                                 raise OSError("forced write failure after TOML")
                             return original_replace(source, target)
 
                         injected = mock.patch.object(application.os, "replace", side_effect=fail_after_toml)
-                    else:
-                        injected = mock.patch.object(
-                            application.tomllib, "loads",
-                            side_effect=application.tomllib.TOMLDecodeError("forced parse failure", "", 0),
-                        )
                     with injected, self.assertRaisesRegex(ApplicationError, "update rolled back"):
                         commit(update)
                     for path, raw in originals.items():
@@ -1197,6 +1197,100 @@ class RuleGraphTests(unittest.TestCase):
                     self.assertEqual(path.read_bytes(), raw)
                 self.assertTrue(request_path.is_file())
                 self.assertTrue(candidate_path.is_file())
+
+    def test_accepted_candidate_is_applied_without_any_content_revalidation(self):
+        import apply_rules_update as application
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            request, rules, automation, _ = self.toml_update_request(root, mixed=True)
+            history = rules.with_name("AGENTS.history.json")
+            with mock.patch.object(application, "validate_rule_candidate",
+                                   wraps=application.validate_rule_candidate) as validator:
+                accepted = self.accept_update_request(request)
+            self.assertEqual(validator.call_count, 1)
+            candidate_path = pathlib.Path(accepted["validated_candidate"])
+            frozen = json.loads(candidate_path.read_text(encoding="utf-8"))
+            self.assertIn("check_versions", frozen["acceptance"])
+            expected = {pathlib.Path(path): application.base64.b64decode(payload)
+                        for path, payload in frozen["acceptance"]["outputs"].items()}
+            self.assertEqual(set(expected), {rules, automation, history})
+            # A newer/unavailable checker cannot revoke the original acceptance.
+            with (
+                mock.patch.object(application, "validate_rule_candidate",
+                                  side_effect=AssertionError("revalidated text")),
+                mock.patch.object(application, "validate_stack_texts",
+                                  side_effect=AssertionError("revalidated graph")),
+                mock.patch.object(application, "load_history_source",
+                                  side_effect=AssertionError("revalidated history")),
+                mock.patch.object(application, "read_source",
+                                  side_effect=AssertionError("reparsed source formatting")),
+                mock.patch.object(rule_candidate, "resolve_markdown_policy",
+                                  side_effect=AssertionError("consulted new policy")),
+                mock.patch.object(rule_candidate.tomllib, "loads",
+                                  side_effect=AssertionError("reparsed TOML")),
+            ):
+                update = load_accepted_update(accepted)
+                commit(update)
+            self.assertEqual({path: path.read_bytes() for path in expected}, expected)
+            self.assertEqual(list(root.rglob("*.rules-update.*")), [])
+
+    def test_history_only_acceptance_cli_preserves_the_prepared_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            producer, _, history = self.history_only_update_request(pathlib.Path(directory) / "repo")
+            task_root = pathlib.Path(producer["task_temp_root"])
+            candidate = task_root / "candidate.json"
+            candidate.write_text(json.dumps({
+                "schema": "ceratops-rule-candidate.v2", "rule_stack": producer["rule_stack"],
+                "targets": [], "history_operations": producer["history_operations"], "acceptance": None,
+            }), encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, str(SCRIPTS / "validate_rule_candidate.py"), "--accept",
+                 "--candidate", str(candidate), "--evidence", producer["validation_evidence"]],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            accepted = {"version": 5, "task_temp_root": str(task_root),
+                        "request_disposable": False, "candidate_disposable": False,
+                        "validated_candidate": str(candidate), "validated_candidate_sha256": file_hash(candidate)}
+            commit(load_accepted_update(accepted))
+            self.assertNotRegex(history.read_text(encoding="utf-8"), r"TEST-0[123]")
+
+    def test_accepted_candidate_identity_and_destination_base_are_protected(self):
+        for changed in ("candidate", "source", "history"):
+            with self.subTest(changed=changed), tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory)
+                request, rules, _, _ = self.toml_update_request(root, mixed=True)
+                accepted = self.accept_update_request(request)
+                target = {"candidate": pathlib.Path(accepted["validated_candidate"]),
+                          "source": rules, "history": rules.with_name("AGENTS.history.json")}[changed]
+                target.write_bytes(target.read_bytes() + b" ")
+                before = {path: path.read_bytes() for path in
+                          (rules, rules.with_name("AGENTS.history.json"), root / "automation.toml")}
+                with self.assertRaisesRegex(ApplicationError, "stale|changed since acceptance"):
+                    load_accepted_update(accepted)
+                self.assertEqual({path: path.read_bytes() for path in before}, before)
+
+    def test_candidate_producer_does_not_accept_intervening_history_edit(self):
+        import apply_rules_update as application
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            request, rules, _, _ = self.toml_update_request(root, mixed=True)
+            history = rules.with_name("AGENTS.history.json")
+            validator = application.validate_rule_candidate
+
+            def validate_then_edit(*args, **kwargs):
+                result = validator(*args, **kwargs)
+                history.write_bytes(history.read_bytes() + b" ")
+                return result
+
+            with mock.patch.object(application, "validate_rule_candidate", side_effect=validate_then_edit):
+                with self.assertRaisesRegex(ApplicationError, "source changed during candidate production"):
+                    self.accept_update_request(request)
+            candidate = json.loads(pathlib.Path(request["validated_candidate"]).read_text(encoding="utf-8"))
+            self.assertIsNone(candidate["acceptance"])
+            self.assertNotIn("approved rule", rules.read_text(encoding="utf-8"))
 
     def test_rules_update_toml_detects_source_drift_after_prepare(self):
         for target_type in ("toml", "rules"):
