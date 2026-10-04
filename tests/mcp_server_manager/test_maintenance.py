@@ -470,6 +470,7 @@ def test_cli_lock_refresh_does_not_build_register_or_activate(source_package, ca
     assert cli.main(["package", "--source", str(project), "--lock"]) == 0
     assert json.loads(capsys.readouterr().out) == {"lock": str(project / "pylock.toml")}
     assert len(calls) == 1 and calls[0][0][1:3] == ["pip", "compile"]
+    assert calls[0][0][calls[0][0].index("--python-version") + 1] == "3.14.7"
     assert not (runtime_root / "fixture/registry.json").exists()
     assert not (runtime_root / "fixture/current.json").exists()
     assert not list((runtime_root / "fixture/staging").iterdir())

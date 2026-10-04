@@ -41,6 +41,9 @@ from .contracts import (
 from .engine import Engine, global_runtime, preflight_release, run, wheel_metadata
 from .storage import Layout
 
+# Keep lock metadata stable when the ambient 3.14.x interpreter is patched.
+LOCK_PYTHON_VERSION = "3.14.7"
+
 
 @dataclass(frozen=True)
 class MCPServerSource:
@@ -216,7 +219,8 @@ def package(source: Path, *, lock_only: bool = False,
         if package_lock is None and (lock.exists() or lock.is_symlink()):
             source_file(source, "pylock.toml")
         if lock_only:
-            run([str(uv), "pip", "compile", "pyproject.toml", "--python", str(python), "--python-platform", "windows",
+            run([str(uv), "pip", "compile", "pyproject.toml", "--python", str(python), "--python-version", LOCK_PYTHON_VERSION,
+                 "--python-platform", "windows",
                  "--format", "pylock.toml", "--output-file", "pylock.toml", "--no-header", "--no-config", "--no-sources"], cwd=source, env=env)
             return {"lock": str(lock)}
         if package_lock is not None and package_lock.name == "uv.lock":
