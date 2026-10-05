@@ -40,6 +40,10 @@
       {
         "source": "skills/sections/scripts/manage_checkpoints.py",
         "target": "scripts/manage_checkpoints.py"
+      },
+      {
+        "source": "skills/sections/scripts/hold_write_lock.py",
+        "target": "scripts/hold_write_lock.py"
       }
     ],
     "ceratops-skill-lifecycle": [
@@ -54,6 +58,10 @@
       {
         "source": "skills/sections/scripts/manage_checkpoints.py",
         "target": "scripts/manage_checkpoints.py"
+      },
+      {
+        "source": "skills/sections/scripts/hold_write_lock.py",
+        "target": "scripts/hold_write_lock.py"
       }
     ],
     "*": []
