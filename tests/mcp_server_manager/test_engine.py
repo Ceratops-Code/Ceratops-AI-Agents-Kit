@@ -160,7 +160,7 @@ def test_schema_probe_uses_short_lived_child_process(tmp_path, monkeypatch):
     candidate.mkdir()
     executable = candidate / "python.exe"
     executable.write_bytes(b"candidate")
-    recorded = {}
+    recorded: dict[str, Any] = {}
 
     monkeypatch.setattr(
         engine_module.importlib.util,
@@ -191,7 +191,9 @@ def test_schema_probe_uses_short_lived_child_process(tmp_path, monkeypatch):
     assert recorded["cwd"] == candidate and recorded["timeout"] == 45
     probe_paths = recorded["env"]["PYTHONPATH"].split(os.pathsep)
     assert str(dependency.parents[1]) in probe_paths
-    assert str(Path(engine_module.__file__).resolve().parents[1]) in probe_paths
+    module_file = engine_module.__file__
+    assert module_file is not None
+    assert str(Path(module_file).resolve().parents[1]) in probe_paths
 
 
 def test_schema_probe_child_main_emits_structured_result(
