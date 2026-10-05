@@ -8,6 +8,7 @@ registry is a development capability and must never be exposed to Forms.
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
 import os
 import re
@@ -146,8 +147,8 @@ async def _published_tool_schemas(
 ) -> dict[str, dict[str, Any]]:
     """Read the production server's actual MCP list_tools schemas over stdio."""
 
-    # Keep these imports lazy: first-install bootstrap imports this module before
-    # its locked third-party libraries enter sys.path.
+    # Keep these imports inside the short-lived probe child. Native SDK
+    # dependencies must unload before the bootstrap library tree is removed.
     from mcp import ClientSession, StdioServerParameters, types
     from mcp.client.stdio import stdio_client
 
@@ -184,9 +185,73 @@ async def _published_tool_schemas(
 def probe_published_tool_schemas(
     executable: Path, module: str, candidate: Path, env: dict[str, str]
 ) -> dict[str, dict[str, Any]]:
-    """Run the bounded asynchronous MCP schema probe from synchronous deployment."""
+    """Run the MCP client in a child that releases native libraries on exit."""
 
-    return asyncio.run(_published_tool_schemas(executable, module, candidate, env))
+    specification = importlib.util.find_spec("mcp")
+    if specification is None or specification.origin is None:
+        raise DeploymentError("MCP client dependency is unavailable for schema probe")
+    dependency_root = Path(specification.origin).resolve().parent.parent
+    package_root = Path(__file__).resolve().parents[1]
+    probe_env = dict(env)
+    probe_env["PYTHONPATH"] = os.pathsep.join(
+        dict.fromkeys((str(package_root), str(dependency_root)))
+    )
+    output = run(
+        [
+            sys.executable,
+            "-B",
+            "-s",
+            "-m",
+            "ceratops_mcp_server_manager.engine",
+            "--probe-list-tools",
+            str(executable),
+            module,
+            str(candidate),
+        ],
+        cwd=candidate,
+        env=probe_env,
+        timeout=45,
+    )
+    try:
+        published = json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise DeploymentError("invalid MCP list_tools schema probe response") from exc
+    if (
+        not isinstance(published, dict)
+        or not all(
+            isinstance(name, str) and isinstance(schema_value, dict)
+            for name, schema_value in published.items()
+        )
+    ):
+        raise DeploymentError("invalid MCP list_tools schema probe response")
+    return published
+
+
+def _schema_probe_main(arguments: list[str]) -> int:
+    """Own one child-only MCP probe and emit its structured result."""
+
+    if len(arguments) != 4 or arguments[0] != "--probe-list-tools":
+        print("invalid internal schema probe invocation", file=sys.stderr)
+        return 2
+    executable = Path(arguments[1])
+    candidate = Path(arguments[3])
+    if not executable.is_file() or not candidate.is_dir():
+        print("invalid internal schema probe paths", file=sys.stderr)
+        return 2
+    try:
+        published = asyncio.run(
+            _published_tool_schemas(
+                executable,
+                arguments[2],
+                candidate,
+                dict(os.environ),
+            )
+        )
+    except (DeploymentError, OSError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    print(json.dumps(published, sort_keys=True, separators=(",", ":")))
+    return 0
 
 
 def preflight_release(
@@ -388,3 +453,7 @@ class Engine:
             running = self.running_version if mcp_server_name == MCP_SERVER_NAME else None
             return {"mcp_server_name": mcp_server_name, "installed_version": version, "running_version": running,
                     "manifest_sha256": sha256, "reconnection_required": bool(running and running != version)}
+
+
+if __name__ == "__main__":
+    raise SystemExit(_schema_probe_main(sys.argv[1:]))

@@ -151,6 +151,70 @@ def test_install_rejects_list_tools_schema_drift_before_activation(
     assert not list((tmp_path / "fixture/versions").iterdir())
 
 
+def test_schema_probe_uses_short_lived_child_process(tmp_path, monkeypatch):
+    dependency = tmp_path / "bootstrap/libraries/mcp/__init__.py"
+    dependency.parent.mkdir(parents=True)
+    dependency.write_text("", encoding="utf-8")
+    specification = importlib.util.spec_from_file_location("mcp", dependency)
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    executable = candidate / "python.exe"
+    executable.write_bytes(b"candidate")
+    recorded = {}
+
+    monkeypatch.setattr(
+        engine_module.importlib.util,
+        "find_spec",
+        lambda name: specification if name == "mcp" else None,
+    )
+
+    def fake_run(command, *, cwd, env, timeout=120):
+        recorded.update(command=command, cwd=cwd, env=env, timeout=timeout)
+        return json.dumps({"inspect": FIXTURE_INPUT_SCHEMA})
+
+    monkeypatch.setattr(engine_module, "run", fake_run)
+
+    assert engine_module.probe_published_tool_schemas(
+        executable, "fixture", candidate, {"SYSTEMROOT": "C:/Windows"}
+    ) == {"inspect": FIXTURE_INPUT_SCHEMA}
+    assert recorded["command"] == [
+        sys.executable,
+        "-B",
+        "-s",
+        "-m",
+        "ceratops_mcp_server_manager.engine",
+        "--probe-list-tools",
+        str(executable),
+        "fixture",
+        str(candidate),
+    ]
+    assert recorded["cwd"] == candidate and recorded["timeout"] == 45
+    probe_paths = recorded["env"]["PYTHONPATH"].split(os.pathsep)
+    assert str(dependency.parents[1]) in probe_paths
+    assert str(Path(engine_module.__file__).resolve().parents[1]) in probe_paths
+
+
+def test_schema_probe_child_main_emits_structured_result(
+    tmp_path, monkeypatch, capsys
+):
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    executable = candidate / "python.exe"
+    executable.write_bytes(b"candidate")
+
+    async def fake_probe(*_args):
+        return {"inspect": FIXTURE_INPUT_SCHEMA}
+
+    monkeypatch.setattr(engine_module, "_published_tool_schemas", fake_probe)
+
+    assert engine_module._schema_probe_main(
+        ["--probe-list-tools", str(executable), "fixture", str(candidate)]
+    ) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "inspect": FIXTURE_INPUT_SCHEMA
+    }
+
+
 def test_deployment_retains_current_two_predecessors_and_prunes_release_bytes(deployment, tmp_path):
     engine, _, _ = deployment
     selections = []
