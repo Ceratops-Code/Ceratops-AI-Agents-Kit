@@ -153,12 +153,34 @@ Use a pinned maintained build backend. The module's fixed readiness invocation
 is `python -I -B -m <module> --deployment-check`. It must return exactly:
 
 ```json
-{"mcp_server_id": "example_mcp_server", "version": "1.0.0", "ready": true}
+{
+  "mcp_server_id": "example_mcp_server",
+  "version": "1.0.0",
+  "ready": true,
+  "tools": {
+    "inspect": {
+      "input_schema": {
+        "type": "object",
+        "properties": {"path": {"type": "string"}},
+        "required": ["path"]
+      },
+      "opaque_parameters": []
+    }
+  }
+}
 ```
 
 Readiness checks dependencies and necessary local prerequisites without
-modifying user data. Create and test MCP servers in their owning development
-repositories; MCP server creation never runs through this manager.
+modifying user data. `tools` is the server-owned canonical contract for every
+public tool input schema. An object parameter without published properties or a
+typed `additionalProperties` schema is valid only when its parameter name is in
+that tool's `opaque_parameters` list. During preflight, the manager starts the
+installed candidate with `--mcp`, calls MCP `list_tools`, and requires its tool
+set and input schemas to equal this canonical contract. Create and test MCP
+servers in their owning development repositories; their lifecycle tests must
+call the production server's actual `list_tools` and compare structured
+parameters with the same canonical schemas. MCP server creation never runs
+through this manager.
 
 After the manager's first installation, use its public launcher from any
 directory; a Ceratops-AI-Agents-Kit checkout is not required:
@@ -183,10 +205,10 @@ server uses the paired package flags and still builds its own small MCP server
 wheel from source. Other repository MCP servers use CLI install. Reconnect
 after selecting a new manager version.
 
-Persistent records and the fixed readiness response retain the schema-1
-`mcp_server_id` field required by existing launchers and installed MCP
-servers. Its value is the project name; it is not a separate identifier or
-source declaration. The release manifest is a closed JSON object containing
+Persistent records and the readiness response retain the schema-1
+`mcp_server_id` field required by launchers and installed MCP servers. Its
+value is the project name; it is not a separate identifier or source
+declaration. The release manifest is a closed JSON object containing
 `schema`, `mcp_server_id`, `version`, `distribution`, `module`, and
 `wheels`. Each wheel has exactly a `filename` and `sha256`. The engine
 validates every field, digest, wheel archive, and the MCP server's distribution

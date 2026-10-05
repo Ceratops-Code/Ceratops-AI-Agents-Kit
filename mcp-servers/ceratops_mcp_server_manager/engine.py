@@ -7,6 +7,7 @@ registry is a development capability and must never be exposed to Forms.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -24,8 +25,10 @@ from . import MCP_SERVER_NAME, __version__
 from .contracts import (
     DeploymentError,
     active,
+    deployment_check,
     digest,
     manifest,
+    published_tool_input_schemas,
     read_json,
     registry,
     token,
@@ -138,6 +141,54 @@ def wheel_metadata(path: Path) -> tuple[str, str]:
         raise DeploymentError("invalid wheel") from exc
 
 
+async def _published_tool_schemas(
+    executable: Path, module: str, candidate: Path, env: dict[str, str]
+) -> dict[str, dict[str, Any]]:
+    """Read the production server's actual MCP list_tools schemas over stdio."""
+
+    # Keep these imports lazy: first-install bootstrap imports this module before
+    # its locked third-party libraries enter sys.path.
+    from mcp import ClientSession, StdioServerParameters, types
+    from mcp.client.stdio import stdio_client
+
+    parameters = StdioServerParameters(
+        command=str(executable),
+        args=["-I", "-B", "-m", module, "--mcp"],
+        env=env,
+        cwd=candidate,
+    )
+    published: dict[str, dict[str, Any]] = {}
+    try:
+        with open(os.devnull, "w", encoding="utf-8") as errlog:
+            async with stdio_client(parameters, errlog=errlog) as streams:
+                async with ClientSession(*streams, read_timeout_seconds=30) as session:
+                    await session.initialize()
+                    cursor = None
+                    for _ in range(256):
+                        params = types.PaginatedRequestParams(cursor=cursor) if cursor else None
+                        result = await session.list_tools(params=params)
+                        for tool in result.tools:
+                            if tool.name in published:
+                                raise DeploymentError("duplicate published MCP tool name")
+                            published[tool.name] = tool.input_schema
+                        cursor = result.next_cursor
+                        if cursor is None:
+                            return published
+    except DeploymentError:
+        raise
+    except Exception as exc:
+        raise DeploymentError("MCP list_tools schema publication check failed") from exc
+    raise DeploymentError("MCP list_tools pagination did not terminate")
+
+
+def probe_published_tool_schemas(
+    executable: Path, module: str, candidate: Path, env: dict[str, str]
+) -> dict[str, dict[str, Any]]:
+    """Run the bounded asynchronous MCP schema probe from synchronous deployment."""
+
+    return asyncio.run(_published_tool_schemas(executable, module, candidate, env))
+
+
 def preflight_release(
     layout: Layout,
     release: dict[str, Any],
@@ -240,8 +291,11 @@ def preflight_release(
         ready = json.loads(output)
     except json.JSONDecodeError as exc:
         raise DeploymentError("invalid readiness response") from exc
-    if ready != {"mcp_server_id": identity, "version": version, "ready": True}:
-        raise DeploymentError("MCP server readiness failed")
+    canonical = deployment_check(ready, identity, version)
+    published = probe_published_tool_schemas(
+        executable, release["module"], candidate, env
+    )
+    published_tool_input_schemas(canonical, published)
 
 
 class Engine:

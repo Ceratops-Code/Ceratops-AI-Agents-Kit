@@ -9,6 +9,48 @@ from mcp.types import CallToolResult, TextContent, ToolAnnotations
 from .engine import Engine
 
 
+def _versioned_server_schema(title: str) -> dict[str, Any]:
+    """Return the canonical input schema shared by install and update."""
+
+    return {
+        "additionalProperties": False,
+        "properties": {
+            "mcp_server_name": {"title": "Mcp Server Name", "type": "string"},
+            "version": {"title": "Version", "type": "string"},
+        },
+        "required": ["mcp_server_name", "version"],
+        "title": title,
+        "type": "object",
+    }
+
+
+TOOL_INPUT_SCHEMA_CONTRACT = {
+    "install": {
+        "input_schema": _versioned_server_schema("installArguments"),
+        "opaque_parameters": [],
+    },
+    "update": {
+        "input_schema": _versioned_server_schema("updateArguments"),
+        "opaque_parameters": [],
+    },
+    "versions": {
+        "input_schema": {
+            "additionalProperties": False,
+            "properties": {
+                "mcp_server_name": {
+                    "default": "ceratops_mcp_server_manager",
+                    "title": "Mcp Server Name",
+                    "type": "string",
+                }
+            },
+            "title": "versionsArguments",
+            "type": "object",
+        },
+        "opaque_parameters": [],
+    },
+}
+
+
 class DeploymentServer(MCPServer):
     """Reject unknown inputs before SDK conversion can ignore extra fields."""
 

@@ -20,6 +20,18 @@ storage = importlib.import_module("ceratops_mcp_server_manager.storage")
 contracts = importlib.import_module("ceratops_mcp_server_manager.contracts")
 cli = importlib.import_module("ceratops_mcp_server_manager.cli")
 
+FIXTURE_INPUT_SCHEMA = {
+    "type": "object",
+    "properties": {"name": {"type": "string"}},
+    "required": ["name"],
+}
+FIXTURE_TOOL_CONTRACT = {
+    "inspect": {
+        "input_schema": FIXTURE_INPUT_SCHEMA,
+        "opaque_parameters": [],
+    }
+}
+
 
 def make_release(
     root, version, *, mcp_server="fixture", dependency=False, metadata_name=None
@@ -74,11 +86,21 @@ def deployment(tmp_path, monkeypatch):
         if "--deployment-check" in command:
             version, mcp_server = cwd.parent.name, cwd.parents[2].name
             return json.dumps(
-                {"mcp_server_id": mcp_server, "version": version, "ready": True}
+                {
+                    "mcp_server_id": mcp_server,
+                    "version": version,
+                    "ready": True,
+                    "tools": FIXTURE_TOOL_CONTRACT,
+                }
             )
         return ""
 
     monkeypatch.setattr(engine_module, "run", fake_run)
+    monkeypatch.setattr(
+        engine_module,
+        "probe_published_tool_schemas",
+        lambda *_args: {"inspect": FIXTURE_INPUT_SCHEMA},
+    )
     return engine, calls, failure
 
 
@@ -106,6 +128,27 @@ def test_install_update_previous_and_versions(deployment, tmp_path):
     assert (tmp_path / "fixture/registry.json").read_bytes() == own_registry
     assert engine.versions("independent")["available_versions"] == ["1.0.0"]
     assert not (tmp_path / "registry.json").exists()
+
+
+def test_install_rejects_list_tools_schema_drift_before_activation(
+    deployment, tmp_path, monkeypatch
+):
+    engine, _, _ = deployment
+    make_release(tmp_path, "1.0.0")
+    monkeypatch.setattr(
+        engine_module,
+        "probe_published_tool_schemas",
+        lambda *_args: {"inspect": {"type": "object"}},
+    )
+
+    with pytest.raises(
+        contracts.DeploymentError,
+        match="published MCP tool input schema differs from canonical",
+    ):
+        engine.install("fixture", "1.0.0")
+
+    assert not (tmp_path / "fixture/current.json").exists()
+    assert not list((tmp_path / "fixture/versions").iterdir())
 
 
 def test_deployment_retains_current_two_predecessors_and_prunes_release_bytes(deployment, tmp_path):

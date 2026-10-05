@@ -19,10 +19,19 @@ repository.
    JSON must report exact MCP server identity and installed package version with
    `ready: true`; check required dependencies without modifying user data.
 4. Add focused behavioral tests and usage documentation in the owning repo.
-   The manager's `package` operation must install the built wheel set in an
-   isolated candidate environment and validate the exact `--deployment-check`
-   identity, version, and readiness response before committing registry state.
-   A failed preflight must leave the registry unchanged.
+   Define every public structured MCP tool parameter from the server's
+   canonical JSON Schema. The actual MCP `list_tools` result must expose that
+   complete nested schema; an unqualified `{"type":"object"}` placeholder is
+   invalid. An intentionally open-ended map may remain opaque only when the
+   canonical deployment contract names that tool parameter in its opaque-map
+   allowlist. Make `--deployment-check` publish the canonical tool input
+   schemas and opaque-map allowlist; the manager must compare them with a real
+   MCP `list_tools` response before accepting the candidate. Lifecycle tests
+   must exercise the production server's `list_tools` result and compare each
+   structured parameter with its canonical schema. The manager's `package`
+   operation must install the built wheel set in an isolated candidate
+   environment and validate the exact deployment contract before committing
+   registry state. A failed preflight must leave the registry unchanged.
 5. Use the installed manager's public CLI:
 
    ```powershell

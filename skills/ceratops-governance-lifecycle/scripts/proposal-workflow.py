@@ -32,6 +32,7 @@ import sys
 import tempfile
 from collections.abc import Mapping, Sequence
 
+from iteration_controller import validate_max_iterations
 from rule_graph import parse_rule_source
 from validate_rule_candidate import CONTEXT_SCHEMA as CANDIDATE_CONTEXT_SCHEMA
 from validate_rule_candidate import (
@@ -93,6 +94,14 @@ DISPOSABLE_ROLES = {
 
 class ProposalWorkflowError(RuntimeError):
     """One compact request, evidence, or delegated-controller failure."""
+
+
+def _validated_max_iterations(value: object) -> int:
+    """Apply the controller-owned accepted-proposal convergence minimum."""
+    try:
+        return validate_max_iterations(value)
+    except ValueError as exc:
+        raise ProposalWorkflowError(str(exc)) from exc
 
 
 def _read_json(path: pathlib.Path, label: str) -> Mapping[str, object]:
@@ -455,13 +464,7 @@ def _validated_request(path: pathlib.Path) -> dict[str, object]:
                 "regressions cannot be disposable when no regressions input exists"
             )
         _task_file(regressions, task_temp_root, "regressions", must_exist=True)
-    max_iterations = request["max_iterations"]
-    if (
-        not isinstance(max_iterations, int)
-        or isinstance(max_iterations, bool)
-        or max_iterations < 1
-    ):
-        raise ProposalWorkflowError("max_iterations must be a positive integer")
+    max_iterations = _validated_max_iterations(request["max_iterations"])
     mutation_authorized = request["mutation_authorized"]
     if not isinstance(mutation_authorized, bool):
         raise ProposalWorkflowError("mutation_authorized must be boolean")
@@ -695,6 +698,7 @@ def command_construct(spec_path: pathlib.Path) -> str:
     _closed_fields(spec, SPEC_FIELDS, "construction spec")
     if spec["schema"] != SPEC_SCHEMA:
         raise ProposalWorkflowError(f"construction spec schema must be {SPEC_SCHEMA}")
+    max_iterations = _validated_max_iterations(spec["max_iterations"])
     root = _verified_task_temp_root(spec["task_temp_root"])
     sources, replacements = _construction_sources(spec["sources"])
     for key in ("failure", "regressions"):
@@ -721,7 +725,7 @@ def command_construct(spec_path: pathlib.Path) -> str:
         "regressions": str(paths["regressions"]),
         "evidence_output": str(paths["evidence"]),
         "champion_output": str(paths["champion"]),
-        "max_iterations": spec["max_iterations"],
+        "max_iterations": max_iterations,
         "mutation_authorized": spec["mutation_authorized"],
         "expected_side_effects": spec["expected_side_effects"], "sources": sources,
     }
@@ -802,6 +806,7 @@ def command_init(
 ) -> str:
     """Construct and prepare a proposal from simple, UTF-8-safe declarations."""
 
+    max_iterations = _validated_max_iterations(max_iterations)
     root = _verified_task_temp_root(str(task_temp_root))
     sources: dict[tuple[str, str | None], dict[str, object]] = {}
     history_by_rules: dict[str, str | None] = {}
@@ -1448,8 +1453,6 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         if args.command == "init":
-            if args.max_iterations < 1:
-                raise ProposalWorkflowError("max-iterations must be positive")
             output = command_init(
                 args.task_temp_root,
                 args.failure_file,

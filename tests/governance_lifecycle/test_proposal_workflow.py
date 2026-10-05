@@ -157,6 +157,62 @@ def test_driver_reports_iteration_limit_as_interrupted() -> None:
     assert status["next_action"] == "report_iteration_limit_interruption"
 
 
+def test_init_rejects_cap_below_accepted_convergence_minimum(
+    tmp_path: pathlib.Path,
+) -> None:
+    task_temp_root = tmp_path / "task-temp"
+    task_temp_root.mkdir()
+    target = tmp_path / "contract.md"
+    target.write_text("# Contract\n\nCurrent.\n", encoding="utf-8", newline="\n")
+    target_repository_markdown_policy(tmp_path)
+    inputs = {
+        "failure": "Observed failure.\n",
+        "regressions": "Preserve current behavior.\n",
+        "expected": "Current.",
+        "replacement": "Replacement.",
+    }
+    paths: dict[str, pathlib.Path] = {}
+    for name, value in inputs.items():
+        path = tmp_path / f"{name}.txt"
+        path.write_text(value, encoding="utf-8", newline="\n")
+        paths[name] = path
+
+    rejected = subprocess.run(
+        [
+            sys.executable,
+            str(PROPOSAL_WORKFLOW),
+            "init",
+            "--task-temp-root",
+            str(task_temp_root),
+            "--failure-file",
+            str(paths["failure"]),
+            "--regressions-file",
+            str(paths["regressions"]),
+            "--context",
+            str(ROOT / "AGENTS.md"),
+            str(ROOT / "AGENTS.history.json"),
+            "SKILLS-GOV-01",
+            "--replacement",
+            str(target),
+            "-",
+            str(paths["expected"]),
+            str(paths["replacement"]),
+            "--max-iterations",
+            "3",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert rejected.returncode != 0
+    assert (
+        "max iterations must be at least 4 to accept a proposal and observe "
+        "convergence; received 3"
+    ) in rejected.stderr
+    assert not any(task_temp_root.iterdir())
+
+
 @pytest.mark.parametrize("accepted", [True, False])
 @pytest.mark.parametrize("target_name", ["contract.md", "automation.toml"])
 @pytest.mark.parametrize("prepare_mode", ["request", "construct"])
@@ -736,19 +792,33 @@ def test_iteration_controller_direct_commands_record_validated_candidate(
     assert not state.exists() and not (tmp_path / "iterations").exists()
     assert original.is_file() and context.is_file()
 
-    # An administrative cap is an interruption, never successful convergence.
+    with pytest.raises(ValueError, match="max iterations must be at least 4"):
+        controller.command_init(argparse.Namespace(
+            state=state, original=original, regressions=None,
+            validation_context=context, max_iterations=3,
+        ))
+    assert not state.exists()
+
+    # A viable administrative cap remains an interruption without convergence.
     controller.command_init(argparse.Namespace(
         state=state, original=original, regressions=None,
-        validation_context=context, max_iterations=1,
+        validation_context=context, max_iterations=4,
     ))
     controller.command_next(argparse.Namespace(state=state))
-    pending = controller.load_state(state)["pending"]
-    candidate = pathlib.Path(pending["candidate"])
-    value = json.loads(candidate.read_text(encoding="utf-8"))
-    value["targets"][0]["replacements"][0]["replacement"] = "Capped improvement"
-    candidate.write_text(json.dumps(value), encoding="utf-8")
-    pathlib.Path(pending["assessment"]).write_text("Improved, not converged.\n", encoding="utf-8")
-    controller.command_advance(argparse.Namespace(state=state, outcome="improved", regressions="passed"))
+    for iteration in range(1, 5):
+        pending = controller.load_state(state)["pending"]
+        candidate = pathlib.Path(pending["candidate"])
+        value = json.loads(candidate.read_text(encoding="utf-8"))
+        value["targets"][0]["replacements"][0]["replacement"] = (
+            f"Capped improvement {iteration}"
+        )
+        candidate.write_text(json.dumps(value), encoding="utf-8")
+        pathlib.Path(pending["assessment"]).write_text(
+            "Improved, not converged.\n", encoding="utf-8"
+        )
+        controller.command_advance(argparse.Namespace(
+            state=state, outcome="improved", regressions="passed",
+        ))
     capped = controller.load_state(state)
     assert capped["interrupted"] and not capped["complete"]
     assert capped["pending"] is None and capped["stop_reason"] == "max_iterations"
