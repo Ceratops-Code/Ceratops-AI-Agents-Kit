@@ -19,6 +19,10 @@ repository.
    JSON must report exact MCP server identity and installed package version with
    `ready: true`; check required dependencies without modifying user data.
 4. Add focused behavioral tests and usage documentation in the owning repo.
+   If the server also offers a CLI for the same user tasks, define one
+   canonical task catalog and executor, and use one public launcher for CLI
+   requests and MCP startup. Test matching task names, input schemas, and
+   structured results; document transport-only administrative commands.
    Define every public structured MCP tool parameter from the server's
    canonical JSON Schema. The actual MCP `list_tools` result must expose that
    complete nested schema; an unqualified `{"type":"object"}` placeholder is
