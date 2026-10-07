@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""Record approved skill changes, run their checks, and close their checkpoints.
+"""Initialize or record skill changes, run checks, and close checkpoints.
 
 Source edits and requested commit/promotion/deployment belong to the calling
 task. Each command discovers one update by worktree and holds its producer lock.
 States and check results are immutable generations. Recovery links a completed
 result without replaying checks; close consumes saved success without inspecting
-the live checkout. Caller request files and unrelated work are never deleted.
-Stdout is only OK; failures are one compact stderr line.
+the live checkout. ``init`` builds an ordinary request from repeated declarations;
+``run`` performs only needed checks and reports one next action. Lower-level
+commands retain caller-owned request support. Caller files and unrelated work
+are never deleted. Driver output is compact JSON or ``OK``; lower-level success
+is ``OK`` and failures are one compact stderr line.
 """
 from __future__ import annotations
 
@@ -235,17 +238,12 @@ def _shared_source_owners(
                         owners.add(skill)
     return owners
 
-def _validated_request(
-    path: pathlib.Path,
+def _validated_request_data(
+    request: Mapping[str, object],
     repo_root: pathlib.Path,
     *,
     carried_paths: Sequence[str] = (),
 ) -> dict[str, Any]:
-    request_path = _absolute(path)
-    _reject_link_chain(request_path, "request")
-    if not request_path.is_file():
-        raise UpdateExecutionError(f"request must be a regular file: {request_path}")
-    request = _read_json(request_path, "request")
     _closed_fields(request, REQUEST_FIELDS, "request")
     if request.get("schema") != REQUEST_SCHEMA:
         raise UpdateExecutionError(f"request schema must be {REQUEST_SCHEMA}")
@@ -349,6 +347,23 @@ def _validated_request(
         "baseline_targets": baseline_targets,
     }
     return {**state, "status": "pending", "input_sha256": None, "last_result": None}
+
+
+def _validated_request(
+    path: pathlib.Path,
+    repo_root: pathlib.Path,
+    *,
+    carried_paths: Sequence[str] = (),
+) -> dict[str, Any]:
+    request_path = _absolute(path)
+    _reject_link_chain(request_path, "request")
+    if not request_path.is_file():
+        raise UpdateExecutionError(f"request must be a regular file: {request_path}")
+    return _validated_request_data(
+        _read_json(request_path, "request"),
+        repo_root,
+        carried_paths=carried_paths,
+    )
 
 def _validated_state(raw: dict[str, Any]) -> dict[str, Any]:
     repo_value = raw["repo_root"]
@@ -685,26 +700,149 @@ def _recover_result(context: Any, state: dict[str, Any]) -> dict[str, Any]:
     return state
 
 
-def command_open_skill_change(repo_root: pathlib.Path, request_path: pathlib.Path) -> None:
-    """Capture scope and original baseline before edits; identical reopening reuses it."""
+def _utf8_command_arguments(path: pathlib.Path) -> list[str]:
+    """Read one exact process argument per nonempty UTF-8 line."""
+
+    resolved = _absolute(path)
+    _reject_link_chain(resolved, "command check file")
+    if not resolved.is_file():
+        raise UpdateExecutionError(
+            f"command check file must be a regular file: {resolved}"
+        )
+    try:
+        text = resolved.read_bytes().decode("utf-8-sig")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise UpdateExecutionError(
+            f"command check file is not readable UTF-8: {exc}"
+        ) from exc
+    arguments = [line for line in text.splitlines() if line]
+    if not arguments or any("\0" in value for value in arguments):
+        raise UpdateExecutionError(
+            "command check file must contain nonempty arguments without NUL"
+        )
+    return arguments
+
+
+def _request_from_declarations(
+    selected_skills: Sequence[str],
+    group_declarations: Sequence[Sequence[str]],
+    command_check_files: Sequence[pathlib.Path],
+    search_declarations: Sequence[Sequence[str]],
+) -> dict[str, object]:
+    """Build the closed request while leaving scope choices with the caller."""
+
+    groups: list[dict[str, object]] = []
+    allowed_paths: list[str] = []
+    for index, declaration in enumerate(group_declarations, start=1):
+        if len(declaration) < 2:
+            raise UpdateExecutionError(
+                f"group {index} requires a name and at least one path"
+            )
+        name, *paths = declaration
+        if not name.strip():
+            raise UpdateExecutionError(f"group {index} name is empty")
+        groups.append({"name": name, "paths": paths})
+        allowed_paths.extend(paths)
+    if len(allowed_paths) != len(set(allowed_paths)):
+        raise UpdateExecutionError("group paths must be unique across the update")
+
+    checks: list[dict[str, object]] = [
+        {"kind": "command", "argv": _utf8_command_arguments(path)}
+        for path in command_check_files
+    ]
+    for index, declaration in enumerate(search_declarations, start=1):
+        if len(declaration) < 3:
+            raise UpdateExecutionError(
+                f"search check {index} requires EXPECTED, PATTERN, and PATH"
+            )
+        expected_raw, pattern, *paths = declaration
+        try:
+            expected = int(expected_raw)
+        except ValueError as exc:
+            raise UpdateExecutionError(
+                f"search check {index} EXPECTED must be an integer"
+            ) from exc
+        checks.append(
+            {
+                "kind": "search",
+                "pattern": pattern,
+                "paths": paths,
+                "expected_matches": expected,
+            }
+        )
+    return {
+        "schema": REQUEST_SCHEMA,
+        "selected_skills": list(selected_skills),
+        "allowed_paths": allowed_paths,
+        "change_groups": groups,
+        "checks": checks,
+    }
+
+
+def _open_skill_change(
+    repo_root: pathlib.Path,
+    request: Mapping[str, object],
+) -> None:
+    """Persist one validated request or recover an identical open request."""
+
+    request_data = dict(request)
     with update_context(repo_root) as context:
         if read_record(context, "completion_receipt.json") is not None:
-            raise UpdateExecutionError("close the completed skill change before opening another")
+            raise UpdateExecutionError(
+                "close the completed skill change before opening another"
+            )
         original = read_record(context, "update_request.json")
         if original is not None:
-            _reject_link_chain(_absolute(request_path), "request")
-            if original.get("request") != _read_json(request_path, "request"):
-                raise UpdateExecutionError("another unfinished request exists; expand or replace it explicitly")
+            if original.get("request") != request_data:
+                raise UpdateExecutionError(
+                    "another unfinished request exists; expand or replace it explicitly"
+                )
             _recover_result(context, load_update(context))
             return
-        state = _validated_request(request_path, repo_root)
+        state = _validated_request_data(request_data, repo_root)
         if any(context.directory.iterdir()):
             raise UpdateExecutionError("unfinished records lack their original request")
-        write_record(context, "update_request.json", {
-            "schema": UPDATE_SCHEMA, "worktree_id": context.worktree_id,
-            "request": dict(_read_json(request_path, "request")), "initial_state": state,
-        })
+        write_record(
+            context,
+            "update_request.json",
+            {
+                "schema": UPDATE_SCHEMA,
+                "worktree_id": context.worktree_id,
+                "request": request_data,
+                "initial_state": state,
+            },
+        )
         append_state(context, state, None)
+
+
+def command_init(
+    repo_root: pathlib.Path,
+    selected_skills: Sequence[str],
+    group_declarations: Sequence[Sequence[str]],
+    command_check_files: Sequence[pathlib.Path],
+    search_declarations: Sequence[Sequence[str]],
+) -> str:
+    """Open an ordinary update without caller-authored JSON state."""
+
+    _open_skill_change(
+        repo_root,
+        _request_from_declarations(
+            selected_skills,
+            group_declarations,
+            command_check_files,
+            search_declarations,
+        ),
+    )
+    return _driver_status(repo_root)
+
+
+def command_open_skill_change(repo_root: pathlib.Path, request_path: pathlib.Path) -> None:
+    """Capture scope and original baseline before edits; identical reopening reuses it."""
+    resolved = _absolute(request_path)
+    _reject_link_chain(resolved, "request")
+    if not resolved.is_file():
+        raise UpdateExecutionError(f"request must be a regular file: {resolved}")
+    _open_skill_change(repo_root, _read_json(resolved, "request"))
 
 
 def _change_request(repo_root: pathlib.Path, request_path: pathlib.Path, *, replace_failed: bool) -> None:
@@ -827,6 +965,52 @@ def command_run_skill_checks(repo_root: pathlib.Path) -> None:
             raise UpdateExecutionError(failures[0])
 
 
+def _driver_status(repo_root: pathlib.Path) -> str:
+    """Return the durable workflow status and exactly one caller action."""
+
+    with update_context(repo_root) as context:
+        state = _validated_state(_recover_result(context, load_update(context)))
+        status = str(state["status"])
+        actions = {
+            "pending": "edit_declared_paths_then_run",
+            "checking": "run_to_resume_checks",
+            "passed": "complete_requested_caller_use_then_run_with_caller_use_complete",
+            "failed": "fix_reported_failure_then_run",
+        }
+        if status not in actions:
+            raise UpdateExecutionError(f"unsupported skill-change status: {status}")
+        payload: dict[str, object] = {
+            "status": status,
+            "next_action": actions[status],
+        }
+        result = read_result(context, state)
+        if status == "failed":
+            failures = result.get("failures") if isinstance(result, Mapping) else None
+            if not isinstance(failures, list) or not failures:
+                raise UpdateExecutionError("failed skill change lacks failure evidence")
+            payload["failure"] = failures[0]
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def command_run(repo_root: pathlib.Path, caller_use_complete: bool) -> str:
+    """Run needed checks once, report saved status, or close completed use."""
+
+    if caller_use_complete:
+        command_close_skill_change(repo_root)
+        return "OK"
+    try:
+        command_run_skill_checks(repo_root)
+    except UpdateExecutionError as original:
+        try:
+            status = _driver_status(repo_root)
+        except UpdateExecutionError:
+            raise original
+        if json.loads(status).get("status") != "failed":
+            raise original
+        return status
+    return _driver_status(repo_root)
+
+
 def command_close_skill_change(repo_root: pathlib.Path) -> None:
     """Consume saved acceptance; retain the completion receipt until cleanup ends."""
     with update_context(repo_root) as context:
@@ -878,7 +1062,24 @@ def command_close_skill_change(repo_root: pathlib.Path) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("open_skill_change", "expand_skill_scope", "run_skill_checks", "replace_failed_request", "close_skill_change"):
+    init = commands.add_parser("init")
+    init.add_argument("--repo-root", required=True, type=pathlib.Path)
+    init.add_argument("--selected-skill", action="append", required=True)
+    init.add_argument("--group", action="append", nargs="+", required=True)
+    init.add_argument(
+        "--command-check-file", action="append", type=pathlib.Path, default=[]
+    )
+    init.add_argument("--search-check", action="append", nargs="+", default=[])
+    run = commands.add_parser("run")
+    run.add_argument("--repo-root", required=True, type=pathlib.Path)
+    run.add_argument("--caller-use-complete", action="store_true")
+    for name in (
+        "open_skill_change",
+        "expand_skill_scope",
+        "run_skill_checks",
+        "replace_failed_request",
+        "close_skill_change",
+    ):
         command = commands.add_parser(name)
         command.add_argument("--repo-root", required=True, type=pathlib.Path)
         if name in {"open_skill_change", "expand_skill_scope", "replace_failed_request"}:
@@ -890,15 +1091,27 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         repo_root = _absolute(args.repo_root)
-        command = globals()["command_" + args.command]
-        if hasattr(args, "change_request"):
-            command(repo_root, args.change_request)
+        output: str | None = None
+        if args.command == "init":
+            output = command_init(
+                repo_root,
+                args.selected_skill,
+                args.group,
+                args.command_check_file,
+                args.search_check,
+            )
+        elif args.command == "run":
+            output = command_run(repo_root, args.caller_use_complete)
         else:
-            command(repo_root)
+            command = globals()["command_" + args.command]
+            if hasattr(args, "change_request"):
+                command(repo_root, args.change_request)
+            else:
+                command(repo_root)
     except (UpdateExecutionError, OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    print("OK")
+    print(output or "OK")
     return 0
 
 

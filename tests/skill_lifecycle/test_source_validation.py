@@ -97,6 +97,90 @@ def test_consistency_review_packet_resolves_one_installed_skill(
     assert packet["blockers"] == []
 
 
+def test_consistency_review_packet_uses_tracked_helpers_and_repo_resources(
+    tmp_path: pathlib.Path,
+) -> None:
+    repo = tmp_path / "source"
+    skill = "alpha-tool"
+    create_compatible_repo(repo, "test-source", [skill, "beta-tool"])
+    source_skill = repo / "skills" / skill
+    scripts = source_skill / "scripts"
+    scripts.mkdir()
+    (scripts / "helper.py").write_text("print('tracked')\n", encoding="utf-8")
+    shared_resource = (
+        repo / "skills" / "beta-tool" / "references" / "contracts" / "shared.json"
+    )
+    shared_resource.parent.mkdir(parents=True)
+    shared_resource.write_text("{}\n", encoding="utf-8")
+    (source_skill / "SKILL.md").write_text(
+        (source_skill / "SKILL.md").read_text(encoding="utf-8")
+        + "\nUse `skills/beta-tool/references/contracts/shared.json`.\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    validator = (
+        repo
+        / "skills"
+        / "ceratops-skill-lifecycle"
+        / "scripts"
+        / "skills-consistency-source-validator.py"
+    )
+    validator.parent.mkdir(parents=True)
+    validator.write_text("raise SystemExit(0)\n", encoding="utf-8", newline="\n")
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+
+    (scripts / "untracked.py").write_text("print('untracked')\n", encoding="utf-8")
+    cache = scripts / "__pycache__"
+    cache.mkdir()
+    (cache / "helper.pyc").write_bytes(b"generated-cache")
+    installed = tmp_path / "installed" / skill
+    installed.mkdir(parents=True)
+    (installed / ".runtime-manifest.json").write_text(
+        json.dumps(
+            {
+                "schema": "ceratops-runtime-skill.v3",
+                "skill": skill,
+                "runtime_source_id": "test-source",
+                "source_path": f"skills/{skill}",
+                "source_repository_root": str(repo),
+                "validation_profile": "ceratops-compatible",
+                "payload_patterns": [],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    output = tmp_path / "packet.json"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(CONSISTENCY_REVIEW_PACKET),
+            "--skill",
+            skill,
+            "--repo-root",
+            str(repo),
+            "--installed-skill",
+            str(installed),
+            "--output",
+            str(output),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    packet = json.loads(output.read_text(encoding="utf-8"))
+    assert packet["surfaces"]["helpers"] == ["scripts/helper.py"]
+    assert packet["surfaces"]["resources"] == [
+        "skills/beta-tool/references/contracts/shared.json"
+    ]
+    assert packet["blockers"] == []
+
+
 @pytest.mark.parametrize(
     ("command", "error"),
     [

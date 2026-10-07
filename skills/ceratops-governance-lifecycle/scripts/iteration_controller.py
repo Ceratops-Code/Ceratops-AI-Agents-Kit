@@ -35,6 +35,27 @@ VERSION = 2
 NO_IMPROVEMENT_LIMIT = 3
 
 
+def minimum_iterations_for_accepted_proposal() -> int:
+    """Return the smallest cap that can accept and converge a proposal."""
+    return NO_IMPROVEMENT_LIMIT + 1
+
+
+def validate_max_iterations(value: object) -> int:
+    """Reject a cap that cannot accept one proposal before convergence."""
+    minimum = minimum_iterations_for_accepted_proposal()
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or value < minimum
+    ):
+        raise ValueError(
+            "max iterations must be at least "
+            f"{minimum} to accept a proposal and observe convergence; "
+            f"received {value!r}"
+        )
+    return value
+
+
 def file_hash(path: Path) -> str:
     """Return a SHA-256 hash for an existing file."""
     digest = hashlib.sha256()
@@ -141,6 +162,7 @@ def open_iteration(
 
 def command_init(args: argparse.Namespace) -> None:
     """Create immutable run state; ``next`` owns every iteration opening."""
+    max_iterations = validate_max_iterations(args.max_iterations)
     state_path = args.state.resolve()
     if state_path.exists():
         raise ValueError(f"refusing to overwrite existing state: {state_path}")
@@ -171,7 +193,7 @@ def command_init(args: argparse.Namespace) -> None:
             "sha256": file_hash(validation_context),
             "value": context_value,
         },
-        "max_iterations": args.max_iterations,
+        "max_iterations": max_iterations,
         "patience": NO_IMPROVEMENT_LIMIT,
         "next_iteration": 1,
         "no_improvement_streak": 0,
@@ -239,7 +261,7 @@ def record_iteration(
     try:
         accept_candidate(
             candidate, validation_evidence,
-            expected_context=state["validation_context"]["value"], fix=True,
+            expected_context=state["validation_context"]["value"], fix=False,
         )
     except RuleCandidateValidationError as error:
         raise ValueError(str(error)) from error

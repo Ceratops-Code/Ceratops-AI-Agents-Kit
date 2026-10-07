@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import re
+from fnmatch import fnmatchcase
 from typing import Any
 
 from ..github_api import ApiResult, run_gh_api, run_json_command, substitute
@@ -269,6 +270,110 @@ def _active_rulesets(value: Any) -> list[dict[str, Any]]:
     ]
 
 
+def _ruleset_targets_default_branch(ruleset: dict[str, Any], default_branch: str) -> bool:
+    """Use only active rules whose declared ref condition covers the default branch.
+
+    Exact refs and GitHub's default/all tokens are unambiguous. Unknown include
+    globs fail closed; exclusion globs may conservatively remove a match.
+    """
+    conditions = ruleset.get("conditions")
+    ref_name = conditions.get("ref_name") if isinstance(conditions, dict) else None
+    if not isinstance(ref_name, dict) or not default_branch:
+        return False
+    included = ref_name.get("include")
+    excluded = ref_name.get("exclude")
+    if not isinstance(included, list) or not isinstance(excluded, list):
+        return False
+    branch_ref = f"refs/heads/{default_branch}"
+    exact_matches = {"~ALL", "~DEFAULT_BRANCH", branch_ref}
+    return any(pattern in exact_matches for pattern in included) and not any(
+        isinstance(pattern, str)
+        and (pattern in exact_matches or fnmatchcase(branch_ref, pattern))
+        for pattern in excluded
+    )
+
+
+def _ruleset_protection_facts(
+    active: list[dict[str, Any]], default_branch: str
+) -> dict[str, Any]:
+    """Map effective branch rules to the classic protection contract's facts.
+
+    Only a detailed, targeted ruleset can prove a protection. A pull-request-only
+    bypass still prevents direct administrator pushes; an always/exempt bypass
+    does not. Missing evidence stays unset so the contract cannot pass by guess.
+    """
+    targeted = [
+        item for item in active if _ruleset_targets_default_branch(item, default_branch)
+    ]
+    if not targeted:
+        return {}
+    rules = [
+        rule
+        for item in targeted
+        for rule in _items(item.get("rules"))
+        if isinstance(rule, dict)
+    ]
+    pull_requests = [
+        parameters
+        for rule in rules
+        if rule.get("type") == "pull_request"
+        for parameters in [rule.get("parameters")]
+        if isinstance(parameters, dict)
+    ]
+    status_checks = [
+        parameters
+        for rule in rules
+        if rule.get("type") == "required_status_checks"
+        for parameters in [rule.get("parameters")]
+        if isinstance(parameters, dict)
+    ]
+    required_checks = sorted(
+        {
+            entry["context"]
+            for parameters in status_checks
+            for entry in _items(parameters.get("required_status_checks"))
+            if isinstance(entry, dict) and isinstance(entry.get("context"), str)
+        }
+    )
+    review_counts = [
+        parameters["required_approving_review_count"]
+        for parameters in pull_requests
+        if isinstance(parameters.get("required_approving_review_count"), int)
+    ]
+    bypass_actors = [
+        actor
+        for item in targeted
+        for actor in _items(item.get("bypass_actors"))
+    ]
+    rule_types = {rule.get("type") for rule in rules}
+    return {
+        "strict": any(
+            parameters.get("strict_required_status_checks_policy") is True
+            for parameters in status_checks
+        ) if status_checks else None,
+        "required_checks": required_checks,
+        "approving_reviews": max(review_counts) if review_counts else None,
+        "dismiss_stale_reviews": any(
+            parameters.get("dismiss_stale_reviews_on_push") is True
+            for parameters in pull_requests
+        ) if pull_requests else None,
+        "code_owner_reviews": any(
+            parameters.get("require_code_owner_review") is True
+            for parameters in pull_requests
+        ) if pull_requests else None,
+        "conversation_resolution": any(
+            parameters.get("required_review_thread_resolution") is True
+            for parameters in pull_requests
+        ) if pull_requests else None,
+        "enforce_admins": all(
+            isinstance(actor, dict) and actor.get("bypass_mode") == "pull_request"
+            for actor in bypass_actors
+        ),
+        "allow_force_pushes": False if "non_fast_forward" in rule_types else None,
+        "allow_deletions": False if "deletion" in rule_types else None,
+    }
+
+
 def _ruleset_facts(
     active: list[dict[str, Any]], expected_actors: list[Any], default_branch: str
 ) -> dict[str, Any]:
@@ -409,7 +514,10 @@ def collect_repository(
     pull_request_reviews = protection_data.get("required_pull_request_reviews") or {}
     rulesets_response = _result(fetched, "/repos/${owner}/${repo}/rulesets", parameters)
     active_rulesets = _active_rulesets(rulesets_response.data)
-    if active_rulesets and _uses_state_path(rules, "/repository/rulesets/"):
+    if active_rulesets and (
+        _uses_state_path(rules, "/repository/rulesets/")
+        or _uses_state_path(rules, "/repository/protection_facts/")
+    ):
         details = []
         for ruleset in active_rulesets:
             ruleset_id = ruleset.get("id")
@@ -425,6 +533,27 @@ def collect_repository(
                 else ruleset
             )
         active_rulesets = details or active_rulesets
+    protection_facts = {
+        "strict": required_status_checks.get("strict"),
+        "required_checks": required_status_checks.get("checks")
+        or required_status_checks.get("contexts")
+        or [],
+        "approving_reviews": pull_request_reviews.get("required_approving_review_count"),
+        "dismiss_stale_reviews": pull_request_reviews.get("dismiss_stale_reviews"),
+        "code_owner_reviews": pull_request_reviews.get("require_code_owner_reviews"),
+        "conversation_resolution": (
+            protection_data.get("required_conversation_resolution") or {}
+        ).get("enabled"),
+        "enforce_admins": (protection_data.get("enforce_admins") or {}).get("enabled"),
+        "allow_force_pushes": (protection_data.get("allow_force_pushes") or {}).get(
+            "enabled"
+        ),
+        "allow_deletions": (protection_data.get("allow_deletions") or {}).get(
+            "enabled"
+        ),
+    }
+    if not protection.ok:
+        protection_facts.update(_ruleset_protection_facts(active_rulesets, default_branch))
 
     dependabot_prs = (
         _search_dependabot_prs(parameters)
@@ -575,31 +704,7 @@ def collect_repository(
             "active_ruleset": bool(active_rulesets),
         },
         "protection": protection_data,
-        "protection_facts": {
-            "strict": required_status_checks.get("strict"),
-            "required_checks": required_status_checks.get("checks")
-            or required_status_checks.get("contexts")
-            or [],
-            "approving_reviews": pull_request_reviews.get(
-                "required_approving_review_count"
-            ),
-            "dismiss_stale_reviews": pull_request_reviews.get("dismiss_stale_reviews"),
-            "code_owner_reviews": pull_request_reviews.get(
-                "require_code_owner_reviews"
-            ),
-            "conversation_resolution": (
-                protection_data.get("required_conversation_resolution") or {}
-            ).get("enabled"),
-            "enforce_admins": (protection_data.get("enforce_admins") or {}).get(
-                "enabled"
-            ),
-            "allow_force_pushes": (protection_data.get("allow_force_pushes") or {}).get(
-                "enabled"
-            ),
-            "allow_deletions": (protection_data.get("allow_deletions") or {}).get(
-                "enabled"
-            ),
-        },
+        "protection_facts": protection_facts,
         "rulesets": _ruleset_facts(
             active_rulesets,
             parameters.get("expected_maintainer_bypass_actors", []),

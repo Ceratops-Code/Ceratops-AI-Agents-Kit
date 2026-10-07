@@ -79,17 +79,26 @@ repo docs, then update the narrowest correct source that exists.
 
 #### 3. Apply updates at the real source
 
-- Before editing helper-runtime code or a multi-file contract, create a
-  caller-owned request with schema `ceratops-skill-update-request.v3`,
-  selected skills, allowed paths, cohesive change groups and non-test checks.
-  `WORKTREE` is the selected task worktree; `REQUEST` is that JSON file.
-  Run these commands with the skill's managed Python runtime.
-- (D) Before editing, run `python scripts/skill-update-workflow.py
-  open_skill_change --repo-root WORKTREE --change-request REQUEST`.
+- (D) Before editing helper-runtime code or a multi-file contract, run `python
+  scripts/skill-update-workflow.py init --repo-root WORKTREE --selected-skill
+  SKILL --group NAME PATH`.
+- Repeat `--selected-skill` and `--group` as needed, and declare non-test checks
+  with `--command-check-file FILE` or `--search-check EXPECTED PATTERN PATH`.
+  `init` derives allowed paths from the groups, records the closed request in
+  the worktree-owned checkpoint, and returns one next action. Command-check
+  files are UTF-8 with one exact argument per nonempty line.
+- For a caller-owned complete `ceratops-skill-update-request.v3`, run `python
+  scripts/skill-update-workflow.py open_skill_change --repo-root WORKTREE
+  --change-request REQUEST`. `WORKTREE` is the selected task worktree;
+  `REQUEST` is the caller's JSON file. Run these commands with the skill's
+  managed Python runtime.
 - The calling task applies the requested source edits. This helper records
   approved scope and checks; it does not edit, commit, promote or deploy source.
-- (D) After editing, run `python scripts/skill-update-workflow.py
-  run_skill_checks --repo-root WORKTREE`.
+- (D) After editing, run `python scripts/skill-update-workflow.py run
+  --repo-root WORKTREE`.
+- `run` performs only the needed verification, then returns the recorded status
+  and one next action. Caller-owned request flows may use the lower-level
+  `run_skill_checks --repo-root WORKTREE` command.
 - Preserve the original Git and dirty-file baselines, explicit approved scope,
   shared-source ownership and Git whitespace gates. Tests remain owned by the
   repository-declared SDLC test phase; requests contain only non-test checks.
@@ -147,13 +156,15 @@ repo docs, then update the narrowest correct source that exists.
 - If runtime generation, installer, or transaction code changed, run the
   affected transaction tests and one all-managed temporary installation.
 - (D) After successful checks and the final requested commit, deployment or
-  other caller use, run `python scripts/skill-update-workflow.py
-  close_skill_change --repo-root WORKTREE`.
+  other caller use, run `python scripts/skill-update-workflow.py run
+  --repo-root WORKTREE --caller-use-complete`.
 - Closing consumes saved success without rechecking the checkout, writes
   `completion_receipt.json`, and removes the operation's checkpoints.
   It preserves caller inputs and unrelated work. Interrupted cleanup resumes
   from that receipt; successful close also sweeps removed-worktree checkpoints
-  for the same producer. Do not close failed or incomplete changes.
+  for the same producer. Caller-owned request flows may use the lower-level
+  `close_skill_change --repo-root WORKTREE` command. Do not close failed or
+  incomplete changes.
 - After committing, use `$ceratops-repo-lifecycle` `promote` when only local
   release staging is requested, `promote-and-deploy` when the repository's
   declared deployment should run, or `ship` when the staged release should be

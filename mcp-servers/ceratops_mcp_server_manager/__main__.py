@@ -6,10 +6,19 @@ import sys
 from . import MCP_SERVER_NAME, __version__
 
 if sys.argv[1:] == ["--deployment-check"]:
-    from .server import build_server
+    from .server import TOOL_INPUT_SCHEMA_CONTRACT, build_server
 
     build_server()
-    print(json.dumps({"mcp_server_id": MCP_SERVER_NAME, "version": __version__, "ready": True}))
+    print(
+        json.dumps(
+            {
+                "mcp_server_id": MCP_SERVER_NAME,
+                "version": __version__,
+                "ready": True,
+                "tools": TOOL_INPUT_SCHEMA_CONTRACT,
+            }
+        )
+    )
 elif sys.argv[1:] == ["--mcp"]:
     from .server import build_server
 

@@ -35,6 +35,108 @@ def load(name):
     return module
 
 
+def test_default_install_root_is_user_codex_mcp():
+    assert storage.INSTALL_ROOT == Path.home() / ".codex" / "mcp"
+
+
+def test_child_environment_retains_profile_for_user_owned_install_root(tmp_path, monkeypatch):
+    monkeypatch.setattr(storage, "INSTALL_ROOT", tmp_path / "installed")
+    environment = engine_module.child_environment(storage.Layout("fixture"), tmp_path / "temporary")
+    probe = subprocess.run(
+        [sys.executable, "-I", "-B", "-c", "from pathlib import Path; print(Path.home())"],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert probe.returncode == 0, probe.stderr
+    assert Path(probe.stdout.strip()) == Path.home()
+    assert "HOME" not in environment
+
+
+def test_legacy_catalog_import_rehydrates_without_copying_environments(
+    deployment, tmp_path, monkeypatch
+):
+    """Import immutable inputs, then rebuild the old active selection."""
+    legacy = tmp_path / "legacy"
+    target = tmp_path / "current"
+    legacy.mkdir()
+    bundle = make_release(legacy, "1.0.0", mcp_server="fixture")
+    manifest_sha256 = bundle.name
+    selection = {
+        "schema": 1,
+        "mcp_server_id": "fixture",
+        "version": "1.0.0",
+        "manifest_sha256": manifest_sha256,
+        "instance": "a" * 32,
+        "module": "fixture",
+    }
+    server = legacy / "fixture"
+    (server / "current.json").write_text(json.dumps(selection), encoding="utf-8")
+    legacy_environment = (
+        server
+        / "versions"
+        / "1.0.0"
+        / selection["instance"]
+        / "environment"
+    )
+    legacy_environment.mkdir(parents=True)
+    (legacy_environment / "legacy-marker.txt").write_text("do not copy")
+    monkeypatch.setattr(storage, "INSTALL_ROOT", target)
+    engine = engine_module.Engine()
+    module = load("deploy-mcp-server-manager")
+
+    original_run = engine_module.run
+
+    def legacy_readiness(command, **kwargs):
+        response = original_run(command, **kwargs)
+        if "--deployment-check" in command:
+            value = json.loads(response)
+            del value["tools"]
+            return json.dumps(value)
+        return response
+
+    monkeypatch.setattr(engine_module, "run", legacy_readiness)
+    monkeypatch.setattr(
+        engine_module,
+        "probe_published_tool_schemas",
+        lambda *_args: pytest.fail("legacy release must not require a new schema probe"),
+    )
+
+    selections, imported = module.import_catalogs(legacy)
+    assert imported == [
+        {"mcp_server_name": "fixture", "available_versions": ["1.0.0"]}
+    ]
+    assert selections == [selection]
+    assert (target / "fixture/registry.json").is_file()
+    assert not (target / "fixture/current.json").exists()
+    assert not (target / "fixture/versions").exists()
+
+    rebuilt = module.rehydrate_selected(engine, selections)
+    assert rebuilt[0]["status"] == "installed"
+    assert engine.selected("fixture")["manifest_sha256"] == manifest_sha256
+    assert not list(target.glob("**/legacy-marker.txt"))
+    assert (legacy_environment / "legacy-marker.txt").read_text() == "do not copy"
+
+    repeated_selections, repeated_import = module.import_catalogs(legacy)
+    assert repeated_import == imported
+    assert module.rehydrate_selected(engine, repeated_selections)[0]["status"] == "reused"
+
+
+def test_legacy_catalog_import_rejects_tampering_before_writes(tmp_path, monkeypatch):
+    legacy = tmp_path / "legacy"
+    target = tmp_path / "current"
+    legacy.mkdir()
+    bundle = make_release(legacy, "1.0.0", mcp_server="fixture")
+    next(bundle.glob("*.whl")).write_bytes(b"tampered")
+    monkeypatch.setattr(storage, "INSTALL_ROOT", target)
+    module = load("deploy-mcp-server-manager")
+
+    with pytest.raises(contracts.DeploymentError, match="wheel digest mismatch"):
+        module.import_catalogs(legacy)
+    assert not target.exists()
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="Global runtime prerequisites require Windows")
 @pytest.mark.parametrize("case", ["valid", "missing-python", "missing-uv", "private-runtime", "old-python", "old-uv", "invalid-probe"])
 def test_deploy_completes_launchers_after_runtime_record(tmp_path, monkeypatch, case):
@@ -228,6 +330,7 @@ def test_package_wheel_prerequisite_is_registered_and_installed_without_package_
     assert len(calls) == 1 and calls[0][0][1] == "build"
     release_dir = runtime_root / "fixture" / "artifacts" / "1.0.0" / registered["manifest_sha256"]
     release = json.loads((release_dir / "manifest.json").read_text())
+    assert release["schema"] == 2
     assert {entry["filename"] for entry in release["wheels"]} == {"fixture-1.0.0-py3-none-any.whl", wheel.name}
     assert (release_dir / wheel.name).read_bytes() == wheel.read_bytes()
     assert not (runtime_root / "fixture" / "current.json").exists()
@@ -394,12 +497,20 @@ def test_package_wheel_prerequisite_rejects_invalid_contract_before_build(source
     assert not calls and not (runtime_root / "fixture" / "registry.json").exists()
 
 
-def test_cli_lock_refresh_does_not_build_register_or_activate(source_package, capsys):
+@pytest.mark.parametrize("python_version", ["3.14.0", "3.14.7"])
+def test_cli_lock_refresh_does_not_build_register_or_activate(source_package, capsys, monkeypatch, python_version):
     project, runtime_root, calls = source_package
+    current = package_module.global_runtime()
+    monkeypatch.setattr(
+        package_module,
+        "global_runtime",
+        lambda: engine_module.Runtime(current.python, current.uv, python_version, current.uv_version),
+    )
     (project / "pylock.toml").unlink()
     assert cli.main(["package", "--source", str(project), "--lock"]) == 0
     assert json.loads(capsys.readouterr().out) == {"lock": str(project / "pylock.toml")}
     assert len(calls) == 1 and calls[0][0][1:3] == ["pip", "compile"]
+    assert calls[0][0][calls[0][0].index("--python-version") + 1] == python_version
     assert not (runtime_root / "fixture/registry.json").exists()
     assert not (runtime_root / "fixture/current.json").exists()
     assert not list((runtime_root / "fixture/staging").iterdir())

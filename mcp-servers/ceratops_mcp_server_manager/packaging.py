@@ -216,7 +216,8 @@ def package(source: Path, *, lock_only: bool = False,
         if package_lock is None and (lock.exists() or lock.is_symlink()):
             source_file(source, "pylock.toml")
         if lock_only:
-            run([str(uv), "pip", "compile", "pyproject.toml", "--python", str(python), "--python-platform", "windows",
+            run([str(uv), "pip", "compile", "pyproject.toml", "--python", str(python), "--python-version", runtime.python_version,
+                 "--python-platform", "windows",
                  "--format", "pylock.toml", "--output-file", "pylock.toml", "--no-header", "--no-config", "--no-sources"], cwd=source, env=env)
             return {"lock": str(lock)}
         if package_lock is not None and package_lock.name == "uv.lock":
@@ -297,7 +298,7 @@ def package(source: Path, *, lock_only: bool = False,
             if digest(destination) != wheel["hashes"]["sha256"]:
                 raise DeploymentError("locked dependency digest mismatch")
             wheels.append(destination)
-        release = manifest({**config, "version": version, "wheels": [{"filename": p.name, "sha256": digest(p)} for p in sorted(wheels)]})
+        release = manifest({**config, "schema": 2, "version": version, "wheels": [{"filename": p.name, "sha256": digest(p)} for p in sorted(wheels)]})
         manifest_path = temporary / "manifest.json"
         manifest_path.write_text(json.dumps(release, sort_keys=True, indent=2) + "\n", encoding="utf-8")
         release_hash = digest(manifest_path)

@@ -24,7 +24,7 @@ from typing import Any
 from . import MCP_SERVER_NAME
 from .contracts import DeploymentError, active, read_json, registry, token
 
-INSTALL_ROOT = Path("C:/AI-Agents-MCP-Servers")
+INSTALL_ROOT = Path.home() / ".codex" / "mcp"
 ABANDONED_SECONDS = 24 * 60 * 60
 RETAINED_INSTALLATIONS = 3
 

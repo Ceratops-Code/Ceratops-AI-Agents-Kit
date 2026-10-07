@@ -21,7 +21,9 @@ from typing import Any
 SCHEMA = "ceratops-skills-consistency-review-packet.v1"
 RUNTIME_SCHEMA = "ceratops-runtime-skill.v3"
 SKILL_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
-RESOURCE_RE = re.compile(r"references/[A-Za-z0-9_.\-/]+")
+RESOURCE_RE = re.compile(
+    r"(?:skills/[A-Za-z0-9_.-]+/)?references/[A-Za-z0-9_.\-/]+"
+)
 TEXT_SUFFIXES = {".json", ".md", ".py", ".toml", ".yaml", ".yml"}
 CAPTURE_LIMIT = 32_000
 
@@ -100,13 +102,67 @@ def source_resources(source_skill: pathlib.Path) -> list[str]:
     return sorted(values)
 
 
-def helper_callers(source_skill: pathlib.Path, helpers: list[pathlib.Path]) -> dict[str, list[str]]:
+def tracked_files(repo: pathlib.Path, source_root: pathlib.Path) -> list[pathlib.Path]:
+    """Return existing Git-tracked files below one contained source root.
+
+    Generated caches and other untracked files must never become review surfaces.
+    Literal pathspec handling also keeps repository-controlled names from changing
+    the meaning of the Git query.
+    """
+
+    try:
+        source_relative = source_root.relative_to(repo).as_posix()
+    except ValueError as exc:
+        raise PacketError("source root escapes the selected repository") from exc
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "--literal-pathspecs",
+                "ls-files",
+                "-z",
+                "--",
+                source_relative,
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="surrogateescape",
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise PacketError("Git-tracked source enumeration was unavailable") from exc
+    if result.returncode != 0:
+        diagnostic = result.stderr.strip()[:500]
+        suffix = f": {diagnostic}" if diagnostic else ""
+        raise PacketError(f"Git-tracked source enumeration failed{suffix}")
+    files: list[pathlib.Path] = []
+    for value in result.stdout.split("\0"):
+        if not value:
+            continue
+        pure = pathlib.PurePosixPath(value)
+        path = (repo / pathlib.Path(*pure.parts)).resolve()
+        if not path.is_relative_to(source_root):
+            raise PacketError(f"tracked source path escapes selected skill: {value}")
+        if path.is_file():
+            files.append(path)
+    return sorted(files)
+
+
+def helper_callers(
+    source_skill: pathlib.Path,
+    helpers: list[pathlib.Path],
+    source_files: list[pathlib.Path],
+) -> dict[str, list[str]]:
     """Map each helper to selected-skill text files that explicitly name it."""
 
     candidates = [
         path
-        for path in source_skill.rglob("*")
-        if path.is_file() and path.suffix.lower() in TEXT_SUFFIXES
+        for path in source_files
+        if path.suffix.lower() in TEXT_SUFFIXES
     ]
     result: dict[str, list[str]] = {}
     for helper in helpers:
@@ -283,7 +339,8 @@ def packet(args: argparse.Namespace) -> dict[str, Any]:
 
     resources = source_resources(source_skill)
     for resource in resources:
-        existing_file(source_skill, resource, blockers)
+        resource_root = repo if resource.startswith("skills/") else source_skill
+        existing_file(resource_root, resource, blockers)
     payload_map = mapping(manifest.get("runtime_payloads", {}), "runtime payloads")
     payloads: list[object] = []
     for owner in ("*", skill):
@@ -292,11 +349,13 @@ def packet(args: argparse.Namespace) -> dict[str, Any]:
             raise PacketError(f"runtime_payloads.{owner} must be a list")
         payloads.extend(declared)
 
-    helpers = sorted(
+    source_files = tracked_files(repo, source_skill)
+    scripts_root = source_skill / "scripts"
+    helpers = [
         path
-        for path in (source_skill / "scripts").rglob("*")
-        if path.is_file()
-    ) if (source_skill / "scripts").is_dir() else []
+        for path in source_files
+        if scripts_root.is_dir() and path.is_relative_to(scripts_root)
+    ]
     metadata = source_skill / "agents" / "openai.yaml"
     if not metadata.is_file():
         blockers.append("missing source metadata: agents/openai.yaml")
@@ -355,7 +414,7 @@ def packet(args: argparse.Namespace) -> dict[str, Any]:
             "resources": resources,
             "runtime_payloads": payloads,
             "helpers": [path.relative_to(source_skill).as_posix() for path in helpers],
-            "helper_callers": helper_callers(source_skill, helpers),
+            "helper_callers": helper_callers(source_skill, helpers, source_files),
             "installers": installers,
             "validator": relative(repo, validator),
             "documentation": docs,

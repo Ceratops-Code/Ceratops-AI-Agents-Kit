@@ -20,6 +20,18 @@ storage = importlib.import_module("ceratops_mcp_server_manager.storage")
 contracts = importlib.import_module("ceratops_mcp_server_manager.contracts")
 cli = importlib.import_module("ceratops_mcp_server_manager.cli")
 
+FIXTURE_INPUT_SCHEMA = {
+    "type": "object",
+    "properties": {"name": {"type": "string"}},
+    "required": ["name"],
+}
+FIXTURE_TOOL_CONTRACT = {
+    "inspect": {
+        "input_schema": FIXTURE_INPUT_SCHEMA,
+        "opaque_parameters": [],
+    }
+}
+
 
 def make_release(
     root, version, *, mcp_server="fixture", dependency=False, metadata_name=None
@@ -74,11 +86,21 @@ def deployment(tmp_path, monkeypatch):
         if "--deployment-check" in command:
             version, mcp_server = cwd.parent.name, cwd.parents[2].name
             return json.dumps(
-                {"mcp_server_id": mcp_server, "version": version, "ready": True}
+                {
+                    "mcp_server_id": mcp_server,
+                    "version": version,
+                    "ready": True,
+                    "tools": FIXTURE_TOOL_CONTRACT,
+                }
             )
         return ""
 
     monkeypatch.setattr(engine_module, "run", fake_run)
+    monkeypatch.setattr(
+        engine_module,
+        "probe_published_tool_schemas",
+        lambda *_args: {"inspect": FIXTURE_INPUT_SCHEMA},
+    )
     return engine, calls, failure
 
 
@@ -106,6 +128,93 @@ def test_install_update_previous_and_versions(deployment, tmp_path):
     assert (tmp_path / "fixture/registry.json").read_bytes() == own_registry
     assert engine.versions("independent")["available_versions"] == ["1.0.0"]
     assert not (tmp_path / "registry.json").exists()
+
+
+def test_install_rejects_list_tools_schema_drift_before_activation(
+    deployment, tmp_path, monkeypatch
+):
+    engine, _, _ = deployment
+    make_release(tmp_path, "1.0.0")
+    monkeypatch.setattr(
+        engine_module,
+        "probe_published_tool_schemas",
+        lambda *_args: {"inspect": {"type": "object"}},
+    )
+
+    with pytest.raises(
+        contracts.DeploymentError,
+        match="published MCP tool input schema differs from canonical",
+    ):
+        engine.install("fixture", "1.0.0")
+
+    assert not (tmp_path / "fixture/current.json").exists()
+    assert not list((tmp_path / "fixture/versions").iterdir())
+
+
+def test_schema_probe_uses_short_lived_child_process(tmp_path, monkeypatch):
+    dependency = tmp_path / "bootstrap/libraries/mcp/__init__.py"
+    dependency.parent.mkdir(parents=True)
+    dependency.write_text("", encoding="utf-8")
+    specification = importlib.util.spec_from_file_location("mcp", dependency)
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    executable = candidate / "python.exe"
+    executable.write_bytes(b"candidate")
+    recorded: dict[str, Any] = {}
+
+    monkeypatch.setattr(
+        engine_module.importlib.util,
+        "find_spec",
+        lambda name: specification if name == "mcp" else None,
+    )
+
+    def fake_run(command, *, cwd, env, timeout=120):
+        recorded.update(command=command, cwd=cwd, env=env, timeout=timeout)
+        return json.dumps({"inspect": FIXTURE_INPUT_SCHEMA})
+
+    monkeypatch.setattr(engine_module, "run", fake_run)
+
+    assert engine_module.probe_published_tool_schemas(
+        executable, "fixture", candidate, {"SYSTEMROOT": "C:/Windows"}
+    ) == {"inspect": FIXTURE_INPUT_SCHEMA}
+    assert recorded["command"] == [
+        sys.executable,
+        "-B",
+        "-s",
+        "-m",
+        "ceratops_mcp_server_manager.engine",
+        "--probe-list-tools",
+        str(executable),
+        "fixture",
+        str(candidate),
+    ]
+    assert recorded["cwd"] == candidate and recorded["timeout"] == 45
+    probe_paths = recorded["env"]["PYTHONPATH"].split(os.pathsep)
+    assert str(dependency.parents[1]) in probe_paths
+    module_file = engine_module.__file__
+    assert module_file is not None
+    assert str(Path(module_file).resolve().parents[1]) in probe_paths
+
+
+def test_schema_probe_child_main_emits_structured_result(
+    tmp_path, monkeypatch, capsys
+):
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    executable = candidate / "python.exe"
+    executable.write_bytes(b"candidate")
+
+    async def fake_probe(*_args):
+        return {"inspect": FIXTURE_INPUT_SCHEMA}
+
+    monkeypatch.setattr(engine_module, "_published_tool_schemas", fake_probe)
+
+    assert engine_module._schema_probe_main(
+        ["--probe-list-tools", str(executable), "fixture", str(candidate)]
+    ) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "inspect": FIXTURE_INPUT_SCHEMA
+    }
 
 
 def test_deployment_retains_current_two_predecessors_and_prunes_release_bytes(deployment, tmp_path):
@@ -269,6 +378,9 @@ def test_tampered_wheel_rejected_before_execution(deployment, tmp_path):
 def test_strict_manifest_rejects_commands_extra_fields_and_wheel_paths(tmp_path):
     bundle = make_release(tmp_path, "1.0.0")
     value = json.loads((bundle / "manifest.json").read_text())
+    assert contracts.manifest({**value, "schema": 2})["schema"] == 2
+    with pytest.raises(contracts.DeploymentError, match="schema"):
+        contracts.manifest({**value, "schema": 3})
     with pytest.raises(contracts.DeploymentError):
         contracts.manifest({**value, "command": "whoami"})
     value["wheels"][0]["filename"] = "../escape.whl"
@@ -278,6 +390,16 @@ def test_strict_manifest_rejects_commands_extra_fields_and_wheel_paths(tmp_path)
         contracts.registry({"schema": True, "mcp_server_id": "fixture", "versions": {}})
     with pytest.raises(contracts.DeploymentError):
         contracts.registry({"schema": 1, "mcp_server_id": "fixture", "versions": {}}, "independent")
+
+
+def test_legacy_readiness_preserves_immutable_releases_without_weakening_new_ones():
+    legacy = {"mcp_server_id": "fixture", "version": "1.0.0", "ready": True}
+    assert contracts.deployment_check(legacy, "fixture", "1.0.0", manifest_schema=1) is None
+    with pytest.raises(contracts.DeploymentError):
+        contracts.deployment_check(legacy, "fixture", "1.0.0", manifest_schema=2)
+    with_tools = {**legacy, "tools": FIXTURE_TOOL_CONTRACT}
+    assert contracts.deployment_check(with_tools, "fixture", "1.0.0", manifest_schema=1) == FIXTURE_TOOL_CONTRACT
+    assert contracts.deployment_check(with_tools, "fixture", "1.0.0", manifest_schema=2) == FIXTURE_TOOL_CONTRACT
 
 
 def test_duplicate_json_keys_rejected(tmp_path):

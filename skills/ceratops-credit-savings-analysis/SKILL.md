@@ -15,9 +15,9 @@ recommends controls but never applies them.
 
 ## Design Reference
 
-`README.md` is the authoritative architecture and maintenance reference. Read
-it before changing or diagnosing this skill's workflow, schemas, persistence,
-retry, recovery, or deployment behavior.
+`README.md` is the architecture and maintenance reference. Read it before
+changing or diagnosing this skill. The versioned executable contract and
+controller implementation are authoritative for workflow mechanics.
 
 ## Public Action Routing
 
@@ -29,7 +29,8 @@ retry, recovery, or deployment behavior.
   `references/deep-thread-analysis.md`
 - Analyze helper contracts alone for one selected root thread and its retained
   descendants: `references/helper-contracts.md`
-- Analyze context and evidence alone for one selected root thread and its retained
+- Analyze context and evidence alone for one selected root thread and its
+  retained
   descendants: `references/context-evidence.md`
 - Analyze rework and validation alone for one selected root thread and its
   retained descendants: `references/rework-validation.md`
@@ -38,140 +39,35 @@ retry, recovery, or deployment behavior.
 - Analyze instruction reasoning alone for one selected root thread and its
   retained descendants: `references/instruction-reasoning.md`
 
-The next three sections govern `deep-thread-analysis` and the five named surfaces.
+ The next three sections govern `deep-thread-analysis` and the five named
+surfaces.
 `quick-analysis` uses its own evidence, classification, and completion rules.
 
-## Shared Evidence And Controller Invariants
+## Shared Evidence And Controller Contract
 
 - Resolve one exact root thread. The current thread is only the valid
   `CODEX_THREAD_ID`; never infer it from recency. Resolve an exact thread name
   against the thread index and reject zero or multiple matches. An incremental
   closure begins strictly after the previous completed closure; active runs and
   the boundary run are excluded.
-- For deep analysis or one named surface alone, run
-  `python scripts/credit-analysis-workflow.py run --request REQUEST`.
-- On every fresh plan, validate the installed
-  contract and bind its version and hash to controller state. Resume only from
-  state whose immutable artifacts still validate. Require mutation authority
-  `false`, use a task root under `<repo-parent>/tmp/<repo-name>/<thread-name>`,
-  and keep retained evidence inside it.
-  Analyze every available retained descendant discovered from that root's source
-  lineage as ordinary source runs; report unavailable references and exclude
-  only descendants created by the current analysis.
-- Planning retains complete protected evidence and read-only canonical
-  snapshots. Deep analysis treats every completed run as one semantic unit,
-  freezes run order and UTF-8 byte counts, and divides only an oversized run
-  into
-  the minimum ordered input parts that each fit Luna. Calls remain attached to
-  their run context. If seventy Luna attempts cannot cover all prepared
-  evidence,
-  prioritize the largest runs and their immediate successors, admit as many
-  ordered parts as the remaining slots allow, and record the exact unreviewed
-  remainder. Retain input bytes, planned Luna-output bytes, and actual output
-  bytes for every run part. Reserve the controller prompt and output schema
-  inside each proven UTF-8 input envelope.
-- The end-to-end `run` command executes or resumes the frozen plan. Keep
-  `plan --request` for planning-only inspection and `execute --state` for direct
-  state-path resume. Treat controller state, evidence and manifest hashes, task
-  identities, candidate membership, prompts, results, and attempt telemetry as
-  authoritative. Execution never recollects the session. Never skip, repeat,
-  reorder, or add a semantic task outside the manifest.
-- Before freezing child tasks, read and retain the complete effective global
-  and run-local `AGENTS.md` chain once. If a recorded canonical worktree cwd is
-  gone, use its primary checkout only after exact repository-identity
-  verification and record the substitution. Launch Luna from each verified run
-  cwd and Sol from the verified primary cwd; retain the frozen chain hash on
-  every task and attempt and give Sol the frozen hash and frozen differing
-  run-local rule text. During execution and resume, validate the retained rule
-  snapshot from its stored text and hashes without rereading live `AGENTS.md`;
-  later live instruction changes do not invalidate accepted or pending analysis
-  tasks. Stop on an unresolved source or rule-snapshot omission; never fall
-  back to task temporary root.
-- The controller validates `gpt-5.6-luna` and `gpt-5.6-sol` at maximum effort
-  from the local Codex catalog. Luna and Sol children retain native rollout
-  state. Every child is approval-free and read-only. The
-  controller owns waiting, timeout, process-tree termination, non-model
-  progress,
-  prompts, evidence, results, and telemetry, and never spends model calls
-  polling
-  children. Accepted calls and attempts retain immutable hashes and resumable
-  attempt records.
-  Validate and durably checkpoint each completed child while siblings continue.
-  Keep shared orchestration state mutations in the controller and final ordering
-  deterministic.
-- Luna inspects every admitted call across all five fixed surfaces and
-  selects the strongest supported candidates within a frozen count limit.
-  Disclose when a task reaches that limit so discovery is not described as
-  exhaustive.
-  Run up to fifteen Luna children concurrently and admit no more than seventy
-  Luna attempts for one frozen thread tree, including corrective reruns. Launch
-  Luna with a retained native session so a later analysis can collect it as an
-  ordinary descendant thread. Before launch, assign every admitted run part to
-  one of up to six Sol reviewers. Calculate each Luna's output-byte allowance
-  from its reviewer's fixed input and remaining proven capacity. Divide a
-  conservative candidate count budget among that reviewer's Luna tasks before
-  launch and validate both limits. If a Luna result violates its
-  schema or allowance, rerun that task once with a smaller output allowance; if
-  it still fails, report that run part as unreviewed and continue. Never
-  truncate
-  a result, detach calls from their run context, or create per-surface Luna
-  calls.
-- A temporary-control review governs only its described owner/control subclaim
-  and does not veto an independent finding carried by the same candidate. Route
-  every retained Luna candidate exactly once to its preassigned reviewer. Apply
-  the unassessed-call ceiling only to the aggregate routed call set. When that
-  aggregate exceeds the ceiling and both Sol limits permit, review only
-  the unassessed calls with their complete run-part context and replace those
-  classifications; prioritize this recovery over optional direct-evidence
-  review. After the parallel reviewers and any recovery or direct-evidence
-  review finish, run one dependent final Sol to judge candidates without an
-  accepted decision and deeply verify the top three deduplicated owner/control
-  findings against exact evidence. Code carries accepted judgments into the
-  final result and produces the report. Each rejected Sol task receives one
-  automatic corrective retry when the sixteen-attempt ceiling permits. When the
-  caller requests stop-on-validation-error, run model tasks serially and stop after
-  the first rejection before another model call. After a non-final
-  task fails validation twice, retain its exact unreviewed candidate, call, and
-  byte inventory, exclude that inventory from final transport, and continue to
-  the final merger. Plan at most eight Sol calls, excluding retries and
-  corrective attempts; allow at most sixteen actual Sol invocations including
-  initial calls, retries, and corrective attempts. The final Sol does not
-  re-adjudicate every candidate or receive the complete source tree.
-- Restore canonical identifiers, derive candidate dispositions from finding/risk
-  links, and derive nonsemantic summaries, ordering, surfaces, workstreams,
-  repeated evidence, final helper-category summaries, and savings arithmetic
-  in code. The final Sol returns an empty
-  helper-category review array; copy exact accepted reviewer records and
-  assemble that section in the controller. Sol adjudicators merge overlaps and
-  temporary controls, apply recurrence and ROI rules, and classify source calls
-  in grouped form. Persist result-size,
-  duration, visible-token, and reasoning-token telemetry as diagnostics. Run no
-  model bookkeeping calls; stop before execution when the finite plan is
-  malformed or changes admitted run, part, or candidate coverage.
-  Generate model-facing schemas and Python shape checks from one shared response
-  contract, preserving independent evidence and semantic validation. Give each
-  existing corrective retry its complete retained prior response,
-  exact validation errors, and deterministically diagnosed invalid-claim scope
-  inside the proven input envelope. Reconsider only those invalid claims against
-  the same evidence: correct supported estimates or withdraw unsupported
-  findings
-  with their dependent references and call accounting. Preserve accepted
-  results,
-  complete coverage, valid identifiers, and unaffected judgments; repair invalid
-  identifiers consistently with their references. Do not invent savings to pass
-  validation.
-- The planner attempts every completed run. When the seventy-Luna cap prevents
-  complete transport, retain exact partial-coverage records by run and part
-  identity, record count, input bytes, candidate count, and output bytes.
-  Continue
-  with every admitted part and never imply that the unreviewed remainder was
-  semantically reviewed. When eight planned Sol calls cannot preserve all
-  accepted
-  Luna findings, retain the exact candidate and byte inventory of the unreviewed
-  overflow.
-- Keep session evidence, accepted surface results, the append-only index, and
-  the final machine result at their controller-retained paths. Do not echo raw
-  session material or caller-local paths unnecessarily.
+- For deep analysis or one named surface, follow the selected action reference
+  and run `python scripts/credit-analysis-workflow.py run --request REQUEST`.
+  Keep `plan --request` for planning-only inspection and `execute --state` for
+  direct resume of controller state.
+- On a fresh request, require mutation authority `false`, select a task root
+  under `<repo-parent>/tmp/<repo-name>/<thread-name>`, and keep retained
+  evidence
+  inside it. Treat the controller's compact status and retained machine result
+  as authoritative; report its blockers, incomplete coverage, and exact
+  omissions.
+- `scripts/credit-analysis-contract.json` and the controller implementation are
+  the sole authorities for model selection, capacity and byte budgets,
+  partitioning and routing, concurrency, retry and timeout policy, validation,
+  checkpoint and resume behavior, persistence, and finalization. Do not
+  reproduce, calculate, or override those internal mechanics in agent
+  instructions.
+- Keep collected evidence and outputs at the controller-returned paths. Do not
+  echo raw session material or caller-local paths unnecessarily.
 
 ## Common Classification And ROI Rules
 

@@ -18,6 +18,201 @@ from tests.governance_lifecycle.support import (
 from tests.support.repositories import ROOT
 
 
+def test_init_and_run_drive_utf8_proposal_without_caller_json(
+    tmp_path: pathlib.Path,
+) -> None:
+    task_temp_root = tmp_path / "task-temp"
+    task_temp_root.mkdir()
+    target_dir = tmp_path / "governed"
+    target_dir.mkdir()
+    target = target_dir / "contract.md"
+    target.write_text(
+        "# Contract\n\nCurrent exact target.\n", encoding="utf-8", newline="\n"
+    )
+    target_repository_markdown_policy(target_dir)
+    inputs = {
+        "failure": "Observed deterministic failure.\n",
+        "regressions": "Preserve existing scope.\n",
+        "expected": "Current exact target.",
+        "replacement": "מלא only for form results.",
+        "assessment": "The replacement is narrower and preserves scope.\n",
+    }
+    paths: dict[str, pathlib.Path] = {}
+    for name, value in inputs.items():
+        path = tmp_path / f"{name}.txt"
+        path.write_text(value, encoding="utf-8", newline="\n")
+        paths[name] = path
+
+    initialized = subprocess.run(
+        [
+            sys.executable,
+            str(PROPOSAL_WORKFLOW),
+            "init",
+            "--task-temp-root",
+            str(task_temp_root),
+            "--failure-file",
+            str(paths["failure"]),
+            "--regressions-file",
+            str(paths["regressions"]),
+            "--context",
+            str(ROOT / "AGENTS.md"),
+            str(ROOT / "AGENTS.history.json"),
+            "SKILLS-GOV-01",
+            "--replacement",
+            str(target),
+            "-",
+            str(paths["expected"]),
+            str(paths["replacement"]),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert initialized.returncode == 0, initialized.stderr
+    pending = json.loads(initialized.stdout)
+    assert pending["next_action"] == "assess_candidate_then_run"
+    candidate = json.loads(pathlib.Path(pending["candidate"]).read_text(encoding="utf-8"))
+    assert candidate["targets"][0]["replacements"][0]["replacement"] == inputs[
+        "replacement"
+    ]
+    assert not list(task_temp_root.glob(".proposal-init-*"))
+
+    status = subprocess.run(
+        [sys.executable, str(PROPOSAL_WORKFLOW), "run", "--state", pending["state"]],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert status.returncode == 0
+    assert json.loads(status.stdout)["next_action"] == "assess_candidate_then_run"
+    advanced = subprocess.run(
+        [
+            sys.executable,
+            str(PROPOSAL_WORKFLOW),
+            "run",
+            "--state",
+            pending["state"],
+            "--assessment-file",
+            str(paths["assessment"]),
+            "--outcome",
+            "improved",
+            "--regressions",
+            "passed",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert advanced.returncode == 0, advanced.stderr
+    progress = json.loads(advanced.stdout)
+    accepted_candidate = pathlib.Path(pending["candidate"])
+    for _ in range(3):
+        pathlib.Path(progress["pending"]["candidate"]).write_bytes(
+            accepted_candidate.read_bytes()
+        )
+        continued = subprocess.run(
+            [
+                sys.executable,
+                str(PROPOSAL_WORKFLOW),
+                "run",
+                "--state",
+                pending["state"],
+                "--assessment-file",
+                str(paths["assessment"]),
+                "--outcome",
+                "no-improvement",
+                "--regressions",
+                "passed",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert continued.returncode == 0, continued.stderr
+        progress = json.loads(continued.stdout)
+    assert progress["next_action"] == "finalize"
+    finalized = subprocess.run(
+        [sys.executable, str(PROPOSAL_WORKFLOW), "finalize", "--state", pending["state"]],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert finalized.returncode == 0, finalized.stderr
+    champion = json.loads(
+        (task_temp_root / "validated-champion.json").read_text(encoding="utf-8")
+    )
+    assert champion["targets"][0]["replacements"][0]["replacement"] == inputs[
+        "replacement"
+    ]
+
+
+def test_driver_reports_iteration_limit_as_interrupted() -> None:
+    with mock.patch.object(sys, "path", [str(PROPOSAL_WORKFLOW.parent), *sys.path]):
+        workflow = runpy.run_path(str(PROPOSAL_WORKFLOW))
+    status = json.loads(
+        workflow["_annotated_status"](
+            {"complete": False, "interrupted": True, "stop_reason": "max_iterations"}
+        )
+    )
+    assert status["next_action"] == "report_iteration_limit_interruption"
+
+
+def test_init_rejects_cap_below_accepted_convergence_minimum(
+    tmp_path: pathlib.Path,
+) -> None:
+    task_temp_root = tmp_path / "task-temp"
+    task_temp_root.mkdir()
+    target = tmp_path / "contract.md"
+    target.write_text("# Contract\n\nCurrent.\n", encoding="utf-8", newline="\n")
+    target_repository_markdown_policy(tmp_path)
+    inputs = {
+        "failure": "Observed failure.\n",
+        "regressions": "Preserve current behavior.\n",
+        "expected": "Current.",
+        "replacement": "Replacement.",
+    }
+    paths: dict[str, pathlib.Path] = {}
+    for name, value in inputs.items():
+        path = tmp_path / f"{name}.txt"
+        path.write_text(value, encoding="utf-8", newline="\n")
+        paths[name] = path
+
+    rejected = subprocess.run(
+        [
+            sys.executable,
+            str(PROPOSAL_WORKFLOW),
+            "init",
+            "--task-temp-root",
+            str(task_temp_root),
+            "--failure-file",
+            str(paths["failure"]),
+            "--regressions-file",
+            str(paths["regressions"]),
+            "--context",
+            str(ROOT / "AGENTS.md"),
+            str(ROOT / "AGENTS.history.json"),
+            "SKILLS-GOV-01",
+            "--replacement",
+            str(target),
+            "-",
+            str(paths["expected"]),
+            str(paths["replacement"]),
+            "--max-iterations",
+            "3",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert rejected.returncode != 0
+    assert (
+        "max iterations must be at least 4 to accept a proposal and observe "
+        "convergence; received 3"
+    ) in rejected.stderr
+    assert not any(task_temp_root.iterdir())
+
+
 @pytest.mark.parametrize("accepted", [True, False])
 @pytest.mark.parametrize("target_name", ["contract.md", "automation.toml"])
 @pytest.mark.parametrize("prepare_mode", ["request", "construct"])
@@ -165,7 +360,11 @@ def test_proposal_workflow_validates_context_and_owns_iteration_transition(
         assert not state.exists() and not evidence.exists() and not iterations.exists()
         assert not list(task_temp_root.glob(".rule-candidate-*"))
         # Keeping only the in-range error is permitted; advance repairs it.
-        target.write_text(valid_text.replace("Current exact target.", broken), encoding="utf-8")
+        target.write_text(
+            valid_text.replace("Current exact target.", broken),
+            encoding="utf-8",
+            newline="\n",
+        )
     target_before_prepare = target.read_bytes()
     prepared = prepare_proposal()
     assert prepared.returncode == 0, prepared.stderr
@@ -254,15 +453,51 @@ def test_proposal_workflow_validates_context_and_owns_iteration_transition(
     assert failed_state["records"] == []
     assert failed_state["pending"]["iteration"] == 1
     assert candidate_path.read_bytes() == candidate_before_failure
-    candidate_value["targets"][0]["replacements"][0]["replacement"] = (
-        "Validated candidate prose is safely wrapped before the controller "
-        "records its exact post-validation hash."
+    replacement = (
+        "Validated candidate prose is rejected when it needs automatic "
+        "wrapping before the controller records its exact submitted hash."
     )
+    candidate_value["targets"][0]["replacements"][0]["replacement"] = replacement
     candidate_path.write_text(
         json.dumps(candidate_value, indent=2) + "\n",
         encoding="utf-8",
         newline="\n",
     )
+    if not is_toml:
+        unwrapped_candidate = candidate_path.read_bytes()
+        formatting_failure = subprocess.run(
+            [
+                sys.executable,
+                str(PROPOSAL_WORKFLOW),
+                "advance",
+                "--state",
+                str(state),
+                "--outcome",
+                "improved",
+                "--regressions",
+                "passed",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert formatting_failure.returncode == 2
+        assert "MD013" in formatting_failure.stderr
+        assert candidate_path.read_bytes() == unwrapped_candidate
+        failed_state = json.loads(state.read_text(encoding="utf-8"))
+        assert failed_state["records"] == []
+        replacement = (
+            "Validated candidate prose is accepted only when its exact\n"
+            "submitted formatting already satisfies the governing policy."
+        )
+        candidate_value["targets"][0]["replacements"][0]["replacement"] = (
+            replacement
+        )
+        candidate_path.write_text(
+            json.dumps(candidate_value, indent=2) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
     advanced = subprocess.run(
         [
             sys.executable,
@@ -303,9 +538,11 @@ def test_proposal_workflow_validates_context_and_owns_iteration_transition(
     assert record["candidate_sha256"] == hashlib.sha256(
         candidate_path.read_bytes()
     ).hexdigest()
-    fixed_candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
-    replacement = fixed_candidate["targets"][0]["replacements"][0]["replacement"]
-    assert ("\n" in replacement) is not is_toml
+    recorded_candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+    recorded_replacement = recorded_candidate["targets"][0]["replacements"][0][
+        "replacement"
+    ]
+    assert recorded_replacement == replacement
     assert pathlib.Path(record["validation_evidence"]).is_file()
     champion_bytes = candidate_path.read_bytes()
     completed_state_text = state.read_text(encoding="utf-8")
@@ -555,19 +792,33 @@ def test_iteration_controller_direct_commands_record_validated_candidate(
     assert not state.exists() and not (tmp_path / "iterations").exists()
     assert original.is_file() and context.is_file()
 
-    # An administrative cap is an interruption, never successful convergence.
+    with pytest.raises(ValueError, match="max iterations must be at least 4"):
+        controller.command_init(argparse.Namespace(
+            state=state, original=original, regressions=None,
+            validation_context=context, max_iterations=3,
+        ))
+    assert not state.exists()
+
+    # A viable administrative cap remains an interruption without convergence.
     controller.command_init(argparse.Namespace(
         state=state, original=original, regressions=None,
-        validation_context=context, max_iterations=1,
+        validation_context=context, max_iterations=4,
     ))
     controller.command_next(argparse.Namespace(state=state))
-    pending = controller.load_state(state)["pending"]
-    candidate = pathlib.Path(pending["candidate"])
-    value = json.loads(candidate.read_text(encoding="utf-8"))
-    value["targets"][0]["replacements"][0]["replacement"] = "Capped improvement"
-    candidate.write_text(json.dumps(value), encoding="utf-8")
-    pathlib.Path(pending["assessment"]).write_text("Improved, not converged.\n", encoding="utf-8")
-    controller.command_advance(argparse.Namespace(state=state, outcome="improved", regressions="passed"))
+    for iteration in range(1, 5):
+        pending = controller.load_state(state)["pending"]
+        candidate = pathlib.Path(pending["candidate"])
+        value = json.loads(candidate.read_text(encoding="utf-8"))
+        value["targets"][0]["replacements"][0]["replacement"] = (
+            f"Capped improvement {iteration}"
+        )
+        candidate.write_text(json.dumps(value), encoding="utf-8")
+        pathlib.Path(pending["assessment"]).write_text(
+            "Improved, not converged.\n", encoding="utf-8"
+        )
+        controller.command_advance(argparse.Namespace(
+            state=state, outcome="improved", regressions="passed",
+        ))
     capped = controller.load_state(state)
     assert capped["interrupted"] and not capped["complete"]
     assert capped["pending"] is None and capped["stop_reason"] == "max_iterations"

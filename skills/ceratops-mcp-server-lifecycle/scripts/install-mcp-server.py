@@ -20,10 +20,13 @@ import sys
 from typing import Any
 
 
-MANAGER = pathlib.Path(
-    "C:/AI-Agents-MCP-Servers/ceratops_mcp_server_manager/bin/ceratops_mcp_server_manager.py"
+INSTALL_ROOT = pathlib.Path.home() / ".codex" / "mcp"
+MANAGER = (
+    INSTALL_ROOT
+    / "ceratops_mcp_server_manager"
+    / "bin"
+    / "ceratops_mcp_server_manager.py"
 )
-INSTALL_ROOT = pathlib.Path("C:/AI-Agents-MCP-Servers")
 IDENTITY_RE = re.compile(r"[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*")
 VERSION_RE = re.compile(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)")
 HEX_32_RE = re.compile(r"[0-9a-f]{32}")
