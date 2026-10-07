@@ -65,6 +65,8 @@ def run_ci_action(
     repo: pathlib.Path,
     evidence: pathlib.Path,
     bundle: pathlib.Path,
+    *,
+    run_tests: bool = True,
 ) -> subprocess.CompletedProcess[str]:
     """Execute the real composite action in a caller-owned isolated action checkout."""
     action_root = bundle / "skills/ceratops-repo-lifecycle"
@@ -88,6 +90,7 @@ def run_ci_action(
         "${{ github.action_path }}": str(action_root),
         "${{ inputs.repo-root }}": str(repo),
         "${{ inputs.evidence-file }}": str(evidence),
+        "${{ inputs.run-tests }}": "true" if run_tests else "false",
     }
     environment = dict(os.environ)
     environment.pop("UV_PROJECT_ENVIRONMENT", None)

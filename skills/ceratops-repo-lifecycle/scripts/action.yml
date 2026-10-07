@@ -1,5 +1,6 @@
+---
 name: Ceratops repository checks
-description: Run declared validation and tests through the lifecycle skill.
+description: Run declared validation and optional tests through the lifecycle.
 inputs:
   repo-root:
     description: Repository root containing sdlc/sdlc.yml.
@@ -7,19 +8,33 @@ inputs:
   evidence-file:
     description: Failure evidence path owned by the caller.
     required: true
+  run-tests:
+    description: Run tests after validation; disable for noninteractive CI.
+    required: false
+    default: "true"
 runs:
   using: composite
   steps:
-    - name: Run SDLC validation and tests
+    - name: Run SDLC checks
       shell: bash
       env:
         CERATOPS_ACTION_ROOT: ${{ github.action_path }}
         CERATOPS_REPOSITORY: ${{ inputs.repo-root }}
         CERATOPS_EVIDENCE: ${{ inputs.evidence-file }}
+        CERATOPS_RUN_TESTS: ${{ inputs.run-tests }}
       run: |
+        : "${CERATOPS_EVIDENCE:?evidence-file input is required}"
+        case "$CERATOPS_RUN_TESTS" in
+          true) set -- --validate --tests --ci ;;
+          false) set -- --validate --ci ;;
+          *)
+            echo "run-tests must be true or false" >&2
+            exit 2
+            ;;
+        esac
         uv run --quiet --locked \
           --project "$CERATOPS_ACTION_ROOT/../../sections/python" \
           python "$CERATOPS_ACTION_ROOT/repository_operation.py" \
           --repo-root "${CERATOPS_REPOSITORY:?repo-root input is required}" \
-          --validate --tests --ci \
-          --evidence-file "${CERATOPS_EVIDENCE:?evidence-file input is required}"
+          "$@" \
+          --evidence-file "$CERATOPS_EVIDENCE"

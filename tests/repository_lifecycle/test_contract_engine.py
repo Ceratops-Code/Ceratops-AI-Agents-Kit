@@ -43,6 +43,7 @@ from github_contract_engine.collectors.local_repository import (
 from github_contract_engine.collectors.repository import (
     _latest_completed_runs_per_workflow,
     _latest_stable_release_assets_count,
+    _ruleset_protection_facts,
     stale_branch_candidates,
     stale_pull_request_candidates,
     stale_release_candidates,
@@ -98,6 +99,78 @@ class GHContractStateEngineTests(unittest.TestCase):
         self.assertEqual(selected_levels, ["ERROR", "WARN", "NEEDS_AI_AGENT_REVIEW"])
         with self.assertRaises(ValueError):
             levels.parse_levels("NEEDS_" + "REVIEW")
+
+    def test_default_branch_ruleset_supplies_protection_facts(self):
+        ruleset = {
+            "target": "branch",
+            "enforcement": "active",
+            "conditions": {
+                "ref_name": {"include": ["refs/heads/main"], "exclude": []}
+            },
+            "bypass_actors": [
+                {"actor_type": "OrganizationAdmin", "bypass_mode": "pull_request"}
+            ],
+            "rules": [
+                {
+                    "type": "pull_request",
+                    "parameters": {
+                        "required_approving_review_count": 1,
+                        "dismiss_stale_reviews_on_push": True,
+                        "require_code_owner_review": True,
+                        "required_review_thread_resolution": True,
+                    },
+                },
+                {
+                    "type": "required_status_checks",
+                    "parameters": {
+                        "strict_required_status_checks_policy": True,
+                        "required_status_checks": [
+                            {"context": "validate-repository"}
+                        ],
+                    },
+                },
+                {"type": "non_fast_forward"},
+                {"type": "deletion"},
+            ],
+        }
+        self.assertEqual(
+            _ruleset_protection_facts([ruleset], "main"),
+            {
+                "strict": True,
+                "required_checks": ["validate-repository"],
+                "approving_reviews": 1,
+                "dismiss_stale_reviews": True,
+                "code_owner_reviews": True,
+                "conversation_resolution": True,
+                "enforce_admins": True,
+                "allow_force_pushes": False,
+                "allow_deletions": False,
+            },
+        )
+        unrelated = {
+            **ruleset,
+            "conditions": {
+                "ref_name": {"include": ["refs/heads/develop"], "exclude": []}
+            },
+        }
+        self.assertEqual(_ruleset_protection_facts([unrelated], "main"), {})
+        excluded = {
+            **ruleset,
+            "conditions": {
+                "ref_name": {
+                    "include": ["~DEFAULT_BRANCH"],
+                    "exclude": ["refs/heads/main"],
+                }
+            },
+        }
+        self.assertEqual(_ruleset_protection_facts([excluded], "main"), {})
+        unrestricted_admin = {
+            **ruleset,
+            "bypass_actors": [{"bypass_mode": "always"}],
+        }
+        self.assertFalse(
+            _ruleset_protection_facts([unrestricted_admin], "main")["enforce_admins"]
+        )
 
     def test_audit_snapshot_compacts_local_contract_discovery(self):
         snapshot = audit_snapshot.build_snapshot(ROOT)

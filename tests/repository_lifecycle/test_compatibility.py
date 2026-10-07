@@ -1742,6 +1742,12 @@ def test_generated_scripts_and_skill_owned_ci_keep_environments_and_tests_separa
         "errors": [],
     }
     assert json.loads(evidence.read_text())["status"] == "tests_failed"
+    validation_only = run_ci_action(repo, evidence, bundle, run_tests=False)
+    assert validation_only.returncode == 0, validation_only.stdout + validation_only.stderr
+    assert not evidence.exists()
+    assert json.loads(validation_only.stdout)["completed_operations"] == [
+        "repository.actions.validate"
+    ]
     probe.write_text("def test_probe():\n    assert True\n")
     passed = run_ci_action(repo, evidence, bundle)
     assert passed.returncode == 0, passed.stdout + passed.stderr
