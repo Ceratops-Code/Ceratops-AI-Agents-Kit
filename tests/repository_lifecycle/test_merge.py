@@ -386,9 +386,17 @@ def test_read_admin_enforcement_preserves_boolean_state(
     assert merge._read_admin_enforcement("endpoint", cwd=tmp_path) is enabled
 
 
-def test_private_free_plan_limit_skips_admin_protection_mutation(
+@pytest.mark.parametrize(
+    "api_error",
+    [
+        "Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)",
+        "Branch not protected (HTTP 404)",
+    ],
+)
+def test_no_classic_admin_protection_skips_mutation(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
+    api_error: str,
 ) -> None:
     merge = load_pr_workflow_module(monkeypatch, "merge")
     repo = tmp_path / "repo"
@@ -399,11 +407,7 @@ def test_private_free_plan_limit_skips_admin_protection_mutation(
     def require_output(command: list[str], *, cwd: pathlib.Path) -> str:
         commands.append(tuple(command))
         if command[:2] == ["gh", "api"]:
-            raise merge.CommandError(
-                "gh api failed\n"
-                "Upgrade to GitHub Pro or make this repository public "
-                "to enable this feature. (HTTP 403)"
-            )
+            raise merge.CommandError("gh api failed\n" + api_error)
         if command[:3] == ["gh", "pr", "view"]:
             return merged_pr_state(head)
         raise AssertionError(command)
@@ -434,18 +438,26 @@ def test_private_free_plan_limit_skips_admin_protection_mutation(
     )
 
 
-def test_read_admin_enforcement_rejects_unrelated_forbidden_error(
+@pytest.mark.parametrize(
+    "api_error",
+    [
+        "Resource not accessible by integration (HTTP 403)",
+        "Not Found (HTTP 404)",
+    ],
+)
+def test_read_admin_enforcement_rejects_unrelated_api_error(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
+    api_error: str,
 ) -> None:
     merge = load_pr_workflow_module(monkeypatch, "merge")
 
     def require_output(command: list[str], *, cwd: pathlib.Path) -> str:
-        raise merge.CommandError("Resource not accessible by integration (HTTP 403)")
+        raise merge.CommandError(api_error)
 
     monkeypatch.setattr(merge, "require_output", require_output)
 
-    with pytest.raises(merge.CommandError, match="Resource not accessible"):
+    with pytest.raises(merge.CommandError, match=api_error.split(" (")[0]):
         merge._read_admin_enforcement("endpoint", cwd=tmp_path)
 
 
