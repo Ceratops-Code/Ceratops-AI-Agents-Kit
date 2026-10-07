@@ -42,6 +42,8 @@ must remain available and compatible while these environments are used.
 are installed offline with uv's hash enforcement, followed by dependency and
 package readiness checks. A manager update changes its wheel dependencies;
 global Python and uv remain independently maintained prerequisites.
+Lock refresh resolves against the exact patch version of the global Python
+interpreter that will install the locked dependencies.
 
 ## Source installation and use
 
@@ -181,6 +183,13 @@ servers in their owning development repositories; their lifecycle tests must
 call the production server's actual `list_tools` and compare structured
 parameters with the same canonical schemas. MCP server creation never runs
 through this manager.
+
+Newly packaged releases use manifest schema 2 and must include `tools` in the
+readiness response. Previously registered, immutable schema-1 releases remain
+usable: the original three-field response is accepted, while a schema-1
+response that already includes `tools` still receives the schema comparison.
+The three-field path does not require a tool-schema probe that those releases
+were never built to provide.
 
 After the manager's first installation, use its public launcher from any
 directory; a Ceratops-AI-Agents-Kit checkout is not required:

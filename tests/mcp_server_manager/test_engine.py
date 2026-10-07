@@ -378,6 +378,9 @@ def test_tampered_wheel_rejected_before_execution(deployment, tmp_path):
 def test_strict_manifest_rejects_commands_extra_fields_and_wheel_paths(tmp_path):
     bundle = make_release(tmp_path, "1.0.0")
     value = json.loads((bundle / "manifest.json").read_text())
+    assert contracts.manifest({**value, "schema": 2})["schema"] == 2
+    with pytest.raises(contracts.DeploymentError, match="schema"):
+        contracts.manifest({**value, "schema": 3})
     with pytest.raises(contracts.DeploymentError):
         contracts.manifest({**value, "command": "whoami"})
     value["wheels"][0]["filename"] = "../escape.whl"
@@ -387,6 +390,16 @@ def test_strict_manifest_rejects_commands_extra_fields_and_wheel_paths(tmp_path)
         contracts.registry({"schema": True, "mcp_server_id": "fixture", "versions": {}})
     with pytest.raises(contracts.DeploymentError):
         contracts.registry({"schema": 1, "mcp_server_id": "fixture", "versions": {}}, "independent")
+
+
+def test_legacy_readiness_preserves_immutable_releases_without_weakening_new_ones():
+    legacy = {"mcp_server_id": "fixture", "version": "1.0.0", "ready": True}
+    assert contracts.deployment_check(legacy, "fixture", "1.0.0", manifest_schema=1) is None
+    with pytest.raises(contracts.DeploymentError):
+        contracts.deployment_check(legacy, "fixture", "1.0.0", manifest_schema=2)
+    with_tools = {**legacy, "tools": FIXTURE_TOOL_CONTRACT}
+    assert contracts.deployment_check(with_tools, "fixture", "1.0.0", manifest_schema=1) == FIXTURE_TOOL_CONTRACT
+    assert contracts.deployment_check(with_tools, "fixture", "1.0.0", manifest_schema=2) == FIXTURE_TOOL_CONTRACT
 
 
 def test_duplicate_json_keys_rejected(tmp_path):

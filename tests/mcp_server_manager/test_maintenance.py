@@ -86,6 +86,23 @@ def test_legacy_catalog_import_rehydrates_without_copying_environments(
     engine = engine_module.Engine()
     module = load("deploy-mcp-server-manager")
 
+    original_run = engine_module.run
+
+    def legacy_readiness(command, **kwargs):
+        response = original_run(command, **kwargs)
+        if "--deployment-check" in command:
+            value = json.loads(response)
+            del value["tools"]
+            return json.dumps(value)
+        return response
+
+    monkeypatch.setattr(engine_module, "run", legacy_readiness)
+    monkeypatch.setattr(
+        engine_module,
+        "probe_published_tool_schemas",
+        lambda *_args: pytest.fail("legacy release must not require a new schema probe"),
+    )
+
     selections, imported = module.import_catalogs(legacy)
     assert imported == [
         {"mcp_server_name": "fixture", "available_versions": ["1.0.0"]}
@@ -313,6 +330,7 @@ def test_package_wheel_prerequisite_is_registered_and_installed_without_package_
     assert len(calls) == 1 and calls[0][0][1] == "build"
     release_dir = runtime_root / "fixture" / "artifacts" / "1.0.0" / registered["manifest_sha256"]
     release = json.loads((release_dir / "manifest.json").read_text())
+    assert release["schema"] == 2
     assert {entry["filename"] for entry in release["wheels"]} == {"fixture-1.0.0-py3-none-any.whl", wheel.name}
     assert (release_dir / wheel.name).read_bytes() == wheel.read_bytes()
     assert not (runtime_root / "fixture" / "current.json").exists()
@@ -479,13 +497,20 @@ def test_package_wheel_prerequisite_rejects_invalid_contract_before_build(source
     assert not calls and not (runtime_root / "fixture" / "registry.json").exists()
 
 
-def test_cli_lock_refresh_does_not_build_register_or_activate(source_package, capsys):
+@pytest.mark.parametrize("python_version", ["3.14.0", "3.14.7"])
+def test_cli_lock_refresh_does_not_build_register_or_activate(source_package, capsys, monkeypatch, python_version):
     project, runtime_root, calls = source_package
+    current = package_module.global_runtime()
+    monkeypatch.setattr(
+        package_module,
+        "global_runtime",
+        lambda: engine_module.Runtime(current.python, current.uv, python_version, current.uv_version),
+    )
     (project / "pylock.toml").unlink()
     assert cli.main(["package", "--source", str(project), "--lock"]) == 0
     assert json.loads(capsys.readouterr().out) == {"lock": str(project / "pylock.toml")}
     assert len(calls) == 1 and calls[0][0][1:3] == ["pip", "compile"]
-    assert calls[0][0][calls[0][0].index("--python-version") + 1] == "3.14.7"
+    assert calls[0][0][calls[0][0].index("--python-version") + 1] == python_version
     assert not (runtime_root / "fixture/registry.json").exists()
     assert not (runtime_root / "fixture/current.json").exists()
     assert not list((runtime_root / "fixture/staging").iterdir())

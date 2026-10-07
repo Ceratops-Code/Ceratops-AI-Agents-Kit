@@ -160,8 +160,15 @@ def tool_input_contract(value: Any) -> dict[str, Any]:
     return value
 
 
-def deployment_check(value: Any, identity: str, version: str) -> dict[str, Any]:
-    """Validate readiness identity plus the server-owned canonical tool contract."""
+def deployment_check(
+    value: Any, identity: str, version: str, *, manifest_schema: int = 2
+) -> dict[str, Any] | None:
+    """Preserve schema-1 readiness while requiring tools for new releases.
+
+    Older immutable releases returned only the three identity/readiness fields.
+    Schema 1 also accepts the later four-field form without weakening its tool
+    validation. Schema 2 always requires the canonical tool contract.
+    """
 
     if (
         not isinstance(value, dict)
@@ -170,6 +177,10 @@ def deployment_check(value: Any, identity: str, version: str) -> dict[str, Any]:
         or value.get("ready") is not True
     ):
         raise DeploymentError("MCP server readiness failed")
+    if manifest_schema == 1 and set(value) == {"mcp_server_id", "version", "ready"}:
+        return None
+    if manifest_schema not in {1, 2}:
+        raise DeploymentError("unsupported release manifest schema")
     value = fields(value, {"mcp_server_id", "version", "ready", "tools"})
     return tool_input_contract(value["tools"])
 
@@ -215,7 +226,8 @@ def registry(value: Any, identity: str | None = None) -> dict[str, Any]:
 
 def manifest(value: Any) -> dict[str, Any]:
     value = fields(value, {"schema", "mcp_server_id", "version", "distribution", "module", "wheels"})
-    schema(value)
+    if type(value["schema"]) is not int or value["schema"] not in {1, 2}:
+        raise DeploymentError("unsupported release manifest schema")
     token(value["mcp_server_id"])
     token(value["version"], "version")
     token(value["distribution"])

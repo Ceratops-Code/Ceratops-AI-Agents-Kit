@@ -356,11 +356,14 @@ def preflight_release(
         ready = json.loads(output)
     except json.JSONDecodeError as exc:
         raise DeploymentError("invalid readiness response") from exc
-    canonical = deployment_check(ready, identity, version)
-    published = probe_published_tool_schemas(
-        executable, release["module"], candidate, env
+    canonical = deployment_check(
+        ready, identity, version, manifest_schema=release["schema"]
     )
-    published_tool_input_schemas(canonical, published)
+    if canonical is not None:
+        published = probe_published_tool_schemas(
+            executable, release["module"], candidate, env
+        )
+        published_tool_input_schemas(canonical, published)
 
 
 class Engine:
