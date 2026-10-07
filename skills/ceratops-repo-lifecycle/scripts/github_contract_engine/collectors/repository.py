@@ -314,16 +314,18 @@ def _ruleset_protection_facts(
         if isinstance(rule, dict)
     ]
     pull_requests = [
-        rule.get("parameters")
+        parameters
         for rule in rules
         if rule.get("type") == "pull_request"
-        and isinstance(rule.get("parameters"), dict)
+        for parameters in [rule.get("parameters")]
+        if isinstance(parameters, dict)
     ]
     status_checks = [
-        rule.get("parameters")
+        parameters
         for rule in rules
         if rule.get("type") == "required_status_checks"
-        and isinstance(rule.get("parameters"), dict)
+        for parameters in [rule.get("parameters")]
+        if isinstance(parameters, dict)
     ]
     required_checks = sorted(
         {
