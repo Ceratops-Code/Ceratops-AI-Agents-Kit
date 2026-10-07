@@ -232,6 +232,10 @@ def _read_admin_enforcement(endpoint: str, *, cwd: pathlib.Path) -> bool:
         message = str(exc)
         if "HTTP 403" in message and _ADMIN_ENFORCEMENT_PLAN_LIMIT in message:
             return False
+        if "HTTP 404" in message and "Branch not protected" in message:
+            # A ruleset can protect the branch without classic branch protection.
+            # There is no classic admin-enforcement setting to toggle or restore.
+            return False
         raise
     value = json.loads(raw)
     enabled = value.get("enabled") if isinstance(value, dict) else None
