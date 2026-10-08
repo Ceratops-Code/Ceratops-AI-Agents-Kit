@@ -291,7 +291,7 @@ def package(source: Path, *, lock_only: bool = False,
             _, filename, wheel = min(candidates, key=lambda value: (value[0], value[1]))
             token(filename, "wheel")
             destination = temporary / filename
-            with urllib.request.urlopen(wheel["url"], timeout=60) as response, destination.open("xb") as output:
+            with urllib.request.urlopen(wheel["url"], timeout=300) as response, destination.open("xb") as output:
                 if urllib.parse.urlparse(response.url).hostname != "files.pythonhosted.org":
                     raise DeploymentError("dependency artifact redirect escaped PyPI")
                 shutil.copyfileobj(response, output)
