@@ -18,8 +18,9 @@ from tests.governance_lifecycle.support import (
 from tests.support.repositories import ROOT
 
 
+@pytest.mark.parametrize("authorized", [False, True])
 def test_init_and_run_drive_utf8_proposal_without_caller_json(
-    tmp_path: pathlib.Path,
+    tmp_path: pathlib.Path, authorized: bool,
 ) -> None:
     task_temp_root = tmp_path / "task-temp"
     task_temp_root.mkdir()
@@ -63,6 +64,7 @@ def test_init_and_run_drive_utf8_proposal_without_caller_json(
             "-",
             str(paths["expected"]),
             str(paths["replacement"]),
+            *(["--mutation-authorized"] if authorized else []),
         ],
         capture_output=True,
         text=True,
@@ -129,21 +131,25 @@ def test_init_and_run_drive_utf8_proposal_without_caller_json(
             check=False,
         )
         assert continued.returncode == 0, continued.stderr
-        progress = json.loads(continued.stdout)
-    assert progress["next_action"] == "finalize"
-    finalized = subprocess.run(
-        [sys.executable, str(PROPOSAL_WORKFLOW), "finalize", "--state", pending["state"]],
-        capture_output=True,
-        text=True,
-        check=False,
+        progress = json.loads(continued.stdout) if continued.stdout.strip() != "OK" else {"status": "applied"}
+    if authorized:
+        assert progress["status"] == "applied"
+        assert inputs["replacement"] in target.read_text(encoding="utf-8")
+        assert not list(task_temp_root.iterdir())
+        return
+    assert progress["status"] == "awaiting_approval"
+    request_path = task_temp_root / "update-request.json"
+    champion = json.loads(request_path.read_bytes())["accepted_candidate"]
+    assert champion["targets"][0]["replacements"][0]["replacement"] == inputs["replacement"]
+    assert set(task_temp_root.iterdir()) == {request_path}
+    assert "Current exact target." in target.read_text(encoding="utf-8")
+    applied = subprocess.run(
+        [sys.executable, str(PROPOSAL_WORKFLOW.parent / "apply_rules_update.py"),
+         "--request", str(request_path)], capture_output=True, text=True, check=False,
     )
-    assert finalized.returncode == 0, finalized.stderr
-    champion = json.loads(
-        (task_temp_root / "validated-champion.json").read_text(encoding="utf-8")
-    )
-    assert champion["targets"][0]["replacements"][0]["replacement"] == inputs[
-        "replacement"
-    ]
+    assert applied.returncode == 0, applied.stderr
+    assert inputs["replacement"] in target.read_text(encoding="utf-8")
+    assert not list(task_temp_root.iterdir())
 
 
 def test_driver_reports_iteration_limit_as_interrupted() -> None:
@@ -234,7 +240,7 @@ def test_proposal_workflow_validates_context_and_owns_iteration_transition(
     request_path = task_temp_root / "proposal-request.json"
     state = task_temp_root / "proposal-state.json"
     evidence = task_temp_root / "proposal-context.json"
-    champion_output = task_temp_root / "validated-champion.json"
+    champion_output = task_temp_root / "update-request.json"
     iterations = task_temp_root / "iterations"
     undeclared_input = task_temp_root / "user-owned.md"
     if not constructing:
@@ -398,7 +404,7 @@ def test_proposal_workflow_validates_context_and_owns_iteration_transition(
         [
             sys.executable,
             str(PROPOSAL_WORKFLOW),
-            "finalize",
+            "generate-update-request",
             "--state",
             str(state),
         ],
@@ -552,7 +558,7 @@ def test_proposal_workflow_validates_context_and_owns_iteration_transition(
         missing_champion = {**completed_state, "champion": None}
         state.write_text(json.dumps(missing_champion) + "\n", encoding="utf-8")
         refused = subprocess.run(
-            [sys.executable, str(PROPOSAL_WORKFLOW), "finalize", "--state", str(state)],
+            [sys.executable, str(PROPOSAL_WORKFLOW), "generate-update-request", "--state", str(state)],
             capture_output=True, text=True, check=False,
         )
         assert refused.returncode == 2 and "missing champion" in refused.stderr
@@ -576,7 +582,7 @@ def test_proposal_workflow_validates_context_and_owns_iteration_transition(
         [
             sys.executable,
             str(PROPOSAL_WORKFLOW),
-            "finalize",
+            "generate-update-request",
             "--state",
             str(state),
         ],
@@ -597,7 +603,7 @@ def test_proposal_workflow_validates_context_and_owns_iteration_transition(
         [
             sys.executable,
             str(PROPOSAL_WORKFLOW),
-            "finalize",
+            "generate-update-request",
             "--state",
             str(state),
         ],
@@ -606,13 +612,12 @@ def test_proposal_workflow_validates_context_and_owns_iteration_transition(
         check=False,
     )
     assert finalized.returncode == 0, finalized.stderr
-    assert finalized.stdout.strip() == "OK"
     if accepted:
-        assert champion_output.read_bytes() == champion_bytes
-        assert hashlib.sha256(champion_output.read_bytes()).hexdigest() == record[
-            "candidate_sha256"
-        ]
+        assert json.loads(finalized.stdout)["status"] == "awaiting_approval"
+        exported = json.loads(champion_output.read_bytes())
+        assert exported["accepted_candidate"] == json.loads(champion_bytes)
     else:
+        assert finalized.stdout.strip() == "OK"
         assert not champion_output.exists()
     assert not state.exists()
     assert not iterations.exists()
@@ -673,7 +678,7 @@ def test_proposal_workflow_validates_context_and_owns_iteration_transition(
 
     if constructing:
         # A failed candidate write occurs after controller state exists. Keep
-        # that state and its inputs recoverable through advance/finalize.
+        # that state and its inputs recoverable through advance/generate-update-request.
         recovery_root = task_temp_root / "recovery"
         recovery_root.mkdir()
         recovery_spec = {**spec, "task_temp_root": str(recovery_root)}
@@ -708,8 +713,8 @@ def test_proposal_workflow_validates_context_and_owns_iteration_transition(
             review = result["pending"]
             pathlib.Path(review["assessment"]).write_text("No supported improvement.\n", encoding="utf-8")
             result = json.loads(workflow["command_advance"](recovery_state, "no-improvement", "passed"))
-        assert workflow["command_finalize"](recovery_state) == "OK"
-        assert set(recovery_root.iterdir()) == {recovery_root / "validated-champion.json"}
+        assert json.loads(workflow["command_generate_update_request"](recovery_state))["status"] == "awaiting_approval"
+        assert set(recovery_root.iterdir()) == {recovery_root / "update-request.json"}
         assert spec_path.is_file() and target.read_bytes() == target_before_prepare
 
 

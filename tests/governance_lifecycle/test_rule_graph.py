@@ -23,6 +23,7 @@ import validate_rule_candidate as rule_candidate  # noqa: E402
 from apply_rules_update import (  # noqa: E402
     ApplicationError,
     accept_candidate,
+    build_update_request,
     commit,
     file_hash,
     load_accepted_update,
@@ -365,13 +366,10 @@ class RuleGraphTests(unittest.TestCase):
         candidate_path.write_text(json.dumps(candidate, ensure_ascii=False, indent=2) + "\n",
                                   encoding="utf-8")
         accept_candidate(candidate_path, pathlib.Path(request["validation_evidence"]))
-        return {
-            "version": 5, "task_temp_root": request["task_temp_root"],
-            "request_disposable": request["request_disposable"],
-            "validated_candidate": str(candidate_path),
-            "validated_candidate_sha256": file_hash(candidate_path),
-            "candidate_disposable": True,
-        }
+        return build_update_request(
+            json.loads(candidate_path.read_bytes()), pathlib.Path(request["task_temp_root"]),
+            disposable=request["request_disposable"],
+        )
 
     @classmethod
     def run_rules_update(cls, request: dict, request_path: pathlib.Path):
@@ -388,6 +386,8 @@ class RuleGraphTests(unittest.TestCase):
         )
         if result.returncode == 0:
             pathlib.Path(request["validation_evidence"]).unlink()
+            pathlib.Path(request["validated_candidate"] or
+                         pathlib.Path(request["task_temp_root"]) / "accepted-history.json").unlink()
         return result
 
     def test_rule_local_user_override_is_rejected_case_insensitively(self):
@@ -1209,8 +1209,7 @@ class RuleGraphTests(unittest.TestCase):
                                    wraps=application.validate_rule_candidate) as validator:
                 accepted = self.accept_update_request(request)
             self.assertEqual(validator.call_count, 1)
-            candidate_path = pathlib.Path(accepted["validated_candidate"])
-            frozen = json.loads(candidate_path.read_text(encoding="utf-8"))
+            frozen = accepted["accepted_candidate"]
             self.assertIn("check_versions", frozen["acceptance"])
             expected = {pathlib.Path(path): application.base64.b64decode(payload)
                         for path, payload in frozen["acceptance"]["outputs"].items()}
@@ -1250,9 +1249,7 @@ class RuleGraphTests(unittest.TestCase):
                 capture_output=True, text=True, check=False,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            accepted = {"version": 5, "task_temp_root": str(task_root),
-                        "request_disposable": False, "candidate_disposable": False,
-                        "validated_candidate": str(candidate), "validated_candidate_sha256": file_hash(candidate)}
+            accepted = build_update_request(json.loads(candidate.read_bytes()), task_root, disposable=False)
             commit(load_accepted_update(accepted))
             self.assertNotRegex(history.read_text(encoding="utf-8"), r"TEST-0[123]")
 
@@ -1262,9 +1259,11 @@ class RuleGraphTests(unittest.TestCase):
                 root = pathlib.Path(directory)
                 request, rules, _, _ = self.toml_update_request(root, mixed=True)
                 accepted = self.accept_update_request(request)
-                target = {"candidate": pathlib.Path(accepted["validated_candidate"]),
-                          "source": rules, "history": rules.with_name("AGENTS.history.json")}[changed]
-                target.write_bytes(target.read_bytes() + b" ")
+                if changed == "candidate":
+                    accepted["accepted_candidate"]["acceptance"]["outputs"][str(rules)] += " "
+                else:
+                    target = rules if changed == "source" else rules.with_name("AGENTS.history.json")
+                    target.write_bytes(target.read_bytes() + b" ")
                 before = {path: path.read_bytes() for path in
                           (rules, rules.with_name("AGENTS.history.json"), root / "automation.toml")}
                 with self.assertRaisesRegex(ApplicationError, "stale|changed since acceptance"):

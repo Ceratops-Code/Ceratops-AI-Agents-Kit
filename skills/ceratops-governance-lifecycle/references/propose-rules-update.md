@@ -78,21 +78,26 @@ Route approved skill-source mutations through `$ceratops-skill-lifecycle`
 - (D) Inspect or submit the current iteration with `python
   scripts/proposal-workflow.py run --state STATE [--assessment-file FILE
   --outcome OUTCOME --regressions RESULT]`. Without decision flags, `run`
-  returns the current next action. With all three decision flags, it writes the
-  UTF-8 assessment, validates and records the candidate, and returns the next
-  semantic action or finalization step.
+  returns the current next action. With all three decision flags, it records
+  the assessment and checks new edits once. At convergence it generates one
+  application request and invokes the updater when application is authorized;
+  otherwise it returns the request for approval.
 - Report one compact status after each submission; do not repeat iteration
   logs in the final answer.
-- (D) Before presenting the selected proposal, run
-  `python scripts/proposal-workflow.py finalize --state STATE`.
+- (D) For a completed run not closed by `run`, use
+  `python scripts/proposal-workflow.py generate-update-request --state STATE`.
 
 ## Applying an approved change
 
-- (D) For an approved history-only ID repair, first prepare its candidate with
-  `python scripts/validate_rule_candidate.py --candidate CANDIDATE
-  --evidence EVIDENCE --accept`.
-- (D) After approval, apply the exact exported candidate with
-  `python scripts/apply_rules_update.py --request REQUEST`.
+- (D) For a supplied candidate, including history-only repairs, run
+  `python scripts/proposal-workflow.py generate-update-request
+  --candidate CANDIDATE --task-temp-root ROOT`; CANDIDATE is the caller's JSON
+  file and ROOT is the verified current task-temp directory.
+- Set `--mutation-authorized` only when the user has authorized application;
+  authorized runs invoke the updater directly.
+- (D) After approval of a retained request, run
+  `python scripts/apply_rules_update.py --request REQUEST`; REQUEST is the
+  single application file returned by the generator.
 
 ## Done When
 

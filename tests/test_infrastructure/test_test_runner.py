@@ -624,6 +624,92 @@ def test_failure_summary_matches_real_long_pytest_titles(
     assert "assert 0 == 0" not in summary["decisive_excerpt"]
 
 
+@pytest.mark.parametrize("traceback_style", ["auto", "short"])
+@pytest.mark.parametrize("chain_clause", [" from error", ""])
+@pytest.mark.parametrize(
+    "parameter_id", ["ordinary", "with - separator", "literal ] - separator :: value"]
+)
+def test_failure_summary_reports_real_exception_messages(
+    test_runner_module: Any,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    traceback_style: str,
+    chain_clause: str,
+    parameter_id: str,
+) -> None:
+    # Native pytest output covers custom exceptions, multiline details, chains,
+    # and captured noise without coupling the fixture to the extractor's syntax.
+    monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
+    path = tmp_path / "test_errors.py"
+    inner_reason = "\n".join(f"inner-{index}" for index in range(8))
+    path.write_text(
+        "import pytest\n"
+        "class Rejected(Exception): pass\n"
+        f"@pytest.mark.parametrize('value', [0], ids=[{parameter_id!r}])\n"
+        "def test_direct(value):\n"
+        "    print('E       misleading captured text')\n"
+        "    raise Rejected('actual exception message\\nfollow-up detail')\n"
+        "def test_chain():\n"
+        "    try:\n"
+        f"        raise ValueError({inner_reason!r})\n"
+        "    except ValueError as error:\n"
+        f"        raise RuntimeError('final exception - actual cause\\nfinal details'){chain_clause}\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [
+            sys.executable, "-m", "pytest", "-q", "--color=no", "-o", "addopts=",
+            f"--tb={traceback_style}", path.name,
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    summary = test_runner_module.pytest_diagnostics.pytest_failure_summary(
+        result.stdout, result.stderr
+    )
+    assert summary["failed_tests"] == [
+        f"{path.name}::test_direct[{parameter_id}]", f"{path.name}::test_chain",
+    ]
+    direct, chained = summary["failures"]
+    assert direct["source_location"] == f"{path.name}:6"
+    assert "Rejected: actual exception message" in direct["excerpt"]
+    assert "follow-up detail" in direct["excerpt"]
+    assert chained["source_location"] == f"{path.name}:11"
+    assert "RuntimeError: final exception - actual cause" in chained["excerpt"]
+    assert "final details" in chained["excerpt"]
+    assert "inner-" not in chained["excerpt"]
+    assert "misleading captured text" not in summary["decisive_excerpt"]
+    assert "raise Rejected(" not in direct["excerpt"]
+    assert "raise RuntimeError(" not in chained["excerpt"]
+    for failure in summary["failures"]:
+        assert len(failure["excerpt"].encode("utf-8")) <= 800
+
+
+@pytest.mark.parametrize("reason", ["RuntimeError: the actual failure", ""])
+def test_failure_summary_prefers_reason_to_source_call(
+    test_runner_module: Any, reason: str
+) -> None:
+    output = (
+        "_ test_failure[with - separator] _\n"
+        ">       call_that_failed()\n"
+        "tests/test_example.py:10: RuntimeError\n"
+        "----------------------------- Captured stdout call -----------------------------\n"
+        "E       misleading captured text\n"
+        ">       misleading captured source\n"
+        "=== short test summary info ===\n"
+        "FAILED tests/test_example.py::test_failure[with - separator]"
+        + (f" - {reason}" if reason else "")
+        + "\n"
+    )
+    summary = test_runner_module.pytest_diagnostics.pytest_failure_summary(output, "")
+    assert summary["failures"][0]["excerpt"] == (reason or ">       call_that_failed()")
+    assert "misleading captured text" not in summary["decisive_excerpt"]
+
+
 @pytest.mark.parametrize(
     ("title", "identity"),
     [
@@ -638,13 +724,17 @@ def test_failure_summary_matches_real_long_pytest_titles(
         ),
         ("ERROR at teardown of test_same", "tests/test_a.py::test_same"),
         ("ERROR collecting tests/test_a.py", "tests/test_a.py"),
+        (
+            "ERROR at setup of TestExample.test_same[value - with separator]",
+            "tests/test_a.py::TestExample::test_same[value - with separator]",
+        ),
     ],
 )
 @pytest.mark.parametrize(
     ("traceback_line", "expected_excerpt"),
     [
         ("E       exact-match", "E       exact-match"),
-        (">       assert actual == expected", ">       assert actual == expected"),
+        (">       assert actual == expected", "exact-reason"),
         ("assert setup_ok", "exact-reason"),
     ],
 )

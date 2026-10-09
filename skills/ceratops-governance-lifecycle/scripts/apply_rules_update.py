@@ -3,14 +3,15 @@
 
 The producer accepts candidate text and history operations together. Its immutable
 candidate contains exact output bytes, destination base identities and the original
-check results. Application requests (version 5) name only that candidate, its hash,
-and cleanup ownership. Application never calls a content validator, reconstructs
+check results. Application requests (version 6) embed that candidate, its hash,
+and cleanup ownership in one file. Application never calls a content validator, reconstructs
 replacements, or consults a newer policy. Hash comparisons protect the accepted
 artifact and prevent overwriting another writer's edits.
 
-Candidate/evidence files belong to the proposal's bounded iteration directory;
-finalization retains only the champion. Successful application removes only exact
-declared disposable inputs. Same-directory staging and backups exist only during
+Proposal completion retains one request for approval or applies it immediately
+when authorized. Supplied candidate inputs remain caller-owned. Successful
+application removes only its declared disposable request. Same-directory staging
+and backups exist only during
 the transaction and are removed after success or a completed rollback.
 """
 
@@ -53,10 +54,10 @@ from validate_rule_candidate import (
     validate_stack_texts,
 )
 
-REQUEST_VERSION = 5
+REQUEST_VERSION = 6
 ROOT_FIELDS = {
-    "version", "task_temp_root", "request_disposable", "validated_candidate",
-    "validated_candidate_sha256", "candidate_disposable",
+    "version", "task_temp_root", "request_disposable", "accepted_candidate",
+    "accepted_candidate_sha256",
 }
 PRODUCER_FIELDS = {
     "version",
@@ -113,6 +114,7 @@ class PreparedUpdate:
     validation_evidence_disposable: bool
     policy_hashes: dict[Path, str]
     rule_stack_sha256: dict[Path, str]
+    already_applied: bool = False
 
 
 def require_fields(value: object, fields: set[str], label: str) -> dict[str, Any]:
@@ -195,7 +197,9 @@ def verified_task_temp_root(value: object) -> Path:
     return resolved
 
 
-def workflow_artifact(path: Path, task_temp_root: Path, label: str) -> Path:
+def workflow_artifact(
+    path: Path, task_temp_root: Path, label: str, *, must_exist: bool = True,
+) -> Path:
     """Validate one exact disposable artifact without deriving its name."""
 
     lexical = absolute_path(path)
@@ -212,7 +216,7 @@ def workflow_artifact(path: Path, task_temp_root: Path, label: str) -> Path:
             raise ApplicationError(
                 f"disposable {label} uses a symlink or junction: {current}"
             )
-    if not lexical.is_file():
+    if (lexical.exists() or must_exist) and not lexical.is_file():
         raise ApplicationError(
             f"disposable {label} is not a regular file: {lexical}"
         )
@@ -220,7 +224,7 @@ def workflow_artifact(path: Path, task_temp_root: Path, label: str) -> Path:
         raise ApplicationError(
             f"disposable {label} must not be a repository file"
         )
-    if lexical.resolve(strict=True).parent != lexical.parent.resolve(strict=True):
+    if lexical.resolve(strict=must_exist).parent != lexical.parent.resolve(strict=True):
         raise ApplicationError(
             f"disposable {label} resolves outside its directory"
         )
@@ -967,20 +971,76 @@ def accept_candidate(
     _write_json_atomic(evidence_path, evidence)
 
 
+def accepted_candidate_hash(candidate: dict[str, Any]) -> str:
+    """Bind the complete accepted work, including its original check evidence."""
+    return hashlib.sha256(json.dumps(
+        candidate, sort_keys=True, ensure_ascii=False, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+
+
+def build_update_request(
+    candidate: dict[str, Any], task_temp_root: Path, *, disposable: bool = True,
+) -> dict[str, Any]:
+    """Embed accepted contents without rebuilding or checking them again."""
+    acceptance = candidate.get("acceptance")
+    if not isinstance(acceptance, dict) or acceptance.get("schema") != "ceratops-rule-acceptance.v1":
+        raise ApplicationError("candidate has no producer acceptance")
+    if acceptance.get("input_sha256") != candidate_identity(candidate):
+        raise ApplicationError("candidate differs from its accepted input")
+    return {
+        "version": REQUEST_VERSION, "task_temp_root": str(task_temp_root),
+        "request_disposable": disposable, "accepted_candidate": candidate,
+        "accepted_candidate_sha256": accepted_candidate_hash(candidate),
+    }
+
+
+def export_update_request(
+    candidate_path: Path, output: Path, root: Path, *, expected_sha256: str | None = None,
+) -> None:
+    """Write one task-owned request; identical recovery never overwrites other work."""
+    root = verified_task_temp_root(str(root))
+    output = workflow_artifact(output, root, "update request", must_exist=False)
+    reject_link_chain(candidate_path, "candidate")
+    raw = candidate_path.read_bytes()
+    if expected_sha256 is not None and hashlib.sha256(raw).hexdigest() != expected_sha256:
+        raise ApplicationError("candidate changed after selection")
+    request = build_update_request(json.loads(raw), root)
+    if output.exists():
+        if load_request(output) != request:
+            raise ApplicationError("update request already contains other content")
+        return
+    _write_json_atomic(output, request)
+
+
+def generate_candidate_update_request(candidate_path: Path, root: Path) -> Path:
+    """Accept a supplied candidate once and export it; the input stays caller-owned."""
+    root = verified_task_temp_root(str(root))
+    evidence = root / "update-validation.json"
+    if evidence.exists():
+        raise ApplicationError("update-validation.json already exists")
+    try:
+        accept_candidate(candidate_path, evidence)
+        output = root / "update-request.json"
+        export_update_request(candidate_path, output, root)
+        return output
+    finally:
+        evidence.unlink(missing_ok=True)
+
+
 def load_accepted_update(request: dict[str, Any]) -> PreparedUpdate:
-    """Load frozen bytes after identity checks, without invoking producer code."""
+    """Read the single frozen request, using only integrity and destination checks."""
+    require_fields(request, ROOT_FIELDS, "request")
     if request["version"] != REQUEST_VERSION:
         raise ApplicationError(f"request version must be {REQUEST_VERSION}")
     root = verified_task_temp_root(request["task_temp_root"])
-    for field in ("request_disposable", "candidate_disposable"):
-        if not isinstance(request[field], bool):
-            raise ApplicationError(f"{field} must be boolean")
-    path = require_path(request["validated_candidate"], "validated_candidate")
-    reject_link_chain(path, "candidate")
-    digest = require_sha256(request["validated_candidate_sha256"], "candidate hash")
-    if file_hash(path) != digest:
-        raise ApplicationError("validated_candidate_sha256 is stale")
-    candidate = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(request["request_disposable"], bool):
+        raise ApplicationError("request_disposable must be boolean")
+    candidate = request["accepted_candidate"]
+    if not isinstance(candidate, dict):
+        raise ApplicationError("accepted_candidate must be an object")
+    digest = require_sha256(request["accepted_candidate_sha256"], "candidate hash")
+    if accepted_candidate_hash(candidate) != digest:
+        raise ApplicationError("accepted_candidate_sha256 is stale")
     acceptance = candidate.get("acceptance")
     if not isinstance(acceptance, dict) or acceptance.get("schema") != "ceratops-rule-acceptance.v1":
         raise ApplicationError("candidate has no producer acceptance")
@@ -993,26 +1053,32 @@ def load_accepted_update(request: dict[str, Any]) -> PreparedUpdate:
     if not outputs or not set(outputs).issubset(bases):
         raise ApplicationError("accepted outputs lack destination base identities")
     originals = {}
+    current_hashes = {}
     for destination, expected in bases.items():
         reject_link_chain(destination, "destination")
         if destination == root or root in destination.parents:
             raise ApplicationError("task_temp_root must not contain a governed target")
         raw = destination.read_bytes()
-        if hashlib.sha256(raw).hexdigest() != expected:
+        current_hashes[destination] = hashlib.sha256(raw).hexdigest()
+        if destination not in outputs and current_hashes[destination] != expected:
             raise ApplicationError(f"source changed since acceptance: {destination}")
         if destination in outputs:
             originals[destination] = raw
-    if request["candidate_disposable"]:
-        workflow_artifact(path, root, "candidate")
+    # A retry after successful writes or interrupted cleanup consumes the same
+    # accepted result. Mixed/foreign destination contents must never be replayed.
+    already_applied = originals == outputs
+    if not already_applied:
+        for destination in outputs:
+            if current_hashes[destination] != bases[destination]:
+                raise ApplicationError(f"source changed since acceptance: {destination}")
     return PreparedUpdate(
         stack_paths=list(bases), originals=originals, candidates=outputs,
         toml_paths=set(), baseline_reviews=set(), expected_history_entries={},
         task_temp_root=root, request_disposable=request["request_disposable"],
-        candidate_path=path, candidate_sha256=digest,
-        candidate_disposable=request["candidate_disposable"],
-        validation_evidence=path, validation_evidence_sha256=digest,
+        candidate_path=None, candidate_sha256=None, candidate_disposable=False,
+        validation_evidence=root / "update-request.json", validation_evidence_sha256=digest,
         validation_evidence_disposable=False, policy_hashes={},
-        rule_stack_sha256=bases,
+        rule_stack_sha256=current_hashes, already_applied=already_applied,
     )
 
 
@@ -1078,6 +1144,11 @@ def verify_written_identity(update: PreparedUpdate) -> None:
 
 def commit(update: PreparedUpdate) -> None:
     """Replace every target with rollback on write or post-write failure."""
+    if update.already_applied:
+        verify_application_inputs(update)
+        verify_rule_stack_inputs(update)
+        verify_written_identity(update)
+        return
     targets = sorted(update.candidates, key=lambda path: str(path).lower())
     backups: dict[Path, Path] = {}
     staged: dict[Path, Path] = {}
@@ -1121,65 +1192,30 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def apply_update_request(request_path: Path) -> None:
+    """Apply and remove one declared request; failures preserve it for recovery."""
+    request_path = absolute_path(request_path)
+    reject_link_chain(request_path, "request")
+    if not request_path.is_file():
+        raise ApplicationError(f"request does not exist: {request_path}")
+    request_sha256 = file_hash(request_path)
+    update = load_accepted_update(load_request(request_path))
+    if update.request_disposable:
+        request_path = workflow_artifact(request_path, update.task_temp_root, "request")
+    update.candidate_path = request_path
+    update.candidate_sha256 = request_sha256
+    commit(update)
+    if update.request_disposable:
+        if file_hash(request_path) != request_sha256:
+            raise ApplicationError("disposable request changed during transaction")
+        request_path.unlink()
+
+
 def main() -> int:
     """Apply one request with decision-sized output."""
     try:
         args = build_parser().parse_args()
-        request_path = absolute_path(args.request)
-        reject_link_chain(request_path, "request")
-        if not request_path.is_file():
-            raise ApplicationError(f"request does not exist: {request_path}")
-        request_sha256 = file_hash(request_path)
-        update = load_accepted_update(load_request(request_path))
-        if update.request_disposable:
-            request_path = workflow_artifact(
-                request_path,
-                update.task_temp_root,
-                "request",
-            )
-        protected_inputs: set[Path] = set()
-        if update.candidate_path is not None:
-            protected_inputs.add(update.candidate_path)
-        if request_path in protected_inputs:
-            raise ApplicationError("request, candidate, and evidence paths must differ")
-        commit(update)
-        cleanup: list[tuple[Path, str, str]] = []
-        if update.candidate_disposable and update.candidate_path is not None:
-            candidate = workflow_artifact(
-                update.candidate_path,
-                update.task_temp_root,
-                "candidate",
-            )
-            if update.candidate_sha256 is None:
-                raise ApplicationError("candidate hash is missing")
-            cleanup.append((candidate, update.candidate_sha256, "candidate"))
-        if update.validation_evidence_disposable:
-            evidence = workflow_artifact(
-                update.validation_evidence,
-                update.task_temp_root,
-                "validation evidence",
-            )
-            cleanup.append(
-                (
-                    evidence,
-                    update.validation_evidence_sha256,
-                    "validation evidence",
-                )
-            )
-        if update.request_disposable:
-            request_path = workflow_artifact(
-                request_path,
-                update.task_temp_root,
-                "request",
-            )
-            cleanup.append((request_path, request_sha256, "request"))
-        for path, expected_hash, label in cleanup:
-            if file_hash(path) != expected_hash:
-                raise ApplicationError(
-                    f"disposable {label} changed during transaction"
-                )
-        for path, _, _ in cleanup:
-            path.unlink()
+        apply_update_request(args.request)
         print("OK")
         return 0
     except (

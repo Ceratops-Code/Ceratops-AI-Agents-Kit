@@ -7,6 +7,9 @@ import pathlib
 import subprocess
 import sys
 import tomllib
+from unittest import mock
+
+import pytest
 
 from tests.governance_lifecycle.support import (
     RULE_CANDIDATE_VALIDATOR,
@@ -154,7 +157,8 @@ def test_rule_candidate_repairs_multiple_targets_and_is_idempotent(
     assert "\n" not in fixed_second[1]["replacement"].replace("\r\n", "")
     assert (first.read_bytes(), second.read_bytes()) == original_sources
     detail = json.loads(evidence.read_text(encoding="utf-8"))
-    assert detail["status"] == "passed" and detail["idempotent"] is True
+    assert detail["status"] == "passed" and "idempotent" not in detail
+    assert not fixed_first[0]["replacement"].startswith(" ")
     # The policy engine uses this source checkout's npm dependency, regardless
     # of target configuration. Verify the resolved command can validate Markdown.
     command = pathlib.Path(fixed["targets"][0]["markdown_policy"]["validate_command"][0])
@@ -214,6 +218,148 @@ def test_rule_candidate_repairs_multiple_targets_and_is_idempotent(
         checked = subprocess.run(arguments + ["--check-only"], env=environment, capture_output=True, text=True)
         assert checked.returncode == 0, checked.stderr
         assert toml_candidate.read_bytes() == candidate_bytes
+
+
+@pytest.mark.parametrize("newline,bom", [("\n", b""), ("\r\n", b""), ("\r\n", b"\xef\xbb\xbf")])
+@pytest.mark.parametrize("prefix", ["", "- ", "  - ", "> ", "> > - "])
+def test_formatter_is_stable_and_preserves_surrounding_bytes(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, newline: str, bom: bytes, prefix: str,
+) -> None:
+    monkeypatch.syspath_prepend(str(RULE_CANDIDATE_VALIDATOR.parent))
+    import validate_rule_candidate as producer
+
+    target = tmp_path / "contract.md"
+    old = prefix + "Old prose."
+    before = "# Contract" + newline * 2 + old + newline * 2 + "Untouched `code`." + newline
+    original = bom + before.encode("utf-8")
+    target.write_bytes(original)
+    policy = producer.resolve_target_policy(None, target=target)
+    replacement = prefix + "Changed prose " + "with protected `two  words` and punctuation, " * 8
+    repaired = producer._repair_fragment(replacement, newline=newline, policy=policy, target=target, replacement=0)
+    assert repaired.startswith(prefix + "Changed")
+    assert producer._repair_fragment(repaired, newline=newline, policy=policy, target=target, replacement=0) == repaired
+    assert "`two  words`" in repaired
+    source = producer.read_source(target, "target")
+    prospective, _ = producer.construct_prospective(source, [{"expected_old": old, "replacement": repaired}])
+    assert prospective == before.replace(old, repaired)
+    assert target.read_bytes() == original
+    assert "\n" not in repaired.replace(newline, "")
+
+
+@pytest.mark.parametrize("marker", [">", "*", "1.", "#", "```code```"])
+def test_wrapping_cannot_turn_prose_into_markdown_structure(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, marker: str,
+) -> None:
+    monkeypatch.syspath_prepend(str(RULE_CANDIDATE_VALIDATOR.parent))
+    import validate_rule_candidate as producer
+
+    line = "Ordinary safe prose " + marker + " after a long sentence"
+    assert producer._wrap_line(line, 20, target=tmp_path / "contract.md", replacement=0) == [line]
+
+
+def test_new_candidate_invokes_each_external_validator_once(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.syspath_prepend(str(RULE_CANDIDATE_VALIDATOR.parent))
+    import validate_rule_candidate as producer
+
+    target = tmp_path / "contract.md"
+    target.write_bytes(b"# Contract\n\nOld prose.\n")
+    candidate = tmp_path / "candidate.json"
+    write_rule_candidate(candidate, rule_stack=[target], targets=[{
+        "rules": str(target), "history": None,
+        "source_sha256": hashlib.sha256(target.read_bytes()).hexdigest(), "markdown_policy": None,
+        "replacements": [{"expected_old": "Old prose.", "replacement": "New prose."}],
+    }])
+    with mock.patch.object(producer, "_run_policy_command", wraps=producer._run_policy_command) as external:
+        producer.validate_rule_candidate(candidate, tmp_path / "evidence.json")
+    assert external.call_count == 1
+    assert target.read_bytes() == b"# Contract\n\nOld prose.\n"
+
+
+@pytest.mark.parametrize("authorized", [False, True])
+def test_generate_request_is_self_contained_and_honors_application_authority(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, authorized: bool,
+) -> None:
+    monkeypatch.syspath_prepend(str(RULE_CANDIDATE_VALIDATOR.parent))
+    import apply_rules_update as application
+
+    root = tmp_path / "task-temp"
+    root.mkdir()
+    target = tmp_path / "contract.md"
+    target.write_bytes(b"# Contract\r\n\r\nOld prose.\r\n")
+    candidate = tmp_path / "candidate.json"
+    write_rule_candidate(candidate, rule_stack=[target], targets=[{
+        "rules": str(target), "history": None,
+        "source_sha256": hashlib.sha256(target.read_bytes()).hexdigest(), "markdown_policy": None,
+        "replacements": [{"expected_old": "Old prose.", "replacement": "New prose."}],
+    }])
+    result = subprocess.run([
+        sys.executable, str(RULE_CANDIDATE_VALIDATOR.with_name("proposal-workflow.py")),
+        "generate-update-request", "--candidate", str(candidate), "--task-temp-root", str(root),
+        *(["--mutation-authorized"] if authorized else []),
+    ], capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stderr
+    if authorized:
+        assert result.stdout.strip() == "OK"
+    else:
+        assert json.loads(result.stdout)["status"] == "awaiting_approval"
+        request_path = root / "update-request.json"
+        assert set(root.iterdir()) == {request_path}
+        assert b"Old prose." in target.read_bytes()
+        frozen = json.loads(request_path.read_bytes())["accepted_candidate"]["acceptance"]
+        candidate.unlink()
+        # Neither the input file nor newer content checks are needed to apply.
+        with mock.patch.object(application, "validate_rule_candidate", side_effect=AssertionError("revalidated")):
+            application.apply_update_request(request_path)
+        assert frozen["check_versions"]
+    assert target.read_bytes() == b"# Contract\r\n\r\nNew prose.\r\n"
+    assert not list(root.iterdir())
+
+
+def test_application_failure_and_interrupted_cleanup_preserve_recovery(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.syspath_prepend(str(RULE_CANDIDATE_VALIDATOR.parent))
+    import apply_rules_update as application
+
+    root = tmp_path / "task-temp"
+    root.mkdir()
+    target = tmp_path / "contract.md"
+    original = b"# Contract\n\nOld prose.\n"
+    target.write_bytes(original)
+    candidate = tmp_path / "candidate.json"
+    write_rule_candidate(candidate, rule_stack=[target], targets=[{
+        "rules": str(target), "history": None,
+        "source_sha256": hashlib.sha256(original).hexdigest(), "markdown_policy": None,
+        "replacements": [{"expected_old": "Old prose.", "replacement": "New prose."}],
+    }])
+    request_path = application.generate_candidate_update_request(candidate, root)
+    frozen = request_path.read_bytes()
+    target.write_bytes(original + b"\nAnother writer.\n")
+    with pytest.raises(application.ApplicationError, match="source changed since acceptance"):
+        application.apply_update_request(request_path)
+    assert request_path.read_bytes() == frozen
+    assert b"Another writer." in target.read_bytes()
+    target.write_bytes(original)
+    unlink = pathlib.Path.unlink
+
+    def interrupted_cleanup(path, *args, **kwargs):
+        if path == request_path:
+            raise OSError("simulated cleanup interruption")
+        return unlink(path, *args, **kwargs)
+
+    with mock.patch.object(pathlib.Path, "unlink", interrupted_cleanup):
+        with pytest.raises(OSError, match="cleanup interruption"):
+            application.apply_update_request(request_path)
+    expected = b"# Contract\n\nNew prose.\n"
+    assert target.read_bytes() == expected and request_path.read_bytes() == frozen
+    with (
+        mock.patch.object(application, "validate_rule_candidate", side_effect=AssertionError("revalidated")),
+        mock.patch.object(application.os, "replace", side_effect=AssertionError("rewrote completed update")),
+    ):
+        application.apply_update_request(request_path)
+    assert target.read_bytes() == expected and not list(root.iterdir())
 
 
 def test_rule_candidate_failures_are_atomic_and_actionable(

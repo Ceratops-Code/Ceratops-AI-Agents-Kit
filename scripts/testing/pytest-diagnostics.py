@@ -15,6 +15,14 @@ PYTEST_SECTION_HEADER = re.compile(r"^_+\s+(?P<title>.+?)\s+_+$")
 PYTHON_SOURCE_LOCATION = re.compile(
     r"^(?P<path>.+?\.py):(?P<line>[1-9][0-9]*)(?::.*)?$"
 )
+PYTEST_CAPTURE_HEADER = re.compile(r"^-+\s+Captured\s+.+?\s+-+$")
+PYTEST_ERROR_SECTION_PREFIXES = (
+    "ERROR at setup of ", "ERROR at teardown of ", "ERROR collecting ",
+)
+PYTEST_EXCEPTION_CHAIN_MARKERS = (
+    "The above exception was the direct cause of the following exception:",
+    "During handling of the above exception, another exception occurred:",
+)
 MAX_PYTEST_FAILURES = 10
 PYTEST_IDENTITY_BYTES = 400
 PYTEST_LOCATION_BYTES = 500
@@ -76,6 +84,32 @@ def _pytest_title(identity: str) -> str:
     return qualified.replace("::", ".") + bracket + parameters if separator else path
 
 
+def _pytest_section_test_title(title: str) -> str:
+    """Remove pytest's phase label without altering class or parameter names."""
+
+    for prefix in PYTEST_ERROR_SECTION_PREFIXES:
+        if title.startswith(prefix):
+            return title.removeprefix(prefix)
+    return title
+
+
+def _pytest_summary_entry(value: str, section_titles: set[str]) -> tuple[str, str]:
+    """Use the reported title to distinguish a parameter separator from a reason.
+
+    Both parameter names and exception messages can contain `` - ``. Prefer an
+    exact section title; without one, retain pytest's ordinary summary fallback.
+    """
+
+    if _pytest_title(value) in section_titles:
+        return value, ""
+    for separator in re.finditer(r" - ", value):
+        identity = value[:separator.start()]
+        if _pytest_title(identity) in section_titles:
+            return identity, value[separator.end():]
+    identity, _separator, reason = value.partition(" - ")
+    return identity, reason
+
+
 def _pytest_section_for_identity(
     identity: str,
     sections: Sequence[tuple[str, list[str]]],
@@ -93,11 +127,7 @@ def _pytest_section_for_identity(
     expected_title = _pytest_title(identity)
     candidates: list[int] = []
     for index, (title, _content) in enumerate(sections):
-        for prefix in ("ERROR at setup of ", "ERROR at teardown of ", "ERROR collecting "):
-            if title.startswith(prefix):
-                title = title.removeprefix(prefix)
-                break
-        if title == expected_title:
+        if _pytest_section_test_title(title) == expected_title:
             candidates.append(index)
     located = [
         index
@@ -148,11 +178,22 @@ def _pytest_source_location(identity: str, section: Sequence[str]) -> str | None
 def _pytest_failure_excerpt(section: Sequence[str], fallback: str) -> str:
     """Return bounded decisive lines for one failure, or its summary reason."""
 
-    # Ordinary source assertions can have passed before the reported failure.
-    # Use pytest's explanation first; the marked failing source is a fallback.
-    decisive = [line for line in section if line.startswith(("E ", "AssertionError"))]
+    # A chained exception's final block is the reported failure. Earlier blocks
+    # must not consume its budget, and captured output is never exception evidence.
+    decisive: list[str] = []
+    marked_source: list[str] = []
+    for line in section:
+        if PYTEST_CAPTURE_HEADER.fullmatch(line):
+            break
+        if line.startswith("> "):
+            marked_source.append(line)
+        if line in PYTEST_EXCEPTION_CHAIN_MARKERS:
+            decisive = []
+        elif line.startswith(("E ", "AssertionError")):
+            decisive.append(line)
+    # The test's own summary reason is more useful than a marked source call.
     if not decisive:
-        decisive = [line for line in section if line.startswith("> ")]
+        decisive = [fallback] if fallback else marked_source
     return _bounded_lines(
         decisive or [fallback], line_limit=6,
         byte_limit=PYTEST_FAILURE_EXCERPT_BYTES,
@@ -176,18 +217,19 @@ def pytest_failure_summary(stdout: str, stderr: str) -> dict[str, object]:
         line for stream in (stdout, stderr) for line in stream.splitlines()
     ]
     lines = [line.strip() for line in raw_lines if line.strip()]
+    sections = _pytest_failure_sections(raw_lines)
+    section_titles = {_pytest_section_test_title(title) for title, _content in sections}
     summaries: list[tuple[str, str]] = []
     seen_identities: set[str] = set()
     for line in lines:
         if line.startswith(("FAILED ", "ERROR ")):
             summary = line.split(maxsplit=1)
             if len(summary) == 2:
-                identity, separator, reason = summary[1].partition(" - ")
+                identity, reason = _pytest_summary_entry(summary[1], section_titles)
                 if identity and identity not in seen_identities:
-                    summaries.append((identity, reason if separator else ""))
+                    summaries.append((identity, reason))
                     seen_identities.add(identity)
 
-    sections = _pytest_failure_sections(raw_lines)
     title_counts = Counter(_pytest_title(identity) for identity, _reason in summaries)
     used_sections: set[int] = set()
     failures: list[dict[str, object]] = []

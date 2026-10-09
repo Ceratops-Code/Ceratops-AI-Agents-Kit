@@ -133,7 +133,7 @@ without repository deduplication.
 | `scripts/deploy-hooks.py` | Independent hook installation and updates; copies the repository hook payloads and merges their registrations while preserving unrelated files and configuration. Does not grant trust or restart Codex. |
 | `scripts/deploy-mcp-server-manager.py` | Install the checkout's declared MCP server manager version, including over an existing installation, from the scripts environment; uses the manager's global Python and uv prerequisites, temporary locked libraries, and packaging and deployment code. Never changes Codex settings. |
 | `scripts/testing/run-tests.py` | Sole test-selection, collection-reconciliation, and pytest-execution owner; validates `tests/test-impact.json`, explains deterministic Git-diff selection, rejects mapping gaps before pytest collection or execution, supports explicit committed-diff, worktree, collection, and `--all` modes, adds `--select-only` to check diff/worktree mapping without pytest, and saves failed-pytest streams and structured pre-test failures with captured command output through `--diagnostic-output`; pytest output remains bounded in the console. |
-| `scripts/testing/pytest-diagnostics.py` | Extracts bounded failure summaries using exact pytest identities and source-file evidence; prioritizes reported exceptions and assertion differences over source context. Ambiguous or missing tracebacks use only that test's summary reason. Full diagnostic files remain owned by the runner. |
+| `scripts/testing/pytest-diagnostics.py` | Extracts bounded failure summaries using exact pytest identities and source-file evidence, including parameter names containing summary separators; prioritizes the final exception's message and assertion differences over source context, excluding captured output. Ambiguous or missing tracebacks use only that test's summary reason. Full diagnostic files remain owned by the runner. |
 | `scripts/run-actionlint.py` | Provisions the pinned, checksum-verified actionlint release inside the scripts environment and validates every GitHub Actions workflow. |
 | `scripts/validate-repository.py` | Local validation coordinator; checks the running Python against `scripts/pyproject.toml`, runs workflow, repository lint and type checks, and captures first-failure evidence. Tests run separately through `scripts/testing/run-tests.py`. |
 | `skills/ceratops-repo-lifecycle/references/templates/deploy-skills.py.tmpl` | Authoritative standalone installer copied into compatible skill repositories as `scripts/deploy-skills.py`; invoke it through uv using the scripts project. |
@@ -157,10 +157,10 @@ without repository deduplication.
 | `skills/ceratops-credit-savings-analysis/scripts/credit_analysis/report_rendering.py` | Renders full-analysis reports as runs tables with UTC start times, combined avoidable counts, separate unassessed counts, exact omission labels, and token percentages. Direct-result delivery uses retained per-call evidence for the same table. Chat guidance comes from the parent skill Output Contract; the caller selects useful findings across the requested audit while complete findings, risks, accounting, and reviewer records stay in machine evidence. |
 | `skills/ceratops-credit-savings-analysis/scripts/credit_analysis/report_bookkeeping.py` | Owns result-shape validation, surface ordering, temporary-control links, category consolidation, and reviewer-record preservation. Final results retain complete original confirmed findings, risks, control reviews, and category assessments in controller-generated `source_findings`, `source_risks`, and `source_reviews`, checked against accepted reviewer records. Candidate links identify each finding's destination, which must cover its original calls and evidence; retained source findings do not add to savings or finding totals. The controller assembles category summaries from exact accepted checklists, including when resuming a retained older response, and aggregates applicability across reviewed portions without discarding differing assessments. Every distinct risk uncertainty remains in machine evidence. The controller revalidates saved final output before enforcing limits on new attempts and selects the highest-priority complete audit window that fits the reserved review slot. |
 | `skills/ceratops-task-lifecycle/scripts/closure_snapshot.py` | Emits one compact snapshot for explicitly named closure targets, inspects temp-root metadata without traversal unless `--count-temp-files` is requested, and optionally removes exact task-created files validated inside the task temp root. |
-| `skills/ceratops-governance-lifecycle/scripts/apply_rules_update.py` | Owns producer-side preparation of complete rule, history and TOML outputs; applies accepted bytes using identity comparisons and rollback, without rerunning content checks; cleans exact disposable inputs after success. |
-| `skills/ceratops-governance-lifecycle/scripts/validate_rule_candidate.py` | Checks new candidate text and formatter idempotence; `--accept` also freezes complete output and original check results for application, including history-only repairs. |
+| `skills/ceratops-governance-lifecycle/scripts/apply_rules_update.py` | Prepares complete rule, history and TOML outputs, embeds acceptance in one application request, and applies its saved bytes using integrity comparisons and rollback. Completed-write retries perform no writes or content checks; successful application removes only the declared disposable request. |
+| `skills/ceratops-governance-lifecycle/scripts/validate_rule_candidate.py` | Checks new candidate text once; formatting stability, protected-token preservation and untouched source slices are producer invariants covered by behavior tests. `--accept` freezes complete outputs and original check results, including history-only repairs. |
 | `skills/ceratops-governance-lifecycle/scripts/rule_candidate_source.py` | Owns exact UTF-8 source loading, encoding and line-ending preservation, shared candidate data, and input-integrity checks used by governance validation and application. |
-| `skills/ceratops-governance-lifecycle/scripts/proposal-workflow.py` | Initializes proposals from repeated source declarations and UTF-8 text files, constructs requests and seeds the first candidate from exact replacements, or prepares a supplied complete request. Its driver reports or submits one semantic decision at a time; validation covers inputs, histories, target policies, hashes, untouched formatting, task-temp ownership, controller transitions, and accepted-champion retention. |
+| `skills/ceratops-governance-lifecycle/scripts/proposal-workflow.py` | Initializes exact proposals and records semantic decisions. At convergence, its driver generates one application request and invokes the updater when authorized. Proposal-only runs retain that file for approval; generation or application failures retain recovery inputs. Successful completion cleans owned iteration artifacts and preserves caller inputs. |
 | `skills/ceratops-governance-lifecycle/scripts/iteration_controller.py` | Opens structured candidates, invokes mechanical validation before recording, retains the exact validated champion, enforces stopping, and safely finalizes owned artifacts. |
 | `skills/ceratops-governance-lifecycle/scripts/rule_graph.py` | Parses canonical AGENTS rules and rejects structural syntax or rule-local explicit-user override escape clauses. |
 | `skills/ceratops-repo-lifecycle/scripts/github_contract_engine/` | Package CLI for compact local audit snapshots, contract evaluation, shared GitHub API access, sanitized evidence, and evidence-gated CodeQL disposition. |
@@ -599,9 +599,11 @@ Inside the verified task-temp root, construction creates `proposal-request.json`
 `proposal-original.json`, `proposal-regressions.md`, `proposal-state.json`,
 `proposal-context.json` and `iterations/`. It refuses existing output paths.
 Stdout returns the pending iteration paths plus `state` and `champion_output`.
-Continue with `run` or the lower-level `advance`, then `finalize`. Finalization
-removes generated inputs and controller artifacts while retaining
-`validated-champion.json` and the caller's spec. A failure before state creation
+Continue with `run`, which generates the request at convergence. After the
+lower-level `advance`, call `generate-update-request`. Completion removes
+generated inputs and controller artifacts, retaining the proposal's
+`update-request.json` when awaiting approval and preserving the caller's spec.
+A failure before state creation
 removes only unchanged generated inputs; a later failure reports the preserved
 state path for recovery. Callers needing explicit output paths or ownership can
 continue using `prepare --request REQUEST` with the complete request format.
@@ -613,7 +615,7 @@ ID migrations alongside the replacement text, before advancing. Non-rule
 Markdown and TOML edits do not need a companion history. Each accepted candidate
 contains the complete prepared output, destination base hashes, original check
 results and check-version identities. The controller adds the semantic assessment
-and regression result; the finalizer exports these bytes unchanged.
+and regression result; the generator embeds this exact acceptance in one request.
 
 Passing checks does not end optimization. Each accepted improvement resets the
 consecutive-no-improvement count; three completed non-improving reviews converge.
@@ -621,18 +623,22 @@ An iteration cap reports `interrupted: true`, never successful completion.
 Mechanical errors retain the pending iteration. An identical accepted candidate
 retains its original acceptance even if a validator or policy later changes.
 
-Application uses `python scripts/apply_rules_update.py --request REQUEST` with:
+At convergence, `run` invokes `generate-update-request` automatically. For a
+completed state reached through lower-level commands or a recoverable failure,
+use `proposal-workflow.py generate-update-request --state STATE`. Its ordinary
+output is the single task-owned `update-request.json`, with version 6 fields
+`version`, `task_temp_root`, `request_disposable`, `accepted_candidate`, and
+`accepted_candidate_sha256`. The accepted candidate is embedded, including exact
+destination bytes, original-file identities and original check evidence; no
+pointer file or candidate file is needed for application.
 
-```json
-{
-  "version": 5,
-  "task_temp_root": "<absolute existing task-temp directory>",
-  "request_disposable": true,
-  "validated_candidate": "<exact finalized champion path>",
-  "validated_candidate_sha256": "<champion SHA-256>",
-  "candidate_disposable": true
-}
-```
+Set `--mutation-authorized` at initialization only when the user has authorized
+application. The driver invokes `apply_rules_update.py --request REQUEST` in the
+same Python environment and returns `OK` after application and cleanup. A
+proposal-only run returns `status: awaiting_approval`, the request path and the
+next approval action. After approval, invoke the updater with that retained
+request. Explicit generation also accepts `--mutation-authorized` for approval
+received after the proposal was initialized.
 
 Application consumes the frozen output; it does not format, reconstruct history,
 or rerun Markdown, TOML, graph or candidate validation. It compares the supplied
@@ -641,14 +647,22 @@ checks only write integrity. A destination edit requires a new proposal, not
 revalidation of the unchanged winner. The original tests remain part of its
 acceptance regardless of later checker versions.
 
-For an approved history-only repair, a candidate has no targets and contains the
-exact history operations. Produce its accepted output with
-`python scripts/validate_rule_candidate.py --candidate CANDIDATE
---evidence EVIDENCE --accept`, then use the same application request.
-The evidence path is caller-owned. The proposal workflow instead owns its
-iteration evidence and deletes it at finalization after retaining the original
-results inside the champion. No additional receipt or application-time log is
-created.
+For a supplied candidate, including history-only repairs with no targets, use
+`proposal-workflow.py generate-update-request --candidate CANDIDATE
+--task-temp-root ROOT`, adding `--mutation-authorized` for authorized application.
+New candidates are accepted once; unchanged accepted candidates reuse their
+original evidence. The supplied candidate remains caller-owned. Temporary
+acceptance evidence is removed on exit.
+
+The proposal workflow owns its state, iterations and declared inputs beneath
+the verified task-temp root. It retains those while unfinished or failed, then
+removes them after exporting a proposal or completing an authorized application.
+Each root has one retained application request; conflicting existing output is
+rejected. The updater deletes that request after success when declared
+disposable. A retry after completed writes verifies the exact saved bytes and
+finishes cleanup without writing again. Foreign or mixed destination contents
+block recovery. Caller-owned inputs and unrelated files are preserved. No
+additional receipt, application log or background cleanup process is created.
 
 ## Contracts
 
