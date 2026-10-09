@@ -381,11 +381,13 @@ def test_write_lock_rejects_linked_file_without_changing_its_bytes(tmp_path, wri
     assert foreign.read_bytes() == b"preserve"
 
 
-@pytest.mark.skipif(not hasattr(os, "fork"), reason="POSIX fork only")
 def test_write_lock_fork_cannot_reuse_parent_ownership(tmp_path, write_locks):
+    fork = getattr(os, "fork", None)
+    if fork is None:
+        pytest.skip("POSIX fork only")
     path = tmp_path / "release-local"
     with write_locks.hold_write_lock(path) as owned:
-        pid = os.fork()
+        pid = fork()
         if pid == 0:
             try:
                 with write_locks.hold_write_lock(path):
