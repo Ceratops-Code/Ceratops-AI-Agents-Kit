@@ -136,16 +136,6 @@ deliverables:
         install:
           requires: {capabilities: []}
           steps: [{handoff: {lifecycle: ceratops-skill-lifecycle, action: deploy, inputs: {skill: ceratops-misunderstanding-audit}}}]
-    ceratops-openai-docs-managed:
-      source: skills/ceratops-openai-docs-managed
-      prerequisites: []
-      actions:
-        validate:
-          requires: {capabilities: []}
-          steps: [{handoff: {lifecycle: ceratops-skill-lifecycle, action: source-validate, inputs: {skill: ceratops-openai-docs-managed}}}]
-        install:
-          requires: {capabilities: []}
-          steps: [{handoff: {lifecycle: ceratops-skill-lifecycle, action: deploy, inputs: {skill: ceratops-openai-docs-managed}}}]
     ceratops-repo-lifecycle:
       source: skills/ceratops-repo-lifecycle
       prerequisites: []

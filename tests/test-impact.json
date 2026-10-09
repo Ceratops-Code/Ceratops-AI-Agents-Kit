@@ -25,12 +25,6 @@
       ],
       "depends_on": []
     },
-    "openai-docs": {
-      "pytest": [
-        "tests/openai_docs"
-      ],
-      "depends_on": []
-    },
     "repository-lifecycle": {
       "pytest": [
         "tests/repository_lifecycle"
@@ -99,15 +93,6 @@
       ],
       "suites": [
         "governance-lifecycle"
-      ]
-    },
-    {
-      "id": "openai-docs-source",
-      "paths": [
-        "skills/ceratops-openai-docs-managed/**"
-      ],
-      "suites": [
-        "openai-docs"
       ]
     },
     {

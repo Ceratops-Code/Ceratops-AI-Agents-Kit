@@ -449,17 +449,6 @@ def test_bootstrap_full_install_materializes_lifecycle_bundle_with_source_runtim
         assert (installed_sections / "core.md").is_file()
         assert (installed_sections / "multi-action-skill.md").is_file()
         assert not (installed_skill / "skills" / "sections").exists()
-    installed_openai_docs = install_root / "ceratops-openai-docs-managed"
-    assert (
-        installed_openai_docs / "scripts" / "openai_docs_retrieval.py"
-    ).is_file()
-    assert not (
-        installed_openai_docs
-        / "skills"
-        / "ceratops-openai-docs-managed"
-        / "scripts"
-        / "openai_docs_retrieval.py"
-    ).exists()
     assert (
         installed_lifecycle
         / "references"

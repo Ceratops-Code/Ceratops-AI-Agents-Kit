@@ -66,8 +66,7 @@
     "ceratops-skill-lifecycle",
     "ceratops-task-lifecycle",
     "ceratops-mcp-server-lifecycle",
-    "ceratops-design-document-lifecycle",
-    "ceratops-openai-docs-managed"
+    "ceratops-design-document-lifecycle"
   ],
   "skills": {
     "codex-desktop-upgrade": [
@@ -98,10 +97,6 @@
     "ceratops-misunderstanding-audit": [
       "core",
       "evidence-analysis"
-    ],
-    "ceratops-openai-docs-managed": [
-      "core",
-      "bounded-model-analysis"
     ],
     "ceratops-repo-lifecycle": [
       "core",
