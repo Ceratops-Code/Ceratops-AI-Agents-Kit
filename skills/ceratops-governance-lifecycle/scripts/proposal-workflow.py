@@ -11,13 +11,12 @@ existing structured history lookup, rejects untouched Markdown errors before
 opening proposal artifacts, writes detailed context evidence, records
 exact task-temp cleanup ownership, and opens iteration one through
 ``iteration_controller.py``. ``advance`` delegates the controller's validated
-atomic submit-and-open operation. After a completed run, ``finalize`` preserves
-any accepted champion, creates none for all-rejected runs, preflights every recorded
-disposable artifact, delegates controller cleanup, and removes the remaining
-owned request, inputs, and evidence. User-owned or undeclared inputs are
-preserved. This helper never edits a governed source or makes semantic
-judgments, and stdout contains only the pending/status payload needed for the
-next decision or ``OK``.
+atomic submit-and-open operation. At convergence, ``run`` calls
+``generate-update-request`` to export one file containing the accepted contents
+and original evidence. Authorized updates invoke the application script before
+returning; proposals retain the request for approval. Failures retain recovery
+inputs. Success removes owned iteration artifacts and preserves caller-owned
+inputs. This helper makes no semantic judgments. Output is one next action or ``OK``.
 """
 
 from __future__ import annotations
@@ -32,6 +31,7 @@ import sys
 import tempfile
 from collections.abc import Mapping, Sequence
 
+from apply_rules_update import export_update_request, generate_candidate_update_request
 from iteration_controller import validate_max_iterations
 from rule_graph import parse_rule_source
 from validate_rule_candidate import CONTEXT_SCHEMA as CANDIDATE_CONTEXT_SCHEMA
@@ -43,7 +43,7 @@ from validate_rule_candidate import (
 
 REQUEST_SCHEMA = "ceratops-governance-proposal-request.v3"
 CONTEXT_SCHEMA = "ceratops-governance-proposal-context.v3"
-CLEANUP_SCHEMA = "ceratops-governance-proposal-cleanup.v2"
+CLEANUP_SCHEMA = "ceratops-governance-proposal-cleanup.v3"
 SPEC_SCHEMA = "ceratops-governance-proposal-spec.v1"
 SPEC_FIELDS = {
     "schema", "task_temp_root", "sources", "failure", "regressions",
@@ -80,6 +80,7 @@ CLEANUP_FIELDS = {
     "protected_artifacts",
     "governed_sources",
     "champion_output",
+    "mutation_authorized",
 }
 OWNED_ARTIFACT_FIELDS = {"role", "path", "sha256"}
 DISPOSABLE_ROLES = {
@@ -710,7 +711,7 @@ def command_construct(spec_path: pathlib.Path) -> str:
         "regressions": root / "proposal-regressions.md",
         "state": root / "proposal-state.json",
         "evidence": root / "proposal-context.json",
-        "champion": root / "validated-champion.json",
+        "champion": root / "update-request.json",
     }
     for label, path in paths.items():
         _task_file(path, root, label, must_exist=False)
@@ -782,7 +783,7 @@ def _annotated_status(payload: Mapping[str, object]) -> str:
 
     result = dict(payload)
     if result.get("complete") is True:
-        result["next_action"] = "finalize"
+        result["next_action"] = "generate-update-request"
     elif result.get("interrupted") is True:
         result["next_action"] = "report_iteration_limit_interruption"
     elif isinstance(result.get("pending"), Mapping) or isinstance(
@@ -1065,6 +1066,7 @@ def command_prepare(request_path: pathlib.Path) -> str:
             governed_sources.append(str(source["history"]))
     controller_state["proposal_cleanup"] = {
         "schema": CLEANUP_SCHEMA,
+        "mutation_authorized": request["mutation_authorized"],
         "task_temp_root": str(task_temp_root),
         "owned_artifacts": owned_artifacts,
         "protected_artifacts": protected_artifacts,
@@ -1160,6 +1162,8 @@ def command_run(
     advanced = json.loads(command_advance(resolved_state, outcome, regressions))
     if not isinstance(advanced, Mapping):
         raise ProposalWorkflowError("proposal advance payload is invalid")
+    if advanced.get("complete") is True:
+        return command_generate_update_request(resolved_state)
     return _annotated_status(advanced)
 
 
@@ -1175,6 +1179,8 @@ def _validated_cleanup(
     _closed_fields(raw, CLEANUP_FIELDS, "proposal cleanup")
     if raw.get("schema") != CLEANUP_SCHEMA:
         raise ProposalWorkflowError(f"proposal cleanup schema must be {CLEANUP_SCHEMA}")
+    if not isinstance(raw["mutation_authorized"], bool):
+        raise ProposalWorkflowError("mutation_authorized must be boolean")
     task_temp_root = _verified_task_temp_root(raw["task_temp_root"])
     champion_value = raw["champion_output"]
     if not isinstance(champion_value, str) or not champion_value:
@@ -1278,6 +1284,7 @@ def _validated_cleanup(
         "protected_artifacts": protected_paths,
         "governed_sources": governed_paths,
         "champion_output": champion_output,
+        "mutation_authorized": raw["mutation_authorized"],
     }
 
 
@@ -1326,7 +1333,8 @@ def _preflight_iteration_artifacts(
                 )
 
 
-def command_finalize(state: pathlib.Path) -> str:
+def command_generate_update_request(state: pathlib.Path, mutation_authorized: bool = False) -> str:
+    """Export one accepted request, apply authorized work, and close owned inputs."""
     resolved_state = _input_path(str(state), "state")
     controller_state = _read_json(resolved_state, "controller state")
     if controller_state.get("complete") is not True:
@@ -1385,11 +1393,10 @@ def command_finalize(state: pathlib.Path) -> str:
         if _file_hash(path) != artifact["sha256"]:
             raise ProposalWorkflowError(f"owned {role} changed after prepare")
     if champion_path is not None:
-        if champion_output.exists():
-            if not champion_output.is_file() or _file_hash(champion_output) != champion_hash:
-                raise ProposalWorkflowError("champion_output already contains other content")
-        else:
-            _write_bytes_atomic(champion_output, champion_path.read_bytes())
+        export_update_request(champion_path, champion_output, pathlib.Path(str(cleanup["task_temp_root"])),
+                              expected_sha256=champion_hash)
+        if mutation_authorized or cleanup["mutation_authorized"]:
+            _run_helper("apply_rules_update.py", ["--request", str(champion_output)])
     for artifact in artifacts:
         if artifact["role"] in {"state", "iterations"}:
             continue
@@ -1402,6 +1409,9 @@ def command_finalize(state: pathlib.Path) -> str:
     )
     if payload != "OK":
         raise ProposalWorkflowError("iteration_controller.py returned invalid finalization")
+    if champion_path is not None and not (mutation_authorized or cleanup["mutation_authorized"]):
+        return json.dumps({"status": "awaiting_approval", "request": str(champion_output),
+                           "next_action": "obtain_approval_then_apply"}, separators=(",", ":"))
     return "OK"
 
 
@@ -1444,8 +1454,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--assessment-file", type=pathlib.Path)
     run.add_argument("--outcome", choices=("improved", "no-improvement"))
     run.add_argument("--regressions", choices=("passed", "failed"))
-    finalize = commands.add_parser("finalize")
-    finalize.add_argument("--state", required=True, type=pathlib.Path)
+    generate = commands.add_parser("generate-update-request")
+    inputs = generate.add_mutually_exclusive_group(required=True)
+    inputs.add_argument("--state", type=pathlib.Path)
+    inputs.add_argument("--candidate", type=pathlib.Path)
+    generate.add_argument("--task-temp-root", type=pathlib.Path)
+    generate.add_argument("--mutation-authorized", action="store_true")
     return parser
 
 
@@ -1473,8 +1487,15 @@ def main(argv: list[str] | None = None) -> int:
             output = command_run(
                 args.state, args.assessment_file, args.outcome, args.regressions
             )
+        elif args.state is not None:
+            if args.task_temp_root is not None:
+                raise ProposalWorkflowError("task-temp-root is derived from state")
+            output = command_generate_update_request(args.state, args.mutation_authorized)
         else:
-            output = command_finalize(args.state)
+            request = generate_candidate_update_request(args.candidate, args.task_temp_root)
+            output = (_run_helper("apply_rules_update.py", ["--request", str(request)])
+                      if args.mutation_authorized else json.dumps({"status": "awaiting_approval",
+                      "request": str(request), "next_action": "obtain_approval_then_apply"}))
     except (ProposalWorkflowError, OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

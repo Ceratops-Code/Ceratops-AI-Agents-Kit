@@ -997,7 +997,16 @@ class TestHookDeployment:
                     assert executed.returncode == 0, executed.stderr
                     assert executed.stdout.strip() in {"", "OK"}
                     registered += 1
-        assert registered == (4 if os.name == "nt" else 3)
+        assert registered == (5 if os.name == "nt" else 4)
+        first = config["hooks"]["PreToolUse"][0]["hooks"][0]
+        assert "bounded-source-search.py" in first["command"]
+        assert first["command"].endswith("--pre-hook")
+        denied = self.run_handler(first, {
+            "hook_event_name": "PreToolUse", "tool_name": "Bash", "cwd": str(tmp_path),
+            "tool_input": {"command": "rg -n needle ."},
+        }, tmp_path)
+        assert denied.returncode == 0, denied.stderr
+        assert json.loads(denied.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"
         probe = subprocess.run(
             [sys.executable, str(destination / "hooks" / "command-probe.py"), "--help"],
             capture_output=True, text=True, check=False,

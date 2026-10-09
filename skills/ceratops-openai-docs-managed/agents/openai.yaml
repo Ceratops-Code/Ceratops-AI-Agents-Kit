@@ -1,6 +1,0 @@
-interface:
-  display_name: "Ceratops OpenAI Docs Managed"
-  short_description: "Retrieve cited official OpenAI docs without routine model calls"
-  icon_small: "./assets/ceratops-logo-500.png"
-  icon_large: "./assets/ceratops-logo-500.png"
-  default_prompt: "Use $ceratops-openai-docs-managed to answer this OpenAI documentation question from the deterministic opened-page evidence record."

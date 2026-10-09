@@ -1,0 +1,16 @@
+[build-system]
+requires = ["hatchling==1.32.4"]
+build-backend = "hatchling.build"
+
+[project]
+name = "source_search_mcp"
+version = "1.0.0"
+description = "Read-only local bounded source search with complete paginated inventories"
+requires-python = ">=3.14,<3.15"
+dependencies = ["mcp==2.2.0", "anyio==4.15.1", "jsonschema==4.26.0", "ripgrep-bin==15.1.0"]
+
+[tool.hatch.build.targets.wheel]
+include = ["/source_search_mcp.py"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"../hooks/bounded-source-search.py" = "source_search_mcp_support/bounded-source-search.py"

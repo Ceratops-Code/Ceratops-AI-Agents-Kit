@@ -25,12 +25,6 @@
       ],
       "depends_on": []
     },
-    "openai-docs": {
-      "pytest": [
-        "tests/openai_docs"
-      ],
-      "depends_on": []
-    },
     "repository-lifecycle": {
       "pytest": [
         "tests/repository_lifecycle"
@@ -102,15 +96,6 @@
       ]
     },
     {
-      "id": "openai-docs-source",
-      "paths": [
-        "skills/ceratops-openai-docs-managed/**"
-      ],
-      "suites": [
-        "openai-docs"
-      ]
-    },
-    {
       "id": "repository-lifecycle-source",
       "paths": [
         "docs/result_records.py.tmpl",
@@ -145,7 +130,11 @@
       "id": "test-hook-source",
       "paths": [
         "scripts/deploy-hooks.py",
-        "hooks/*.py"
+        "hooks/*.py",
+        "tools/source_search_mcp.py",
+        "tools/pyproject.toml",
+        "tools/mcp-server.json",
+        "tools/pylock.toml"
       ],
       "suites": [
         "test-infrastructure"

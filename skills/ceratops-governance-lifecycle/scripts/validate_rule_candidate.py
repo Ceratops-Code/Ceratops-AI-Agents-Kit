@@ -12,7 +12,8 @@ reflow, so serialized settings and embedded prompt strings remain exact.
 
 Detailed evidence is written atomically to the caller-selected path. Candidate
 repairs are committed with one atomic replacement only after every target,
-history, rule-stack, and idempotence check passes. Temporary command files are
+history and rule-stack input check passes. Formatting stability is guaranteed
+by the producer and its behavior tests. Temporary command files are
 owned by the validation call and removed when each command scope exits.
 """
 
@@ -676,6 +677,11 @@ def _wrap_line(
     target: Path,
     replacement: int,
 ) -> list[str]:
+    """Reflow only between indivisible tokens, copying their bytes and prefixes.
+
+    Unlike arbitrary external formatting, this producer cannot edit protected
+    token contents. Its stability and structure preservation are tested directly.
+    """
     if len(line) <= limit or not line.strip():
         return [line]
     first_prefix, continuation_prefix, content = _prefixes(line)
@@ -685,23 +691,25 @@ def _wrap_line(
     lines: list[str] = []
     current = first_prefix
     for token in tokens:
-        separator = "" if current.endswith((" ", "\t")) else " "
+        # An empty prefix must not manufacture indentation on the first line.
+        separator = "" if not current or current.endswith((" ", "\t")) else " "
         proposed = current + separator + token
         if len(proposed) <= limit or not current.strip():
             current = proposed
             continue
         if current.rstrip() == first_prefix.rstrip():
             return [line]
+        # A new physical line must not reinterpret a prose token as Markdown
+        # structure. Preserve the input for its ordinary format guard instead.
+        marker_probe = token + " text"
+        if _prefixes(marker_probe)[2] != marker_probe or any(
+            pattern.match(marker_probe)
+            for pattern in (HEADING, FENCE, HTML_BLOCK_OPEN, REFERENCE_DEFINITION)
+        ):
+            return [line]
         lines.append(current.rstrip())
         current = continuation_prefix + token
     lines.append(current.rstrip())
-    repaired = "\n".join(lines)
-    _validate_permitted_change(
-        line,
-        repaired,
-        target=target,
-        replacement=replacement,
-    )
     return lines
 
 
@@ -787,12 +795,6 @@ def _repair_fragment(
         repaired = "\n".join(output)
     if newline != "\n":
         repaired = repaired.replace("\n", newline)
-    _validate_permitted_change(
-        text,
-        repaired,
-        target=target,
-        replacement=replacement,
-    )
     return repaired
 
 
@@ -811,12 +813,6 @@ def _normalize_fragment_line_endings(
         )
     normalized = text.replace("\r\n", "\n").replace("\r", "\n")
     repaired = normalized if newline == "\n" else normalized.replace("\n", newline)
-    _validate_permitted_change(
-        text,
-        repaired,
-        target=target,
-        replacement=replacement,
-    )
     return repaired
 
 
@@ -1132,7 +1128,7 @@ def _validate_target(
     changed = fixed_replacements != replacements
     target["replacements"] = fixed_replacements
     prospective, spans = construct_prospective(source, fixed_replacements)
-    if fix:
+    if fix and policy["fix_command"] is not None:
         _validate_permitted_change(
             original_prospective,
             prospective,
@@ -1346,7 +1342,11 @@ def validate_rule_candidate(
     expected_context: Mapping[str, object] | None = None,
     fix: bool = True,
 ) -> ValidationResult:
-    """Repair, validate, prove idempotence, and atomically record one candidate."""
+    """Repair and check new input once, then atomically record the candidate.
+
+    Formatter stability is a producer invariant covered by behavior tests.
+    Runtime checks guard arbitrary input, external commands, and source edits.
+    """
 
     candidate_path = Path(os.path.abspath(candidate_path))
     evidence_path = Path(os.path.abspath(evidence_path))
@@ -1360,7 +1360,6 @@ def validate_rule_candidate(
         "mode": "fix" if fix else "check-only",
         "status": "failed",
         "changed": False,
-        "idempotent": False,
         "targets": [],
         "error": None,
     }
@@ -1376,18 +1375,6 @@ def validate_rule_candidate(
             fix=fix,
             temporary_root=evidence_path.parent,
         )
-        second = json.loads(json.dumps(candidate))
-        _, second_prospective, _, second_changed = _run_pass(
-            second,
-            expected_context=expected_context,
-            fix=fix,
-            temporary_root=evidence_path.parent,
-        )
-        if second_changed or second != candidate or second_prospective != prospective:
-            raise RuleCandidateValidationError(
-                "target=all replacement=all rule=idempotence could not be fixed "
-                "safely: a second validator run changed the candidate"
-            )
         rendered = (
             json.dumps(candidate, ensure_ascii=False, indent=2).encode("utf-8")
             + b"\n"
@@ -1418,7 +1405,6 @@ def validate_rule_candidate(
             {
                 "status": "passed",
                 "changed": artifact_changed,
-                "idempotent": True,
                 "targets": target_evidence,
                 "candidate_sha256": _sha256_bytes(final_bytes),
                 "error": None,

@@ -15,6 +15,18 @@ PYTEST_SECTION_HEADER = re.compile(r"^_+\s+(?P<title>.+?)\s+_+$")
 PYTHON_SOURCE_LOCATION = re.compile(
     r"^(?P<path>.+?\.py):(?P<line>[1-9][0-9]*)(?::.*)?$"
 )
+PYTHON_GROUP_SOURCE_LOCATION = re.compile(
+    r'^File "(?P<path>.+?\.py)", line (?P<line>[1-9][0-9]*), in .+$'
+)
+PYTHON_EXCEPTION_MESSAGE = re.compile(r"^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*:")
+PYTEST_CAPTURE_HEADER = re.compile(r"^-+\s+Captured\s+.+?\s+-+$")
+PYTEST_ERROR_SECTION_PREFIXES = (
+    "ERROR at setup of ", "ERROR at teardown of ", "ERROR collecting ",
+)
+PYTEST_EXCEPTION_CHAIN_MARKERS = (
+    "The above exception was the direct cause of the following exception:",
+    "During handling of the above exception, another exception occurred:",
+)
 MAX_PYTEST_FAILURES = 10
 PYTEST_IDENTITY_BYTES = 400
 PYTEST_LOCATION_BYTES = 500
@@ -72,8 +84,76 @@ def _pytest_title(identity: str) -> str:
     """Translate a complete pytest node ID into its console section title."""
 
     path, separator, node = identity.partition("::")
+    # Unittest subtest descriptions may themselves contain '::' and '['.
+    # Preserve that context verbatim rather than treating it as a class name.
+    node, subtest_separator, subtest_context = node.partition(" (")
     qualified, bracket, parameters = node.partition("[")
-    return qualified.replace("::", ".") + bracket + parameters if separator else path
+    return (qualified.replace("::", ".") + bracket + parameters
+            + subtest_separator + subtest_context) if separator else path
+
+
+def _pytest_section_test_title(title: str) -> str:
+    """Remove pytest's phase label without altering class or parameter names."""
+
+    for prefix in PYTEST_ERROR_SECTION_PREFIXES:
+        if title.startswith(prefix):
+            return title.removeprefix(prefix)
+    return title
+
+
+def _pytest_summary_entry(value: str, section_titles: set[str]) -> tuple[str, str]:
+    """Use the reported title to distinguish a parameter separator from a reason.
+
+    Both parameter names and exception messages can contain `` - ``. Prefer an
+    exact section title; without one, retain pytest's ordinary summary fallback.
+    """
+
+    if _pytest_title(value) in section_titles:
+        return value, ""
+    for separator in re.finditer(r" - ", value):
+        identity = value[:separator.start()]
+        if _pytest_title(identity) in section_titles:
+            return identity, value[separator.end():]
+    identity, _separator, reason = value.partition(" - ")
+    return identity, reason
+
+
+def _pytest_subtest_summary_entry(value: str, section_titles: set[str]) -> tuple[str, str]:
+    """Bind SUBFAILED context to its parent node, including spaces in values.
+
+    Native pytest emits the subtest description before the node ID. Match its
+    full section title before falling back, so ')' and ' - ' inside values
+    cannot attach one subtest's traceback to another.
+    """
+
+    candidates: list[tuple[str, str]] = []
+    for closing in re.finditer(r"\)\s+", value):
+        context = value[:closing.start() + 1]
+        parent_titles = {title.removesuffix(" " + context) for title in section_titles
+                         if title.endswith(" " + context)}
+        identity, reason = _pytest_summary_entry(value[closing.end():], parent_titles)
+        if _pytest_title(identity + " " + context) in section_titles:
+            candidates.append((identity + " " + context, reason))
+    if len(candidates) == 1:
+        return candidates[0]
+    # Missing or ambiguous traceback sections still count as failures. Their
+    # own summary remains usable without guessing another section's evidence.
+    match = re.fullmatch(r"(\(.*\))\s+(.+)", value)
+    if match is not None:
+        identity, reason = _pytest_summary_entry(match.group(2), set())
+        return identity + " " + match.group(1), reason
+    return _pytest_summary_entry(value, section_titles)
+
+
+def _pytest_console_location(line: str) -> re.Match[str] | None:
+    """Accept ordinary pytest frames and Python's exception-group tree frames."""
+
+    ordinary = PYTHON_SOURCE_LOCATION.fullmatch(line)
+    if ordinary is not None:
+        return ordinary
+    if line.startswith("|"):
+        return PYTHON_GROUP_SOURCE_LOCATION.fullmatch(line.removeprefix("|").lstrip())
+    return None
 
 
 def _pytest_section_for_identity(
@@ -93,17 +173,13 @@ def _pytest_section_for_identity(
     expected_title = _pytest_title(identity)
     candidates: list[int] = []
     for index, (title, _content) in enumerate(sections):
-        for prefix in ("ERROR at setup of ", "ERROR at teardown of ", "ERROR collecting "):
-            if title.startswith(prefix):
-                title = title.removeprefix(prefix)
-                break
-        if title == expected_title:
+        if _pytest_section_test_title(title) == expected_title:
             candidates.append(index)
     located = [
         index
         for index in candidates
         if any(
-            (match := PYTHON_SOURCE_LOCATION.fullmatch(line))
+            (match := _pytest_console_location(line))
             and _same_source_path(match.group("path"), path)
             for line in sections[index][1]
         )
@@ -129,7 +205,9 @@ def _pytest_source_location(identity: str, section: Sequence[str]) -> str | None
     expected_path = identity.split("::", 1)[0]
     locations: list[tuple[str, str]] = []
     for line in section:
-        match = PYTHON_SOURCE_LOCATION.fullmatch(line)
+        if PYTEST_CAPTURE_HEADER.fullmatch(line):
+            break
+        match = _pytest_console_location(line)
         if match is None:
             continue
         path = match.group("path")
@@ -148,11 +226,39 @@ def _pytest_source_location(identity: str, section: Sequence[str]) -> str | None
 def _pytest_failure_excerpt(section: Sequence[str], fallback: str) -> str:
     """Return bounded decisive lines for one failure, or its summary reason."""
 
-    # Ordinary source assertions can have passed before the reported failure.
-    # Use pytest's explanation first; the marked failing source is a fallback.
-    decisive = [line for line in section if line.startswith(("E ", "AssertionError"))]
+    # A chained exception's final block is the reported failure. Earlier blocks
+    # must not consume its budget, and captured output is never exception evidence.
+    decisive: list[str] = []
+    marked_source: list[str] = []
+    group_messages: list[str] = []
+    in_group_message = False
+    for line in section:
+        if PYTEST_CAPTURE_HEADER.fullmatch(line):
+            break
+        if line.startswith("|"):
+            message = line.removeprefix("|").lstrip()
+            if message.startswith(("ExceptionGroup:", "BaseExceptionGroup:", "File ", "Traceback ")):
+                in_group_message = False
+            elif PYTHON_EXCEPTION_MESSAGE.match(message):
+                group_messages.append(message)
+                in_group_message = True
+            elif in_group_message:
+                group_messages.append(message)
+            continue
+        if line.startswith("+"):
+            in_group_message = False
+        if line.startswith("> "):
+            marked_source.append(line)
+        if line in PYTEST_EXCEPTION_CHAIN_MARKERS:
+            decisive = []
+        elif line.startswith(("E ", "AssertionError")):
+            decisive.append(line)
+    # Leaf messages explain SDK failures; the outer group label only says how
+    # many exceptions were wrapped. Captured output never supplies these lines.
+    decisive = group_messages or decisive
+    # The test's own summary reason is more useful than a marked source call.
     if not decisive:
-        decisive = [line for line in section if line.startswith("> ")]
+        decisive = [fallback] if fallback else marked_source
     return _bounded_lines(
         decisive or [fallback], line_limit=6,
         byte_limit=PYTEST_FAILURE_EXCERPT_BYTES,
@@ -176,18 +282,27 @@ def pytest_failure_summary(stdout: str, stderr: str) -> dict[str, object]:
         line for stream in (stdout, stderr) for line in stream.splitlines()
     ]
     lines = [line.strip() for line in raw_lines if line.strip()]
+    sections = _pytest_failure_sections(raw_lines)
+    section_titles = {_pytest_section_test_title(title) for title, _content in sections}
     summaries: list[tuple[str, str]] = []
     seen_identities: set[str] = set()
     for line in lines:
+        if line.startswith("SUBFAILED"):
+            identity, reason = _pytest_subtest_summary_entry(
+                line.removeprefix("SUBFAILED").lstrip(), section_titles,
+            )
+            if identity and identity not in seen_identities:
+                summaries.append((identity, reason))
+                seen_identities.add(identity)
+            continue
         if line.startswith(("FAILED ", "ERROR ")):
             summary = line.split(maxsplit=1)
             if len(summary) == 2:
-                identity, separator, reason = summary[1].partition(" - ")
+                identity, reason = _pytest_summary_entry(summary[1], section_titles)
                 if identity and identity not in seen_identities:
-                    summaries.append((identity, reason if separator else ""))
+                    summaries.append((identity, reason))
                     seen_identities.add(identity)
 
-    sections = _pytest_failure_sections(raw_lines)
     title_counts = Counter(_pytest_title(identity) for identity, _reason in summaries)
     used_sections: set[int] = set()
     failures: list[dict[str, object]] = []

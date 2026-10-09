@@ -3,9 +3,10 @@
 ## Scope and status
 
 This unfinished draft records repository validation, Python environments,
-SDLC, and deployment decisions. The release-unit, receipt, bundle-transaction,
-and update-correction sections additionally describe their scoped implementation
-and behavior tests. Other sections remain discussion-derived, not a complete
+SDLC, and deployment decisions. The bounded-search, pytest-diagnostics,
+release-unit, receipt, bundle-transaction, and update-correction sections
+additionally describe their scoped implementation and behavior tests. Other
+sections remain discussion-derived, not a complete
 implementation audit or a new governing contract. This draft owns the lifecycle
 methodology and design detail. README records implemented capabilities and current
 output lifetimes; the refactor plan records delivery order. The working-folder
@@ -154,6 +155,98 @@ test paths or node IDs and optional automatic selection: all tests locally and
 on pushes, with impact selection from the exact pull-request base/head in CI.
 That impact-selection implementation is repository-specific, not a requirement
 imposed on every compatible repository.
+
+## Bounded source search
+
+The implemented search boundary has two callers and one search owner:
+
+| Surface | Responsibility |
+| --- | --- |
+| `hooks/bounded-source-search.py` | Own ripgrep discovery, counts, context extraction, path validation, byte budgeting, in-memory inventories, and direct/pre/post hook interfaces. |
+| `tools/source_search_mcp.py` | Adapt that helper to one read-only STDIO MCP tool, validate the closed input schema, serialize SDK results, and report canonical deployment readiness. |
+| `scripts/deploy-hooks.py` | Install hook files and merge registrations atomically, placing the search guard before Windows command wrapping. |
+| `tools/pyproject.toml`, `mcp-server.json`, and `pylock.toml` | Declare the managed MCP release, readiness module, package contents, and locked dependencies. |
+
+The MCP adapter uses the repository's pinned MCP SDK. Its wheel carries the
+owning search helper as package data rather than maintaining another search
+implementation. The locked `ripgrep-bin` dependency supplies an executable
+beside the installed interpreter, so manager validation and deployed execution
+work with a sanitized PATH and without a retained checkout. Source execution
+can use the repository helper and an existing ripgrep executable.
+
+`overview` returns exact counts with ranked, bounded snippets. `files` returns
+every matching path across pages sorted by casefolded path and then exact path.
+`inspect` extracts bounded context only from explicitly selected relative files,
+including selections with zero matches. MCP discovery has no match-count cap;
+the existing capped direct-search contract remains unchanged.
+
+The complete serialized MCP `CallToolResult` is at most 8,000 UTF-8 bytes,
+including JSON escaping and SDK fields. The adapter supplies its serialized
+size calculation to the shared helper, which shortens pages before returning
+them. Long lines are clipped with explicit markers. Totals, omissions, remaining
+files, and a continuation cursor distinguish a bounded page from exhaustive
+discovery. A path that cannot fit produces an error instead of a truncated path
+or a skipped inventory entry. Cursors advance by files; they do not recover
+snippets omitted within a file.
+
+An inventory freezes paths and counts after discovery. The process keeps at
+most eight inventories for fifteen minutes from discovery completion, pruning
+them on requests; it writes no search state, temporary files, or logs. Cursor
+expiry, eviction, invalid values, and argument mismatches return errors rather
+than false end-of-inventory results. Context extraction rejects files changed
+since discovery. A new search is required to observe source changes.
+
+The startup root is a fixed access boundary. Requested roots must resolve
+inside it; selected paths must identify literal regular files inside the
+requested root. Absolute paths, traversal, missing files, directories, and
+symlink escapes are rejected. Ripgrep's normal ignore and hidden-file behavior
+defines the searchable inventory, and binary content is excluded. MCP searches
+disable personal ripgrep configuration to prevent executable preprocessors;
+the existing direct interface retains its configuration behavior. Literal file
+operands also prevent a filename such as `-` from selecting standard input.
+
+The `PreToolUse` mode recognizes static broad content-producing `rg` commands
+for `Bash` and denies them before execution with a `source_search` referral.
+Piping the broad result into an output limiter does not bypass that decision.
+File-list discovery, count/quiet modes, stdin filtering, and searches whose
+targets are all existing concrete files remain allowed. The recognizer neither
+dispatches MCP nor rewrites commands. It is an output guard with a closed
+recognition contract, not a general shell interpreter; dynamic programs and
+here-strings are outside that contract. Direct searches and the existing
+`PostToolUse` bounding behavior remain separate supported interfaces.
+
+The MCP lifecycle skill and manager own release packaging, installation,
+version selection, and bounded retention. Codex registration selects the stable
+launcher and startup boundary. Hook deployment is independently declared in
+`sdlc/sdlc.yml` as `deliverables.hooks.codex-hooks.actions.install`; it copies
+definitions without granting trust or restarting Codex. Register and connect
+the MCP server before relying on the guard, then review changed hook trust as
+required by the client. An installed or registered server is not evidence that
+an already running chat has connected to it.
+
+Behavior tests exercise the actual server through an MCP STDIO client,
+including inventories beyond the direct-search cap, complete Unicode path
+pagination, all three modes, rejected paths and cursors, config isolation,
+changed files, and the serialized response ceiling. Hook tests replay the
+recorded source-turn commands from calls 1, 3, 4, and 41 and distinguish broad
+content searches from focused searches.
+
+## Pytest failure diagnostics
+
+`scripts/testing/pytest-diagnostics.py` owns the bounded failure summary used
+by the repository test runner. The runner retains complete failed stdout and
+stderr at its selected diagnostic path; successful runs remove stale evidence.
+The compact summary keeps pytest's failure evidence within the existing byte
+and identity limits and excludes unrelated captured output.
+
+Nested MCP transport failures can arrive as native exception groups. The
+diagnostic parser retains the group's leaf errors and locations so the summary
+shows the underlying failure, rather than only an exception-group heading.
+Failed unittest subtests retain their distinct context and are counted
+individually, including when only a short pytest summary is available. Native
+pytest subprocess fixtures cover these formats alongside ordinary exceptions,
+repeated failure titles, and multibyte bounds. This changes evidence extraction,
+not test execution or acceptance rules.
 
 ## Portable result records
 

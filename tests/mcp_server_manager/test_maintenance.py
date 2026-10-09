@@ -1,6 +1,7 @@
 """Validate source packaging and deployment contracts without network access."""
 
 import importlib.util
+import io
 import json
 import shutil
 import subprocess
@@ -232,6 +233,52 @@ def test_packaging_refuses_changed_version_and_publishes_atomically(source_packa
     assert not list((runtime_root / "fixture/staging").iterdir())
     assert package_module.package(project) == result
     assert not (runtime_root / "fixture/current.json").exists()
+
+
+@pytest.mark.parametrize("corrupt", [False, True])
+def test_dependency_download_uses_five_minute_timeout_and_enforces_hash(
+    source_package, tmp_path, monkeypatch, corrupt
+):
+    """Slow connections get five minutes; downloaded bytes still require the lock hash."""
+    project, runtime_root, calls = source_package
+    dependency_root = tmp_path / "dependency"
+    dependency_root.mkdir()
+    bundle = make_release(dependency_root, "1.0.0", mcp_server="locked_dependency")
+    dependency_wheel = next(bundle.glob("*.whl"))
+    expected = dependency_wheel.read_bytes()
+    url = f"https://files.pythonhosted.org/packages/{dependency_wheel.name}"
+    (project / "pylock.toml").write_text(
+        'lock-version="1.0"\n[[packages]]\n'
+        'name="locked-dependency"\nversion="1.0.0"\n'
+        f'[[packages.wheels]]\nurl="{url}"\n'
+        f'[packages.wheels.hashes]\nsha256="{contracts.digest(dependency_wheel)}"\n',
+        encoding="utf-8",
+    )
+    requests = []
+
+    def download(request_url, *, timeout):
+        requests.append((request_url, timeout))
+        response = io.BytesIO(b"corrupt archive" if corrupt else expected)
+        setattr(response, "url", url)
+        return response
+
+    monkeypatch.setattr(package_module.urllib.request, "urlopen", download)
+    if corrupt:
+        with pytest.raises(contracts.DeploymentError, match="locked dependency digest mismatch"):
+            package_module.package(project)
+        assert not (runtime_root / "fixture/registry.json").exists()
+    else:
+        result = package_module.package(project)
+        release_dir = runtime_root / "fixture/artifacts/1.0.0" / result["manifest_sha256"]
+        release = json.loads((release_dir / "manifest.json").read_text())
+        assert release["schema"] == 2
+        assert {wheel["filename"] for wheel in release["wheels"]} == {
+            "fixture-1.0.0-py3-none-any.whl", dependency_wheel.name
+        }
+        assert (release_dir / dependency_wheel.name).read_bytes() == expected
+    assert requests == [(url, 300)]
+    assert len(calls) == 1 and calls[0][0][1] == "build"
+    assert not list((runtime_root / "fixture/staging").iterdir())
 
 
 def test_package_preflight_failure_leaves_registry_and_artifacts_unchanged(

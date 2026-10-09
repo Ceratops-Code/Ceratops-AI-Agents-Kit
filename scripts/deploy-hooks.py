@@ -33,6 +33,7 @@ HOOK_FILES = (
     "windows-shell-sanity.py",
 )
 REGISTRATIONS = (
+    ("PreToolUse", "^Bash$", "bounded-source-search.py", "--pre-hook", "Checking source-search scope"),
     ("PreToolUse", "^Bash$", "windows-shell-sanity.py", "--hook", "Checking Windows shell command"),
     ("PreToolUse", "^apply_patch$", "preserve-eol-for-apply-patch-tool.py", "pre", "Recording file line endings"),
     ("PostToolUse", "^Bash$", "bounded-source-search.py", "--hook", "Bounding source-search output"),
@@ -144,7 +145,13 @@ An invocation at another timing is ambiguous and fails before installation.
             handler = {"type": "command", "command": command, "timeout": 30, "statusMessage": message}
             if os.name == "nt":
                 handler["commandWindows"] = command
-            events.setdefault(event, []).append({"matcher": matcher, "hooks": [handler]})
+            group = {"matcher": matcher, "hooks": [handler]}
+            if filename == "bounded-source-search.py" and argument == "--pre-hook":
+                # See original rg arguments before the Windows hook can wrap
+                # them in a command-probe invocation.
+                events.setdefault(event, []).insert(0, group)
+            else:
+                events.setdefault(event, []).append(group)
     return result
 
 
