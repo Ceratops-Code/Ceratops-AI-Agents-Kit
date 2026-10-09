@@ -72,7 +72,7 @@ def task(
 def threads(
     cleanup: ModuleType, monkeypatch: pytest.MonkeyPatch, rows: list[tuple[Any, ...]]
 ) -> None:
-    original = cleanup.ThreadCatalog
+    original: Any = cleanup.ThreadCatalog
 
     class Catalog(original):
         def __init__(self, codex_home: pathlib.Path | None = None) -> None:
