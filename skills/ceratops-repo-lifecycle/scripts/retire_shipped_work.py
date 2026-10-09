@@ -22,6 +22,7 @@ import sqlite3
 import subprocess
 import sys
 from contextlib import closing
+from functools import cache
 from typing import Any
 
 from filelock import FileLock, Timeout
@@ -292,6 +293,108 @@ def _save_record(path: pathlib.Path, record: dict[str, Any]) -> None:
     _paths["_write_scope"](path, record)
 
 
+@cache
+def _scope_manager() -> dict[str, Any]:
+    """Use the promotion owner's schema and atomic source-state operations."""
+    return runpy.run_path(str(SCRIPT_ROOT / "manage-pending-work.py"))
+
+
+def _matching_promotion_sources(
+    repo: pathlib.Path, branch: str, expected: str
+) -> list[tuple[pathlib.Path, dict[str, Any]]]:
+    directory = (
+        _paths["_common_git_dir"](repo)
+        / "codex"
+        / "repository-lifecycle"
+        / "promotions"
+    )
+    if not directory.exists():
+        return []
+    if directory != directory.resolve():
+        raise CleanupError("Promotion scope directory is redirected.")
+    manager = _scope_manager()
+    matches = []
+    try:
+        for path in sorted(directory.glob("*.json")):
+            if path.is_symlink() or path != path.resolve():
+                raise CleanupError("Promotion scope path is redirected.")
+            raw = manager["_read_scope"](path)
+            sources = raw.get("sources", [])
+            if not isinstance(sources, list) or not any(
+                isinstance(source, dict) and source.get("branch") == branch
+                for source in sources
+            ):
+                continue
+            if not isinstance(raw.get("target_branch"), str) or not isinstance(
+                raw.get("target_commit"), str
+            ):
+                raise CleanupError(
+                    "Matching promotion scope lacks its target identity."
+                )
+            scope = manager["_validated_scope"](
+                repo,
+                path,
+                target_branch=raw["target_branch"],
+                target_commit=raw["target_commit"],
+            )
+            source = next(
+                value for value in scope["sources"] if value["branch"] == branch
+            )
+            if source["commit"] != expected or not _contained(
+                repo, expected, scope["target_commit"]
+            ):
+                raise CleanupError(
+                    "Matching promotion source has another recorded head."
+                )
+            if manager["_residual_cleanup_record_path"](path, branch).exists():
+                raise CleanupError(
+                    "Matching promotion source retains unfinished residual recovery."
+                )
+            matches.append((path, scope))
+    except RuntimeError as exc:
+        raise CleanupError(str(exc)) from exc
+    return matches
+
+
+def _prepare_promotion_source_retirement(
+    repo: pathlib.Path, branch: str, expected: str
+) -> None:
+    """Mark exact matching sources before Git mutation, so preflight can recover.
+
+    Missing retained sources block Ship. A durable deleting state lets the
+    existing scope owner prove an interruption after our exact ref deletion.
+    """
+    manager = _scope_manager()
+    try:
+        for path, scope in _matching_promotion_sources(repo, branch, expected):
+            source = next(
+                value for value in scope["sources"] if value["branch"] == branch
+            )
+            if source["state"] != "deleting":
+                manager["_set_source_state"](path, scope, branch, "deleting")
+    except RuntimeError as exc:
+        raise CleanupError(str(exc)) from exc
+
+
+def _retire_promotion_source(repo: pathlib.Path, branch: str, expected: str) -> None:
+    """Retire only this completed source; preserve every unrelated scope entry."""
+    if _git(
+        repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", allowed=(0, 1)
+    ):
+        raise CleanupError("Promotion source branch exists after cleanup.")
+    manager = _scope_manager()
+    try:
+        for path, scope in _matching_promotion_sources(repo, branch, expected):
+            source = next(
+                value for value in scope["sources"] if value["branch"] == branch
+            )
+            if source["state"] != "deleting":
+                raise CleanupError("Promotion source retirement was not prepared.")
+            manager["_remove_source_record"](path, scope, branch)
+    except RuntimeError as exc:
+        raise CleanupError(str(exc)) from exc
+
+
 def _remove_branch(repo: pathlib.Path, branch: str, expected: str) -> None:
     """Ref deletion is conditional on the exact checked head and no checkout."""
     if any(
@@ -432,6 +535,9 @@ def _finish_record(
         ):
             raise CleanupError("Recorded worktree is locked or dirty.")
         _paths["_validate_worktree_path"](path, root, allow_inaccessible=False)
+    if item["branch"]:
+        _prepare_promotion_source_retirement(repo, item["branch"], item["head"])
+    if registered is not None:
         _git(repo, "worktree", "remove", str(path))
     if path is not None and path.exists():
         if any(
@@ -449,6 +555,7 @@ def _finish_record(
         _paths["_remove_tree"](path)
     if item["branch"]:
         _remove_branch(repo, item["branch"], item["head"])
+        _retire_promotion_source(repo, item["branch"], item["head"])
     _paths["_remove_completed_state_file"](record_path)
 
 
@@ -580,7 +687,7 @@ def finalize_shipping(
         )
     if _git(repo, "status", "--porcelain=v1", "--untracked-files=all"):
         raise CleanupError("Primary checkout is dirty after synchronization.")
-    manager = runpy.run_path(str(SCRIPT_ROOT / "manage-pending-work.py"))
+    manager = _scope_manager()
 
     def retention_reason(branch: str, worktree: pathlib.Path | None) -> str | None:
         if branch in {"main", "master", "release/local", target_branch, current_branch}:

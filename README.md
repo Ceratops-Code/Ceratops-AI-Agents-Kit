@@ -640,6 +640,10 @@ retains only unfinished removal records under
 `<common-git-dir>/codex/repository-lifecycle/shipped-cleanup/`. A persistent native
 lock serializes cleanup; successful removal deletes its record and atomic-write
 sibling. Recovery never repeats completed publication or deployment.
+Before Git removal, exact matching promotion sources become `deleting`; after
+their branch is gone, cleanup retires those entries through the promotion owner.
+Unrelated entries stay intact, and interrupted removal cannot leave a missing
+`retained` source blocking the next Ship.
 
 ### Governance proposal construction
 

@@ -1219,6 +1219,10 @@ Success removes the exact record and sibling, then the empty record directory;
 no completed history is retained. Directory identity prevents recovery from
 deleting a replacement path. This cleanup leaves remote refs, accepted artifacts
 and installations to their existing owners.
+Exact matching promotion sources enter `deleting` before Git removal and are
+retired through the existing scope owner after ref deletion. Other entries remain
+untouched. This handoff lets preflight consume a completed interrupted deletion
+without treating the missing branch as unresolved work.
 
 Step 7 extends the implemented checkpoint helper and connects the existing domain
 owners. After successful top-level completion, remove the operation's checkpoints

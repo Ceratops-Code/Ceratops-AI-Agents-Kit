@@ -473,6 +473,87 @@ def test_startup_removes_only_an_owned_orphan_atomic_sibling(
 
 
 @pytest.mark.parametrize(
+    "condition", ["complete", "unrelated-source", "interrupted", "changed-head"]
+)
+def test_repository_cleanup_retires_only_its_exact_promotion_source(
+    cleanup: ModuleType,
+    repository: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    condition: str,
+) -> None:
+    worktree = task(repository)
+    rows: list[tuple[Any, ...]] = []
+    sources = ["codex/candidate"]
+    other = None
+    if condition == "unrelated-source":
+        other = task(repository, "live-other")
+        sources.append("codex/live-other")
+        rows.append((THREAD, str(other), 0, "codex/live-other", "Live other"))
+    threads(cleanup, monkeypatch, rows)
+    manager = cleanup._scope_manager()
+    git(repository, "branch", "release/local")
+    original_head = git(repository, "rev-parse", "HEAD")
+    recorded = manager["record_scope"](
+        repository,
+        target_branch="release/local",
+        target_commit=original_head,
+        source_branches=sources,
+    )
+    scope = pathlib.Path(recorded["pending_work_scope"])
+    before = json.loads(scope.read_text(encoding="utf-8"))
+    if condition == "changed-head":
+        (repository / "README.md").write_text(
+            "later shipped commit\n", encoding="utf-8"
+        )
+        git(repository, "commit", "-am", "later shipped commit")
+        git(worktree, "merge", "--ff-only", "main")
+    retire = cleanup._retire_promotion_source
+    if condition == "interrupted":
+
+        def interrupt(*args: Any) -> None:
+            raise cleanup.CleanupError("interrupted after ref deletion")
+
+        monkeypatch.setattr(cleanup, "_retire_promotion_source", interrupt)
+    result = cleanup.retire_shipped_work(repository, "main", apply=True)
+    if condition == "changed-head":
+        assert result["status"] == "blocked"
+        assert worktree.exists()
+        assert json.loads(scope.read_text(encoding="utf-8")) == before
+        return
+    assert not worktree.exists()
+    if condition == "interrupted":
+        assert result["status"] == "blocked"
+        assert (
+            json.loads(scope.read_text(encoding="utf-8"))["sources"][0]["state"]
+            == "deleting"
+        )
+        # The existing preflight owner can retire our proven completed deletion.
+        checked = manager["check_scope"](
+            repository,
+            scope,
+            target_branch="release/local",
+            target_commit=original_head,
+        )
+        assert checked["status"] == "ready"
+        assert checked["pending_work_scope"] == ""
+        monkeypatch.setattr(cleanup, "_retire_promotion_source", retire)
+        resumed = cleanup.retire_shipped_work(repository, "main", apply=True)
+        assert resumed["status"] == "completed"
+    else:
+        assert result["status"] == "completed"
+    if other:
+        assert other.exists()
+        after = json.loads(scope.read_text(encoding="utf-8"))
+        assert after["sources"] == [
+            value
+            for value in before["sources"]
+            if value["branch"] == "codex/live-other"
+        ]
+    else:
+        assert not scope.exists()
+
+
+@pytest.mark.parametrize(
     "with_scope,condition",
     [
         (False, "archived"),
