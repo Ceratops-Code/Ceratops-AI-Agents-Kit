@@ -13,7 +13,14 @@ import pytest
 from filelock import FileLock
 
 from tests.repository_lifecycle import test_shipping as shipping_cases
-from tests.support.repositories import run_git
+from tests.repository_lifecycle.support import (
+    OPERATION_RUNNER,
+    PR_WORKFLOW_ENTRYPOINT,
+    PROMOTE_REPOSITORY,
+    SHIP_REPOSITORY,
+    prepare_repository_lifecycle_repo,
+)
+from tests.support.repositories import run_git, write_sdlc_contract
 
 SCRIPTS = (
     pathlib.Path(__file__).resolve().parents[2]
@@ -769,3 +776,77 @@ def test_synchronized_source_is_checked_before_publication_or_deployment(
     result = loaded["ship_repository"](args)
     assert result["status"] == "already_shipped"
     assert log.read_text().splitlines()[-2:] == ["deploy", "finalize"]
+
+
+def test_composed_promotion_and_shipping_each_run_their_validation_boundary(
+    tmp_path: pathlib.Path,
+) -> None:
+    repo, _, _, _ = prepare_repository_lifecycle_repo(tmp_path)
+    log = tmp_path / "validation.txt"
+    (repo / "other-verifier.py").write_text(
+        f"import pathlib\nwith pathlib.Path({str(log)!r}).open('a') as out: out.write('checked\\n')\n",
+        encoding="utf-8",
+    )
+    write_sdlc_contract(
+        repo,
+        repository={
+            "capabilities": {},
+            "actions": {
+                "validate": {
+                    "requires": {"capabilities": []},
+                    "steps": [{"run": [sys.executable, "other-verifier.py"]}],
+                },
+                "test": {
+                    "requires": {"capabilities": []},
+                    "no-op": "Fixture has no test command.",
+                },
+            },
+        },
+    )
+    assert run_git(repo, "add", ".").returncode == 0
+    assert run_git(repo, "commit", "-m", "alternate validator").returncode == 0
+    head = run_git(repo, "rev-parse", "HEAD").stdout.strip()
+    promotion = runpy.run_path(str(PROMOTE_REPOSITORY))
+    shipping = runpy.run_path(str(SHIP_REPOSITORY))
+    original_promotion = promotion["_run_json"]
+    original_shipping = shipping["_run_json"]
+
+    def ship_json(command: list[str], **kwargs: Any) -> tuple[int, dict[str, Any]]:
+        if pathlib.Path(command[1]) in (OPERATION_RUNNER, SHIP_REPOSITORY.with_name("retire_shipped_work.py")):
+            return original_shipping(command, **kwargs)
+        if "prepare" in command:
+            return 0, {
+                "status": "ready",
+                "pending_work_scope": "",
+                "source_branches": [],
+            }
+        assert pathlib.Path(command[1]) == PR_WORKFLOW_ENTRYPOINT
+        assert log.read_text().splitlines() == ["checked", "checked"]
+        assert run_git(repo, "switch", "main").returncode == 0
+        assert run_git(repo, "merge", "--ff-only", head).returncode == 0
+        assert run_git(repo, "update-ref", "refs/remotes/origin/main", head).returncode == 0
+        return 0, {"status": "shipped", "commit": head, "synchronized_head": head}
+
+    shipping["ship_repository"].__globals__["_run_json"] = ship_json
+
+    def promote_json(
+        command: list[str], cwd: pathlib.Path
+    ) -> tuple[int, dict[str, Any]]:
+        if pathlib.Path(command[1]) == SHIP_REPOSITORY:
+            args = shipping["build_parser"]().parse_args(command[2:])
+            return 0, shipping["ship_repository"](args)
+        return original_promotion(command, cwd)
+
+    promotion["promote"].__globals__["_run_json"] = promote_json
+    args = promotion["build_parser"]().parse_args(
+        [
+            "--repo-root",
+            str(repo),
+            "--source-branch",
+            "approved",
+            "--ship-after-promotion",
+        ]
+    )
+    result = promotion["promote"](args)
+    assert result["status"] == "shipped"
+    assert log.read_text().splitlines() == ["checked", "checked"]

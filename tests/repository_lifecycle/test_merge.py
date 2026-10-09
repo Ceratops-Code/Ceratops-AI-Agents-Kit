@@ -235,7 +235,7 @@ def test_dependency_selected_cleanup_reuses_manager_and_preserves_unapproved_wor
         if mode == "changed_head":
             assert run_git(worktree, "commit", "-am", "later work").returncode == 0
     if mode in {"residual", "interrupted"}:
-        namespace = manager["finalize_scope"].__globals__
+        namespace = manager["_remove_selected_worktree"].__globals__
         original_run = namespace["run_command"]
 
         def leave_residue(command: list[str], **kwargs: Any):
