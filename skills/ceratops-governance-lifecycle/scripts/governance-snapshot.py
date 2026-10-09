@@ -50,9 +50,30 @@ MEMORY_REQUIRED_RE = re.compile(
     r"|\b(?:read|create|append|update|write)\b[^\n]*\bmemory(?:\.md)?\b",
     re.IGNORECASE,
 )
+HELPER_SUFFIXES = frozenset(
+    {
+        ".bat",
+        ".cmd",
+        ".cjs",
+        ".exe",
+        ".js",
+        ".mjs",
+        ".ps1",
+        ".psm1",
+        ".py",
+        ".sh",
+        ".ts",
+        ".tsx",
+    }
+)
+REFERENCE_SUFFIXES = HELPER_SUFFIXES | frozenset({".json", ".md", ".toml"})
+REFERENCE_SUFFIX_PATTERN = "|".join(
+    re.escape(suffix)
+    for suffix in sorted(REFERENCE_SUFFIXES, key=lambda value: (-len(value), value))
+)
 REFERENCE_RE = re.compile(
-    r"(?:[`\"'](?P<quoted>[^`\"'\r\n]+\.(?:py|ps1|json|toml|md)|[^`\"'\r\n]*\.gitignore)[`\"']"
-    r"|(?P<bare>[^\s`\"']+\.(?:py|ps1|json|toml|md)|[^\s`\"']*\.gitignore))",
+    rf"(?:[`\"'](?P<quoted>[^`\"'\r\n]+(?:{REFERENCE_SUFFIX_PATTERN})(?![A-Za-z0-9_])|[^`\"'\r\n]*\.gitignore)[`\"']"
+    rf"|(?P<bare>[^\s`\"']+(?:{REFERENCE_SUFFIX_PATTERN})(?![A-Za-z0-9_])|[^\s`\"']*\.gitignore))",
     re.IGNORECASE,
 )
 
@@ -77,7 +98,7 @@ def maybe_rel(path: pathlib.Path, base: pathlib.Path) -> str:
 
 
 def reference_inventory(prompt: str) -> dict[str, list[str]]:
-    """Classify referenced paths so helpers never include memory or result artifacts."""
+    """Classify paths from one registry so supported helpers cannot become artifacts."""
     helpers: set[str] = set()
     memory: set[str] = set()
     artifacts: set[str] = set()
@@ -89,7 +110,7 @@ def reference_inventory(prompt: str) -> dict[str, list[str]]:
             r"^\$env:CODEX_HOME", "$CODEX_HOME", reference, flags=re.IGNORECASE
         ).replace("\\", "/")
         lowered = reference.lower()
-        if lowered.endswith((".py", ".ps1")):
+        if pathlib.PurePosixPath(lowered).suffix in HELPER_SUFFIXES:
             helpers.add(reference)
         elif lowered.endswith("memory.md"):
             memory.add(reference)
