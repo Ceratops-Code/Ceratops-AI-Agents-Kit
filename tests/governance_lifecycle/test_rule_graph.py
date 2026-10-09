@@ -43,6 +43,7 @@ agents_rule_graph_inventory = GOVERNANCE_SNAPSHOT["agents_rule_graph_inventory"]
 build_decision_payload = GOVERNANCE_SNAPSHOT["build_decision_payload"]
 build_snapshot = GOVERNANCE_SNAPSHOT["build_snapshot"]
 repo_git_state = GOVERNANCE_SNAPSHOT["repo_git_state"]
+reference_inventory = GOVERNANCE_SNAPSHOT["reference_inventory"]
 
 
 class RuleGraphTests(unittest.TestCase):
@@ -153,6 +154,54 @@ class RuleGraphTests(unittest.TestCase):
                 "global-governance-consistency-audit/decision.v2",
             )
             self.assertNotIn("misplaced_worktrees", decision["counts"])
+
+    def test_reference_inventory_classifies_supported_helper_suffixes(self):
+        helper_names = [
+            "helper.bat",
+            "repository-audit-preflight.cmd",
+            "helper.cjs",
+            "helper.exe",
+            "helper.js",
+            "helper.mjs",
+            "helper.ps1",
+            "helper.psm1",
+            "helper.py",
+            "helper.sh",
+            "helper.ts",
+            "helper.tsx",
+        ]
+        prompt = " ".join(
+            f"`$env:CODEX_HOME\\automations\\demo\\{name}`"
+            for name in helper_names
+        )
+        prompt += (
+            " `$CODEX_HOME/automations/demo/result.json`"
+            " `$CODEX_HOME/automations/demo/memory.md`"
+            " `$CODEX_HOME/automations/demo/automation.toml`"
+            " Use finalMessage.summary."
+        )
+
+        inventory = reference_inventory(prompt)
+
+        self.assertEqual(
+            inventory["helper_refs"],
+            sorted(
+                f"$CODEX_HOME/automations/demo/{name}"
+                for name in helper_names
+            ),
+        )
+        self.assertEqual(
+            inventory["artifact_refs"],
+            ["$CODEX_HOME/automations/demo/result.json"],
+        )
+        self.assertEqual(
+            inventory["memory_refs"],
+            ["$CODEX_HOME/automations/demo/memory.md"],
+        )
+        self.assertEqual(
+            inventory["control_refs"],
+            ["$CODEX_HOME/automations/demo/automation.toml"],
+        )
 
     def rules_update_request(
         self,
