@@ -234,6 +234,7 @@ def test_formatter_is_stable_and_preserves_surrounding_bytes(
     original = bom + before.encode("utf-8")
     target.write_bytes(original)
     policy = producer.resolve_target_policy(None, target=target)
+    assert policy is not None
     replacement = prefix + "Changed prose " + "with protected `two  words` and punctuation, " * 8
     repaired = producer._repair_fragment(replacement, newline=newline, policy=policy, target=target, replacement=0)
     assert repaired.startswith(prefix + "Changed")
