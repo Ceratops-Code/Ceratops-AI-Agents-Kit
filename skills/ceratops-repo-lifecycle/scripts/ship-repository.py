@@ -40,6 +40,7 @@ from repository_operation import (
 SCRIPT_ROOT = pathlib.Path(__file__).resolve().parent
 OPERATION_RUNNER = SCRIPT_ROOT / "repository_operation.py"
 PENDING_MANAGER = SCRIPT_ROOT / "manage-pending-work.py"
+SHIPPED_CLEANUP = SCRIPT_ROOT / "retire_shipped_work.py"
 PR_WORKFLOW_ENTRYPOINT = SCRIPT_ROOT / "github_pr_workflow" / "__main__.py"
 DEFAULT_SDLC_CONTRACT = pathlib.Path("sdlc/sdlc.yml")
 RELEASE_BRANCH = "release/local"
@@ -746,7 +747,7 @@ def _pending_command(
     action: str,
     *,
     repo_root: pathlib.Path,
-    scope: pathlib.Path,
+    scope: pathlib.Path | None,
     target_branch: str,
     target_commit: str,
     current_branch: str | None = None,
@@ -754,17 +755,17 @@ def _pending_command(
 ) -> list[str]:
     command = [
         sys.executable,
-        str(PENDING_MANAGER),
+        str(SHIPPED_CLEANUP if action == "finalize" else PENDING_MANAGER),
         "--repo-root",
         str(repo_root),
         action,
-        "--scope",
-        str(scope),
         "--target-branch",
         target_branch,
         "--target-commit",
         target_commit,
     ]
+    if scope is not None:
+        command.extend(("--scope", str(scope)))
     if action == "finalize":
         if current_branch is None or current_commit is None:
             raise RepositoryShipError("Finalization requires synchronized identity.")
@@ -1285,23 +1286,46 @@ def ship_repository(args: argparse.Namespace) -> dict[str, object]:
             )
 
     finalized: dict[str, Any] | None = None
-    if pending_scope is not None:
-        finalize_code, finalized = _run_finalization(
-            _pending_command(
-                "finalize",
-                repo_root=repo_root,
-                scope=pending_scope,
-                target_branch=args.head_branch,
-                target_commit=target_commit,
-                current_branch=args.base_branch,
-                current_commit=synchronized_head,
-            ),
+    finalize_code, finalized = _run_finalization(
+        _pending_command(
+            "finalize",
             repo_root=repo_root,
-        )
-        if finalize_code == 2:
-            return _with_preserved_worktrees({
+            scope=pending_scope,
+            target_branch=args.head_branch,
+            target_commit=target_commit,
+            current_branch=args.base_branch,
+            current_commit=synchronized_head,
+        ),
+        repo_root=repo_root,
+    )
+    if finalize_code == 2:
+        return _with_preserved_worktrees({
+            **finalized,
+            "phase": "post_operations",
+            "repository": shipped.get("repository"),
+            "commit": target_commit,
+            "pr": shipped.get("pr"),
+            "url": shipped.get("url"),
+            "release_publication": release_publication,
+            "deployment": deployment,
+            "remote_mutation": True,
+            **_phase_recovery(
+                args,
+                repo_root=repo_root,
+                shipped=shipped,
+                target_commit=target_commit,
+                synchronized_head=synchronized_head,
+                remaining="finalization",
+                release_publication=release_publication,
+                deployment=deployment,
+            ),
+        }, preserved_worktrees)
+    if finalize_code:
+        raise RepositoryShipError(
+            str(finalized.get("message", "Selected-work cleanup failed.")),
+            {
                 **finalized,
-                "phase": "post_operations",
+                "phase": "finalization",
                 "repository": shipped.get("repository"),
                 "commit": target_commit,
                 "pr": shipped.get("pr"),
@@ -1319,32 +1343,8 @@ def ship_repository(args: argparse.Namespace) -> dict[str, object]:
                     release_publication=release_publication,
                     deployment=deployment,
                 ),
-            }, preserved_worktrees)
-        if finalize_code:
-            raise RepositoryShipError(
-                str(finalized.get("message", "Selected-work cleanup failed.")),
-                {
-                    **finalized,
-                    "phase": "finalization",
-                    "repository": shipped.get("repository"),
-                    "commit": target_commit,
-                    "pr": shipped.get("pr"),
-                    "url": shipped.get("url"),
-                    "release_publication": release_publication,
-                    "deployment": deployment,
-                    "remote_mutation": True,
-                    **_phase_recovery(
-                        args,
-                        repo_root=repo_root,
-                        shipped=shipped,
-                        target_commit=target_commit,
-                        synchronized_head=synchronized_head,
-                        remaining="finalization",
-                        release_publication=release_publication,
-                        deployment=deployment,
-                    ),
-                },
-            )
+            },
+        )
     for checkpoint in operation_checkpoints:
         _remove_completed_operation_checkpoint(checkpoint)
 

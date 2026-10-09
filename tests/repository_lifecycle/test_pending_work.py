@@ -916,11 +916,10 @@ def test_pending_work_finalization_persists_partial_cleanup_progress(
     finally:
         sys.path.remove(lifecycle_scripts)
     finalize_scope = loaded["finalize_scope"]
+    worktree_cleanup = loaded["_remove_selected_worktree"].__globals__
     original_require_success = finalize_scope.__globals__["require_success"]
-    original_run_command = finalize_scope.__globals__["run_command"]
-    original_residual_cleanup = finalize_scope.__globals__[
-        "_finish_recorded_residual_cleanup"
-    ]
+    original_run_command = worktree_cleanup["run_command"]
+    original_residual_cleanup = worktree_cleanup["_finish_recorded_residual_cleanup"]
     pending_error = loaded["PendingWorkError"]
 
     def leave_unregistered_residual(
@@ -951,8 +950,8 @@ def test_pending_work_finalization_persists_partial_cleanup_progress(
     ) -> None:
         raise pending_error("simulated residual cleanup interruption")
 
-    finalize_scope.__globals__["run_command"] = leave_unregistered_residual
-    finalize_scope.__globals__["_finish_recorded_residual_cleanup"] = (
+    worktree_cleanup["run_command"] = leave_unregistered_residual
+    worktree_cleanup["_finish_recorded_residual_cleanup"] = (
         interrupt_residual_cleanup
     )
     with pytest.raises(pending_error, match="residual cleanup interruption"):
@@ -1052,8 +1051,8 @@ def test_pending_work_finalization_persists_partial_cleanup_progress(
         newline="\n",
     )
 
-    finalize_scope.__globals__["run_command"] = original_run_command
-    finalize_scope.__globals__["_finish_recorded_residual_cleanup"] = (
+    worktree_cleanup["run_command"] = original_run_command
+    worktree_cleanup["_finish_recorded_residual_cleanup"] = (
         original_residual_cleanup
     )
 
@@ -1086,7 +1085,7 @@ def test_pending_work_finalization_persists_partial_cleanup_progress(
         original_rmtree(worktree)
 
     monkeypatch.setattr(shutil, "rmtree", deny_first_residual)
-    finalize_scope.__globals__["_run_recorded_residual_cleanup"] = (
+    worktree_cleanup["_run_recorded_residual_cleanup"] = (
         ownership_cleanup
     )
     finalize_scope.__globals__["require_success"] = fail_second_branch

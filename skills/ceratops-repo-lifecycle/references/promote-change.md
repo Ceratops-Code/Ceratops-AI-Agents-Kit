@@ -8,7 +8,7 @@ apply the lifecycle helper's promotion gate to the assembled commit. If
 repository as incompatible; never substitute another promotion branch. For
 `promote-and-deploy`, run selected `deploy-local` entries in order. Composed
 shipping validates again at its own boundary and owns selected post-merge
-publication, deployment and cleanup.
+publication, deployment and repository-wide shipped-task cleanup.
 
 ## Context
 
@@ -71,7 +71,8 @@ publication, deployment and cleanup.
 ### Boundaries
 
 - Promote only explicitly selected task branches.
-- Keep unrelated branches and worktrees outside inspection and cleanup scope.
+- Keep unselected branches and worktrees outside promotion checks; Ship owns
+  repository-wide cleanup through its cleanup helper's eligibility gates.
 - Supply the promotion trigger, tested release branch, and exact assembled
   commit to the SDLC test phase; leave test selection to the repository runner.
 - Before promotion, identify the selected task's unique linear commit range
@@ -190,9 +191,9 @@ artifacts, and pending-work state. Success prints `OK`; failure reports
   shipping repeated both gates and ran only the selected post-merge work.
   Advisory routing alone was never reported as completed domain work.
 - The exact pending-work scope is retained for standalone promotion or a
-  shipping blocker; successful composed shipping finalizes it, cleans selected
-  sources, and reports any preserved legacy sources or non-cleanup-eligible
-  worktrees left untouched.
+  shipping blocker; successful composed shipping finalizes it, removes eligible
+  shipped task work throughout the repository, and reports retained work with
+  reasons.
 
 ### Output Contract
 

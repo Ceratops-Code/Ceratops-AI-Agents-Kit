@@ -629,6 +629,18 @@ authorizes the complete workflow. Its final merge uses admin only after
 readiness, CI, Codex-review, and exact-head gates pass; standalone merge
 behavior remains unchanged.
 
+Ship cleanup discovers task worktrees and local `codex/` task branches across
+the repository, including older batches absent from the pending-work scope.
+Removal requires clean Git state including untracked files, the exact head
+included in the synchronized shipped commit, and associated Codex threads that
+are archived or absent. Active or uncertain owners and protected checkouts stay.
+The repository lifecycle helper `retire_shipped_work.py` reads the existing Codex
+thread catalog without writing it, rechecks current removal conditions, and
+retains only unfinished removal records under
+`<common-git-dir>/codex/repository-lifecycle/shipped-cleanup/`. A persistent native
+lock serializes cleanup; successful removal deletes its record and atomic-write
+sibling. Recovery never repeats completed publication or deployment.
+
 ### Governance proposal construction
 
 For an ordinary proposal, run `proposal-workflow.py init` with a verified task

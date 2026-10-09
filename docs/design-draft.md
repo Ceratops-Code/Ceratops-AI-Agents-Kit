@@ -1198,7 +1198,27 @@ runtime test exercises the mapped helper in an isolated interpreter without a
 source-checkout import. These checks establish this boundary, not public Build
 or whole-system recovery.
 
-### Planned completion and abandoned-work cleanup
+### Shipped task work and planned abandoned-work cleanup
+
+Implemented Ship cleanup is owned by `retire_shipped_work.py`. After selected
+operations succeed, it finalizes the optional promotion scope and discovers task
+worktrees and unchecked-out local `codex/` task branches throughout the repository.
+An absent scope does not suppress discovery. Removal requires clean Git state
+including untracked files, exact head ancestry in the synchronized shipped commit,
+and archived or absent associated Codex threads. The existing thread catalog is
+read-only; unavailable evidence and possible active owners under moved paths
+preserve work. The primary checkout, main/master and reusable `release/local`
+remain protected. Current state is checked before removal, and expected-head Git
+transactions protect branch deletion.
+
+The helper owns one unfinished path/ref-bound record per target under
+`<common-git-dir>/codex/repository-lifecycle/shipped-cleanup/` and one reusable
+native lock beside that directory. Startup resumes unfinished removals before
+discovering new candidates and removes orphaned owned atomic-write siblings.
+Success removes the exact record and sibling, then the empty record directory;
+no completed history is retained. Directory identity prevents recovery from
+deleting a replacement path. This cleanup leaves remote refs, accepted artifacts
+and installations to their existing owners.
 
 Step 7 extends the implemented checkpoint helper and connects the existing domain
 owners. After successful top-level completion, remove the operation's checkpoints
