@@ -689,6 +689,60 @@ def test_failure_summary_reports_real_exception_messages(
         assert len(failure["excerpt"].encode("utf-8")) <= 800
 
 
+@pytest.mark.parametrize("traceback_style", ["auto", "short"])
+def test_failure_summary_reports_native_group_and_subtest_failures(
+    test_runner_module: Any,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    traceback_style: str,
+) -> None:
+    """Use native pytest formatting, including punctuation in subtest identities."""
+
+    monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
+    path = tmp_path / "test_nested.py"
+    cases = ["with - separator", "literal [ ] :: ) case"]
+    path.write_text(
+        "import unittest\n"
+        "def test_nested():\n"
+        "    print('E       misleading captured text')\n"
+        "    raise ExceptionGroup('outer', [ExceptionGroup('sdk', [ValueError('inner actual\\ninner detail')]), RuntimeError('sibling actual')])\n"
+        "class TestCases(unittest.TestCase):\n"
+        "    def test_subcases(self):\n"
+        f"        for case in {cases!r}:\n"
+        "            with self.subTest(case=case):\n"
+        "                self.assertEqual('actual', 'expected')\n",
+        encoding="utf-8", newline="\n",
+    )
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "--color=no", "-o", "addopts=",
+         f"--tb={traceback_style}", path.name],
+        cwd=tmp_path, capture_output=True, text=True, check=False, timeout=30,
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    summary = test_runner_module.pytest_diagnostics.pytest_failure_summary(result.stdout, result.stderr)
+    expected_subtests = [f"{path.name}::TestCases::test_subcases (case={case!r})" for case in cases]
+    assert summary["failure_count"] == 3
+    assert summary["omitted_failure_count"] == 0
+    assert summary["failed_tests"] == [f"{path.name}::test_nested", *expected_subtests]
+    grouped, *subtests = summary["failures"]
+    assert grouped["source_location"].endswith(f"{path.name}:4")
+    assert "ValueError: inner actual" in grouped["excerpt"]
+    assert "inner detail" in grouped["excerpt"]
+    assert "RuntimeError: sibling actual" in grouped["excerpt"]
+    assert "ExceptionGroup:" not in grouped["excerpt"]
+    for failure in subtests:
+        assert failure["source_location"] == f"{path.name}:9"
+        assert "AssertionError: 'actual' != 'expected'" in failure["excerpt"]
+    assert "misleading captured text" not in summary["decisive_excerpt"]
+    assert all(len(failure["excerpt"].encode("utf-8")) <= 800 for failure in summary["failures"])
+    # Losing traceback sections must not erase the failure count or merge the
+    # two distinct subtests under their shared parent node ID.
+    subtest_lines = "\n".join(line for line in result.stdout.splitlines() if line.startswith("SUBFAILED"))
+    without_sections = test_runner_module.pytest_diagnostics.pytest_failure_summary(subtest_lines, "")
+    assert without_sections["failure_count"] == 2
+    assert without_sections["failed_tests"] == expected_subtests
+
+
 @pytest.mark.parametrize("reason", ["RuntimeError: the actual failure", ""])
 def test_failure_summary_prefers_reason_to_source_call(
     test_runner_module: Any, reason: str

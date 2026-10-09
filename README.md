@@ -66,6 +66,11 @@ hooks/
   preserve-eol-for-apply-patch-tool.py
   windows-shell-sanity.py
   README.md
+tools/
+  source_search_mcp.py
+  pyproject.toml
+  mcp-server.json
+  pylock.toml
 ```
 
 Source `SKILL.md` and action-reference files are portable, delta-only
@@ -125,14 +130,15 @@ without repository deduplication.
 | Script | Caller And Timing |
 | --- | --- |
 | `skills/ceratops-design-document-lifecycle/scripts/validate_design_document.py` | Validates document metadata, mapped sections, fences, local paths, and Mermaid through an existing official CLI; generates the human contract and minimal template from its skill-owned JSON contract. Mermaid checks require the CLI/browser and a caller-selected task temp root. |
-| `hooks/bounded-source-search.py` | Runs bounded two-phase ripgrep searches and replaces oversized successful ripgrep hook output with a compact per-file projection. |
+| `hooks/bounded-source-search.py` | Owns bounded source-search logic and complete MCP inventory pages; denies recognizable broad ripgrep content commands in PreToolUse and bounds oversized successful PostToolUse output. |
+| `tools/source_search_mcp.py` | Read-only local STDIO `source_search` adapter using the pinned MCP SDK; exposes overview, complete paginated files, and selected-file inspect within an 8,000-byte tool-result ceiling. The MCP lifecycle skill packages and installs its declared release. See [installation and search semantics](hooks/README.md#bounded-source-search). |
 | `hooks/preserve-eol-for-apply-patch-tool.py` | Preserves each updated text file's existing encoding and uniform line-ending convention around `apply_patch`. |
 | `hooks/windows-shell-sanity.py` | Repository-owned source for the user-global Windows PowerShell preflight; rewrites exact command defects, annotates ordinary failures, and blocks unreliable or policy-prohibited forms. |
 | `scripts/deploy-skills.py` | Independent installation and updates; renders selected skills and overlays their files without validation, retirement, or lifecycle runtime calls. |
 | `scripts/deploy-hooks.py` | Independent hook installation and updates; copies the repository hook payloads and merges their registrations while preserving unrelated files and configuration. Does not grant trust or restart Codex. |
 | `scripts/deploy-mcp-server-manager.py` | Install the checkout's declared MCP server manager version, including over an existing installation, from the scripts environment; uses the manager's global Python and uv prerequisites, temporary locked libraries, and packaging and deployment code. Never changes Codex settings. |
 | `scripts/testing/run-tests.py` | Sole test-selection, collection-reconciliation, and pytest-execution owner; validates `tests/test-impact.json`, explains deterministic Git-diff selection, rejects mapping gaps before pytest collection or execution, supports explicit committed-diff, worktree, collection, and `--all` modes, adds `--select-only` to check diff/worktree mapping without pytest, and saves failed-pytest streams and structured pre-test failures with captured command output through `--diagnostic-output`; pytest output remains bounded in the console. |
-| `scripts/testing/pytest-diagnostics.py` | Extracts bounded failure summaries using exact pytest identities and source-file evidence, including parameter names containing summary separators; prioritizes the final exception's message and assertion differences over source context, excluding captured output. Ambiguous or missing tracebacks use only that test's summary reason. Full diagnostic files remain owned by the runner. |
+| `scripts/testing/pytest-diagnostics.py` | Extracts bounded failure summaries using exact pytest and unittest-subtest identities and source-file evidence, including parameter names containing summary separators; reports nested exception-group messages and assertion differences over source context, excluding captured output. Ambiguous or missing tracebacks use only that test's summary reason. Full diagnostic files remain owned by the runner. |
 | `scripts/run-actionlint.py` | Provisions the pinned, checksum-verified actionlint release inside the scripts environment and validates every GitHub Actions workflow. |
 | `scripts/validate-repository.py` | Local validation coordinator; checks the running Python against `scripts/pyproject.toml`, runs workflow, repository lint and type checks, and captures first-failure evidence. Tests run separately through `scripts/testing/run-tests.py`. |
 | `skills/ceratops-repo-lifecycle/references/templates/deploy-skills.py.tmpl` | Authoritative standalone installer copied into compatible skill repositories as `scripts/deploy-skills.py`; invoke it through uv using the scripts project. |
@@ -1133,6 +1139,52 @@ $HOME/.claude/skills/<skill-name>/SKILL.md
 Invoke skills directly with `/skill-name` in Claude Code. In Codex, invoke them
 with `$skill-name`.
 
+## Bounded Source Search
+
+The local STDIO MCP tool `source_search` provides read-only source searches
+through the existing `hooks/bounded-source-search.py` implementation.
+
+| Mode | Use |
+| --- | --- |
+| `overview` | Exact match counts and bounded snippets from ranked files. |
+| `files` | A complete, deterministically paginated inventory of matching paths. |
+| `inspect` | Bounded context from explicitly selected relative files. |
+
+Each complete MCP tool result, including SDK fields and JSON escaping, fits
+within **8,000 UTF-8 bytes**. Results report totals, omitted files and matches,
+remaining files, clipped lines, and `next_cursor`. For exhaustive rename
+discovery, use `files` and repeat the same arguments with that cursor until it
+is null; a bounded overview alone is not an exhaustive inventory. Inspect
+selected candidates before changing references.
+
+```json
+{"query":"old_name","mode":"files","page_size":100}
+{"query":"old_name","mode":"files","page_size":100,"cursor":"RETURNED_NEXT_CURSOR"}
+{"query":"old_name","mode":"inspect","paths":["src/example.py"],"context":3}
+```
+
+The server validates roots and literal file paths inside its fixed startup
+boundary. It uses ripgrep's ordinary ignore and hidden-file rules, excludes
+binary content, and disables personal ripgrep configuration. Pagination freezes
+the matching inventory in memory; expired or mismatched cursors and changed
+context files fail explicitly. Restart discovery to observe source changes.
+
+`ceratops-mcp-server-lifecycle` owns packaging and installation from `tools/`,
+including the pinned MCP SDK, search helper, and isolated ripgrep executable.
+The installed release runs without its source checkout. Register its stable
+launcher with Codex before deploying the guard; installation, client
+registration, and hook deployment are separate steps. The repository's hook
+install action is `deliverables.hooks.codex-hooks.actions.install` in
+`sdlc/sdlc.yml`. See [hook interfaces and installation](hooks/README.md#bounded-source-search)
+for the exact commands and retention boundaries.
+
+The `PreToolUse` guard denies recognizable broad, content-producing `rg`
+commands before execution and directs the model to `source_search`. Concrete
+file searches and file-list discovery remain allowed. The guard neither calls
+MCP nor rewrites searches; direct search and `PostToolUse` output bounding
+remain available. Changed hooks may require Codex's hook trust review, and
+registration alone does not establish that an existing session has connected.
+
 ## Rename Files And References
 
 From the installed `ceratops-repo-lifecycle` skill directory, preview a rename:
@@ -1249,6 +1301,8 @@ bounded failing-test summary plus the file path, byte count, and SHA-256 hash.
 Compact summaries prioritize pytest's reported assertion differences and
 exceptions; passing setup assertions cannot displace them. Each selected line
 gets a share of the byte budget so a long value cannot hide later differences.
+Nested exception groups retain their leaf error messages. Failed unittest
+subtests count separately and preserve their context in each test identity.
 A successful pytest run removes stale evidence at the selected path.
 
 For a structural test migration, capture the pre-migration collection and

@@ -4,7 +4,8 @@ This directory owns user-global operational hooks that are not part of one
 managed skill runtime:
 
 - `bounded-source-search.py` performs bounded two-phase ripgrep searches and
-  replaces oversized successful ripgrep output in `PostToolUse`.
+  replaces oversized successful ripgrep output in `PostToolUse`. Its
+  `PreToolUse` guard directs broad content searches to `source_search`.
 - `preserve-eol-for-apply-patch-tool.py` records and restores encoding and
   uniform line endings around `apply_patch`.
 - `command-probe.py` returns structured false results for exact read-only
@@ -28,8 +29,8 @@ shell-expansion characters. Other hosts use the installer's Python executable.
 
 Existing handler options, unrelated registrations and extra files are retained.
 Identical registrations are deduplicated; conflicting options or timing stop
-before copying. Windows receives four registrations; other platforms receive
-the three platform-independent registrations. `command-probe.py` is copied as
+before copying. Windows receives five registrations; other platforms receive
+the four platform-independent registrations. `command-probe.py` is copied as
 a dependency of the Windows preflight, not registered separately.
 
 The helper prints `OK` on success or a bounded error with a nonzero exit code.
@@ -44,6 +45,95 @@ require review through Codex's [hook trust flow](https://learn.chatgpt.com/docs/
 
 ## Bounded Source Search
 
+`tools/source_search_mcp.py` exposes one local STDIO MCP tool, `source_search`,
+using the MCP SDK pinned in `scripts/pyproject.toml`. It reuses this directory's
+search implementation and has three modes:
+
+| Mode | Result |
+| --- | --- |
+| `overview` | Exact match counts, ranked files, and bounded contextual snippets. |
+| `files` | Every matching path and its count, sorted by casefolded path then exact path, across deterministic pages. |
+| `inspect` | Bounded context from explicitly selected relative files, including selected files with no matches. |
+
+All modes require a ripgrep regular expression in `query`; `root` defaults to
+the server's startup root, and `globs` applies ripgrep include/exclude globs.
+Searches follow ripgrep's ordinary hidden-file and ignore rules, exclude binary
+content, and ignore personal ripgrep configuration to prevent executable
+preprocessors. The startup `--root` is a fixed access boundary: a requested
+root must resolve inside it, and inspected paths must be literal regular files
+inside the requested root. Traversal, missing files, directories, and symlink
+escapes fail explicitly.
+
+The complete MCP `CallToolResult`, including JSON escaping and SDK fields, is
+at most **8,000 UTF-8 bytes**. `total_files` and `total_matches` cover the whole
+inventory; for `inspect`, `total_files` includes selected files with zero
+matches. `omitted_files` counts files absent from the current response,
+`remaining_files` counts files after this page, and `omitted_matches` counts
+occurrences whose match lines are not represented in the returned snippets.
+`files` has no snippets, so its `omitted_matches` equals `total_matches`.
+`clipped_lines` and each snippet's `text_truncated` flag report line clipping.
+
+Repeat the same request with the returned `next_cursor` until it is null to
+enumerate every file. `page_size` bounds a `files` page; `max_files` bounds an
+`overview` or `inspect` page. Byte limits can shorten any page. Snippet limits
+are `matches_per_file` and `context`; the cursor advances by files, not by
+omitted snippets. Use `inspect` with smaller selections or adjusted limits to
+focus context. A path that cannot fit is an explicit error, never a shortened
+or silently discarded inventory entry.
+
+Inventories/counts remain frozen across continuation requests without rerunning
+discovery. The process owns at most eight inventories for fifteen minutes,
+pruned on requests; it writes no search state or temporary files. Expired,
+evicted, mismatched, and invalid cursors return errors instead of false EOF.
+Changed files are rejected before returning context from an older inventory.
+Start a new search to observe source changes.
+
+For example, discover all rename candidates, then inspect selected files:
+
+```json
+{"query":"old_name","mode":"files","page_size":100}
+{"query":"old_name","mode":"files","page_size":100,"cursor":"RETURNED_NEXT_CURSOR"}
+{"query":"old_name","mode":"inspect","paths":["src/example.py"],"context":3}
+```
+
+### Managed installation and registration
+
+The `ceratops-mcp-server-lifecycle` skill owns release packaging and installation.
+`tools/pyproject.toml` declares `source_search_mcp` version `1.0.0` with the
+repository's pinned MCP dependency and wheel backend. `tools/mcp-server.json`
+selects the readiness module, and `tools/pylock.toml` locks the release's
+dependencies, including `ripgrep-bin==15.1.0`. The wheel contains the entry point
+and the existing search helper; an installed server uses its isolated ripgrep
+binary and does not depend on a retained source checkout or ambient PATH.
+
+Use the skill's create action to lock, review, and package `tools/` through the
+installed manager, then its install action for that exact registered release.
+The manager owns artifacts, isolated environments, selection, locks, and bounded
+retention under `$HOME/.codex/mcp/source_search_mcp`: activation keeps the selected
+version and at most two inactive predecessors, deferring live leased environments.
+The server itself writes no search state. `--deployment-check` reports installed
+package metadata, local ripgrep readiness, and the canonical tool schemas;
+`--mcp` starts STDIO. Both are transport administration, not extra search tools.
+
+After managed installation, register its stable launcher before installing the
+broad-search guard. Select a startup search root containing all directories the
+tool should be allowed to search:
+
+```powershell
+$searchRoot = (Get-Location).Path
+$launcher = Join-Path $env:USERPROFILE '.codex\mcp\source_search_mcp\bin\source_search_mcp.py'
+codex mcp add source_search_mcp -- python "$launcher" --mcp --root "$searchRoot"
+codex mcp get source_search_mcp
+```
+
+Registration changes live Codex configuration. Hook installation through
+`scripts/deploy-hooks.py` separately changes the selected profile and requires
+its own execution request. Review changed hooks through Codex's hook trust flow
+before use. Hook installation does not register the MCP server. Source execution
+still needs both `tools/` and `hooks/`; copying only the entry point is insufficient.
+
+### Direct and hook interfaces
+
 Run a direct search with one model-facing result:
 
 ```powershell
@@ -53,7 +143,26 @@ python .\hooks\bounded-source-search.py --root PATH --query TEXT
 The helper first counts and ranks matches without emitting the intermediate
 file list, then extracts context from only the selected files. It excludes
 binary files through ripgrep's default behavior and caps files, matches,
-context, line length, and total JSON bytes.
+context, line length, and total JSON bytes. Its existing
+`bounded-source-search.v1` result and capped discovery are retained; use MCP
+`files` for an exhaustive inventory.
+
+The new guard reads one Codex `PreToolUse` event for `Bash` and denies
+recognizable static `rg` commands that would return source content from a
+directory, wildcard target, or implicit recursive root:
+
+```powershell
+python "$env:CODEX_HOME\hooks\bounded-source-search.py" --pre-hook
+```
+
+The denial directs the model to `source_search`; it never calls MCP or rewrites
+the command. File-list discovery, count/quiet modes, stdin-filter pipelines,
+and focused searches where every target is an existing concrete file remain
+allowed. Piping a broad directory search into an output limiter still denies
+the search. This recognizer is an output guard, not a general shell interpreter;
+dynamic programs and here-strings remain outside its recognition contract.
+The installer adds the guard before the Windows shell preflight so it sees
+the original `rg` arguments before that preflight can wrap them.
 
 Hook mode reads one Codex `PostToolUse` event. It leaves small, failed, and
 non-ripgrep results unchanged. Oversized successful ripgrep results are replaced

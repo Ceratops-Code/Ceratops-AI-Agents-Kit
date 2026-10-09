@@ -130,7 +130,11 @@
       "id": "test-hook-source",
       "paths": [
         "scripts/deploy-hooks.py",
-        "hooks/*.py"
+        "hooks/*.py",
+        "tools/source_search_mcp.py",
+        "tools/pyproject.toml",
+        "tools/mcp-server.json",
+        "tools/pylock.toml"
       ],
       "suites": [
         "test-infrastructure"
