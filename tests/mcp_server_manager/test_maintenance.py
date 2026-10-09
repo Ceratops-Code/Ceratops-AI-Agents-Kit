@@ -259,7 +259,7 @@ def test_dependency_download_uses_five_minute_timeout_and_enforces_hash(
     def download(request_url, *, timeout):
         requests.append((request_url, timeout))
         response = io.BytesIO(b"corrupt archive" if corrupt else expected)
-        response.url = url
+        setattr(response, "url", url)
         return response
 
     monkeypatch.setattr(package_module.urllib.request, "urlopen", download)
