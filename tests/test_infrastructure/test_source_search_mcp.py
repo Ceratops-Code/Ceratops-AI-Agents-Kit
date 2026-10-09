@@ -66,7 +66,8 @@ def test_client_lists_one_read_only_tool_and_complete_deterministic_pages(tmp_pa
             assert tool.input_schema["properties"]["paths"]["items"]["type"] == "string"
             assert tool.input_schema["additionalProperties"] is False
             assert tool.input_schema == TOOL_INPUT_SCHEMA
-            seen, cursor, pages = [], None, 0
+            seen: list[str] = []
+            cursor, pages = None, 0
             while True:
                 response = await checked_call(client, {"query": "needle", "mode": "files",
                                                        "page_size": 200, "cursor": cursor})
