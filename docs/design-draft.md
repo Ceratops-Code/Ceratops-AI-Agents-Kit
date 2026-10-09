@@ -370,9 +370,10 @@ introduced.
 
 ## Working-folder acceptance methodology (planned)
 
-This section owns the target methodology: one release lock for a complete
-promotion, ordinary work in other worktrees, and explicit recovery after an
-uncertain interruption. Automatic child-process recovery is optional future work.
+This section owns the approved target methodology: one release lock for a
+complete promotion or Ship, ordinary work in other worktrees, and explicit
+recovery after an uncertain interruption. Automatic child-process recovery
+is optional future work.
 It does not claim that the complete execution path is
 implemented. The v2 transaction above
 remains usable; the internal versioned reservation, direct output, receipt,
@@ -382,6 +383,9 @@ README records implementation status and actual runtime paths after each step;
 the refactor plan owns delivery order. No additional methodology document is
 needed, and the portable result-record template remains an existing reference
 asset rather than a second release-acceptance authority.
+Qualification-level reuse, CI-written receipts, success-only lifecycle receipts
+and the full Ship/publication/installation sequence below are planned changes.
+The implemented 2A.1a helper is not their public workflow integration.
 
 ### One existing worktree, two commit boundaries
 
@@ -389,6 +393,10 @@ Run source, validators and tests from the selected existing worktree. Do not
 make a clone, detached checkout, source-copy tree or source snapshot directory
 for this workflow. Artifact output directories, generated portable packages and
 temporary installation environments are outputs, not alternate source checkouts.
+CI uses its normal job checkout, not an additional source-copy tree. The two
+commit boundaries below apply to selected artifact production. When no unit needs
+production, run/reuse applicable repository checks and integrate without inventing
+a version, artifact receipt, tag or empty receipt-only commit.
 
 1. For promotion, retain the release lock acquired before selecting its release
    base, including through corrections. Standalone Build has no general worktree
@@ -407,9 +415,11 @@ temporary installation environments are outputs, not alternate source checkouts.
    Use repository-owned dependency information to run affected checks and retain
    applicable results. Do not discard an earlier artifact's acceptance or rerun
    its tests merely because a check definition or commit identifier changed.
-4. After every required target succeeds, serialize each build receipt once,
-   calculate its SHA-256 and write its exact bytes with owned evidence directly
-   at the declared final worktree paths. Validate those bytes and create C.
+4. After every required target succeeds, construct each receipt from the complete
+   successful results and serialize it once. Retain its SHA-256, write its exact
+   bytes with owned evidence directly at the declared final worktree paths and
+   create C. If correct construction is not possible, write no receipt. Do not
+   add a separate post-write receipt-validation phase.
    Targets share prepared source checkpoint B and final receipt commit C, with
    separate artifact inventories, toolchain identities and test outcomes.
 5. Compare B and C. Only exact producer-owned receipt/evidence paths may differ;
@@ -504,6 +514,14 @@ cancellation after its writing commands stop. Ordinary work in other worktrees
 continues. No general task-worktree execution lock is planned; the caller
 coordinates edits and commands in its selected source worktree.
 
+Ship acquires the same lock before its first fetch/base selection and retains it
+through local corrections, CI/review waits, receipt fetch/fast-forward, protected
+PR merge, selected publication, local installation and completion cleanup. Remote
+CI writers do not share this machine-local lock; conditional remote branch updates
+and GitHub protection guard their changes. A second local promotion or Ship fails
+immediately, before candidate work starts. Closing the correction input cancels
+the owning operation; it does not leave an unattended lock-holder service.
+
 Take the release lock before existing producer checkpoint locks and short store
 locks when nested. Do not hold a store lock through tests or human correction.
 Checkpoint cleanup retains its current nonblocking producer lock and never
@@ -512,9 +530,14 @@ flag. Commands that ignore the helper, including manual Git, are not protected.
 
 Step 6 later applies this same helper to `<destination>/locks/install`, held
 through generation production, activation and owned cleanup. A destination lock
-must not acquire the release lock in reverse order. The existing plan releases
-the promotion lock before its separately selected deployment; installer adoption
-is not part of 2A.1a. Optional step 2A.1c may automate abandoned-command cleanup;
+must not acquire the release lock in reverse order. Ordinary Promote-and-deploy
+releases the release lock before installation. Ship retains its outer release
+lock and takes the destination lock inside it, releasing the destination lock
+before completion cleanup and the release lock. Installation failure stops
+automatic execution; stop commands and release locks cleanly, or retain the
+unfinished flag if shutdown is uncertain. Explicit later resume reacquires the
+locks. Installer adoption is not part of 2A.1a.
+Optional step 2A.1c may automate abandoned-command cleanup;
 ordinary use does not depend on it.
 
 `uv run --locked` controls dependency resolution against `uv.lock`. It is not
@@ -534,7 +557,7 @@ exclusion, command supervision and public recovery integration remain 2A.1b.
 | --- | --- | --- |
 | Build receipt | Attempt ID, pre-test B, unit/version/target and required targets, declared build inputs, artifacts and dependencies by digest, original required checks and completed outcomes, and evidence digests | Written after checks and committed at `.build/<unit>/<version>/build_receipt.json`; add `<target>` below the version for separately qualified targets; it contains neither its own hash nor C |
 | Artifact receipt | Final C, repository-relative build-receipt path, hash of its exact committed bytes, store-relative artifact locations and completed acceptance reference | Stored alongside immutable artifacts in the Git common directory after closure passes |
-| Promotion/deployment record | Selected artifact receipts, integrated release commit, version/target, expected old and resulting refs, completed effects | Existing owning lifecycle checkpoint/result; it does not duplicate test acceptance |
+| Promotion/deployment completion record | Selected artifact receipts, integrated release commit, version/target, expected old and resulting refs, successful completed effects | Existing owning lifecycle result; it does not duplicate test acceptance or record aggregate failure; essential unfinished-request data stays in checkpoints |
 
 `ceratops-build-result.v3` and `ceratops-artifact-receipt.v1` are implemented as
 explicit definitions in the existing operation-result schema. Existing v2
@@ -606,21 +629,81 @@ For a selected accepted artifact, later stages consume its original passed
 results and check versions. They may compare identity and integrity hashes;
 they do not recompute current test coverage or impose today's check catalog.
 
-For new or corrected product inputs, repository-owned selection maps changed
-inputs to affected check groups, including dependencies, shared configuration,
-locks and environment requirements. The shared operation runner coordinates
-selection and records results; it does not maintain a second repository-specific
-dependency graph. Ceratops-AI-Agents-Kit starts from `tests/test-impact.json` and
-`scripts/testing/run-tests.py`. The portable result-record template informs
-record shape; do not turn it into an installed runtime by copying it implicitly.
-A changed file with no sound mapping requires an explicit broader group, not
-assumed zero impact. Unchanged accepted units are not swept into that rerun.
+A tag locates a completed version and its receipt. Test files present at that
+commit do not prove those tests ran. The receipt accounts for every required
+check through an executed pass or a reference to an applicable earlier pass;
+the whole suite need not have run in one process.
+
+Step 2A.2 adds this minimum qualification policy:
+
+| Candidate level | Eligible earlier result levels |
+| --- | --- |
+| alpha | alpha, beta, rc, final |
+| beta | beta, rc, final |
+| rc | rc, final |
+| final | final |
+
+Level alone is insufficient. Match applicable product/check inputs, check identity,
+arguments, dependencies and compatible platform/tool/runtime/environment scope.
+Keep the original check version and stable result identity. Inherited passes keep
+their original level; another receipt or tag cannot promote a lower-level pass.
+This policy does not introduce a public rc command.
+
+Select the most recent eligible completed baseline for the same release unit and
+target on the candidate's relevant history, recording its exact tag, commit and
+receipt. Do not choose a repository-wide last tag or another branch's newest
+version. Missing baseline evidence leaves missing coverage; without a usable
+baseline, run the full relevant suite. It does not revoke historical acceptance.
+
+Compare baseline inputs with intended candidate inputs, including additions,
+deletions, renames and intended new/untracked files. Git diff narrows the work;
+input identities also cover dependency locks, generated inputs and tool/environment
+changes absent from that diff. The repository's declared input map selects affected
+checks. Unknown dependencies select the declared conservative/full scope, never
+an assumed empty pass. The shared operation runner coordinates this selection,
+not a second dependency graph. This repository's owners remain
+`tests/test-impact.json` and `scripts/testing/run-tests.py`.
+
+Promotion reuses eligible unaffected passes and runs missing or affected checks.
+A source-only check may survive an unrelated version change; an artifact test
+bound to changed bytes cannot. Build alpha/beta packages with their actual
+embedded versions, never relabel already accepted bytes.
+
+Ship compares each unit with its last successfully published final version, or
+last accepted final CI version when publication is not configured. A new/changed
+final unit initially runs its full declared suite for every required target and
+affected integration scope, not promotion's incremental subset. Unaffected tests
+from an older, different final unit cannot replace this initial full run; neither
+can alpha/beta/rc evidence. An identical already-final-qualified unit instead
+reuses its complete acceptance with no build or tests.
+
+Corrections/resumption within that final qualification retain applicable
+final-level passes and rerun only failed, missing or affected checks. The finished
+receipt must still cover the whole required final suite on the corrected inputs.
+Unchanged final units keep their existing versions, artifacts and acceptance.
 
 Separate artifact-producing inputs from check-only inputs in new records.
 Editing a test or validator alone cannot revoke acceptance of unchanged bytes.
 Failed/missing required checks still prevent first acceptance of a new candidate.
 An explicit request for additional checks is a distinct operation, not a
 retroactive rewrite of the earlier receipt.
+
+Only declared repository runners/validators produce executed outcomes. The
+operation owner supplies their final result paths under
+`<git-common-dir>/ceratops/results/repository-checks/<result-id>.json`; results
+are saved before success is returned. They outlive checkpoints and worktrees.
+Step 2A.2 adds qualification levels and original/reused references to the existing
+schemas, writers and readers together. Historical evidence is not rewritten or
+assigned an invented level. Retain evidence referenced by active candidates,
+retained receipts or selected unit/target/level baselines; prune unreferenced
+results to current plus two predecessors per check scope/level at startup and
+completion. Artifact retention must protect final baselines from alpha churn
+and gain a separate rc group if rc production is supported.
+
+The portable result-record template remains a reference, not an implicitly copied
+runtime. Existing runner modes stay usable until callers adopt this policy;
+fast-change's narrow transaction-local self-checks create no reusable repository
+or artifact acceptance. No new cache service or Nx prerequisite is introduced.
 
 The implemented v2 store has separate internal production and reading helpers.
 Production accepts source/dependency/build inputs and required tests, publishes
@@ -636,10 +719,61 @@ locks belong to a new build; they do not revoke an earlier artifact's acceptance
 Missing, failed, unfinished, malformed, wrong-identity or corrupt records/files
 still block consumption. Public receipt-based Deploy remains a later integration.
 
+### Affected deliverables and empty delivery
+
+Step 2A.4 uses existing SDLC ownership, declared inputs, dependency edges and
+release-unit membership. A release unit contains members sharing a version or
+release; it is not every deliverable connected anywhere in the dependency graph.
+
+Changed product/build/runtime inputs select their owners and downstream consumers
+whose declared inputs depend on them. Follow upstream dependencies to obtain the
+exact prerequisites, reusing unchanged accepted prerequisites. A consumer change
+does not invalidate its suppliers. Select affected cross-unit/integration checks
+without automatically rebuilding all participants. Expand coupled unit membership
+when its shared-version or atomic-release contract requires it.
+
+Keep three decisions separate: artifacts to build, checks to execute/reuse and
+existing outputs to deliver. Compute change before allocating versions, then
+include extra impact from prepared versions/pins/locks. Report the changed input
+or dependency edge responsible for each selection. Incomplete ownership uses a
+declared conservative selection or reports the unresolved paths; it cannot imply
+zero impact. Documentation inside a shipped payload can affect a deliverable.
+
+With no affected deliverable, run/reuse applicable repository checks and integrate
+without a new artifact, version, tag or receipt-only commit. Requested change-scoped
+deployment becomes `no_op` with reason `no_deliverable_change`; an unrequested
+deployment remains a different outcome. Explicit Deploy of an existing receipt
+or version still installs it, even into a new destination with no source changes.
+
+### Successful receipts and failure recovery
+
+High-level build, artifact, publication, installation and completion receipts
+record successful completed effects only. A failed candidate produces no aggregate
+receipt saying it failed. Return the actual failing check/command and hand control
+to supported deterministic recovery or the model/user correction path. Installation
+has the separate stop-and-diagnose rule below, not an automatic retry loop.
+
+Specific failed/blocked/interrupted check reports may identify work to rerun.
+Bounded cause diagnostics and indispensable unfinished-request checkpoints may
+also remain. They never satisfy acceptance. Preserve successful checks and
+completed publication/installation effects when a later stage fails; do not
+relabel them failed or claim overall success.
+
+The producer establishes complete successful coverage and constructs correct
+canonical receipt bytes before writing them, or writes no receipt. Do not add a
+second validator for its newly created receipt. B-to-C input checks, exact-byte
+hashes and normal receipt-chain integrity checks remain: they protect identity,
+not a renewed decision that already accepted work passes today's tests.
+Steps 2A.2/2A.3 update the implemented outcome writers under this policy; historical
+records and earlier implemented steps are not rewritten by this documentation.
+
 ### Merge-back, promotion and Ship
 
 Promotion keeps the source branch history. No automatic rebase is part of the
-target flow. Step 2A.1b holds the shared release lock before selecting the
+target flow. Local promotion requires neither a remote nor GitHub: discover the
+common directory, local main/release refs and release checkout locally. Steps 2B/8
+remove the current remote prerequisite; fetching, pushing and publication checks
+belong to Ship. Step 2A.1b holds the shared release lock before selecting the
 `release/local` tip and throughout qualification and correction. If source
 lacks release changes, merge that recorded release tip into the task worktree,
 resolve conflicts and commit prepared inputs before checks. This pre-test
@@ -661,14 +795,139 @@ Promote stops at release staging. Resume incomplete effects using their recorded
 receipts. Keep destination activation ordered and protect artifacts needed by
 active operations/rollback.
 
-Ship captures the synchronized remote target tip before publication/deployment
-selection. If it includes newer product fixes, automatically select the new
-candidate. Reuse its existing accepted artifacts or qualify that new candidate
-through the normal source/PR/CI flow; never silently fall back to an older
-candidate. A merge commit with unchanged relevant inputs can retain acceptance.
-Do not rebuild merely for a new SHA. Once a candidate is selected, publication
-consumes its saved artifacts. Later remote movement belongs to a successor
-selection, not an endless moving target or an in-place mutation of a release.
+### Ship, CI receipts and local installation
+
+Steps 9–12 implement the following sequence. CI owns deterministic release
+builds/tests, receipts, required-check reporting and publication. Local Ship owns
+the local release lock, source corrections, synchronization and local installation.
+Declared publication/install configuration does not itself authorize those actions;
+capture the requested units, target branch and selected delivery stages first.
+
+1. Acquire the release lock before fetching or choosing a candidate. Keep the
+   same local Ship process and lock through every selected stage below, including
+   correction and CI/review waits. Do not deploy during preparation.
+2. Fetch remote `main`, record its commit and update local `main` without
+   overwriting independent or dirty work. Integrate that commit into
+   `release/local`: already included means no change; behind-only means
+   fast-forward; divergent histories require a merge. Do not rebase or create
+   ceremonial merge commits. Select affected units against their final baselines,
+   choose new final versions only for changed units and prepare versions/pins/locks
+   before B. Run applicable local source/preparation checks and correct failures.
+3. Push exact candidate B to remote `release/local` and create/update its PR into
+   `main`. Corrections update the same open PR. CI builds selected final artifacts
+   and runs their required final qualification in its normal checkout, recording
+   exact input/tool/platform identities, check outcomes and the tested main base.
+   Unchanged final units do no build/test work. Candidate execution has no receipt,
+   branch-write or publication credentials.
+4. A separate trusted CI job consumes the exact successful run's results and
+   constructs build receipts through the shared producer. Create receipt-only
+   commit C with parent exactly B and only declared result paths. Atomically append
+   C to remote `release/local` **only if its tip is still B**. A read followed by
+   an unconditional push is insufficient. Reject stale writes without overwriting
+   newer work or claiming completion; preserve applicable successful results.
+   If the push outcome is uncertain, inspect that exact remote effect before
+   attempting missing work. Bind all target artifact receipts to C and their
+   committed byte hashes, retain the complete asset set under exact CI artifact
+   identities, then create the immutable unit/version tag. No local receipt
+   serialization, commit or return trip to GitHub is required.
+5. Report the original successful acceptance against exact C for its required
+   checks. Do not rebuild, retest, validate the newly written receipt separately
+   or create another receipt commit. The reporting route trusts the producer's
+   selected run and constructed commit, not an arbitrary receipt-looking diff.
+   Local Ship fetches C **and explicitly fast-forwards** local `release/local`
+   and its checkout; fetch alone does not move the local branch. Unexpected local
+   divergence stops for diagnosis rather than a reset. CI/review corrections
+   return to preparation under the same held lock.
+6. Before final merge, fetch remote `main` again and compare it with the main
+   commit used for qualification. If different, apply the same already-included,
+   fast-forward or divergent-merge decision, then recompute changed inputs.
+   Fast-forward can change code; a merge can leave relevant inputs unchanged.
+   Reuse applicable acceptance or return to preparation/CI for affected work.
+   Merge only the exact approved PR head with required checks, reviews and
+   GitHub's strict up-to-date gate, without admin/bypass. If main advances after
+   the fetch and GitHub refuses, return to this refresh/integration decision.
+7. Accept GitHub's final PR merge commit, preserving B/C and their accepted
+   history. Record its head/base/parents/result and synchronize local main/release,
+   preferring fast-forward. A different commit ID alone causes no rebuild. If
+   the captured synchronized target includes newer relevant fixes, select and
+   qualify that successor through the normal version/PR flow before publication;
+   never silently fall back to an older candidate after failure. Later remote
+   movement belongs to another selection, not an endless latest-tip loop.
+8. After merge, a trusted GitHub Actions job publishes the selected accepted bytes
+   to the configured registry or GitHub Release when publication was selected.
+   Resolve exact unit/version tags, C, run/artifact IDs and receipt hashes; never
+   rebuild or move the version tag to the merge commit. For immutable GitHub
+   Releases, create a draft, attach the full matching asset set, then publish.
+   Recovery may complete an unpublished draft or consume an already published
+   exact set; it cannot overwrite conflicts or published assets. If no publication
+   is configured, explicitly skip it and select the accepted Actions artifacts
+   after merge. Failed configured publication cannot switch to that fallback.
+9. Local Ship downloads the selected published assets or CI artifacts directly
+   to their final owned cache paths, or uses an exact trusted cached copy. Install
+   through the same receipt consumer, with no source build or repeated acceptance
+   tests. Take the destination lock inside the still-held release lock; release
+   it after activation and owned installer cleanup. Once every selected stage
+   succeeds, record the successful effects, remove this operation's checkpoints
+   and sweep the same producer's confirmed abandoned checkpoints. Then release
+   the outer release lock. Cleanup-only recovery repeats no successful effects.
+
+If no artifacts need production, reuse selected existing final receipts and report
+applicable checks; create no empty receipt commit or new version tag. Explicitly
+unrequested publication or installation is skipped, not inferred from configuration.
+Empty change-scoped delivery does not suppress a separately requested existing
+version's installation.
+
+The receipt-writing job uses a protected trusted workflow/helper revision in a
+fresh job. It must not execute candidate code, candidate actions or executable
+artifacts with write credentials. Use narrowly scoped GitHub App permissions for
+the guarded receipt append and a deliberate trusted required-check reporting/trigger
+route. Ordinary `GITHUB_TOKEN` pushes do not trigger push workflows automatically.
+Every required context must report on C through its configured trusted owner,
+without a receipt loop or main-branch protection bypass. Incompatible release-branch
+write rules or final PR merge settings block activation until explicitly resolved.
+See [GitHub workflow security](https://docs.github.com/en/actions/reference/security/secure-use)
+and [token behavior](https://docs.github.com/en/actions/concepts/security/github_token).
+
+The local lock protects cooperating local writers, not remote main. A fetch is
+only a snapshot, and a PR-head guard does not pin its base. The final merge must
+enforce [GitHub branch protection](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches).
+Use [Git fast-forward behavior](https://git-scm.com/docs/git-merge#Documentation/git-merge.txt---ff)
+locally; allow GitHub's protected merge commit rather than introducing a separate
+direct-to-main fast-forward route, squash or rebase.
+
+`skills/ceratops-repo-lifecycle/scripts/action.yml` stays a thin composite wrapper:
+ordinary jobs call repository checks; release jobs use the same operation owner's
+build/test/result interface. Step 10 updates that wrapper, its workflow callers,
+`validate.yml.tmpl` and compatibility generation together. It owns no PR management,
+publication or local installation. Preserve applicable Ubuntu repository checks
+while the release-build jobs produce the declared targets.
+
+GitHub Actions artifacts have finite retention, not a permanent-release lifetime.
+Record repository, exact run/artifact IDs, unit/version/target, receipt hashes
+and expiry. Bound retained versions by unit/target/level, protecting active selections
+within service limits. Expired/missing artifacts without an exact trusted cached
+copy make delivery unavailable; never choose another run, wildcard/latest file or
+silent rebuild. Availability loss does not revoke recorded acceptance. Published
+assets instead follow the selected registry or
+[immutable GitHub Release lifecycle](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases).
+
+Local installation failure stops automatic execution and reports the concrete
+error alongside the completed delivery stage, for example: "1.4.0 published
+successfully; local installation failed." For CI-only delivery, report accepted
+CI artifacts rather than claiming publication. Preserve the previous active
+installation, stop writers, release locks cleanly and diagnose; uncertain shutdown
+retains unfinished-run handling. Save only essential resume inputs, not a failed
+high-level receipt.
+
+- A local-environment fault keeps the release. After fixing its cause, explicitly
+  resume installation from the same accepted files; do not retry automatically.
+- An artifact defect requires a new version. An ordinary backward-compatible
+  bug fix uses a patch version, such as `1.4.0` to `1.4.1`.
+- If a published version is unusable, obtain exact confirmation before the
+  publishing owner withdraws/removes it and issues a new version. Do not overwrite
+  immutable assets or reuse the old version/tag. Preserve accurate publication
+  history and stop selecting known withdrawn versions. A local installation
+  failure alone is not a reason to remove a release.
 
 ### Integrity-only consumption and recovery
 
@@ -846,6 +1105,38 @@ runtime test exercises the mapped helper in an isolated interpreter without a
 source-checkout import. These checks establish this boundary, not public Build
 or whole-system recovery.
 
+### Planned completion and abandoned-work cleanup
+
+Step 7 extends the implemented checkpoint helper and connects the existing domain
+owners. After successful top-level completion, remove the operation's checkpoints
+and sweep only the same producer's confirmed abandoned unfinished requests. In
+addition to removed worktrees, explicit cancellation/supersession with stopped
+writers can establish abandonment in an existing worktree. Failure, age or a free
+release lock cannot: retain live and diagnosis-paused requests. Try each producer
+lock once; a busy owner is untouched until a later successful cleanup. No scheduled
+cleaner, failure-triggered sweep or sweep at every command is introduced.
+
+Before controlled worktree removal, the caller finishes/cancels its commands and
+establishes ownership, unchanged expected refs and absence of later/dirty work.
+Use the release lock so removal cannot take a running promotion/Ship's source or
+release checkout. This does not prove unrelated standalone task commands stopped.
+After actual removal, call the existing cross-owner checkpoint cleanup interface;
+preserve busy owners. External removal is handled by the next successful same-owner
+sweep. Never delete a lock file or clear an unfinished flag to force cleanup.
+
+Checkpoint deletion does not own artifact reservations, partial artifacts or
+installation generations. Their producers read existing ownership metadata and
+clean their abandoned output separately, preserving unresolved writers, completed
+artifacts, active installations and retained predecessors. A completed tag/receipt
+with stale reservation bookkeeping needs cleanup only, not another build/test.
+Installer cleanup uses its destination lock; standalone artifact writers still
+need their own recovery evidence or explicit confirmation that commands stopped.
+
+Successful Ship performs its completion and same-owner abandoned-checkpoint sweep
+after releasing any destination lock but before releasing its outer release lock.
+Cleanup failure retains only the information needed to finish cleanup; retry
+does not repeat successful tests, builds, merges, publication or installation.
+
 ### Output ownership and lifetime
 
 The artifact reservation and direct final paths below are implemented internally.
@@ -903,6 +1194,9 @@ come from the selected repository's YAML; the promotion helper must not
 hardcode dependencies on the skill-lifecycle implementation. Skill-driven
 execution resolves the named installed skill/action and waits for each command
 to finish successfully before dependent mutations.
+The current public promotion still requires its configured remote and fetches it;
+2A.1a's remote-free lock-path discovery does not remove that caller dependency.
+Remote-independent local promotion is a separate planned change in 2B/8.
 
 Automatic rebasing considers the task-only commit range. Inherited
 `origin/main` tracking is not proof that the task branch is published, and
@@ -1021,6 +1315,15 @@ implementation and behavior tests. The internal receipt binding and effect-deriv
 recovery described
 above are implemented. This is not a system-wide audit. The proposed health-audit
 rename remains unresolved.
+
+The qualification-level matrix, affected-unit/full-final-suite policy, success-only
+outcome changes, full-Ship lock lifetime, trusted CI receipt append and publication,
+protected merge refresh, CI-only delivery and installation-failure handling remain
+planned. Their stated guarantees require the focused integration/race/failure
+tests in steps 2A.1b–2A.4 and 6–12, including actual GitHub permission and required
+check behavior before activation. Documentation alignment is not evidence those
+runtime paths exist. The implemented 2A.1a helper passed its Windows checks;
+Linux execution remains unverified.
 
 This draft has no individually assigned design owner. A later full design
 would need an owner and implementation review. Changes to the recorded contract

@@ -198,9 +198,10 @@ scope before mutation and owns exact-match validation, diff generation,
 application, repository-declared Markdown lint, exact helper tests when
 required, targeted installation, staging, commit, and compensation.
 
-Promotion validates the assembled local `release/local` commit. A repository
-with `refs/heads/release` is incompatible until that namespace is repaired; the
-helper never substitutes another promotion branch.
+Current promotion validates the assembled local `release/local` commit. It still
+requires the configured remote; remote-independent local promotion is planned,
+not implemented. A repository with `refs/heads/release` is incompatible until
+that namespace is repaired; the helper never substitutes another promotion branch.
 `promote-and-deploy` additionally runs explicitly selected `deploy-local`
 entries after that single validation and test pass. Shipping uses the same
 selected promotion branch. It requires both results before remote changes and
@@ -208,6 +209,8 @@ repeats both on the synchronized commit before pending publication or
 deployment. Successful earlier checks do not suppress a later lifecycle
 boundary. The agent repairs ordinary failures in the selected task worktree,
 commits and retries; a failed check never permits later mutation.
+The planned replacement preserves accepted results instead of repeating checks
+at each boundary; see [refactor status](#working-folder-lifecycle-refactor-status).
 
 Operations are identified by their YAML location, such as
 `repository.actions.validate` or
@@ -289,7 +292,7 @@ acceptance identity, the repository-relative committed-receipt location and
 exact byte hash, and store-relative artifact locations; it does not duplicate
 the authoritative check inventory.
 
-Committed receipts use `.build/<unit>/<version>/receipt.json`, adding
+New committed receipts use `.build/<unit>/<version>/build_receipt.json`, adding
 `<target>` below the version for separately qualified targets. Artifact
 receipts live beside retained output under
 `<shared-git-directory>/ceratops/artifacts/<unit>/<version>/artifact-receipt.json`,
@@ -478,9 +481,12 @@ The helper neither launches nor discovers processes. It creates no temporary
 flag file, operation record, PID registry, background service or OS process group.
 Keep this one fixed-size lock file outside checkpoint cleanup.
 
-Public promotion does **not** use this helper yet. Step 2A.1b connects all
-release writers and retains the lock for the entire promotion, including tests
-and correction waits in its source worktree. No general task-worktree lock is
+Public promotion and Ship do **not** use this helper yet. Step 2A.1b connects all
+local release writers. Promotion keeps the lock through tests, correction waits
+and release integration. Ship keeps it from before its first fetch through
+CI/review waits, receipt synchronization, PR merge, selected publication, local
+installation and completion cleanup. A second promotion or Ship fails immediately
+without starting candidate work. No general task-worktree lock is
 planned. Existing producer checkpoint locks remain unchanged; step 6 later
 adds a separate lock for each installation destination. Optional automatic
 child-process recovery is deferred to 2A.1c, not required for normal operation.
@@ -500,10 +506,11 @@ serialize commands.
 | 1e.2 skill-change generations | Implemented immutable approvals, states and check results, five descriptive commands, interrupted-write recovery and completion cleanup; new committed receipts use `build_receipt.json` | Release-writer integration remains 2A.1b; historical committed receipts retain their recorded names |
 | 1e.3 test-result contract | Implemented generated-runner result contract and compatibility probe | 2A.2 connects repository-wide result ownership, retention and affected-check orchestration |
 | Completed-build consumption | Implemented internal v2 reader; recorded acceptance and exact stored paths survive current test/input changes | Connect public receipt-based Deploy in later steps |
-| 2A.1a release-lock helper | Implemented internally: canonical release lock, immediate busy refusal, nested ownership and durable unfinished-run flag | 2A.1b connects complete promotion and other release writers; no general task-worktree lock |
-| Working-folder attempts | Planned | Connect affected-check reuse and working-folder orchestration in 2A.2/2A.3 |
-| Merge-back and beta qualification | Planned | Activate promotion through the shared Build operation with actual beta versions |
-| Public Build, receipt Deploy and GitHub release integration | Planned | Connect producers/consumers before repository adoption |
+| 2A.1a release-lock helper | Implemented internally in `fb6863c`: canonical release lock, immediate busy refusal, nested ownership and durable unfinished-run flag; Windows checks passed, Linux execution unverified | 2A.1b connects complete promotion/Ship and all local release writers; no general task-worktree lock |
+| Working-folder attempts and result reuse | Planned | 2A.2/2A.3 connect qualification-level baselines, successful-result reuse, success-only receipts and receipt commits; 2A.4 selects affected units |
+| Merge-back and beta qualification | Planned | 2B/8 remove the remote prerequisite for local promotion and activate merge-back, incremental qualification and guarded fast-forward |
+| Public Build and receipt Deploy | Planned | Connect producers/consumers before repository adoption; installation does not rebuild or repeat acceptance tests |
+| CI receipts and GitHub delivery | Planned | 9–12 connect CI-owned builds/receipts/checks/publication, protected PR merge, exact published-or-CI artifact installation and completion cleanup |
 
 The completed-build readers remain internal capabilities; they do not activate
 public Build or receipt-based Deploy. Each subsequent implementation step must
@@ -511,6 +518,49 @@ update this table, actual command guidance and affected output-lifecycle rows in
 the same working revision. Unused internal additions stay labeled
 internal/planned until their consumers are connected. Existing supported
 commands remain usable.
+
+The approved changes below are **planned**, not new behavior of today's commands:
+
+- Promotion reuses applicable passes from the same or a higher qualification
+  level: alpha can reuse alpha/beta/rc/final; beta can reuse beta/rc/final; rc can
+  reuse rc/final; final can reuse only final. Receipts, exact inputs and compatible
+  execution context are required; a tag alone proves no test ran.
+- Ship compares each release unit with its last published final version, or its
+  last accepted final CI version when publication is not configured. A changed
+  unit initially runs its full final suite; corrections retain applicable passes.
+  Unchanged final units retain their versions and do no build/test work. The
+  existing input/dependency graph selects changed units, affected consumers and
+  checks without rebuilding unchanged upstream prerequisites.
+- High-level receipts record successful effects only. Specific failed tests,
+  cause diagnostics and essential unfinished-request information remain useful;
+  there is no aggregate failed-candidate receipt or second validation of a newly
+  constructed successful receipt.
+- CI builds/tests the exact candidate, then a separate trusted job appends the
+  receipt-only commit to remote `release/local` only if its tip is still that
+  candidate. Required checks report the existing acceptance on the new commit
+  without rebuilding, retesting or creating a receipt loop. Local Ship fetches
+  **and fast-forwards** its release branch; it does not carry receipts to GitHub.
+- Ship refreshes remote `main` before merge, prefers local fast-forward and
+  merges only divergent histories. GitHub's final PR merge commit is allowed;
+  required checks, reviews and the up-to-date requirement cannot be bypassed.
+- After merge, trusted GitHub Actions publishes the accepted bytes when selected.
+  With no publication configured, installation uses the exact accepted Actions
+  artifacts instead. A failed configured publication cannot choose that fallback.
+  Expired artifacts without an exact trusted cached copy are unavailable, not
+  permission to rebuild an accepted version.
+- Local installation failure stops for diagnosis, with no automatic retry.
+  Report publication/CI success separately; a local fix permits explicit resume
+  from the same files. An artifact fix requires a new version; ordinary compatible
+  bug fixes use a patch version. Successful completion removes its checkpoints
+  and the same producer's confirmed abandoned checkpoints, not other live work.
+
+See [test reuse and affected checks](docs/design-draft.md#acceptance-reuse-and-affected-checks),
+[the complete Ship sequence](docs/design-draft.md#ship-ci-receipts-and-local-installation)
+and [completion cleanup](docs/design-draft.md#planned-completion-and-abandoned-work-cleanup).
+The existing `skills/ceratops-repo-lifecycle/scripts/action.yml` remains a thin
+repository-check wrapper. Step 10 updates it, its workflow callers and the
+compatibility template together; PR management, publication and local installation
+do not belong inside that composite action.
 
 ### Generated-output lifecycle
 
@@ -562,9 +612,10 @@ selected repository.
 The manager reads the MCP server name and version from that checkout's `pyproject.toml`.
 There is no separate command named "SDLC install."
 
-`ship` derives its optional pending-work scope from the staged branch. When
-present, the same generic scope is checked before the first remote
-push, after synchronization before release publication and local deployment,
+The current `ship` implementation derives its optional pending-work scope from
+the staged branch. When present, the same generic scope is checked before the
+first remote push, after synchronization before release publication and local
+deployment,
 and again before cleanup because local state can change while CI or operations
 run. Pre-push detection returns compact `pending_work` output with
 `remote_mutation: false`; later detection reports `remote_mutation: true`
