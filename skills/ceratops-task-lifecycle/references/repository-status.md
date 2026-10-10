@@ -38,11 +38,19 @@ evidence.
 
 ## Output Contract
 
-Preserve this header text and column order:
+Use these compact headers and column order:
 
-| Branch | Worktree | Is promoted? | Is shipped? | It's active thread name, if has any | If all the answers are "no" - does it have any changes worth promoting? | What does it implement, in short |
-| --- | --- | --- | --- | --- | --- | --- |
-| `<branch or ->` | `<worktree or ->` | `<Yes, No, or Unavailable>` | `<Yes, No, or Unavailable>` | `<task title, None, or Unverified>` | `<Yes/No/Unverified with reason, or ->` | `<short implementation summary>` |
+| Branch | Worktree | Dirty? | Promoted? | Shipped? | Active task | Worth promoting? | Changes |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `<branch or ->` | `<worktree or ->` | `<Yes/No/Unavailable, or ->` | `<Yes/No/Unavailable>` | `<Yes/No/Unavailable>` | `<task title or note, None, or Unverified>` | `<Yes/No/Unverified with short reason or note, or ->` | `<brief summary or note>` |
+
+Derive `Dirty?` from the snapshot's `worktree_state`: use `Yes` when
+`clean` is false, `No` when true, `Unavailable` when unreadable, and `-`
+when the branch has no worktree. Ignored files do not make a worktree dirty.
+
+Keep branch and worktree identifiers exact. Use numbered notes for longer cell
+content, preserving every required detail and uncertainty; key each note to
+the exact branch or worktree.
 
 ## Done When
 
