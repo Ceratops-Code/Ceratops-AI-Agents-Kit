@@ -12,7 +12,7 @@ dependencies = [
   "packaging==26.3",
   "pytest==9.1.1",
   "ruff==0.16.9",
-  "tzdata==2026.4",
+  "tzdata==2026.5",
   "yamllint==1.38.0"
 ]
 
