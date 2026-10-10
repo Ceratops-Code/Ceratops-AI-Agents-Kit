@@ -37,19 +37,29 @@ from ceratops_repo_compatibility_engine.sdlc_contract_validation import (
 from ceratops_repo_compatibility_engine.sdlc_contract_validation import (
     operation_category as contract_operation_category,
 )
-from github_pr_workflow.command import failure_excerpt
+from github_pr_workflow.command import failure_excerpt, run_progress_command
 from sdlc_results import StepResultError, capture_step_result
 from store_artifacts import (
-    BUILD_BUNDLE_RETENTION,
+    BUILD_BUNDLE_RETENTION as BUILD_BUNDLE_RETENTION,
+)
+from store_artifacts import (
     ArtifactVersionTransaction,
     BuildProduct,
-    CompletedBuild,
-    CompletedDependency,
     CompletedArtifactVersion,
     OperationError,
     PreparedBuildReceipt,
-    RecoveryRequired,
-    read_completed_build,
+)
+from store_artifacts import (
+    CompletedBuild as CompletedBuild,
+)
+from store_artifacts import (
+    CompletedDependency as CompletedDependency,
+)
+from store_artifacts import (
+    RecoveryRequired as RecoveryRequired,
+)
+from store_artifacts import (
+    read_completed_build as read_completed_build,
 )
 
 DEFAULT_CONTRACT = pathlib.Path("sdlc/sdlc.yml")
@@ -565,15 +575,7 @@ def execute_handoff(
                     require_clean_commit(repo_root, expected_commit)
                 except OperationError as exc:
                     return {**evidence, "status": "state_changed", "message": str(exc)}
-            result = subprocess.run(
-                argv,
-                cwd=repo_root,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                check=False,
-            )
+            result = run_progress_command(argv, cwd=repo_root)
             if result.returncode:
                 return {
                     **evidence,
@@ -968,16 +970,7 @@ def _execute_prepared_operation(prepared: PreparedOperation) -> dict[str, object
                         dict(prepared.test_context)
                     ),
                 }
-            result = subprocess.run(
-                argv,
-                cwd=step.cwd,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                check=False,
-                **process_options,
-            )
+            result = run_progress_command(argv, cwd=step.cwd, **process_options)
             code, stdout, stderr = result.returncode, result.stdout, result.stderr
         except OSError as exc:
             code, stdout, stderr = None, "", str(exc)

@@ -232,6 +232,33 @@ changed files, and the serialized response ceiling. Hook tests replay the
 recorded source-turn commands from calls 1, 3, 4, and 41 and distinguish broad
 content searches from focused searches.
 
+## Live test progress
+
+`scripts/testing/report_test_progress.py` owns the repository runner's pytest
+hooks and child transport. Explicit plugin registration reserves a stderr
+descriptor before pytest redirects test output. Collection, current-test names,
+completed counts, and the actual pytest exit code use escaped `[tests] ` lines.
+Ordinary updates are limited to one per second; a sixty-second heartbeat reports
+the current test and elapsed time during long waits. First and final status lines
+are always sent. Collection-only probes keep their existing output contract.
+
+The installed repository lifecycle's `github_pr_workflow/command.py` owns
+parent transport. Both repository commands and skill handoffs use it, and
+promotion delegates its JSON command exchange to it. Every parent drains stderr
+while its child is running and forwards only `[tests] ` lines immediately.
+stdout remains the final machine-readable result; both original streams remain
+available to existing failure diagnostics. Final JSON on stderr also remains
+readable after progress lines are excluded. A closed display does not stop pipe
+drainage or change the command result; interruption stops the owned child and
+joins its reader before propagating.
+
+These status messages are in-memory observations, with no execution identifier,
+checkpoint, file, or selection/recovery role. The tool caller can display them
+inside one active tool execution without a model turn per update. The runner's
+existing diagnostic-file retention is unchanged. This implementation covers this
+repository's pytest runner, SDLC command/handoff execution, and promotion; it does
+not instrument arbitrary downstream test frameworks.
+
 ## Pytest failure diagnostics
 
 `scripts/testing/pytest-diagnostics.py` owns the bounded failure summary used

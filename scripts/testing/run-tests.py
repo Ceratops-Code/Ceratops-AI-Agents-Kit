@@ -34,6 +34,7 @@ from runner_requests import TEST_CONTEXT_ENV, parse_request, validate_execution_
 
 pytest_diagnostics = importlib.import_module("pytest-diagnostics")
 pytest_environment = importlib.import_module("pytest-environment")
+pytest_progress = importlib.import_module("report_test_progress")
 
 SCHEMA = "ceratops-ai-agents-kit-test-impact-result.v1"
 COLLECTION_SCHEMA = "ceratops-ai-agents-kit-pytest-collection.v1"
@@ -180,10 +181,16 @@ def run_text(
                 # A test subprocess must not pass this invocation's promotion
                 # identity to runner calls made by fixtures or nested repos.
                 environ.pop(TEST_CONTEXT_ENV, None)
-            result = subprocess.run(
-                list(command), cwd=cwd, env=environ, capture_output=True,
-                text=True, encoding="utf-8", errors="replace", check=False,
-            )
+            if is_pytest and not any(
+                option in command for option in ("--collect-only", "--co")
+            ):
+                assert environ is not None
+                result = pytest_progress.run_pytest(command, cwd, environ)
+            else:
+                result = subprocess.run(
+                    list(command), cwd=cwd, env=environ, capture_output=True,
+                    text=True, encoding="utf-8", errors="replace", check=False,
+                )
     except (OSError, pytest_environment.PytestEnvironmentError) as exc:
         if not is_pytest:
             raise
