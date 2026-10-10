@@ -1219,6 +1219,11 @@ Success removes the exact record and sibling, then the empty record directory;
 no completed history is retained. Directory identity prevents recovery from
 deleting a replacement path. This cleanup leaves remote refs, accepted artifacts
 and installations to their existing owners.
+After removing a worktree, the helper clears its exact name and captured thread
+UUID groups under `<repo-parent>/tmp/<repo-name>`, using the existing scoped
+temp owner. Redirected roots and matching links stop removal. A temp-removal
+failure retains the same unfinished record, so recovery can finish scratch
+cleanup after the worktree is gone without touching other tasks' data.
 Exact matching promotion sources enter `deleting` before Git removal and are
 retired through the existing scope owner after ref deletion. Other entries remain
 untouched. This handoff lets preflight consume a completed interrupted deletion
