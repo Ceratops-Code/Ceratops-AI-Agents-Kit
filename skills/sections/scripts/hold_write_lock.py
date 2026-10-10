@@ -1,6 +1,6 @@
 """Hold a native write lock and remember an operation that did not finish cleanly.
 
-This internal helper does not run commands or yet protect public promotion.
+This internal helper does not run commands. Release-writing workflows use it.
 Callers own command lifetimes and explicit recovery confirmation. The lock file
 is permanent infrastructure: its first byte is the fixed-size ``unfinished_run``
 Boolean (ASCII 0/1), not a checkpoint, lease, PID record or acceptance result.

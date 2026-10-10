@@ -415,7 +415,7 @@ def test_integrated_ship_delegates_admin_semantics_to_merge_owner(
         }
 
     monkeypatch.setattr(ship.merge, "merge_verified_pr", delegated)
-    result = ship.ship(
+    result = ship._ship(
         argparse.Namespace(
             repo_root=repo,
             repo="example/repository",
@@ -967,7 +967,7 @@ def test_ship_stops_before_remote_mutation_on_confirmed_actions_outage(
         lambda *args, **kwargs: pytest.fail("outage must stop before PR mutation"),
     )
     with pytest.raises(ship.ShipBlocked) as blocked:
-        ship.ship(
+        ship._ship(
             argparse.Namespace(
                 repo_root=repo,
                 repo="example/repository",
@@ -1059,7 +1059,7 @@ def test_ship_reconciles_merged_pr_before_actions_outage(
     monkeypatch.setattr(ship.sync, "sync_main", synchronize)
     monkeypatch.setattr(ship, "_remove_completed_pr_checkpoints", lambda *args: [])
 
-    result = ship.ship(
+    result = ship._ship(
         argparse.Namespace(
             repo_root=repo,
             repo="example/repository",

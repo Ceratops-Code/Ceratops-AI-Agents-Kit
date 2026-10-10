@@ -21,6 +21,11 @@ from ceratops_repo_compatibility_engine.sdlc_contract_validation import (
     operation_entries,
 )
 from github_pr_workflow import ship as github_ship
+from github_pr_workflow.command import (
+    CommandError,
+    release_write_context,
+    run_lifecycle_main,
+)
 from repository_operation import (
     FAILED_STATUSES,
     OperationError,
@@ -136,6 +141,9 @@ def _run_json(
     command: list[str], *, cwd: pathlib.Path
 ) -> tuple[int, dict[str, Any]]:
     """Run a lifecycle child and retain bounded diagnostics for invalid output."""
+
+    if command[1:3] == [str(PR_WORKFLOW_ENTRYPOINT), "ship"]:
+        return run_lifecycle_main(github_ship.main, command[3:], cwd=cwd)
 
     result = subprocess.run(
         command,
@@ -589,7 +597,7 @@ def _ship_command(
 ) -> list[str]:
     command = [
         sys.executable,
-        # The child runs from repo_root, where this module is not importable by name.
+        # Preserve the CLI argv contract; _run_json dispatches Ship in-process.
         str(PR_WORKFLOW_ENTRYPOINT),
         "ship",
         "--repo-root",
@@ -1078,8 +1086,7 @@ def _synchronized_post_merge_resume(
 
 
 def ship_repository(args: argparse.Namespace) -> dict[str, object]:
-    """Run complete shipping, release publication, deployment, and cleanup."""
-
+    """Hold the release lock through this complete synchronous Ship invocation."""
     repo_root = args.repo_root.expanduser().resolve(strict=True)
     if args.head_branch != RELEASE_BRANCH:
         raise RepositoryShipError(f"Head branch must be {RELEASE_BRANCH}.")
@@ -1090,6 +1097,20 @@ def ship_repository(args: argparse.Namespace) -> dict[str, object]:
             "Run ship-repository.py from the target repository directory "
             f"{repo_root} so deployment can replace the installed skill."
         )
+    with release_write_context(
+        args.repo_root,
+        confirm_stopped=getattr(args, "confirm_previous_commands_stopped", False),
+    ) as owned:
+        result = _ship_repository(args)
+        if owned.outermost and result.get("status") in {"shipped", "already_shipped"}:
+            owned.complete(commands_stopped=True)
+        return result
+
+
+def _ship_repository(args: argparse.Namespace) -> dict[str, object]:
+    """Run complete shipping, release publication, deployment, and cleanup."""
+
+    repo_root = args.repo_root.expanduser().resolve(strict=True)
     if _local_branch_exists(repo_root, "release"):
         raise RepositoryShipError(
             "refs/heads/release blocks the required release/local branch namespace."
@@ -1428,6 +1449,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--review-wait-seconds", type=int, default=260)
     parser.add_argument("--review-replies-request", type=pathlib.Path)
     parser.add_argument("--interval-seconds", type=int, default=10)
+    parser.add_argument("--confirm-previous-commands-stopped", action="store_true",
+                        help="Recover an unfinished release run after confirming its commands stopped.")
     return parser
 
 
@@ -1443,7 +1466,7 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
-    except (OperationError, OSError, ValueError) as exc:
+    except (CommandError, OperationError, OSError, ValueError) as exc:
         print(
             json.dumps(
                 {"status": "error", "message": str(exc)},

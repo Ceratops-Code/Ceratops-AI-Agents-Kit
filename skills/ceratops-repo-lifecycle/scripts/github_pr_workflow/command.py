@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import importlib
+import io
 import json
 import pathlib
 import re
 import subprocess
+import sys
+from contextlib import chdir, contextmanager, redirect_stderr, redirect_stdout
+from functools import cache
 from typing import Any
 
 from github_contract_engine.github_api import github_read_command, run_github_command
@@ -41,6 +46,71 @@ class CommandError(RuntimeError):
     ) -> None:
         super().__init__(message)
         self.completed = completed
+
+
+@cache
+def release_lock_module() -> Any:
+    """Load the installed sibling, or the declared shared source in development."""
+    skill = pathlib.Path(__file__).resolve().parents[2]
+    if not (skill / ".runtime-manifest.json").is_file():
+        source = str(skill.parent / "sections" / "scripts")
+        if source not in sys.path:
+            sys.path.insert(0, source)
+    return importlib.import_module("hold_write_lock")
+
+
+@contextmanager
+def release_write_context(repo_root, *, required=True, confirm_stopped=False, affected_worktrees=()):
+    """Let the workflow own release exclusion; never pass ownership to a child.
+
+    The outermost workflow must explicitly report completion. Failed calls keep
+    the saved unfinished flag. Protect the primary checkout even on main: a
+    promotion can switch it to release/local while another workflow is running.
+    Operations confined to other non-release worktrees need no lock.
+    """
+    locks = release_lock_module()
+    try:
+        lock_path = locks.release_lock_path(repo_root)
+        primary = lock_path.parents[3]  # <primary>/.git/ceratops/locks/release-local
+        if not required and all(
+            pathlib.Path(path).resolve() != primary
+            for path in (repo_root, *affected_worktrees) if path is not None
+        ):
+            yield None
+            return
+        with locks.hold_write_lock(
+            lock_path,
+            confirm_previous_commands_stopped=confirm_stopped,
+        ) as owned:
+            yield owned
+    except locks.WriteLockError as exc:
+        error = CommandError(str(exc))
+        error.release_not_started = isinstance(
+            exc, (locks.WriteLockBusy, locks.WriteLockRecoveryRequired),
+        )
+        if isinstance(exc, locks.WriteLockBusy):
+            error.args = ("Another promotion or Ship owns release/local; lock is busy; operation did not start.",)
+        raise error from exc
+
+
+def run_lifecycle_main(main, arguments, *, cwd):
+    """Call a nested CLI in this controller, keeping its JSON/exit-code contract.
+
+    Only synchronous lifecycle handoffs use this adapter. They finish before
+    restoring cwd/output; it must not be used concurrently from worker threads.
+    The nested workflow shares the same native-lock context, not a bypass token.
+    """
+    stdout, stderr = io.StringIO(), io.StringIO()
+    with chdir(cwd), redirect_stdout(stdout), redirect_stderr(stderr):
+        code = main(arguments)
+    raw = stdout.getvalue().strip() or stderr.getvalue().strip()
+    try:
+        result = json.loads(raw)
+    except ValueError as exc:
+        raise CommandError("Nested lifecycle command returned invalid JSON.") from exc
+    if not isinstance(result, dict):
+        raise CommandError("Nested lifecycle command returned a non-object result.")
+    return code, result
 
 
 def clean_log(value: str) -> str:

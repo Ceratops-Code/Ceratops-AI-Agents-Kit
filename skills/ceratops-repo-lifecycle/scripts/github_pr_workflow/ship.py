@@ -19,11 +19,19 @@ import sys
 import time
 from typing import Any, Mapping
 
+import git_branch_operations as git_branches
+from git_branch_operations import ShipError
 from github_contract_engine.github_api import run_gh_api, run_json_command
 from github_contract_engine.levels import ERROR, WARN
 
 from . import actions_availability, codex_review, ensure_pr, merge, readiness, sync
-from .command import CommandError, require_output, require_success, run_command
+from .command import (
+    CommandError,
+    release_write_context,
+    require_output,
+    require_success,
+    run_command,
+)
 
 PHASES = ("prepared", "pr_ready", "gates_passed", "merged", "synchronized")
 FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -31,10 +39,6 @@ SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 PENDING_WORK_SCOPE_VERSION = 2
 PENDING_SOURCE_STATES = {"retained", "preserved", "deleting"}
 CHECK_UNCERTAINTY_GRACE_SECONDS = 60
-
-
-class ShipError(RuntimeError):
-    """Raised when an exact-state shipping invariant is not satisfied."""
 
 
 class ShipBlocked(ShipError):
@@ -201,26 +205,6 @@ def _remove_completed_pr_checkpoints(
     return removed
 
 
-def _local_branch_head(repo_root: pathlib.Path, branch: str) -> str | None:
-    """Return one local branch head, or ``None`` when the ref is absent."""
-
-    result = run_command(
-        _git(
-            repo_root,
-            "rev-parse",
-            "--verify",
-            f"refs/heads/{branch}^{{commit}}",
-        ),
-        cwd=repo_root,
-    )
-    if result.returncode:
-        return None
-    lines = result.stdout.strip().splitlines()
-    if len(lines) != 1 or not FULL_SHA_RE.fullmatch(lines[0]):
-        raise ShipError(f"Local branch {branch!r} resolved to an invalid commit.")
-    return lines[0]
-
-
 def _fresh_remote_base_head(
     repo_root: pathlib.Path,
     remote_name: str,
@@ -285,7 +269,7 @@ def _remove_obsolete_prepared_checkpoints(
 ) -> set[pathlib.Path]:
     """Delete only prepared checkpoints proven obsolete by Git and GitHub."""
 
-    local_head = _local_branch_head(repo_root, head_branch)
+    local_head = git_branches._local_branch_head(repo_root, head_branch)
     if local_head is None:
         return set()
     eligible: list[tuple[pathlib.Path, dict[str, Any]]] = []
@@ -1718,6 +1702,18 @@ def _address_review_replies(
 
 
 def ship(args: argparse.Namespace) -> dict[str, Any]:
+    """Keep release ownership across the existing GitHub gates and local sync."""
+    with release_write_context(
+        args.repo_root, required=args.head_branch == "release/local",
+        confirm_stopped=getattr(args, "confirm_previous_commands_stopped", False),
+    ) as owned:
+        result = _ship(args)
+        if owned is not None and owned.outermost and result.get("status") in {"shipped", "already_shipped"}:
+            owned.complete(commands_stopped=True)
+        return result
+
+
+def _ship(args: argparse.Namespace) -> dict[str, Any]:
     """Advance one exact commit through PR publication, gates, merge, and sync."""
 
     repo_root = args.repo_root.expanduser().resolve(strict=True)
@@ -1955,6 +1951,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--head-branch", required=True)
     parser.add_argument("--base-branch", default="main")
     parser.add_argument("--remote-name", default="origin")
+    parser.add_argument("--confirm-previous-commands-stopped", action="store_true",
+                        help="Recover an unfinished release run after confirming its commands stopped.")
     parser.add_argument("--commit", help="full head SHA for exact checkpoint resume")
     parser.add_argument("--title")
     parser.add_argument("--body")

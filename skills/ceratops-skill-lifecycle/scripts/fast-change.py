@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import importlib
 import json
 import os
 import pathlib
@@ -21,6 +22,7 @@ import re
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 REQUEST_VERSION = 2
@@ -757,7 +759,35 @@ def _reverse_patch(spec: ChangeSpec, *, staged: bool) -> None:
     )
 
 
+@contextmanager
+def _release_write_context(repo_root, *, confirm_stopped=False):
+    """Use the mapped shared lock, never reach into another installed skill."""
+    skill = pathlib.Path(__file__).resolve().parent.parent
+    if not (skill / ".runtime-manifest.json").is_file():
+        source = str(skill.parent / "sections" / "scripts")
+        if source not in sys.path:
+            sys.path.insert(0, source)
+    locks = importlib.import_module("hold_write_lock")
+    try:
+        with locks.hold_write_lock(
+            locks.release_lock_path(repo_root),
+            confirm_previous_commands_stopped=confirm_stopped,
+        ) as owned:
+            yield owned
+    except locks.WriteLockError as exc:
+        raise FastChangeError(str(exc)) from exc
+
+
 def execute(spec: ChangeSpec) -> dict[str, object]:
+    """Protect direct callers as well as the full command's nested invocation."""
+    with _release_write_context(spec.repo_root) as owned:
+        result = _execute(spec)
+        if owned.outermost:
+            owned.complete(commands_stopped=True)
+        return result
+
+
+def _execute(spec: ChangeSpec) -> dict[str, object]:
     """Apply, test, install, stage, and commit one classified change."""
 
     patch_applied = False
@@ -895,6 +925,8 @@ def build_parser() -> argparse.ArgumentParser:
         description="Apply one classified direct-release skill change."
     )
     parser.add_argument("--request", required=True, type=pathlib.Path)
+    parser.add_argument("--confirm-previous-commands-stopped", action="store_true",
+                        help="Recover an unfinished release run after confirming its commands stopped.")
     return parser
 
 
@@ -941,28 +973,48 @@ def _preserved_request_context(path: pathlib.Path) -> dict[str, object]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Classify before mutation, then run the complete fast-change workflow."""
-
+    """Lock before reading the release baseline; retain ownership through cleanup."""
     args = build_parser().parse_args(argv)
     request_path = pathlib.Path(os.path.abspath(args.request.expanduser()))
     try:
+        request = _request(request_path)
+        repo_value = request.get("repo_root")
+        if not isinstance(repo_value, str) or not repo_value:
+            raise DecisionRequired("repo_root must name the target repository")
+        repo_root = pathlib.Path(repo_value).expanduser().resolve(strict=True)
+        _request_scope(request_path, repo_root)
+        with _release_write_context(
+            repo_root, confirm_stopped=args.confirm_previous_commands_stopped,
+        ) as owned:
+            code, result = _run_request(request_path, repo_root)
+            if code == 0 or code == 2:
+                owned.complete(commands_stopped=True)
+    except DecisionRequired as exc:
+        code, result = 2, _rejected_request(request_path, exc)
+    except (FastChangeError, OSError, ValueError) as exc:
+        code, result = 1, {"status": "error", "detail": str(exc)}
+    print(json.dumps(result, separators=(",", ":")),
+          file=sys.stderr if code else sys.stdout)
+    return code
+
+
+def _rejected_request(path: pathlib.Path, error: Exception) -> dict[str, object]:
+    """Keep the existing decision-required routing fields on preflight refusal."""
+    return {
+        "status": "decision_required", "reason": str(error),
+        **_preserved_request_context(path), "route": "update",
+        "change_specification": str(path),
+    }
+
+
+def _run_request(request_path: pathlib.Path, locked_repo: pathlib.Path) -> tuple[int, dict]:
+    """Return the existing command result without releasing the outer lock."""
+    try:
         spec = classify_request(request_path)
+        if spec.repo_root != locked_repo:
+            raise DecisionRequired("request changed repository after release locking")
     except (DecisionRequired, OSError, ValueError) as exc:
-        preserved = _preserved_request_context(request_path)
-        print(
-            json.dumps(
-                {
-                    "status": "decision_required",
-                    "reason": str(exc),
-                    **preserved,
-                    "route": "update",
-                    "change_specification": str(request_path),
-                },
-                separators=(",", ":"),
-            ),
-            file=sys.stderr,
-        )
-        return 2
+        return 2, _rejected_request(request_path, exc)
     try:
         result = execute(spec)
     except (FastChangeError, OSError, ValueError) as exc:
@@ -971,31 +1023,13 @@ def main(argv: list[str] | None = None) -> int:
             detail = json.loads(str(exc))
         except json.JSONDecodeError:
             pass
-        print(
-            json.dumps(
-                {"status": "error", "detail": detail},
-                separators=(",", ":"),
-            ),
-            file=sys.stderr,
-        )
-        return 1
+        return 1, {"status": "error", "detail": detail}
     try:
         cleanup = _cleanup_successful_request(spec)
     except (FastChangeError, OSError, ValueError) as exc:
-        print(
-            json.dumps(
-                {
-                    "status": "cleanup_blocked",
-                    "commit": result.get("commit"),
-                    "detail": str(exc),
-                },
-                separators=(",", ":"),
-            ),
-            file=sys.stderr,
-        )
-        return 1
-    print(json.dumps({**result, "request_cleanup": cleanup}, separators=(",", ":")))
-    return 0
+        return 1, {"status": "cleanup_blocked", "commit": result.get("commit"),
+                   "detail": str(exc)}
+    return 0, {**result, "request_cleanup": cleanup}
 
 
 if __name__ == "__main__":

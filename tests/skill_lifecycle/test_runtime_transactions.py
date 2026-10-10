@@ -116,7 +116,7 @@ def test_installed_repo_lifecycle_helpers_use_regular_runtime(
     assert run_git(repo, "init", "-b", "main").returncode == 0
     isolated = subprocess.run(
         [str(interpreter), "-I", "-c",
-         ("import pathlib,sys; sys.path.insert(0,sys.argv[1]); import store_artifacts,hold_write_lock; "
+         ("import pathlib,sys; sys.path.insert(0,sys.argv[1]); import store_artifacts,hold_write_lock,git_branch_operations; "
          "cp=store_artifacts._checkpoint_storage(); "
          "assert pathlib.Path(cp.__file__).parent==pathlib.Path(sys.argv[1]);\n"
          "with cp.open_checkpoints(pathlib.Path(sys.argv[2]),'artifact-versions') as context:\n"

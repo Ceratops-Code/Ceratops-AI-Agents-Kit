@@ -1070,14 +1070,14 @@ def test_release_preparation_failure_restores_original_checkout_and_refs(
     loaded = runpy.run_path(str(PROMOTE_REPOSITORY))
     promote = loaded["promote"]
     promotion_error = loaded["PromotionError"]
-    original_clean = promote.__globals__["_clean"]
+    original_clean = loaded["git_branches"]._clean
 
     def fail_after_preparation(repo_root: pathlib.Path, phase: str) -> None:
         if phase == "after preparing release/local":
             raise promotion_error("forced release preparation failure")
         original_clean(repo_root, phase)
 
-    promote.__globals__["_clean"] = fail_after_preparation
+    loaded["git_branches"]._clean = fail_after_preparation
     args = loaded["build_parser"]().parse_args(
         [
             "--repo-root",
@@ -1089,7 +1089,10 @@ def test_release_preparation_failure_restores_original_checkout_and_refs(
     )
 
     with pytest.raises(promotion_error, match="forced release preparation failure"):
-        promote(args)
+        try:
+            promote(args)
+        finally:
+            loaded["git_branches"]._clean = original_clean
 
     assert run_git(repo, "branch", "--show-current").stdout.strip() == "approved"
     assert run_git(repo, "rev-parse", "HEAD").stdout.strip() == approved_head
@@ -1455,6 +1458,7 @@ def test_promote_repository_rejects_noncanonical_release_branch_before_mutation(
                 "--source-branch",
                 "approved",
                 "--no-run-operation",
+                "--confirm-previous-commands-stopped",
             ],
             capture_output=True,
             text=True,
@@ -1738,6 +1742,7 @@ def test_promotion_repairs_and_revalidates_the_final_commit_before_deployment(
     assert evidence["commit"] == broken
     assert pathlib.Path(evidence["pending_work_scope"]).is_file()
     assert not deployment_log.exists()
+    command.append("--confirm-previous-commands-stopped")
 
     assert run_git(repo, "switch", "approved").returncode == 0
     (repo / "quality.txt").write_text("good", encoding="utf-8")
@@ -2025,7 +2030,7 @@ def test_automatic_rebase_refuses_uncertain_git_evidence(
             )
         return run(argv, **kwargs)
 
-    original_head = loaded["_branch_head"]
+    original_head = loaded["git_branches"]._branch_head
     failed_head_query = False
 
     def branch_head(*args: Any) -> str:
@@ -2036,12 +2041,12 @@ def test_automatic_rebase_refuses_uncertain_git_evidence(
         return original_head(*args)
 
     monkeypatch.setitem(
-        loaded["_prepare_source_for_fast_forward"].__globals__,
+        vars(loaded["git_branches"]),
         "_branch_head",
         branch_head,
     )
     monkeypatch.setitem(
-        loaded["_prepare_source_for_fast_forward"].__globals__, "run_command", probe
+        vars(loaded["git_branches"]), "run_command", probe
     )
     with pytest.raises(loaded["PromotionError"]):
         loaded["_prepare_source_for_fast_forward"](

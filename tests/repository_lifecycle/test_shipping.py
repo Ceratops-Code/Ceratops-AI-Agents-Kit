@@ -182,6 +182,7 @@ def _setup(
             "--head-branch",
             head_branch,
             "--reusable-head",
+            "--confirm-previous-commands-stopped",
             *(
                 ["--publish-operation", PUBLIC, "--deploy-operation", LOCAL]
                 if contract
@@ -255,7 +256,7 @@ def test_repository_ship_metadata_reaches_shared_pr_producer(
 
     monkeypatch.setattr(ship.ensure_pr, "ensure_pr", ensure)
     with pytest.raises(ProducerReached):
-        ship.ship(parsed)
+        ship._ship(parsed)
     assert events == ["availability", "producer"]
 
 
@@ -560,7 +561,7 @@ def test_repository_ship_blocks_selected_worktree_caller_before_remote_process(
             "pending_work_scope": str(scope),
         }
 
-    ship_repository = loaded["ship_repository"]
+    ship_repository = loaded["_ship_repository"]
     ship_repository.__globals__["_branch_worktree"] = branch_worktree
     ship_repository.__globals__["_run_json"] = run_json
     ship_repository.__globals__["_local_branch_exists"] = lambda *_args: False
@@ -1015,6 +1016,7 @@ def test_publish_pr_failure_retains_work_and_retry_does_not_duplicate(
         )
     state["fail"] = None
     args.check_command = []
+    args.confirm_previous_commands_stopped = True
     assert module.ensure_pr(args)["status"] == "pr_ready"
     assert run_git(repo, "rev-list", "--count", "main..HEAD").stdout.strip() == "1"
     assert state["creates"] == 1
@@ -1289,7 +1291,9 @@ def test_repository_ship_checks_declared_test_selection_before_remote_work(
         first = loaded["ship_repository"](args)
         assert first["status"] == "pending_work"
         assert json.loads(selection_log.read_text()) == [base, head]
-        args = loaded["build_parser"]().parse_args(first["resume_action"]["argv"][2:])
+        args = loaded["build_parser"]().parse_args([
+            *first["resume_action"]["argv"][2:], "--confirm-previous-commands-stopped",
+        ])
         assert run_git(repo, "checkout", "-b", args.base_branch).returncode == 0
         (repo / "merged.txt").write_text("merged", encoding="utf-8")
         synchronized = _commit(repo)
