@@ -237,7 +237,8 @@ content searches from focused searches.
 `scripts/testing/report_test_progress.py` owns the repository runner's pytest
 hooks and child transport. Explicit plugin registration reserves a stderr
 descriptor before pytest redirects test output. Collection, current-test names,
-completed counts, and the actual pytest exit code use escaped `[tests] ` lines.
+completed counts, and the actual pytest exit code use escaped lines prefixed
+with `[tests]` and a space.
 Ordinary updates are limited to one per second; a sixty-second heartbeat reports
 the current test and elapsed time during long waits. First and final status lines
 are always sent. Collection-only probes keep their existing output contract.
@@ -245,7 +246,7 @@ are always sent. Collection-only probes keep their existing output contract.
 The installed repository lifecycle's `github_pr_workflow/command.py` owns
 parent transport. Both repository commands and skill handoffs use it, and
 promotion delegates its JSON command exchange to it. Every parent drains stderr
-while its child is running and forwards only `[tests] ` lines immediately.
+while its child is running and forwards matching progress lines immediately.
 stdout remains the final machine-readable result; both original streams remain
 available to existing failure diagnostics. Final JSON on stderr also remains
 readable after progress lines are excluded. A closed display does not stop pipe
