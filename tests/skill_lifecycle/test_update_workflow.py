@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import runpy
+import subprocess
 import sys
 from typing import Any
 
@@ -127,6 +129,30 @@ def test_init_and_run_drive_update_without_caller_request_json(tmp_path):
     assert command_file.is_file()
 
 
+@pytest.mark.parametrize("status", ["unavailable", "pending"])
+def test_run_preserves_original_error_without_failure_status(tmp_path, monkeypatch, status):
+    workflow = _workflow(monkeypatch)
+    namespace = workflow["command_run"].__globals__
+    error = workflow["UpdateExecutionError"]
+    original = error("original check failure")
+
+    def failed_checks(_root):
+        raise original
+
+    def read_status(_root):
+        if status == "unavailable":
+            raise error("status is unavailable")
+        return json.dumps({"status": "pending"})
+
+    monkeypatch.setitem(namespace, "command_run_skill_checks", failed_checks)
+    monkeypatch.setitem(namespace, "_driver_status", read_status)
+    with pytest.raises(error, match="original check failure") as caught:
+        workflow["command_run"](tmp_path, False)
+    assert caught.value is original
+    if status == "unavailable":
+        assert caught.value.__suppress_context__
+
+
 def test_open_discovers_same_update_and_preserves_original_request(tmp_path):
     root, _, _, request, data = _case(tmp_path, dirty=True)
     _ok(root, "open_skill_change", request)
@@ -176,7 +202,7 @@ def test_expand_preserves_baseline_before_and_after_checks(tmp_path, checked):
     assert request.is_file()
 
 
-@pytest.mark.parametrize("problem", ["scope_removed", "check_changed", "duplicate_path", "untracked_ancillary"])
+@pytest.mark.parametrize("problem", ["scope_removed", "check_changed", "duplicate_path", "escaping_ancillary"])
 def test_expand_refuses_invalid_scope_without_writing_a_generation(tmp_path, problem):
     root, _, _, request, data = _case(tmp_path)
     _ok(root, "open_skill_change", request)
@@ -190,12 +216,164 @@ def test_expand_refuses_invalid_scope_without_writing_a_generation(tmp_path, pro
     elif problem == "duplicate_path":
         data["allowed_paths"] *= 2
     else:
-        (root / "undeclared.txt").write_text("x", encoding="utf-8")
-        data["allowed_paths"].append("undeclared.txt")
-        data["change_groups"][0]["paths"].append("undeclared.txt")
+        data["allowed_paths"].append("../undeclared.txt")
+        data["change_groups"][0]["paths"].append("../undeclared.txt")
     _request(request, data)
     assert _run(root, "expand_skill_scope", request).returncode == 2
     assert {p: p.read_bytes() for p in directory.rglob("*.json")} == before
+
+
+@pytest.mark.parametrize("entry", ["init", "open_skill_change", "expand_skill_scope"])
+@pytest.mark.parametrize("target_kind", ["new_test", "untracked_file", "missing_parents"])
+def test_declared_checkout_files_need_no_git_tracking(tmp_path, entry, target_kind):
+    """Declare before creation or staging, then use the ordinary check/close flow."""
+
+    root, _, _, request, data = _case(tmp_path)
+    added = {
+        "new_test": "tests/test_added.py",
+        "untracked_file": "notes.txt",
+        "missing_parents": "new-area/nested/example.txt",
+    }[target_kind]
+    target = root / added
+    if target_kind == "untracked_file":
+        target.write_text("original\n", encoding="utf-8", newline="\n")
+    if entry == "expand_skill_scope":
+        _ok(root, "open_skill_change", request)
+    data["allowed_paths"].append(added)
+    data["change_groups"][0]["paths"].append(added)
+    _request(request, data)
+    assert run_git(root, "ls-files", "--error-unmatch", "--", added).returncode != 0
+    if entry == "init":
+        initialized = run_skill_update_workflow(
+            "init", "--repo-root", str(root), "--selected-skill", "alpha-tool",
+            "--group", "change", SOURCE, added,
+        )
+        assert initialized.returncode == 0, initialized.stderr
+        assert json.loads(initialized.stdout)["status"] == "pending"
+    else:
+        _ok(root, entry, request)
+    directory = _directory(root)
+    baseline = _state(directory)[1]["baseline_targets"][added]["content"]
+    assert baseline["kind"] == ("file" if target_kind == "untracked_file" else "missing")
+    if entry != "expand_skill_scope":
+        _ok(root, "open_skill_change", request)
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("completed\n", encoding="utf-8", newline="\n")
+    _edit(root)
+    _ok(root, "run_skill_checks")
+    assert added in _result(directory)["changed_paths"]
+    passed = {path: path.read_bytes() for path in directory.rglob("*.json")}
+    _ok(root, "run_skill_checks")
+    assert {path: path.read_bytes() for path in directory.rglob("*.json")} == passed
+    assert run_git(root, "ls-files", "--error-unmatch", "--", added).returncode != 0
+    _ok(root, "close_skill_change")
+    assert not directory.exists()
+    assert target.read_text() == "completed\n"
+
+
+@pytest.mark.parametrize("path", [
+    "../outside.txt", "C:/outside.txt", "tests/../other.txt",
+    ".git", ".git/config", "nested/.GIT/HEAD", "tests", SOURCE + "/nested.py",
+])
+def test_declared_checkout_paths_reject_escapes_and_non_file_targets(tmp_path, path):
+    root, _, _, request, data = _case(tmp_path)
+    data["allowed_paths"].append(path)
+    data["change_groups"][0]["paths"].append(path)
+    _request(request, data)
+    result = _run(root, "open_skill_change", request)
+    assert result.returncode == 2, result.stderr
+    assert not list(_directory(root).rglob("*.json"))
+
+
+@pytest.mark.parametrize("phase", ["open", "run"])
+@pytest.mark.parametrize("outside", [False, True])
+@pytest.mark.parametrize("link_kind", ["symlink", "junction"])
+def test_declared_checkout_paths_reject_linked_components(tmp_path, phase, outside, link_kind):
+    root, scope, _, request, data = _case(tmp_path)
+    destination = (scope if outside else root) / "real-directory"
+    destination.mkdir()
+    sentinel = destination / "keep.txt"
+    sentinel.write_text("untouched", encoding="utf-8")
+    added = "linked/new.txt"
+    data["allowed_paths"].append(added)
+    data["change_groups"][0]["paths"].append(added)
+    _request(request, data)
+    if phase == "run":
+        _ok(root, "open_skill_change", request)
+    link = root / "linked"
+    if link_kind == "junction":
+        if os.name != "nt":
+            pytest.skip("junctions are Windows-only")
+        created = subprocess.run(
+            [os.environ.get("COMSPEC", "cmd.exe"), "/c", "mklink", "/J", str(link), str(destination)],
+            capture_output=True, text=True, check=False,
+        )
+        assert created.returncode == 0, created.stderr
+        assert link.is_junction()
+    else:
+        try:
+            link.symlink_to(destination, target_is_directory=True)
+        except OSError:
+            pytest.skip("creating symbolic links is unavailable")
+    try:
+        directory = _directory(root) if phase == "run" else None
+        before = {path: path.read_bytes() for path in directory.rglob("*.json")} if directory else {}
+        result = _run(root, "run_skill_checks") if phase == "run" else _run(root, "open_skill_change", request)
+        assert result.returncode == 2, result.stderr
+        assert "escapes the repository" in result.stderr or "symlink or junction" in result.stderr
+        directory = _directory(root)
+        assert {path: path.read_bytes() for path in directory.rglob("*.json")} == before
+        assert sentinel.read_text() == "untouched"
+    finally:
+        if link_kind == "junction":
+            link.rmdir()
+        else:
+            link.unlink()
+
+
+@pytest.mark.parametrize("when", ["before", "after"])
+def test_new_checkout_scope_survives_interruption_at_recording(tmp_path, monkeypatch, when):
+    root, _, _, request, data = _case(tmp_path)
+    _ok(root, "open_skill_change", request)
+    added = "tests/test_added.py"
+    data["allowed_paths"].append(added)
+    data["change_groups"][0]["paths"].append(added)
+    _request(request, data)
+    workflow = _workflow(monkeypatch)
+    namespace = workflow["command_expand_skill_scope"].__globals__
+    append = namespace["append_state"]
+
+    def interrupted(context, state, previous):
+        if when == "before":
+            raise OSError("interrupted before recording")
+        append(context, state, previous)
+        raise OSError("interrupted after recording")
+
+    monkeypatch.setitem(namespace, "append_state", interrupted)
+    with pytest.raises(OSError, match="interrupted"):
+        workflow["command_expand_skill_scope"](root, request)
+    monkeypatch.setitem(namespace, "append_state", append)
+    if when == "before":
+        _ok(root, "expand_skill_scope", request)
+    directory = _directory(root)
+    assert _state(directory)[1]["baseline_targets"][added]["content"]["kind"] == "missing"
+    (root / added).write_text("completed\n", encoding="utf-8", newline="\n")
+    _edit(root)
+    _ok(root, "run_skill_checks")
+    _ok(root, "close_skill_change")
+    assert (root / added).read_text() == "completed\n"
+
+
+def test_checkout_membership_preserves_selected_skill_ownership(tmp_path):
+    root, _, _, request, data = _case(tmp_path)
+    data["allowed_paths"] = ["tests/test_helper.py"]
+    data["change_groups"][0]["paths"] = data["allowed_paths"].copy()
+    _request(request, data)
+    result = _run(root, "open_skill_change", request)
+    assert result.returncode == 2
+    assert "selected skill has no allowed source path" in result.stderr
+    assert not list(_directory(root).rglob("*.json"))
 
 
 @pytest.mark.parametrize("fault", ["dirty_baseline", "undeclared", "whitespace", "unchanged"])

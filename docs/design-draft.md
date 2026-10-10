@@ -1378,6 +1378,14 @@ state/evidence paths are required. The caller's request has schema
 `ceratops-skill-update-request.v3` and fields `selected_skills`,
 `allowed_paths`, `change_groups` and non-test `checks`.
 
+Declared files may be existing, untracked or not yet created, including files
+whose parent directories do not yet exist. The selected checkout's resolved
+root bounds their location; the request's exact paths bound the change scope.
+Opening a request and loading its recorded scope use the same file-target
+checks: Git internals, symlinks, junctions, directories and paths outside the
+checkout are rejected. Git tracking is not an eligibility condition. Selected
+skills still require an owned source path in the declared scope.
+
 The ordinary driver boundary is deterministic: `init` derives that closed
 request from repeated skill/path groups plus UTF-8 command files, and `run`
 performs only the needed verification or emits the recorded result and one

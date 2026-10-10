@@ -43,10 +43,10 @@ from skill_update_state import (
     STATE_SCHEMA,
     UPDATE_SCHEMA,
     _absolute,
+    _allowed_file_target,
     _closed_fields,
     _dirty_paths,
     _git,
-    _is_tracked,
     _read_json,
     _reject_link_chain,
     _run_bytes,
@@ -241,8 +241,6 @@ def _shared_source_owners(
 def _validated_request_data(
     request: Mapping[str, object],
     repo_root: pathlib.Path,
-    *,
-    carried_paths: Sequence[str] = (),
 ) -> dict[str, Any]:
     _closed_fields(request, REQUEST_FIELDS, "request")
     if request.get("schema") != REQUEST_SCHEMA:
@@ -262,7 +260,7 @@ def _validated_request_data(
     owners: set[str] = set()
     for value in allowed:
         pure = _safe_relative(value, "allowed path")
-        target = _target(repo_root, value)
+        _allowed_file_target(repo_root, value)
         matches = [
             skill
             for skill in selected
@@ -270,30 +268,6 @@ def _validated_request_data(
         ]
         if matches:
             owners.update(matches)
-        existing_ancillary = target.is_file() and _is_tracked(repo_root, value)
-        shared_source = pure.is_relative_to(
-            pathlib.PurePosixPath("skills/sections")
-        )
-        new_shared_source = (
-            shared_source and not target.exists() and target.parent.is_dir()
-        )
-        # Explicitly declared repository tooling belongs to the same update as
-        # its skill-owned templates. Missing files still get a baseline snapshot.
-        new_maintenance = (
-            pure.is_relative_to(pathlib.PurePosixPath("scripts"))
-            and not target.exists() and target.parent.is_dir()
-        )
-        if (not matches and not existing_ancillary and not new_shared_source
-                and not new_maintenance and value not in carried_paths):
-            raise UpdateExecutionError(
-                "allowed path must be selected-skill source, an existing "
-                "tracked ancillary file, or declared new shared/maintenance source: "
-                + value
-            )
-        if target.is_symlink() or (target.exists() and not target.is_file()):
-            raise UpdateExecutionError(f"allowed path must be a regular file target: {value}")
-        if not target.exists() and not target.parent.is_dir():
-            raise UpdateExecutionError(f"allowed path parent does not exist: {value}")
     owners.update(_shared_source_owners(repo_root, allowed, set(selected) - owners))
     missing_owners = sorted(set(selected) - owners)
     if missing_owners:
@@ -352,8 +326,6 @@ def _validated_request_data(
 def _validated_request(
     path: pathlib.Path,
     repo_root: pathlib.Path,
-    *,
-    carried_paths: Sequence[str] = (),
 ) -> dict[str, Any]:
     request_path = _absolute(path)
     _reject_link_chain(request_path, "request")
@@ -362,7 +334,6 @@ def _validated_request(
     return _validated_request_data(
         _read_json(request_path, "request"),
         repo_root,
-        carried_paths=carried_paths,
     )
 
 def _validated_state(raw: dict[str, Any]) -> dict[str, Any]:
@@ -381,36 +352,16 @@ def _validated_state(raw: dict[str, Any]) -> dict[str, Any]:
         root = repo_root / "skills" / skill
         if root.is_symlink() or not (root / "SKILL.md").is_file():
             raise UpdateExecutionError(f"selected skill source changed after prepare: {skill}")
-    baseline_targets_value = raw["baseline_targets"]
-    if not isinstance(baseline_targets_value, Mapping):
-        raise UpdateExecutionError("state target baseline is invalid")
     owners: set[str] = set()
     for value in allowed:
         pure = _safe_relative(value, "state allowed path")
-        _target(repo_root, value)
+        _allowed_file_target(repo_root, value)
         matches = [
             skill
             for skill in selected
             if pure.is_relative_to(pathlib.PurePosixPath("skills") / skill)
         ]
         owners.update(matches)
-        snapshot = baseline_targets_value.get(value)
-        content = snapshot.get("content") if isinstance(snapshot, Mapping) else None
-        new_shared_source = (
-            (pure.is_relative_to(pathlib.PurePosixPath("skills/sections"))
-             or pure.is_relative_to(pathlib.PurePosixPath("scripts")))
-            and isinstance(content, Mapping)
-            and content.get("kind") == "missing"
-        )
-        # The index loses a staged deletion; its prepared commit retains ownership.
-        if not matches and not new_shared_source and not _is_tracked(repo_root, value):
-            prepared_paths = _git(
-                repo_root, "ls-tree", "--name-only", "-z", str(raw["head"]), "--", value,
-            ).split("\0")
-            if value not in prepared_paths:
-                raise UpdateExecutionError(
-                    f"state ancillary path is not tracked at the prepared commit: {value}"
-                )
     owners.update(_shared_source_owners(repo_root, allowed, set(selected) - owners))
     if owners != set(selected):
         raise UpdateExecutionError("state selected skills lack allowed source paths")
@@ -851,7 +802,7 @@ def _change_request(repo_root: pathlib.Path, request_path: pathlib.Path, *, repl
         prior = read_result(context, old)
         if replace_failed and (old["status"] != "failed" or prior is None):
             raise UpdateExecutionError("replace_failed_request requires recorded failed checks")
-        candidate = _validated_request(request_path, repo_root, carried_paths=old["allowed_paths"])
+        candidate = _validated_request(request_path, repo_root)
         if candidate["branch"] != old["branch"]:
             raise UpdateExecutionError("request changed task branch")
         keys = ("selected_skills", "allowed_paths", "checks", "change_groups")
@@ -1004,7 +955,7 @@ def command_run(repo_root: pathlib.Path, caller_use_complete: bool) -> str:
         try:
             status = _driver_status(repo_root)
         except UpdateExecutionError:
-            raise original
+            raise original from None
         if json.loads(status).get("status") != "failed":
             raise original
         return status
