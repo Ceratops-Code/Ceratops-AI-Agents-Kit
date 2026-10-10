@@ -644,6 +644,11 @@ Worktree removal also clears matching task directories under
 `<repo-parent>/tmp/<repo-name>` by exact worktree name or captured thread UUID.
 Unrelated task directories remain; a temp-removal failure keeps its removal
 record for the next cleanup attempt.
+Standalone `cleanup` accepts `--worktree <absolute-path>` to select one canonical
+task worktree and its associated branch. Preview, removal, unfinished-record
+handling and atomic scratch cleanup stay within that selection; sibling
+worktrees and unchecked-out branches remain outside it. Omitting the option
+keeps repository-wide discovery, including during Ship.
 Before Git removal, exact matching promotion sources become `deleting`; after
 their branch is gone, cleanup retires those entries through the promotion owner.
 Unrelated entries stay intact, and interrupted removal cannot leave a missing

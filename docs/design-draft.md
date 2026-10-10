@@ -1219,6 +1219,10 @@ Success removes the exact record and sibling, then the empty record directory;
 no completed history is retained. Directory identity prevents recovery from
 deleting a replacement path. This cleanup leaves remote refs, accepted artifacts
 and installations to their existing owners.
+Standalone `cleanup --worktree <absolute-path>` narrows discovery and unfinished
+removal handling to one canonical task-worktree path and its associated branch.
+Unrelated removal records and atomic scratch remain with their existing owners;
+the default Ship cleanup continues to discover repository-wide candidates.
 After removing a worktree, the helper clears its exact name and captured thread
 UUID groups under `<repo-parent>/tmp/<repo-name>`, using the existing scoped
 temp owner. Redirected roots and matching links stop removal. A temp-removal
