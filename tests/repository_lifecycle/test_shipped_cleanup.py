@@ -1118,7 +1118,7 @@ def test_composed_promotion_and_shipping_each_run_their_validation_boundary(
     head = run_git(repo, "rev-parse", "HEAD").stdout.strip()
     promotion = runpy.run_path(str(PROMOTE_REPOSITORY))
     shipping = runpy.run_path(str(SHIP_REPOSITORY))
-    original_promotion = promotion["_run_json"]
+    original_promotion = promotion["run_json_command"]
     original_shipping = shipping["_run_json"]
 
     def ship_json(command: list[str], **kwargs: Any) -> tuple[int, dict[str, Any]]:
@@ -1153,7 +1153,7 @@ def test_composed_promotion_and_shipping_each_run_their_validation_boundary(
             return 0, shipping["ship_repository"](args)
         return original_promotion(command, cwd)
 
-    promotion["promote"].__globals__["_run_json"] = promote_json
+    promotion["promote"].__globals__["run_json_command"] = promote_json
     args = promotion["build_parser"]().parse_args(
         [
             "--repo-root",
