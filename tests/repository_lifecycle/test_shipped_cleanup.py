@@ -111,6 +111,12 @@ def test_repository_wide_cleanup_conditions(
     removed: bool,
 ) -> None:
     worktree = task(repository)
+    temp_root = repository.parent / "tmp" / repository.name
+    owned_temp = [temp_root / name for name in ("candidate", THREAD, THREAD + "-files")]
+    other_temp = temp_root / "candidate-other"
+    for directory in [*owned_temp, other_temp]:
+        directory.mkdir(parents=True)
+        (directory / "scratch.txt").write_text("scratch\n", encoding="utf-8")
     rows: list[tuple[Any, ...]] = []
     if condition != "missing":
         cwd = (
@@ -153,6 +159,10 @@ def test_repository_wide_cleanup_conditions(
     result = cleanup.retire_shipped_work(repository, "main", apply=True, **options)
     assert result["status"] == "completed"
     assert worktree.exists() is not removed
+    assert owned_temp[0].exists() is not removed
+    for directory in owned_temp[1:]:
+        assert directory.exists() is not (removed and condition == "archived")
+    assert other_temp.is_dir()
     assert (
         run_git(
             repository, "show-ref", "--verify", "--quiet", "refs/heads/codex/candidate"
@@ -329,6 +339,83 @@ def test_conditions_changed_after_recording_stop_deletion(
         ).returncode
         == 0
     )
+
+
+def test_task_temp_failure_keeps_removal_record_for_resume(
+    cleanup: ModuleType,
+    repository: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worktree = task(repository)
+    threads(
+        cleanup,
+        monkeypatch,
+        [(THREAD, str(worktree), 1, "codex/candidate", "Candidate")],
+    )
+    temp_root = repository.parent / "tmp" / repository.name
+    owned_temp = [temp_root / "candidate", temp_root / (THREAD + "-files")]
+    for directory in owned_temp:
+        directory.mkdir(parents=True)
+        (directory / "scratch.txt").write_text("scratch\n", encoding="utf-8")
+    original = cleanup._paths["_remove_matching_task_temp_directories"]
+
+    def interrupt(*args: Any, **kwargs: Any) -> None:
+        raise cleanup.CleanupError("task-temp removal interrupted")
+
+    monkeypatch.setitem(cleanup._paths, "_remove_matching_task_temp_directories", interrupt)
+    first = cleanup.retire_shipped_work(repository, "main", apply=True)
+    assert first["status"] == "blocked"
+    assert not worktree.exists()
+    assert all(directory.exists() for directory in owned_temp)
+    records = repository / ".git" / "codex" / "repository-lifecycle" / "shipped-cleanup"
+    assert len(list(records.glob("*.json"))) == 1
+    assert git(repository, "rev-parse", "codex/candidate") == git(
+        repository, "rev-parse", "main"
+    )
+
+    # Recovery retains the captured owner even if its archived chat is removed.
+    threads(cleanup, monkeypatch, [])
+    monkeypatch.setitem(cleanup._paths, "_remove_matching_task_temp_directories", original)
+    resumed = cleanup.retire_shipped_work(repository, "main", apply=True)
+    assert resumed["status"] == "completed"
+    assert not any(directory.exists() for directory in owned_temp)
+    assert not records.exists()
+
+
+def test_redirected_task_temp_root_preserves_work_and_link_target(
+    cleanup: ModuleType,
+    repository: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worktree = task(repository)
+    threads(cleanup, monkeypatch, [])
+    temp_root = repository.parent / "tmp" / repository.name
+    temp_root.parent.mkdir()
+    target = repository.parent / "unrelated-temp"
+    scratch = target / "candidate" / "scratch.txt"
+    scratch.parent.mkdir(parents=True)
+    scratch.write_text("keep\n", encoding="utf-8")
+    if sys.platform == "win32":
+        subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(temp_root), str(target)],
+            check=True,
+            capture_output=True,
+        )
+    else:
+        temp_root.symlink_to(target, target_is_directory=True)
+    try:
+        result = cleanup.retire_shipped_work(repository, "main", apply=True)
+        assert result["status"] == "blocked"
+        assert worktree.exists()
+        assert scratch.read_text(encoding="utf-8") == "keep\n"
+        assert git(repository, "rev-parse", "codex/candidate") == git(
+            repository, "rev-parse", "main"
+        )
+    finally:
+        if sys.platform == "win32":
+            temp_root.rmdir()
+        else:
+            temp_root.unlink()
 
 
 def test_native_worktree_removal_residual_is_bound_to_original_directory(

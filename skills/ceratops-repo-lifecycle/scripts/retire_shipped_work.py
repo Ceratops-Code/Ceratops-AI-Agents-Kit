@@ -6,6 +6,8 @@ is opened read-only; an unavailable database never establishes thread absence.
 The cleanup owner keeps one unfinished JSON record per exact path/ref below
 ``<git-common-dir>/codex/repository-lifecycle/shipped-cleanup``. Records disappear
 after removal; a reusable native lock serializes this owner's cleanup calls.
+After worktree removal, the same record owns matching task directories under
+``<repo-parent>/tmp/<repo-name>`` until temporary data and refs are both retired.
 No remote refs, accepted artifacts, installations or unrelated temp files change.
 """
 
@@ -535,6 +537,9 @@ def _finish_record(
         ):
             raise CleanupError("Recorded worktree is locked or dirty.")
         _paths["_validate_worktree_path"](path, root, allow_inaccessible=False)
+    task_temp_root = repo.parent / "tmp" / repo.name
+    if path is not None and task_temp_root != task_temp_root.resolve():
+        raise CleanupError("Task-temp root is redirected.")
     if item["branch"]:
         _prepare_promotion_source_retirement(repo, item["branch"], item["head"])
     if registered is not None:
@@ -553,6 +558,16 @@ def _finish_record(
         ):
             raise CleanupError("Residual path was replaced after cleanup started.")
         _paths["_remove_tree"](path)
+    if path is not None:
+        # Keep the existing removal record through temp failures. Its captured
+        # archived owners still identify UUID-named scratch after Git removal.
+        for thread_id in sorted(original_ids) or [None]:
+            _paths["_remove_matching_task_temp_directories"](
+                repo,
+                task_temp_root,
+                worktree_name=path.name,
+                thread_id=thread_id,
+            )
     if item["branch"]:
         _remove_branch(repo, item["branch"], item["head"])
         _retire_promotion_source(repo, item["branch"], item["head"])
