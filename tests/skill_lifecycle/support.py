@@ -25,7 +25,7 @@ FAST_CHANGE = LIFECYCLE_SOURCE / "scripts" / "fast-change.py"
 SKILL_UPDATE_WORKFLOW = LIFECYCLE_SOURCE / "scripts" / "skill-update-workflow.py"
 RUNTIME_MANIFEST = ".runtime-manifest.json"
 RUNTIME_MANIFEST_SCHEMA = "ceratops-runtime-skill.v3"
-INSTALLER_VERSION = 17
+INSTALLER_VERSION = 18
 
 
 def prepare_fast_change_repo(tmp_path: pathlib.Path) -> pathlib.Path:

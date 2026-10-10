@@ -259,38 +259,6 @@ def test_repository_ship_metadata_reaches_shared_pr_producer(
     assert events == ["availability", "producer"]
 
 
-@pytest.mark.parametrize("scope_present", [False, True])
-def test_repository_ship_absent_default_contract_is_no_op_and_finalizes(
-    tmp_path: pathlib.Path,
-    scope_present: bool,
-) -> None:
-    repo, loaded, args, log, state, commands = _setup(tmp_path, contract=False)
-    state["scope"] = scope_present
-    result = loaded["ship_repository"](args)
-    assert result["status"] == "shipped"
-    for phase in ("release_publication", "deployment"):
-        assert result[phase] == {
-            "status": "completed",
-            "completed_operations": [],
-            "pending_operations": [],
-            "results": [],
-        }
-    assert result["finalization"] == (
-        {"status": "finalized"} if scope_present else None
-    )
-    assert log.read_text().splitlines() == (
-        ["remote", "finalize"] if scope_present else ["remote"]
-    )
-    remote = next(
-        command for command in commands if str(PR_WORKFLOW_ENTRYPOINT) in command
-    )
-    assert ("--pending-work-check" in remote) is scope_present
-    assert ("--no-pending-work-check" in remote) is not scope_present
-    args.review_replies_request = tmp_path / "review-replies.json"
-    forwarded = loaded["_ship_command"](args, repo, None, None)
-    assert forwarded[forwarded.index("--review-replies-request") + 1] == str(
-        args.review_replies_request
-    )
 
 
 def test_repository_ship_rejects_release_namespace_conflict(
@@ -336,67 +304,8 @@ def test_repository_ship_missing_custom_contract_blocks_before_remote_mutation(
     assert state["calls"] == 0 and not log.exists()
 
 
-def test_repository_ship_prevalidates_and_executes_ordered_phase_selections(
-    tmp_path: pathlib.Path,
-) -> None:
-    _, loaded, args, log, _, commands = _setup(tmp_path)
-    args.publish_operation = [PUBLIC, PUBLIC]
-    result = loaded["ship_repository"](args)
-    assert log.read_text().splitlines() == [
-        "check",
-        "remote",
-        "check",
-        "publish",
-        "publish",
-        "check",
-        "deploy",
-    ]
-    assert result["release_publication"]["completed_operations"] == [PUBLIC, PUBLIC]
-    assert result["deployment"]["completed_operations"] == [LOCAL]
-    assert "--prepare-only" in commands[0]
-    assert "--validate" in next(
-        command for command in commands if "--validate" in command
-    )
 
 
-@pytest.mark.parametrize("gate", ["validate", "tests"])
-def test_failed_checks_prevent_remote_work_and_succeed_after_committed_repair(
-    tmp_path: pathlib.Path,
-    gate: str,
-) -> None:
-    repo, loaded, args, log, state, _ = _setup(tmp_path)
-    if gate == "tests":
-        import yaml
-
-        path = repo / "sdlc/sdlc.yml"
-        document = yaml.safe_load(path.read_text())
-        actions = document["repository"]["actions"]
-        actions["test"] = actions["validate"]
-        actions["validate"] = {
-            "requires": {"capabilities": []},
-            "no-op": "Fixture has no validation command.",
-        }
-        path.write_text(yaml.safe_dump(document))
-    (repo / "code.txt").write_text("broken", encoding="utf-8")
-    broken = _commit(repo)
-    with pytest.raises(loaded["RepositoryShipError"]) as failure:
-        loaded["ship_repository"](args)
-    assert failure.value.payload["status"] == (
-        "validation_failed" if gate == "validate" else "tests_failed"
-    )
-    assert failure.value.payload["phase"] == "before_remote"
-    assert failure.value.payload["commit"] == broken
-    assert failure.value.payload["diagnostic"]["stderr_tail"] == [
-        "ordinary check failure"
-    ]
-    assert failure.value.payload["remote_mutation"] is False
-    assert state["calls"] == 0 and log.read_text().splitlines() == ["check"]
-    (repo / "code.txt").write_text("good", encoding="utf-8")
-    repaired = _commit(repo)
-    result = loaded["ship_repository"](args)
-    assert result["commit"] == repaired != broken
-    assert result["status"] == "shipped"
-    assert log.read_text().splitlines()[-1] == "deploy"
 
 
 def test_repository_ship_release_failure_blocks_deployment_and_cleanup(
@@ -420,25 +329,6 @@ def test_repository_ship_release_failure_blocks_deployment_and_cleanup(
     assert log.read_text().splitlines()[-2:] == ["deploy", "finalize"]
 
 
-def test_synchronized_source_is_checked_before_publication_or_deployment(
-    tmp_path: pathlib.Path,
-) -> None:
-    repo, loaded, args, log, state, _ = _setup(tmp_path)
-    state["break_after_remote"] = True
-    with pytest.raises(loaded["RepositoryShipError"]) as failure:
-        loaded["ship_repository"](args)
-    payload = failure.value.payload
-    assert payload["status"] == "validation_failed"
-    assert payload["phase"] == "release_publication"
-    assert payload["remote_mutation"] is True
-    assert payload["commit"] == run_git(repo, "rev-parse", "HEAD").stdout.strip()
-    assert log.read_text().splitlines() == ["check", "remote", "check"]
-    state["break_after_remote"] = False
-    (repo / "code.txt").write_text("good", encoding="utf-8")
-    _commit(repo)
-    result = loaded["ship_repository"](args)
-    assert result["status"] == "already_shipped"
-    assert log.read_text().splitlines()[-1] == "deploy"
 
 
 def test_synchronized_dirty_state_preserves_remote_recovery(

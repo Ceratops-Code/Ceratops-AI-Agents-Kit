@@ -22,9 +22,12 @@ evidence.
   `Yes`, `No`, or `Unavailable` from ref freshness and commit containment, and
   supplies unique-commit, patch-equivalence, and diff evidence without changing
   branches, worktrees, or tasks.
-- Resolve active task titles from available Codex task or session evidence. Do
-  not infer a task solely from a branch or folder name; report `None` or
-  `Unverified` when appropriate.
+- Resolve active task titles from available Codex task or session evidence;
+  branch names, folder names, and shortened IDs alone do not prove ownership.
+  For competing matches, inspect creation or ownership records; if unresolved,
+  list every candidate's full ID, title, and archived state. Use `None` when
+  no active owner remains; accompany `Unverified` with the candidates or
+  unavailable evidence.
 - Fill the promotion-worth column with `Yes`, `No`, or `Unverified` only when
   promotion and shipping are both `No` and there is no active task; otherwise
   use `-`. Base the decision on unique commits, patch equivalence, and the

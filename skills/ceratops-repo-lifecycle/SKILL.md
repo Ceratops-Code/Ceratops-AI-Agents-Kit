@@ -53,7 +53,7 @@ and publication.
 ### Skill-Specific Rules
 
 - Keep local promotion, GitHub publication, guarded merge, synchronization,
-  deployment routing, repository compatibility, and selected-source cleanup in
+  deployment routing, repository compatibility, and shipped-task cleanup in
   this skill.
 - Execute named SDLC entries through `scripts/repository_operation.py` with
   `--repo-root PATH --sdlc-contract PATH --operation LOCATION`; repeat the last
@@ -93,7 +93,8 @@ and publication.
 - Use `references/merge-pr.md` for standalone PR finalization. Integrated ship
   must preserve every readiness, CI, Codex-review, and exact-head gate before
   its final admin merge.
-- Inspect only branches and worktrees named by the selected pending-work scope.
+- Limit promotion checks to the selected pending-work scope. Ship cleanup
+  discovers eligible shipped task branches and worktrees across that repository.
 
 ### Boundaries
 
@@ -129,8 +130,8 @@ and publication.
   enter the complete ship workflow immediately after promotion; only shipping
   may publish a release or deploy in this mode.
 - Use `ship` for GitHub delivery from the same branch selected during promotion
-  and for selected-source cleanup; publication and local deployment run only
-  when their operations are selected.
+  and for repository-wide shipped-task cleanup; publication and local deployment
+  run only when their operations are selected.
 - Use `merge-pr` only when standalone PR finalization is the whole task.
 - Use `publish-pr` when explicitly asked to publish selected changes as a PR;
   preserve repository branch and promotion policies, and stop after verifying

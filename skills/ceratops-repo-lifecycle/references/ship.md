@@ -4,7 +4,8 @@
 
 Validate staged work locally, ship it through GitHub, synchronize main, then
 run explicitly selected publication and local deployment operations before
-selected-source cleanup. YAML declares capabilities; this action owns timing.
+repository-wide shipped-task cleanup. YAML declares capabilities; this action
+owns timing.
 
 ## Context
 
@@ -31,8 +32,9 @@ selected-source cleanup. YAML declares capabilities; this action owns timing.
   `--validation-operation LOCATION` flags replace validation discovery.
 - The helper derives the canonical pending-work scope from `--head-branch`.
   When a retained scope exists, the wrapper reuses its recorded exact target
-  commit; a caller-supplied `--commit` must match it. An absent scope is a
-  cleanup no-op. Each version-2 source persists its branch, exact recorded tip,
+  commit; a caller-supplied `--commit` must match it. An absent scope skips checks
+  of selected sources; repository-wide cleanup still runs. Each version-2 source
+  persists its branch, exact recorded tip,
   and helper-owned `retained`, `preserved`, or `deleting` state. A missing
   `retained` source remains blocking. Only a missing `deleting` source whose
   recorded commit exists and is an ancestor of the recorded target may be
@@ -41,7 +43,8 @@ selected-source cleanup. YAML declares capabilities; this action owns timing.
   to version 2. A missing legacy source is retired; a clean source still
   contained in the legacy target becomes `retained`; a dirty, unavailable, or
   advanced source becomes `preserved`, does not block rollout, and remains
-  untouched during cleanup. Other old or malformed formats block.
+  untouched by scope-driven cleanup. Repository-wide discovery applies current
+  eligibility independently. Other old or malformed formats block.
 
 ### Inputs To Capture
 
@@ -111,8 +114,8 @@ selected-source cleanup. YAML declares capabilities; this action owns timing.
    commit exists and is an ancestor of the recorded target. A missing
    `retained` source or an unproven `deleting` source remains `pending_work` and
    performs no remote mutation. A `preserved` legacy source is outside
-   pending-work blockers and destructive cleanup. An absent or proven-empty
-   scope is a cleanup no-op.
+   pending-work blockers and scope-driven cleanup. An absent or proven-empty
+   scope skips only checks of selected sources; repository-wide cleanup still runs.
 4. (D) The delegated GitHub workflow must resolve exact-head gates with bounded,
    shell-safe evidence. A confirmed Actions outage must stop shipping with
    `external_service_outage`; gates are never bypassed.
@@ -130,35 +133,29 @@ selected-source cleanup. YAML declares capabilities; this action owns timing.
    Failed checks stop the batch before any later side effect. Keep the action
    active for repair and a fresh committed attempt; repository scripts need
    only normal exit codes and diagnostics, not special JSON.
-   Before removing a selected worktree or branch
-   for a retained source, finalization atomically changes its state to
-   `deleting`; an existing `deleting` branch first passes the same cleanliness
-   and ancestry checks. Before removing a selected worktree, finalization
-   revalidates its exact path and derives its direct parent as the cleanup root
-   only when that parent chain contains a case-insensitive `worktrees` directory
-   component. Otherwise it leaves the worktree and branch untouched, retires
-   their scope record, and returns the exact preserved path. For an eligible
-   worktree, it records the exact path, name, cleanup root, and any thread ID
-   from `.codex-thread`. Automatic residual cleanup handles only the case where
-   Git unregisters that worktree but leaves the recorded directory. The helper
-   verifies that the path is unregistered and remains below the recorded root
-   before deleting it. When elevated, it may take ownership only of that
-   validated path, without a public flag or second confirmation. Before
-   retiring the record, it deletes matching task-temp subdirectories under
-   `<repo-parent>/tmp/<repo-name>` only when a
-   name exactly matches the recorded worktree name, exactly matches the thread
-   ID, or starts with the thread ID followed by `-`; it preserves every other
-   name. It removes empty worktree and task-temp parents
-   only up to their nearest `worktrees`, `tmp`, or `temp` boundary and never
-   deletes the boundary itself. On Windows sharing violation 32,
-   after Git unregisters an eligible worktree, the helper preserves and reports
-   the exact residual path, retains its cleanup record until branch deletion
-   succeeds, and continues merged-branch cleanup. Other residual cleanup errors
-   remain blocking.
-   Otherwise, the record is removed only after the worktree path and matching
-   task-temp directories are absent. After successful branch
-   deletion, it atomically removes the source record and deletes the scope after
-   the final source is removed.
+   Then the wrapper invokes `retire_shipped_work.py finalize` with the optional
+   scope and synchronized branch/commit identities. It first finalizes the
+   selected scope, preserving active threads and worktrees outside the canonical
+   repository worktree root, then discovers registered task worktrees and
+   unchecked-out local `codex/` task branches throughout the repository.
+   Remove work only when Git state is clean including untracked files, its exact
+   head is an ancestor of the synchronized shipped commit, and its associated
+   Codex threads are archived or absent. An unreadable or missing existing thread
+   catalog cannot establish absence. Preserve possible active owners under moved
+   paths, the primary checkout, main/master and reusable `release/local`.
+   Before each deletion, recheck thread state, worktree registration, exact head,
+   cleanliness, ancestry and the canonical path boundary. Branch deletion uses
+   the expected head atomically; native Git worktree removal never uses force.
+   Repository-wide unfinished removals belong to
+   `<common-git-dir>/codex/repository-lifecycle/shipped-cleanup/`, with one
+   record per exact target. Resume them before discovering new candidates;
+   replaced residual directories block removal. Delete successful records and
+   their exact atomic-write siblings; retain unfinished evidence and a single
+   native cleanup lock, without retaining completed history.
+   Selected-scope cleanup retains its existing source states, path-bound
+   residual recovery, matching task-temp cleanup, Windows sharing-violation
+   handling and empty-parent boundaries. Report preserved paths and blocking
+   failures; cleanup-only recovery never repeats publication or deployment.
 8. After each declared release publication or deployment operation succeeds,
    the helper checkpoints its result independently against the exact target,
    ordered position, operation ID, and resolved contract before continuing. A
@@ -184,13 +181,14 @@ selected-source cleanup. YAML declares capabilities; this action owns timing.
 - Local validation, GitHub gates, exact-head merge, synchronization and selected
   deterministic operations completed in order; advisory routing was not treated
   as proof of completed domain work.
-- Every existing cleanup-selected source branch passed pending-work checks; an
-  absent or proven-empty scope completed as a cleanup no-op.
+- Every existing cleanup-selected source branch passed pending-work checks;
+  repository-wide cleanup ran even when that scope was absent or empty.
 - Only an evidence-proven interrupted `deleting` record was recovered
   automatically; every missing `retained` source remained blocking.
-- Dirty, unavailable, or advanced legacy sources were preserved, excluded from
-  destructive cleanup, and reported by finalization.
-- Only selected clean merged source work was removed.
+- Dirty, unavailable, or advanced work, active threads and protected checkouts
+  or branches were retained with reasons.
+- Every removed task worktree or branch was clean, had its exact head included
+  in the shipped commit, and had only archived or absent associated threads.
 
 ### Output Contract
 
@@ -198,5 +196,6 @@ Report only:
 
 - PR URL and merge outcome
 - synchronized main, release-publication outcome, and local deployment outcome
-- finalized or retained selected scope with reasons, exact preserved worktree
-  paths, and phase-aware recovery data for terminal post-mutation blockers
+- finalized or retained selected scope, repository-wide removal outcomes and
+  retained reasons, exact preserved worktree paths, and phase-aware recovery data
+  for terminal post-mutation blockers

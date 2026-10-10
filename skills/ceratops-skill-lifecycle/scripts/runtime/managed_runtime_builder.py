@@ -517,8 +517,8 @@ def _running_process_paths() -> str | None:
     """Return normalized executable paths, or None when they cannot be read.
 
     Retention is conservative: an unavailable process inventory prevents old
-    runtime deletion. The probe reads executable paths only and never changes a
-    process or requires elevated access.
+    runtime deletion. Windows reads process metadata in one query, avoiding slow
+    per-process image lookups without changing processes or elevating access.
     """
 
     if os.name == "nt":
@@ -532,7 +532,7 @@ def _running_process_paths() -> str | None:
                     "-NoProfile",
                     "-NonInteractive",
                     "-Command",
-                    "$ErrorActionPreference='Stop'; Get-Process | ForEach-Object { try { $_.Path } catch {} }",
+                    "$ErrorActionPreference='Stop'; Get-CimInstance Win32_Process | ForEach-Object { $_.ExecutablePath }",
                 ],
                 capture_output=True,
                 text=True,
