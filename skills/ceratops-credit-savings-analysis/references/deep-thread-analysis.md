@@ -12,7 +12,7 @@ Preserve every confirmed finding and report every capacity omission.
 
 - Use the source, completed-run selection, task temporary root, retained evidence
   path inside that root, optional pricing profile, and contract version required
-  by the parent.
+  by Shared Evidence And Controller Contract above.
 - Accept exactly one root source: an explicit thread ID or session path, the current
   thread, or one exact thread name. Resolve the current thread only from
   `CODEX_THREAD_ID`; resolve a name against the latest thread-index records and
@@ -152,7 +152,7 @@ saves no calls.
 If analysis is incomplete or blocked, report that state and the exact
 unassessed scope.
 
-Use the parent Output Contract for chat selection and presentation. Preserve
+Use the shared Output Contract for chat selection and presentation. Preserve
 all accounting and review evidence required by the Completion Gate in the
 machine result. Move detailed coverage and control tables there; do not place
 them or the detailed finding list in the saved human report.
@@ -179,7 +179,7 @@ owner/control. Rank deterministically by recurrence across runs, affected-call
 count, evidence bytes, direct error/retry/user-correction sequence, identifiable
 owner, then stable finding ID. Deeply verify and expand the top three without
 discarding other qualifying findings. This review ranking does not override
-the parent's separate presentation priorities.
+the shared Output Contract's separate presentation priorities.
 
 Retain confirmed input/output-volume waste and its complete volume evidence in
 the machine result even when it saves zero model calls; exclude it from

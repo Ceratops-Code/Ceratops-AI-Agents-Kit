@@ -2,9 +2,10 @@
 
 This is the authoritative architecture and maintenance reference for the
 `ceratops-credit-savings-analysis` skill. The operational instructions remain
-in [SKILL.md](SKILL.md) and its action references. The versioned contract,
-Python controller, and session collector own their respective executable
-behavior; this document explains how they work together.
+in [SKILL.md](SKILL.md) and its generated action references, whose deep and
+surface routes include [shared rules](../sections/credit-analysis-deep-surface.md).
+The versioned contract, Python controller, and session collector own their
+respective executable behavior; this document explains how they work together.
 
 ```design-document
 {
@@ -36,7 +37,11 @@ behavior; this document explains how they work together.
     },
     {
       "path": "skills/ceratops-credit-savings-analysis/SKILL.md",
-      "role": "Public action routing, shared invariants, classification policy, and output contract"
+      "role": "Public action routing and cross-action analysis boundaries"
+    },
+    {
+      "path": "skills/sections/credit-analysis-deep-surface.md",
+      "role": "Deep and standalone surface evidence, classification, completion, and presentation contract"
     },
     {
       "path": "skills/ceratops-credit-savings-analysis/references/deep-thread-analysis.md",
@@ -241,7 +246,9 @@ surface order, classifications, and controller actions. `SKILL.md` owns the
 public action list; the controller actions must appear there in the same order.
 Python owns field shape, cross-field rules, state transitions, persistence,
 and failure behavior. The skill text owns operator-facing policy and
-presentation. Tests establish which
+presentation. The section manifest inserts the shared deep/surface rules only
+into the six controller action references; quick analysis keeps its own rules.
+Tests establish which
 behaviors have been exercised. This README is the authoritative explanation of
 that design; it does not override the executable sources.
 
