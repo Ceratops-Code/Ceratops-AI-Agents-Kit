@@ -55,8 +55,10 @@ def _git(repo: pathlib.Path, *args: str, allowed: tuple[int, ...] = (0,)) -> str
 
 
 def _path_key(value: str) -> str:
-    """Compare Windows extended paths and ordinary paths without disk writes."""
-    return value.replace("\\", "/").removeprefix("//?/").rstrip("/").casefold()
+    """Keep POSIX case distinctions; compare Windows extended paths equally."""
+    if os.name == "nt":
+        return value.replace("\\", "/").removeprefix("//?/").rstrip("/").casefold()
+    return value.rstrip("/")
 
 
 def _slug(value: str) -> str:
@@ -122,7 +124,9 @@ class ThreadCatalog:
         for row in self.rows:
             thread_id, raw_cwd, _, recorded_branch, name = row
             recorded_cwd = _path_key(raw_cwd or "")
-            leaf = recorded_cwd.rsplit("/", 1)[-1]
+            # Leaf-name ownership is a conservative retention hint, unlike the
+            # exact platform-aware path comparison used to select cleanup.
+            leaf = recorded_cwd.rsplit("/", 1)[-1].casefold()
             if (
                 thread_id == marker_id
                 or (cwd is not None and recorded_cwd == cwd)
@@ -177,6 +181,34 @@ def _primary(repo: pathlib.Path) -> pathlib.Path:
     return pathlib.Path(records[0]["worktree"]).resolve(strict=True)
 
 
+def _selected_worktree_path(
+    root: pathlib.Path, selected: pathlib.Path | None
+) -> pathlib.Path | None:
+    """Bind cleanup to one absolute canonical child of its task root.
+
+    Removed paths remain selectable so fresh calls can finish remaining ref
+    and task-temp effects without adding sibling or branch-only candidates.
+    """
+    if selected is None:
+        return None
+    path = selected.expanduser()
+    if not path.is_absolute() or path != path.resolve() or path.parent != root:
+        raise CleanupError(
+            "Selected worktree must be one absolute canonical child of the "
+            "repository worktree root."
+        )
+    return path
+
+
+def _record_selects_worktree(record: Any, selected: pathlib.Path | None) -> bool:
+    """Leave other targets' unfinished identity records outside this invocation."""
+    if selected is None:
+        return True
+    item = record.get("candidate") if isinstance(record, dict) else None
+    path = item.get("path") if isinstance(item, dict) else None
+    return isinstance(path, str) and _path_key(path) == _path_key(str(selected))
+
+
 def plan_cleanup(
     repo_root: pathlib.Path,
     shipped_ref: str,
@@ -185,12 +217,14 @@ def plan_cleanup(
     protected_branches: tuple[str, ...] = (),
     codex_home: pathlib.Path | None = None,
     include_branch_only: bool = True,
+    selected_worktree: pathlib.Path | None = None,
 ) -> dict[str, Any]:
     """Discover candidates from Git, independently of promotion scope records."""
     repo = _primary(repo_root.resolve(strict=True))
     root = (worktree_root or repo.parent / "worktrees" / repo.name).absolute()
     if root != root.resolve():
         raise CleanupError("Worktree cleanup root contains a link or redirected path.")
+    selected = _selected_worktree_path(root, selected_worktree)
     shipped = _git(repo, "rev-parse", "--verify", f"{shipped_ref}^{{commit}}")
     if not SHA.fullmatch(shipped):
         raise CleanupError("Shipped ref did not resolve to one full commit ID.")
@@ -255,10 +289,12 @@ def plan_cleanup(
 
     for record in records:
         path = pathlib.Path(record["worktree"]).absolute()
+        if selected is not None and path != selected:
+            continue
         if path != root and root in path.parents:
             branch = record.get("branch", "").removeprefix("refs/heads/") or None
             candidate(branch, record["HEAD"], path, "locked" in record)
-    if include_branch_only:
+    if include_branch_only and selected is None:
         for line in _git(
             repo,
             "for-each-ref",
@@ -433,6 +469,7 @@ def _finish_record(
     shipped: str,
     protected_branches: tuple[str, ...] = (),
     include_branch_only: bool = True,
+    selected_worktree: pathlib.Path | None = None,
 ) -> None:
     """Resume only an exact, still-inactive retirement recorded by this owner."""
     required = {
@@ -483,6 +520,8 @@ def _finish_record(
     ):
         raise CleanupError("Shipped cleanup record has an unsafe root.")
     path = pathlib.Path(item["path"]) if item["path"] else None
+    if selected_worktree is not None and path != selected_worktree:
+        raise CleanupError("Cleanup record is outside the selected worktree.")
     if path is None and not include_branch_only:
         raise CleanupError(
             "Recorded branch-only cleanup is outside the current selection."
@@ -583,6 +622,7 @@ def retire_shipped_work(
     protected_branches: tuple[str, ...] = (),
     codex_home: pathlib.Path | None = None,
     include_branch_only: bool = True,
+    selected_worktree: pathlib.Path | None = None,
 ) -> dict[str, Any]:
     """Preview or remove eligible work, preserving unfinished removal evidence."""
     options: dict[str, Any] = {
@@ -590,11 +630,15 @@ def retire_shipped_work(
         "protected_branches": protected_branches,
         "codex_home": codex_home,
         "include_branch_only": include_branch_only,
+        "selected_worktree": selected_worktree,
     }
     plan = plan_cleanup(repo_root, shipped_ref, **options)
     if not apply:
         return plan
     repo = pathlib.Path(plan["repo_root"])
+    selected = _selected_worktree_path(
+        pathlib.Path(plan["worktree_root"]), selected_worktree
+    )
     owner = _paths["_common_git_dir"](repo) / "codex" / "repository-lifecycle"
     owner.mkdir(parents=True, exist_ok=True)
     directory = owner / "shipped-cleanup"
@@ -609,16 +653,23 @@ def retire_shipped_work(
                 raise CleanupError("Shipped cleanup record directory is redirected.")
             # Git mutation starts only after the final JSON record exists. An
             # orphan atomic-write sibling therefore carries no deletion debt.
+            selected_atomic_names = {
+                _record_path(directory, item).with_suffix(".tmp").name
+                for item in plan["candidates"]
+            }
             for temporary in directory.glob("*.tmp"):
                 if (
                     re.fullmatch(r"[0-9a-f]{64}\.tmp", temporary.name)
                     and not temporary.with_suffix(".json").exists()
+                    and (selected is None or temporary.name in selected_atomic_names)
                 ):
                     temporary.unlink()
             # Finish recorded work before discovering another use of its path.
             for record_path in sorted(directory.glob("*.json")):
                 try:
                     record = json.loads(record_path.read_text(encoding="utf-8"))
+                    if not _record_selects_worktree(record, selected):
+                        continue
                     if record_path.is_symlink() or not record_path.is_file():
                         raise CleanupError("Cleanup record is not a regular file.")
                     _finish_record(
@@ -630,6 +681,7 @@ def retire_shipped_work(
                         plan["shipped_commit"],
                         protected_branches,
                         include_branch_only,
+                        selected_worktree=selected,
                     )
                     removed.append(record["candidate"])
                 except (OSError, ValueError, CleanupError) as exc:
@@ -651,8 +703,8 @@ def retire_shipped_work(
                         "device": attributes.st_dev if attributes else None,
                         "inode": attributes.st_ino if attributes else None,
                     }
-                    _save_record(record_path, record)
                     try:
+                        _save_record(record_path, record)
                         _finish_record(
                             repo,
                             record_path,
@@ -662,6 +714,7 @@ def retire_shipped_work(
                             plan["shipped_commit"],
                             protected_branches,
                             include_branch_only,
+                            selected_worktree=selected,
                         )
                         removed.append(item)
                     except (OSError, ValueError, CleanupError) as exc:
@@ -771,6 +824,14 @@ def main(argv: list[str] | None = None) -> int:
     cleanup.add_argument("--worktree-root", type=pathlib.Path)
     cleanup.add_argument("--protected-branch", action="append", default=[])
     cleanup.add_argument("--worktrees-only", action="store_true")
+    cleanup.add_argument(
+        "--worktree",
+        type=pathlib.Path,
+        help=(
+            "Clean up only this absolute canonical task-worktree path, "
+            "leaving other worktrees, branches and cleanup records untouched."
+        ),
+    )
     cleanup.add_argument("--apply", action="store_true")
     finalize = commands.add_parser(
         "finalize", help="Finish Ship's selected and repository-wide cleanup."
@@ -802,6 +863,7 @@ def main(argv: list[str] | None = None) -> int:
                 protected_branches=tuple(args.protected_branch),
                 codex_home=args.codex_home,
                 include_branch_only=not args.worktrees_only,
+                selected_worktree=args.worktree,
             )
         if args.report:
             args.report.write_text(

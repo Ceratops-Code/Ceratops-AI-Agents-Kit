@@ -7,7 +7,7 @@ name = "ceratops_mcp_server_manager"
 version = "0.4.6"
 description = "Independent local MCP server packaging, installation, updates, and version inspection"
 requires-python = ">=3.14,<3.15"
-dependencies = ["mcp==2.2.0", "packaging==26.3"]
+dependencies = ["mcp==2.3.0", "packaging==26.3"]
 
 [project.scripts]
 ceratops_mcp_server_manager = "ceratops_mcp_server_manager.cli:main"

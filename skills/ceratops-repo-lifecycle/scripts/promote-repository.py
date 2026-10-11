@@ -30,6 +30,7 @@ from github_pr_workflow.command import (
     require_output,
     require_success,
     run_command,
+    run_json_command,
 )
 from repository_operation import (
     OperationError,
@@ -841,24 +842,6 @@ def _prepare_source_for_fast_forward(
     return result
 
 
-def _run_json(command: list[str], cwd: pathlib.Path) -> tuple[int, dict[str, Any]]:
-    result = subprocess.run(
-        command,
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    raw = result.stdout.strip() if result.stdout.strip() else result.stderr.strip()
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise PromotionError("Lifecycle helper returned invalid JSON.") from exc
-    if not isinstance(payload, dict):
-        raise PromotionError("Lifecycle helper returned a non-object result.")
-    return result.returncode, payload
-
-
 def _operation_ids(value: object, category: str) -> list[str]:
     """Require explicit complete YAML locations in the lifecycle-owned category."""
 
@@ -948,7 +931,7 @@ def _ship_after_promotion(
     ):
         for operation in operations:
             command.extend((flag, operation))
-    ship_code, shipped = _run_json(command, repo_root)
+    ship_code, shipped = run_json_command(command, repo_root)
     status = shipped.get("status")
     if ship_code == 0:
         if (
@@ -1156,7 +1139,7 @@ def _promote(
     ]
     for branch in merged:
         record_command.extend(("--source-branch", branch))
-    record_code, record = _run_json(record_command, SCRIPT_ROOT)
+    record_code, record = run_json_command(record_command, SCRIPT_ROOT)
     if record_code == 2:
         return record
     if record_code:
@@ -1179,7 +1162,7 @@ def _promote(
                     args.sdlc_contract,
                     context="ci",
                 )
-            validation_code, validation = _run_json(
+            validation_code, validation = run_json_command(
                 _validation_command(args, repo_root, target_commit),
                 repo_root,
             )

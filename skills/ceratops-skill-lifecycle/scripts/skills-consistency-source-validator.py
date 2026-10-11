@@ -23,6 +23,7 @@ from collections.abc import Mapping, Sequence
 from typing import cast
 
 import tomllib
+import yaml
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
 
@@ -69,10 +70,13 @@ ACTION_REFERENCE_TOKEN_RE = re.compile(r"`(?P<path>references/[^`\s]+\.md)`")
 DIRECT_ACTION_REFERENCE_RE = re.compile(r"references/[a-z0-9]+(?:-[a-z0-9]+)*\.md")
 ACTION_TITLE_RE = re.compile(r"# .+ Action")
 ALLOWED_EXTERNAL_SKILL_REFS = {"skill-creator", "skill-name"}
-INTERFACE_FIELD_RE = re.compile(
-    r"^\s*(display_name|short_description|icon_small|icon_large|default_prompt):\s*(.+?)\s*$",
-    re.MULTILINE,
-)
+REQUIRED_SKILL_FRONTMATTER_FIELDS = {"name", "description"}
+OPTIONAL_SKILL_FRONTMATTER_FIELDS = {
+    "license",
+    "compatibility",
+    "metadata",
+    "allowed-tools",
+}
 CERATOPS_ICON_REL = "./assets/ceratops-logo-500.png"
 CERATOPS_ICON_SOURCE = (
     ROOT
@@ -156,8 +160,8 @@ INSTALLER_VERSION_RE = re.compile(
 )
 
 
-def parse_frontmatter(path: pathlib.Path) -> tuple[dict[str, str], str]:
-    """Parse the simple YAML frontmatter format used by source skills."""
+def parse_frontmatter(path: pathlib.Path) -> tuple[dict[str, object], str]:
+    """Parse one Agent Skills YAML frontmatter mapping and Markdown body."""
 
     text = path.read_text(encoding="utf-8")
     lines = text.splitlines()
@@ -169,17 +173,17 @@ def parse_frontmatter(path: pathlib.Path) -> tuple[dict[str, str], str]:
     except ValueError as exc:
         raise ValueError("missing closing YAML frontmatter marker") from exc
 
-    data: dict[str, str] = {}
-    for line in lines[1:end]:
-        if not line.strip():
-            continue
-        if ":" not in line:
-            raise ValueError(f"invalid frontmatter line: {line!r}")
-        key, value = line.split(":", 1)
-        data[key.strip()] = value.strip().strip('"')
+    try:
+        loaded = yaml.safe_load("\n".join(lines[1:end]))
+    except yaml.YAMLError as exc:
+        raise ValueError(f"invalid YAML frontmatter: {exc}") from exc
+    if not isinstance(loaded, Mapping) or not all(
+        isinstance(key, str) for key in loaded
+    ):
+        raise ValueError("frontmatter must be a string-keyed YAML mapping")
 
     body = "\n".join(lines[end + 1 :])
-    return data, body
+    return dict(loaded), body
 
 
 def load_section_manifest() -> dict[str, object]:
@@ -221,17 +225,85 @@ def validation_profile(manifest: Mapping[str, object]) -> str:
     return value if isinstance(value, str) and value in VALIDATION_PROFILES else ""
 
 
-def parse_openai_interface(path: pathlib.Path) -> dict[str, str]:
-    """Extract the flat `interface` fields validated from `openai.yaml`."""
+def load_openai_metadata(path: pathlib.Path) -> dict[str, object]:
+    """Load the product metadata as one string-keyed YAML mapping."""
 
-    data: dict[str, str] = {}
-    text = path.read_text(encoding="utf-8")
-    for key, raw_value in INTERFACE_FIELD_RE.findall(text):
-        value = raw_value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
-            value = value[1:-1]
-        data[key] = value
-    return data
+    try:
+        loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except yaml.YAMLError as exc:
+        raise ValueError(f"invalid agents/openai.yaml: {exc}") from exc
+    if not isinstance(loaded, Mapping) or not all(
+        isinstance(key, str) for key in loaded
+    ):
+        raise ValueError("agents/openai.yaml must be a string-keyed mapping")
+    return dict(loaded)
+
+
+def openai_metadata_shape(
+    metadata: Mapping[str, object],
+) -> tuple[dict[str, str], list[str]]:
+    """Return interface strings and structural errors for optional metadata."""
+
+    errors: list[str] = []
+    interface_value = metadata.get("interface")
+    interface: dict[str, str] = {}
+    if not isinstance(interface_value, Mapping):
+        errors.append("openai.yaml interface must be a mapping")
+    elif not all(
+        isinstance(key, str) and isinstance(value, str)
+        for key, value in interface_value.items()
+    ):
+        errors.append("openai.yaml interface fields must be strings")
+    else:
+        interface = dict(interface_value)
+
+    dependencies = metadata.get("dependencies")
+    if dependencies is not None:
+        if not isinstance(dependencies, Mapping):
+            errors.append("openai.yaml dependencies must be a mapping")
+        else:
+            tools = dependencies.get("tools")
+            if tools is not None:
+                if not isinstance(tools, list):
+                    errors.append("openai.yaml dependencies.tools must be an array")
+                else:
+                    for index, tool in enumerate(tools):
+                        if not isinstance(tool, Mapping):
+                            errors.append(
+                                "openai.yaml dependencies.tools"
+                                f"[{index}] must be an object"
+                            )
+                            continue
+                        if tool.get("type") != "mcp":
+                            errors.append(
+                                "openai.yaml dependencies.tools"
+                                f"[{index}].type must be mcp"
+                            )
+                        value = tool.get("value")
+                        if not isinstance(value, str) or not value.strip():
+                            errors.append(
+                                "openai.yaml dependencies.tools"
+                                f"[{index}].value must be a nonempty string"
+                            )
+                        for field in ("description", "transport", "url"):
+                            if field in tool and not isinstance(tool[field], str):
+                                errors.append(
+                                    "openai.yaml dependencies.tools"
+                                    f"[{index}].{field} must be a string"
+                                )
+
+    policy = metadata.get("policy")
+    if policy is not None:
+        if not isinstance(policy, Mapping):
+            errors.append("openai.yaml policy must be a mapping")
+        elif (
+            "allow_implicit_invocation" in policy
+            and not isinstance(policy["allow_implicit_invocation"], bool)
+        ):
+            errors.append(
+                "openai.yaml policy.allow_implicit_invocation must be Boolean"
+            )
+    return interface, errors
 
 
 def normalized_tokens(text: str) -> list[str]:
@@ -1253,15 +1325,55 @@ def check_skill(
         errors.append(f"{name}: {exc}")
         return errors
 
-    if set(frontmatter) != {"name", "description"}:
-        errors.append(f"{name}: frontmatter must contain only name and description")
-    if frontmatter.get("name") != name:
+    frontmatter_fields = set(frontmatter)
+    missing_frontmatter = sorted(
+        REQUIRED_SKILL_FRONTMATTER_FIELDS - frontmatter_fields
+    )
+    unsupported_frontmatter = sorted(
+        frontmatter_fields
+        - REQUIRED_SKILL_FRONTMATTER_FIELDS
+        - OPTIONAL_SKILL_FRONTMATTER_FIELDS
+    )
+    if missing_frontmatter:
+        errors.append(
+            f"{name}: frontmatter missing required fields: "
+            + ", ".join(missing_frontmatter)
+        )
+    if unsupported_frontmatter:
+        errors.append(
+            f"{name}: frontmatter has unsupported fields: "
+            + ", ".join(unsupported_frontmatter)
+        )
+    if not isinstance(frontmatter.get("name"), str) or frontmatter.get("name") != name:
         errors.append(f"{name}: frontmatter name does not match directory")
-    description = frontmatter.get("description", "")
+    description_value = frontmatter.get("description")
+    if not isinstance(description_value, str):
+        errors.append(f"{name}: description must be a string")
+        description = ""
+    else:
+        description = description_value
     if len(description) < 40:
         errors.append(f"{name}: description is too short")
     if len(description) > 1024:
         errors.append(f"{name}: description exceeds 1024 characters")
+    for field in ("license", "allowed-tools"):
+        if field in frontmatter and not isinstance(frontmatter[field], str):
+            errors.append(f"{name}: {field} must be a string")
+    compatibility = frontmatter.get("compatibility")
+    if compatibility is not None:
+        if not isinstance(compatibility, str):
+            errors.append(f"{name}: compatibility must be a string")
+        elif len(compatibility) > 500:
+            errors.append(f"{name}: compatibility exceeds 500 characters")
+    skill_metadata = frontmatter.get("metadata")
+    if skill_metadata is not None and (
+        not isinstance(skill_metadata, Mapping)
+        or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in skill_metadata.items()
+        )
+    ):
+        errors.append(f"{name}: metadata must map strings to strings")
     if "TODO" in skill_md.read_text(encoding="utf-8"):
         errors.append(f"{name}: contains TODO placeholder")
     if "publish-github-registry" in skill_md.read_text(encoding="utf-8"):
@@ -1292,22 +1404,29 @@ def check_skill(
         errors.append(f"{name}: missing agents/openai.yaml")
     else:
         yaml_text = openai_yaml.read_text(encoding="utf-8")
-        required_fields = ["display_name:", "short_description:", "default_prompt:"]
+        try:
+            openai_metadata = load_openai_metadata(openai_yaml)
+            interface, metadata_errors = openai_metadata_shape(openai_metadata)
+            errors.extend(f"{name}: {error}" for error in metadata_errors)
+        except ValueError as exc:
+            errors.append(f"{name}: {exc}")
+            interface = {}
+        required_fields = ["display_name", "short_description", "default_prompt"]
         if profile == PROFILE_CERATOPS:
-            required_fields.extend(("icon_small:", "icon_large:"))
+            required_fields.extend(("icon_small", "icon_large"))
         for required in required_fields:
-            if required not in yaml_text:
-                errors.append(f"{name}: openai.yaml missing {required}")
-        if f"${name}" not in yaml_text:
+            if not interface.get(required):
+                errors.append(f"{name}: openai.yaml missing {required}:")
+        default_prompt = interface.get("default_prompt", "")
+        if default_prompt and f"${name}" not in default_prompt:
             errors.append(f"{name}: default_prompt should mention ${name}")
-        interface = parse_openai_interface(openai_yaml)
         display_name = interface.get("display_name", "")
         short_description = interface.get("short_description", "")
         icon_small = interface.get("icon_small", "")
         icon_large = interface.get("icon_large", "")
         if display_name and not display_name_sane(name, display_name, profile):
             errors.append(f"{name}: display_name no longer matches the skill name closely enough")
-        if short_description and not short_description_relevant(short_description, frontmatter.get("description", "")):
+        if short_description and not short_description_relevant(short_description, description):
             errors.append(f"{name}: short_description no longer matches the skill description closely enough")
         icon_fields = (("icon_small", icon_small), ("icon_large", icon_large)) if profile == PROFILE_CERATOPS else ()
         for field_name, icon_value in icon_fields:

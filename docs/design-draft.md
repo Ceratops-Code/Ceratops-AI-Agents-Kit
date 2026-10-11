@@ -232,6 +232,77 @@ changed files, and the serialized response ceiling. Hook tests replay the
 recorded source-turn commands from calls 1, 3, 4, and 41 and distinguish broad
 content searches from focused searches.
 
+## Live test progress
+
+`scripts/testing/report_test_progress.py` owns the repository runner's pytest
+hooks and child transport. Explicit plugin registration reserves a stderr
+descriptor before pytest redirects test output. Collection, current-test names,
+completed counts, and the actual pytest exit code use escaped lines prefixed
+with `[tests]` and a space.
+Ordinary updates are limited to one per second; a sixty-second heartbeat reports
+the current test and elapsed time during long waits. First and final status lines
+are always sent. Collection-only probes keep their existing output contract.
+
+The installed repository lifecycle's `github_pr_workflow/command.py` owns
+parent transport. Both repository commands and skill handoffs use it, and
+promotion delegates its JSON command exchange to it. Every parent drains stderr
+while its child is running and forwards matching progress lines immediately.
+stdout remains the final machine-readable result; both original streams remain
+available to existing failure diagnostics. Final JSON on stderr also remains
+readable after progress lines are excluded. A closed display does not stop pipe
+drainage or change the command result; interruption stops the owned child and
+joins its reader before propagating.
+
+These status messages are in-memory observations, with no execution identifier,
+checkpoint, file, or selection/recovery role. The tool caller can display them
+inside one active tool execution without a model turn per update. The runner's
+existing diagnostic-file retention is unchanged. This implementation covers this
+repository's pytest runner, SDLC command/handoff execution, and promotion; it does
+not instrument arbitrary downstream test frameworks.
+
+## Saved pytest passes
+
+`scripts/testing/reuse_test_results.py` owns executed-pass acceptance for this
+repository's existing runner. It uses pytest phase reports and the existing
+input inventory; it introduces no database, worker history or second production
+dependency graph. The skill-update CLI separately configures stdout and stderr
+as UTF-8 before parsing or dispatch, preserving errors under Windows legacy
+encodings and leaving command exit statuses unchanged.
+
+Every fresh runner call collects the current required checks. A matching pass
+deselects only that check; failed, interrupted, skipped and unknown checks run
+normally. Records are written only after successful setup, call and teardown,
+so passes from a failed or interrupted suite remain useful. A test-file change
+runs that file's cases again and preserves passes for other unchanged checks.
+An empty collection and actual pytest failures retain their failure exit codes.
+The returned JSON includes collected, executed and reused counts; no model call
+is needed to select or transfer individual results.
+
+Matching inputs include checkout identity, exact arguments, caller environment
+digest (excluding worker-monitoring IDs), runtime/platform, Git/uv versions,
+installed distribution versions, the producer version,
+test bytes, imported repository helpers and the conservative non-test input
+inventory. All fixture/helper/data files and new unignored inputs participate.
+Documentation-only patterns come from `tests/test-impact.json`. Hashes identify
+versions; successful pytest reports prove that execution passed. Checks with
+unrepresented dynamic or external-service inputs use `no_result_reuse` and
+execute on every call. Distributed pytest workers also execute normally.
+
+The owner writes canonical `ceratops-pytest-pass.v1` JSON directly to unique
+`<git-common-dir>/ceratops/results/repository-checks/pytest-pass-<result-id>.json`
+paths. Records name the check, executed phase results, exact inputs and their
+digest. `.pytest-pass.lock` serializes reads, final writes and pruning; a busy
+writer leaves another invocation free to execute its checks normally. Startup
+and each completed write retain current plus two predecessors per checkout/check
+and remove malformed producer-owned records. Other producers' files are untouched.
+These accepted results survive task-temp and worktree deletion. The caller-owned
+`pytest-results.json` lives only inside pytest's isolated temp directory, carries
+returned counts/provenance, and is removed by that directory's existing owner.
+
+This is runner-level reuse. Release-unit qualification levels, historical baseline
+selection and lifecycle receipt references remain the separate refactor-plan
+integration; they must consume this owner rather than create another pass store.
+
 ## Pytest failure diagnostics
 
 `scripts/testing/pytest-diagnostics.py` owns the bounded failure summary used
@@ -239,6 +310,12 @@ by the repository test runner. The runner retains complete failed stdout and
 stderr at its selected diagnostic path; successful runs remove stale evidence.
 The compact summary keeps pytest's failure evidence within the existing byte
 and identity limits and excludes unrelated captured output.
+
+Plugin import tracebacks retain their terminal exception in both the per-failure
+excerpt and the compact global excerpt, rather than spending the line budget on
+wrapper frames. A native stderr traceback before collection has the explicit
+`<pytest startup>` runner identity; it is not attributed to an undiscovered test.
+The runner's existing JSON fields and numeric exit code are unchanged.
 
 Nested MCP transport failures can arrive as native exception groups. The
 diagnostic parser retains the group's leaf errors and locations so the summary
@@ -1219,6 +1296,10 @@ Success removes the exact record and sibling, then the empty record directory;
 no completed history is retained. Directory identity prevents recovery from
 deleting a replacement path. This cleanup leaves remote refs, accepted artifacts
 and installations to their existing owners.
+Standalone `cleanup --worktree <absolute-path>` narrows discovery and unfinished
+removal handling to one canonical task-worktree path and its associated branch.
+Unrelated removal records and atomic scratch remain with their existing owners;
+the default Ship cleanup continues to discover repository-wide candidates.
 After removing a worktree, the helper clears its exact name and captured thread
 UUID groups under `<repo-parent>/tmp/<repo-name>`, using the existing scoped
 temp owner. Redirected roots and matching links stop removal. A temp-removal
@@ -1346,6 +1427,14 @@ the shared producer lock per invocation. No operation UUID or caller-supplied
 state/evidence paths are required. The caller's request has schema
 `ceratops-skill-update-request.v3` and fields `selected_skills`,
 `allowed_paths`, `change_groups` and non-test `checks`.
+
+Declared files may be existing, untracked or not yet created, including files
+whose parent directories do not yet exist. The selected checkout's resolved
+root bounds their location; the request's exact paths bound the change scope.
+Opening a request and loading its recorded scope use the same file-target
+checks: Git internals, symlinks, junctions, directories and paths outside the
+checkout are rejected. Git tracking is not an eligibility condition. Selected
+skills still require an owned source path in the declared scope.
 
 The ordinary driver boundary is deterministic: `init` derives that closed
 request from repeated skill/path groups plus UTF-8 command files, and `run`

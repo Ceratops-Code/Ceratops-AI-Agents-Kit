@@ -6,6 +6,7 @@
     "multi-action-skill": "skills/sections/multi-action-skill.md",
     "evidence-analysis": "skills/sections/evidence-analysis.md",
     "bounded-model-analysis": "skills/sections/bounded-model-analysis.md",
+    "credit-analysis-deep-surface": "skills/sections/credit-analysis-deep-surface.md",
     "contract-review": "skills/sections/contract-review.md"
   },
   "maintenance_workflows": {
@@ -124,6 +125,26 @@
     ]
   },
   "actions": {
+    "ceratops-credit-savings-analysis": {
+      "references/deep-thread-analysis.md": [
+        "credit-analysis-deep-surface"
+      ],
+      "references/helper-contracts.md": [
+        "credit-analysis-deep-surface"
+      ],
+      "references/context-evidence.md": [
+        "credit-analysis-deep-surface"
+      ],
+      "references/rework-validation.md": [
+        "credit-analysis-deep-surface"
+      ],
+      "references/tool-flow.md": [
+        "credit-analysis-deep-surface"
+      ],
+      "references/instruction-reasoning.md": [
+        "credit-analysis-deep-surface"
+      ]
+    },
     "ceratops-repo-lifecycle": {
       "references/repo-contracts-review.md": [
         "contract-review"

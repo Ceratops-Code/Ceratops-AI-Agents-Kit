@@ -1,6 +1,7 @@
 """Bounded pytest failure summaries for the adjacent repository test runner.
 
 Console sections are evidence only when matched to a reported test identity.
+Before collection, a native stderr traceback has its own runner-level identity.
 Raw stdout and stderr remain available in the runner-owned diagnostic artifact.
 """
 
@@ -223,7 +224,9 @@ def _pytest_source_location(identity: str, section: Sequence[str]) -> str | None
     return None
 
 
-def _pytest_failure_excerpt(section: Sequence[str], fallback: str) -> str:
+def _pytest_failure_excerpt(
+    section: Sequence[str], fallback: str, *, native: bool = False,
+) -> str:
     """Return bounded decisive lines for one failure, or its summary reason."""
 
     # A chained exception's final block is the reported failure. Earlier blocks
@@ -249,8 +252,17 @@ def _pytest_failure_excerpt(section: Sequence[str], fallback: str) -> str:
             in_group_message = False
         if line.startswith("> "):
             marked_source.append(line)
-        if line in PYTEST_EXCEPTION_CHAIN_MARKERS:
+        message = line[1:].lstrip() if line.startswith("E ") else line
+        if message in PYTEST_EXCEPTION_CHAIN_MARKERS:
             decisive = []
+        elif (
+            PYTHON_EXCEPTION_MESSAGE.match(message)
+            and (line.startswith("E ") or native)
+            and _pytest_console_location(message) is None
+        ):
+            # Plugin import failures can wrap a whole traceback in E-prefixed
+            # lines. Its terminal exception, not its first frame, owns the budget.
+            decisive = [line]
         elif line.startswith(("E ", "AssertionError")):
             decisive.append(line)
     # Leaf messages explain SDK failures; the outer group label only says how
@@ -276,7 +288,7 @@ def _bounded_lines(lines: Iterable[str], *, line_limit: int, byte_limit: int) ->
 
 
 def pytest_failure_summary(stdout: str, stderr: str) -> dict[str, object]:
-    """Extract bounded per-failure actions plus compact global context."""
+    """Extract bounded evidence for a failed pytest process, including startup."""
 
     raw_lines = [
         line for stream in (stdout, stderr) for line in stream.splitlines()
@@ -318,6 +330,19 @@ def pytest_failure_summary(stdout: str, stderr: str) -> dict[str, object]:
                 "excerpt": _pytest_failure_excerpt(section, reason),
             }
         )
+    if not summaries and not sections:
+        startup = [line.strip() for line in stderr.splitlines() if line.strip()]
+        # Only a native process traceback can supply this synthetic identity.
+        # Never turn arbitrary stdout or captured test output into a test failure.
+        if (
+            "Traceback (most recent call last):" in startup
+            and not any(PYTEST_CAPTURE_HEADER.fullmatch(line) for line in startup)
+            and any(PYTHON_EXCEPTION_MESSAGE.match(line) for line in startup)
+        ):
+            identity = "<pytest startup>"
+            summaries.append((identity, ""))
+            failures.append({"test": identity, "source_location": None,
+                             "excerpt": _pytest_failure_excerpt(startup, "", native=True)})
     return {
         "failure_count": len(summaries),
         "omitted_failure_count": max(0, len(summaries) - len(failures)),
