@@ -41,6 +41,10 @@ controller implementation are authoritative for workflow mechanics.
 
 `quick-analysis` uses its own evidence, classification, and completion rules.
 
+## Output Contract
+
+Use the selected action's output contract.
+
 ## Analysis-Only Boundaries
 
 ### Research Boundaries
