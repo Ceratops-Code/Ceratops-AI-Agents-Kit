@@ -274,6 +274,7 @@ def preflight(args: argparse.Namespace) -> int:
             }
             # An advisory with no published fix has parsed successfully. Keep
             # its remediation blocker distinct from malformed update metadata.
+            registry: dict[str, Any]
             if update.get("package") and not alert.get("patched_versions"):
                 registry = {"status": "unavailable", "reason": "no_patched_version_listed"}
             elif update.get("package") and not update.get("target_version"):
