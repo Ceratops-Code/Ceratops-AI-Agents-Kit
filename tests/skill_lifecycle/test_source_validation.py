@@ -60,7 +60,7 @@ def test_consistency_review_packet_resolves_one_installed_skill(
     automations.mkdir(parents=True)
     consumer = automations / "automation.toml"
     consumer.write_text(
-        'name = "Status review"\nprompt = "Use $ceratops-task-lifecycle repository-status."\n',
+        'name = "Status review"\nprompt = "Use $ceratops-task-lifecycle worktree-status."\n',
         encoding="utf-8",
         newline="\n",
     )
@@ -92,7 +92,7 @@ def test_consistency_review_packet_resolves_one_installed_skill(
     assert packet["schema"] == "ceratops-skills-consistency-review-packet.v1"
     assert packet["identity"]["skill"] == skill
     assert packet["validator"]["status"] == "passed"
-    assert "scripts/repository-status-snapshot.py" in packet["surfaces"]["helpers"]
+    assert "scripts/collect-worktree-status.py" in packet["surfaces"]["helpers"]
     assert packet["surfaces"]["automation_consumers"] == [str(consumer.resolve())]
     assert packet["blockers"] == []
 
