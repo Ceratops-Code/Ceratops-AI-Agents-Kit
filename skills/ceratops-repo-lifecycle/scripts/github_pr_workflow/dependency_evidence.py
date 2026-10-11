@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import pathlib
 import re
 import subprocess
-import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any
+
+import tomllib
 
 from .dependency_common import (
     BUMP_RE,
@@ -51,11 +53,11 @@ def project_check(check: dict[str, Any]) -> dict[str, Any]:
     conclusion = str(check.get("conclusion") or check.get("state") or "").upper()
     if conclusion in FAILED_CHECK_RESULTS:
         classification = "failed"
-    elif status and status != "COMPLETED":
-        classification = "pending"
-    elif conclusion and conclusion not in SUCCESS_CHECK_RESULTS:
-        classification = "pending"
-    elif not conclusion and status != "COMPLETED":
+    elif (
+        (status and status != "COMPLETED")
+        or (conclusion and conclusion not in SUCCESS_CHECK_RESULTS)
+        or (not conclusion and status != "COMPLETED")
+    ):
         classification = "pending"
     else:
         classification = "passed"
@@ -312,6 +314,11 @@ def build_update(
             for name in ("requirements", "pyproject.toml", "poetry.lock", "uv.lock")
         ):
             ecosystem = "pip"
+        elif package == "gradle-wrapper" and any(
+            pathlib.PurePosixPath(path).name == "gradle-wrapper.properties"
+            for path in changed_paths
+        ):
+            ecosystem = "gradle"
     return {
         "package": package,
         "current_version": current,
@@ -448,13 +455,23 @@ def bounded_json(value: Any, *, depth: int = 0) -> Any:
     return value
 
 
-def fetch_url_json(url: str) -> dict[str, Any]:
+def fetch_url_json(url: str, *, release_version: str | None = None) -> dict[str, Any]:
+    """Read one metadata object, selecting an exact release from list APIs."""
+
     request = urllib.request.Request(
         url,
         headers={"Accept": "application/json", "User-Agent": "codex-dependabot-preflight/1"},
     )
     with urllib.request.urlopen(request, timeout=20) as response:
         value = json.loads(response.read().decode("utf-8"))
+    if release_version is not None:
+        matches = [
+            item for item in value
+            if isinstance(item, dict) and item.get("version") == release_version
+        ] if isinstance(value, list) else []
+        if len(matches) != 1:
+            raise WorkflowError(f"registry must list exactly one release {release_version}")
+        value = matches[0]
     if not isinstance(value, dict):
         raise WorkflowError(f"registry returned non-object JSON for {url}")
     return value
@@ -509,13 +526,38 @@ def registry_evidence(update: dict[str, Any]) -> dict[str, Any]:
                     "api",
                     f"repos/{action_repo}/commits/{target_ref}",
                     "--jq",
-                    "{sha:.sha,html_url:.html_url,committed_at:.commit.committer.date,"
-                    "verified:.commit.verification.verified}",
+                    (
+                        "{sha:.sha,html_url:.html_url,committed_at:.commit.committer.date,"
+                        "verified:.commit.verification.verified}"
+                    ),
                 ]
             )
             if completed.returncode != 0:
                 return {"status": "blocked", "source": "api.github.com", "error": compact_error(completed)}
             return {"status": "ok", "source": "api.github.com", **json.loads(completed.stdout or "{}")}
+        if ecosystem == "gradle" and package == "gradle-wrapper":
+            target_version = str(target).removeprefix("v")
+            raw = fetch_url_json(
+                "https://services.gradle.org/versions/all", release_version=target_version,
+            )
+            if (
+                raw.get("released") is not True
+                or raw.get("final") is not True
+                or raw.get("snapshot") is not False
+                or raw.get("broken") is not False
+            ):
+                raise WorkflowError("Gradle target is not an available stable release")
+            expected_url = f"https://services.gradle.org/distributions/gradle-{target_version}-bin.zip"
+            if raw.get("downloadUrl") != expected_url or any(
+                not re.fullmatch(r"[0-9a-fA-F]{64}", str(raw.get(name) or ""))
+                for name in ("checksum", "wrapperChecksum")
+            ):
+                raise WorkflowError("Gradle release distribution or checksum metadata is incomplete")
+            return {
+                "status": "ok", "source": "services.gradle.org", "version": target_version,
+                "distribution_url": expected_url, "distribution_sha256": raw["checksum"],
+                "wrapper_sha256": raw["wrapperChecksum"],
+            }
     except (OSError, ValueError, json.JSONDecodeError, urllib.error.URLError, WorkflowError) as exc:
         return {"status": "blocked", "error": str(exc)[:360]}
     return {"status": "unavailable", "reason": f"unsupported_ecosystem:{ecosystem or 'unknown'}"}
@@ -670,6 +712,63 @@ def github_actions_tree_evidence(
     }
 
 
+def gradle_wrapper_tree_evidence(
+    checkout: pathlib.Path,
+    relative_paths: set[str],
+) -> dict[str, Any]:
+    """Collect checkout wrapper context, not candidate-head acceptance.
+
+    Wrapper updates have distribution and bootstrap references rather than a
+    Maven dependency graph. Accept canonical Gradle-generated fields only;
+    ambiguous properties, missing pins, and checkout escapes remain blocking.
+    """
+
+    sources: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+    for relative in sorted(relative_paths):
+        if pathlib.PurePosixPath(relative).name != "gradle-wrapper.properties":
+            continue
+        path = (checkout / relative).resolve()
+        try:
+            path.relative_to(checkout.resolve())
+            text = path.read_text(encoding="utf-8")
+            for line in text.splitlines():
+                if not line.strip() or line.lstrip().startswith(("#", "!")):
+                    continue
+                if not re.fullmatch(r"[A-Za-z][A-Za-z0-9]*[ \t]*=[^\r\n]*", line) or line.endswith("\\"):
+                    raise WorkflowError("wrapper properties must use canonical unambiguous fields")
+            urls = re.findall(r"(?m)^distributionUrl[ \t]*=[ \t]*(\S+)[ \t]*$", text)
+            pins = re.findall(r"(?m)^distributionSha256Sum[ \t]*=[ \t]*(\S+)[ \t]*$", text)
+            if len(urls) != 1 or len(pins) != 1 or not re.fullmatch(r"[0-9a-fA-F]{64}", pins[0]):
+                raise WorkflowError("wrapper requires one distribution URL and one SHA-256 pin")
+            url = urls[0].replace("\\:", ":")
+            parsed = urllib.parse.urlsplit(url)
+            match = re.fullmatch(
+                r"/distributions/gradle-(?P<version>\d+(?:\.\d+){1,2}(?:-[0-9A-Za-z.-]+)?)-(?:bin|all)\.zip",
+                parsed.path,
+            )
+            if (
+                parsed.scheme != "https" or parsed.netloc != "services.gradle.org"
+                or parsed.query or parsed.fragment or not match
+            ):
+                raise WorkflowError("wrapper distribution must name an exact official Gradle release")
+            jar = (path.parent / "gradle-wrapper.jar").resolve()
+            jar.relative_to(checkout.resolve())
+            if jar.stat().st_size > 5 * 1024 * 1024:
+                raise WorkflowError("wrapper JAR exceeds the evidence size bound")
+            sources.append({
+                "file": relative, "distribution_url": url, "version": match.group("version"),
+                "distribution_sha256": pins[0],
+                "wrapper_sha256": hashlib.sha256(jar.read_bytes()).hexdigest(),
+            })
+        except (OSError, ValueError, WorkflowError) as exc:
+            errors.append({"file": relative, "error": str(exc)[:300]})
+    return {
+        "status": "ok" if sources and not errors else ("blocked" if errors else "unavailable"),
+        "sources": sources, "errors": errors,
+    }
+
+
 def dependency_tree_evidence(
     checkout: pathlib.Path,
     update: dict[str, Any],
@@ -701,6 +800,8 @@ def dependency_tree_evidence(
             relative_paths.add(name)
     if str(update.get("ecosystem") or "").lower() == "github-actions":
         return github_actions_tree_evidence(checkout, str(package), relative_paths)
+    if str(update.get("ecosystem") or "").lower() == "gradle" and package == "gradle-wrapper":
+        return gradle_wrapper_tree_evidence(checkout, relative_paths)
     sources: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
     for relative in sorted(relative_paths):

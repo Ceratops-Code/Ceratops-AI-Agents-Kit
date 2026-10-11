@@ -272,7 +272,14 @@ def preflight(args: argparse.Namespace) -> int:
                 "ecosystem": str(alert.get("ecosystem") or "unknown"),
                 "update_type": "unknown",
             }
-            registry = registry_evidence(update)
+            # An advisory with no published fix has parsed successfully. Keep
+            # its remediation blocker distinct from malformed update metadata.
+            if update.get("package") and not alert.get("patched_versions"):
+                registry = {"status": "unavailable", "reason": "no_patched_version_listed"}
+            elif update.get("package") and not update.get("target_version"):
+                registry = {"status": "unavailable", "reason": "unparsed_patched_version_range"}
+            else:
+                registry = registry_evidence(update)
             dependency_tree = (
                 dependency_tree_evidence(
                     pathlib.Path(str(checkout["path"])),
@@ -288,7 +295,11 @@ def preflight(args: argparse.Namespace) -> int:
                     {
                         "repo": full_name,
                         "alert": alert_number,
-                        "check": "alert_registry_preflight",
+                        "check": (
+                            "alert_patch_availability"
+                            if registry.get("reason") == "no_patched_version_listed"
+                            else "alert_registry_preflight"
+                        ),
                         "message": str(registry.get("error") or registry.get("reason") or "registry metadata unavailable")[:360],
                     }
                 )
