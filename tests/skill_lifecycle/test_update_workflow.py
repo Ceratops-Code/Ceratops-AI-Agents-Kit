@@ -709,3 +709,57 @@ def test_check_scratch_is_disposable_and_not_a_result(tmp_path, monkeypatch):
 def test_removed_command_names_have_no_compatibility_alias(tmp_path, old_command):
     result = run_skill_update_workflow(old_command, "--repo-root", str(tmp_path))
     assert result.returncode == 2 and "invalid choice" in result.stderr
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_cli_prints_utf8_with_legacy_windows_streams(monkeypatch, tmp_path, failure):
+    import io
+
+    workflow = _workflow(monkeypatch)
+    message = "תוצאה: ошибка"
+
+    def outcome(*args):
+        if failure:
+            raise workflow["UpdateExecutionError"](message)
+        return message
+
+    monkeypatch.setitem(workflow["main"].__globals__, "command_run", outcome)
+    buffers = [io.BytesIO(), io.BytesIO()]
+    streams = [io.TextIOWrapper(buffer, encoding="cp1252") for buffer in buffers]
+    with monkeypatch.context() as context:
+        context.setattr(sys, "stdout", streams[0])
+        context.setattr(sys, "stderr", streams[1])
+        code = workflow["main"](["run", "--repo-root", str(tmp_path)])
+        for stream in streams:
+            stream.flush()
+            assert stream.encoding == "utf-8"
+    assert code == (2 if failure else 0)
+    output = buffers[1 if failure else 0].getvalue().decode("utf-8")
+    assert output == ("error: " if failure else "") + message + os.linesep
+    assert buffers[0 if failure else 1].getvalue() == b""
+    for stream in streams:
+        stream.detach()
+
+
+@pytest.mark.parametrize("after_write", [False, True])
+def test_cli_fresh_call_after_output_interruption(monkeypatch, tmp_path, after_write):
+    import io
+
+    workflow = _workflow(monkeypatch)
+    monkeypatch.setitem(workflow["main"].__globals__, "command_run", lambda *args: "תוצאה")
+
+    class InterruptedOutput(io.StringIO):
+        def write(self, text):
+            if after_write:
+                super().write(text)
+            raise BrokenPipeError("observer stopped")
+
+    with monkeypatch.context() as context:
+        context.setattr(sys, "stdout", InterruptedOutput())
+        with pytest.raises(BrokenPipeError, match="observer stopped"):
+            workflow["main"](["run", "--repo-root", str(tmp_path)])
+    fresh = io.StringIO()
+    with monkeypatch.context() as context:
+        context.setattr(sys, "stdout", fresh)
+        assert workflow["main"](["run", "--repo-root", str(tmp_path)]) == 0
+    assert fresh.getvalue() == "תוצאה\n"

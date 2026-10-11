@@ -619,3 +619,394 @@ def test_final_status_uses_process_exit_after_session_finish_hooks(
     assert result.returncode == 7, result.stdout + result.stderr
     assert result.stderr.endswith("[tests] pytest exit 7\n")
     assert "pytest exit 0" not in result.stderr
+
+
+def _acceptance_repository(tmp_path):
+    from tests.support.repositories import run_git
+
+    root = tmp_path / "repository"
+    (root / "tests").mkdir(parents=True)
+    assert run_git(root, "init", "-q").returncode == 0
+    (root / ".gitignore").write_text("__pycache__/\n.pytest_cache/\n", encoding="utf-8")
+    (root / "tests/test-impact.json").write_text(json.dumps({
+        "version": 1,
+        "suites": {"example": {"pytest": ["tests"], "depends_on": []}},
+        "rules": [], "full_suite_paths": ["**"],
+        "ignored_paths": [], "unmapped_production": "error",
+    }), encoding="utf-8")
+    (root / "production.py").write_text("VALUE = 1\n", encoding="utf-8")
+    return root
+
+
+def _acceptance_test(root, name, counter, *, failure=False, extra=""):
+    (root / "tests" / f"test_{name}.py").write_text(
+        "import pathlib\n" + extra + f"def test_{name}():\n"
+        f"    with pathlib.Path({str(counter)!r}).open('a') as output:\n"
+        f"        output.write('{name}\\n')\n"
+        + ("    assert False, 'unfinished-check'\n" if failure else ""),
+        encoding="utf-8",
+    )
+
+
+def _acceptance_run(runner, root):
+    return runner.run_text(
+        [sys.executable, "-m", "pytest", "-q", "-o", "addopts=", "tests"], root,
+    )
+
+
+def _pass_store(root):
+    import importlib
+
+    module = importlib.import_module("reuse_test_results")
+    context = json.loads(module.result_environment(
+        [sys.executable, "-m", "pytest", "-q", "tests"], root, {},
+    )[module.RESULT_CONTEXT_ENV])
+    return module.PassStore(root, context)
+
+
+def test_test_only_correction_reuses_passes_from_failed_suite(
+    test_runner_module, tmp_path, monkeypatch,
+):
+    monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
+    root = _acceptance_repository(tmp_path)
+    counter = tmp_path / "effects.log"
+    _acceptance_test(root, "first", counter)
+    _acceptance_test(root, "second", counter, failure=True)
+    first = _acceptance_run(test_runner_module, root)
+    assert first.returncode == 1, first.stdout + first.stderr
+    assert first.accepted_checks == {"collected": 2, "executed": 2, "reused": 0}
+    _acceptance_test(root, "second", counter)
+    corrected = _acceptance_run(test_runner_module, root)
+    assert corrected.returncode == 0, corrected.stdout + corrected.stderr
+    assert corrected.accepted_checks == {"collected": 2, "executed": 1, "reused": 1}
+    repeated = _acceptance_run(test_runner_module, root)
+    assert repeated.returncode == 0, repeated.stdout + repeated.stderr
+    assert repeated.accepted_checks == {"collected": 2, "executed": 0, "reused": 2}
+    assert counter.read_text().splitlines() == ["first", "second", "second"]
+    assert len(list(_pass_store(root).directory.glob("pytest-pass-*.json"))) == 2
+
+
+@pytest.mark.parametrize("change", ["production", "fixture", "settings", "lock", "environment", "new-input"])
+def test_changed_test_inputs_execute_checks_again(
+    test_runner_module, tmp_path, monkeypatch, change,
+):
+    root = _acceptance_repository(tmp_path)
+    counter = tmp_path / "effects.log"
+    _acceptance_test(root, "example", counter)
+    first = _acceptance_run(test_runner_module, root)
+    assert first.returncode == 0, first.stdout + first.stderr
+    if change == "environment":
+        monkeypatch.setenv("TEST_DEPENDENCY_VERSION", "changed")
+    else:
+        path, text = {
+            "production": ("production.py", "VALUE = 2\n"),
+            "fixture": ("tests/conftest.py", "VALUE = 2\n"),
+            "settings": ("pytest.ini", "[pytest]\naddopts = --color=no\n"),
+            "lock": ("dependency.lock", "version = 2\n"),
+            "new-input": ("new-input.json", '{"value": 2}\n'),
+        }[change]
+        (root / path).write_text(text, encoding="utf-8")
+    changed = _acceptance_run(test_runner_module, root)
+    assert changed.returncode == 0, changed.stdout + changed.stderr
+    assert changed.accepted_checks == {"collected": 1, "executed": 1, "reused": 0}
+    assert counter.read_text().splitlines() == ["example", "example"]
+
+
+def test_interrupted_suite_keeps_only_completed_passes(test_runner_module, tmp_path):
+    root = _acceptance_repository(tmp_path)
+    counter = tmp_path / "effects.log"
+    _acceptance_test(root, "first", counter)
+    (root / "tests/test_second.py").write_text(
+        "def test_second():\n    raise KeyboardInterrupt('power lost')\n", encoding="utf-8",
+    )
+    interrupted = _acceptance_run(test_runner_module, root)
+    assert interrupted.returncode == 2, interrupted.stdout + interrupted.stderr
+    _acceptance_test(root, "second", counter)
+    fresh = _acceptance_run(test_runner_module, root)
+    assert fresh.returncode == 0, fresh.stdout + fresh.stderr
+    assert fresh.accepted_checks == {"collected": 2, "executed": 1, "reused": 1}
+    assert counter.read_text().splitlines() == ["first", "second"]
+
+
+def test_failed_teardown_is_not_a_pass(test_runner_module, tmp_path):
+    root = _acceptance_repository(tmp_path)
+    counter = tmp_path / "effects.log"
+    _acceptance_test(root, "example", counter)
+    (root / "tests/conftest.py").write_text(
+        "import pytest\n@pytest.fixture(autouse=True)\ndef broken():\n"
+        "    yield\n    assert False, 'teardown failed'\n", encoding="utf-8",
+    )
+    for _ in range(2):
+        result = _acceptance_run(test_runner_module, root)
+        assert result.returncode == 1, result.stdout + result.stderr
+        assert result.accepted_checks["reused"] == 0
+    assert not list(_pass_store(root).directory.glob("pytest-pass-*.json"))
+    assert counter.read_text().splitlines() == ["example", "example"]
+
+
+def test_external_input_marker_and_empty_collection_do_not_borrow_passes(
+    test_runner_module, tmp_path,
+):
+    root = _acceptance_repository(tmp_path)
+    counter = tmp_path / "effects.log"
+    _acceptance_test(root, "example", counter, extra="import pytest\n@pytest.mark.no_result_reuse\n")
+    for _ in range(2):
+        result = _acceptance_run(test_runner_module, root)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.accepted_checks["reused"] == 0
+    assert not list(_pass_store(root).directory.glob("pytest-pass-*.json"))
+    (root / "tests/test_example.py").unlink()
+    empty = _acceptance_run(test_runner_module, root)
+    assert empty.returncode == 5, empty.stdout + empty.stderr
+
+
+@pytest.mark.parametrize("effect", ["_write_pass", "_prune"])
+@pytest.mark.parametrize("after_effect", [False, True])
+def test_pass_record_interruption_uses_fresh_entry_without_execution_ids(
+    test_runner_module, tmp_path, monkeypatch, effect, after_effect,
+):
+    root = _acceptance_repository(tmp_path)
+    _acceptance_test(root, "example", tmp_path / "effects.log")
+    store = _pass_store(root)
+    nodeid = "tests/test_example.py::test_example"
+    inputs = store.inputs(nodeid)
+    original = getattr(store, effect)
+
+    def interrupted(*args):
+        if after_effect:
+            original(*args)
+        raise KeyboardInterrupt("power lost")
+
+    monkeypatch.setattr(store, effect, interrupted)
+    with pytest.raises(KeyboardInterrupt, match="power lost"):
+        store.save(nodeid, inputs)
+    fresh = _pass_store(root)
+    assert bool(fresh.matching(nodeid, inputs)) == (after_effect or effect == "_prune")
+    fresh.save(nodeid, inputs)
+    repeated = _pass_store(root)
+    repeated.save(nodeid, inputs)
+    assert repeated.matching(nodeid, inputs) is not None
+    assert len(list(repeated.directory.glob("pytest-pass-*.json"))) == 1
+
+
+def test_result_retention_prunes_at_startup_and_preserves_other_producers(
+    test_runner_module, tmp_path, monkeypatch,
+):
+    import importlib
+
+    module = importlib.import_module("reuse_test_results")
+    root = _acceptance_repository(tmp_path)
+    _acceptance_test(root, "example", tmp_path / "effects.log")
+    store = _pass_store(root)
+    unrelated = store.directory / "other-producer.json"
+    unrelated.write_text("keep", encoding="utf-8")
+    monkeypatch.setattr(module, "RETAINED_VERSIONS", 99)
+    for version in range(5):
+        (root / "tests/test_example.py").write_text(f"VERSION = {version}\n", encoding="utf-8")
+        current = _pass_store(root)
+        current.save("tests/test_example.py::test_example", current.inputs("tests/test_example.py::test_example"))
+    assert len(list(store.directory.glob("pytest-pass-*.json"))) == 5
+    monkeypatch.setattr(module, "RETAINED_VERSIONS", 3)
+    fresh = _pass_store(root)
+    assert len(list(fresh.directory.glob("pytest-pass-*.json"))) == 3
+    (fresh.directory / "pytest-pass-partial.json").write_text('{"schema":', encoding="utf-8")
+    clean = _pass_store(root)
+    assert len(list(clean.directory.glob("pytest-pass-*.json"))) == 3
+    assert unrelated.read_text() == "keep"
+
+
+def test_changed_arguments_and_dependency_versions_do_not_reuse_results(
+    test_runner_module, tmp_path, monkeypatch,
+):
+    import importlib
+    import types
+
+    module = importlib.import_module("reuse_test_results")
+    root = _acceptance_repository(tmp_path)
+    _acceptance_test(root, "example", tmp_path / "effects.log")
+    nodeid = "tests/test_example.py::test_example"
+    store = _pass_store(root)
+    store.save(nodeid, store.inputs(nodeid))
+    monkeypatch.setattr(module.importlib.metadata, "distributions", lambda: [
+        types.SimpleNamespace(metadata={"Name": "fixture-dependency"}, version="2"),
+    ])
+    changed = _pass_store(root)
+    assert changed.matching(nodeid, changed.inputs(nodeid)) is None
+    context = json.loads(module.result_environment(
+        [sys.executable, "-m", "pytest", "-x", "tests"], root, {},
+    )[module.RESULT_CONTEXT_ENV])
+    arguments = module.PassStore(root, context)
+    assert arguments.matching(nodeid, arguments.inputs(nodeid)) is None
+
+
+def test_runner_json_accounts_for_executed_and_reused_checks(test_runner_module, tmp_path, capsys):
+    root = _acceptance_repository(tmp_path)
+    counter = tmp_path / "effects.log"
+    _acceptance_test(root, "example", counter)
+    for executed, reused in ((1, 0), (0, 1)):
+        code = test_runner_module.execute(["--all"], repo_root=root)
+        payload = json.loads(capsys.readouterr().out)
+        assert code == 0 and payload["status"] == "passed", payload
+        assert payload["pytest"]["checks"] == {
+            "collected": 1, "executed": executed, "reused": reused,
+        }
+    assert counter.read_text().splitlines() == ["example"]
+
+
+def test_another_test_module_used_as_helper_is_an_input(test_runner_module, tmp_path):
+    root = _acceptance_repository(tmp_path)
+    helper = root / "tests/test_shared.py"
+    helper.write_text("def value():\n    return 1\n", encoding="utf-8")
+    (root / "tests/test_consumer.py").write_text(
+        "from test_shared import value\ndef test_consumer():\n    assert value() == 1\n",
+        encoding="utf-8",
+    )
+    first = _acceptance_run(test_runner_module, root)
+    assert first.returncode == 0, first.stdout + first.stderr
+    helper.write_text("def value():\n    return 100\n", encoding="utf-8")
+    changed = _acceptance_run(test_runner_module, root)
+    assert changed.returncode == 1, changed.stdout + changed.stderr
+    assert changed.accepted_checks["reused"] == 0
+
+
+def test_competing_writer_keeps_fresh_calls_live_and_retention_bounded(
+    test_runner_module, tmp_path,
+):
+    import importlib
+
+    module = importlib.import_module("reuse_test_results")
+    root = _acceptance_repository(tmp_path)
+    _acceptance_test(root, "example", tmp_path / "effects.log")
+    nodeid = "tests/test_example.py::test_example"
+    stale = _pass_store(root)
+    with stale.lock:
+        busy = _pass_store(root)
+        assert busy.records == []
+        assert busy.save(nodeid, busy.inputs(nodeid)) is None
+    for version in range(4):
+        context = json.loads(module.result_environment(
+            [sys.executable, "-m", "pytest", "-q", "tests"], root, {"VERSION": str(version)},
+        )[module.RESULT_CONTEXT_ENV])
+        current = module.PassStore(root, context)
+        current.save(nodeid, current.inputs(nodeid))
+    stale.save(nodeid, stale.inputs(nodeid))
+    fresh = _pass_store(root)
+    assert fresh.matching(nodeid, fresh.inputs(nodeid)) is not None
+    assert len(list(fresh.directory.glob("pytest-pass-*.json"))) == 3
+
+
+def test_fixture_imports_from_other_checks_are_inputs(test_runner_module, tmp_path):
+    root = _acceptance_repository(tmp_path)
+    helper = root / "tests/test_shared.py"
+    helper.write_text("def value():\n    return 1\n", encoding="utf-8")
+    (root / "tests/conftest.py").write_text(
+        "import pytest\nfrom test_shared import value\n@pytest.fixture\n"
+        "def helper_value():\n    return value()\n", encoding="utf-8",
+    )
+    (root / "tests/test_consumer.py").write_text(
+        "def test_consumer(helper_value):\n    assert helper_value == 1\n", encoding="utf-8",
+    )
+    first = _acceptance_run(test_runner_module, root)
+    assert first.returncode == 0, first.stdout + first.stderr
+    helper.write_text("def value():\n    return 100\n", encoding="utf-8")
+    changed = _acceptance_run(test_runner_module, root)
+    assert changed.returncode == 1, changed.stdout + changed.stderr
+    assert changed.accepted_checks["reused"] == 0
+
+
+def test_ignored_generated_code_does_not_produce_reusable_passes(test_runner_module, tmp_path):
+    root = _acceptance_repository(tmp_path)
+    with (root / ".gitignore").open("a") as stream:
+        stream.write("generated/\n")
+    generated = root / "generated"
+    generated.mkdir()
+    (generated / "generated_helper.py").write_text("def value():\n    return 1\n", encoding="utf-8")
+    (root / "tests/test_consumer.py").write_text(
+        "import sys\nsys.path.insert(0, 'generated')\nfrom generated_helper import value\n"
+        "def test_consumer():\n    assert value() == 1\n", encoding="utf-8",
+    )
+    for _ in range(2):
+        result = _acceptance_run(test_runner_module, root)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.accepted_checks["reused"] == 0
+    assert not list(_pass_store(root).directory.glob("pytest-pass-*.json"))
+
+
+def test_configuration_outside_checkout_executes_checks_normally(test_runner_module, tmp_path):
+    root = _acceptance_repository(tmp_path)
+    counter = tmp_path / "effects.log"
+    _acceptance_test(root, "example", counter)
+    config = tmp_path / "outside.ini"
+    config.write_text("[pytest]\n", encoding="utf-8")
+    for _ in range(2):
+        result = test_runner_module.run_text([
+            sys.executable, "-m", "pytest", "-q", "-c", str(config), "tests",
+        ], root)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.accepted_checks["reused"] == 0
+    assert counter.read_text().splitlines() == ["example", "example"]
+
+
+def test_fresh_worker_identity_reuses_current_input_passes(test_runner_module, tmp_path, monkeypatch):
+    root = _acceptance_repository(tmp_path)
+    counter = tmp_path / "effects.log"
+    _acceptance_test(root, "example", counter)
+    for identity, reused in (("first-worker", 0), ("different-worker", 1)):
+        monkeypatch.setenv("CODEX_SESSION_ID", identity)
+        monkeypatch.setenv("CODEX_THREAD_ID", identity)
+        monkeypatch.setenv("CODEX_TASK_WORKSPACE_VERIFYING_IDENTITY", identity)
+        result = _acceptance_run(test_runner_module, root)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.accepted_checks["reused"] == reused
+    assert counter.read_text().splitlines() == ["example"]
+
+
+@pytest.mark.parametrize("change", ["arguments", "tools"])
+def test_argument_and_tool_changes_are_independent_inputs(test_runner_module, tmp_path, monkeypatch, change):
+    import importlib
+
+    module = importlib.import_module("reuse_test_results")
+    root = _acceptance_repository(tmp_path)
+    _acceptance_test(root, "example", tmp_path / "effects.log")
+    nodeid = "tests/test_example.py::test_example"
+    original = _pass_store(root)
+    original.save(nodeid, original.inputs(nodeid))
+    command = [sys.executable, "-m", "pytest", "-q", "tests"]
+    if change == "arguments":
+        command.insert(3, "-x")
+    else:
+        monkeypatch.setattr(module, "_tool_versions", lambda root: {"git": "changed", "uv": "changed"})
+    context = json.loads(module.result_environment(command, root, {})[module.RESULT_CONTEXT_ENV])
+    changed = module.PassStore(root, context)
+    assert changed.matching(nodeid, changed.inputs(nodeid)) is None
+
+
+@pytest.mark.parametrize("target", ["production.py", "tests/test_example.py"])
+def test_edits_after_input_snapshot_block_reuse_and_recording(test_runner_module, tmp_path, target):
+    root = _acceptance_repository(tmp_path)
+    _acceptance_test(root, "example", tmp_path / "effects.log")
+    nodeid = "tests/test_example.py::test_example"
+    store = _pass_store(root)
+    inputs = store.inputs(nodeid)
+    store.save(nodeid, inputs)
+    assert store.matching(nodeid, inputs) is not None
+    with (root / target).open("a") as stream:
+        stream.write("\nCHANGED = True\n")
+    assert store.matching(nodeid, inputs) is None
+    assert store.save(nodeid, inputs) is None
+    assert len(list(store.directory.glob("pytest-pass-*.json"))) == 1
+
+
+def test_unchanged_bytes_keep_acceptance_after_timestamp_change(test_runner_module, tmp_path):
+    root = _acceptance_repository(tmp_path)
+    _acceptance_test(root, "example", tmp_path / "effects.log")
+    nodeid = "tests/test_example.py::test_example"
+    store = _pass_store(root)
+    inputs = store.inputs(nodeid)
+    store.save(nodeid, inputs)
+    path = root / "production.py"
+    value = path.stat()
+    os.utime(path, ns=(value.st_atime_ns, value.st_mtime_ns + 1_000_000_000))
+    assert store.matching(nodeid, inputs) is not None
+    store.save(nodeid, inputs)
+    assert len(list(store.directory.glob("pytest-pass-*.json"))) == 1

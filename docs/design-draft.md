@@ -260,6 +260,49 @@ existing diagnostic-file retention is unchanged. This implementation covers this
 repository's pytest runner, SDLC command/handoff execution, and promotion; it does
 not instrument arbitrary downstream test frameworks.
 
+## Saved pytest passes
+
+`scripts/testing/reuse_test_results.py` owns executed-pass acceptance for this
+repository's existing runner. It uses pytest phase reports and the existing
+input inventory; it introduces no database, worker history or second production
+dependency graph. The skill-update CLI separately configures stdout and stderr
+as UTF-8 before parsing or dispatch, preserving errors under Windows legacy
+encodings and leaving command exit statuses unchanged.
+
+Every fresh runner call collects the current required checks. A matching pass
+deselects only that check; failed, interrupted, skipped and unknown checks run
+normally. Records are written only after successful setup, call and teardown,
+so passes from a failed or interrupted suite remain useful. A test-file change
+runs that file's cases again and preserves passes for other unchanged checks.
+An empty collection and actual pytest failures retain their failure exit codes.
+The returned JSON includes collected, executed and reused counts; no model call
+is needed to select or transfer individual results.
+
+Matching inputs include checkout identity, exact arguments, caller environment
+digest (excluding worker-monitoring IDs), runtime/platform, Git/uv versions,
+installed distribution versions, the producer version,
+test bytes, imported repository helpers and the conservative non-test input
+inventory. All fixture/helper/data files and new unignored inputs participate.
+Documentation-only patterns come from `tests/test-impact.json`. Hashes identify
+versions; successful pytest reports prove that execution passed. Checks with
+unrepresented dynamic or external-service inputs use `no_result_reuse` and
+execute on every call. Distributed pytest workers also execute normally.
+
+The owner writes canonical `ceratops-pytest-pass.v1` JSON directly to unique
+`<git-common-dir>/ceratops/results/repository-checks/pytest-pass-<result-id>.json`
+paths. Records name the check, executed phase results, exact inputs and their
+digest. `.pytest-pass.lock` serializes reads, final writes and pruning; a busy
+writer leaves another invocation free to execute its checks normally. Startup
+and each completed write retain current plus two predecessors per checkout/check
+and remove malformed producer-owned records. Other producers' files are untouched.
+These accepted results survive task-temp and worktree deletion. The caller-owned
+`pytest-results.json` lives only inside pytest's isolated temp directory, carries
+returned counts/provenance, and is removed by that directory's existing owner.
+
+This is runner-level reuse. Release-unit qualification levels, historical baseline
+selection and lifecycle receipt references remain the separate refactor-plan
+integration; they must consume this owner rather than create another pass store.
+
 ## Pytest failure diagnostics
 
 `scripts/testing/pytest-diagnostics.py` owns the bounded failure summary used

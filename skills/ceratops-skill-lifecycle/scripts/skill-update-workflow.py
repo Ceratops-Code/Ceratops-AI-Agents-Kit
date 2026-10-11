@@ -1039,6 +1039,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # CLI output is UTF-8 even when the Windows caller inherits a legacy code
+    # page. Captured in-process streams may intentionally lack reconfigure().
+    for stream in (sys.stdout, sys.stderr):
+        configure = getattr(stream, "reconfigure", None)
+        if configure is not None:
+            configure(encoding="utf-8", errors="backslashreplace")
     args = build_parser().parse_args(argv)
     try:
         repo_root = _absolute(args.repo_root)

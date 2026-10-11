@@ -21,9 +21,17 @@ from typing import TYPE_CHECKING, TextIO
 if TYPE_CHECKING:
     import pytest
 
+from reuse_test_results import RESULT_CONTEXT_ENV, RESULT_SUMMARY_ENV
+
 PREFIX = "[tests] "
 UPDATE_INTERVAL = 1.0
 HEARTBEAT_INTERVAL = 60.0
+
+
+class PytestProcess(subprocess.CompletedProcess[str]):
+    """Carry bounded returned check counts alongside pytest's actual exit code."""
+
+    accepted_checks: dict[str, int] | None = None
 
 
 class TestProgress:
@@ -189,7 +197,11 @@ def run_pytest(
     child["PYTHONPATH"] = os.pathsep.join(
         value for value in (plugin_root, child.get("PYTHONPATH")) if value
     )
-    argv = [*command[:3], "-p", "report_test_progress", *command[3:]]
+    plugins = ["-p", "report_test_progress"]
+    if RESULT_CONTEXT_ENV in child:
+        plugins += ["-p", "reuse_test_results"]
+        child[RESULT_SUMMARY_ENV] = str(pathlib.Path(child["TMP"]) / "pytest-results.json")
+    argv = [*command[:3], *plugins, *command[3:]]
     errors: list[str] = []
     read_errors: list[OSError] = []
     with subprocess.Popen(
@@ -233,4 +245,10 @@ def run_pytest(
         sys.stderr.flush()
     except (OSError, ValueError):
         pass
-    return subprocess.CompletedProcess(command, code, stdout, "".join(errors) + final_status)
+    result = PytestProcess(command, code, stdout, "".join(errors) + final_status)
+    if destination := child.get(RESULT_SUMMARY_ENV):
+        summary_path = pathlib.Path(destination)
+        if summary_path.is_file():
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            result.accepted_checks = {key: summary[key] for key in ("collected", "executed", "reused")}
+    return result

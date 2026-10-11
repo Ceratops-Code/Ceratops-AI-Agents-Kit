@@ -30,6 +30,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
+from reuse_test_results import result_environment
 from runner_requests import TEST_CONTEXT_ENV, parse_request, validate_execution_context
 
 pytest_diagnostics = importlib.import_module("pytest-diagnostics")
@@ -185,6 +186,7 @@ def run_text(
                 option in command for option in ("--collect-only", "--co")
             ):
                 assert environ is not None
+                environ.update(result_environment(command, cwd, os.environ))
                 result = pytest_progress.run_pytest(command, cwd, environ)
             else:
                 result = subprocess.run(
@@ -1417,6 +1419,8 @@ def execute(
         "exit_code": result.returncode,
         "outcome": outcome_name(result.returncode),
     }
+    if accepted_checks := getattr(result, "accepted_checks", None):
+        pytest_payload["checks"] = accepted_checks
     if result.returncode != 0:
         pytest_payload.update(
             pytest_diagnostics.pytest_failure_summary(result.stdout, result.stderr)
