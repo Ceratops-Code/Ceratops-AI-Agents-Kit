@@ -44,3 +44,10 @@ updates:
     labels:
       - dependencies
       - python
+  - package-ecosystem: pip
+    directory: /tools
+    schedule:
+      interval: weekly
+    labels:
+      - dependencies
+      - python
