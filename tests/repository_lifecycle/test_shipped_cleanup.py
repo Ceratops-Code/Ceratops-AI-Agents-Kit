@@ -6,7 +6,7 @@ import pathlib
 import runpy
 import subprocess
 import sys
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Any, Self
 
 import pytest
@@ -29,6 +29,23 @@ SCRIPTS = (
     / "scripts"
 )
 THREAD = "019ffd18-edc9-7c81-9a2c-4e07af2b2ca3"
+
+
+@pytest.mark.parametrize("platform", ["nt", "posix"])
+def test_cleanup_record_selection_preserves_platform_path_identity(
+    cleanup: ModuleType, monkeypatch: pytest.MonkeyPatch, platform: str,
+) -> None:
+    monkeypatch.setattr(cleanup, "os", SimpleNamespace(name=platform))
+    selected = pathlib.PurePosixPath("/tasks/Foo")
+    for _ in range(2):
+        assert cleanup._record_selects_worktree({"candidate": {"path": "/tasks/Foo"}}, selected)
+        assert cleanup._record_selects_worktree(
+            {"candidate": {"path": "/tasks/foo"}}, selected,
+        ) == (platform == "nt")
+        assert not cleanup._record_selects_worktree({"candidate": {"path": "/tasks/other"}}, selected)
+    assert cleanup._path_key("//?/C:\\tasks\\Foo") == (
+        "c:/tasks/foo" if platform == "nt" else "//?/C:\\tasks\\Foo"
+    )
 
 
 @pytest.fixture
@@ -278,12 +295,16 @@ def test_selected_worktree_rejects_paths_outside_its_exact_boundary(
     assert not (repository / ".git" / "codex").exists()
 
 
+@pytest.mark.parametrize("case_distinct", [False, True])
 def test_selected_worktree_preserves_unrelated_unfinished_removal(
     cleanup: ModuleType,
     repository: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
+    case_distinct: bool,
 ) -> None:
-    other = task(repository, "other")
+    if case_distinct and sys.platform == "win32":
+        pytest.skip("Case-distinct sibling directories require a case-sensitive filesystem")
+    other = task(repository, "Foo" if case_distinct else "other")
     threads(cleanup, monkeypatch, [])
     original = cleanup._remove_branch
 
@@ -301,14 +322,14 @@ def test_selected_worktree_preserves_unrelated_unfinished_removal(
     before = record.read_bytes()
     orphan = records / ("a" * 64 + ".tmp")
     orphan.write_text("other target's atomic scratch", encoding="utf-8")
-    selected = task(repository, "selected")
+    selected = task(repository, "foo" if case_distinct else "selected")
     result = cleanup.retire_shipped_work(
         repository, "main", apply=True, selected_worktree=selected
     )
     assert result["status"] == "completed" and not selected.exists()
     assert record.read_bytes() == before
     assert orphan.read_text(encoding="utf-8") == "other target's atomic scratch"
-    assert git(repository, "rev-parse", "codex/other")
+    assert git(repository, "rev-parse", f"codex/{other.name}")
     resumed = cleanup.retire_shipped_work(
         repository, "main", apply=True, selected_worktree=other
     )

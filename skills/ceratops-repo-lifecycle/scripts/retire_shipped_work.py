@@ -55,8 +55,10 @@ def _git(repo: pathlib.Path, *args: str, allowed: tuple[int, ...] = (0,)) -> str
 
 
 def _path_key(value: str) -> str:
-    """Compare Windows extended paths and ordinary paths without disk writes."""
-    return value.replace("\\", "/").removeprefix("//?/").rstrip("/").casefold()
+    """Keep POSIX case distinctions; compare Windows extended paths equally."""
+    if os.name == "nt":
+        return value.replace("\\", "/").removeprefix("//?/").rstrip("/").casefold()
+    return value.rstrip("/")
 
 
 def _slug(value: str) -> str:
@@ -122,7 +124,9 @@ class ThreadCatalog:
         for row in self.rows:
             thread_id, raw_cwd, _, recorded_branch, name = row
             recorded_cwd = _path_key(raw_cwd or "")
-            leaf = recorded_cwd.rsplit("/", 1)[-1]
+            # Leaf-name ownership is a conservative retention hint, unlike the
+            # exact platform-aware path comparison used to select cleanup.
+            leaf = recorded_cwd.rsplit("/", 1)[-1].casefold()
             if (
                 thread_id == marker_id
                 or (cwd is not None and recorded_cwd == cwd)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -9,6 +10,51 @@ import sys
 import pytest
 
 from tests.support.repositories import ROOT, run_git
+
+
+@pytest.mark.parametrize("interruption", [None, "before-fetch", "after-fetch"])
+def test_worktree_status_fetch_retains_authentication_without_checkout_redirects(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, interruption: str | None,
+) -> None:
+    helper = load_worktree_status_helper()
+    retained = {
+        "GIT_ASKPASS": "test-askpass",
+        "GIT_SSH_COMMAND": "ssh -o BatchMode=yes",
+        "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "http.extraHeader",
+        "GIT_CONFIG_VALUE_0": "test-only-header",
+    }
+    for key, value in retained.items():
+        monkeypatch.setenv(key, value)
+    for key in helper.GIT_REPOSITORY_ENV:
+        monkeypatch.setenv(key, "unrelated-checkout")
+    effects: list[dict[str, str]] = []
+    fail = interruption
+
+    def fetch(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal fail
+        point, fail = fail, None
+        if point == "before-fetch":
+            raise KeyboardInterrupt
+        environment = kwargs["env"]
+        assert isinstance(environment, dict)
+        assert all(environment.get(key) == value for key, value in retained.items())
+        assert not helper.GIT_REPOSITORY_ENV.intersection(environment)
+        assert environment["GIT_TERMINAL_PROMPT"] == "0"
+        assert environment["GIT_OPTIONAL_LOCKS"] == "0"
+        effects.append(environment)
+        if point == "after-fetch":
+            raise KeyboardInterrupt
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(helper.subprocess, "run", fetch)
+    if interruption:
+        with pytest.raises(KeyboardInterrupt):
+            helper.run_git(tmp_path, "fetch", "--prune", "origin")
+    for _ in range(2):
+        assert helper.run_git(tmp_path, "fetch", "--prune", "origin").returncode == 0
+        assert os.environ["GIT_DIR"] == "unrelated-checkout"
+    assert len(effects) == (3 if interruption == "after-fetch" else 2)
+
 
 CLOSURE_SNAPSHOT = ROOT / "skills" / "ceratops-task-lifecycle" / "scripts" / "closure_snapshot.py"
 COLLECT_WORKTREE_STATUS = (

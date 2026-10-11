@@ -31,6 +31,14 @@ SCHEMA = "ceratops-worktree-status-report.v1"
 REQUEST_SCHEMA = "ceratops-worktree-status-request.v1"
 LIST_LIMIT = 20
 TASK_LIMIT = 50
+# Remove inherited checkout/object redirects, not remote authentication or
+# transport configuration required by an explicitly authorized fetch.
+GIT_REPOSITORY_ENV = frozenset({
+    "GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE", "GIT_IMPLICIT_WORK_TREE",
+    "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_QUARANTINE_PATH", "GIT_GRAFT_FILE", "GIT_SHALLOW_FILE",
+    "GIT_REPLACE_REF_BASE", "GIT_NO_REPLACE_OBJECTS", "GIT_NAMESPACE", "GIT_PREFIX",
+})
 TABLE_HEADERS = (
     "Branch", "Worktree", "Dirty?", "Promoted?", "Shipped?", "Active task",
     "Worth promoting?", "Changes",
@@ -79,7 +87,7 @@ def run_git(
             check=False,
             timeout=60,
             env={
-                **{key: value for key, value in os.environ.items() if not key.startswith("GIT_")},
+                **{key: value for key, value in os.environ.items() if key not in GIT_REPOSITORY_ENV},
                 "GIT_TERMINAL_PROMPT": "0",
                 "GIT_OPTIONAL_LOCKS": "0",
             },
