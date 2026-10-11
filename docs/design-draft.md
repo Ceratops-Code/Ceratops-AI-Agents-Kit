@@ -311,6 +311,12 @@ stderr at its selected diagnostic path; successful runs remove stale evidence.
 The compact summary keeps pytest's failure evidence within the existing byte
 and identity limits and excludes unrelated captured output.
 
+Plugin import tracebacks retain their terminal exception in both the per-failure
+excerpt and the compact global excerpt, rather than spending the line budget on
+wrapper frames. A native stderr traceback before collection has the explicit
+`<pytest startup>` runner identity; it is not attributed to an undiscovered test.
+The runner's existing JSON fields and numeric exit code are unchanged.
+
 Nested MCP transport failures can arrive as native exception groups. The
 diagnostic parser retains the group's leaf errors and locations so the summary
 shows the underlying failure, rather than only an exception-group heading.

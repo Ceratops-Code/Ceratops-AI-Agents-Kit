@@ -400,6 +400,26 @@ compares the selected ledger and semantics instead of rejecting irrelevant
 changes outside the selected window. `--include-current` is an explicit caller
 override. `--pricing-profile` uses the collector's existing pricing contract.
 
+`inspect-quick-calls --batch BATCH --thread THREAD_ID --turn TURN_ID
+--first-call FIRST --call-count COUNT` pages redacted evidence already retained
+in the batch without reading live sessions or launching models. The default
+page contains at most ten calls and 16,000 stdout bytes. `--call-count` is capped
+at 50, `--text-limit` bounds each text preview (default 500 UTF-8 bytes, maximum
+2,000), and `--max-bytes` caps the whole JSON payload (maximum 64,000). Prompt IDs
+retain their call relationships; ellipses and `omitted_actions` expose shortened
+content. `next_call` identifies the next unread call, or is null at the run's
+end. Excluded, empty, and failed records retain their status instead of producing
+call evidence. These views are transient stdout, not another output group.
+
+`build-quick-classifications --batch BATCH --decisions DECISIONS --output
+CLASSIFICATIONS` assembles the collector envelope from
+`ceratops-credit-quick-decisions.v1`: a `threads` list containing `thread_id`
+and `runs`; each run contains `turn_id` and explicit `groups` with `category`,
+`indices`, and an owning `control` for avoidable calls. It supplies the retained
+session and collector schema rather than asking the model to copy them.
+Assembly makes no acceptance claim and never fills missing judgments. Run
+`quick-validate` next; that operation remains the single source/coverage gate.
+
 `quick-validate --batch BATCH --classifications CLASSIFICATIONS --output RESULT`
 accepts `ceratops-credit-quick-classifications.v1`: a `threads` list of objects
 with `thread_id` and `classification`, where `classification` is the existing
@@ -408,12 +428,19 @@ out-of-batch identities reject the request. Missing classifications, invalid
 call coverage, unavailable sources, and changed windows become per-thread
 `unassessed` results. `ceratops-credit-quick-result.v1` retains these gaps and
 accepted classifications with aggregate counts and tokens for validated threads
-only. It does not infer semantic correctness from successful validation.
+only. Additive `categories` and `controls` lists provide counts and separate token
+fields. Controls combine the same owning correction across threads and runs,
+retain category subtotals and exact call identities, and count each accepted
+call once. Rejected threads contribute nothing to these totals. It does not
+infer semantic correctness from successful validation.
 
-Both commands refuse output overwrite, require an existing output directory,
-and print compact counts and the output path. Batch and result files belong to
-the caller for incremental review and eventual cleanup; the helper creates no
-temporary files. A failed source does not discard successfully collected or
+The batch, classification, and result writers refuse output overwrite, require
+an existing output directory, and print compact counts and the output path.
+The caller groups these files by frozen selection and owns their retention and
+eventual cleanup; the helper creates no temporary files. Caught interruptions
+or write failures remove only that
+invocation's incomplete output; a completed output remains immutable even if
+stdout is interrupted. A failed source does not discard successfully collected or
 validated peers. Exact-source quick reviews retain the individual collector
 workflow.
 

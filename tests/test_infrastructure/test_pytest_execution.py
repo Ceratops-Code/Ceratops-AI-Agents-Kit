@@ -1010,3 +1010,75 @@ def test_unchanged_bytes_keep_acceptance_after_timestamp_change(test_runner_modu
     assert store.matching(nodeid, inputs) is not None
     store.save(nodeid, inputs)
     assert len(list(store.directory.glob("pytest-pass-*.json"))) == 1
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_import_failure_summary_keeps_terminal_plugin_error(
+    test_runner_module, tmp_path, monkeypatch, capsys, wrapped,
+):
+    """Exercise real startup and E-prefixed nested tracebacks, not source shapes."""
+    monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
+    plugin = tmp_path / "report_test_progress.py"
+    plugin.write_text("import ceratops_missing_report_dependency\n", encoding="utf-8")
+    startup = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "--color=no", "-o", "addopts=", "-p", "report_test_progress"],
+        cwd=tmp_path, env={**os.environ, "PYTHONPATH": str(tmp_path)},
+        capture_output=True, text=True, check=False, timeout=30,
+    )
+    assert startup.returncode != 0
+    terminal = 'ImportError: Error importing plugin "report_test_progress": No module named \'ceratops_missing_report_dependency\''
+    assert terminal in startup.stderr
+    stdout, stderr = startup.stdout, startup.stderr
+    if wrapped:
+        path = tmp_path / "test_wrapper.py"
+        path.write_text(
+            "def test_plugin_runner():\n"
+            "    print('E       unrelated captured exception')\n"
+            f"    raise RuntimeError({startup.stderr!r})\n", encoding="utf-8",
+        )
+        outer = subprocess.run(
+            [sys.executable, "-m", "pytest", "-q", "--color=no", "-o", "addopts=", path.name],
+            cwd=tmp_path, capture_output=True, text=True, check=False, timeout=30,
+        )
+        assert outer.returncode == 1, outer.stdout + outer.stderr
+        stdout, stderr = outer.stdout, outer.stderr
+    for _ in range(2):
+        summary = test_runner_module.pytest_diagnostics.pytest_failure_summary(stdout, stderr)
+        assert summary["failure_count"] == 1
+        assert summary["omitted_failure_count"] == 0
+        assert terminal in summary["failures"][0]["excerpt"]
+        assert terminal in summary["decisive_excerpt"]
+        assert "unrelated captured exception" not in summary["decisive_excerpt"]
+        assert len(summary["failures"][0]["excerpt"].encode()) <= 800
+        assert len(summary["decisive_excerpt"].encode()) <= 2_000
+        assert summary["failed_tests"] == (["test_wrapper.py::test_plugin_runner"] if wrapped else ["<pytest startup>"])
+
+    from tests.test_infrastructure.test_test_runner import DeterministicExecution
+
+    exit_code = outer.returncode if wrapped else startup.returncode
+    execution = DeterministicExecution(
+        test_runner_module, b"", final_returncode=exit_code,
+        final_stdout=stdout, final_stderr=stderr,
+    )
+    code = test_runner_module.execute(
+        ["tests/test_infrastructure/test_test_runner.py::test_pytest_failure_writes_full_diagnostic_and_emits_bounded_summary",
+         "--diagnostic-output", str(tmp_path / "runner-failure.json")],
+        repo_root=ROOT, text_runner=execution.text, bytes_runner=execution.bytes,
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert code == exit_code and payload["pytest"]["exit_code"] == exit_code
+    assert terminal in payload["pytest"]["failures"][0]["excerpt"]
+    assert terminal in payload["pytest"]["decisive_excerpt"]
+
+
+@pytest.mark.parametrize("stream", ["stdout", "stderr", "captured"])
+def test_startup_summary_requires_uncaptured_native_stderr(test_runner_module, stream):
+    traceback = "Traceback (most recent call last):\nImportError: actual import failure\n"
+    stdout, stderr = (traceback, "") if stream == "stdout" else ("", traceback)
+    if stream == "stderr":
+        stderr = "ImportError: not a native traceback\n"
+    elif stream == "captured":
+        stderr = "----- Captured stderr call -----\n" + stderr
+    summary = test_runner_module.pytest_diagnostics.pytest_failure_summary(stdout, stderr)
+    assert summary["failure_count"] == 0 and summary["failures"] == []
+    assert summary["decisive_excerpt"] == ""
