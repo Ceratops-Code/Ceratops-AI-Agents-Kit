@@ -493,6 +493,138 @@ def test_source_validator_enforces_description_boundaries(
         assert expected_error in result.stderr
 
 
+def test_source_validator_accepts_supported_optional_frontmatter(
+    tmp_path: pathlib.Path,
+) -> None:
+    repo = tmp_path / "compatible"
+    create_compatible_repo(repo, "example/compatible", ["alpha-tool"])
+    skill_md = repo / "skills" / "alpha-tool" / "SKILL.md"
+    lines = skill_md.read_text(encoding="utf-8").splitlines()
+    closing_marker = lines.index("---", 1)
+    lines[closing_marker:closing_marker] = [
+        "license: Apache-2.0",
+        "compatibility: Requires a local Git checkout.",
+        "metadata:",
+        "  owner: platform",
+        "allowed-tools: Read Write",
+    ]
+    skill_md.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+
+    result = subprocess.run(
+        [sys.executable, str(VALIDATOR), "--repo-root", str(repo), "--mode", "full"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    ("declaration", "expected_error"),
+    [
+        (["owner: platform"], "frontmatter has unsupported fields: owner"),
+        ([f"compatibility: {'x' * 501}"], "compatibility exceeds 500 characters"),
+        (["metadata:", "  owner: 7"], "metadata must map strings to strings"),
+        (["allowed-tools:", "  - Read"], "allowed-tools must be a string"),
+    ],
+)
+def test_source_validator_rejects_invalid_optional_frontmatter(
+    tmp_path: pathlib.Path,
+    declaration: list[str],
+    expected_error: str,
+) -> None:
+    repo = tmp_path / "compatible"
+    create_compatible_repo(repo, "example/compatible", ["alpha-tool"])
+    skill_md = repo / "skills" / "alpha-tool" / "SKILL.md"
+    lines = skill_md.read_text(encoding="utf-8").splitlines()
+    closing_marker = lines.index("---", 1)
+    lines[closing_marker:closing_marker] = declaration
+    skill_md.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+
+    result = subprocess.run(
+        [sys.executable, str(VALIDATOR), "--repo-root", str(repo), "--mode", "full"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert expected_error in result.stderr
+
+
+def test_source_validator_accepts_openai_dependencies_and_policy(
+    tmp_path: pathlib.Path,
+) -> None:
+    repo = tmp_path / "compatible"
+    create_compatible_repo(repo, "example/compatible", ["alpha-tool"])
+    openai_yaml = repo / "skills" / "alpha-tool" / "agents" / "openai.yaml"
+    openai_yaml.write_text(
+        openai_yaml.read_text(encoding="utf-8")
+        + "dependencies:\n"
+        + "  tools:\n"
+        + "    - type: mcp\n"
+        + "      value: github\n"
+        + "      description: GitHub MCP server\n"
+        + "      transport: streamable_http\n"
+        + "policy:\n"
+        + "  allow_implicit_invocation: false\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+
+    result = subprocess.run(
+        [sys.executable, str(VALIDATOR), "--repo-root", str(repo), "--mode", "full"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    ("declaration", "expected_error"),
+    [
+        (
+            "dependencies:\n  tools: {}\n",
+            "openai.yaml dependencies.tools must be an array",
+        ),
+        (
+            "dependencies:\n  tools:\n    - type: http\n      value: github\n",
+            "openai.yaml dependencies.tools[0].type must be mcp",
+        ),
+        (
+            'policy:\n  allow_implicit_invocation: "yes"\n',
+            "openai.yaml policy.allow_implicit_invocation must be Boolean",
+        ),
+    ],
+)
+def test_source_validator_rejects_invalid_openai_optional_metadata(
+    tmp_path: pathlib.Path,
+    declaration: str,
+    expected_error: str,
+) -> None:
+    repo = tmp_path / "compatible"
+    create_compatible_repo(repo, "example/compatible", ["alpha-tool"])
+    openai_yaml = repo / "skills" / "alpha-tool" / "agents" / "openai.yaml"
+    openai_yaml.write_text(
+        openai_yaml.read_text(encoding="utf-8") + declaration,
+        encoding="utf-8",
+        newline="\n",
+    )
+
+    result = subprocess.run(
+        [sys.executable, str(VALIDATOR), "--repo-root", str(repo), "--mode", "full"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert expected_error in result.stderr
+
+
 def test_openai_example_comparison_is_not_a_per_skill_check() -> None:
     contract = json.loads(
         (
