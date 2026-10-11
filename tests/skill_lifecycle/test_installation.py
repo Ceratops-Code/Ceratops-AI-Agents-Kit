@@ -1125,14 +1125,13 @@ def test_credit_presentation_contract_reads_shared_action_rules(
     )
     with pytest.raises(ValueError, match="Output Contract is missing"):
         presentation()
+    failure: type[Exception] = ValueError if installed else FileNotFoundError
     if installed:
         policy_path.write_text(original_policy.replace(
             "<!-- CERATOPS_SHARED_SECTIONS_END -->", ""
         ), encoding="utf-8")
-        failure = ValueError
     else:
         policy_path.unlink()
-        failure = FileNotFoundError
     with pytest.raises(failure, match="incomplete" if installed else None):
         presentation()
     policy_path.write_text(original_policy, encoding="utf-8")
