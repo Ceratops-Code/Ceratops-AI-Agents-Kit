@@ -24,6 +24,69 @@ from tests.support.repositories import ROOT, run_git, write_sdlc_contract
 commands = importlib.import_module("github_pr_workflow.command")
 
 
+@pytest.mark.parametrize(
+    ("argv", "keeps_active_environment"),
+    [
+        (["uv", "run", "--project", "scripts", "python", "probe.py"], False),
+        (["uv", "run", "--locked", "probe.py"], False),
+        (["uv", "sync", "--project", "scripts"], False),
+        (["uv", "run", "--active", "python", "probe.py"], True),
+        (["uv", "run", "--no-project", "python", "probe.py"], True),
+        ([sys.executable, "probe.py"], True),
+    ],
+)
+@pytest.mark.parametrize("interruption", [None, "before-command", "after-command"])
+def test_sdlc_command_environment_stays_scoped_across_fresh_calls(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    argv: list[str],
+    keeps_active_environment: bool,
+    interruption: str | None,
+) -> None:
+    runner = importlib.import_module("repository_operation")
+    repo, _, _, _ = prepare_repository_lifecycle_repo(tmp_path)
+    write_sdlc_contract(repo, repository={
+        "capabilities": {},
+        "actions": {
+            "validate": {
+                "requires": {"capabilities": []}, "steps": [{"run": argv}],
+            },
+            "test": {
+                "requires": {"capabilities": []}, "no-op": "Environment boundary fixture.",
+            },
+        },
+    })
+    prepared = runner.prepare_operations(
+        repo, [runner.OperationRequest("repository.actions.validate")], context="skill",
+    )[0]
+    monkeypatch.setenv("VIRTUAL_ENV", "caller-owned-environment")
+    monkeypatch.setenv("SCOPED_ENVIRONMENT_TEST", "preserved")
+    effects: list[dict[str, str]] = []
+    fail = interruption
+
+    def run(arguments: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        nonlocal fail
+        point, fail = fail, None
+        if point == "before-command":
+            raise KeyboardInterrupt
+        environment = dict(kwargs.get("env", os.environ))
+        effects.append(environment)
+        assert ("VIRTUAL_ENV" in environment) == keeps_active_environment
+        assert environment["SCOPED_ENVIRONMENT_TEST"] == "preserved"
+        if point == "after-command":
+            raise KeyboardInterrupt
+        return subprocess.CompletedProcess(arguments, 0, "OK\n", "")
+
+    monkeypatch.setattr(runner, "run_progress_command", run)
+    if interruption:
+        with pytest.raises(KeyboardInterrupt):
+            runner.execute_prepared_operation(prepared)
+    for _ in range(2):
+        assert runner.execute_prepared_operation(prepared)["status"] == "completed"
+        assert os.environ["VIRTUAL_ENV"] == "caller-owned-environment"
+    assert len(effects) == (3 if interruption == "after-command" else 2)
+
+
 @pytest.mark.parametrize("result_stream", ["stdout", "stderr"])
 def test_json_command_forwards_progress_before_exit_without_polluting_its_result(
     tmp_path: pathlib.Path,

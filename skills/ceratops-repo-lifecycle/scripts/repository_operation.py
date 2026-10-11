@@ -963,13 +963,22 @@ def _execute_prepared_operation(prepared: PreparedOperation) -> dict[str, object
             # Context belongs only to this test command, never the parent
             # process or later deployment commands.
             process_options: dict[str, Any] = {}
-            if prepared.test_context is not None:
-                process_options["env"] = {
-                    **os.environ,
-                    "CERATOPS_SDLC_TEST_CONTEXT": json.dumps(
+            repository_uv = (
+                pathlib.Path(argv[0]).stem.lower() == "uv"
+                and len(argv) > 1 and argv[1] in {"run", "sync", "lock"}
+                and "--active" not in argv and "--no-project" not in argv
+            )
+            if repository_uv or prepared.test_context is not None:
+                environment = dict(os.environ)
+                if repository_uv:
+                    # Repository-selected environments must not inherit the
+                    # installed lifecycle helper's unrelated active venv.
+                    environment.pop("VIRTUAL_ENV", None)
+                if prepared.test_context is not None:
+                    environment["CERATOPS_SDLC_TEST_CONTEXT"] = json.dumps(
                         dict(prepared.test_context)
-                    ),
-                }
+                    )
+                process_options["env"] = environment
             result = run_progress_command(argv, cwd=step.cwd, **process_options)
             code, stdout, stderr = result.returncode, result.stdout, result.stderr
         except OSError as exc:
