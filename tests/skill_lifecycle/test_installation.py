@@ -1079,13 +1079,83 @@ def test_action_sections_reject_invalid_assignments(tmp_path: pathlib.Path, rend
     assert {p.relative_to(destination): p.read_bytes() for p in destination.rglob("*") if p.is_file()} == {pathlib.Path("user.txt"): b"preserve"}
 
 
+@pytest.mark.parametrize("installed", [False, True], ids=["source", "installed"])
+def test_credit_presentation_contract_reads_shared_action_rules(
+    tmp_path: pathlib.Path, installed: bool,
+) -> None:
+    skill = tmp_path / "repo/skills/ceratops-credit-savings-analysis"
+    action = skill / "references/deep-thread-analysis.md"
+    action.parent.mkdir(parents=True)
+    policy = "## Shared Rules\n\n### Output Contract\n\nRouted delivery guidance.\n"
+    delta = "## Goal\n\nAnalyze the thread.\n\n### Output Contract\n\nLocal action guidance.\n"
+    if installed:
+        action.write_text(
+            "# Deep Thread Analysis Action\n\n"
+            "<!-- CERATOPS_SHARED_SECTIONS_START -->\n" + policy
+            + "<!-- CERATOPS_SHARED_SECTIONS_END -->\n\n" + delta,
+            encoding="utf-8",
+        )
+        policy_path = action
+    else:
+        action.write_text("# Deep Thread Analysis Action\n\n" + delta, encoding="utf-8")
+        policy_path = skill.parent / "sections/delivery.md"
+        policy_path.parent.mkdir()
+        policy_path.write_text(policy, encoding="utf-8")
+        (skill.parent / "skill-sections.json").write_text(json.dumps({
+            "sections": {"delivery": "skills/sections/delivery.md"},
+            "actions": {skill.name: {"references/deep-thread-analysis.md": ["delivery"]}},
+        }), encoding="utf-8")
+    (skill / "SKILL.md").write_text(
+        "### Output Contract\n\nGeneric parent guidance.\n", encoding="utf-8"
+    )
+    namespace = runpy.run_path(str(
+        ROOT / "skills/ceratops-credit-savings-analysis/scripts/credit_analysis/report_rendering.py"
+    ))
+    presentation = namespace["_presentation_contract"]
+    presentation.__globals__["__file__"] = str(
+        skill / "scripts/credit_analysis/report_rendering.py"
+    )
+    original_policy = policy_path.read_text(encoding="utf-8")
+    assert presentation() == "Routed delivery guidance."
+    assert presentation() == "Routed delivery guidance."
+    policy_path.write_text(
+        policy_path.read_text(encoding="utf-8").replace(
+            "### Output Contract", "### Missing Contract", 1
+        ), encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="Output Contract is missing"):
+        presentation()
+    if installed:
+        policy_path.write_text(original_policy.replace(
+            "<!-- CERATOPS_SHARED_SECTIONS_END -->", ""
+        ), encoding="utf-8")
+        failure = ValueError
+    else:
+        policy_path.unlink()
+        failure = FileNotFoundError
+    with pytest.raises(failure, match="incomplete" if installed else None):
+        presentation()
+    policy_path.write_text(original_policy, encoding="utf-8")
+    assert presentation() == "Routed delivery guidance."
+
+
 def test_contract_review_adoption_and_all_managed_output(tmp_path: pathlib.Path) -> None:
     manifest = json.loads((ROOT / "skills/skill-sections.json").read_text(encoding="utf-8"))
     expected = {
         "ceratops-repo-lifecycle": {"references/repo-contracts-review.md": ["contract-review"]},
         "ceratops-skill-lifecycle": {"references/skills-contract-review.md": ["contract-review"]},
     }
-    assert manifest["actions"] == expected
+    credit_actions = {
+        relative: ["credit-analysis-deep-surface"]
+        for relative in (
+            "references/deep-thread-analysis.md", "references/helper-contracts.md",
+            "references/context-evidence.md", "references/rework-validation.md",
+            "references/tool-flow.md", "references/instruction-reasoning.md",
+        )
+    }
+    assert manifest["actions"] == {
+        **expected, "ceratops-credit-savings-analysis": credit_actions,
+    }
     shared = ROOT / manifest["sections"]["contract-review"]
     assert "## Core Rules" not in shared.read_text(encoding="utf-8")
     snapshots = []
@@ -1124,6 +1194,20 @@ def test_contract_review_adoption_and_all_managed_output(tmp_path: pathlib.Path)
                 relative = item.relative_to(source).as_posix()
                 if relative != "SKILL.md" and relative not in refs:
                     assert (destination / skill / relative).read_bytes() == item.read_bytes()
+        credit = destination / "ceratops-credit-savings-analysis"
+        unrouted = (credit / "SKILL.md").read_text(encoding="utf-8") + (
+            credit / "references/quick-analysis.md"
+        ).read_text(encoding="utf-8")
+        headings = (
+            "## Shared Evidence And Controller Contract",
+            "## Common Classification And ROI Rules",
+            "## Cross-Surface Completion",
+        )
+        assert all(heading not in unrouted for heading in headings)
+        for relative in credit_actions:
+            rendered = (credit / relative).read_text(encoding="utf-8")
+            assert all(rendered.count(heading) == 1 for heading in headings)
+            assert "Problem:" in rendered and "Proposed fix:" in rendered
         repository_review = " ".join((destination / "ceratops-repo-lifecycle/references/repo-contracts-review.md").read_text(encoding="utf-8").split())
         assert "including ecosystems absent from the contract" in repository_review
         assert "at most four web discovery queries per routine review" in repository_review

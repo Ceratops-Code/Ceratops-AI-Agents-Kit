@@ -8,6 +8,7 @@ Contract; report rendering never treats a safeguard's existence as resolution.
 from __future__ import annotations
 
 import datetime as dt
+import json
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -20,15 +21,35 @@ TOKEN_FIELDS = (
 
 
 def _presentation_contract() -> str:
-    """Read delivery guidance from its skill owner, without copying that policy."""
+    """Read the routed policy from installed output or its manifest-owned source."""
 
-    skill = Path(__file__).resolve().parents[2] / "SKILL.md"
-    text = skill.read_text(encoding="utf-8")
+    skill = Path(__file__).resolve().parents[2]
+    action = "references/deep-thread-analysis.md"
+    text = (skill / action).read_text(encoding="utf-8")
+    _, shared_start, shared_text = text.partition(
+        "<!-- CERATOPS_SHARED_SECTIONS_START -->"
+    )
+    if shared_start:
+        text, shared_end, _ = shared_text.partition(
+            "<!-- CERATOPS_SHARED_SECTIONS_END -->"
+        )
+        if not shared_end:
+            raise ValueError("credit-analysis action shared rules are incomplete")
+    else:
+        # Source actions are delta-only; the manifest owns their shared policy.
+        manifest_path = skill.parent / "skill-sections.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        text = "\n".join(
+            (manifest_path.parent.parent / manifest["sections"][section_id]).read_text(
+                encoding="utf-8"
+            )
+            for section_id in manifest["actions"][skill.name][action]
+        )
     _, heading, section = text.partition("### Output Contract\n")
-    contract, boundary, _ = section.partition("\n## Analysis-Only Boundaries\n")
-    if not heading or not boundary or not contract.strip():
+    contract = section.split("\n#", 1)[0].strip()
+    if not heading or not contract:
         raise ValueError("credit-analysis skill Output Contract is missing")
-    return contract.strip()
+    return contract
 
 
 def _finding_savings(finding: Mapping[str, Any]) -> float:

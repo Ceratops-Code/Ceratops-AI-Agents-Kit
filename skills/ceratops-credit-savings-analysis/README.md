@@ -248,6 +248,8 @@ Python owns field shape, cross-field rules, state transitions, persistence,
 and failure behavior. The skill text owns operator-facing policy and
 presentation. The section manifest inserts the shared deep/surface rules only
 into the six controller action references; quick analysis keeps its own rules.
+The controller reads presentation rules from the generated action block when
+installed and from its manifest-assigned shared source in a checkout.
 Tests establish which
 behaviors have been exercised. This README is the authoritative explanation of
 that design; it does not override the executable sources.
