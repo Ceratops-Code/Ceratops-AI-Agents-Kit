@@ -193,14 +193,23 @@ def _dirty_paths(repo_root: pathlib.Path) -> set[str]:
         paths.update(path.replace("\\", "/") for path in output.split("\0") if path)
     return paths
 
-def _is_tracked(repo_root: pathlib.Path, path: str) -> bool:
-    """Allow existing ancillary files without permitting undeclared new surfaces."""
+def _allowed_file_target(repo_root: pathlib.Path, value: str) -> pathlib.Path:
+    """Accept declared files within this checkout, independent of Git tracking.
 
-    result = _run(
-        ["git", "-C", str(repo_root), "ls-files", "--error-unmatch", "--", path],
-        cwd=repo_root,
-    )
-    return result.returncode == 0
+    Missing files and parents are allowed so scope can be recorded before
+    creation. Git internals, linked components and non-file targets are excluded.
+    """
+
+    pure = _safe_relative(value, "allowed path")
+    if any(part.casefold() == ".git" for part in pure.parts):
+        raise UpdateExecutionError(f"allowed path cannot name Git internals: {value}")
+    target = _target(repo_root, value)
+    _reject_link_chain(target, "allowed path")
+    if target.exists() and not target.is_file():
+        raise UpdateExecutionError(f"allowed path must be a regular file target: {value}")
+    if any(parent.exists() and not parent.is_dir() for parent in target.parents):
+        raise UpdateExecutionError(f"allowed path parent is not a directory: {value}")
+    return target
 
 def _content_snapshot(target: pathlib.Path) -> dict[str, object]:
     if target.is_symlink():

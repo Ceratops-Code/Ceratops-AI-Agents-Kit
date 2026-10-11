@@ -37,12 +37,13 @@ from rule_candidate_source import (
     RuleCandidateValidationError,
     TextSource,
     ValidationResult,
+    parse_rename_mapping,
     read_source,
+    review_keys_after_renames,
 )
 from rule_graph import (
     HISTORY_ENTRY_KEYS,
     HISTORY_VERSION,
-    RULE_ID_PATTERN,
     ParsedRuleSource,
     RuleRecord,
     load_history_source,
@@ -79,7 +80,6 @@ RENAME_OPERATION_FIELDS = {
     "renames",
     "semantic_replacements",
 }
-RENAME_FIELDS = {"old", "new"}
 SEMANTIC_REPLACEMENT_FIELDS = {"expected_old", "replacement"}
 
 
@@ -321,37 +321,6 @@ def render_history(
     if source.newline != "\n":
         text = text.replace("\n", source.newline)
     return text
-
-
-def parse_rename_mapping(value: object, label: str) -> dict[str, str]:
-    """Validate one simultaneous, one-to-one rule-ID mapping."""
-
-    if not isinstance(value, list) or not value:
-        raise ApplicationError(f"{label} must be a non-empty list")
-    mapping: dict[str, str] = {}
-    targets: set[str] = set()
-    for index, raw in enumerate(value):
-        item = require_fields(raw, RENAME_FIELDS, f"{label}[{index}]")
-        old = item["old"]
-        new = item["new"]
-        if not isinstance(old, str) or not re.fullmatch(RULE_ID_PATTERN, old):
-            raise ApplicationError(f"{label}[{index}].old is invalid")
-        if not isinstance(new, str) or not re.fullmatch(RULE_ID_PATTERN, new):
-            raise ApplicationError(f"{label}[{index}].new is invalid")
-        if old == new:
-            raise ApplicationError(f"{label}[{index}] does not rename an ID")
-        if old in mapping:
-            raise ApplicationError(f"{label} old IDs must be unique")
-        if new in targets:
-            raise ApplicationError(f"{label} new IDs must be unique")
-        mapping[old] = new
-        targets.add(new)
-    overlap = sorted(set(mapping).intersection(targets))
-    if overlap:
-        raise ApplicationError(
-            f"{label} must not cascade through ID {overlap[0]}"
-        )
-    return mapping
 
 
 def parse_semantic_replacements(
@@ -660,6 +629,14 @@ def prepare(
             candidate_rule_texts,
             label="invalid candidate rule stack",
         )
+        try:
+            baseline_reviews = review_keys_after_renames(
+                baseline_reviews, baseline_parsed, candidate_parsed,
+                history_operations=request["history_operations"],
+                history_by_rules=history_by_rules,
+            )
+        except RuleCandidateValidationError as error:
+            raise ApplicationError(str(error)) from error
         new_reviews = candidate_reviews - baseline_reviews
         if new_reviews:
             review = json.loads(sorted(new_reviews)[0])
@@ -746,10 +723,13 @@ def prepare(
                 raise ApplicationError(
                     f"history has multiple rename operations: {history}"
                 )
-            mapping = parse_rename_mapping(
-                operation["renames"],
-                f"history_operations[{index}].renames",
-            )
+            try:
+                mapping = parse_rename_mapping(
+                    operation["renames"],
+                    f"history_operations[{index}].renames",
+                )
+            except RuleCandidateValidationError as error:
+                raise ApplicationError(str(error)) from error
             replacements = parse_semantic_replacements(
                 operation["semantic_replacements"],
                 f"history_operations[{index}].semantic_replacements",

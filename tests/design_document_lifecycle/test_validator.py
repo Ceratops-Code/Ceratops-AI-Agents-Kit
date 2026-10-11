@@ -274,6 +274,29 @@ def test_contract_structure_and_field_consumers(tmp_path: pathlib.Path, mutation
         VALIDATOR.load_contract(path)
 
 
+def test_contract_covers_current_c4_view_and_notation_sources() -> None:
+    contract = VALIDATOR.load_contract()
+
+    assert {view["id"] for view in contract["views"]} == {
+        "system_landscape",
+        "context",
+        "container",
+        "component",
+        "code",
+        "deployment",
+        "dynamic",
+    }
+    assert contract["annotations"]["c4_defaults"].startswith(
+        "Treat system context, container, and deployment views"
+    )
+    source_urls = {source["url"] for source in contract["source_files"]}
+    assert {
+        "https://c4model.com/diagrams/notation",
+        "https://c4model.com/diagrams/system-landscape",
+        "https://c4model.com/diagrams/code",
+    } <= source_urls
+
+
 def test_generated_resources_match_contract_and_seed_requires_evidence(tmp_path: pathlib.Path) -> None:
     contract = VALIDATOR.load_contract()
     expected = VALIDATOR.render_resources(contract)

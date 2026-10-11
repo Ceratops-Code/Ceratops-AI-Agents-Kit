@@ -2,7 +2,7 @@
   "contract_format_version": 1,
   "kind": "design_document_contract",
   "name": "design_document_lifecycle_contract",
-  "captured_on": "2026-09-08",
+  "captured_on": "2026-10-11",
   "field_roles": {
     "executable": ["contract_format_version", "kind", "field_roles", "sections.id", "sections.heading", "sections.group", "sections.required"],
     "annotation_only": ["name", "captured_on", "annotations", "sections.content", "views", "source_files"]
@@ -11,6 +11,7 @@
     "organization": "Use a tailored arc42 organization. Preserve an adequate project layout by mapping these topics to its headings; consolidate related sections when useful.",
     "completeness": "Account for every topic with evidence. Distinguish implemented facts, accepted target design, assumptions, and unverified coverage. Conditional topics may be inapplicable only with a reason.",
     "diagrams": "The required, optional, and unnecessary criteria below are this skill's tailoring policy. Include a view only when it materially improves explanation; use prose for trivial relationships. Keep names, boundaries, directions, protocols, cardinality, and runtime ordering consistent with prose and evidence. Give each diagram a title stating its type and scope and a legend; label element types, responsibilities, and relationship intent, with technologies and protocols at the appropriate abstraction level.",
+    "c4_defaults": "Treat system context, container, and deployment views as C4-recommended defaults. Omit one only when the document records why its intended readers and scope do not benefit; component, dynamic, and code views remain value-driven.",
     "limits": "Mechanical validation checks declarations and syntax only. Section presence, declared coverage, link existence, and rendered Mermaid never prove architectural quality, behavioral truth, security, or complete review.",
     "references": "The wording and template are original. IEEE 1016-2009 is an inactive-reserved historical completeness reference; its public official scope supports design information and stakeholder communication. The licensed full text was not inspected, so do not assert clause-level conformance."
   },
@@ -33,9 +34,11 @@
     {"id": "governance", "heading": "14 Ownership and maintenance", "group": null, "required": true, "content": "Name the document owner, authoritative path, source-of-truth hierarchy, and update triggers. Explain how code, APIs, data, deployment, decisions, and quality changes trigger a design review."}
   ],
   "views": [
+    {"id": "system_landscape", "title": "C4 system landscape", "required_when": "The document covers a portfolio or organisation and cross-system ownership or dependencies cannot be understood from per-system context views.", "optional_when": "Several peer systems benefit from one shared portfolio map.", "unnecessary_when": "The document concerns one software system and its external dependencies are clear in its system-context view."},
     {"id": "context", "title": "C4 system context", "required_when": "Multiple actors or external systems, or a significant trust or ownership boundary, make a prose-only account ambiguous.", "optional_when": "One simple external interaction still benefits stakeholder communication.", "unnecessary_when": "The system is isolated or its boundary and single interaction are already clear in concise prose."},
     {"id": "container", "title": "C4 container", "required_when": "Several applications or stores interact and the distribution of responsibilities or communication materially affects the design.", "optional_when": "A simple application/store split is useful to the intended readers.", "unnecessary_when": "One executable unit has no meaningful internal application/store split; a C4 container is not synonymous with a Docker container."},
     {"id": "component", "title": "C4 component", "required_when": "A critical internal boundary or collaboration inside one container cannot be adequately explained by its container view and prose.", "optional_when": "A stable internal decomposition helps developers make an actual design decision.", "unnecessary_when": "It would restate file lists or code structure without explaining a consequential relationship."},
+    {"id": "code", "title": "C4 code", "required_when": "A critical implementation structure cannot be adequately explained at component level and the view can be generated from authoritative source.", "optional_when": "An important complex area benefits from a generated class, entity, or dependency view.", "unnecessary_when": "For ordinary code structure or whenever a hand-maintained diagram would duplicate source code."},
     {"id": "deployment", "title": "C4 deployment", "required_when": "Distribution, environment differences, replication, failover, or a network/trust boundary materially affects operation.", "optional_when": "A simple host/runtime mapping benefits operators.", "unnecessary_when": "A local tool or library has one obvious host arrangement adequately stated in prose."},
     {"id": "dynamic", "title": "C4 dynamic or sequence", "required_when": "Ordering, concurrency, asynchronous handoff, retry, transaction boundaries, or recovery has consequential interactions that prose cannot explain clearly.", "optional_when": "A recurring user journey benefits from a compact ordered interaction view.", "unnecessary_when": "The operation is a trivial linear call or would duplicate an already sufficient sequence. Use one notation per scenario."}
   ],
@@ -43,9 +46,12 @@
     {"title": "arc42 overview", "url": "https://arc42.org/overview/", "note": "Primary organization: twelve tailorable architectural topics; testing and maintenance are explicit extensions here."},
     {"title": "arc42 documentation", "url": "https://arc42.org/documentation/", "note": "Tailor the depth to stakeholder needs and keep documentation alongside code."},
     {"title": "C4 diagram overview", "url": "https://c4model.com/diagrams", "note": "Select valuable abstraction levels rather than requiring all four static views."},
+    {"title": "C4 notation", "url": "https://c4model.com/diagrams/notation", "note": "Source for diagram titles and scope, legends, element types and responsibilities, relationship direction and intent, technologies, and protocols."},
+    {"title": "C4 system landscape", "url": "https://c4model.com/diagrams/system-landscape", "note": "Map several software systems and people across a portfolio or organisation boundary."},
     {"title": "C4 system context", "url": "https://c4model.com/diagrams/system-context", "note": "Model people and external software around one system boundary."},
     {"title": "C4 container", "url": "https://c4model.com/diagrams/container", "note": "Model applications and stores, their responsibilities, and communications; deployment is a separate view."},
     {"title": "C4 component", "url": "https://c4model.com/diagrams/component", "note": "Decompose one container only when doing so adds value."},
+    {"title": "C4 code", "url": "https://c4model.com/diagrams/code", "note": "Use only for important complex implementation structure, preferably generated from source."},
     {"title": "C4 deployment", "url": "https://c4model.com/diagrams/deployment", "note": "Map system or container instances to infrastructure in a named environment."},
     {"title": "C4 dynamic", "url": "https://c4model.com/diagrams/dynamic", "note": "Use ordered interactions sparingly for consequential runtime patterns."},
     {"title": "IEEE 1016-2009 official record", "url": "https://standards.ieee.org/ieee/1016/4502/", "note": "Inactive-reserved since 2020-03-05. Public scope supports stakeholder-oriented software design descriptions, including reconstruction from implementation; licensed clauses were not inspected."}

@@ -155,6 +155,8 @@
     "scripts/testing/runner_requests.py",
     "scripts/testing/pytest-diagnostics.py",
     "scripts/testing/pytest-environment.py",
+    "scripts/testing/report_test_progress.py",
+    "scripts/testing/reuse_test_results.py",
     "scripts/run-actionlint.py",
     "scripts/validate-repository.py",
     "skills/ceratops-automation-run/**",

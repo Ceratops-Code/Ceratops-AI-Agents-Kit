@@ -6,6 +6,9 @@ import json
 import pathlib
 import re
 import subprocess
+import sys
+import threading
+from collections.abc import Mapping
 from typing import Any
 
 from github_contract_engine.github_api import github_read_command, run_github_command
@@ -200,3 +203,71 @@ def require_success(args: list[str], *, cwd: pathlib.Path) -> None:
     """Require a successful native command while suppressing routine output."""
 
     require_output(args, cwd=cwd)
+
+
+def run_progress_command(
+    args: list[str],
+    *,
+    cwd: pathlib.Path,
+    env: Mapping[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Capture command results and immediately forward declared test-status lines.
+
+    stdout remains exclusively the child's result. stderr is drained concurrently
+    and retained in full for diagnostics; only the runner's ``[tests] `` lines
+    reach the live display. No status controls execution, acceptance or repetition.
+    """
+    stderr: list[str] = []
+    read_errors: list[OSError] = []
+    with subprocess.Popen(
+        args, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8", errors="replace",
+    ) as process:
+        assert process.stdout is not None and process.stderr is not None
+
+        def drain() -> None:
+            assert process.stderr is not None
+            try:
+                for line in process.stderr:
+                    stderr.append(line)
+                    if line.startswith("[tests] "):
+                        try:
+                            sys.stderr.write(line)
+                            sys.stderr.flush()
+                        except (OSError, ValueError):
+                            pass  # A closed observer must not block pipe drainage.
+            except OSError as exc:
+                read_errors.append(exc)
+
+        reader = threading.Thread(target=drain, daemon=True)
+        reader.start()
+        try:
+            stdout = process.stdout.read()
+            code = process.wait()
+        except BaseException:
+            process.kill()
+            process.wait()
+            raise
+        finally:
+            reader.join()
+        if read_errors:
+            raise read_errors[0]
+    return subprocess.CompletedProcess(args, code, stdout, "".join(stderr))
+
+
+def run_json_command(command: list[str], cwd: pathlib.Path) -> tuple[int, dict[str, Any]]:
+    """Run a lifecycle command and require its single JSON object result."""
+    result = run_progress_command(command, cwd=cwd)
+    # Failed lifecycle helpers may put their final JSON on stderr. Progress is
+    # observational and must not make that otherwise valid result unparsable.
+    error_result = "\n".join(
+        line for line in result.stderr.splitlines() if not line.startswith("[tests] ")
+    ).strip()
+    raw = result.stdout.strip() or error_result
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise CommandError("Lifecycle helper returned invalid JSON.", completed=result) from exc
+    if not isinstance(payload, dict):
+        raise CommandError("Lifecycle helper returned a non-object result.", completed=result)
+    return result.returncode, payload

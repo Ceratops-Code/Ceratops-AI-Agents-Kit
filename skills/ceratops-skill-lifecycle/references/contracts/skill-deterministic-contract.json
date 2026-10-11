@@ -3,7 +3,7 @@
   "contract_format_version": 1,
   "kind": "skill_design_contract",
   "name": "ceratops_skill_deterministic_contract",
-  "captured_on": "2026-07-31",
+  "captured_on": "2026-10-11",
   "source_files": [
     {
       "path": "$CERATOPS_AI_AGENTS_KIT_ROOT/skills/ceratops-skill-lifecycle/references/contracts/skill-contract-source-docs.json",
@@ -123,7 +123,7 @@
         "source SKILL.md frontmatter",
         "source SKILL.md section and subsection structure"
       ],
-      "pass_condition": "Source skill frontmatter contains only name and description; name matches the directory, contains 1 to 64 lowercase ASCII letters, digits, or hyphens, does not start or end with a hyphen, and contains no consecutive hyphens; description contains 40 to 1024 characters; the body contains a Markdown H2 section structure; the ceratops profile additionally requires Boundaries and Output Contract subsections."
+      "pass_condition": "Source skill frontmatter requires name and description and permits the supported optional Agent Skills fields license, compatibility, metadata, and allowed-tools with their published types and limits; name matches the directory, contains 1 to 64 lowercase ASCII letters, digits, or hyphens, does not start or end with a hyphen, and contains no consecutive hyphens; description contains 40 to 1024 characters; the body contains a Markdown H2 section structure; the ceratops profile additionally requires Boundaries and Output Contract subsections."
     },
     {
       "id": "skill.metadata_alignment",
@@ -133,7 +133,7 @@
         "skills/ceratops-skill-lifecycle/references/templates/ceratops-logo-500.png",
         "source SKILL.md description"
       ],
-      "pass_condition": "OpenAI interface metadata exists, default_prompt names the skill, display name resembles the skill identity, and short description contains 25 to 64 characters and overlaps the trigger description; the ceratops profile additionally requires icon fields, shared Ceratops icon paths, and matching bytes."
+      "pass_condition": "OpenAI interface metadata exists, default_prompt names the skill, display name resembles the skill identity, and short description contains 25 to 64 characters and overlaps the trigger description; when present, dependencies.tools is an array of supported tool dependency objects and policy.allow_implicit_invocation is Boolean; the ceratops profile additionally requires icon fields, shared Ceratops icon paths, and matching bytes."
     },
     {
       "id": "skill.shared_section_generation",

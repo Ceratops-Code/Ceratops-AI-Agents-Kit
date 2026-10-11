@@ -2,7 +2,7 @@
   "contract_format_version": 1,
   "kind": "repository_validation_contract",
   "name": "ceratops_repository_validation_contract",
-  "captured_on": "2026-09-20",
+  "captured_on": "2026-10-11",
   "source_docs_ref": "github-contract-source-docs.json",
   "source_doc_scopes": [
     "repository_validation"
@@ -26,6 +26,87 @@
       "required_prerequisites": [
         "jdk",
         "android-sdk"
+      ],
+      "require_repository_entrypoint": true
+    },
+    {
+      "id": "go-module",
+      "when": [
+        {
+          "kind": "path-any",
+          "value": [
+            "**/go.mod"
+          ]
+        }
+      ],
+      "operation_category": "validate",
+      "required_capabilities": [
+        "go-vet"
+      ],
+      "required_prerequisites": [
+        "go"
+      ],
+      "require_repository_entrypoint": true
+    },
+    {
+      "id": "rust-cargo",
+      "when": [
+        {
+          "kind": "path-any",
+          "value": [
+            "**/Cargo.toml"
+          ]
+        }
+      ],
+      "operation_category": "validate",
+      "required_capabilities": [
+        "rustfmt-check",
+        "rust-clippy"
+      ],
+      "required_prerequisites": [
+        "rustfmt",
+        "clippy"
+      ],
+      "require_repository_entrypoint": true
+    },
+    {
+      "id": "dotnet",
+      "when": [
+        {
+          "kind": "path-any",
+          "value": [
+            "**/*.sln",
+            "**/*.csproj",
+            "**/*.fsproj",
+            "**/*.vbproj"
+          ]
+        }
+      ],
+      "operation_category": "validate",
+      "required_capabilities": [
+        "dotnet-format-check"
+      ],
+      "required_prerequisites": [
+        "dotnet-sdk"
+      ],
+      "require_repository_entrypoint": true
+    },
+    {
+      "id": "shell",
+      "when": [
+        {
+          "kind": "path-any",
+          "value": [
+            "**/*.sh"
+          ]
+        }
+      ],
+      "operation_category": "validate",
+      "required_capabilities": [
+        "shellcheck"
+      ],
+      "required_prerequisites": [
+        "shellcheck"
       ],
       "require_repository_entrypoint": true
     }
