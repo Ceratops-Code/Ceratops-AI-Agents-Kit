@@ -41,7 +41,7 @@ controller implementation are authoritative for workflow mechanics.
 
 `quick-analysis` uses its own evidence, classification, and completion rules.
 
-## Output Contract
+### Output Contract
 
 Use the selected action's output contract.
 
