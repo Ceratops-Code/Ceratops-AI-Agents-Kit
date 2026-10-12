@@ -30,6 +30,7 @@ from filelock import FileLock, Timeout
 SCHEMA = "ceratops-worktree-status-report.v1"
 REQUEST_SCHEMA = "ceratops-worktree-status-request.v1"
 LIST_LIMIT = 20
+PATCH_LIMIT = 16000
 TASK_LIMIT = 50
 # Remove inherited checkout/object redirects, not remote authentication or
 # transport configuration required by an explicitly authorized fetch.
@@ -171,10 +172,9 @@ def comparison(repo: pathlib.Path, base: str | None, commit: str) -> dict[str, A
             "patch_equivalence": None,
             "diff": None,
         }
-    subjects = git_text(
+    commits = git_text(
         repo,
-        "log",
-        "--format=%s",
+        "rev-list",
         f"{base}..{commit}",
     ).splitlines()
     cherry_lines = [
@@ -185,10 +185,12 @@ def comparison(repo: pathlib.Path, base: str | None, commit: str) -> dict[str, A
         for line in git_text(repo, "diff", "--name-only", f"{base}...{commit}").splitlines()
         if line
     ]
+    patch = git_text(repo, "diff", "--no-ext-diff", "--no-textconv", "--no-color", f"{base}...{commit}")
+    tree_diff = run_git(repo, "diff", "--quiet", base, commit, allowed_codes=(0, 1))
     return {
         "status": "available",
         "reason": None,
-        "unique_commits": bounded(subjects),
+        "unique_commits": bounded(commits),
         "patch_equivalence": {
             "equivalent": sum(line.startswith("-") for line in cherry_lines),
             "unique": sum(line.startswith("+") for line in cherry_lines),
@@ -197,6 +199,10 @@ def comparison(repo: pathlib.Path, base: str | None, commit: str) -> dict[str, A
         "diff": {
             "paths": bounded(changed_paths),
             "shortstat": git_text(repo, "diff", "--shortstat", f"{base}...{commit}"),
+            "patch": patch[:PATCH_LIMIT],
+            "patch_characters": len(patch),
+            "patch_truncated": len(patch) > PATCH_LIMIT,
+            "tree_matches_base": tree_diff.returncode == 0,
         },
     }
 
@@ -255,6 +261,24 @@ def containment(repo: pathlib.Path, commit: str, base: str | None) -> str:
     return "Yes" if is_ancestor(repo, commit, base) else "No"
 
 
+def assessment_eligible(record: dict[str, Any]) -> bool:
+    """Keep assessment scope independent of read-only ownership observations."""
+
+    branch = record["branch"]
+    if record["kind"] == "remote_branch":
+        branch = branch.partition("/")[2]
+    return record["promoted"] == record["shipped"] == "No" and not branch.startswith("dependabot/")
+
+
+def integration_ref(ref: str, release_ref: str, remote_ref: str) -> bool:
+    """Omit integration branches on any remote and their checked-out worktrees."""
+
+    label = ref_label(ref)
+    if ref.startswith("refs/remotes/"):
+        label = label.partition("/")[2]
+    return label in {"main", "release/local", ref_label(release_ref), remote_ref.partition("/")[2]}
+
+
 def row(
     repo: pathlib.Path,
     *,
@@ -291,9 +315,8 @@ def row(
             "subject": git_text(repo, "show", "-s", "--format=%s", commit),
             "promoted": containment(repo, commit, release_commit),
             "shipped": containment(repo, commit, remote_commit) if remote_fresh else "Unavailable",
-            "release_evidence": comparison(repo, release_commit, commit),
         }
-    return {
+    record = {
         "branch": branch,
         "worktree": worktree,
         "kind": kind,
@@ -301,6 +324,22 @@ def row(
         **commit_cache[commit],
         "worktree_state": worktree_state,
     }
+    # Eligibility precedes expensive patch collection. A bot ref may share its
+    # commit with a human branch, so this decision cannot live in commit_cache.
+    if assessment_eligible(record):
+        record["release_evidence"] = comparison(repo, release_commit, commit)
+        record["shipping_evidence"] = (record["release_evidence"] if remote_commit == release_commit
+                                       else comparison(repo, remote_commit, commit))
+        if worktree_state is not None and worktree_state["status"] == "available" and not worktree_state["clean"]:
+            dirty_patch = git_text(repo if worktree == "-" else pathlib.Path(worktree),
+                                   "diff", "HEAD", "--no-ext-diff", "--no-textconv", "--no-color")
+            record["worktree_changes"] = {
+                "patch": dirty_patch[:PATCH_LIMIT], "patch_truncated": len(dirty_patch) > PATCH_LIMIT,
+                "untracked": bounded(git_text(pathlib.Path(worktree), "ls-files", "--others", "--exclude-standard").splitlines()),
+            }
+    else:
+        record["release_evidence"] = record["shipping_evidence"] = {"status": "not_applicable"}
+    return record
 
 
 def snapshot(selection: dict[str, Any], repo: pathlib.Path) -> dict[str, Any]:
@@ -352,6 +391,8 @@ def snapshot(selection: dict[str, Any], repo: pathlib.Path) -> dict[str, Any]:
         branch_ref = item.get("branch")
         if branch_ref:
             represented.add(branch_ref)
+            if integration_ref(branch_ref, release_ref, remote_ref):
+                continue
         records.append(
             row(
                 repo,
@@ -366,7 +407,7 @@ def snapshot(selection: dict[str, Any], repo: pathlib.Path) -> dict[str, Any]:
             )
         )
     for ref, commit, _symbolic in refs(repo, "refs/heads"):
-        if ref in represented:
+        if ref in represented or integration_ref(ref, release_ref, remote_ref):
             continue
         records.append(
             row(
@@ -382,7 +423,7 @@ def snapshot(selection: dict[str, Any], repo: pathlib.Path) -> dict[str, Any]:
             )
         )
     for ref, commit, symbolic in refs(repo, "refs/remotes"):
-        if symbolic:
+        if symbolic or integration_ref(ref, release_ref, remote_ref):
             continue
         records.append(
             row(
@@ -408,12 +449,15 @@ def snapshot(selection: dict[str, Any], repo: pathlib.Path) -> dict[str, Any]:
         for record in records:
             record["promoted"] = record["shipped"] = "Unavailable"
             record["release_evidence"] = {"status": "unavailable", "reason": gaps[-1]}
+            record["shipping_evidence"] = {"status": "unavailable", "reason": gaps[-1]}
     for record in records:
         state = record["worktree_state"]
         if state is not None and state["status"] == "unavailable":
             gaps.append(f"worktree_state_unavailable: {record['worktree']}")
         if record["release_evidence"]["status"] == "unavailable":
             gaps.append(f"release_evidence_unavailable: {record['branch']}")
+        if record["shipping_evidence"]["status"] == "unavailable":
+            gaps.append(f"shipping_evidence_unavailable: {record['branch']}")
     return {
         "status": "partial" if gaps else "complete",
         "repository": str(repo),
@@ -566,23 +610,15 @@ def table_row(record: dict[str, Any], evidence: dict[str, Any]) -> list[str]:
         task_cell += ": " + "; ".join(descriptions)
     if owner["reason"]:
         task_cell += f" ({owner['reason']})"
-    eligible = record["promoted"] == record["shipped"] == "No" and owner["status"] == "None"
-    worth = "Unverified: agent judgment required" if eligible else "-"
+    eligible = assessment_eligible(record)
+    worth = "Unverified: inspect file changes" if eligible else "-"
     record["worth_promoting"] = {"eligible": eligible, "value": worth}
-    comparison_evidence = record["release_evidence"]
-    if comparison_evidence["status"] == "available":
-        subjects = comparison_evidence["unique_commits"]
-        paths = comparison_evidence["diff"]["paths"]
-        parts = ["; ".join(subjects["items"]) or "No unique commits"]
-        if subjects["truncated"]:
-            parts.append(f"{subjects['count']} subjects total; list truncated")
-        if paths["items"]:
-            parts.append("Paths: " + ", ".join(paths["items"]))
-        if paths["truncated"]:
-            parts.append(f"{paths['count']} paths total; list truncated")
-        changes = "; ".join(parts)
-    else:
-        changes = "Unavailable: " + comparison_evidence["reason"]
+    # A deterministic collector must not invent a semantic recommendation from
+    # subjects or filenames. The caller reads the supplied patches and replaces
+    # these explicit pending cells with a behavior-based judgment.
+    changes = "Unverified: inspect file changes" if eligible else "-"
+    if eligible and "worktree_changes" in record:
+        changes += "; uncommitted and untracked content requires inspection"
     return [record["branch"], record["worktree"], dirty, record["promoted"], record["shipped"], task_cell, worth, changes]
 
 

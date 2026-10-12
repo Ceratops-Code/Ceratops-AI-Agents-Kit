@@ -101,7 +101,7 @@ For example, discover all rename candidates, then inspect selected files:
 The `ceratops-mcp-server-lifecycle` skill owns release packaging and installation.
 `tools/pyproject.toml` declares `source_search_mcp` version `1.0.0` with the
 repository's pinned MCP dependency and wheel backend. `tools/mcp-server.json`
-selects the readiness module, and `tools/pylock.toml` locks the release's
+selects the readiness module, and `tools/uv.lock` locks the release's
 dependencies, including `ripgrep-bin==15.1.0`. The wheel contains the entry point
 and the existing search helper; an installed server uses its isolated ripgrep
 binary and does not depend on a retained source checkout or ambient PATH.

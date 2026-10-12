@@ -134,7 +134,7 @@
         "tools/source_search_mcp.py",
         "tools/pyproject.toml",
         "tools/mcp-server.json",
-        "tools/pylock.toml"
+        "tools/uv.lock"
       ],
       "suites": [
         "test-infrastructure"

@@ -44,7 +44,7 @@ updates:
     labels:
       - dependencies
       - python
-  - package-ecosystem: pip
+  - package-ecosystem: uv
     directory: /tools
     schedule:
       interval: weekly

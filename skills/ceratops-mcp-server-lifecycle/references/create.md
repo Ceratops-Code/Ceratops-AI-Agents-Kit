@@ -43,7 +43,7 @@ repository.
    %USERPROFILE%\.codex\mcp\ceratops_mcp_server_manager\bin\ceratops_mcp_server_manager.cmd package --source <mcp-server-source>
    ```
 
-   Review `pylock.toml` between these commands. The first records locked
+   Review the source's canonical lockfile between these commands. The first records locked
    dependencies; the second builds and registers that exact MCP server without
    activating it. For an MCP server declaring a separate SDLC package prerequisite,
    build and validate that package wheel first; register the MCP server with
