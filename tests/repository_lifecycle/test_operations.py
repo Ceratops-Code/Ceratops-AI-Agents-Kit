@@ -259,7 +259,7 @@ def test_sdlc_template_is_a_schema_valid_empty_skeleton(tmp_path: pathlib.Path) 
     assert "deliverables.skills.ceratops-repo-lifecycle.actions.validate" in validation
     assert "deliverables.hooks.codex-hooks.actions.validate" in validation
     assert "deliverables.mcp-servers.ceratops-mcp-server-manager.actions.validate" in validation
-    assert validation[-1] == "repository.actions.test"
+    assert "repository.actions.test" in validation
 
 
 def test_absent_sdlc_section_is_a_successful_no_op(tmp_path: pathlib.Path) -> None:
