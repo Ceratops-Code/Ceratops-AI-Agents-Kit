@@ -63,7 +63,7 @@ deliverables:
           steps:
             - run: [uv, run, --locked, scripts/deploy-mcp-server-manager.py]
 
-    source_search_mcp:
+    source-search-mcp:
       source: tools
       manifest: tools/mcp-server.json
       prerequisites: []
@@ -84,7 +84,7 @@ deliverables:
                 lifecycle: ceratops-mcp-server-lifecycle
                 action: install
                 inputs:
-                  mcp-server: source_search_mcp
+                  mcp-server: source-search-mcp
 
   skills:
     ceratops-automation-run:

@@ -108,7 +108,7 @@ binary and does not depend on a retained source checkout or ambient PATH.
 
 Use the skill's create action to lock, review, and package `tools/` through the
 installed manager, then its install action for that exact registered release.
-The repository's `deliverables.mcp-servers.source_search_mcp.actions.install`
+The repository's `deliverables.mcp-servers.source-search-mcp.actions.install`
 entry routes local delivery through that same lifecycle action.
 The manager owns artifacts, isolated environments, selection, locks, and bounded
 retention under `$HOME/.codex/mcp/source_search_mcp`: activation keeps the selected
