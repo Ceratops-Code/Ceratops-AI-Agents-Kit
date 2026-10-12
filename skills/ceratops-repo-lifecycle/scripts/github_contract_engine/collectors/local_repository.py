@@ -9,10 +9,10 @@ import pathlib
 import posixpath
 import re
 import subprocess
+import tomllib
 import xml.etree.ElementTree as ET
 from typing import Any
 
-import tomllib
 import yaml
 from ceratops_repo_compatibility_engine.sdlc_contract_validation import (
     read_contract,
