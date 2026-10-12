@@ -197,10 +197,13 @@ def run_pytest(
     child["PYTHONPATH"] = os.pathsep.join(
         value for value in (plugin_root, child.get("PYTHONPATH")) if value
     )
-    plugins = ["-p", "report_test_progress"]
+    plugins = []
     if RESULT_CONTEXT_ENV in child:
+        # Register the acceptance plugin before progress imports its constants,
+        # so pytest can install assertion rewriting before the first import.
         plugins += ["-p", "reuse_test_results"]
         child[RESULT_SUMMARY_ENV] = str(pathlib.Path(child["TMP"]) / "pytest-results.json")
+    plugins += ["-p", "report_test_progress"]
     argv = [*command[:3], *plugins, *command[3:]]
     errors: list[str] = []
     read_errors: list[OSError] = []

@@ -28,6 +28,10 @@
       "type": "string",
       "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"
     },
+    "mcpIdentifier": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*$"
+    },
     "parameter": {
       "type": "string",
       "pattern": "^[a-z][a-z0-9_]*$"
@@ -563,7 +567,7 @@
       "type": "object",
       "minProperties": 1,
       "propertyNames": {
-        "$ref": "#/$defs/identifier"
+        "$ref": "#/$defs/mcpIdentifier"
       },
       "additionalProperties": {
         "$ref": "#/$defs/mcpServer"

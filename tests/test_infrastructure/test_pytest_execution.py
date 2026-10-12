@@ -664,6 +664,19 @@ def _pass_store(root):
     return module.PassStore(root, context)
 
 
+def test_acceptance_plugin_loads_without_assertion_rewrite_warning(
+    test_runner_module, tmp_path, monkeypatch,
+):
+    monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
+    root = _acceptance_repository(tmp_path)
+    _acceptance_test(root, "example", tmp_path / "effects.log")
+    for _ in range(2):
+        result = _acceptance_run(test_runner_module, root)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "PytestAssertRewriteWarning" not in result.stdout + result.stderr
+        assert "[tests] pytest exit 0" in result.stderr
+
+
 def test_test_only_correction_reuses_passes_from_failed_suite(
     test_runner_module, tmp_path, monkeypatch,
 ):
