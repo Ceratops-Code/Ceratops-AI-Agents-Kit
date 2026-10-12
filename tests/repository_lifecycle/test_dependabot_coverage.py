@@ -22,20 +22,28 @@ from github_contract_engine.compare_states import compare_states  # noqa: E402
 
 
 class DependabotCoverageTests(unittest.TestCase):
-    def test_generated_tooling_lint_target_matches_supported_python(self):
+    def test_generated_tooling_uses_contract_ruff_target(self):
         import tomllib
 
         from ceratops_repo_compatibility_engine.python_tool_configuration import (
             project_text,
         )
+        from ceratops_repo_compatibility_engine.repository_validation_contract import (
+            load_validation_contract,
+        )
 
         template = SCRIPTS.parent / "references/templates/validation-pyproject.toml.tmpl"
+        ruff_policy = load_validation_contract()["ruff_policy"]
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
             for _ in range(2):
                 project = tomllib.loads(project_text(root, template))
+                # The lint target does not raise the application's Python minimum.
                 self.assertEqual(project["project"]["requires-python"], ">=3.11")
-                self.assertEqual(project["tool"]["ruff"]["target-version"], "py311")
+                self.assertEqual(
+                    project["tool"]["ruff"]["target-version"],
+                    ruff_policy["target-version"],
+                )
 
     def test_release_attestation_consumer_commands_include_docs_and_scripts(self):
         for name, text in [("README.md", "gh release verify-asset v1.0 ./setup.exe"),
