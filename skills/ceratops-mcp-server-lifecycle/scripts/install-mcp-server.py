@@ -19,7 +19,6 @@ import subprocess
 import sys
 from typing import Any
 
-
 INSTALL_ROOT = pathlib.Path.home() / ".codex" / "mcp"
 MANAGER = (
     INSTALL_ROOT
@@ -334,6 +333,19 @@ def main(argv: list[str] | None = None) -> int:
         promotion = _promotion_binding(
             args.promotion_result, args.operation, repo_root, commit
         )
+        # Receipt routing is a caller precondition, not a post-install failure.
+        output = None
+        if args.evidence_output is not None:
+            if promotion is None:
+                raise InstallCompletionError(
+                    "evidence-output requires a bound promotion result"
+                )
+            output = pathlib.Path(os.path.abspath(args.evidence_output.expanduser()))
+            result_file = pathlib.Path(promotion["result_file"])
+            if output.parent != result_file.parent:
+                raise InstallCompletionError(
+                    "evidence output must share the promotion task directory"
+                )
         if args.manager_result is not None:
             if any(
                 value is not None
@@ -354,10 +366,6 @@ def main(argv: list[str] | None = None) -> int:
         else:
             payload = _install(args, repo_root)
         mcp_server_name, transaction_id = _selected_transaction(payload)
-        if promotion is not None and "_" in mcp_server_name:
-            raise InstallCompletionError(
-                "promotion completion requires a kebab-case MCP server identity"
-            )
         receipt = {
             "schema": "ceratops-deployment-completion.v1",
             "producer": "ceratops-mcp-server-lifecycle/install",
@@ -371,17 +379,7 @@ def main(argv: list[str] | None = None) -> int:
             "cleanup_debt": [],
             "promotion": promotion,
         }
-        if args.evidence_output is not None:
-            if promotion is None:
-                raise InstallCompletionError(
-                    "evidence-output requires a bound promotion result"
-                )
-            output = pathlib.Path(os.path.abspath(args.evidence_output.expanduser()))
-            result_file = pathlib.Path(promotion["result_file"])
-            if output.parent != result_file.parent:
-                raise InstallCompletionError(
-                    "evidence output must share the promotion task directory"
-                )
+        if output is not None:
             _write_output(output, receipt)
         print(json.dumps(receipt, separators=(",", ":")))
         return 0
