@@ -70,7 +70,7 @@ tools/
   source_search_mcp.py
   pyproject.toml
   mcp-server.json
-  pylock.toml
+  uv.lock
 ```
 
 Source `SKILL.md` and action-reference files are portable, delta-only
