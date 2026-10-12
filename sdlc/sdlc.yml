@@ -63,6 +63,29 @@ deliverables:
           steps:
             - run: [uv, run, --locked, scripts/deploy-mcp-server-manager.py]
 
+    source_search_mcp:
+      source: tools
+      manifest: tools/mcp-server.json
+      prerequisites: []
+      actions:
+        validate:
+          requires:
+            capabilities: []
+          no-op: Repository checks cover source-search inputs; the MCP installer checks the locked candidate before activation.
+        test:
+          requires:
+            capabilities: []
+          no-op: Repository tests cover bounded source-search behavior and MCP packaging.
+        install:
+          requires:
+            capabilities: []
+          steps:
+            - handoff:
+                lifecycle: ceratops-mcp-server-lifecycle
+                action: install
+                inputs:
+                  mcp-server: source_search_mcp
+
   skills:
     ceratops-automation-run:
       source: skills/ceratops-automation-run
