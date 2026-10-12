@@ -43,10 +43,11 @@ repository.
    %USERPROFILE%\.codex\mcp\ceratops_mcp_server_manager\bin\ceratops_mcp_server_manager.cmd package --source <mcp-server-source>
    ```
 
-   Review the source's canonical lockfile between these commands. The first records locked
-   dependencies; the second builds and registers that exact MCP server without
-   activating it. For an MCP server declaring a separate SDLC package prerequisite,
-   build and validate that package wheel first; register the MCP server with
+   Review the source's canonical lockfile between these commands. The first
+   records locked dependencies; the second builds and registers that exact MCP
+   server without activating it. For an MCP server declaring a separate SDLC
+   package prerequisite, build and validate that package wheel first; register
+   the MCP server with
    `package --source <mcp-server-source> --package-wheel <wheel> --package-lock
    <package-lockfile>`. Keep the package source and canonical lockfile in its package
    directory. A Ceratops-AI-Agents-Kit checkout is not required. If the manager

@@ -84,7 +84,7 @@ deliverables:
                 lifecycle: ceratops-mcp-server-lifecycle
                 action: install
                 inputs:
-                  mcp-server: source-search-mcp
+                  mcp-server: source_search_mcp
 
   skills:
     ceratops-automation-run:
