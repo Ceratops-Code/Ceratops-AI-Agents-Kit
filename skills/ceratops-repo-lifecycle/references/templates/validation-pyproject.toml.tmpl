@@ -11,10 +11,18 @@ package = false
 members = []
 
 [tool.ruff]
-target-version = "py311"
+target-version = "py314"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "B"]
+select = [
+  "E", "F", "I", "B",
+  # Credentials, disabled HTTPS checks, and shell execution.
+  "S105", "S106", "S107", "S501", "S602", "S604", "S605",
+  # Blocking network, process, filesystem, input, and sleep calls in async code.
+  "ASYNC210", "ASYNC212", "ASYNC220", "ASYNC221", "ASYNC222",
+  "ASYNC230", "ASYNC240", "ASYNC250", "ASYNC251",
+  "DTZ003", "DTZ004", "DTZ005", "DTZ006", "UP", "RUF100",
+]
 ignore = ["E501"]
 
 [tool.mypy]
