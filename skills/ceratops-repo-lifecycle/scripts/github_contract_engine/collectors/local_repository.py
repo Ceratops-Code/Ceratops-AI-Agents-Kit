@@ -1255,8 +1255,8 @@ def collect_local_repository(
             ),
             "verification_command_detected": bool(
                 re.search(
-                    r"(?i)(gh attestation verify|cosign verify|cosign verify-attestation)",
-                    workflow_text,
+                    r"(?i)(gh attestation verify|gh release verify(?:-asset)?|cosign verify|cosign verify-attestation)",
+                    "\n".join(local["texts"].values()),
                 )
             ),
             "contents_read_present": "contents: read" in workflow_text,

@@ -22,6 +22,16 @@ from github_contract_engine.compare_states import compare_states  # noqa: E402
 
 
 class DependabotCoverageTests(unittest.TestCase):
+    def test_release_attestation_consumer_commands_include_docs_and_scripts(self):
+        for name, text in [("README.md", "gh release verify-asset v1.0 ./setup.exe"),
+                           ("scripts/install.py", "gh release verify v1.0"),
+                           (".github/workflows/check.yml", "run: gh attestation verify setup.exe")]:
+            with self.subTest(path=name):
+                facts = self.facts({name: text}, [])
+                self.assertTrue(facts["workflows"]["verification_command_detected"])
+        facts = self.facts({"README.md": "Download the release asset."}, [])
+        self.assertFalse(facts["workflows"]["verification_command_detected"])
+
     def test_language_coverage_uses_owned_files_and_ignores_dependency_trees(self):
         from ceratops_repo_compatibility_engine.repository_validation_contract import (
             load_validation_contract,
