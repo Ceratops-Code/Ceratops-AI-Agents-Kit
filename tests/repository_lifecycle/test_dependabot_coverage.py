@@ -22,6 +22,21 @@ from github_contract_engine.compare_states import compare_states  # noqa: E402
 
 
 class DependabotCoverageTests(unittest.TestCase):
+    def test_generated_tooling_lint_target_matches_supported_python(self):
+        import tomllib
+
+        from ceratops_repo_compatibility_engine.python_tool_configuration import (
+            project_text,
+        )
+
+        template = SCRIPTS.parent / "references/templates/validation-pyproject.toml.tmpl"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            for _ in range(2):
+                project = tomllib.loads(project_text(root, template))
+                self.assertEqual(project["project"]["requires-python"], ">=3.11")
+                self.assertEqual(project["tool"]["ruff"]["target-version"], "py311")
+
     def test_release_attestation_consumer_commands_include_docs_and_scripts(self):
         for name, text in [("README.md", "gh release verify-asset v1.0 ./setup.exe"),
                            ("scripts/install.py", "gh release verify v1.0"),

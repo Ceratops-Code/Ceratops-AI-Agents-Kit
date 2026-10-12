@@ -27,10 +27,9 @@ credential-bound fixes precisely.
   readiness without running repository validators or tests. It checks the SDLC
   contract and required validation files; missing or invalid required files
   remain findings. External-only health runs no local commands.
-- When the local repository declares artifact identities in a supported
-  `sdlc/sdlc.yml`, the repo checker validates that contract and uses its
-  artifact identities automatically. Caller-supplied
-  `artifact_contracts` remain only for repositories without local declarations.
+- SDLC package artifact fields describe build outputs. Supply
+  `artifact_contracts` for external registry, version, changelog, and
+  release-policy checks when applicable.
 - Report each `content.sdlc_migration` finding as an advisory proposal naming
   the repository, current and recommended SDLC versions, and reason.
   Supported contracts remain usable; automatic migration is outside this action.
