@@ -408,7 +408,7 @@
           "AKIA[0-9A-Z]{16}",
           "gh[pousr]_[A-Za-z0-9_]{20,}",
           "github_pat_[A-Za-z0-9_]{20,}",
-          "sk-[A-Za-z0-9_-]{20,}",
+          "(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]{20,}",
           "xox[baprs]-[A-Za-z0-9-]{10,}",
           "BEGIN (?:RSA |OPENSSH |EC |DSA )?PRIVATE KEY"
         ],

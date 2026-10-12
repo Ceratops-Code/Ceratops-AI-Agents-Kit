@@ -10,6 +10,7 @@ mapping; repository health owns aggregate execution separately.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import os
 import pathlib
@@ -82,12 +83,35 @@ def _validation_coverage_errors(
     entries = operation_entries(sdlc)
     version = int(sdlc["version"])
     errors: list[str] = []
+    # Installed dependencies and Git-ignored outputs do not create first-party
+    # language obligations, even when a captured package tracks vendor files.
+    dependency_dirs = {".git", "node_modules", ".venv", "venv", "__pycache__"}
+    inventory = subprocess.run(
+        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+        cwd=root, capture_output=True, check=False,
+    )
+    if inventory.returncode == 0:
+        paths = [root / os.fsdecode(value) for value in inventory.stdout.split(b"\0") if value]
+    else:
+        paths = []
+        for directory, directories, names in os.walk(root, followlinks=False):
+            directories[:] = [
+                name for name in directories
+                if name not in dependency_dirs and not (pathlib.Path(directory) / name).is_symlink()
+            ]
+            paths.extend(pathlib.Path(directory) / name for name in names)
+    owned_paths = [
+        path.relative_to(root).as_posix() for path in paths
+        if path.is_file() and not path.is_symlink()
+        and not dependency_dirs.intersection(path.relative_to(root).parts)
+    ]
     for requirement in validation_contract["coverage_requirements"]:
         active = any(
-            candidate.is_file() and not candidate.is_symlink()
+            fnmatch.fnmatchcase(path, pattern)
+            or (pattern.startswith("**/") and fnmatch.fnmatchcase(path, pattern[3:]))
             for condition in requirement["when"]
             for pattern in condition["value"]
-            for candidate in root.glob(pattern)
+            for path in owned_paths
         )
         if not active:
             continue

@@ -110,6 +110,11 @@ credential-bound fixes precisely.
 #### 4. Repair safe gaps
 
 - Apply low-risk reversible fixes directly.
+- In `RomanOstr/Codex-Desktop-App-Code`, inspect all open Dependabot alerts
+  and bot PRs. Prove upstream-only scope against the official package on
+  `original`; report those items, dismiss their alerts as `tolerable_risk`
+  with an upstream-ownership reason, and   close their bot PRs. Keep local-
+  tooling and mixed-scope items in the normal   dependency workflow.
 - Treat a successful mutation command as evidence for that exact setting or file
   change; rerun the checker only for uncertain state, asynchronous effects, or a
   broader clean-health claim.
