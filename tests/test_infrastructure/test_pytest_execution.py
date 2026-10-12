@@ -677,6 +677,26 @@ def test_acceptance_plugin_loads_without_assertion_rewrite_warning(
         assert "[tests] pytest exit 0" in result.stderr
 
 
+def test_repo_local_runtime_libraries_are_not_missing_repository_helpers(tmp_path, monkeypatch):
+    import importlib
+    import types
+
+    reuse = importlib.import_module("reuse_test_results")
+    library_root = tmp_path / ".venv/Lib/site-packages"
+    monkeypatch.setattr(reuse.sysconfig, "get_path", lambda name: str(library_root))
+    library = types.ModuleType("installed_library")
+    library.__file__ = str(library_root / "installed_library/__init__.py")
+    source = types.ModuleType("repository_helper")
+    source.__file__ = str(tmp_path / "helper.py")
+    setattr(source, "library", library)
+    for _ in range(2):
+        assert reuse._module_inputs(source, tmp_path) == {"helper.py"}
+    # Ignored generated source outside installed library roots must still stop
+    # acceptance; only the interpreter's actual dependency directories differ.
+    library.__file__ = str(tmp_path / "generated/library.py")
+    assert reuse._module_inputs(source, tmp_path) == {"helper.py", "generated/library.py"}
+
+
 def test_test_only_correction_reuses_passes_from_failed_suite(
     test_runner_module, tmp_path, monkeypatch,
 ):

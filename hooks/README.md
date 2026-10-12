@@ -108,6 +108,8 @@ binary and does not depend on a retained source checkout or ambient PATH.
 
 Use the skill's create action to lock, review, and package `tools/` through the
 installed manager, then its install action for that exact registered release.
+The repository's `deliverables.mcp-servers.source_search_mcp.actions.install`
+entry routes local delivery through that same lifecycle action.
 MCP server identifiers keep the exact project name, including underscores;
 other SDLC deliverable names remain hyphenated.
 The manager owns artifacts, isolated environments, selection, locks, and bounded

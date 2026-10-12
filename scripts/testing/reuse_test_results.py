@@ -25,6 +25,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import sysconfig
 import time
 import types
 import uuid
@@ -109,6 +110,11 @@ def _module_inputs(module: types.ModuleType, root: pathlib.Path) -> set[str]:
     use the no_result_reuse marker and always execute.
     """
     found: set[str] = set()
+    # A repo-local virtualenv is still an installed dependency environment.
+    # Distribution versions already bind it; treating its ignored libraries as
+    # missing repo helpers would disable every pass record in ordinary uv runs.
+    library_roots = {pathlib.Path(sysconfig.get_path(name)).resolve()
+                     for name in ("purelib", "platlib")}
     pending = [module]
     seen: set[int] = set()
     while pending:
@@ -119,8 +125,11 @@ def _module_inputs(module: types.ModuleType, root: pathlib.Path) -> set[str]:
         source = getattr(current, "__file__", None)
         if not source:
             continue
+        source_path = pathlib.Path(source).resolve()
+        if any(source_path.is_relative_to(library) for library in library_roots):
+            continue
         try:
-            relative = pathlib.Path(source).resolve().relative_to(root).as_posix()
+            relative = source_path.relative_to(root).as_posix()
         except ValueError:
             continue
         found.add(relative)
