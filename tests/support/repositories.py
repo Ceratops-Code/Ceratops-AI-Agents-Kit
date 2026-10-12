@@ -5,6 +5,7 @@ import os
 import pathlib
 import shutil
 import subprocess
+import sys
 
 import yaml
 
@@ -22,12 +23,17 @@ INSTALLER_TEMPLATE = (
 def prepare_script_environment(repo: pathlib.Path) -> None:
     """Give an entrypoint fixture its declared uv project without installed skills."""
     templates = INSTALLER_TEMPLATE.parent
+    bundle_scripts = templates.parents[1] / "scripts"
+    if str(bundle_scripts) not in sys.path:
+        sys.path.insert(0, str(bundle_scripts))
+    from ceratops_repo_compatibility_engine.python_tool_configuration import (
+        project_text,
+    )
+
     scripts = repo / "scripts"
     scripts.mkdir(exist_ok=True)
     (scripts / "pyproject.toml").write_text(
-        (templates / "validation-pyproject.toml.tmpl")
-        .read_text(encoding="utf-8")
-        .replace("__DEPENDENCIES__", '["jsonschema", "PyYAML", "ruff", "mypy"]'),
+        project_text(repo, templates / "validation-pyproject.toml.tmpl", ["jsonschema", "PyYAML", "ruff", "mypy"]),
         encoding="utf-8",
     )
     (scripts / ".gitignore").write_text(".venv/\n__pycache__/\n", encoding="utf-8")

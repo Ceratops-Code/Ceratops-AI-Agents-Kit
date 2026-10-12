@@ -6,7 +6,6 @@ the verified target; an existing environment is never recursively discarded.
 """
 
 # Environment setup reports malformed declarations as RuntimeError.
-# ruff: noqa: TRY004
 from __future__ import annotations
 
 import os
@@ -14,10 +13,10 @@ import pathlib
 import re
 import shutil
 import subprocess
+import tomllib
 from collections.abc import Mapping
 from typing import Any
 
-import tomllib
 import yaml
 
 from .python_tool_configuration import project_text
@@ -34,7 +33,9 @@ def runtime_files(
     runtime = contract["runtime"]
     planned_files = planned_files or {}
     files: dict[pathlib.Path, str] = {}
-    dependencies: set[str] = set()
+    # Compatibility inspects native Ruff settings even when a custom runner
+    # owns the repository checks; its locked environment must provide Ruff.
+    dependencies: set[str] = {"ruff"}
     # Preserved runners own their framework dependencies. Only the runner this
     # transaction generates has a known pytest dependency.
     if generate_python_test_runner:
@@ -55,7 +56,7 @@ def runtime_files(
         missing = {name for name in dependencies if name.lower().replace("_", "-") not in names}
         if missing:
             raise RuntimeError("existing validator project must declare: " + ", ".join(sorted(missing)))
-    if not project.is_file() or project.read_text(encoding="utf-8") != rendered:
+    if not project.is_file() or project.read_bytes().decode("utf-8") != rendered:
         files[project] = rendered
     surface = contract["surfaces"]["actionlint_runner"]
     runner = root / surface["path"]

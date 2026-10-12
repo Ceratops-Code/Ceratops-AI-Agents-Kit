@@ -4,7 +4,7 @@
   "title": "Repository validation generation contract",
   "type": "object",
   "additionalProperties": false,
-  "required": ["contract_format_version", "kind", "name", "source_docs_ref", "source_doc_scopes", "coverage_requirements", "checks"],
+  "required": ["contract_format_version", "kind", "name", "source_docs_ref", "source_doc_scopes", "ruff_policy", "coverage_requirements", "checks"],
   "properties": {
     "contract_format_version": {"const": 1},
     "kind": {"const": "repository_validation_contract"},
@@ -21,6 +21,23 @@
       "minItems": 1,
       "uniqueItems": true,
       "items": {"type": "string", "minLength": 1}
+    },
+    "ruff_policy": {
+      "description": "Required Ruff settings consumed by python_tool_configuration during generation and compatibility checks. Ruff expands selectors and ignores using the selected tool runtime.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target-version", "select", "ignore"],
+      "properties": {
+        "target-version": {"type": "string", "pattern": "^py3[0-9]{1,2}$"},
+        "select": {
+          "type": "array", "minItems": 1, "uniqueItems": true,
+          "items": {"type": "string", "pattern": "^(?:[A-Z]+[0-9]*|ALL)$"}
+        },
+        "ignore": {
+          "type": "array", "uniqueItems": true,
+          "items": {"type": "string", "pattern": "^(?:[A-Z]+[0-9]*|ALL)$"}
+        }
+      }
     },
     "coverage_requirements": {
       "description": "Required validation coverage consumed by validate_ceratops_compatibility without generating duplicate repository commands.",

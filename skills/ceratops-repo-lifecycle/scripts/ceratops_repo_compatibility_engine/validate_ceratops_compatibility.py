@@ -1,6 +1,7 @@
 """Structural compatibility and explicit repository test-result probes.
 
-The structural checker never runs the repository aggregate or tests. Optional
+The structural checker never runs the repository aggregate or tests. Ruff's
+read-only settings commands enforce the shared rule and Python-target policy. Optional
 result probes run controlled commands only in a caller-owned result directory;
 structural success alone is not acceptance of reusable test results.
 Callers receive only the stable ``applicable``, ``valid``, and ``errors``
@@ -27,6 +28,7 @@ import yaml
 from .ci_workflow import workflow_errors
 from .compatibility_contract import load_compatibility_contract, template_path
 from .generate_test_script import discover_python_tests
+from .python_tool_configuration import ruff_policy_errors
 from .repository_validation_contract import load_validation_contract
 from .sdlc_contract_validation import (
     operation_category,
@@ -497,6 +499,8 @@ def validate_ceratops_compatibility(
     for relative in [contract["runtime"]["lockfile"]]:
         if error := _regular_file_error(root, pathlib.Path(relative)):
             errors.append(error)
+    if not errors:
+        errors.extend(ruff_policy_errors(root, validation_contract["ruff_policy"], contract["runtime"]))
 
     if (result_directory is None) != (runner_command is None):
         errors.append("test-result probing requires both runner_command and result_directory")
