@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import argparse
 import copy
 import hashlib
 import json
@@ -15,9 +14,7 @@ import pytest
 
 from tests.repository_lifecycle.support import (
     MANAGE_PENDING_WORK,
-    OPERATION_RUNNER,
     PROMOTE_REPOSITORY,
-    SHIP_REPOSITORY,
     prepare_divergent_promotion_repo,
     prepare_repository_lifecycle_repo,
 )
@@ -701,152 +698,6 @@ def test_promote_repository_runs_explicit_operation_ids_in_order(
     assert run_git(repo, "show-ref", "--verify", "refs/heads/approved").returncode == 0
     assert log.read_text(encoding="utf-8") == operation_log
 
-
-@pytest.mark.parametrize(
-    "metadata",
-    [
-        [],
-        ["--title", "Complete Dev Tools catalog"],
-        ["--body", "Use explicit exclusions.\n\nPreserve deployment.\n"],
-        ["--title", "Complete Dev Tools catalog", "--body", "Exact description"],
-        ["--body", ""],
-    ],
-    ids=["defaults", "title", "body", "both", "empty-body"],
-)
-def test_promote_repository_ship_after_promotion_composes_terminal_workflow(
-    tmp_path: pathlib.Path,
-    metadata: list[str],
-) -> None:
-    repo, approved_head, log, _ = prepare_repository_lifecycle_repo(tmp_path)
-    loaded = runpy.run_path(str(PROMOTE_REPOSITORY))
-    parser = loaded["build_parser"]()
-    arguments = [
-        "--repo-root",
-        str(repo),
-        "--source-branch",
-        "approved",
-        "--main-branch",
-        "main",
-        "--release-branch",
-        "release/local",
-        "--remote-name",
-        "origin",
-        "--ship-after-promotion",
-        *metadata,
-    ]
-    parsed = parser.parse_args(arguments)
-    assert parsed.ship_after_promotion is True
-    assert parsed.run_operation is None
-    assert parsed.no_run_operation is False
-    for conflicting in (
-        ["--run-operation", "deliverables.apps.sample.actions.install"],
-        ["--no-run-operation"],
-    ):
-        with pytest.raises(SystemExit):
-            parser.parse_args([*arguments, *conflicting])
-
-    shipped = {
-        "status": "shipped",
-        "repository": "example/repository",
-        "commit": approved_head,
-        "pr": 31,
-        "url": "https://example.invalid/pull/31",
-        "merge_commit": "c" * 40,
-        "synchronized_head": "b" * 40,
-        "release_publication": {
-            "status": "published",
-            "operation": "publish",
-            "steps": ["publish"],
-        },
-        "deployment": {
-            "status": "completed",
-            "operation": "deliverables.apps.sample.actions.install",
-            "steps": ["install"],
-        },
-        "finalization": {"status": "finalized"},
-    }
-    original_run_json = loaded["_run_json"]
-    original_ship_after_promotion = loaded["_ship_after_promotion"]
-    commands: list[list[str]] = []
-    recorded: dict[str, object] = {}
-    captured_handoff: dict[str, object] = {}
-
-    def run_json(command: list[str], cwd: pathlib.Path) -> tuple[int, dict[str, Any]]:
-        if pathlib.Path(command[1]) == OPERATION_RUNNER:
-            assert "--validate" in command
-            return original_run_json(command, cwd)
-        commands.append(command)
-        if pathlib.Path(command[1]) == MANAGE_PENDING_WORK:
-            assert "--preserve-divergent-target" in command
-            code, result = original_run_json(command, cwd)
-            recorded.update(result)
-            return code, result
-        assert pathlib.Path(command[1]) == SHIP_REPOSITORY
-        assert recorded["target_commit"] == approved_head
-        assert pathlib.Path(str(recorded["pending_work_scope"])).is_file()
-        assert run_git(repo, "rev-parse", "release/local").stdout.strip() == (
-            approved_head
-        )
-        return 0, shipped
-
-    def ship_after_promotion(
-        args: argparse.Namespace,
-        repo_root: pathlib.Path,
-        *,
-        target_commit: str,
-        pending_work_scope: object,
-    ) -> dict[str, object]:
-        captured_handoff.update(
-            {
-                "target_commit": target_commit,
-                "pending_work_scope": pending_work_scope,
-            }
-        )
-        return original_ship_after_promotion(
-            args,
-            repo_root,
-            target_commit=target_commit,
-            pending_work_scope=pending_work_scope,
-        )
-
-    promote = loaded["promote"]
-    promote.__globals__["_run_json"] = run_json
-    promote.__globals__["_ship_after_promotion"] = ship_after_promotion
-    result = promote(parsed)
-
-    assert result == shipped
-    assert len(commands) == 2
-    assert pathlib.Path(commands[0][1]) == MANAGE_PENDING_WORK
-    ship_command = commands[1]
-    assert pathlib.Path(ship_command[1]) == SHIP_REPOSITORY
-    assert ship_command[ship_command.index("--repo-root") + 1] == str(repo.resolve())
-    assert ship_command[ship_command.index("--head-branch") + 1] == "release/local"
-    assert ship_command[ship_command.index("--base-branch") + 1] == "main"
-    assert ship_command[ship_command.index("--remote-name") + 1] == "origin"
-    assert ship_command[ship_command.index("--commit") + 1] == approved_head
-    assert pathlib.Path(
-        ship_command[ship_command.index("--sdlc-contract") + 1]
-    ) == pathlib.Path("sdlc/sdlc.yml")
-    assert "--publish-operation" not in ship_command
-    assert "--deploy-operation" not in ship_command
-    assert "--validation-operation" not in ship_command
-    assert "--reusable-head" in ship_command
-    for flag in ("--title", "--body"):
-        if flag in metadata:
-            assert (
-                ship_command[ship_command.index(flag) + 1]
-                == metadata[metadata.index(flag) + 1]
-            )
-        else:
-            assert flag not in ship_command
-    assert str(OPERATION_RUNNER) not in (command[1] for command in commands)
-    assert captured_handoff == {
-        "target_commit": approved_head,
-        "pending_work_scope": recorded["pending_work_scope"],
-    }
-    assert not log.exists()
-
-
 @pytest.mark.parametrize("mode", ["--prepare-release-only", "--no-run-operation"])
 @pytest.mark.parametrize("metadata", [["--title", "Custom title"], ["--body", ""]])
 def test_promote_repository_metadata_requires_composed_shipping_before_mutation(
@@ -863,128 +714,12 @@ def test_promote_repository_metadata_requires_composed_shipping_before_mutation(
         pytest.fail("metadata misuse must block before repository commands")
 
     promote = loaded["promote"]
-    for name in ("require_output", "require_success", "_run_json"):
+    for name in ("require_output", "require_success", "run_command_for_json"):
         promote.__globals__[name] = unexpected
     with pytest.raises(
         loaded["PromotionError"], match="PR metadata requires --ship-after-promotion"
     ):
         promote(args)
-
-
-def test_promote_repository_ship_after_promotion_preserves_blocked_state(
-    tmp_path: pathlib.Path,
-) -> None:
-    (
-        repo,
-        source_worktree,
-        _,
-        _release_head,
-        _,
-    ) = prepare_divergent_promotion_repo(tmp_path / "shipping-blocker")
-    loaded = runpy.run_path(str(PROMOTE_REPOSITORY))
-    original_run_json = loaded["_run_json"]
-    commands: list[list[str]] = []
-    retained: dict[str, pathlib.Path] = {}
-    blocker = {
-        "status": "blocked",
-        "message": "Codex review gate found one active thread.",
-        "phase": "gates",
-        "blocker": {
-            "kind": "review_threads",
-            "head_oid": "a" * 40,
-            "threads": [{"thread_id": "PRRT_1", "body": "Fix this."}],
-        },
-    }
-
-    def run_json(command: list[str], cwd: pathlib.Path) -> tuple[int, dict[str, Any]]:
-        if pathlib.Path(command[1]) == OPERATION_RUNNER:
-            assert "--validate" in command
-            return original_run_json(command, cwd)
-        commands.append(command)
-        if pathlib.Path(command[1]) == MANAGE_PENDING_WORK:
-            code, result = original_run_json(command, cwd)
-            scope = pathlib.Path(str(result["pending_work_scope"]))
-            checkpoint = scope.with_suffix(".release-publication.json")
-            retained.update({"scope": scope, "checkpoint": checkpoint})
-            return code, result
-        assert pathlib.Path(command[1]) == SHIP_REPOSITORY
-        retained["checkpoint"].write_text(
-            "{}\n",
-            encoding="utf-8",
-            newline="\n",
-        )
-        return 1, blocker
-
-    promote = loaded["promote"]
-    promote.__globals__["_run_json"] = run_json
-    args = loaded["build_parser"]().parse_args(
-        [
-            "--repo-root",
-            str(repo),
-            "--source-branch",
-            "approved",
-            "--ship-after-promotion",
-        ]
-    )
-    with pytest.raises(loaded["PromotionError"]) as captured:
-        promote(args)
-
-    assert captured.value.payload == blocker
-    assert len(commands) == 2
-    assert retained["scope"].is_file()
-    assert retained["checkpoint"].is_file()
-    assert source_worktree.is_dir()
-    assert run_git(source_worktree, "status", "--porcelain").stdout == ""
-    assert run_git(repo, "show-ref", "--verify", "refs/heads/approved").returncode == 0
-    assert run_git(repo, "status", "--porcelain").stdout == ""
-
-    original_ship_after_promotion = loaded["_ship_after_promotion"]
-    original_ship_after_promotion.__globals__["_run_json"] = lambda command, cwd: (
-        0,
-        {"status": "ready"},
-    )
-    with pytest.raises(
-        loaded["PromotionError"],
-        match="incomplete terminal result",
-    ):
-        original_ship_after_promotion(
-            args,
-            repo.resolve(),
-            target_commit=run_git(repo, "rev-parse", "release/local").stdout.strip(),
-            pending_work_scope=str(retained["scope"]),
-        )
-
-    conflict_root = tmp_path / "promotion-blocker"
-    (
-        conflict_repo,
-        _,
-        _,
-        conflict_release_head,
-        _,
-    ) = prepare_divergent_promotion_repo(conflict_root, conflict=True)
-    conflict_loaded = runpy.run_path(str(PROMOTE_REPOSITORY))
-    conflict_promote = conflict_loaded["promote"]
-
-    def unexpected_run_json(
-        command: list[str], cwd: pathlib.Path
-    ) -> tuple[int, dict[str, Any]]:
-        pytest.fail(f"promotion blocker invoked lifecycle child: {command}")
-
-    conflict_promote.__globals__["_run_json"] = unexpected_run_json
-    conflict_args = conflict_loaded["build_parser"]().parse_args(
-        [
-            "--repo-root",
-            str(conflict_repo),
-            "--source-branch",
-            "approved",
-            "--ship-after-promotion",
-        ]
-    )
-    with pytest.raises(conflict_loaded["PromotionError"]):
-        conflict_promote(conflict_args)
-    assert run_git(conflict_repo, "rev-parse", "release/local").stdout.strip() == (
-        conflict_release_head
-    )
 
 
 def test_promote_repository_routes_linked_repo_root_without_branch_drift(
@@ -1113,16 +848,16 @@ def test_validation_failure_restores_original_checkout_and_refs(
     original_main = run_git(repo, "rev-parse", "main").stdout.strip()
     loaded = runpy.run_path(str(PROMOTE_REPOSITORY))
     promote = loaded["promote"]
-    original_run_json = promote.__globals__["_run_json"]
+    original_run_command_for_json = promote.__globals__["run_command_for_json"]
 
     def fail_validation(
         command: list[str], cwd: pathlib.Path
     ) -> tuple[int, dict[str, Any]]:
         if pathlib.Path(command[1]) == MANAGE_PENDING_WORK:
-            return original_run_json(command, cwd)
+            return original_run_command_for_json(command, cwd)
         return 1, {"status": "validation_failed", "message": "forced failure"}
 
-    promote.__globals__["_run_json"] = fail_validation
+    promote.__globals__["run_command_for_json"] = fail_validation
     args = loaded["build_parser"]().parse_args(
         [
             "--repo-root",
@@ -1155,12 +890,12 @@ def test_promote_repository_prepare_only_mode_remains_unchanged(
     loaded = runpy.run_path(str(PROMOTE_REPOSITORY))
     promote = loaded["promote"]
 
-    def unexpected_run_json(
+    def unexpected_run_command_for_json(
         command: list[str], cwd: pathlib.Path
     ) -> tuple[int, dict[str, Any]]:
         pytest.fail(f"prepare-only invoked lifecycle child: {command}")
 
-    promote.__globals__["_run_json"] = unexpected_run_json
+    promote.__globals__["run_command_for_json"] = unexpected_run_command_for_json
     result = promote(
         loaded["build_parser"]().parse_args(
             [
@@ -1751,13 +1486,13 @@ def test_promotion_repairs_and_revalidates_the_final_commit_before_deployment(
     repaired = run_git(repo, "rev-parse", "HEAD").stdout.strip()
     if mutation != "none":
         promotion = runpy.run_path(str(PROMOTE_REPOSITORY))
-        original_run_json = promotion["_run_json"]
+        original_run_command_for_json = promotion["run_command_for_json"]
 
         def change_after_validation(
             argv: list[str],
             cwd: pathlib.Path,
         ) -> tuple[int, dict[str, Any]]:
-            code, result = original_run_json(argv, cwd)
+            code, result = original_run_command_for_json(argv, cwd)
             if "--validate" in argv and code == 0:
                 (repo / "quality.txt").write_text("changed", encoding="utf-8")
                 if mutation == "head":
@@ -1768,7 +1503,7 @@ def test_promotion_repairs_and_revalidates_the_final_commit_before_deployment(
                     )
             return code, result
 
-        promotion["promote"].__globals__["_run_json"] = change_after_validation
+        promotion["promote"].__globals__["run_command_for_json"] = change_after_validation
         args = promotion["build_parser"]().parse_args(command[2:])
         with pytest.raises(promotion["PromotionError"]) as caught:
             promotion["promote"](args)

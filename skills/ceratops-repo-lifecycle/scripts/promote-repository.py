@@ -16,7 +16,6 @@ import json
 import os
 import pathlib
 import re
-import runpy
 import stat
 import subprocess
 import sys
@@ -27,13 +26,15 @@ from typing import Any
 
 import git_branch_operations as git_branches
 from git_branch_operations import PromotionError, SourceState
+from github_pr_workflow import ship_repository as repository_ship
 from github_pr_workflow.command import (
     CommandError,
+    describe_command_failure,
     release_write_context,
     require_output,
     require_success,
     run_command,
-    run_lifecycle_main,
+    run_command_for_json,
 )
 from repository_operation import (
     OperationError,
@@ -50,7 +51,6 @@ from sdlc_results import _unique_result_object
 SCRIPT_ROOT = pathlib.Path(__file__).resolve().parent
 PENDING_MANAGER = SCRIPT_ROOT / "manage-pending-work.py"
 OPERATION_RUNNER = SCRIPT_ROOT / "repository_operation.py"
-SHIP_REPOSITORY = SCRIPT_ROOT / "ship-repository.py"
 RELEASE_BRANCH = "release/local"
 DEFAULT_SDLC_CONTRACT = pathlib.Path("sdlc/sdlc.yml")
 
@@ -224,29 +224,6 @@ def _prepare_source_for_fast_forward(
     return result
 
 
-def _run_json(command: list[str], cwd: pathlib.Path) -> tuple[int, dict[str, Any]]:
-    # Shipping must reuse this controller's release lock rather than compete
-    # for it in a second process. Other leaf commands remain foreground children.
-    if len(command) > 1 and command[1] == str(SHIP_REPOSITORY):
-        owner = runpy.run_path(str(SHIP_REPOSITORY))
-        return run_lifecycle_main(owner["main"], command[2:], cwd=cwd)
-    result = subprocess.run(
-        command,
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    raw = result.stdout.strip() if result.stdout.strip() else result.stderr.strip()
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise PromotionError("Lifecycle helper returned invalid JSON.") from exc
-    if not isinstance(payload, dict):
-        raise PromotionError("Lifecycle helper returned a non-object result.")
-    return result.returncode, payload
-
-
 def _operation_ids(value: object, category: str) -> list[str]:
     """Require explicit complete YAML locations in the lifecycle-owned category."""
 
@@ -308,67 +285,38 @@ def _ship_after_promotion(
     scope = pathlib.Path(pending_work_scope)
     if not scope.is_absolute() or not scope.resolve(strict=True).is_file():
         raise PromotionError("Recorded pending-work scope is unavailable for shipping.")
-    command = [
-        sys.executable,
-        str(SHIP_REPOSITORY),
-        "--repo-root",
-        str(repo_root),
-        "--head-branch",
-        args.release_branch,
-        "--base-branch",
-        args.main_branch,
-        "--remote-name",
-        args.remote_name,
-        "--commit",
-        target_commit,
-        "--reusable-head",
-        "--sdlc-contract",
-        str(args.sdlc_contract),
-    ]
-    for field in ("title", "body"):
-        value = getattr(args, field, None)
-        if value is not None:
-            command.extend((f"--{field}", value))
-    for flag, operations in (
-        ("--validation-operation", args.validation_operation or []),
-        ("--publish-operation", _operation_ids(args.publish_operation, "publish")),
-        ("--deploy-operation", _operation_ids(args.deploy_operation, "deploy-local")),
+    request = repository_ship.ShipOptions(
+        repo_root=repo_root,
+        head_branch=args.release_branch,
+        base_branch=args.main_branch,
+        remote_name=args.remote_name,
+        commit=target_commit,
+        reusable_head=True,
+        sdlc_contract=args.sdlc_contract,
+        title=getattr(args, "title", None),
+        body=getattr(args, "body", None),
+        validation_operation=args.validation_operation,
+        publish_operation=_operation_ids(args.publish_operation, "publish"),
+        deploy_operation=_operation_ids(args.deploy_operation, "deploy-local"),
+    )
+    try:
+        shipped = repository_ship.ship_repository(request)
+    except (repository_ship.RepositoryShipError, CommandError, OperationError, OSError, ValueError) as exc:
+        raise PromotionError(str(exc), describe_command_failure(exc)) from exc
+    if shipped.get("status") == "pending_work":
+        if not isinstance(shipped.get("findings"), list):
+            raise PromotionError("Shipping returned an incomplete pending-work blocker.")
+        return shipped
+    if (
+        shipped.get("status") not in {"shipped", "already_shipped"}
+        or shipped.get("commit") != target_commit
+        or not isinstance(shipped.get("synchronized_head"), str)
+        or not isinstance(shipped.get("release_publication"), dict)
+        or not isinstance(shipped.get("deployment"), dict)
+        or "finalization" not in shipped
     ):
-        for operation in operations:
-            command.extend((flag, operation))
-    ship_code, shipped = _run_json(command, repo_root)
-    status = shipped.get("status")
-    if ship_code == 0:
-        if (
-            status not in {"shipped", "already_shipped"}
-            or shipped.get("commit") != target_commit
-            or not isinstance(shipped.get("synchronized_head"), str)
-            or not isinstance(shipped.get("release_publication"), dict)
-            or not isinstance(shipped.get("deployment"), dict)
-            or "finalization" not in shipped
-        ):
-            raise PromotionError("Shipping returned an incomplete terminal result.")
-        return shipped
-    if ship_code == 2:
-        if status != "pending_work" or not isinstance(shipped.get("findings"), list):
-            raise PromotionError(
-                "Shipping returned an incomplete pending-work blocker."
-            )
-        return shipped
-    if ship_code == 1:
-        message = shipped.get("message")
-        if status not in {
-            "blocked",
-            "error",
-            "operation_failed",
-            "validation_failed",
-            "tests_failed",
-            "handoff_required",
-            "state_changed",
-        } or not isinstance(message, str):
-            raise PromotionError("Shipping returned an incomplete blocker.")
-        raise PromotionError(message, shipped)
-    raise PromotionError(f"Shipping returned unsupported exit code: {ship_code}")
+        raise PromotionError("Shipping returned an incomplete terminal result.")
+    return shipped
 
 
 def _promotion_inputs(args: argparse.Namespace) -> tuple[pathlib.Path, list[str], bool, dict[str, str]]:
@@ -548,7 +496,7 @@ def _promote(
     ]
     for branch in merged:
         record_command.extend(("--source-branch", branch))
-    record_code, record = _run_json(record_command, SCRIPT_ROOT)
+    record_code, record = run_command_for_json(record_command, SCRIPT_ROOT)
     if record_code == 2:
         return record
     if record_code:
@@ -571,7 +519,7 @@ def _promote(
                     args.sdlc_contract,
                     context="ci",
                 )
-            validation_code, validation = _run_json(
+            validation_code, validation = run_command_for_json(
                 _validation_command(args, repo_root, target_commit),
                 repo_root,
             )
@@ -697,10 +645,8 @@ def promote(
     with release_write_context(
         args.repo_root,
         confirm_stopped=getattr(args, "confirm_previous_commands_stopped", False),
-    ) as owned:
+    ):
         result = _promote_with_rollback(args, timings=timings, inputs=inputs)
-        if owned.outermost and result.get("status") in {"prepared", "ready", "shipped", "already_shipped"}:
-            owned.complete(commands_stopped=True)
         return result
 
 
@@ -1403,7 +1349,7 @@ def main(argv: list[str] | None = None) -> int:
         result = (
             exc.payload
             if isinstance(exc, PromotionError) and exc.payload is not None
-            else {"status": "error", "message": str(exc)}
+            else describe_command_failure(exc)
         )
     timings["total"] = round(time.monotonic() - started, 6)
     result["timings_seconds"] = timings

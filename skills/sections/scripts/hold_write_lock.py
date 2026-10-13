@@ -35,6 +35,24 @@ class WriteLockRecoveryRequired(WriteLockError):
     """Previous commands must be confirmed stopped before starting new work."""
 
 
+def attach_cleanup_failure(error: BaseException, cleanup_error: BaseException) -> None:
+    """Keep the operation's original exception and append a cleanup failure.
+
+    Structured lifecycle exceptions also carry the detail in their public
+    payload. Other callers retain it in the exception's notes and attribute.
+    """
+    detail = f"{type(cleanup_error).__name__}: {cleanup_error}"
+    failures = [
+        *getattr(error, "cleanup_errors", ()), detail,
+        *getattr(cleanup_error, "cleanup_errors", ()),
+    ]
+    error.cleanup_errors = failures
+    error.add_note(f"Cleanup also failed: {detail}")
+    payload = getattr(error, "payload", None)
+    if isinstance(payload, dict):
+        payload["cleanup_errors"] = failures
+
+
 def release_lock_path(repo_root: pathlib.Path) -> pathlib.Path:
     """Find the same release lock from any checkout, without consulting remotes."""
     try:
@@ -83,9 +101,9 @@ def _save_unfinished(fd: int, unfinished_run: bool) -> None:
 class WriteLockContext:
     """Ownership valid in the acquiring thread and only until its context exits.
 
-    ``complete(commands_stopped=True)`` reports success or clean cancellation.
-    It schedules clearing the flag at normal outermost exit, not at this call;
-    a later exception or nested operation invalidates that report.
+    ``complete(commands_stopped=True)`` reports stopped local commands, not
+    operation success. It schedules clearing at outermost exit, including an
+    exceptional exit. A later nested operation invalidates that report.
     """
 
     path: pathlib.Path
@@ -131,8 +149,8 @@ def hold_write_lock(
     optional caller-owned query for commands it knows about; a positive result
     blocks recovery even with confirmation. The helper discovers no processes.
     Without ``complete(commands_stopped=True)``, normal return also leaves the
-    flag set. A failed check need not end this context: its caller may correct
-    and continue while retaining ownership.
+    flag set. Workflows finish their local commands and report that fact before
+    returning a failure or a question to the model; model edits run unlocked.
     """
     supplied = pathlib.Path(path).absolute()
     # Resolve parent aliases, not a redirected lock file. The opened descriptor
@@ -154,6 +172,8 @@ def hold_write_lock(
     descriptor: int | None = None
     held = False
     owner_pid = os.getpid()
+    context: WriteLockContext | None = None
+    operation_error: BaseException | None = None
     try:
         try:
             canonical.parent.mkdir(parents=True, exist_ok=True)
@@ -189,28 +209,53 @@ def hold_write_lock(
         context = WriteLockContext(canonical, commands_running)
         active[canonical] = context
         yield context
-        if os.getpid() != owner_pid:
-            raise WriteLockError("A forked child cannot complete its parent's operation.")
-        if context._completed:
-            if context._running():
-                raise WriteLockError("Writing commands restarted before lock release.")
-            try:
-                _save_unfinished(descriptor, False)
-            except OSError as exc:
-                # A failed durable clear must not advertise a successful end.
-                # Try restoring uncertainty, retaining both errors if that fails.
-                try:
-                    _save_unfinished(descriptor, True)
-                except OSError as restore_error:
-                    raise WriteLockError(f"Cannot save or restore unfinished flag: {canonical}") from restore_error
-                raise WriteLockError(f"Cannot save clean lock completion: {canonical}") from exc
+    except BaseException as exc:
+        operation_error = exc
+        raise
     finally:
-        active.pop(canonical, None)
-        if descriptor is not None:
+        # Complete is a statement about command lifetime, so a failed operation
+        # must still clear the flag when its caller confirmed clean shutdown.
+        try:
+            if context is not None and context._completed:
+                if os.getpid() != owner_pid:
+                    raise WriteLockError("A forked child cannot complete its parent's operation.")
+                if context._running():
+                    raise WriteLockError("Writing commands restarted before lock release.")
+                try:
+                    _save_unfinished(descriptor, False)
+                except OSError as exc:
+                    failure = WriteLockError(f"Cannot save clean lock completion: {canonical}")
+                    try:
+                        _save_unfinished(descriptor, True)
+                    except OSError as restore_error:
+                        attach_cleanup_failure(failure, restore_error)
+                    raise failure from exc
+        except BaseException as cleanup_error:
+            if operation_error is None:
+                operation_error = cleanup_error
+                raise
+            attach_cleanup_failure(operation_error, cleanup_error)
+        finally:
+            active.pop(canonical, None)
             try:
                 # Explicit unlock in a forked child would unlock the parent's
                 # shared OS description. Close only the child's duplicate.
-                if held and os.getpid() == owner_pid:
-                    unlock_descriptor(descriptor)
-            finally:
-                os.close(descriptor)
+                if descriptor is not None:
+                    unlock_error = None
+                    try:
+                        if held and os.getpid() == owner_pid:
+                            unlock_descriptor(descriptor)
+                    except BaseException as exc:
+                        unlock_error = exc
+                        raise
+                    finally:
+                        try:
+                            os.close(descriptor)
+                        except BaseException as close_error:
+                            if unlock_error is None:
+                                raise
+                            attach_cleanup_failure(unlock_error, close_error)
+            except BaseException as cleanup_error:
+                if operation_error is None:
+                    raise
+                attach_cleanup_failure(operation_error, cleanup_error)

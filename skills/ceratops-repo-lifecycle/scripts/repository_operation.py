@@ -37,7 +37,7 @@ from ceratops_repo_compatibility_engine.sdlc_contract_validation import (
 from ceratops_repo_compatibility_engine.sdlc_contract_validation import (
     operation_category as contract_operation_category,
 )
-from github_pr_workflow.command import failure_excerpt
+from github_pr_workflow.command import failure_excerpt, track_command_completion
 from sdlc_results import StepResultError, capture_step_result
 from store_artifacts import (
     BUILD_BUNDLE_RETENTION,
@@ -565,15 +565,16 @@ def execute_handoff(
                     require_clean_commit(repo_root, expected_commit)
                 except OperationError as exc:
                     return {**evidence, "status": "state_changed", "message": str(exc)}
-            result = subprocess.run(
-                argv,
-                cwd=repo_root,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                check=False,
-            )
+            with track_command_completion():
+                result = subprocess.run(
+                    argv,
+                    cwd=repo_root,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    check=False,
+                )
             if result.returncode:
                 return {
                     **evidence,
@@ -968,16 +969,17 @@ def _execute_prepared_operation(prepared: PreparedOperation) -> dict[str, object
                         dict(prepared.test_context)
                     ),
                 }
-            result = subprocess.run(
-                argv,
-                cwd=step.cwd,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                check=False,
-                **process_options,
-            )
+            with track_command_completion():
+                result = subprocess.run(
+                    argv,
+                    cwd=step.cwd,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    check=False,
+                    **process_options,
+                )
             code, stdout, stderr = result.returncode, result.stdout, result.stderr
         except OSError as exc:
             code, stdout, stderr = None, "", str(exc)

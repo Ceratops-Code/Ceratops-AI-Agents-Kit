@@ -176,7 +176,8 @@ without repository deduplication.
 | `skills/ceratops-repo-lifecycle/scripts/pending-work-cleanup.py` | Checks named directory boundaries, preserves active skill-update state, and removes selected residual and task-temp trees after clearing read-only Windows files and directories without traversing links. |
 | `skills/ceratops-repo-lifecycle/scripts/action.yml` | GitHub composite action that runs declared validation and, by default, tests using the skill-owned SDLC engine; `run-tests: false` permits validation-only CI when tests require an interactive desktop. CI defers skill handoffs and retains failure evidence. |
 | `skills/ceratops-repo-lifecycle/scripts/repository_operation.py` | Single capability runner: resolves complete YAML locations, prevalidates ordered argv/parameters/cwd, runs applicable validation and test gates before deployment or publication, and retains bounded structured step results separately from command completion; skill callers execute registered handoffs and CI defers them. |
-| `skills/ceratops-repo-lifecycle/scripts/ship-repository.py` | Prevalidates one SDLC contract and ordered phase selections, runs declared CI test selection against freshly fetched base and exact staged head commits before push, and orchestrates guarded GitHub shipping, main synchronization, per-operation publication and deployment checkpoints, and resumable selected-source cleanup. |
+| `skills/ceratops-repo-lifecycle/scripts/ship-repository.py` | Public Ship argument parser and JSON/exit-code adapter; calls `github_pr_workflow/ship_repository.py`. |
+| `skills/ceratops-repo-lifecycle/scripts/github_pr_workflow/ship_repository.py` | Callable Ship orchestration and shared inputs/errors, used by both the CLI and Promote: SDLC checks, direct GitHub workflow calls, publication, installation and cleanup. |
 | `skills/ceratops-repo-lifecycle/scripts/rename-repository-path.py` | Plans or applies tracked file renames and exact filename references; accepts explicit or Git-detected rename pairs, updates relative Markdown links, blocks ambiguous references, preserves the index and text bytes outside replacements, and compensates caught file errors. |
 | `skills/ceratops-skill-lifecycle/scripts/skills-consistency-source-validator.py` | Source, metadata, runtime-input, contract, and portability validator invoked by source-validate and explicit skill workflows. It accepts optional skill-local `README.md` design documentation and a matching relative README Skills-table link. Full validation and selected skill-lifecycle validation check the deterministic contract against its closed schema, supported command arguments, and existing helper paths. The schema identifies descriptive fields as annotations; validation never executes contract-supplied commands. |
 | `skills/ceratops-skill-lifecycle/scripts/skill_update_state.py` | Owns update state, filesystem boundaries and cleanup-record validation; successful successor finalization removes only unchanged inherited disposable records and preserves protected inputs. |
@@ -399,8 +400,8 @@ not copy them into checkpoint records. After durable completion, cleanup removes
 only checkpoints, never artifacts or receipts. If cleanup fails, a fresh
 invocation discovers the attempt from its committed receipt and performs cleanup
 without recreating C, receipts or tags. This does not supervise artifact-writing
-child processes. 2B connects the current release invocation; correction waits
-and controlled cleanup remain steps 3 and 4.
+child processes. 3A releases stopped attempts before model corrections;
+report handling and controlled cleanup remain later parts of 3/4.
 
 ### Exact-artifact foundation and update methodology
 
@@ -421,8 +422,8 @@ The implemented foundation has six separate responsibilities:
   record through approved scope extensions and repeated edit/check/fix cycles.
   Its finalizer consumes recorded verification without rechecking the advanced
   checkout. It does not derive ownership from Git or select tests; release
-  writer integration is connected in 2B; correction waits and controlled cleanup
-  remain steps 3 and 4.
+  writer integration is connected in 2B; 3A releases stopped attempts before
+  corrections. Report handling and controlled cleanup remain later parts of 3/4.
 - **1d — production and storage:** the internal `build_bundle` function in
   `skills/ceratops-repo-lifecycle/scripts/repository_operation.py` orchestrates
   adapters and required artifact tests. Its sibling `store_artifacts.py` owns
@@ -449,8 +450,8 @@ or checked inputs change. Finalize only at the real end of the requested work;
 do not finalize/reopen between corrections. Finalization consumes the saved
 successful verification, so later source advancement does not repeat its checks.
 The generated-runner result contract and compatibility probe are implemented in
-1e.3. Release invocation locking is connected in 2B; correction waits and cleanup
-remain steps 3 and 4. Affected-check reuse remains step 6, with general ownership
+1e.3. Release invocation locking is connected in 2B and clean unsuccessful exits
+in 3A; report handling and cleanup remain later parts of 3/4. Affected-check reuse remains step 6, with general ownership
 derivation and an optional Nx trial later.
 
 The 1c preservation checkpoint reverified the unchanged `prepare`, `amend`,
@@ -480,9 +481,10 @@ immediate busy result; the owning operation has no 30-second time limit.
 The retained lock file stores one Boolean, `unfinished_run`: its first byte
 is `1` during work and `0` after explicit clean completion. Before allowing
 protected work, the helper writes and flushes `1` in place. The outer owner
-calls `complete(commands_stopped=True)` after success or clean cancellation;
-normal context exit then writes and flushes `0`. A crash, exception or missing
-completion report leaves uncertainty. A later caller must acquire the native
+calls `complete(commands_stopped=True)` once its commands have stopped, whether
+the attempt succeeded, failed or needs a model decision. `finally` writes and
+flushes `0` before unlocking, including when propagating an exception. A crash
+or unknown command shutdown leaves uncertainty. A later caller must acquire the native
 lock and explicitly confirm that the previous commands stopped before retrying.
 Confirmation cannot bypass a busy lock or a caller-known running command.
 The helper neither launches nor discovers processes. It creates no temporary
@@ -492,8 +494,10 @@ Keep this one fixed-size lock file outside checkpoint cleanup.
 2B connects promotion, Ship, release synchronization, release PR preparation and
 direct-release `fast-change` to this lock. Each current invocation holds it from
 before selecting release work until its synchronous commands finish. Promotion
-calls Ship in-process, and Ship calls its GitHub workflow in-process, so nested
-calls retain the same lock. Independent processes cannot borrow it. The lock
+calls `github_pr_workflow.ship_repository.ship_repository(ShipOptions(...))`,
+and Ship calls `github_pr_workflow.ship.ship()` directly. Neither call builds
+CLI arguments or captures printed JSON; nested calls retain the same lock.
+The public Ship CLI calls that same implementation. Independent processes cannot borrow it. The lock
 also covers today's CI/review wait, publication and installation calls.
 Synchronization and PR preparation also take it when they can change the primary
 checkout, even while it is on `main`: promotion may switch that checkout to
@@ -513,10 +517,24 @@ fast-forwards and branch alignment. It takes no locks. Workflow callers still
 choose branches, fetch remotes, run checks and acquire the release lock.
 Existing Git behavior is unchanged, including today's remote prerequisite.
 
-This is the first part of the unmerged 2B/3/4 batch. Step 3 keeps the process and
-lock alive while corrections are requested; 2B still returns on a failure.
-Step 4 connects controlled cleanup and installation-lock ordering. Do not promote
-or deploy this batch before all three steps are complete. No general task-worktree
+3A ends an automatic attempt before handing corrections to the model. The shared
+`command.py::release_write_context()` clears the flag after existing synchronous
+command waits finish, then unlocks on return or exception. A failed check or
+expired remote CI wait does not itself mean local commands remain running.
+A launcher exception with unknown shutdown retains the flag even if caught.
+Cleanup errors accompany the original cause. Corrections take place unlocked;
+a fresh invocation takes the lock and reads current inputs. Clearing the flag
+neither accepts failed work nor deletes checkpoints.
+
+`command.py::run_command_for_json()` always starts the supplied external program,
+such as pending-work management or `repository_operation.py`, and reads its JSON.
+It does not dispatch by filename. Existing environment, working-directory and
+GitHub retry behavior remain unchanged; malformed output keeps its captured
+diagnostics. Full diagnostic-file forwarding belongs to 3B.
+
+The 2B/3/4 batch remains unmerged through 4C: 3C and 4 connect the remaining
+handoffs, cleanup and installation-lock ordering. Do not promote or deploy it
+before that combined exit. No general task-worktree
 lock is introduced. Existing checkpoint locks remain unchanged; installer
 destination locks and optional automatic child cleanup are later work.
 See [Release locking and unfinished operations](docs/design-draft.md#release-locking-and-unfinished-operations).
@@ -529,14 +547,15 @@ serialize commands.
 | --- | --- | --- |
 | 1a release declarations | Implemented | Keep current v4/v5 readers; connect exact-output producers later |
 | 1b receipt verification | Implemented v2 verifier plus internal v3/v1 receipt definitions and saved-chain reader | Connect public lifecycle callers in later steps |
-| 1c correction continuity | Implemented and preservation-verified; finalization consumes recorded success without rechecking the checkout | Complete correction waits and cleanup in steps 3 and 4 |
+| 1c correction continuity | Implemented and preservation-verified; finalization consumes recorded success without rechecking the checkout | Complete report handling and cleanup in later parts of 3/4 |
 | 1d build/test/store | Implemented current v2 transaction plus an internal direct-write versioned route: reservations, final artifact paths, committed v3 build receipts, B-to-C result binding, artifact receipts, immutable tag and effect-derived recovery | 2B connects current release writers; public Build and receipt-driven Promote remain pending |
 | 1e.1 shared checkpoints | Implemented storage, native producer locking, fresh-invocation discovery and success-triggered orphan cleanup; versioned artifacts and skill updates adopted | Steps 4/20 connect controlled worktree removal; domain cleanup remains with its owners |
 | 1e.2 skill-change generations | Implemented immutable approvals, states and check results, five descriptive commands, interrupted-write recovery and completion cleanup; new committed receipts use `build_receipt.json` | 2B protects direct-release changes; historical committed receipts retain their recorded names |
 | 1e.3 test-result contract | Implemented generated-runner result contract and compatibility probe | 6 connects repository-wide result ownership, retention and affected-check orchestration |
 | Completed-build consumption | Implemented internal v2 reader; recorded acceptance and exact stored paths survive current test/input changes | Connect public receipt-based Deploy in later steps |
-| 2A release-lock helper | Implemented internally in `fb6863c`: canonical release lock, immediate busy refusal, nested ownership and durable unfinished-run flag; Windows checks passed, Linux execution unverified | 2B connects current release writers; steps 3 and 4 complete correction waits and cleanup |
+| 2A release-lock helper | Implemented internally in `fb6863c`: canonical release lock, immediate busy refusal, nested ownership and durable unfinished-run flag; Windows checks passed, Linux execution unverified | 3A adds known-stopped unsuccessful exits; later parts of 3/4 complete report handling and cleanup |
 | 2B Git separation and release writers | Shared `git_branch_operations.py`; promotion, Ship, release sync, PR preparation and fast-change use the native release lock | Local commit only; do not promote/deploy until steps 3 and 4 finish |
+| 3A direct Ship calls and stopped-attempt release | One callable Ship implementation, external-command-only JSON helper and exception-safe clean lock exits; model corrections run unlocked | 3B adds complete failure reports; keep the batch unmerged through 4C |
 | Working-folder attempts and result reuse | Planned | 6/7 connect qualification-level baselines, successful-result reuse, success-only receipts and receipt commits; 8 selects affected units |
 | Merge-back and beta qualification | Planned | 9/22 remove the remote prerequisite for local promotion and activate merge-back, incremental qualification and guarded fast-forward |
 | Public Build and receipt Deploy | Planned | Connect producers/consumers before repository adoption; installation does not rebuild or repeat acceptance tests |

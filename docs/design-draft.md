@@ -464,7 +464,7 @@ introduced.
 ## Working-folder acceptance methodology (planned)
 
 This section owns the approved target methodology: one release lock for a
-complete promotion or Ship, ordinary work in other worktrees, and explicit
+complete automatic promotion or Ship attempt, ordinary work in other worktrees, and explicit
 recovery after an uncertain interruption. Automatic child-process recovery
 is optional future work.
 It does not claim that the complete execution path is
@@ -478,8 +478,8 @@ needed, and the portable result-record template remains an existing reference
 asset rather than a second release-acceptance authority.
 Qualification-level reuse, CI-written receipts, success-only lifecycle receipts
 and the full Ship/publication/installation sequence below are planned changes.
-2B connects the 2A helper to current release invocations; steps 3 and 4 complete
-correction waits and controlled cleanup.
+2B connects the 2A helper to current release invocations; 3A ends stopped attempts
+before model corrections. Later parts of 3/4 add report handling and controlled cleanup.
 
 ### One existing worktree, two commit boundaries
 
@@ -493,7 +493,7 @@ production, run/reuse applicable repository checks and integrate without inventi
 a version, artifact receipt, tag or empty receipt-only commit.
 
 1. For promotion, retain the release lock acquired before selecting its release
-   base, including through corrections. Standalone Build has no general worktree
+   base, until the automatic attempt returns. Standalone Build has no general worktree
    lock; its caller coordinates commands changing that folder. Reserve the
    selected unit/version and required targets.
    Complete intended version/lock preparation,
@@ -503,9 +503,10 @@ a version, artifact receipt, tag or empty receipt-only commit.
 2. Run the required build-independent checks against that worktree. Build needed
    artifacts from the same folder and test the exact produced bytes. A failed
    attempt has no accepted artifact receipt or version tag. Wait for child
-   commands to finish before corrections; a promotion retains its release lock.
+   commands to finish and release the promotion lock before model corrections.
 3. After a correction, start another attempt with a new pre-test checkpoint
-   inside the same running promotion, not a replacement promotion process.
+   through the normal command, reacquiring the lock and reading the current
+   release commit. Integrate any new release changes before affected checks.
    Use repository-owned dependency information to run affected checks and retain
    applicable results. Do not discard an earlier artifact's acceptance or rerun
    its tests merely because a check definition or commit identifier changed.
@@ -559,7 +560,8 @@ and `unlock_descriptor` functions. It opens its file without truncation and
 calls `lock_descriptor(fd, blocking=False)` once. A busy lock returns
 `WriteLockBusy` before protected work starts.
 This is an acquisition rule, not an operation time limit. An owner may retain
-the lock through long tests and corrections. It does not require Job Objects,
+the lock through long automatic tests and CI monitoring, not model corrections.
+It does not require Job Objects,
 cgroups, elevated process-control permissions, a daemon or a remote repository.
 Missing native locking still prevents protected writes; it does not silently
 switch to file-existence locking. Do not use `FileLock` for this state-bearing
@@ -590,11 +592,12 @@ The internal interface is:
 | --- | --- |
 | `release_lock_path(repo_root)` | Discover the shared repository release-lock path without mutating Git or contacting a remote. |
 | `hold_write_lock(path, ...)` | Acquire once, resolve saved uncertainty, durably set the flag, then yield ownership. |
-| `context.complete(commands_stopped=True)` | Outermost caller reports success or clean cancellation after all its writing commands stopped. Clear the flag only on normal context exit. |
+| `context.complete(commands_stopped=True)` | Outermost caller reports that its writing commands stopped, independently of success. Clear the flag before native unlock on normal or exceptional exit. |
 
-A write or flush failure before entry prevents protected work. An exception,
-crash or exit without a completion report leaves the flag set. A later exception
-or new nested call invalidates an earlier completion report. Only the outermost
+A write or flush failure before entry prevents protected work. A crash or exit
+without confirmed command shutdown leaves the flag set. An exception alone does
+not undo confirmed shutdown; starting a new nested call invalidates an earlier
+completion report. Only the outermost
 owner can report completion, and an expired or other-thread context cannot do so.
 
 When the next caller acquires a free native lock, an unfinished or unreadable
@@ -620,26 +623,47 @@ updates and composed Ship call. The CLI option
 `--confirm-previous-commands-stopped` supplies explicit recovery consent for one
 retry; it neither waits for nor overrides a competing owner.
 
-Nested promotion-to-Ship and Ship-to-GitHub calls run in the same Python process.
-`github_pr_workflow/command.py` adapts their existing CLI argument/result contract
-without starting another lock-owning process. The outermost workflow alone
-reports completion. Leaf Git/test/build commands stay synchronous foreground
-children; they must not leave detached writing workers after returning.
-Unexpected exceptions or interrupted shutdown leave the unfinished flag set.
+3A gives both the public `ship-repository.py` CLI and Promote one callable owner:
+`github_pr_workflow/ship_repository.py::ship_repository(ShipOptions(...))`.
+The CLI only parses arguments and prints results/errors with the existing exit
+codes. The imported module owns input defaults, errors and orchestration and
+calls `github_pr_workflow.ship.ship()` directly. Both levels receive explicit
+repository paths; neither calls `main()`, builds internal command lines, loads
+scripts by filename or captures printed JSON. Script payload packaging includes
+the new module automatically; the shared lock helper keeps its existing mapping.
 
-2B still returns when checks fail. Keeping the controller alive for corrections
-and continuation is step 3; controlled cleanup and destination-lock ordering are
-step 4. These three steps are an unmerged batch, not independently deployable
-releases. Ordinary work in other task worktrees remains unlocked.
+External programs, including pending-work management and the SDLC operation
+runner, use `command.py::run_command_for_json()`. It always starts the supplied
+program through the existing launcher, preserves its working directory,
+environment and retry policy, and decodes one JSON object with its exit code.
+Bad output retains the captured stdout/stderr and bounded error details; 3B adds
+complete report-file forwarding. It never switches execution type by filename.
+
+`command.py::release_write_context()` waits through the existing synchronous
+calls in `run_command()` and `repository_operation.py`. A shared in-memory
+counter records whether those calls returned; a launcher exception keeps shutdown
+uncertain even if caught. No process registry, new waiting system or saved cursor
+is introduced. In `finally`, the outer invocation reports confirmed shutdown
+before native unlock, including after failed checks, decisions or controller
+errors. Nested calls cannot clear the flag. Unknown shutdown retains it; cleanup
+failures accompany the original error instead of replacing it. Commands must not
+leave detached writing workers after returning.
+
+The automatic attempt ends and unlocks before the model edits code. A fresh
+normal call takes the lock and uses current inputs; clearing `unfinished_run`
+is not successful acceptance or permission to delete checkpoints. Report handling
+and cleanup remain later parts of 3/4. The batch remains unmerged through 4C;
+ordinary work in other task worktrees stays unlocked.
 
 The current Ship invocation holds the same lock through its CI/review waits,
 local synchronization, selected publication, installation and completion calls.
-The later receipt-driven Ship flow will additionally retain it through local
-corrections, receipt fetch/fast-forward and protected PR merge. Remote
+The later receipt-driven Ship flow will additionally retain it through
+automatic receipt fetch/fast-forward and protected PR merge. Model corrections
+run after the local attempt ends and unlocks. Remote
 CI writers do not share this machine-local lock; conditional remote branch updates
 and GitHub protection guard their changes. A second local promotion or Ship fails
-immediately, before candidate work starts. The correction-input close/cancel
-behavior belongs to step 3; 2B introduces no background lock-holder service.
+immediately, before candidate work starts. No background lock-holder or incoming
+correction-command listener is introduced. Local exit does not cancel remote CI.
 
 Take the release lock before existing producer checkpoint locks and short store
 locks when nested. Do not hold a store lock through tests or human correction.
@@ -670,8 +694,9 @@ cancellation and installed copies. Windows tests pass locally; POSIX fork
 coverage is present but Linux execution has not been exercised here.
 `tests/repository_lifecycle/test_release_locking.py` covers competing release
 commands, nested workflow ownership, refusal before candidate changes, explicit
-recovery and ordinary non-release work. Step 3 still owns correction waits;
-optional command supervision remains deferred.
+recovery, direct versus external Ship calls, known-stopped unsuccessful exits,
+unknown shutdown and ordinary non-release work. Complete report forwarding and
+optional command supervision remain deferred.
 
 ### Build receipt, artifact receipt and version
 
@@ -896,18 +921,18 @@ target flow. Local promotion requires neither a remote nor GitHub: discover the
 common directory, local main/release refs and release checkout locally. Steps 9/22
 remove the current remote prerequisite; fetching, pushing and publication checks
 belong to Ship. Steps 2B/3/4 hold the shared release lock before selecting the
-`release/local` tip and throughout qualification and correction. If source
+`release/local` tip and throughout each automatic qualification attempt. If source
 lacks release changes, merge that recorded release tip into the task worktree,
 resolve conflicts and commit prepared inputs before checks. This pre-test
-checkpoint is not acceptance. Keep the same promotion process and release lock
-through subsequent corrections.
+checkpoint is not acceptance. End the attempt and release the lock before model
+corrections; the next call takes the lock and integrates the then-current release.
 
 After candidate completion, require that it contains the recorded release tip,
 then fast-forward to the exact accepted commit with an expected-old guard and
 update the owning release checkout/index. A manual release move that bypasses
-the helper stops this attempt rather than silently changing its base. Clean
-cancellation releases the lock; a later promotion selects the then-current tip
-and reuses applicable accepted results. Never rebase or discard newer work.
+the helper returns to merge-back and affected-work selection rather than
+overwriting newer work. These loops remain steps 9/22, not a 3A Git-policy change.
+Normal retries reuse applicable accepted results. Never rebase or discard newer work.
 
 Promotion qualifies actual beta artifacts through the shared Build operation.
 After merge-back, run affected qualification and assign a subsequent beta version
@@ -927,7 +952,8 @@ capture the requested units, target branch and selected delivery stages first.
 
 1. Acquire the release lock before fetching or choosing a candidate. Keep the
    same local Ship process and lock through every selected stage below, including
-   correction and CI/review waits. Do not deploy during preparation.
+   automatic CI/review waits. End the attempt and unlock when model correction
+   is needed; the next call reacquires and uses current state. Do not deploy during preparation.
 2. Fetch remote `main`, record its commit and update local `main` without
    overwriting independent or dirty work. Integrate that commit into
    `release/local`: already included means no change; behind-only means
@@ -959,7 +985,7 @@ capture the requested units, target branch and selected delivery stages first.
    Local Ship fetches C **and explicitly fast-forwards** local `release/local`
    and its checkout; fetch alone does not move the local branch. Unexpected local
    divergence stops for diagnosis rather than a reset. CI/review corrections
-   return to preparation under the same held lock.
+   end the attempt and unlock before model edits; a fresh call returns to preparation.
 6. Before final merge, fetch remote `main` again and compare it with the main
    commit used for qualification. If different, apply the same already-included,
    fast-forward or divergent-merge decision, then recompute changed inputs.
@@ -1215,10 +1241,11 @@ Successful acceptance stays in its existing receipts, Git and artifact storage.
 Generic checkpoint cleanup cannot delete those, reservations or installations.
 The producer lock does not prove an earlier artifact-writing child has stopped.
 Step 2A provides the shared release-lock helper; 2B connects promotion and other
-release writers. Steps 3 and 4 complete correction waits and controlled cleanup. Neither helper
-supervises child processes
-or adds general worktree locks. The v2 producer is unchanged; skill updates
-use checkpoint storage for immutable generations.
+release writers. 3A releases stopped attempts before model corrections;
+report handling and controlled cleanup remain later parts of 3/4.
+Neither helper supervises child processes or adds general worktree locks.
+The v2 producer is unchanged; skill updates use checkpoint storage for
+immutable generations.
 
 The existing handoff/storage tests cover fresh-process discovery, direct writes,
 conflicting and unreadable records, nesting, native lock contention, worktree
@@ -1293,7 +1320,8 @@ does not repeat successful tests, builds, merges, publication or installation.
 
 The artifact reservation and direct final paths below are implemented internally.
 The release-lock helper and current invocation wiring are implemented in 2A/2B;
-correction waits and controlled cleanup remain steps 3 and 4:
+3A adds stopped-attempt exits; report handling and controlled cleanup remain
+later parts of 3 and 4:
 
 New committed build receipts use `build_receipt.json` in both target layouts.
 The artifact receipt stores the exact Git path and hash. Readers and completed
@@ -1443,7 +1471,8 @@ not these disposable checkpoints.
 
 1e.2 preserves the behavior verified by the earlier 1c documentation checkpoint
 while replacing its storage and command interfaces. 2B connects release writers;
-steps 3 and 4 complete correction waits and controlled worktree-removal handoffs.
+3A unlocks stopped attempts before corrections; later parts of 3/4 complete
+report handling and controlled worktree-removal handoffs.
 
 ## Shared sections and generated skill copies
 

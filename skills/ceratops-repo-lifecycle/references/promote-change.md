@@ -48,6 +48,21 @@ publication, deployment and repository-wide shipped-task cleanup.
   --main-branch main --release-branch release/local --remote-name origin
   --prepare-release-only`.
 
+### Callable implementation and lock lifetime
+
+The current helper calls `github_pr_workflow.ship_repository.ship_repository()`
+directly for composed shipping, passing `ShipOptions` and the repository path.
+The standalone Ship CLI uses that same implementation. External pending-work
+and operation-runner commands use `command.py::run_command_for_json()`, which
+always launches a program; no filename selects a different calling mechanism.
+The outer release lock covers the automatic attempt, including composed Ship's
+CI wait. Once local commands are known to have stopped, it unlocks before a
+failure or decision reaches the model. Corrections therefore run unlocked; the
+next normal call reads current inputs. Unknown shutdown retains `unfinished_run`
+and the existing explicit recovery requirement. Clearing it neither accepts
+failed work nor deletes checkpoints. Full report forwarding remains step 3B;
+new phase scheduling and receipt-driven remote work remain later steps.
+
 ### Inputs To Capture
 
 - Repository checkout, selected committed source branches, main branch, local

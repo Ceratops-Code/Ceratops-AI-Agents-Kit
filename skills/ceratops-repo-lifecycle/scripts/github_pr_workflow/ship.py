@@ -1706,10 +1706,8 @@ def ship(args: argparse.Namespace) -> dict[str, Any]:
     with release_write_context(
         args.repo_root, required=args.head_branch == "release/local",
         confirm_stopped=getattr(args, "confirm_previous_commands_stopped", False),
-    ) as owned:
+    ):
         result = _ship(args)
-        if owned is not None and owned.outermost and result.get("status") in {"shipped", "already_shipped"}:
-            owned.complete(commands_stopped=True)
         return result
 
 

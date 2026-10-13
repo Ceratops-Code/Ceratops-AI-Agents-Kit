@@ -46,6 +46,22 @@ owns timing.
   untouched by scope-driven cleanup. Repository-wide discovery applies current
   eligibility independently. Other old or malformed formats block.
 
+### Callable implementation and lock lifetime
+
+`ship-repository.py` is the public parser and JSON/exit-code adapter. It and
+Promote call the same `github_pr_workflow/ship_repository.py::ship_repository()`
+implementation with shared `ShipOptions`; that implementation calls
+`github_pr_workflow.ship.ship()` directly with an explicit repository path.
+Neither internal call builds argv or captures printed JSON. External commands
+use `command.py::run_command_for_json()` and always start a separate program.
+The outer release lock stays held during the automatic attempt and its current
+CI/review waits. Confirmed local command shutdown allows a clean unlock on
+success, failure, exception or a decision return; unknown shutdown retains the
+unfinished flag. Model corrections happen after return, unlocked. The next
+normal call reads current inputs. Local exit does not cancel remote CI, and
+clearing the flag does not accept work or delete checkpoints. Full diagnostic
+files remain step 3B; new CI receipt/publication behavior remains later work.
+
 ### Inputs To Capture
 
 - Repository checkout, staged promotion branch, base branch, remote, merge

@@ -15,7 +15,6 @@ from filelock import FileLock
 from tests.repository_lifecycle import test_shipping as shipping_cases
 from tests.repository_lifecycle.support import (
     OPERATION_RUNNER,
-    PR_WORKFLOW_ENTRYPOINT,
     PROMOTE_REPOSITORY,
     SHIP_REPOSITORY,
     prepare_repository_lifecycle_repo,
@@ -723,7 +722,7 @@ def test_ship_finalization_command_without_scope_calls_repository_cleanup(
     cleanup: ModuleType,
     repository: pathlib.Path,
 ) -> None:
-    wrapper = runpy.run_path(str(SCRIPTS / "ship-repository.py"))
+    wrapper = shipping_cases._load_ship()
     head = git(repository, "rev-parse", "HEAD")
     command = wrapper["_pending_command"](
         "finalize",
@@ -747,8 +746,9 @@ def test_ship_finalization_command_without_scope_calls_repository_cleanup(
 def test_repository_ship_absent_default_contract_is_no_op_and_finalizes(
     tmp_path: pathlib.Path,
     scope_present: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    repo, loaded, args, log, state, commands = shipping_cases._setup(
+    repo, loaded, args, log, state, _ = shipping_cases._setup(
         tmp_path, contract=False
     )
     state["scope"] = scope_present
@@ -763,18 +763,14 @@ def test_repository_ship_absent_default_contract_is_no_op_and_finalizes(
         }
     assert result["finalization"] == {"status": "finalized"}
     assert log.read_text().splitlines() == ["remote", "finalize"]
-    remote = next(
-        command
-        for command in commands
-        if str(shipping_cases.PR_WORKFLOW_ENTRYPOINT) in command
-    )
-    assert ("--pending-work-check" in remote) is scope_present
-    assert ("--no-pending-work-check" in remote) is not scope_present
+    _, pending_scope, _ = state["github_request"]
+    assert (pending_scope is not None) is scope_present
+    received = []
+    monkeypatch.setattr(loaded["github_ship"], "ship", lambda request: received.append(request) or {})
     args.review_replies_request = tmp_path / "review-replies.json"
-    forwarded = loaded["_ship_command"](args, repo, None, None)
-    assert forwarded[forwarded.index("--review-replies-request") + 1] == str(
-        args.review_replies_request
-    )
+    loaded["_call_github_ship"](args, repo, pending_scope, None)
+    assert received[0].review_replies_request == args.review_replies_request
+    assert received[0].pending_work_check is scope_present
 
 
 def test_repository_ship_prevalidates_and_executes_ordered_phase_selections(
@@ -867,6 +863,7 @@ def test_synchronized_source_is_checked_before_publication_or_deployment(
 
 def test_composed_promotion_and_shipping_each_run_their_validation_boundary(
     tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repo, _, _, _ = prepare_repository_lifecycle_repo(tmp_path)
     log = tmp_path / "validation.txt"
@@ -894,9 +891,8 @@ def test_composed_promotion_and_shipping_each_run_their_validation_boundary(
     assert run_git(repo, "commit", "-m", "alternate validator").returncode == 0
     head = run_git(repo, "rev-parse", "HEAD").stdout.strip()
     promotion = runpy.run_path(str(PROMOTE_REPOSITORY))
-    shipping = runpy.run_path(str(SHIP_REPOSITORY))
-    original_promotion = promotion["_run_json"]
-    original_shipping = shipping["_run_json"]
+    shipping = shipping_cases._load_ship()
+    original_shipping = shipping["run_command_for_json"]
 
     def ship_json(command: list[str], **kwargs: Any) -> tuple[int, dict[str, Any]]:
         if pathlib.Path(command[1]) in (OPERATION_RUNNER, SHIP_REPOSITORY.with_name("retire_shipped_work.py")):
@@ -907,24 +903,18 @@ def test_composed_promotion_and_shipping_each_run_their_validation_boundary(
                 "pending_work_scope": "",
                 "source_branches": [],
             }
-        assert pathlib.Path(command[1]) == PR_WORKFLOW_ENTRYPOINT
+        raise AssertionError(command)
+
+    def github_ship(_args, repo_root, _scope, _commit):
+        assert repo_root == repo
         assert log.read_text().splitlines() == ["checked", "checked"]
         assert run_git(repo, "switch", "main").returncode == 0
         assert run_git(repo, "merge", "--ff-only", head).returncode == 0
         assert run_git(repo, "update-ref", "refs/remotes/origin/main", head).returncode == 0
-        return 0, {"status": "shipped", "commit": head, "synchronized_head": head}
+        return {"status": "shipped", "commit": head, "synchronized_head": head}
 
-    shipping["ship_repository"].__globals__["_run_json"] = ship_json
-
-    def promote_json(
-        command: list[str], cwd: pathlib.Path
-    ) -> tuple[int, dict[str, Any]]:
-        if pathlib.Path(command[1]) == SHIP_REPOSITORY:
-            args = shipping["build_parser"]().parse_args(command[2:])
-            return 0, shipping["ship_repository"](args)
-        return original_promotion(command, cwd)
-
-    promotion["promote"].__globals__["_run_json"] = promote_json
+    monkeypatch.setitem(shipping["ship_repository"].__globals__, "run_command_for_json", ship_json)
+    monkeypatch.setitem(shipping["ship_repository"].__globals__, "_call_github_ship", github_ship)
     args = promotion["build_parser"]().parse_args(
         [
             "--repo-root",

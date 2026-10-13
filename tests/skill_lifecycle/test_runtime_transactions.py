@@ -102,7 +102,7 @@ def test_installed_repo_lifecycle_helpers_use_regular_runtime(
     runtime = json.loads((skill / RUNTIME_MANIFEST).read_text(encoding="utf-8"))
     interpreter = pathlib.Path(runtime["python_runtime"])
     assert interpreter.is_file() and not interpreter.is_symlink()
-    for script in ("manage-pending-work.py", "repository_operation.py"):
+    for script in ("manage-pending-work.py", "repository_operation.py", "ship-repository.py"):
         command = subprocess.run(
             [str(interpreter), str(skill / "scripts" / script), "--help"],
             capture_output=True,
@@ -117,6 +117,8 @@ def test_installed_repo_lifecycle_helpers_use_regular_runtime(
     isolated = subprocess.run(
         [str(interpreter), "-I", "-c",
          ("import pathlib,sys; sys.path.insert(0,sys.argv[1]); import store_artifacts,hold_write_lock,git_branch_operations; "
+         "from github_pr_workflow.ship_repository import ShipOptions,ship_repository; "
+         "assert ShipOptions(repo_root=pathlib.Path(sys.argv[2]),head_branch='release/local').base_branch=='main'; "
          "cp=store_artifacts._checkpoint_storage(); "
          "assert pathlib.Path(cp.__file__).parent==pathlib.Path(sys.argv[1]);\n"
          "with cp.open_checkpoints(pathlib.Path(sys.argv[2]),'artifact-versions') as context:\n"
@@ -234,7 +236,7 @@ def test_write_lock_nested_owner_and_stable_file(tmp_path, write_locks):
         owned.complete(commands_stopped=True)
 
 
-@pytest.mark.parametrize("ending", ["return", "exception", "after-complete", "nested-after-complete", "crash"])
+@pytest.mark.parametrize("ending", ["return", "exception", "nested-after-complete", "crash"])
 def test_write_lock_uncertain_end_requires_explicit_recovery(tmp_path, write_locks, ending):
     path = tmp_path / "release-local"
     if ending == "crash":
@@ -243,12 +245,12 @@ def test_write_lock_uncertain_end_requires_explicit_recovery(tmp_path, write_loc
     else:
         try:
             with write_locks.hold_write_lock(path) as owned:
-                if ending in ("after-complete", "nested-after-complete"):
+                if ending == "nested-after-complete":
                     owned.complete(commands_stopped=True)
                 if ending == "nested-after-complete":
                     with write_locks.hold_write_lock(path):
                         pass
-                elif ending in ("exception", "after-complete"):
+                elif ending == "exception":
                     raise ValueError("interrupted")
         except ValueError:
             pass
@@ -259,6 +261,66 @@ def test_write_lock_uncertain_end_requires_explicit_recovery(tmp_path, write_loc
     with write_locks.hold_write_lock(path, confirm_previous_commands_stopped=True) as recovered:
         recovered.complete(commands_stopped=True)
     assert path.read_bytes() == b"0"
+
+
+def test_write_lock_confirmed_stop_clears_flag_on_exception(tmp_path, write_locks):
+    path = tmp_path / "release-local"
+    error = ValueError("required check failed")
+    for _ in range(2):
+        with pytest.raises(ValueError) as raised, write_locks.hold_write_lock(path) as owned:
+            try:
+                raise error
+            finally:
+                owned.complete(commands_stopped=True)
+        assert raised.value is error
+        assert path.read_bytes() == b"0"
+
+
+@pytest.mark.parametrize("failure", ["clear", "unlock", "unlock_and_close"])
+def test_write_lock_cleanup_failure_preserves_original_error(
+    tmp_path, write_locks, monkeypatch, failure,
+):
+    path = tmp_path / "release-local"
+    original = ValueError("required check failed")
+    original.payload = {"status": "error", "message": str(original)}
+    save = write_locks._save_unfinished
+    unlock = write_locks.unlock_descriptor
+    close = write_locks.os.close
+
+    def fail_clear(fd, unfinished):
+        if not unfinished:
+            raise OSError("injected clear failure")
+        save(fd, unfinished)
+
+    def fail_unlock(fd):
+        unlock(fd)
+        raise OSError("injected unlock failure")
+
+    def fail_close(fd):
+        close(fd)
+        raise OSError("injected close failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(write_locks, "_save_unfinished", fail_clear if failure == "clear" else save)
+        patch.setattr(write_locks, "unlock_descriptor", fail_unlock if failure != "clear" else unlock)
+        if failure == "unlock_and_close":
+            patch.setattr(write_locks.os, "close", fail_close)
+        with pytest.raises(ValueError) as raised, write_locks.hold_write_lock(path) as owned:
+            try:
+                raise original
+            finally:
+                owned.complete(commands_stopped=True)
+    assert raised.value is original
+    assert str(raised.value) == "required check failed"
+    assert original.cleanup_errors == original.payload["cleanup_errors"]
+    assert original.__notes__ and original.cleanup_errors
+    if failure == "unlock_and_close":
+        assert original.cleanup_errors == [
+            "OSError: injected unlock failure", "OSError: injected close failure",
+        ]
+    assert path.read_bytes() == (b"1" if failure == "clear" else b"0")
+    with write_locks.hold_write_lock(path, confirm_previous_commands_stopped=True) as owned:
+        owned.complete(commands_stopped=True)
 
 
 @pytest.mark.parametrize("value", [b"?", b"\x00", b"1"])

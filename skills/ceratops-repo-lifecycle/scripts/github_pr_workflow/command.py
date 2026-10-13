@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import importlib
-import io
 import json
 import pathlib
 import re
 import subprocess
 import sys
-from contextlib import chdir, contextmanager, redirect_stderr, redirect_stdout
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from functools import cache
 from typing import Any
 
@@ -48,6 +49,46 @@ class CommandError(RuntimeError):
         self.completed = completed
 
 
+@dataclass
+class _CommandCompletion:
+    """Only synchronous call state; no process discovery or saved progress."""
+
+    active: int = 0
+    uncertain: bool = False
+
+    def unfinished(self) -> bool:
+        return self.uncertain or self.active != 0
+
+
+_COMMAND_COMPLETION: ContextVar[_CommandCompletion | None] = ContextVar(
+    "release_command_completion", default=None,
+)
+
+
+@contextmanager
+def track_command_completion():
+    """Observe an existing foreground wait without managing another process.
+
+    A returned CompletedProcess establishes that the command ended. If the
+    launcher itself raises, it supplies no such result: retain uncertainty,
+    even if a caller catches the error and continues. In particular, killing a
+    timed-out controller does not establish that its writing children stopped.
+    """
+    completion = _COMMAND_COMPLETION.get()
+    if completion is not None:
+        completion.active += 1
+    try:
+        yield
+    except BaseException as exc:
+        exc.local_commands_stopped = False
+        if completion is not None:
+            completion.uncertain = True
+        raise
+    finally:
+        if completion is not None:
+            completion.active -= 1
+
+
 @cache
 def release_lock_module() -> Any:
     """Load the installed sibling, or the declared shared source in development."""
@@ -63,8 +104,9 @@ def release_lock_module() -> Any:
 def release_write_context(repo_root, *, required=True, confirm_stopped=False, affected_worktrees=()):
     """Let the workflow own release exclusion; never pass ownership to a child.
 
-    The outermost workflow must explicitly report completion. Failed calls keep
-    the saved unfinished flag. Protect the primary checkout even on main: a
+    Foreground launchers finish their synchronous waits before this context
+    exits. Stopped unsuccessful work clears the flag too; a launcher that did
+    not establish shutdown keeps it. Protect the primary checkout even on main: a
     promotion can switch it to release/local while another workflow is running.
     Operations confined to other non-release worktrees need no lock.
     """
@@ -78,39 +120,41 @@ def release_write_context(repo_root, *, required=True, confirm_stopped=False, af
         ):
             yield None
             return
+        completion = _COMMAND_COMPLETION.get() or _CommandCompletion()
         with locks.hold_write_lock(
             lock_path,
             confirm_previous_commands_stopped=confirm_stopped,
+            commands_running=completion.unfinished,
         ) as owned:
-            yield owned
+            token = _COMMAND_COMPLETION.set(completion)
+            operation_error = None
+            try:
+                yield owned
+            except BaseException as exc:
+                operation_error = exc
+                if getattr(exc, "local_commands_stopped", None) is False:
+                    completion.uncertain = True
+                raise
+            finally:
+                try:
+                    if owned.outermost and not completion.unfinished():
+                        owned.complete(commands_stopped=True)
+                except BaseException as cleanup_error:
+                    if operation_error is None:
+                        raise
+                    locks.attach_cleanup_failure(operation_error, cleanup_error)
+                finally:
+                    _COMMAND_COMPLETION.reset(token)
     except locks.WriteLockError as exc:
         error = CommandError(str(exc))
+        if failures := getattr(exc, "cleanup_errors", None):
+            error.cleanup_errors = list(failures)
         error.release_not_started = isinstance(
             exc, (locks.WriteLockBusy, locks.WriteLockRecoveryRequired),
         )
         if isinstance(exc, locks.WriteLockBusy):
             error.args = ("Another promotion or Ship owns release/local; lock is busy; operation did not start.",)
         raise error from exc
-
-
-def run_lifecycle_main(main, arguments, *, cwd):
-    """Call a nested CLI in this controller, keeping its JSON/exit-code contract.
-
-    Only synchronous lifecycle handoffs use this adapter. They finish before
-    restoring cwd/output; it must not be used concurrently from worker threads.
-    The nested workflow shares the same native-lock context, not a bypass token.
-    """
-    stdout, stderr = io.StringIO(), io.StringIO()
-    with chdir(cwd), redirect_stdout(stdout), redirect_stderr(stderr):
-        code = main(arguments)
-    raw = stdout.getvalue().strip() or stderr.getvalue().strip()
-    try:
-        result = json.loads(raw)
-    except ValueError as exc:
-        raise CommandError("Nested lifecycle command returned invalid JSON.") from exc
-    if not isinstance(result, dict):
-        raise CommandError("Nested lifecycle command returned a non-object result.")
-    return code, result
 
 
 def clean_log(value: str) -> str:
@@ -231,16 +275,70 @@ def run_command(
 ) -> subprocess.CompletedProcess[str]:
     """Run one command without shell expansion or inherited noisy output."""
 
-    return run_github_command(
-        args,
-        retry_safe=github_read_command(args),
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
+    with track_command_completion():
+        return run_github_command(
+            args,
+            retry_safe=github_read_command(args),
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+
+
+def run_command_for_json(
+    command: list[str], cwd: pathlib.Path,
+) -> tuple[int, dict[str, Any]]:
+    """Start exactly the supplied external command and decode its JSON object.
+
+    No program name or argument changes this into a Python function call.
+    Invalid output retains the complete captured result on the exception and
+    the existing bounded public diagnostic in its structured payload.
+    """
+    result = run_command(command, cwd=cwd)
+    raw = result.stdout.strip() or result.stderr.strip()
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        problem = "invalid JSON"
+        output_error = f"{exc.msg} at line {exc.lineno}, column {exc.colno}"
+    else:
+        if isinstance(payload, dict):
+            return result.returncode, payload
+        problem = "a non-object result"
+        output_error = f"expected an object, received {type(payload).__name__}"
+    error = CommandError(
+        f"Lifecycle helper returned {problem} (exit code {result.returncode}).",
+        completed=result,
     )
+    error.payload = {
+        "status": "error", "message": str(error),
+        "diagnostic": {
+            "command": [
+                "<redacted>" if index and command[index - 1] == "--body"
+                else argument[:512]
+                for index, argument in enumerate(command)
+            ],
+            "exit_code": result.returncode,
+            "stderr_tail": result.stderr[-2048:].splitlines()[-20:],
+            "stdout_tail": result.stdout[-2048:].splitlines()[-20:],
+            "output_error": output_error,
+        },
+    }
+    raise error
+
+
+def describe_command_failure(error: BaseException) -> dict[str, Any]:
+    """Preserve an existing structured cause and any secondary cleanup errors."""
+    existing = getattr(error, "payload", None)
+    payload = dict(existing) if isinstance(existing, dict) else {
+        "status": "error", "message": str(error),
+    }
+    if failures := getattr(error, "cleanup_errors", None):
+        payload["cleanup_errors"] = list(failures)
+    return payload
 
 
 def _tail(completed: subprocess.CompletedProcess[str]) -> str:
