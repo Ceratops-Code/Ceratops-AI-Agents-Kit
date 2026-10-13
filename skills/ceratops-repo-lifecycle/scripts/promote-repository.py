@@ -29,8 +29,10 @@ from git_branch_operations import PromotionError, SourceState
 from github_pr_workflow import ship_repository as repository_ship
 from github_pr_workflow.command import (
     CommandError,
+    capture_failure_report,
     describe_command_failure,
     release_write_context,
+    report_phase,
     require_output,
     require_success,
     run_command,
@@ -263,6 +265,12 @@ def _validation_command(
         command.extend(("--operation", operation))
     for parameter in args.parameter or []:
         command.extend(("--parameter", parameter))
+    if diagnostic_output := getattr(args, "diagnostic_output", None):
+        command.extend((
+            "--diagnostic-output", str(diagnostic_output),
+            "--diagnostic-repo-root", str(args.repo_root),
+            "--diagnostic-action", "promote",
+        ))
     return command
 
 
@@ -298,6 +306,8 @@ def _ship_after_promotion(
         validation_operation=args.validation_operation,
         publish_operation=_operation_ids(args.publish_operation, "publish"),
         deploy_operation=_operation_ids(args.deploy_operation, "deploy-local"),
+        diagnostic_output=getattr(args, "diagnostic_output", None),
+        diagnostic_owner=(args.repo_root, "promote"),
     )
     try:
         shipped = repository_ship.ship_repository(request)
@@ -503,7 +513,7 @@ def _promote(
         raise PromotionError(str(record.get("message", "Scope recording failed.")))
 
     prepared_operations: list[PreparedOperation] = []
-    with _timed_phase(timings, "validation"):
+    with _timed_phase(timings, "validation", diagnostic_output=getattr(args, "diagnostic_output", None)):
         try:
             if args.run_operation is not None:
                 require_clean_commit(repo_root, target_commit)
@@ -525,7 +535,7 @@ def _promote(
             )
         except (OperationError, OSError, ValueError) as exc:
             validation_code = 1
-            validation = {"status": "error", "message": str(exc)[:4096]}
+            validation = describe_command_failure(exc)
     if validation_code:
         raise PromotionError(
             str(validation.get("message", "Repository validation failed.")),
@@ -546,14 +556,19 @@ def _promote(
     operations: dict[str, Any] | None = None
     handoffs: list[dict[str, str]] = []
     if args.run_operation is not None:
-        with _timed_phase(timings, "deployment"):
+        with _timed_phase(timings, "deployment", diagnostic_output=getattr(args, "diagnostic_output", None)):
             try:
                 require_clean_commit(repo_root, target_commit)
-                operations = execute_prepared_operations(prepared_operations)
+                operations = execute_prepared_operations(
+                    prepared_operations,
+                    diagnostic_output=getattr(args, "diagnostic_output", None),
+                    diagnostic_owner=(args.repo_root, "promote"),
+                    successful_results=validation["results"],
+                )
                 if validation_handoffs:
                     operations["validation_handoffs"] = validation_handoffs
             except (OperationError, OSError, ValueError) as exc:
-                operations = {"status": "error", "message": str(exc)[:4096]}
+                operations = describe_command_failure(exc)
         if operations["status"] != "completed":
             raise PromotionError(
                 str(operations.get("message", "Deployment failed.")),
@@ -645,9 +660,11 @@ def promote(
     with release_write_context(
         args.repo_root,
         confirm_stopped=getattr(args, "confirm_previous_commands_stopped", False),
+    ), capture_failure_report(
+        getattr(args, "diagnostic_output", None), repo_root=args.repo_root, action="promote",
     ):
-        result = _promote_with_rollback(args, timings=timings, inputs=inputs)
-        return result
+        report_phase("promotion", enabled=getattr(args, "diagnostic_output", None) is not None)
+        return _promote_with_rollback(args, timings=timings, inputs=inputs)
 
 
 def _promote_with_rollback(
@@ -682,9 +699,10 @@ def _promote_with_rollback(
 
 
 @contextmanager
-def _timed_phase(timings: dict[str, float], phase: str):
+def _timed_phase(timings: dict[str, float], phase: str, *, diagnostic_output=None):
     """Record actual elapsed work even when a phase fails; never repeat it."""
     started = time.monotonic()
+    report_phase(phase, enabled=diagnostic_output is not None)
     try:
         yield
     finally:
@@ -1194,6 +1212,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--repo-root", type=pathlib.Path, default=pathlib.Path.cwd())
     parser.add_argument("--source-branch", action="append")
+    parser.add_argument("--diagnostic-output", type=pathlib.Path,
+                        help="Stable task-owned file for complete failure details.")
     parser.add_argument(
         "--result-file",
         type=pathlib.Path,
@@ -1327,6 +1347,9 @@ def main(argv: list[str] | None = None) -> int:
     result_file = None
     failed = False
     try:
+        if (args.result_file is not None and args.diagnostic_output is not None
+                and args.result_file.expanduser().resolve() == args.diagnostic_output.expanduser().resolve()):
+            raise PromotionError("--result-file and --diagnostic-output must be different files.")
         if args.result_file is not None:
             requested = args.result_file.expanduser().resolve()
             if requested.is_relative_to(args.repo_root.resolve()):

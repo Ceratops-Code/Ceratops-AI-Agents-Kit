@@ -28,6 +28,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--repo-root", type=pathlib.Path, default=defaults.repo_root)
     parser.add_argument("--repo")
+    parser.add_argument("--diagnostic-output", type=pathlib.Path,
+                        help="Stable task-owned file for complete failure details.")
+    parser.add_argument("--diagnostic-repo-root", type=pathlib.Path, help=argparse.SUPPRESS)
+    parser.add_argument("--diagnostic-action", default="ship", help=argparse.SUPPRESS)
     parser.add_argument(
         "--head-branch",
         required=True,
@@ -87,7 +91,12 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     """Run the complete workflow and emit one compact result."""
 
-    args = ShipOptions(**vars(build_parser().parse_args(argv)))
+    values = vars(build_parser().parse_args(argv))
+    owner_root = values.pop("diagnostic_repo_root")
+    action = values.pop("diagnostic_action")
+    if owner_root is not None:
+        values["diagnostic_owner"] = (owner_root, action)
+    args = ShipOptions(**values)
     try:
         result = ship_repository(args)
     except RepositoryShipError as exc:

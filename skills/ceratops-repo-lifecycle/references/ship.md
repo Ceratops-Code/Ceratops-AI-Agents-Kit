@@ -59,8 +59,38 @@ CI/review waits. Confirmed local command shutdown allows a clean unlock on
 success, failure, exception or a decision return; unknown shutdown retains the
 unfinished flag. Model corrections happen after return, unlocked. The next
 normal call reads current inputs. Local exit does not cancel remote CI, and
-clearing the flag does not accept work or delete checkpoints. Full diagnostic
-files remain step 3B; new CI receipt/publication behavior remains later work.
+clearing the flag does not accept work or delete checkpoints. Complete diagnostic
+files are implemented; new CI receipt/publication behavior remains later work.
+
+### Complete failure details
+
+Add `--diagnostic-output FILE` to `ship-repository.py`. The direct
+`ShipOptions` field is `diagnostic_output`. The lower-level
+`python -m github_pr_workflow ship` parser accepts the same flag; that CLI
+adapter now lives in `github_pr_workflow/ship_pull_request.py`.
+FILE is one stable caller-selected path under
+`<repo-parent>/tmp/<repo-name>/<calling-worktree-name>/`, such as
+`_ship_failure.json`, distinct from a separate top-level Promote report.
+Retries reuse FILE. Composed Ship retains its requesting workflow's path/owner.
+
+Direct workflow calls and both operation execution functions forward the path.
+`command.py` writes complete secret-redacted diagnostics directly to FILE
+before returning a short error and `diagnostic_output`, with references to
+existing successful test/build result files. It references a complete child
+report unchanged instead of copying it; the child helper retains deletion
+authority. No report path or a failed write means the full error stays in the
+response. Report-enabled commands flush observational phase JSON lines to stdout
+before the terminal result; those events are not completed outcomes.
+
+The requesting workflow decides when matching results resolve every reported
+failure, then asks the writing helper to remove that exact managed file after
+commands stop. Tests passing can resolve their report while Ship still has work
+left. Partial success and same-work replacement preserve unresolved failures.
+Restart, phase advance and unlock do not delete reports. Cleanup excludes
+successful/mixed results, receipts, required acceptance logs, other actions'
+files and unmanaged retained reports. Step 4B still connects actual success
+callers, 6C connects test-runner report cleanup, and 20C/21 connect abandonment
+and worktree removal; 3B adds no scheduled cleanup or high-level failed receipt.
 
 ### Inputs To Capture
 

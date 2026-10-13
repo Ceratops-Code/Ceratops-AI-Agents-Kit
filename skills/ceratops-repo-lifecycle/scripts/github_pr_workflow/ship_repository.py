@@ -39,8 +39,10 @@ from repository_operation import (
 from github_pr_workflow import ship as github_ship
 from github_pr_workflow.command import (
     CommandError,
+    capture_failure_report,
     describe_command_failure,
     release_write_context,
+    report_phase,
     run_command_for_json,
 )
 
@@ -80,6 +82,8 @@ class ShipOptions:
     review_replies_request: pathlib.Path | None = None
     interval_seconds: int = 10
     confirm_previous_commands_stopped: bool = False
+    diagnostic_output: pathlib.Path | None = None
+    diagnostic_owner: tuple[pathlib.Path, str] | None = None
 
 
 class RepositoryShipError(RuntimeError):
@@ -491,9 +495,12 @@ def _checkpointed_operation_batch(
     target_commit: str,
     synchronized_commit: str,
     validation_operations: list[str] | None = None,
+    diagnostic_output: pathlib.Path | None = None,
+    diagnostic_owner: tuple[pathlib.Path, str] | None = None,
 ) -> tuple[int, dict[str, Any], list[pathlib.Path]]:
     """Resume one ordered phase and checkpoint each completed operation."""
 
+    report_phase(phase, enabled=diagnostic_output is not None)
     checkpoints: list[pathlib.Path] = []
     identities: list[dict[str, object]] = []
     completed_results: list[dict[str, Any]] = []
@@ -544,7 +551,10 @@ def _checkpointed_operation_batch(
             contract,
         )
         require_clean_commit(repo_root, synchronized_commit)
-        checked = execute_prepared_operations(checks)
+        checked = execute_prepared_operations(
+            checks, diagnostic_output=diagnostic_output,
+            diagnostic_owner=diagnostic_owner, successful_results=completed_results,
+        )
         if checked["status"] in FAILED_STATUSES:
             return 1, {
                 **checked, "completed_operations": operations[:first_pending],
@@ -552,7 +562,11 @@ def _checkpointed_operation_batch(
             }, checkpoints
         require_clean_commit(repo_root, synchronized_commit)
         for offset, prepared_operation in enumerate(prepared):
-            result = execute_prepared_operation(prepared_operation)
+            result = execute_prepared_operation(
+                prepared_operation, diagnostic_output=diagnostic_output,
+                diagnostic_owner=diagnostic_owner,
+                successful_results=(checked["results"], completed_results),
+            )
             index = first_pending + offset
             if result["status"] in FAILED_STATUSES:
                 return 1, {
@@ -599,11 +613,7 @@ def _call_github_ship(
         github_ship.readiness.CommandError, github_ship.codex_review.CommandError,
         OSError, ValueError,
     ) as exc:
-        payload = (
-            github_ship.merge.error_payload(exc)
-            if isinstance(exc, github_ship.merge.WorkflowError)
-            else describe_command_failure(exc)
-        )
+        payload = describe_command_failure(exc)
         raise RepositoryShipError(str(exc), payload) from exc
 
 
@@ -812,6 +822,10 @@ def _resume_ship_command(
         command.append("--delete-branch")
     if args.reusable_head:
         command.append("--reusable-head")
+    if diagnostic_output := getattr(args, "diagnostic_output", None):
+        command.extend(("--diagnostic-output", str(diagnostic_output)))
+        if owner := getattr(args, "diagnostic_owner", None):
+            command.extend(("--diagnostic-repo-root", str(owner[0]), "--diagnostic-action", owner[1]))
     return command
 
 
@@ -905,6 +919,12 @@ def _validate_phase(
         operations=operations,
     )
     command.extend(("--validate", "--tests"))
+    if diagnostic_output := getattr(args, "diagnostic_output", None):
+        owner_root, action = getattr(args, "diagnostic_owner", None) or (args.repo_root, "ship")
+        command.extend((
+            "--diagnostic-output", str(diagnostic_output),
+            "--diagnostic-repo-root", str(owner_root), "--diagnostic-action", action,
+        ))
     commit = repository_commit(repo_root)
     if commit:
         command.extend(("--commit", commit))
@@ -966,7 +986,10 @@ def _test_selection_phase(
             OperationRequest(name, parameters={"base": base, "head": head}) for name in selected
         ], args.sdlc_contract)
         require_clean_commit(repo_root, head)
-        result = execute_prepared_operations(prepared)
+        result = execute_prepared_operations(
+            prepared, diagnostic_output=getattr(args, "diagnostic_output", None),
+            diagnostic_owner=getattr(args, "diagnostic_owner", None) or (args.repo_root, "ship"),
+        )
         if result["status"] in FAILED_STATUSES:
             raise RepositoryShipError(
                 str(result.get("message", "CI test selection failed.")),
@@ -1059,9 +1082,12 @@ def ship_repository(args: argparse.Namespace) -> dict[str, object]:
             "Run ship-repository.py from the target repository directory "
             f"{repo_root} so deployment can replace the installed skill."
         )
+    owner_root, action = getattr(args, "diagnostic_owner", None) or (repo_root, "ship")
     with release_write_context(
         args.repo_root,
         confirm_stopped=getattr(args, "confirm_previous_commands_stopped", False),
+    ), capture_failure_report(
+        getattr(args, "diagnostic_output", None), repo_root=owner_root, action=action,
     ):
         return _ship_repository(args)
 
@@ -1191,6 +1217,8 @@ def _ship_repository(args: argparse.Namespace) -> dict[str, object]:
                 target_commit=target_commit,
                 synchronized_commit=synchronized_head,
                 validation_operations=args.validation_operation,
+                diagnostic_output=getattr(args, "diagnostic_output", None),
+                diagnostic_owner=getattr(args, "diagnostic_owner", None) or (args.repo_root, "ship"),
             )
         )
         operation_checkpoints.extend(release_checkpoints)
@@ -1229,6 +1257,8 @@ def _ship_repository(args: argparse.Namespace) -> dict[str, object]:
                 target_commit=target_commit,
                 synchronized_commit=synchronized_head,
                 validation_operations=args.validation_operation,
+                diagnostic_output=getattr(args, "diagnostic_output", None),
+                diagnostic_owner=getattr(args, "diagnostic_owner", None) or (args.repo_root, "ship"),
             )
         )
         operation_checkpoints.extend(deployment_checkpoints)

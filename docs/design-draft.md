@@ -479,7 +479,7 @@ asset rather than a second release-acceptance authority.
 Qualification-level reuse, CI-written receipts, success-only lifecycle receipts
 and the full Ship/publication/installation sequence below are planned changes.
 2B connects the 2A helper to current release invocations; 3A ends stopped attempts
-before model corrections. Later parts of 3/4 add report handling and controlled cleanup.
+before model corrections. 3B supplies complete reports; 4 connects controlled cleanup.
 
 ### One existing worktree, two commit boundaries
 
@@ -636,8 +636,60 @@ External programs, including pending-work management and the SDLC operation
 runner, use `command.py::run_command_for_json()`. It always starts the supplied
 program through the existing launcher, preserves its working directory,
 environment and retry policy, and decodes one JSON object with its exit code.
-Bad output retains the captured stdout/stderr and bounded error details; 3B adds
-complete report-file forwarding. It never switches execution type by filename.
+Bad output retains the captured stdout/stderr. In 3B, report-enabled commands
+flush `ceratops-lifecycle-progress.v1` JSON lines before their terminal result;
+the JSON reader forwards phase events without interpreting them as completion.
+It never switches execution type by filename.
+
+#### Failure-report storage and ownership (3B)
+
+All three public parsers (`promote-repository.py`, `ship-repository.py`,
+and `python -m github_pr_workflow ship`) accept `--diagnostic-output FILE`.
+The GitHub Ship parser/output adapter lives in `ship_pull_request.py`; the
+workflow remains `ship.py::ship()`, with no old parser alias.
+The caller chooses one stable path under
+`<repo-parent>/tmp/<repo-name>/<calling-worktree-name>/`. Top-level Promote and
+Ship use distinct files, reused across attempts; no execution UUID or report
+store exists. Promotion's `--result-file` remains a separate unchanged contract.
+
+`command.py::write_failure_report()` owns the JSON file. Its identity records
+the registered worktree's Git directory and requesting action, not the current
+commit or invocation. `capture_failure_report()` adds the report path to direct
+workflow exceptions without changing their type or cause. The single
+`execute_prepared_operation()` implementation and the ordered
+`execute_prepared_operations()` function pass `diagnostic_output` to the writer.
+When execution uses another checkout, `diagnostic_owner` carries the calling
+worktree/action; the operation CLI forwards these as `--diagnostic-repo-root`
+and `--diagnostic-action`. Generated Ship retry arguments preserve that owner
+too. These values govern diagnostics only, never operation selection.
+
+Before shortening an error, the helper writes complete captured output and
+structured causes directly to the selected final path, using the existing
+secret-redaction code. Existing successful result paths remain references, not
+copies. Child commands' explicit complete-report paths are returned unchanged,
+including the test runner's `pytest.diagnostic.path`; their files stay under
+their own helper's deletion authority. Expected decision payloads remain
+decisions, without a new failure report. Actual command failures retain their
+causes. No high-level failure receipt is produced. If a write fails or no path
+was supplied, full diagnostics remain in the response. Malformed or foreign
+existing records are not overwritten or removed.
+
+Retention is one current failure-only document per worktree/requested action.
+Named command/check failures replace only their same-work entries; other
+unresolved entries and accepted-result references survive replacement. The
+requesting workflow decides obsolescence from existing matching results.
+`remove_failure_report()` requires all recorded failure IDs to be resolved and
+commands to have stopped, and removes only the matching managed file. For
+example, corrected tests passing can resolve their report before Ship finishes;
+one passing check cannot clear a report containing another unfixed failure.
+Unlock, restart, exception and phase advancement confer no deletion authority.
+Successful/mixed test results, build results, receipts, required acceptance logs,
+other worktrees/actions and unmanaged user-retained files are excluded.
+No retention sweep, process discovery or repeat acceptance checks are added.
+
+3B supplies these report APIs and forwarding. Actual check/build/delivery success
+callers remain step 4B, test-runner report lifetime is 6C, and explicit
+abandonment/replacement and worktree-removal connections remain 20C/21.
 
 `command.py::release_write_context()` waits through the existing synchronous
 calls in `run_command()` and `repository_operation.py`. A shared in-memory
@@ -651,8 +703,8 @@ leave detached writing workers after returning.
 
 The automatic attempt ends and unlocks before the model edits code. A fresh
 normal call takes the lock and uses current inputs; clearing `unfinished_run`
-is not successful acceptance or permission to delete checkpoints. Report handling
-and cleanup remain later parts of 3/4. The batch remains unmerged through 4C;
+is not successful acceptance or permission to delete checkpoints. 3B supplies
+report handling; actual success cleanup remains 4B. The batch remains unmerged through 4C;
 ordinary work in other task worktrees stays unlocked.
 
 The current Ship invocation holds the same lock through its CI/review waits,
@@ -1259,7 +1311,7 @@ Generic checkpoint cleanup cannot delete those, reservations or installations.
 The producer lock does not prove an earlier artifact-writing child has stopped.
 Step 2A provides the shared release-lock helper; 2B connects promotion and other
 release writers. 3A releases stopped attempts before model corrections;
-report handling and controlled cleanup remain later parts of 3/4.
+3B supplies complete reports; controlled cleanup remains in 4/20/21.
 Step 20 connects checkpoint cleanup to worktree removal.
 Neither helper supervises child processes or adds general worktree locks.
 Artifact-reservation and incomplete-installation cleanup belong to their
@@ -1339,8 +1391,8 @@ does not repeat successful tests, builds, merges, publication or installation.
 
 The artifact reservation and direct final paths below are implemented internally.
 The release-lock helper and current invocation wiring are implemented in 2A/2B;
-3A adds stopped-attempt exits; report handling and controlled cleanup remain
-later parts of 3 and 4:
+3A supplies stopped-attempt exits and 3B supplies reports; controlled cleanup
+remains in 4:
 
 New committed build receipts use `build_receipt.json` in both target layouts.
 The artifact receipt stores the exact Git path and hash. Readers and completed
@@ -1490,8 +1542,8 @@ not these disposable checkpoints.
 
 1e.2 preserves the behavior verified by the earlier 1c documentation checkpoint
 while replacing its storage and command interfaces. 2B connects release writers;
-3A unlocks stopped attempts before corrections; later parts of 3/4 complete
-report handling and controlled worktree-removal handoffs.
+3A unlocks stopped attempts before corrections; 3B supplies complete reports.
+Controlled worktree-removal handoffs remain in 4/20/21.
 
 ## Shared sections and generated skill copies
 

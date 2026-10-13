@@ -37,7 +37,12 @@ from ceratops_repo_compatibility_engine.sdlc_contract_validation import (
 from ceratops_repo_compatibility_engine.sdlc_contract_validation import (
     operation_category as contract_operation_category,
 )
-from github_pr_workflow.command import failure_excerpt, track_command_completion
+from github_pr_workflow.command import (
+    failure_excerpt,
+    report_failure,
+    report_phase,
+    track_command_completion,
+)
 from sdlc_results import StepResultError, capture_step_result
 from store_artifacts import (
     ArtifactVersionTransaction,
@@ -309,6 +314,9 @@ def execute_handoff(
     *,
     inputs: Mapping[str, Any] | None = None,
     expected_commit: str | None = None,
+    diagnostic_output: pathlib.Path | None = None,
+    diagnostic_owner: tuple[pathlib.Path, str] | None = None,
+    successful_results: Any = (),
 ) -> dict[str, object]:
     """Execute an installed-authorized skill action in its declared order.
 
@@ -574,7 +582,7 @@ def execute_handoff(
                     check=False,
                 )
             if result.returncode:
-                return {
+                failure = {
                     **evidence,
                     "status": "operation_failed",
                     "step": position,
@@ -582,6 +590,15 @@ def execute_handoff(
                     "stderr_tail": result.stderr[-4096:],
                     "stdout_tail": result.stdout[-4096:],
                 }
+                owner_root, action = diagnostic_owner or (repo_root, "operation")
+                return report_failure(
+                    failure, diagnostic_output=diagnostic_output,
+                    repo_root=owner_root, action=action,
+                    failure_id=f"{route}:{position}",
+                    stdout=result.stdout, stderr=result.stderr,
+                    successful_results=successful_results,
+                    output_root=repo_root,
+                )
             completed.append(position)
             captured = capture_step_result(result.stdout)
             if captured:
@@ -853,13 +870,27 @@ def _bounded_tail(value: str | None) -> list[str]:
     return (value or "")[-FAILURE_TAIL_CHARS:].splitlines()[-FAILURE_TAIL_LINES:]
 
 
-def _execute_prepared_operation(prepared: PreparedOperation) -> dict[str, object]:
-    """Run one operation in its declared caller context and retain gate failures."""
+def execute_prepared_operation(
+    prepared: PreparedOperation, *, diagnostic_output: pathlib.Path | None = None,
+    diagnostic_owner: tuple[pathlib.Path, str] | None = None,
+    successful_results: Any = (),
+) -> dict[str, object]:
+    """Run one operation; callers choose prerequisites and diagnostic ownership.
+
+    The optional owner names the requesting worktree/action when the command
+    runs in another checkout. No tests are selected or repeated for reporting.
+    """
 
     base: dict[str, object] = {
         "operation": prepared.operation,
         "commit": prepared.commit,
         "steps": [],
+    }
+    owner_root, action = diagnostic_owner or (prepared.repo_root, "operation")
+    report_options = {
+        "diagnostic_output": diagnostic_output, "repo_root": owner_root,
+        "action": action, "failure_id": prepared.operation,
+        "successful_results": successful_results, "output_root": prepared.repo_root,
     }
     if prepared.test_context is not None:
         base["test_context"] = dict(prepared.test_context)
@@ -867,12 +898,13 @@ def _execute_prepared_operation(prepared: PreparedOperation) -> dict[str, object
         base["prerequisites"] = dict(prepared.prerequisites)
     if prepared.no_op_reason is not None:
         return {**base, "status": "no_op", "reason": prepared.no_op_reason}
+    report_phase(prepared.operation, enabled=diagnostic_output is not None)
     if repository_commit(prepared.repo_root) != prepared.commit:
-        return {
+        return report_failure({
             **base,
             "status": "state_changed",
             "message": "HEAD changed after preparation.",
-        }
+        }, **report_options)
     completed: list[int | str] = []
     step_results: list[dict[str, Any]] = []
     for step in prepared.steps:
@@ -881,12 +913,12 @@ def _execute_prepared_operation(prepared: PreparedOperation) -> dict[str, object
                 try:
                     require_clean_commit(prepared.repo_root, prepared.commit)
                 except OperationError as exc:
-                    return {
+                    return report_failure({
                         **base,
                         "steps": completed,
                         "status": "state_changed",
                         "message": str(exc),
-                    }
+                    }, **report_options)
             if prepared.handoff_mode != "skill":
                 return {
                     **base,
@@ -905,6 +937,9 @@ def _execute_prepared_operation(prepared: PreparedOperation) -> dict[str, object
                 expected_commit=prepared.commit
                 if prepared.category in MUTATION_CATEGORIES
                 else None,
+                diagnostic_output=diagnostic_output,
+                diagnostic_owner=diagnostic_owner,
+                successful_results=(successful_results, step_results),
             )
             # A structured handoff is the final SDLC step. Preserve preceding
             # command evidence and number each executed lifecycle step in order
@@ -936,17 +971,19 @@ def _execute_prepared_operation(prepared: PreparedOperation) -> dict[str, object
                     status="state_changed",
                     message="HEAD changed during the skill action.",
                 )
+            if handoff_result["status"] in FAILED_STATUSES - {"handoff_required"}:
+                return report_failure(handoff_result, **report_options)
             return handoff_result
         if prepared.commit and prepared.category in MUTATION_CATEGORIES:
             try:
                 require_clean_commit(prepared.repo_root, prepared.commit)
             except OperationError as exc:
-                return {
+                return report_failure({
                     **base,
                     "steps": completed,
                     "status": "state_changed",
                     "message": str(exc),
-                }
+                }, **report_options)
         try:
             assert step.argv is not None
             argv = list(step.argv)
@@ -989,7 +1026,7 @@ def _execute_prepared_operation(prepared: PreparedOperation) -> dict[str, object
                     captured["result_omitted"] = "output_limit"
                 if captured:
                     child_results[stream] = captured
-            return {
+            failure = {
                 **base,
                 "status": "validation_failed"
                 if prepared.category == "validate"
@@ -1012,6 +1049,14 @@ def _execute_prepared_operation(prepared: PreparedOperation) -> dict[str, object
                     **({"child_results": child_results} if child_results else {}),
                 },
             }
+            owner_root, action = diagnostic_owner or (prepared.repo_root, "operation")
+            return report_failure(
+                failure, diagnostic_output=diagnostic_output,
+                repo_root=owner_root, action=action,
+                failure_id=f"{prepared.operation}:{step.position}",
+                stdout=stdout, stderr=stderr, successful_results=successful_results,
+                output_root=step.cwd,
+            )
         completed.append(step.position)
         expected_schema = prepared.result_schema if step is prepared.steps[-1] else None
         expected_stage = {
@@ -1025,7 +1070,7 @@ def _execute_prepared_operation(prepared: PreparedOperation) -> dict[str, object
                 expected_stage=expected_stage if expected_schema else None,
             )
         except StepResultError as exc:
-            return {
+            failure = {
                 **base,
                 "status": "result_invalid",
                 "message": (
@@ -1037,33 +1082,32 @@ def _execute_prepared_operation(prepared: PreparedOperation) -> dict[str, object
                 "failed_step": step.position,
                 "diagnostic": {"message": str(exc)},
             }
+            owner_root, action = diagnostic_owner or (prepared.repo_root, "operation")
+            return report_failure(
+                failure, diagnostic_output=diagnostic_output,
+                repo_root=owner_root, action=action,
+                failure_id=f"{prepared.operation}:{step.position}",
+                stdout=stdout, stderr=stderr, successful_results=successful_results,
+                output_root=step.cwd,
+            )
         if captured:
             step_results.append({"step": step.position, **captured})
             # The shared list also preserves earlier receipts on later failures
             # or commit drift, before any subsequent side effect is attempted.
             base["step_results"] = step_results
         if repository_commit(prepared.repo_root) != prepared.commit:
-            return {
+            return report_failure({
                 **base,
                 "steps": completed,
                 "status": "state_changed",
                 "message": "HEAD changed during operation; prepare and validate the new commit.",
-            }
+            }, **report_options)
     result_value = {
         **base,
         "status": "completed" if prepared.steps else "advisory",
         "steps": completed,
     }
     return result_value
-
-
-def execute_prepared_operation(prepared: PreparedOperation) -> dict[str, object]:
-    """Execute one command; lifecycle callers supply ordered prerequisites.
-
-    The public CLI, promotion and shipping workflows run validation and tests
-    before deployment. This command executor neither caches nor replays them.
-    """
-    return _execute_prepared_operation(prepared)
 
 
 def _combined_prerequisites(
@@ -1085,13 +1129,20 @@ def _combined_prerequisites(
 
 def execute_prepared_operations(
     prepared: Sequence[PreparedOperation],
+    *, diagnostic_output: pathlib.Path | None = None,
+    diagnostic_owner: tuple[pathlib.Path, str] | None = None,
+    successful_results: Any = (),
 ) -> dict[str, Any]:
     """Run in order, stopping at the first failure with a bounded pending ledger."""
 
     results: list[dict[str, object]] = []
     completed: list[str] = []
     for index, operation in enumerate(prepared):
-        result = execute_prepared_operation(operation)
+        result = execute_prepared_operation(
+            operation, diagnostic_output=diagnostic_output,
+            diagnostic_owner=diagnostic_owner,
+            successful_results=(successful_results, results),
+        )
         results.append(result)
         if result["status"] in FAILED_STATUSES:
             return {
@@ -1162,6 +1213,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return pending skill routes without dispatch.",
     )
     parser.add_argument("--evidence-file", type=pathlib.Path)
+    parser.add_argument("--diagnostic-output", type=pathlib.Path)
+    parser.add_argument("--diagnostic-repo-root", type=pathlib.Path)
+    parser.add_argument("--diagnostic-action", default="operation")
     parser.add_argument(
         "--commit", help="Require this exact clean Git commit before and after checks."
     )
@@ -1279,7 +1333,9 @@ def main(argv: list[str] | None = None) -> int:
                     if item.category == "tests"
                     else item
                     for item in validations
-                ]
+                ],
+                diagnostic_output=args.diagnostic_output,
+                diagnostic_owner=(args.diagnostic_repo_root or root, args.diagnostic_action),
             )
             if checks["status"] in FAILED_STATUSES:
                 result = {
@@ -1298,7 +1354,11 @@ def main(argv: list[str] | None = None) -> int:
                 result = (
                     checks
                     if args.validate or args.tests
-                    else execute_prepared_operations(prepared)
+                    else execute_prepared_operations(
+                        prepared, diagnostic_output=args.diagnostic_output,
+                        diagnostic_owner=(args.diagnostic_repo_root or root, args.diagnostic_action),
+                        successful_results=checks["results"],
+                    )
                 )
                 advisory_checks = [
                     item
@@ -1308,7 +1368,12 @@ def main(argv: list[str] | None = None) -> int:
                 if advisory_checks and not (args.validate or args.tests):
                     result["validation_handoffs"] = advisory_checks
     except (OperationError, OSError, ValueError) as exc:
-        result = {"status": "error", "message": str(exc)[:4096]}
+        result = report_failure(
+            {"status": "error", "message": str(exc)},
+            diagnostic_output=args.diagnostic_output,
+            repo_root=args.diagnostic_repo_root or args.repo_root,
+            action=args.diagnostic_action,
+        )
     failed = result.get("status") in FAILED_STATUSES
     if args.evidence_file:
         if failed:

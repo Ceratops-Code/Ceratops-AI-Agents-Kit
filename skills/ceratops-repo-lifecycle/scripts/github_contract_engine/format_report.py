@@ -47,7 +47,7 @@ AUTH_VALUE_RE = re.compile(r"\b(bearer|basic)\s+[^\s,;]+", re.IGNORECASE)
 CREDENTIAL_ASSIGNMENT_RE = re.compile(
     r"\b(api[_ -]?key|authorization|client[_ -]?secret|cookie|credentials?|"
     r"password|private[_ -]?key|secret|token)\b"
-    r"(\s*[:=]\s*)(\"[^\"]*\"|'[^']*'|[^\s,;]+)",
+    r"([\"']?\s*[:=]\s*)(\"[^\"]*\"|'[^']*'|[^\s,;]+)",
     re.IGNORECASE,
 )
 GITHUB_TOKEN_RE = re.compile(
@@ -58,6 +58,11 @@ PRIVATE_KEY_RE = re.compile(
     re.DOTALL,
 )
 URL_CREDENTIAL_RE = re.compile(r"(https?://)[^/\s:@]+:[^/\s@]+@", re.IGNORECASE)
+CLI_CREDENTIAL_RE = re.compile(
+    r"(--(?:api[-_]key|authorization|client[-_]secret|cookie|credentials?|"
+    r"password|private[-_]key|secret|token)(?:=|\s+))"
+    r"(\"[^\"]*\"|'[^']*'|[^\s,;]+)", re.IGNORECASE,
+)
 COMMUNITY_PROFILE_CHECK = "content.community_profile_public"
 COMMUNITY_PROFILE_PATH = "/repository/content/community_profile/health_percentage"
 
@@ -73,18 +78,29 @@ def _sanitize_text(value: str) -> str:
     result = URL_CREDENTIAL_RE.sub(rf"\1{REDACTED}@", result)
     result = AUTH_VALUE_RE.sub(lambda match: f"{match.group(1)} {REDACTED}", result)
     result = GITHUB_TOKEN_RE.sub(REDACTED, result)
+    result = CLI_CREDENTIAL_RE.sub(lambda match: f"{match.group(1)}{REDACTED}", result)
     return CREDENTIAL_ASSIGNMENT_RE.sub(
         lambda match: f"{match.group(1)}{match.group(2)}{REDACTED}", result
     )
 
 
-def sanitize_for_output(value: Any, path: tuple[str, ...] = ()) -> Any:
-    """Remove collected content and sensitive values at the stdout boundary."""
+def sanitize_for_output(
+    value: Any, path: tuple[str, ...] = (), *, retain_diagnostics: bool = False,
+) -> Any:
+    """Redact secrets; full diagnostic files may also retain collected output."""
 
     if isinstance(value, str):
         return _sanitize_text(value)
     if isinstance(value, list):
-        return [sanitize_for_output(item, path) for item in value]
+        return [
+            REDACTED
+            if (index and isinstance(value[index - 1], str)
+                and value[index - 1].startswith("--")
+                and (_sensitive_key(value[index - 1][2:].replace("-", "_"))
+                     or value[index - 1] == "--body"))
+            else sanitize_for_output(item, path, retain_diagnostics=retain_diagnostics)
+            for index, item in enumerate(value)
+        ]
     if not isinstance(value, dict):
         return value
 
@@ -95,14 +111,14 @@ def sanitize_for_output(value: Any, path: tuple[str, ...] = ()) -> Any:
         key = str(raw_key)
         normalized = re.sub(r"[^a-z0-9]+", "_", key.lower()).strip("_")
         child_path = (*path, normalized)
-        if normalized in RAW_OUTPUT_KEYS:
+        if not retain_diagnostics and normalized in RAW_OUTPUT_KEYS:
             result[key] = OMITTED
-        elif normalized == "texts" and "local" in path:
+        elif not retain_diagnostics and normalized == "texts" and "local" in path:
             result[key] = {
                 "count": len(item) if isinstance(item, dict) else 0,
                 "content": OMITTED,
             }
-        elif normalized == "text" and path[-1:] == ("workflows",):
+        elif not retain_diagnostics and normalized == "text" and path[-1:] == ("workflows",):
             result[key] = OMITTED
         elif (
             _sensitive_key(normalized)
@@ -112,7 +128,9 @@ def sanitize_for_output(value: Any, path: tuple[str, ...] = ()) -> Any:
         ):
             result[key] = REDACTED
         else:
-            result[key] = sanitize_for_output(item, child_path)
+            result[key] = sanitize_for_output(
+                item, child_path, retain_diagnostics=retain_diagnostics,
+            )
     return result
 
 

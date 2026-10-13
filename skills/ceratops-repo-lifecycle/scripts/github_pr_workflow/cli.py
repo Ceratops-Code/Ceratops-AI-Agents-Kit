@@ -12,7 +12,7 @@ from . import (
     ensure_pr,
     merge,
     readiness,
-    ship,
+    ship_pull_request,
     sync,
 )
 
@@ -68,7 +68,7 @@ def main(argv: list[str] | None = None) -> int:
         "resolve": lambda values: codex_review.main(["resolve", *(values or [])]),
         "merge": merge.main,
         "sync": sync.main,
-        "ship": ship.main,
+        "ship": ship_pull_request.main,
         "dependency-preflight": lambda values: dependency_queue.main(
             ["preflight", *(values or [])]
         ),

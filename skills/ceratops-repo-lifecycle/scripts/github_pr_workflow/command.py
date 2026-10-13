@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from functools import cache
 from typing import Any
 
+from github_contract_engine.format_report import sanitize_for_output
 from github_contract_engine.github_api import github_read_command, run_github_command
 
 _ANSI_RE = re.compile(
@@ -299,6 +300,20 @@ def run_command_for_json(
     """
     result = run_command(command, cwd=cwd)
     raw = result.stdout.strip() or result.stderr.strip()
+    # Report-enabled helpers use JSON lines for observational phase messages.
+    # Forward these events, then decode the terminal result; no filename decides
+    # how a program is executed.
+    lines = raw.splitlines()
+    while lines:
+        try:
+            event = json.loads(lines[0])
+        except ValueError:
+            break
+        if not isinstance(event, dict) or event.get("schema") != "ceratops-lifecycle-progress.v1":
+            break
+        report_phase(str(event.get("phase", "")), enabled=True)
+        lines.pop(0)
+    raw = "\n".join(lines).strip() or result.stderr.strip()
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -339,6 +354,257 @@ def describe_command_failure(error: BaseException) -> dict[str, Any]:
     if failures := getattr(error, "cleanup_errors", None):
         payload["cleanup_errors"] = list(failures)
     return payload
+
+
+def _report_scope(
+    path: pathlib.Path, repo_root: pathlib.Path, action: str,
+) -> tuple[pathlib.Path, dict[str, str]]:
+    """Bind a report to the registered checkout and its caller's task directory."""
+    root = repo_root.resolve(strict=True)
+    git_paths = require_output(
+        ["git", "rev-parse", "--path-format=absolute", "--git-common-dir",
+         "--absolute-git-dir"], cwd=root,
+    ).splitlines()
+    common, checkout = (pathlib.Path(value).resolve() for value in git_paths)
+    task_root = common.parent.parent / "tmp" / common.parent.name / root.name
+    selected = path.expanduser().absolute()
+    # Never follow a redirected parent when writing or deleting diagnostics.
+    if (not action or selected.resolve() != selected
+            or not selected.is_relative_to(task_root)
+            or selected == task_root or selected.is_symlink()
+            or (selected.exists() and selected.stat().st_nlink != 1)):
+        raise ValueError(f"Failure report must be a file inside {task_root}.")
+    return selected, {
+        "writer": "github_pr_workflow.command",
+        "worktree": str(checkout), "action": action,
+    }
+
+
+def _read_failure_report(path: pathlib.Path, owner: dict[str, str]) -> dict[str, Any]:
+    """Only this helper's failure-only document may be replaced or removed."""
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    if (
+        not isinstance(report, dict)
+        or set(report) != {"schema", "owner", "failures", "successful_result_paths"}
+        or report["schema"] != "ceratops-lifecycle-failure-report.v1"
+        or report["owner"] != owner
+        or not isinstance(report["failures"], dict)
+        or not report["failures"]
+        or not isinstance(report["successful_result_paths"], list)
+    ):
+        raise ValueError("Selected file is not this action's failure-only report.")
+    return report
+
+
+def write_failure_report(
+    path: pathlib.Path, *, repo_root: pathlib.Path, action: str,
+    failures: dict[str, Any], successful_result_paths: tuple[str, ...] = (),
+    resolved_failures: tuple[str, ...] = (),
+) -> pathlib.Path:
+    """Keep one current report, carrying unfixed failures into its replacement.
+
+    Failure keys are existing command/check IDs, never attempt IDs. A requesting
+    workflow may supply IDs whose work has succeeded; advancing a phase does
+    not resolve anything. Successful results are referenced, not copied.
+    Writes go directly to the selected file; there are no staging files.
+    """
+    selected, owner = _report_scope(path, repo_root, action)
+    if not failures or any(not isinstance(key, str) or not key for key in failures):
+        raise ValueError("A failure report requires named failed work.")
+    previous = _read_failure_report(selected, owner)
+    remaining = {
+        key: value for key, value in previous.get("failures", {}).items()
+        if key not in resolved_failures
+    }
+    report = sanitize_for_output({
+        "schema": "ceratops-lifecycle-failure-report.v1", "owner": owner,
+        "failures": {**remaining, **failures},
+        "successful_result_paths": sorted({
+            *previous.get("successful_result_paths", []), *successful_result_paths,
+        }),
+    }, retain_diagnostics=True)
+    selected.parent.mkdir(parents=True, exist_ok=True)
+    selected.write_text(json.dumps(report, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
+    return selected
+
+
+def remove_failure_report(
+    path: pathlib.Path, *, repo_root: pathlib.Path, action: str,
+    resolved_failures: tuple[str, ...], commands_stopped: bool,
+) -> bool:
+    """Remove only our exact managed file when its requester resolves every failure.
+
+    This is not a result-retention cleaner. Receipts, mixed result records,
+    other writers' reports and user-retained files are never deletion targets.
+    The caller decides from actual matching results, without running checks here.
+    """
+    if not commands_stopped:
+        return False
+    try:
+        selected, owner = _report_scope(path, repo_root, action)
+        report = _read_failure_report(selected, owner)
+    except (OSError, ValueError, CommandError):
+        return False
+    if not report:
+        return True
+    if not set(report["failures"]).issubset(resolved_failures):
+        return False
+    selected.unlink(missing_ok=True)
+    return True
+
+
+def successful_result_paths(value: Any) -> tuple[str, ...]:
+    """Extract existing result references, without reading or copying accepted files."""
+    paths: set[str] = set()
+    if isinstance(value, dict):
+        if str(value.get("status", "")).lower() in {"ok", "passed", "completed", "success"}:
+            for key in ("path", "result_path", "receipt_path", "evidence_file"):
+                if isinstance(value.get(key), str):
+                    paths.add(value[key])
+        for key in ("successful_result_paths", "committedResultPaths"):
+            paths.update(item for item in value.get(key, []) if isinstance(item, str))
+        for item in value.values():
+            paths.update(successful_result_paths(item))
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            paths.update(successful_result_paths(item))
+    return tuple(sorted(paths))
+
+
+def report_phase(phase: str, *, enabled: bool) -> None:
+    """Flush an observational phase event; the terminal result remains separate."""
+    if enabled:
+        print(json.dumps({
+            "schema": "ceratops-lifecycle-progress.v1",
+            "phase": _clip(sanitize_for_output(phase), 500),
+        }, separators=(",", ":")), flush=True)
+
+
+def _child_report_paths(value: Any, repo_root: pathlib.Path) -> list[str]:
+    """Use only explicit child diagnostic references; never mistake a receipt for one."""
+    paths: set[str] = set()
+    if isinstance(value, dict):
+        if str(value.get("status", "")).lower() in {"ok", "passed", "completed", "success"}:
+            return []
+        for key in ("diagnostic_output", "evidence_file"):
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate:
+                selected = (repo_root / candidate).resolve()
+                if selected.is_file():
+                    paths.add(str(selected))
+        diagnostic = value.get("diagnostic")
+        if isinstance(diagnostic, dict) and isinstance(diagnostic.get("path"), str):
+            selected = (repo_root / diagnostic["path"]).resolve()
+            if selected.is_file():
+                paths.add(str(selected))
+        for item in value.values():
+            paths.update(_child_report_paths(item, repo_root))
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            paths.update(_child_report_paths(item, repo_root))
+    return sorted(paths)
+
+
+def report_failure(
+    payload: dict[str, Any], *, diagnostic_output: pathlib.Path | None,
+    repo_root: pathlib.Path, action: str, failure_id: str | None = None,
+    stdout: str | None = None, stderr: str | None = None,
+    successful_results: Any = (),
+    output_root: pathlib.Path | None = None,
+) -> dict[str, Any]:
+    """Save full diagnostics before shortening a failure, or return them intact.
+
+    Without a selected path (or if its write fails), the response stays complete.
+    Child commands that already supply a complete report keep their own file
+    and cleanup owner. Observational reports never select or resume execution.
+    """
+    full = dict(payload)
+    if stdout is not None or stderr is not None:
+        full["command_output"] = {"stdout": stdout or "", "stderr": stderr or ""}
+    structured_output = []
+    for output in (stdout, stderr):
+        try:
+            structured_output.append(json.loads(output or ""))
+        except (ValueError, RecursionError):
+            pass
+    paths = successful_result_paths((full, successful_results, structured_output))
+    if paths:
+        full["successful_result_paths"] = list(paths)
+    full = sanitize_for_output(full, retain_diagnostics=True)
+    child_paths = _child_report_paths((payload, structured_output), output_root or repo_root)
+    if not child_paths:
+        if diagnostic_output is None:
+            return full
+        try:
+            child_paths = [str(write_failure_report(
+                diagnostic_output, repo_root=repo_root, action=action,
+                failures={failure_id or action: full}, successful_result_paths=paths,
+            ))]
+        except (OSError, ValueError, CommandError) as exc:
+            full["report_write_error"] = sanitize_for_output(str(exc))
+            return full
+    # Keep routing/decision context and accepted-result identities intact. Only
+    # bulk diagnostics are replaced with a path to their complete contents.
+    response = {
+        key: value for key, value in full.items()
+        if key not in {"command_output", "diagnostic", "stdout_tail", "stderr_tail", "causes"}
+    }
+    response["message"] = _clip(str(full.get("message", "Required command failed.")), 2000)
+    if "diagnostic" in full:
+        response["diagnostic"] = {
+            "message": response["message"],
+            **({"exit_code": full["diagnostic"]["exit_code"]}
+               if isinstance(full["diagnostic"], dict) and "exit_code" in full["diagnostic"] else {}),
+        }
+    response["diagnostic_output"] = child_paths[0]
+    if len(child_paths) > 1:
+        response["diagnostic_outputs"] = child_paths
+    return response
+
+
+@contextmanager
+def capture_failure_report(
+    diagnostic_output: pathlib.Path | None, *, repo_root: pathlib.Path, action: str,
+):
+    """Enrich failures from direct workflow calls without changing their exception types."""
+    try:
+        yield
+    except Exception as exc:
+        if not getattr(exc, "release_not_started", False):
+            payload = describe_command_failure(exc)
+            if payload.get("status") in {"pending_work", "handoff_required", "deferred_handoff"}:
+                raise
+            if isinstance(payload.get("blocker"), dict) and payload["blocker"].get("kind") == "review_threads":
+                raise
+            cause = exc
+            seen = set()
+            causes = []
+            completed = None
+            while cause is not None and id(cause) not in seen:
+                seen.add(id(cause))
+                result = getattr(cause, "completed", None)
+                if result is not None:
+                    completed = result
+                    causes.append({
+                        "message": str(cause), "command": result.args,
+                        "exit_code": result.returncode,
+                        "stdout": result.stdout, "stderr": result.stderr,
+                    })
+                cause = cause.__cause__
+            if causes:
+                payload["causes"] = causes
+            if completed is not None:
+                payload["command"] = completed.args
+                payload["exit_code"] = completed.returncode
+            exc.payload = report_failure(
+                payload, diagnostic_output=diagnostic_output, repo_root=repo_root,
+                action=action, stdout=completed.stdout if completed else None,
+                stderr=completed.stderr if completed else None,
+            )
+        raise
 
 
 def _tail(completed: subprocess.CompletedProcess[str]) -> str:

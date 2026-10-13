@@ -60,8 +60,36 @@ CI wait. Once local commands are known to have stopped, it unlocks before a
 failure or decision reaches the model. Corrections therefore run unlocked; the
 next normal call reads current inputs. Unknown shutdown retains `unfinished_run`
 and the existing explicit recovery requirement. Clearing it neither accepts
-failed work nor deletes checkpoints. Full report forwarding remains step 3B;
+failed work nor deletes checkpoints. Complete report forwarding is implemented;
 new phase scheduling and receipt-driven remote work remain later steps.
+
+### Complete failure details
+
+Add `--diagnostic-output FILE` to the promotion command. FILE is one stable
+caller-selected path under
+`<repo-parent>/tmp/<repo-name>/<calling-worktree-name>/`, such as
+`_promote_failure.json`; reuse it on retries. A separate top-level Ship uses a
+different file. Composed Ship receives the original request's path and owner.
+Keep `--result-file` on its own path; its outcome/receipt contract is unchanged.
+
+The direct workflow and both operation execution functions forward this path.
+`command.py` writes complete secret-redacted failure details there before
+returning a short error and `diagnostic_output`. Successful test/build result
+files are referenced, never copied or deleted by report cleanup. Existing
+complete child reports are referenced unchanged; the child's helper owns their
+deletion. Without a selected path, or after a write error, diagnostics remain
+complete in the returned failure. Report-enabled commands flush phase JSON lines
+to stdout before the terminal result; phase events do not signal completion.
+
+The requesting workflow decides from matching successful results when every
+failure in a report is resolved; the writing helper removes its exact managed
+file after commands stop. Tests passing can resolve their report before the
+whole promotion finishes. Partial success retains the report; same-work
+replacement carries other unresolved failures forward. Restart, phase advance
+and unlock alone remove nothing. Successful/mixed results, receipts, acceptance
+logs, other actions' reports and unmanaged retained files are excluded.
+3B provides this API; 4B connects actual success callers, 6C handles child
+test-runner reports, and 20C/21 connect abandonment and worktree removal.
 
 ### Inputs To Capture
 

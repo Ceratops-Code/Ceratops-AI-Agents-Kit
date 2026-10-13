@@ -15,11 +15,12 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 GH_SCRIPTS = ROOT / "skills" / "ceratops-repo-lifecycle" / "scripts"
 sys.path.insert(0, str(GH_SCRIPTS))
 
-from github_pr_workflow import (  # noqa: E402
+from github_pr_workflow import (
     dependency_finalization,
     ensure_pr,
     merge,
     ship,
+    ship_pull_request,
     sync,
 )
 
@@ -45,11 +46,10 @@ class EnsurePrTests(unittest.TestCase):
     def test_stops_after_the_bounded_attempt_count(self) -> None:
         with mock.patch.object(
             ensure_pr, "_open_pr", return_value={"headRefOid": "old"}
-        ) as probe:
-            with self.assertRaisesRegex(ensure_pr.EnsurePrError, "after 3 attempts"):
-                ensure_pr.wait_for_pr_head(
-                    self.args(), "new", max_attempts=3, delay_seconds=0
-                )
+        ) as probe, self.assertRaisesRegex(ensure_pr.EnsurePrError, "after 3 attempts"):
+            ensure_pr.wait_for_pr_head(
+                self.args(), "new", max_attempts=3, delay_seconds=0
+            )
 
         self.assertEqual(probe.call_count, 3)
 
@@ -677,7 +677,7 @@ class ShipTests(unittest.TestCase):
         sync_main.assert_not_called()
 
     def test_pending_work_flags_are_explicit_and_consistent(self) -> None:
-        parser = ship.build_parser()
+        parser = ship_pull_request.build_parser()
         with self.assertRaises(SystemExit):
             parser.parse_args(["--head-branch", "release/local"])
 
@@ -796,7 +796,7 @@ class ShipTests(unittest.TestCase):
 
     def test_obsolete_prepared_checkpoint_is_removed_before_resume(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            repo_root, checkpoint, commit, _ = self.checkpoint_repository(
+            repo_root, checkpoint, _commit, _ = self.checkpoint_repository(
                 temporary_directory
             )
             api_result = mock.Mock(ok=True, data=[])
@@ -991,7 +991,7 @@ class ShipTests(unittest.TestCase):
             mock.patch.object(ship, "ship", return_value=pending),
             mock.patch("builtins.print"),
         ):
-            exit_code = ship.main(
+            exit_code = ship_pull_request.main(
                 [
                     "--head-branch",
                     "release/local",
@@ -1315,20 +1315,19 @@ class ShipTests(unittest.TestCase):
                 ship.readiness,
                 "review_thread_resolution_required",
                 return_value=True,
-            ) as resolution_required,
+            ) as resolution_required,self.assertRaisesRegex(
+            ship.ShipError,
+            "PRRT_old_1, PRRT_old_2",
+        )
         ):
-            with self.assertRaisesRegex(
-                ship.ShipError,
-                "PRRT_old_1, PRRT_old_2",
-            ):
-                ship.run_parallel_gates(
-                    args,
-                    "17",
-                    "owner/repo",
-                    self.commit,
-                    ci_wait_seconds=30,
-                    review_wait_seconds=30,
-                )
+            ship.run_parallel_gates(
+                args,
+                "17",
+                "owner/repo",
+                self.commit,
+                ci_wait_seconds=30,
+                review_wait_seconds=30,
+            )
 
         review_wait.assert_called_once()
         self.assertEqual(review_wait.call_args.kwargs["wait_seconds"], 0)
@@ -1360,20 +1359,19 @@ class ShipTests(unittest.TestCase):
                 ship.readiness,
                 "review_thread_resolution_required",
                 return_value=True,
-            ) as resolution_required,
+            ) as resolution_required,self.assertRaisesRegex(
+            ship.ShipError,
+            "require resolution of 2 unresolved review thread",
+        )
         ):
-            with self.assertRaisesRegex(
-                ship.ShipError,
-                "require resolution of 2 unresolved review thread",
-            ):
-                ship.run_parallel_gates(
-                    args,
-                    "17",
-                    "owner/repo",
-                    self.commit,
-                    ci_wait_seconds=0,
-                    review_wait_seconds=0,
-                )
+            ship.run_parallel_gates(
+                args,
+                "17",
+                "owner/repo",
+                self.commit,
+                ci_wait_seconds=0,
+                review_wait_seconds=0,
+            )
 
         resolution_required.assert_called_once_with("main", args.repo_root)
 
@@ -1730,10 +1728,9 @@ class ShipTests(unittest.TestCase):
                     ship,
                     "run_parallel_gates",
                     side_effect=ship.ShipError("gate failed"),
-                ),
+                ),self.assertRaisesRegex(ship.ShipError, "gate failed")
             ):
-                with self.assertRaisesRegex(ship.ShipError, "gate failed"):
-                    ship._ship(args)
+                ship._ship(args)
 
             self.assertTrue(checkpoint.exists())
 
@@ -1783,11 +1780,9 @@ class ShipTests(unittest.TestCase):
                     ],
                 ) as gates,
                 mock.patch.object(ship.merge, "merge_verified_pr") as merge_pr,
+                self.assertRaisesRegex(ship.ShipError, "pending checks appeared"),
             ):
-                with self.assertRaisesRegex(
-                    ship.ShipError, "pending checks appeared"
-                ):
-                    ship._ship(args)
+                ship._ship(args)
 
             self.assertEqual(gates.call_count, 2)
             merge_pr.assert_not_called()
@@ -2284,12 +2279,11 @@ class DependencyFinalizationTests(unittest.TestCase):
             merge,
             "_validate_readiness",
             return_value={"head_oid": "b" * 40},
+        ), self.assertRaisesRegex(
+            merge.WorkflowError,
+            "externally approved commit",
         ):
-            with self.assertRaisesRegex(
-                merge.WorkflowError,
-                "externally approved commit",
-            ):
-                merge.merge_pr(args)
+            merge.merge_pr(args)
 
 
 if __name__ == "__main__":
