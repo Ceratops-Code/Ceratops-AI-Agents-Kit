@@ -138,6 +138,14 @@
       "requests": [
         {
           "method": "GET",
+          "endpoint": "/repos/${owner}/${repo}/rules/branches/${default_branch}?per_page=100",
+          "paginate": true,
+          "covers_checks": [
+            "process.default_branch_merge_only_rulesets"
+          ]
+        },
+        {
+          "method": "GET",
           "endpoint": "/repos/${owner}/${repo}/rulesets",
           "covers_checks": [
             "process.default_branch_enforcement_present",
@@ -151,7 +159,8 @@
           "covers_checks": [
             "process.default_branch_name_and_protection_indicator",
             "process.default_branch_enforcement_present",
-            "process.branch_protection_or_ruleset_posture"
+            "process.branch_protection_or_ruleset_posture",
+            "process.default_branch_merge_commit_classic_protection"
           ]
         },
         {
@@ -447,35 +456,74 @@
       "id": "repo.merge_settings",
       "kind": "api",
       "endpoint": "/repos/${owner}/${repo}",
-      "applies_when": "repo.archived == false && repo.fork == false",
       "assertions": [
         {
           "path": "/repository/repo/allow_auto_merge",
           "operator": "equal",
           "expected": true,
           "level": "WARN",
-          "when": "repo.visibility != private || owner.plan.name != free"
+          "when": "repo.archived == false && repo.fork == false && (repo.visibility != private || owner.plan.name != free)"
         },
         {
           "path": "/repository/repo/delete_branch_on_merge",
           "operator": "equal",
           "expected": true,
-          "level": "WARN"
+          "level": "WARN",
+          "when": "repo.archived == false && repo.fork == false"
         },
         {
           "path": "/repository/repo/allow_update_branch",
           "operator": "equal",
           "expected": true,
-          "level": "WARN"
+          "level": "WARN",
+          "when": "repo.archived == false && repo.fork == false"
         },
         {
           "path": "/repository/repo/allow_merge_commit",
           "operator": "equal",
           "expected": true,
           "level": "WARN"
+        },
+        {
+          "path": "/repository/repo/allow_squash_merge",
+          "operator": "equal",
+          "expected": false,
+          "level": "WARN"
+        },
+        {
+          "path": "/repository/repo/allow_rebase_merge",
+          "operator": "equal",
+          "expected": false,
+          "level": "WARN"
         }
       ],
       "remediation_action": "repository.update_settings"
+    },
+    {
+      "id": "process.default_branch_merge_only_rulesets",
+      "kind": "api_composite",
+      "applies_when": "repository.rulesets.merge_policy.supported != false",
+      "assertions": [
+        {
+          "path": "/repository/rulesets/merge_policy/compatible",
+          "operator": "equal",
+          "expected": true,
+          "level": "ERROR"
+        }
+      ]
+    },
+    {
+      "id": "process.default_branch_merge_commit_classic_protection",
+      "kind": "api_composite",
+      "applies_when": "repository.rulesets.merge_policy.classic_protection_supported != false",
+      "assertions": [
+        {
+          "path": "/repository/rulesets/merge_policy/classic_protection_compatible",
+          "operator": "equal",
+          "expected": true,
+          "level": "ERROR"
+        }
+      ]
     },
     {
       "id": "process.default_branch_name_and_protection_indicator",

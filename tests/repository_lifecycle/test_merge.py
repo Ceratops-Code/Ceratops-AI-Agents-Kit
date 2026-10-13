@@ -1457,3 +1457,156 @@ def test_dependency_automation_interrupted_failure_publication_converges(depende
     assert call("finalize", "--output", str(output)) == 1
     assert json.loads(output.read_text())["failure"]["exit_code"] == 1
     assert not queue.failure_partial_path(output).exists()
+
+
+@pytest.mark.parametrize("setting", ["allow_merge_commit", "allow_squash_merge", "allow_rebase_merge"])
+def test_contract_requires_merge_only_and_remediates_exact_flags(
+    monkeypatch: pytest.MonkeyPatch, setting: str,
+) -> None:
+    monkeypatch.syspath_prepend(str(PR_WORKFLOW_SCRIPTS))
+    from github_contract_engine.compare_states import compare_states
+    from github_contract_engine.compose_desired_state import compose_desired_state
+    from github_contract_engine.github_api import ApiResult
+    from github_contract_engine.remediations import HANDLERS
+
+    contract = PR_WORKFLOW_SCRIPTS.parent / "references/contracts/github-repo-deterministic-contract.json"
+    desired = compose_desired_state(
+        {"repo": str(contract)}, {"owner": "owner", "repo": "repo"},
+        {"repo": {"repo.merge_settings"}},
+    )
+    expected = {"allow_merge_commit": True, "allow_squash_merge": False, "allow_rebase_merge": False}
+    rule = desired["rules"][0]
+    for name, value in expected.items():
+        assertion = next(a for a in rule["assertions"] if a["path"].endswith("/" + name))
+        assert assertion["expected"] is value and "when" not in assertion
+    repo = {"fork": True, "archived": False, **expected}
+    observed = {"repo": repo, "repository": {"repo": repo}}
+    assert compare_states(observed, desired)["findings"][0]["level"] == "PASS"
+    repo[setting] = not expected[setting]
+    finding = compare_states(observed, desired)["findings"][0]
+    assert finding["path"] == "/repository/repo/" + setting
+    writes = []
+    def update(method: str, endpoint: str, payload: dict[str, Any]) -> ApiResult:
+        writes.append((method, endpoint, payload))
+        return ApiResult(True, method, endpoint, status=200)
+    monkeypatch.setattr("github_contract_engine.remediations.repository.run_gh_api", update)
+    assert HANDLERS["repository.update_settings"](
+        [{**rule, "_mismatch_paths": [finding["path"]]}], {"owner": "owner", "repo": "repo"},
+    )[0]["ok"]
+    assert writes == [("PATCH", "/repos/owner/repo", {setting: expected[setting]})]
+
+
+@pytest.mark.parametrize(("rules", "compatible"), [
+    ([], True),
+    ([{"type": "pull_request", "parameters": {"allowed_merge_methods": ["merge"]}}], True),
+    ([{"type": "pull_request", "parameters": {"allowed_merge_methods": ["squash"]}}], False),
+    ([{"type": "pull_request", "parameters": {"allowed_merge_methods": ["merge", "rebase"]}}], False),
+    ([{"type": "pull_request", "parameters": {}}], None),
+    ([{"type": "required_linear_history"}], False),
+    ([{"type": "merge_queue", "parameters": {"merge_method": "MERGE"}}], True),
+    ([{"type": "merge_queue", "parameters": {"merge_method": "SQUASH"}}], False),
+    ([{"type": "pull_request"}, {"type": "required_linear_history"}], False),
+    ([{}], None),
+    ({}, None),
+])
+def test_effective_merge_rules_keep_conflicts_and_unknowns(
+    monkeypatch: pytest.MonkeyPatch, rules: Any, compatible: bool | None,
+) -> None:
+    monkeypatch.syspath_prepend(str(PR_WORKFLOW_SCRIPTS))
+    from github_contract_engine.collectors.repository import _merge_policy_facts
+    from github_contract_engine.github_api import ApiResult
+
+    inputs = (ApiResult(True, "GET", "rules", data=rules),
+              ApiResult(False, "GET", "protection", status=404, message="Branch not protected"))
+    for _ in range(2):
+        facts = _merge_policy_facts(*inputs)
+        assert facts["compatible"] is compatible
+        assert facts["classic_protection_compatible"] is True
+
+
+@pytest.mark.parametrize(("payload", "status", "message", "compatible", "supported"), [
+    ({"required_linear_history": {"enabled": False}}, 200, None, True, True),
+    ({"required_linear_history": {"enabled": True}}, 200, None, False, True),
+    ({}, 200, None, None, True),
+    (None, 404, "Branch not protected", True, True),
+    (None, 404, "Not Found", None, None),
+    (None, 403, "Resource not accessible by integration", None, None),
+    (None, 403, "Upgrade to GitHub Pro or make this repository public to enable this feature.", None, False),
+    (None, 503, "Service unavailable", None, None),
+])
+def test_classic_merge_protection_requires_conclusive_evidence(
+    monkeypatch: pytest.MonkeyPatch, payload: Any, status: int, message: str | None,
+    compatible: bool | None, supported: bool | None,
+) -> None:
+    monkeypatch.syspath_prepend(str(PR_WORKFLOW_SCRIPTS))
+    from github_contract_engine.collectors.repository import _merge_policy_facts
+    from github_contract_engine.github_api import ApiResult
+
+    facts = _merge_policy_facts(
+        ApiResult(True, "GET", "rules", data=[]),
+        ApiResult(status == 200, "GET", "protection", data=payload, status=status, message=message),
+    )
+    assert facts["classic_protection_compatible"] is compatible
+    assert facts["classic_protection_supported"] is supported
+
+
+@pytest.mark.parametrize("mode", ["merge", "conflict", "unknown", "unsupported", "slurped_unsupported"])
+def test_merge_contract_collects_effective_rules_and_skips_only_plan_limits(
+    monkeypatch: pytest.MonkeyPatch, mode: str,
+) -> None:
+    monkeypatch.syspath_prepend(str(PR_WORKFLOW_SCRIPTS))
+    from github_contract_engine.collectors.repository import collect_repository
+    from github_contract_engine.compare_states import compare_states
+    from github_contract_engine.compose_desired_state import compose_desired_state
+    from github_contract_engine.github_api import ApiResult
+
+    contract = PR_WORKFLOW_SCRIPTS.parent / "references/contracts/github-repo-deterministic-contract.json"
+    ids = {"process.default_branch_merge_only_rulesets", "process.default_branch_merge_commit_classic_protection"}
+    desired = compose_desired_state({"repo": str(contract)}, {"owner": "owner", "repo": "repo"}, {"repo": ids})
+    endpoint = "/repos/owner/repo/rules/branches/main?per_page=100"
+    request = next(r for r in desired["requests"] if "/rules/branches/" in r["endpoint"])
+    assert request["paginate"] is True
+    message = "Upgrade to GitHub Pro or make this repository public to enable this feature."
+    methods = ["squash"] if mode == "conflict" else ["merge"]
+    data = [{"type": "pull_request", "parameters": {"allowed_merge_methods": methods}}]
+    response = ApiResult(mode in {"merge", "conflict"}, "GET", endpoint, data=data, status=200)
+    if mode == "unknown":
+        response.status, response.message = 503, "Service unavailable"
+    if "unsupported" in mode:
+        response.status, response.message = 403, message
+        if mode == "slurped_unsupported":
+            response.message, response.raw_stdout = "gh: rejected (HTTP 403)", json.dumps([{"message": message}])
+    protection = ApiResult(False, "GET", "protection", status=404, message="Branch not protected")
+    fetched = {
+        ("GET", "/repos/owner/repo"): ApiResult(True, "GET", "repo", data={"default_branch": "main"}),
+        ("GET", endpoint): response,
+        ("GET", "/repos/owner/repo/branches/main/protection"): protection,
+    }
+    repo = collect_repository(fetched, {"owner": "owner", "repo": "repo", "default_branch": "main"}, {"available": False, "root": None, "files": [], "texts": {}, "workflows": {}}, desired["rules"])
+    findings = compare_states({"repository": repo}, desired)["findings"]
+    levels = {f["check_id"]: f["level"] for f in findings}
+    assert levels["process.default_branch_merge_only_rulesets"] == ("SKIP" if "unsupported" in mode else "ERROR" if mode in {"conflict", "unknown"} else "PASS")
+    assert levels["process.default_branch_merge_commit_classic_protection"] == "PASS"
+    if mode == "unknown" or "unsupported" in mode:
+        assert repo["rulesets"]["merge_policy"]["errors"]
+
+
+@pytest.mark.parametrize(("repo", "applies"), [
+    ({"archived": False, "fork": False, "visibility": "public"}, True),
+    ({"archived": False, "fork": False, "visibility": "private"}, False),
+    ({"archived": False, "fork": True, "visibility": "public"}, False),
+    ({"archived": True, "fork": False, "visibility": "public"}, False),
+])
+def test_auto_merge_applicability_survives_merge_only_contract(
+    monkeypatch: pytest.MonkeyPatch, repo: dict[str, Any], applies: bool,
+) -> None:
+    monkeypatch.syspath_prepend(str(PR_WORKFLOW_SCRIPTS))
+    from github_contract_engine.compare_states import compare_states
+
+    contract = PR_WORKFLOW_SCRIPTS.parent / "references/contracts/github-repo-deterministic-contract.json"
+    rule = next(r for r in json.loads(contract.read_text())["checks"] if r["id"] == "repo.merge_settings")
+    auto = next(a for a in rule["assertions"] if a["path"].endswith("/allow_auto_merge"))
+    repo = {**repo, "allow_auto_merge": False}
+    observed = {"repo": repo, "repository": {"repo": repo}, "owner": {"plan": {"name": "free"}}}
+    desired = {"rules": [{**rule, "assertions": [auto]}], "contracts": []}
+    assert compare_states(observed, desired)["findings"][0]["level"] == ("WARN" if applies else "PASS")

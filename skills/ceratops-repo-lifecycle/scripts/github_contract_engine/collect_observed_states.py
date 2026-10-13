@@ -129,6 +129,8 @@ CONDITION_STATE_PATTERNS = (
     "repository.content.dependabot_label_referenced",
     "repository.private_fork_enabled",
     "repository.pages.build_type",
+    "repository.rulesets.merge_policy.supported",
+    "repository.rulesets.merge_policy.classic_protection_supported",
     "repository.security.dependabot_prs.available",
     "repository.security.dependabot_prs.items",
     "type.workflow_surface",
