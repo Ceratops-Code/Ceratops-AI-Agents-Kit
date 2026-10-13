@@ -1009,15 +1009,27 @@ sections, validator, or skill-local source.
 Compatibility templates create `scripts/pyproject.toml`, `scripts/uv.lock`
  and an ignored `scripts/.venv` with a Python matching `requires-python`. This
 separate
-uv project owns tooling dependencies. `pyproject.toml` and `uv.lock` suffice
-for that environment; no parallel requirements file is needed. Existing
-application manifests retain their owners and locations. Dependabot gets
-a `uv` entry for `/scripts` without removing other entries.
+uv project owns tooling dependencies. Python dependencies use `pyproject.toml`
+and `uv.lock`, not requirements files. Package metadata and tool configuration
+belong below the repository root: tooling under `scripts`, applications in their
+own directories. Compatibility reports misplaced files before writing and never
+moves or deletes them automatically. Nested application projects retain their
+owners, dependencies and locks. Dependabot gets a `uv` entry for `/scripts`
+without removing other entries.
+
+The compatibility contract's `configuration_layout` owns the filename patterns
+and excluded dependency/output directories. The runtime planner and structural
+checker share the same read-only layout check. Existing environment checks own
+their locks; an application workspace can share one `uv.lock` across its member
+packages. Git supplies tracked and unignored inputs; isolated non-Git targets
+use a pruned filesystem walk. Custom filenames, application dependency ownership
+and command behavior still require the compatibility review; structural success
+is not proof of their policy fit.
 
 The same project template supplies Ruff lint rules and mypy checking defaults.
-Generated validators select those settings explicitly unless the repository
-provides root tool configuration. Existing settings remain authoritative;
-compatibility adds only absent tool tables.
+Generated checks select the scripts project's settings explicitly. Existing
+settings in that project remain authoritative; compatibility adds only absent
+tool tables. Root-level settings are reported, not silently shadowed.
 
 Initial application resolves the lock and syncs the environment. Later runs
 use the lock; missing dependencies are installed by uv before Python starts,

@@ -16,6 +16,7 @@
     "sdlc_version",
     "runtime",
     "skill_python_runtime",
+    "configuration_layout",
     "python_test_detection",
     "dependency_updates",
     "ci_action",
@@ -152,6 +153,19 @@
         "lockfile": {"$ref": "#/$defs/relative_path"}
       },
       "description": "Executable: generator copies the source-only pair for Python skills; checker requires its locked declarations."
+    },
+    "configuration_layout": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "root_file_patterns", "python_dependency_file_patterns", "excluded_directories"
+      ],
+      "properties": {
+        "root_file_patterns": {"$ref": "#/$defs/strings"},
+        "python_dependency_file_patterns": {"$ref": "#/$defs/strings"},
+        "excluded_directories": {"$ref": "#/$defs/strings"}
+      },
+      "description": "Executable: the runtime planner rejects misplaced configuration before writes; the structural checker reports the same paths. Git supplies tracked and unignored inputs, with a pruned non-Git fallback excluding declared output and dependency directories. Existing environment checks own their uv locks; application workspace ownership remains part of the companion review."
     },
     "python_test_detection": {
       "type": "object",

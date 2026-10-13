@@ -701,7 +701,7 @@ def test_compatibility_materializer_preserves_existing_validator_and_ci(
 
 
 @pytest.mark.parametrize("configuration", [
-    ".markdownlint.jsonc", ".markdownlint.yaml", ".markdownlint.cjs", ".markdownlintrc",
+    "scripts/.markdownlint.jsonc", "scripts/.markdownlint.yaml", "scripts/.markdownlintrc",
     "scripts/.markdownlint.json", "scripts/.markdownlint.cjs",
 ])
 def test_compatibility_materializer_preserves_existing_identity_and_custom_sections(
@@ -714,10 +714,9 @@ def test_compatibility_materializer_preserves_existing_identity_and_custom_secti
     (repo / ".git").write_text("gitdir: test\n", encoding="utf-8", newline="\n")
     markdown_config = repo / configuration
     configuration_bytes = {
-        ".markdownlint.jsonc": b'{"MD013": false}\r\n',
-        ".markdownlint.yaml": b"MD013: false\r\n",
-        ".markdownlint.cjs": b"module.exports = { MD013: false };\r\n",
-        ".markdownlintrc": b'{"MD013": false}\r\n',
+        "scripts/.markdownlint.jsonc": b'{"MD013": false}\r\n',
+        "scripts/.markdownlint.yaml": b"MD013: false\r\n",
+        "scripts/.markdownlintrc": b'{"MD013": false}\r\n',
         "scripts/.markdownlint.json": b'{"MD013": false}\r\n',
         "scripts/.markdownlint.cjs": b"module.exports = { MD013: false };\r\n",
     }[configuration]
@@ -763,10 +762,8 @@ def test_compatibility_materializer_preserves_existing_identity_and_custom_secti
     assert not (repo / ".markdownlint.json").exists()
     assert ignore.read_bytes() == b"build/\r\n!node_modules/\r\n/scripts/node_modules/\r\n/.build/\r\n"
     package = json.loads((repo / "scripts/package.json").read_text(encoding="utf-8"))
-    selected_configuration = pathlib.PurePosixPath(configuration).name if configuration.startswith("scripts/") else "../" + configuration
+    selected_configuration = pathlib.PurePosixPath(configuration).name
     assert package["scripts"]["lint:markdown"].endswith(f" --config {selected_configuration}")
-    if not configuration.startswith("scripts/"):
-        assert not (repo / "scripts/.markdownlint.json").exists()
     preserved = {
         name: (repo / name).read_bytes()
         for name in (configuration, ".gitignore", "scripts/package.json", "scripts/package-lock.json")

@@ -395,12 +395,20 @@ def test_tooling_plan_preserves_existing_project_bytes(
         assert project.read_bytes() == original
 
 
+def _write_tooling_settings(repo: pathlib.Path, settings: str) -> None:
+    """Keep fixture tooling in the same owned project used by real setup."""
+    (repo / "scripts").mkdir(exist_ok=True)
+    template = REPOSITORY_LIFECYCLE_SOURCE / "references/templates/validation-pyproject.toml.tmpl"
+    defaults = _ruff_tools().project_text(repo, template, ["ruff", "mypy", "pytest", "yamllint"])
+    (repo / "scripts/pyproject.toml").write_text(defaults.split("[tool.ruff]", 1)[0] + settings, encoding="utf-8")
+
+
 def test_compatibility_repeatedly_rejects_weak_ruff_and_restores_original_files(tmp_path: pathlib.Path) -> None:
     repo = tmp_path / "weak-policy"
     repo.mkdir()
     (repo / ".git").write_text("gitdir: test\n", encoding="utf-8")
     (repo / "README.md").write_text("# Policy fixture\n", encoding="utf-8")
-    (repo / "pyproject.toml").write_text('[tool.ruff]\ntarget-version = "py314"\n[tool.ruff.lint]\nselect = ["F"]\n', encoding="utf-8")
+    _write_tooling_settings(repo, '[tool.ruff]\ntarget-version = "py314"\n[tool.ruff.lint]\nselect = ["F"]\n')
     before = {path.relative_to(repo): path.read_bytes() for path in repo.rglob("*") if path.is_file()}
     for _ in range(2):
         result = run_compatibility_engine(REPOSITORY_LIFECYCLE_SCRIPTS, "apply", "--target-repo-root", str(repo))
@@ -441,7 +449,8 @@ def test_compatibility_materializer_supports_repositories_without_skills(
         encoding="utf-8",
         newline="\n",
     )
-    (repo / "package.json").write_text(
+    (repo / "scripts").mkdir()
+    (repo / "scripts/package.json").write_text(
         json.dumps({"scripts": {"lint": "echo lint"}}) + "\n",
         encoding="utf-8",
         newline="\n",
@@ -477,10 +486,10 @@ def test_compatibility_materializer_supports_repositories_without_skills(
     }
     assert not (repo / "skills").exists()
     assert not (repo / "deploy").exists()
-    assert not (repo / "scripts").exists()
+    assert not (repo / "scripts/pyproject.toml").exists()
     assert not (repo / ".github").exists()
 
-    (repo / "package-lock.json").write_text(
+    (repo / "scripts/package-lock.json").write_text(
         json.dumps({"lockfileVersion": 3, "requires": True, "packages": {}})
         + "\n",
         encoding="utf-8",
@@ -609,21 +618,22 @@ def test_compatibility_materializer_supports_repositories_without_skills(
     for manager in ("npm", "pnpm"):
         for has_build in (False, True):
             typecheck_repo = empty_repository(f"{manager}-typecheck-{has_build}")
+            (typecheck_repo / "scripts").mkdir()
             scripts = {"typecheck": "tsc --noEmit"}
             if has_build:
                 scripts["build"] = "vite build"
             package: dict[str, object] = {"scripts": scripts}
             if manager == "pnpm":
                 package["packageManager"] = "pnpm@10.33.4"
-                (typecheck_repo / "pnpm-lock.yaml").write_text(
+                (typecheck_repo / "scripts/pnpm-lock.yaml").write_text(
                     "lockfileVersion: '9.0'\n", encoding="utf-8", newline="\n"
                 )
             else:
-                (typecheck_repo / "package-lock.json").write_text(
+                (typecheck_repo / "scripts/package-lock.json").write_text(
                     json.dumps({"lockfileVersion": 3, "requires": True, "packages": {}})
                     + "\n", encoding="utf-8", newline="\n"
                 )
-            (typecheck_repo / "package.json").write_text(
+            (typecheck_repo / "scripts/package.json").write_text(
                 json.dumps(package) + "\n", encoding="utf-8", newline="\n"
             )
             typecheck_result = run_compatibility_engine(
@@ -637,7 +647,8 @@ def test_compatibility_materializer_supports_repositories_without_skills(
             assert f"{other_manager}-typecheck" not in selected
 
     pnpm_repo = empty_repository("pnpm-compatible")
-    (pnpm_repo / "package.json").write_text(
+    (pnpm_repo / "scripts").mkdir()
+    (pnpm_repo / "scripts/package.json").write_text(
         json.dumps(
             {
                 "packageManager": "pnpm@10.33.4",
@@ -648,17 +659,10 @@ def test_compatibility_materializer_supports_repositories_without_skills(
         encoding="utf-8",
         newline="\n",
     )
-    (pnpm_repo / "pnpm-lock.yaml").write_text(
+    (pnpm_repo / "scripts/pnpm-lock.yaml").write_text(
         "lockfileVersion: '9.0'\n", encoding="utf-8", newline="\n"
     )
-    (pnpm_repo / "requirements-dev.txt").write_text(
-        "pytest==9.1.1\n", encoding="utf-8", newline="\n"
-    )
-    (pnpm_repo / "pyproject.toml").write_text(
-        '[tool.mypy]\npython_version = "3.12"\n',
-        encoding="utf-8",
-        newline="\n",
-    )
+    _write_tooling_settings(pnpm_repo, '[tool.mypy]\npython_version = "3.12"\n')
     pnpm_result = run_compatibility_engine(
         engine_scripts,
         "apply",
@@ -679,7 +683,7 @@ def test_compatibility_materializer_supports_repositories_without_skills(
     ).read_text(encoding="utf-8")
     assert "actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903" in pnpm_workflow
     assert "corepack prepare pnpm@10.33.4 --activate" in pnpm_workflow
-    assert "pnpm install --frozen-lockfile" in pnpm_workflow
+    assert "pnpm --dir scripts install --frozen-lockfile" in pnpm_workflow
     assert "python -m pip install" not in pnpm_workflow
     pnpm_steps = yaml.safe_load(pnpm_workflow)["jobs"]["validate-repository"]["steps"]
     assert [
@@ -690,11 +694,13 @@ def test_compatibility_materializer_supports_repositories_without_skills(
     assert 'python-version: "3.12"' not in pnpm_workflow
     pnpm_runtime = tomllib.loads((pnpm_repo / "scripts/pyproject.toml").read_text())
     assert "mypy" in pnpm_runtime["project"]["dependencies"]
-    assert (pnpm_repo / "requirements-dev.txt").read_text() == "pytest==9.1.1\n"
+    assert not (pnpm_repo / "requirements-dev.txt").exists()
 
     uv_repo = empty_repository("uv-compatible")
-    (uv_repo / "uv.lock").write_text("version = 1\n", encoding="utf-8", newline="\n")
-    (uv_repo / "pyproject.toml").write_text(
+    (uv_repo / "application").mkdir()
+    (uv_repo / "scripts").mkdir()
+    (uv_repo / "application/uv.lock").write_text("version = 1\n", encoding="utf-8", newline="\n")
+    (uv_repo / "application/pyproject.toml").write_text(
         '[project]\nname = "uv-compatible"\nversion = "1.0.0"\n'
         'requires-python = ">=3.13"\n'
         '[project.optional-dependencies]\ndev = ["pytest", "ruff", "mypy"]\n'
@@ -704,7 +710,7 @@ def test_compatibility_materializer_supports_repositories_without_skills(
         encoding="utf-8",
         newline="\n",
     )
-    (uv_repo / ".yamllint").write_text("extends: default\n", encoding="utf-8", newline="\n")
+    (uv_repo / "scripts/.yamllint").write_text("extends: default\n", encoding="utf-8", newline="\n")
     uv_result = run_compatibility_engine(
         engine_scripts,
         "apply",
@@ -738,7 +744,7 @@ def test_compatibility_materializer_supports_repositories_without_skills(
                        if step.get("uses", "").startswith("Ceratops-Code/"))
     assert action_step["uses"].endswith("@" + CI_ACTION_REVISION)
     assert set(action_step["with"]) == {"repo-root", "evidence-file"}
-    assert (uv_repo / "uv.lock").read_text() == "version = 1\n"
+    assert (uv_repo / "application/uv.lock").read_text() == "version = 1\n"
 
     # Synthetic recipes exercise extension behavior without coupling the shipped
     # contract to any repository's private check names or command conventions.
@@ -826,9 +832,7 @@ def test_compatibility_materializer_supports_repositories_without_skills(
     (docs_repo / "README.md").write_text(
         "python -m ruff check tools/source.py\n", encoding="utf-8", newline="\n"
     )
-    (docs_repo / "pyproject.toml").write_text(
-        _ruff_root_configuration(), encoding="utf-8", newline="\n"
-    )
+    _write_tooling_settings(docs_repo, _ruff_root_configuration())
     (docs_repo / "tests").mkdir()
     (docs_repo / "tests" / "test_example.py").write_text(
         "import unittest\n", encoding="utf-8", newline="\n"
@@ -874,11 +878,7 @@ def test_compatibility_materializer_supports_repositories_without_skills(
         encoding="utf-8",
         newline="\n",
     )
-    (authoritative_repo / "pyproject.toml").write_text(
-        '[tool.mypy]\npython_version = "3.12"\n',
-        encoding="utf-8",
-        newline="\n",
-    )
+    _write_tooling_settings(authoritative_repo, '[tool.mypy]\npython_version = "3.12"\n')
     authoritative_result = run_compatibility_engine(
         engine_scripts,
         "apply",
@@ -929,7 +929,8 @@ def test_compatibility_materializer_supports_repositories_without_skills(
         ("setup.cfg", "[tool:pytest]\n"),
     ]):
         config_repo = empty_repository(f"pytest-config-{index}")
-        (config_repo / config).write_text(contents, encoding="utf-8")
+        (config_repo / "scripts").mkdir()
+        (config_repo / "scripts" / config).write_text(contents, encoding="utf-8")
         (config_repo / "tests").mkdir()
         (config_repo / "tests" / "test_probe.py").write_text(
             "def test_probe(): pass\n", encoding="utf-8"
@@ -1012,8 +1013,9 @@ def test_generated_scripts_and_skill_owned_ci_keep_environments_and_tests_separa
     # A nested tooling workspace must not rewrite the application's lock or
     # adopt its incompatible Python constraint.
     application = '[project]\nname="application"\nversion="1.0"\nrequires-python=">=3.11"\n[tool.uv.workspace]\nmembers=[]\n'
-    (repo / "pyproject.toml").write_text(application)
-    (repo / "requirements.txt").write_text("# repository-owned\n")
+    (repo / "application").mkdir()
+    (repo / "application/pyproject.toml").write_text(application)
+    (repo / "application/uv.lock").write_text("version = 1\n")
     tests = repo / "tests"
     tests.mkdir()
     probe = tests / "test_probe.py"
@@ -1033,8 +1035,8 @@ def test_generated_scripts_and_skill_owned_ci_keep_environments_and_tests_separa
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "no-installed-skills"))
     created = run_compatibility_engine(REPOSITORY_LIFECYCLE_SCRIPTS, "apply", "--target-repo-root", str(repo))
     assert created.returncode == 0, created.stdout + created.stderr
-    assert (repo / "pyproject.toml").read_text() == application
-    assert (repo / "requirements.txt").read_text() == "# repository-owned\n"
+    assert (repo / "application/pyproject.toml").read_text() == application
+    assert (repo / "application/uv.lock").read_text() == "version = 1\n"
     assert not (repo / "scripts/sdlc.py").exists()
     assert not (repo / "scripts/runtime").exists()
     dependencies = tomllib.loads((repo / "scripts/pyproject.toml").read_text())["project"]["dependencies"]
@@ -1131,7 +1133,7 @@ def test_generated_scripts_and_skill_owned_ci_keep_environments_and_tests_separa
     assert reapplied.returncode == 0, reapplied.stdout
     assert project.read_text().startswith(without_mypy)
     assert tomllib.loads(project.read_text())["tool"]["mypy"] == tomllib.loads(project_before.decode())["tool"]["mypy"]
-    # Root settings must not be shadowed by newly generated scripts settings.
+    # Root settings must block setup instead of being silently shadowed.
     root_configured = tmp_path / "root-configured"
     root_configured.mkdir()
     (root_configured / ".git").write_text("gitdir: test\n")
@@ -1142,9 +1144,143 @@ def test_generated_scripts_and_skill_owned_ci_keep_environments_and_tests_separa
     (root_configured / "scripts").mkdir()
     (root_configured / "scripts/check_probe.py").write_text('import math  # noqa: F401\n\n\ndef value() -> int:\n    return "allowed"\n')
     created = run_compatibility_engine(REPOSITORY_LIFECYCLE_SCRIPTS, "apply", "--target-repo-root", str(root_configured))
-    assert created.returncode == 0, created.stdout
-    install_npm(root_configured)
-    defaults = tomllib.loads((root_configured / "scripts/pyproject.toml").read_text())["tool"]
-    assert "ruff" not in defaults and "mypy" not in defaults
-    root_check = subprocess.run([*prefix, "scripts/validate-repository.py"], cwd=root_configured, capture_output=True, text=True, check=False)
-    assert root_check.returncode == 0, root_check.stdout + root_check.stderr
+    assert created.returncode == 1, created.stdout
+    rejected = json.loads(created.stdout)
+    assert rejected["rollback"] == "not_started"
+    assert "repository-root configuration pyproject.toml" in rejected["reason"]
+    assert not (root_configured / "scripts/pyproject.toml").exists()
+
+
+@pytest.mark.parametrize("relative,contents", [
+    ("pyproject.toml", "[tool.ruff]\n"),
+    ("uv.lock", "version = 1\n"),
+    ("package-lock.json", "{}\n"),
+    ("pnpm-lock.yaml", "lockfileVersion: '9.0'\n"),
+    ("yarn.lock", "# fixture\n"),
+    (".markdownlint.json", "{}\n"),
+    (".yamllint", "extends: default\n"),
+    ("eslint.config.js", "export default [];\n"),
+    ("requirements-dev.txt", "pytest\n"),
+    ("application/requirements.in", "requests\n"),
+    ("application/requirements/base.txt", "requests\n"),
+    ("application/Requirements/base.TXT", "requests\n"),
+    ("application/poetry.lock", "# fixture\n"),
+])
+def test_configuration_policy_reports_paths_and_blocks_setup_without_writes(
+    tmp_path: pathlib.Path, relative: str, contents: str, capsys: pytest.CaptureFixture[str],
+) -> None:
+    repo = tmp_path / "layout-policy"
+    repo.mkdir()
+    (repo / ".git").write_text("gitdir: test\n")
+    path = repo / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(contents, encoding="utf-8")
+    environment = importlib.import_module("ceratops_repo_compatibility_engine.validation_environment")
+    contracts = importlib.import_module("ceratops_repo_compatibility_engine.compatibility_contract")
+    checker = importlib.import_module("ceratops_repo_compatibility_engine.validate_ceratops_compatibility")
+    materializer = importlib.import_module("ceratops_repo_compatibility_engine.apply_ceratops_compatibility")
+    contract = contracts.load_compatibility_contract()
+    # A declared surface makes this an applicable structural-check target.
+    (repo / "scripts").mkdir(exist_ok=True)
+    (repo / "scripts/validate-repository.py").write_text("print('OK')\n")
+    before = {p.relative_to(repo): p.read_bytes() for p in repo.rglob("*") if p.is_file()}
+    for _ in range(2):
+        errors = environment.repository_configuration_errors(repo, contract)
+        assert any(relative in error for error in errors), errors
+        result = checker.validate_ceratops_compatibility(repo)
+        assert result["valid"] is False
+        assert set(errors).issubset(result["errors"]), result
+        # Fresh public-entry calls cover the same planner without starting a
+        # new interpreter for every filename. Existing CLI cases cover dispatch.
+        applied = materializer.main([
+            "--target-repo-root", str(repo), "--ci-action-revision", CI_ACTION_REVISION,
+        ])
+        captured = capsys.readouterr()
+        assert applied == 1, captured.out + captured.err
+        outcome = json.loads(captured.out)
+        assert outcome["status"] == "blocked", outcome
+        assert outcome["rollback"] == "not_started", outcome
+        assert relative in outcome["reason"], outcome
+        assert {p.relative_to(repo): p.read_bytes() for p in repo.rglob("*") if p.is_file()} == before
+        assert not (repo / "scripts/.venv").exists()
+
+
+@pytest.mark.parametrize("git_owned", [False, True])
+def test_configuration_policy_preserves_nested_projects_and_ignores_dependencies(
+    tmp_path: pathlib.Path, git_owned: bool,
+) -> None:
+    repo = tmp_path / "nested-project"
+    repo.mkdir()
+    if git_owned:
+        subprocess.run(["git", "init", "--quiet", str(repo)], check=True)
+    files = {
+        "application/pyproject.toml": (
+            '[project]\nname="application"\nversion="0.1.0"\nrequires-python=">=3.14"\n'
+            '[tool.uv.workspace]\nmembers=["packages/*"]\n'
+        ),
+        "application/packages/member/pyproject.toml": (
+            '[project]\nname="application-member"\nversion="0.1.0"\nrequires-python=">=3.14"\n'
+        ),
+        "application/package.json": "{}\n",
+        "application/package-lock.json": "{}\n",
+        "scripts/.markdownlint.json": "{}\n",
+        "scripts/node_modules/vendor/requirements.txt": "vendor\n",
+        "scripts/.venv/requirements.txt": "third-party\n",
+        ".build/requirements.txt": "output\n",
+        ".gitignore": ".local-cache/\n",
+    }
+    for relative, content in files.items():
+        destination = repo / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(content, encoding="utf-8")
+    locked = subprocess.run(
+        ["uv", "lock", "--offline", "--no-python-downloads", "--python", sys.executable,
+         "--project", str(repo / "application")],
+        capture_output=True, text=True, check=False,
+    )
+    assert locked.returncode == 0, locked.stdout + locked.stderr
+    files["application/uv.lock"] = (repo / "application/uv.lock").read_text()
+    assert not (repo / "application/packages/member/uv.lock").exists()
+    if git_owned:
+        subprocess.run(["git", "add", "."], cwd=repo, check=True)
+        (repo / ".local-cache").mkdir()
+        (repo / ".local-cache/requirements.txt").write_text("ignored\n")
+    environment = importlib.import_module("ceratops_repo_compatibility_engine.validation_environment")
+    contracts = importlib.import_module("ceratops_repo_compatibility_engine.compatibility_contract")
+    contract = contracts.load_compatibility_contract()
+    for _ in range(2):
+        assert environment.repository_configuration_errors(repo, contract) == []
+        assert {name: (repo / name).read_text() for name in files} == files
+    # Git must not hide a newly created, untracked first-party declaration.
+    (repo / "application/requirements.txt").write_text("requests\n")
+    assert any("application/requirements.txt" in error
+               for error in environment.repository_configuration_errors(repo, contract))
+
+
+@pytest.mark.parametrize("boundary", ["before", "after"])
+def test_configuration_inventory_interruption_leaves_no_target_effects(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, boundary: str,
+) -> None:
+    repo = tmp_path / "interrupted-inventory"
+    repo.mkdir()
+    (repo / "README.md").write_text("# Preserve me\n")
+    environment = importlib.import_module("ceratops_repo_compatibility_engine.validation_environment")
+    contracts = importlib.import_module("ceratops_repo_compatibility_engine.compatibility_contract")
+    contract = contracts.load_compatibility_contract()
+    original_run = environment.subprocess.run
+
+    def interrupted(*args: Any, **kwargs: Any) -> Any:
+        if boundary == "after":
+            original_run(*args, **kwargs)
+        raise KeyboardInterrupt
+
+    with monkeypatch.context() as patch:
+        patch.setattr(environment.subprocess, "run", interrupted)
+        with pytest.raises(KeyboardInterrupt):
+            environment.runtime_files(repo, REPOSITORY_LIFECYCLE_SOURCE, contract, [])
+    assert [p.name for p in repo.iterdir()] == ["README.md"]
+    for _ in range(2):
+        planned = environment.runtime_files(repo, REPOSITORY_LIFECYCLE_SOURCE, contract, [])
+        assert repo / "scripts/pyproject.toml" in planned
+        assert [p.name for p in repo.iterdir()] == ["README.md"]
+        assert (repo / "README.md").read_text() == "# Preserve me\n"

@@ -35,7 +35,10 @@ from .sdlc_contract_validation import (
     operation_entries,
     read_contract,
 )
-from .validation_environment import detected_python_skills
+from .validation_environment import (
+    detected_python_skills,
+    repository_configuration_errors,
+)
 
 
 class CompatibilityResult(TypedDict):
@@ -430,6 +433,7 @@ def validate_ceratops_compatibility(
 
     errors: list[str] = []
     python_tests = discover_python_tests(root, contract["python_test_detection"])
+    errors.extend(repository_configuration_errors(root, contract))
     sdlc: Mapping[str, Any] | None = None
     sdlc_errors: list[str] = []
     entries: dict[str, Mapping[str, Any]] = {}

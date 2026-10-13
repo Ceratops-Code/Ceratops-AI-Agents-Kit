@@ -108,6 +108,27 @@
     "project": "skills/sections/python/pyproject.toml",
     "lockfile": "skills/sections/python/uv.lock"
   },
+  "configuration_layout": {
+    "root_file_patterns": [
+      "pyproject.toml", "uv.toml", "uv.lock", "setup.cfg", "setup.py",
+      "package.json", "package-lock.json", "npm-shrinkwrap.json",
+      "pnpm-lock.yaml", "pnpm-workspace.yaml", "yarn.lock", "bun.lock", "bun.lockb",
+      ".npmrc", ".yarnrc*", "tsconfig*.json", "jsconfig*.json",
+      "ruff.toml", ".ruff.toml", "mypy.ini", ".mypy.ini", ".flake8", ".pylintrc",
+      ".markdownlint*", ".yamllint*", ".eslintrc*", "eslint.config.*",
+      ".prettierrc*", "prettier.config.*", ".stylelintrc*", "stylelint.config.*",
+      "pytest.ini", ".pytest.ini", "pytest.toml", ".pytest.toml", "tox.ini",
+      ".coveragerc"
+    ],
+    "python_dependency_file_patterns": [
+      "requirements*.txt", "requirements*.in", "Pipfile", "Pipfile.lock",
+      "poetry.lock", "pdm.lock"
+    ],
+    "excluded_directories": [
+      ".git", ".venv", "venv", "node_modules", "__pycache__",
+      ".build", ".test-results", "build", "dist"
+    ]
+  },
   "python_test_detection": {
     "patterns": [
       "test_*.py",
