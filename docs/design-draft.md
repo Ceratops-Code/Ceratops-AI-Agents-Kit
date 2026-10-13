@@ -79,6 +79,20 @@ requirements files. In Ceratops-AI-Agents-Kit, `scripts/pyproject.toml` owns bot
 Python tooling dependencies and Ruff and mypy settings. Node tooling manifests
 and Markdown/YAML lint settings also live under `scripts`; generated diagnostic
 files live under the ignored `.build` directory.
+
+The shared Ruff baseline belongs to `repository-validation-contract.json` under
+`ruff_policy`: it supplies the Python analysis target, required rule selectors,
+and baseline ignores. The tooling-project renderer fills the Ruff template from
+that policy. The locked tooling project includes Ruff even when a custom runner
+owns the repository checks. Existing settings remain owned by the repository.
+Compatibility checks ask the prepared Ruff runtime for its effective settings
+and reject missing required rules, file-specific suppressions of those rules,
+and differing Python targets. Ruff owns inheritance and file exclusions; active
+nested configurations are checked once per configuration. These read-only
+commands disable caches and never run source lint or rewrite configuration.
+An unsupported settings-output format or unavailable tool runtime blocks the
+check. Application Python requirements and acceptance of unchanged artifacts
+remain with their existing owners.
 Dependabot must address the directories containing the dependency projects,
 including `/scripts` and the separate shared skill project.
 

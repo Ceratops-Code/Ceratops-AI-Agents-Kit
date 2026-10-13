@@ -1,6 +1,7 @@
 """Structural compatibility and explicit repository test-result probes.
 
-The structural checker never runs the repository aggregate or tests. Optional
+The structural checker never runs the repository aggregate or tests. Ruff's
+read-only settings commands enforce the shared rule and Python-target policy. Optional
 result probes run controlled commands only in a caller-owned result directory;
 structural success alone is not acceptance of reusable test results.
 Callers receive only the stable ``applicable``, ``valid``, and ``errors``
@@ -10,6 +11,7 @@ mapping; repository health owns aggregate execution separately.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import os
 import pathlib
@@ -26,13 +28,17 @@ import yaml
 from .ci_workflow import workflow_errors
 from .compatibility_contract import load_compatibility_contract, template_path
 from .generate_test_script import discover_python_tests
+from .python_tool_configuration import ruff_policy_errors
 from .repository_validation_contract import load_validation_contract
 from .sdlc_contract_validation import (
     operation_category,
     operation_entries,
     read_contract,
 )
-from .validation_environment import detected_python_skills
+from .validation_environment import (
+    detected_python_skills,
+    repository_configuration_errors,
+)
 
 
 class CompatibilityResult(TypedDict):
@@ -82,12 +88,35 @@ def _validation_coverage_errors(
     entries = operation_entries(sdlc)
     version = int(sdlc["version"])
     errors: list[str] = []
+    # Installed dependencies and Git-ignored outputs do not create first-party
+    # language obligations, even when a captured package tracks vendor files.
+    dependency_dirs = {".git", "node_modules", ".venv", "venv", "__pycache__"}
+    inventory = subprocess.run(
+        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+        cwd=root, capture_output=True, check=False,
+    )
+    if inventory.returncode == 0:
+        paths = [root / os.fsdecode(value) for value in inventory.stdout.split(b"\0") if value]
+    else:
+        paths = []
+        for directory, directories, names in os.walk(root, followlinks=False):
+            directories[:] = [
+                name for name in directories
+                if name not in dependency_dirs and not (pathlib.Path(directory) / name).is_symlink()
+            ]
+            paths.extend(pathlib.Path(directory) / name for name in names)
+    owned_paths = [
+        path.relative_to(root).as_posix() for path in paths
+        if path.is_file() and not path.is_symlink()
+        and not dependency_dirs.intersection(path.relative_to(root).parts)
+    ]
     for requirement in validation_contract["coverage_requirements"]:
         active = any(
-            candidate.is_file() and not candidate.is_symlink()
+            fnmatch.fnmatchcase(path, pattern)
+            or (pattern.startswith("**/") and fnmatch.fnmatchcase(path, pattern[3:]))
             for condition in requirement["when"]
             for pattern in condition["value"]
-            for candidate in root.glob(pattern)
+            for path in owned_paths
         )
         if not active:
             continue
@@ -404,6 +433,7 @@ def validate_ceratops_compatibility(
 
     errors: list[str] = []
     python_tests = discover_python_tests(root, contract["python_test_detection"])
+    errors.extend(repository_configuration_errors(root, contract))
     sdlc: Mapping[str, Any] | None = None
     sdlc_errors: list[str] = []
     entries: dict[str, Mapping[str, Any]] = {}
@@ -473,6 +503,8 @@ def validate_ceratops_compatibility(
     for relative in [contract["runtime"]["lockfile"]]:
         if error := _regular_file_error(root, pathlib.Path(relative)):
             errors.append(error)
+    if not errors:
+        errors.extend(ruff_policy_errors(root, validation_contract["ruff_policy"], contract["runtime"]))
 
     if (result_directory is None) != (runner_command is None):
         errors.append("test-result probing requires both runner_command and result_directory")

@@ -30,10 +30,14 @@ implementation evidence.
   repository, incomplete task source, ambiguous match, and other coverage gap.
   Exact worktree paths bind task candidates; branch names, folder names,
   shortened IDs, and summaries do not prove ownership.
-- Fill an eligible `Worth promoting?` cell with `Yes`, `No`, or
-  `Unverified` and a short reason from unique commits, patch equivalence, and
-  the current diff. The helper marks eligibility only when promotion and
-  shipping are both `No` and no active owner remains. Otherwise keep `-`.
+- For eligible branches, fill `Worth promoting?` and `Changes` from actual
+  file changes against the release and shipping targets, not commit messages.
+  Use `Yes`, `No`, or `Unverified` with a short reason for worth promoting and
+  a brief behavior summary for changes. Read omitted patches before concluding;
+  unavailable evidence stays `Unverified`.
+- The helper marks eligibility only when promotion and shipping are both `No`
+  and the branch is not Dependabot-owned. Otherwise keep both assessment cells
+  `-`; active ownership does not restrict this read-only assessment.
 - Render the supplied fixed tables directly as Markdown, with one repository
   heading per table. Do not replace the tables with prose or a code fence.
 
@@ -46,10 +50,12 @@ Use these compact headers and column order:
 | `<branch or ->` | `<worktree or ->` | `<Yes/No/Unavailable, or ->` | `<Yes/No/Unavailable>` | `<Yes/No/Unavailable>` | `<task title or note, None, or Unverified>` | `<Yes/No/Unverified with short reason or note, or ->` | `<brief summary or note>` |
 
 The helper emits `ceratops-worktree-status-report.v1`, including per-repository
-records, coverage gaps, table-ready cells, and rendered Markdown. It includes
-every registered worktree and remaining local or remote branch once, uses `-`
-for detached or absent worktrees, and leaves shipping `Unavailable` without a
-successful authorized fetch. Ignored files do not make a worktree dirty.
+records, coverage gaps, table-ready cells, and rendered Markdown. It omits
+`main`, `release/local`, configured integration branches, and their remote
+counterparts, including worktrees on those branches. Every other registered
+worktree and remaining local or remote branch appears once. Detached or absent
+worktrees use `-`; shipping remains `Unavailable` without a successful
+authorized fetch. Ignored files do not make a worktree dirty.
 
 A unique active task match includes its full ID and title. Ambiguous matches
 retain every candidate's full ID, title, and archived state. `None` requires
@@ -66,7 +72,7 @@ or tasks; the only remote effect is an explicitly requested fetch.
 
 ## Done When
 
-- Every in-scope worktree and branch appears exactly once.
+- Every non-integration worktree and branch appears exactly once.
 - Every status and recommendation has current evidence or is explicitly marked
   unavailable or unverified, with all coverage gaps retained.
 - The response contains the fixed tables as rendered Markdown.

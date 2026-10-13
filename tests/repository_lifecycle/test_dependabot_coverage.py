@@ -1,6 +1,8 @@
 """Behavior checks for Dependabot manifest classification and coverage."""
 import json
 import pathlib
+import re
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -20,6 +22,74 @@ from github_contract_engine.compare_states import compare_states  # noqa: E402
 
 
 class DependabotCoverageTests(unittest.TestCase):
+    def test_generated_tooling_uses_contract_ruff_target(self):
+        import tomllib
+
+        from ceratops_repo_compatibility_engine.python_tool_configuration import (
+            project_text,
+        )
+        from ceratops_repo_compatibility_engine.repository_validation_contract import (
+            load_validation_contract,
+        )
+
+        template = SCRIPTS.parent / "references/templates/validation-pyproject.toml.tmpl"
+        ruff_policy = load_validation_contract()["ruff_policy"]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            for _ in range(2):
+                project = tomllib.loads(project_text(root, template))
+                # The lint target does not raise the application's Python minimum.
+                self.assertEqual(project["project"]["requires-python"], ">=3.11")
+                self.assertEqual(
+                    project["tool"]["ruff"]["target-version"],
+                    ruff_policy["target-version"],
+                )
+
+    def test_release_attestation_consumer_commands_include_docs_and_scripts(self):
+        for name, text in [("README.md", "gh release verify-asset v1.0 ./setup.exe"),
+                           ("scripts/install.py", "gh release verify v1.0"),
+                           (".github/workflows/check.yml", "run: gh attestation verify setup.exe")]:
+            with self.subTest(path=name):
+                facts = self.facts({name: text}, [])
+                self.assertTrue(facts["workflows"]["verification_command_detected"])
+        facts = self.facts({"README.md": "Download the release asset."}, [])
+        self.assertFalse(facts["workflows"]["verification_command_detected"])
+
+    def test_language_coverage_uses_owned_files_and_ignores_dependency_trees(self):
+        from ceratops_repo_compatibility_engine.repository_validation_contract import (
+            load_validation_contract,
+        )
+        from ceratops_repo_compatibility_engine.validate_ceratops_compatibility import (
+            _validation_coverage_errors,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            subprocess.run(["git", "init", "--quiet", str(root)], check=True)
+            (root / ".gitignore").write_text("generated/\n", encoding="utf-8")
+            for relative in ["node_modules/vendor/setup.sh", ".venv/lib/vendor/build.sln",
+                             "code/asar/node_modules/vendor/build.sln", "generated/setup.sh"]:
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("fixture", encoding="utf-8")
+            subprocess.run(["git", "add", "code/asar/node_modules/vendor/build.sln"], cwd=root, check=True)
+            contract = load_validation_contract()
+            sdlc = {"version": 4, "repository": {"actions": {}}, "deliverables": {}}
+            for _ in range(2):
+                self.assertEqual(_validation_coverage_errors(root, sdlc, contract), [])
+            (root / "owned.sh").write_text("echo owned\n", encoding="utf-8")
+            self.assertTrue(any("shell-source" in error or "shellcheck" in error
+                                for error in _validation_coverage_errors(root, sdlc, contract)))
+
+    def test_secret_pattern_keeps_tokens_but_rejects_word_fragments(self):
+        contract = json.loads((SCRIPTS.parent / "references/contracts/code-repo-deterministic-contract.json").read_text())
+        rule = next(rule for rule in contract["checks"] if rule["id"] == "content.local_secret_pattern_scan")
+        patterns = [re.compile(pattern) for pattern in rule["collection"]["regex_patterns"]]
+        for text in ["disk-" + "x" * 30, "cross-task-" + "x" * 30, "long-task-" + "x" * 30]:
+            self.assertFalse(any(pattern.search(text) for pattern in patterns))
+        for text in ["sk-" + "x" * 30, 'token="sk-' + "x" * 30 + '"']:
+            self.assertTrue(any(pattern.search(text) for pattern in patterns))
+
     def test_dependabot_ecosystems_distinguish_uv_and_pip_manifests(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = pathlib.Path(temporary_directory)

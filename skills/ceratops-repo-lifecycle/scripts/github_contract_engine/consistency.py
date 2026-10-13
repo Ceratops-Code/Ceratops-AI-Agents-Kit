@@ -132,6 +132,7 @@ VALIDATION_EXECUTABLE_FIELDS = frozenset(
         "root.kind",
         "root.name",
         "root.source_docs_ref",
+        "root.ruff_policy",
         "root.coverage_requirements",
         "root.checks",
         "def:coverageRequirement.id",

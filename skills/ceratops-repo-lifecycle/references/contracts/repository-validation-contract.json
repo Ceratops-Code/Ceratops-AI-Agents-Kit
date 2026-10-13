@@ -7,6 +7,17 @@
   "source_doc_scopes": [
     "repository_validation"
   ],
+  "ruff_policy": {
+    "target-version": "py314",
+    "select": [
+      "E", "F", "I", "B",
+      "S105", "S106", "S107", "S501", "S602", "S604", "S605",
+      "ASYNC210", "ASYNC212", "ASYNC220", "ASYNC221", "ASYNC222",
+      "ASYNC230", "ASYNC240", "ASYNC250", "ASYNC251",
+      "DTZ003", "DTZ004", "DTZ005", "DTZ006", "UP", "RUF100"
+    ],
+    "ignore": ["E501"]
+  },
   "coverage_requirements": [
     {
       "id": "android-gradle",

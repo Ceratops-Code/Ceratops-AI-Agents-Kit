@@ -29,6 +29,7 @@ from typing import Any
 import sdlc_results
 import store_artifacts
 from ceratops_repo_compatibility_engine.sdlc_contract_validation import (
+    MCP_NAME,
     SdlcContractError,
     load_contract,
     operation_entries,
@@ -368,10 +369,7 @@ def execute_handoff(
             valid_inputs = (
                 not set(inputs) - {"mcp-server", "prerequisite-packages"}
                 and isinstance(selected_mcp_server, str)
-                and re.fullmatch(
-                    r"[a-z0-9]+(?:-[a-z0-9]+)*", selected_mcp_server
-                )
-                is not None
+                and re.fullmatch(MCP_NAME, selected_mcp_server) is not None
                 and isinstance(packages, list)
                 and all(
                     isinstance(name, str)

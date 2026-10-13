@@ -27,10 +27,12 @@ VERSION_SCHEMAS = {
     5: SCHEMA.with_name("sdlc.v5.schema.json"),
 }
 NAME = r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*"
+# MCP project names are manager identities, not rewritten SDLC display names.
+MCP_NAME = r"[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*"
 V4_OPERATION_RE = re.compile(
     rf"^(?:repository\.actions\.(?P<repository>bootstrap|validate|test|test-selection)|"
     rf"deliverables\.(?P<kind>packages|apps|mcp-servers|skills|hooks)\."
-    rf"(?P<name>{NAME})\.actions\.(?P<action>validate|test|build|install|publish|verify-publish))$"
+    rf"(?P<name>{MCP_NAME})\.actions\.(?P<action>validate|test|build|install|publish|verify-publish))$"
 )
 V4_ACTIONS_BY_KIND = {
     "packages": frozenset({"validate", "test", "build", "publish", "verify-publish"}),
@@ -103,6 +105,8 @@ def operation_category(location: str, *, version: int = 4) -> str:
     if isinstance(location, str) and (match := V4_OPERATION_RE.fullmatch(location)):
         action = match.group("repository") or match.group("action")
         kind = match.group("kind")
+        if kind not in {None, "mcp-servers"} and re.fullmatch(NAME, match.group("name")) is None:
+            raise SdlcContractError(f"Invalid SDLC operation location: {location}")
         if (
             kind is None
             or action in V4_ACTIONS_BY_KIND[kind]

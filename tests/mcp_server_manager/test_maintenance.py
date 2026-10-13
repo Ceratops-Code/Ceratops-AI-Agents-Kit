@@ -202,6 +202,8 @@ def source_package(tmp_path, monkeypatch, request):
         if command[0] == "git":
             return RUN_COMMAND(command, **kwargs)
         calls.append((command, kwargs))
+        if command[1] == "lock":
+            return ""
         if "compile" in command:
             (project / "pylock.toml").write_text('lock-version="1.0"\npackages=[]\n')
             return ""
@@ -456,6 +458,149 @@ def test_uv_package_lock_requires_adjacent_project_before_build(
 
     assert "adjacent regular pyproject.toml" in capsys.readouterr().err
     assert not calls and not (runtime_root / "fixture" / "registry.json").exists()
+
+
+def use_native_source_lock(project):
+    """Select the same canonical lock that Dependabot maintains for uv projects."""
+    (project / "pylock.toml").unlink()
+    lock = project / "uv.lock"
+    lock.write_text('version = 1\nrevision = 3\nrequires-python = "==3.14.*"\n')
+    return lock
+
+
+def test_uv_source_lock_is_exported_without_changing_source_and_repeat_is_exact(source_package):
+    project, runtime_root, calls = source_package
+    lock = use_native_source_lock(project)
+    before = lock.read_bytes()
+    first = package_module.package(project)
+    second = package_module.package(project)
+    assert first == second
+    assert lock.read_bytes() == before and not (project / "pylock.toml").exists()
+    assert [command[1] for command, _ in calls] == ["export", "build", "export", "build"]
+    for command, options in calls[::2]:
+        assert options["cwd"] == project and "--locked" in command
+        output = Path(command[command.index("--output-file") + 1])
+        assert output.name == "pylock.source.toml" and not output.exists()
+    assert not list((runtime_root / "fixture/staging").iterdir())
+
+
+@pytest.mark.parametrize("effect", ["export", "build", "preflight", "registry"])
+@pytest.mark.parametrize("timing", ["before", "after"])
+def test_uv_source_packaging_repeats_after_interruption(source_package, monkeypatch, effect, timing):
+    project, runtime_root, _ = source_package
+    lock = use_native_source_lock(project)
+    before = lock.read_bytes()
+    run = package_module.run
+    preflight = package_module.preflight_release
+    atomic_json = storage.Layout.atomic_json
+    fired = False
+
+    def around(selected, operation):
+        nonlocal fired
+        interrupt = selected and not fired
+        if interrupt and timing == "before":
+            fired = True
+            raise KeyboardInterrupt
+        result = operation()
+        if interrupt and timing == "after":
+            fired = True
+            raise KeyboardInterrupt
+        return result
+
+    monkeypatch.setattr(package_module, "run", lambda command, **kwargs: around(
+        command[1] == effect, lambda: run(command, **kwargs)))
+    monkeypatch.setattr(package_module, "preflight_release", lambda *args: around(
+        effect == "preflight", lambda: preflight(*args)))
+    monkeypatch.setattr(storage.Layout, "atomic_json", lambda self, path, payload: around(
+        effect == "registry" and path.name == "registry.json",
+        lambda: atomic_json(self, path, payload)))
+    with pytest.raises(KeyboardInterrupt):
+        package_module.package(project)
+    assert fired and lock.read_bytes() == before
+    registry = runtime_root / "fixture/registry.json"
+    assert registry.exists() == (effect == "registry" and timing == "after")
+    result = package_module.package(project)
+    assert package_module.package(project) == result
+    assert json.loads(registry.read_text())["versions"] == {"1.0.0": result["manifest_sha256"]}
+    assert not (runtime_root / "fixture/current.json").exists()
+    assert not list((runtime_root / "fixture/staging").iterdir())
+
+
+@pytest.mark.parametrize("input_name", ["uv.lock", "pyproject.toml"])
+@pytest.mark.parametrize("phase", ["export", "build"])
+def test_uv_source_input_change_stops_registry_commit(source_package, monkeypatch, input_name, phase):
+    project, runtime_root, calls = source_package
+    use_native_source_lock(project)
+    original = package_module.run
+
+    def change_input(command, **kwargs):
+        result = original(command, **kwargs)
+        if command[1] == phase:
+            target = project / input_name
+            target.write_text(target.read_text() + "\n# concurrent change\n")
+        return result
+
+    monkeypatch.setattr(package_module, "run", change_input)
+    with pytest.raises(contracts.DeploymentError, match="changed during"):
+        package_module.package(project)
+    assert len(calls) == (1 if phase == "export" else 2)
+    assert not (runtime_root / "fixture/registry.json").exists()
+    assert not list((runtime_root / "fixture/staging").iterdir())
+
+
+def test_uv_source_stale_lock_stops_before_build(source_package, monkeypatch):
+    project, runtime_root, calls = source_package
+    use_native_source_lock(project)
+    original = package_module.run
+
+    def reject_stale(command, **kwargs):
+        if command[1] == "export":
+            assert "--locked" in command
+            raise contracts.DeploymentError("uv.lock needs to be updated")
+        return original(command, **kwargs)
+
+    monkeypatch.setattr(package_module, "run", reject_stale)
+    with pytest.raises(contracts.DeploymentError, match="needs to be updated"):
+        package_module.package(project)
+    assert not calls and not (runtime_root / "fixture/registry.json").exists()
+
+
+def test_uv_source_rejects_ambiguous_lockfiles_before_build(source_package):
+    project, runtime_root, calls = source_package
+    (project / "uv.lock").write_text("version = 1\n")
+    with pytest.raises(contracts.DeploymentError, match="one canonical lockfile"):
+        package_module.package(project)
+    assert not calls and not list(runtime_root.glob("*/registry.json"))
+
+
+@pytest.mark.parametrize("interruption", [None, "before", "after"])
+def test_uv_source_lock_refresh_keeps_native_format_and_does_not_register(source_package, monkeypatch, interruption):
+    project, runtime_root, calls = source_package
+    lock = use_native_source_lock(project)
+    if interruption:
+        original = package_module.run
+        fired = False
+
+        def refresh(command, **kwargs):
+            nonlocal fired
+            if not fired and interruption == "before":
+                fired = True
+                raise KeyboardInterrupt
+            result = original(command, **kwargs)
+            if not fired and interruption == "after":
+                fired = True
+                raise KeyboardInterrupt
+            return result
+
+        monkeypatch.setattr(package_module, "run", refresh)
+        with pytest.raises(KeyboardInterrupt):
+            package_module.package(project, lock_only=True)
+    for _ in range(2):
+        assert package_module.package(project, lock_only=True) == {"lock": str(lock)}
+    assert [command[1] for command, _ in calls] == ["lock"] * (3 if interruption == "after" else 2)
+    assert all("--python" in command for command, _ in calls)
+    assert not (project / "pylock.toml").exists()
+    assert not (runtime_root / "fixture/registry.json").exists()
 
 
 def test_uv_package_lock_change_during_export_stops_before_build(

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import importlib
+import io
 import json
 import os
 import sys
@@ -31,6 +33,45 @@ FIXTURE_TOOL_CONTRACT = {
         "opaque_parameters": [],
     }
 }
+
+
+@pytest.mark.parametrize("failure", [None, "before-open", "after-open", "probe"])
+def test_schema_probe_owns_its_log_outside_the_event_loop(tmp_path, monkeypatch, capsys, failure):
+    executable = tmp_path / "python.exe"
+    executable.write_bytes(b"candidate")
+    streams = []
+
+    class ProbeLog(io.StringIO):
+        def __enter__(self):
+            if failure == "after-open":
+                self.close()
+                raise OSError("stream activation failed")
+            return super().__enter__()
+
+    def open_log(path, mode, **kwargs):
+        with pytest.raises(RuntimeError, match="no running event loop"):
+            asyncio.get_running_loop()
+        if failure == "before-open":
+            raise OSError("stream open failed")
+        stream = ProbeLog()
+        streams.append(stream)
+        return stream
+
+    async def probe(*args):
+        assert args[-1] is streams[-1] and not args[-1].closed
+        if failure == "probe":
+            raise engine_module.DeploymentError("probe failed")
+        return {"inspect": FIXTURE_INPUT_SCHEMA}
+
+    monkeypatch.setattr(engine_module, "open", open_log, raising=False)
+    monkeypatch.setattr(engine_module, "_published_tool_schemas", probe)
+    for _ in range(2):
+        code = engine_module._schema_probe_main(["--probe-list-tools", str(executable), "fixture", str(tmp_path)])
+        assert code == (0 if failure is None else 2)
+        assert all(stream.closed for stream in streams)
+        output = capsys.readouterr()
+        if failure is None:
+            assert json.loads(output.out) == {"inspect": FIXTURE_INPUT_SCHEMA}
 
 
 def make_release(

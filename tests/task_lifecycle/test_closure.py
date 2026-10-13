@@ -266,6 +266,7 @@ def create_worktree_status_repo(path: pathlib.Path) -> pathlib.Path:
     assert run_git(path, "add", "README.md").returncode == 0
     assert run_git(path, "commit", "-m", "base status").returncode == 0
     assert run_git(path, "branch", "release/local").returncode == 0
+    assert run_git(path, "checkout", "-b", "codex/status-fixture").returncode == 0
     return path
 
 
@@ -306,6 +307,10 @@ def test_worktree_status_enumerates_and_binds_fresh_shipping_state(
     (feature / "feature.txt").write_text("feature\n", encoding="utf-8", newline="\n")
     assert run_git(feature, "add", "feature.txt").returncode == 0
     assert run_git(feature, "commit", "-m", "implement feature").returncode == 0
+    feature_commit = run_git(feature, "rev-parse", "HEAD").stdout.strip()
+    assert run_git(repo, "branch", "dependabot/uv/dependency", feature_commit).returncode == 0
+    assert run_git(repo, "update-ref", "refs/remotes/upstream/dependabot/uv/dependency", feature_commit).returncode == 0
+    assert run_git(repo, "update-ref", "refs/remotes/upstream/release/local", feature_commit).returncode == 0
 
     paths = write_worktree_status_inputs(tmp_path, [worktree_status_selection(repo)], {
         "threads": [{"id": "full-task-id", "title": "Feature | task\nnext", "kind": "codex", "hostId": "local", "cwd": str(feature)}],
@@ -332,11 +337,12 @@ def test_worktree_status_enumerates_and_binds_fresh_shipping_state(
     assert "| Branch | Worktree | Dirty? | Promoted? | Shipped? | Active task | Worth promoting? | Changes |" in packet["markdown"]
     records = packet["repositories"][0]["records"]
     keys = {(record["branch"], record["worktree"]) for record in records}
-    assert ("main", str(repo.resolve())) in keys
+    assert ("main", str(repo.resolve())) not in keys
     assert ("codex/status-feature", str(feature.resolve())) in keys
     assert ("dormant", "-") in keys
-    assert ("release/local", "-") in keys
-    assert ("origin/main", "-") in keys
+    assert ("release/local", "-") not in keys
+    assert ("origin/main", "-") not in keys
+    assert ("upstream/release/local", "-") not in keys
     feature_record = next(
         record for record in records if record["branch"] == "codex/status-feature"
     )
@@ -344,13 +350,21 @@ def test_worktree_status_enumerates_and_binds_fresh_shipping_state(
     assert feature_record["shipped"] == "No"
     assert feature_record["active_task"]["status"] == "Active"
     assert feature_record["active_task"]["candidates"][0]["id"] == "full-task-id"
-    assert feature_record["worth_promoting"]["eligible"] is False
+    assert feature_record["worth_promoting"]["eligible"] is True
     assert feature_record["release_evidence"]["unique_commits"]["items"] == [
-        "implement feature"
+        feature_commit
     ]
     assert feature_record["release_evidence"]["diff"]["paths"]["items"] == [
         "feature.txt"
     ]
+    assert "+feature" in feature_record["release_evidence"]["diff"]["patch"]
+    assert "+feature" in feature_record["shipping_evidence"]["diff"]["patch"]
+    assert "implement feature" not in packet["markdown"]
+    for record, cells in zip(records, packet["repositories"][0]["table_rows"]):
+        if "dependabot/" in record["branch"]:
+            assert record["worth_promoting"]["eligible"] is False
+            assert record["release_evidence"]["status"] == "not_applicable"
+            assert cells[-2:] == ["-", "-"]
 
 
 def test_worktree_status_batches_failures_duplicates_and_dirty_state(tmp_path: pathlib.Path) -> None:
@@ -374,11 +388,67 @@ def test_worktree_status_batches_failures_duplicates_and_dirty_state(tmp_path: p
     assert [repo["status"] for repo in packet["repositories"]] == ["partial", "partial", "excluded_duplicate", "unavailable"]
     first_records = packet["repositories"][0]["records"]
     assert len({(row["branch"], row["worktree"]) for row in first_records}) == len(first_records)
-    assert next(row for row in first_records if row["branch"] == "main")["dirty"] == "No"
+    assert next(row for row in first_records if row["branch"] == "codex/status-fixture")["dirty"] == "No"
     assert next(row for row in first_records if row["worktree"] == str(detached.resolve()))["branch"] == "-"
-    assert next(row for row in packet["repositories"][1]["records"] if row["branch"] == "main")["dirty"] == "Yes"
+    assert next(row for row in packet["repositories"][1]["records"] if row["branch"] == "codex/status-fixture")["dirty"] == "Yes"
     assert "remote is not configured" in packet["repositories"][0]["remote_base"]["fetch"]["detail"]
     assert "absent" in packet["markdown"]
+
+
+def test_worktree_status_assessment_skips_integrated_and_bot_refs_and_bounds_real_patches(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = create_worktree_status_repo(tmp_path / "repo")
+    remote = tmp_path / "remote.git"
+    assert run_git(tmp_path, "init", "--bare", str(remote)).returncode == 0
+    assert run_git(repo, "remote", "add", "origin", str(remote)).returncode == 0
+    assert run_git(repo, "push", "origin", "main").returncode == 0
+    (repo / "actual.py").write_text("print('real behavior, not the commit subject')\n" * 80)
+    assert run_git(repo, "add", "actual.py").returncode == 0
+    assert run_git(repo, "commit", "-m", "misleading empty documentation change").returncode == 0
+    eligible_commit = run_git(repo, "rev-parse", "HEAD").stdout.strip()
+    assert run_git(repo, "branch", "dependabot/uv/example", eligible_commit).returncode == 0
+    for name in ("promoted", "shipped"):
+        path = tmp_path / name
+        assert run_git(repo, "worktree", "add", "-b", f"codex/{name}-only", str(path), "main").returncode == 0
+        (path / f"{name}.txt").write_text(name)
+        assert run_git(path, "add", ".").returncode == 0
+        assert run_git(path, "commit", "-m", name).returncode == 0
+    assert run_git(repo, "branch", "-f", "release/local", "codex/promoted-only").returncode == 0
+    assert run_git(repo, "push", "origin", "codex/shipped-only:main").returncode == 0
+    (repo / "untracked.py").write_text("print('untracked change')\n")
+    helper = load_worktree_status_helper()
+    original_comparison = helper.comparison
+    inspected = []
+
+    def inspect_changes(path, base, commit):
+        inspected.append(commit)
+        return original_comparison(path, base, commit)
+
+    monkeypatch.setattr(helper, "comparison", inspect_changes)
+    packet = helper.snapshot(worktree_status_selection(repo, fetch=True), repo)
+    # The bot shares the eligible human commit; integrated human branches have
+    # different commits. Only the eligible human work receives patch inspection.
+    assert set(inspected) == {eligible_commit} and len(inspected) == 2
+    assert not {"main", "release/local", "origin/main"} & {r["branch"] for r in packet["records"]}
+    feature = next(r for r in packet["records"] if r["branch"] == "codex/status-fixture")
+    assert "+print('real behavior" in feature["release_evidence"]["diff"]["patch"]
+    assert feature["worktree_changes"]["untracked"]["items"] == ["untracked.py"]
+    tasks = {"tasks": [], "complete": True, "gaps": []}
+    for name in ("promoted", "shipped"):
+        integrated = next(r for r in packet["records"] if r["branch"] == f"codex/{name}-only")
+        assert integrated[name] == "Yes"
+        assert integrated["release_evidence"]["status"] == "not_applicable"
+        assert helper.table_row(integrated, tasks)[-2:] == ["-", "-"]
+    bot = next(r for r in packet["records"] if r["branch"].startswith("dependabot/"))
+    assert bot["release_evidence"]["status"] == "not_applicable"
+    assert helper.table_row(bot, tasks)[-2:] == ["-", "-"]
+    monkeypatch.setattr(helper, "PATCH_LIMIT", 100)
+    diff = helper.comparison(repo, run_git(repo, "rev-parse", "main").stdout.strip(), eligible_commit)["diff"]
+    assert diff["patch_truncated"] and len(diff["patch"]) == 100
+    assert diff["patch_characters"] > 100 and not diff["tree_matches_base"]
+    assert helper.integration_ref("refs/remotes/upstream/stable", "staging", "origin/stable")
+    assert helper.integration_ref("refs/heads/staging", "staging", "origin/stable")
 
 
 @pytest.mark.parametrize("case, expected", [
@@ -535,7 +605,7 @@ raise SystemExit(helper.main(["--request", request, "--task-evidence", tasks, "-
     result = collect_worktree_status(paths)
     assert result.returncode == 0, result.stderr
     fresh = json.loads(paths[2].read_text(encoding="utf-8"))
-    assert next(row for row in fresh["repositories"][0]["records"] if row["branch"] == "main")["subject"] == "new current state"
+    assert next(row for row in fresh["repositories"][0]["records"] if row["branch"] == "codex/status-fixture")["subject"] == "new current state"
     assert not pending.exists()
     retained = {path.name for path in tmp_path.glob("report.json*")}
     assert "report.json" in retained
