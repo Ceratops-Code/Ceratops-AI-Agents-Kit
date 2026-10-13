@@ -402,6 +402,8 @@ invocation discovers the attempt from its committed receipt and performs cleanup
 without recreating C, receipts or tags. This does not supervise artifact-writing
 child processes. 3A releases stopped attempts before model corrections;
 report handling and controlled cleanup remain later parts of 3/4.
+See [shared checkpoint storage](#shared-checkpoint-storage-1e1)
+for its interfaces and cleanup boundaries.
 
 ### Exact-artifact foundation and update methodology
 
@@ -460,6 +462,48 @@ tests. It adds no helper implementation, state-schema revision or test-selection
 path: the active record, original baseline, approved monotonic scope additions,
 repeated correction generations and recorded-success finalizer remain the
 implemented behavior.
+
+### Shared checkpoint storage (1e.1)
+
+The imported helper
+[`manage_checkpoints.py`](skills/sections/scripts/manage_checkpoints.py)
+stores disposable records for the code that writes them, called their
+**producer**. The fixed owner names are `artifact-versions` for versioned
+artifact operations and `skill-updates` for skill changes. It is not a separate
+command or a saved program counter.
+
+Every worktree in the repository shares the Git common directory. The helper
+derives these paths without a caller-supplied operation ID:
+
+```text
+<git-common-dir>/ceratops/operations/<owner>/<worktree-id>/
+<git-common-dir>/ceratops/locks/<owner>/<worktree-id>.lock
+```
+
+The primary checkout uses `main` as its directory ID regardless of branch name.
+A linked worktree's ID comes from its Git registration name, so another process
+finds the same records even after the worktree moves. One directory holds one
+unfinished request; producers bind it before recording additional essentials.
+
+`open_checkpoints` holds the native lock until context exit, including failure.
+`read_checkpoint` reads a record; `write_checkpoint` writes immutable JSON
+directly to its final path, reusing identical data and refusing conflicting or
+unreadable data. Same-thread nested calls share the context. Opening or leaving
+it does not delete records. `finish_checkpoints`, called by the outermost
+producer after durable success, removes its records and sweeps only that
+owner's removed-worktree records. A busy orphan lock is skipped until a later
+successful cleanup. A failed Git lookup preserves the records.
+
+`discard_worktree_checkpoints` provides the corresponding cleanup across
+owners after confirmed worktree removal; connecting that removal caller remains
+plan step 20. Neither cleanup follows redirected paths or deletes the reusable
+lock files, artifacts, reservations, installations or accepted results. There
+is no scheduled cleaner or sweep at every command start. Artifact operations
+keep recovery information in existing reservations/receipts, not duplicate
+checkpoint JSON. Artifact-writing child processes are outside this lock's scope.
+
+See the design's [five-function interface table and caller responsibilities](docs/design-draft.md#shared-checkpoint-storage-implemented)
+for arguments, errors, storage limits and cleanup-only retries.
 
 ### Working-folder lifecycle refactor status
 

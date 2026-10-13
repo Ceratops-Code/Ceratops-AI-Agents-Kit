@@ -17,7 +17,8 @@ import pathlib
 import re
 import sys
 import time
-from typing import Any, Mapping
+from collections.abc import Mapping
+from typing import Any
 
 import git_branch_operations as git_branches
 from git_branch_operations import ShipError
@@ -794,7 +795,7 @@ def _load_or_create_checkpoint(
                 commit,
                 pending_work_identity,
             )
-        except ShipError as original_error:
+        except ShipError:
             merged_state = _merged_pr_checkpoint(
                 args,
                 repo_root,
@@ -803,7 +804,7 @@ def _load_or_create_checkpoint(
                 pending_work_identity,
             )
             if merged_state is None:
-                raise original_error
+                raise
             state = merged_state
     expected = {
         "repository": repository,
@@ -837,13 +838,11 @@ def _transient_readiness(finding: readiness.Finding) -> bool:
         and finding.message in readiness.SHORT_STATUS_CHECK_UNCERTAINTY_MESSAGES
     ):
         return True
-    if (
+    return (
         finding.check == "pr.review_decision"
         and finding.level == ERROR
         and finding.actual == "REVIEW_REQUIRED"
-    ):
-        return True
-    return False
+    )
 
 
 def _short_check_uncertainty(finding: readiness.Finding) -> bool:

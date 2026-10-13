@@ -1198,13 +1198,15 @@ ceratops/operations/<owner>/<worktree-id>/
 ceratops/locks/<owner>/<worktree-id>.lock
 ```
 
-The producer fixes its owner name in code: `artifact-versions` for the versioned
-artifact route and `skill-updates` for skill changes. The primary checkout's
-ID is
-`main`; a linked worktree uses `linked-` plus SHA-256 of its platform-normalized
-Git registration name. Git keeps that
+A producer is the helper responsible for writing these records. Its owner name
+is fixed in code: `artifact-versions` for the versioned artifact route and
+`skill-updates` for skill changes. The primary checkout's directory ID is
+`main`, regardless of its branch. A linked worktree uses `linked-` plus SHA-256
+of its Git registration directory name after `os.path.normcase`. Git keeps that
 name when a worktree moves. This is a directory identity, not a new operation
-identity, and a fresh process derives it without caller-supplied recovery IDs.
+identity; a fresh process derives it from Git without caller-supplied recovery
+IDs. The `repo_root` argument is an existing worktree root in this repository,
+including when removing records belonging to a different, removed worktree.
 
 | Interface | Behavior |
 | --- | --- |
@@ -1212,22 +1214,37 @@ identity, and a fresh process derives it without caller-supplied recovery IDs.
 | `read_checkpoint(context, name)` | Read a relative JSON-object record, or return `None` only when missing. Invalid JSON, duplicate keys, non-finite numbers and oversized records are unreadable, never silently absent. |
 | `write_checkpoint(context, name, data)` | Write directly to the final relative JSON path and flush to disk. Records are immutable, bounded to 2 MiB: an identical write is a no-op; a different or unreadable record blocks. Producers bind their request before saving further essentials, using distinct names for later immutable records. |
 | `finish_checkpoints(context)` | Only the outermost caller, after durable success, removes its records and performs one same-owner orphan sweep. It can be retried as cleanup only. |
-| `discard_worktree_checkpoints(repo_root, worktree_id)` | After confirmed removal, remove that worktree's records across owners whose native locks are free. Step 7 will connect the controlled-removal caller. |
+| `discard_worktree_checkpoints(repo_root, worktree_id)` | Refuse a still-present worktree; after confirmed removal, remove only its records across owners whose native locks are free. Plan step 20 connects the controlled-removal caller; this interface alone does not remove a worktree. |
 
-The context carries directory and lock information, not a recovery plan. The
-parent helper alone writes checkpoints; child commands return results. Opening
-or a failed invocation retains records. Cleanup derives destinations from the
-common directory, owner and worktree ID, never from saved JSON. It rejects links,
-junctions and hard-linked files rather than traversing them. A failed Git or
-registration lookup preserves the potentially live records. Existing worktrees
-are retained; for a removed worktree, a busy native lock skips deletion because
-the parent may still be running. Lock files remain reusable outside deleted
-trees. No scheduled cleaner or every-command orphan sweep exists. Abandoned
-records may remain until another same-owner operation succeeds.
+The context carries directory and lock information, not a recovery plan, and is
+usable only while `open_checkpoints` holds the lock. Record names are relative
+JSON paths within that directory. The parent helper alone writes checkpoints;
+child commands return results. Context exit releases the lock on success or
+failure, but does not finish the request or delete records. Only explicit
+`finish_checkpoints` after durable success does that; nested callers leave
+this decision to their outermost caller.
 
-`repository_operation.py` wraps versioned reserve, prepare and completion calls
-in this producer context. Lock order is producer first, short artifact-store
-lock second. Unit/version reservations already contain its recovery essentials,
+Cleanup derives destinations from the common directory, owner and worktree ID,
+never from saved JSON. It refuses links, junctions and hard-linked files rather
+than traversing them. A failed Git or registration lookup preserves the
+potentially live records. Existing worktrees are retained; for a removed
+worktree, cleanup tries its checkpoint lock once without waiting. If busy, it
+leaves the records because the parent may still be running. After acquiring
+the lock it checks the registration again before deletion, protecting a
+worktree that reappeared during cleanup. Lock files remain reusable outside
+deleted trees. No scheduled cleaner or every-command orphan sweep exists.
+Abandoned records may remain until another same-owner operation succeeds;
+controlled worktree-removal integration is still planned in step 20.
+
+`repository_operation.py` wraps `reserve_versioned_build`,
+`prepare_versioned_receipt` and `complete_versioned_build` through
+`store_artifacts.versioned_artifact_checkpoints`. Completion then calls
+`store_artifacts.finish_versioned_checkpoints`. These adapters use the shared
+five-function interface; the artifact producer still owns the decision that
+all of the request's units are complete. Within this route, lock order is the
+checkpoint lock first, short artifact-store lock second. This is not a
+whole-worktree execution lock. Unit/version reservations already contain its
+recovery essentials,
 so the artifact route needs no additional checkpoint JSON. Different unfinished
 repository/branch/B requests are refused; a request with another pending unit
 does not finish its checkpoints prematurely. New attempts still receive their
@@ -1243,9 +1260,11 @@ The producer lock does not prove an earlier artifact-writing child has stopped.
 Step 2A provides the shared release-lock helper; 2B connects promotion and other
 release writers. 3A releases stopped attempts before model corrections;
 report handling and controlled cleanup remain later parts of 3/4.
+Step 20 connects checkpoint cleanup to worktree removal.
 Neither helper supervises child processes or adds general worktree locks.
-The v2 producer is unchanged; skill updates use checkpoint storage for
-immutable generations.
+Artifact-reservation and incomplete-installation cleanup belong to their
+existing owners in planned step 21, not this checkpoint API. The v2 producer
+is unchanged; skill updates use checkpoint storage for immutable generations.
 
 The existing handoff/storage tests cover fresh-process discovery, direct writes,
 conflicting and unreadable records, nesting, native lock contention, worktree

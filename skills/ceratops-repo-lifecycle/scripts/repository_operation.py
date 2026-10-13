@@ -40,17 +40,15 @@ from ceratops_repo_compatibility_engine.sdlc_contract_validation import (
 from github_pr_workflow.command import failure_excerpt, track_command_completion
 from sdlc_results import StepResultError, capture_step_result
 from store_artifacts import (
-    BUILD_BUNDLE_RETENTION,
     ArtifactVersionTransaction,
     BuildProduct,
-    CompletedBuild,
-    CompletedDependency,
     CompletedArtifactVersion,
     OperationError,
     PreparedBuildReceipt,
-    RecoveryRequired,
-    read_completed_build,
 )
+
+# Public receipt-reader API; storage owns the implementation.
+read_completed_build = store_artifacts.read_completed_build
 
 DEFAULT_CONTRACT = pathlib.Path("sdlc/sdlc.yml")
 PARAMETER_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
