@@ -68,7 +68,7 @@ def main(argv: list[str] | None = None) -> int:
         result = ship.ship(args)
         print(json.dumps(result, separators=(",", ":"), ensure_ascii=True))
         return 2 if result.get("status") == "pending_work" else 0
-    except ship.ShipBlocked as exc:
+    except ship.wait_pr_checks.ShipBlocked as exc:
         print(
             json.dumps(
                 exc.payload,

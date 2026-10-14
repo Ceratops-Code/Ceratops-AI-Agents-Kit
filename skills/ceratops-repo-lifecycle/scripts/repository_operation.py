@@ -41,6 +41,7 @@ from ceratops_repo_compatibility_engine.sdlc_contract_validation import (
 )
 from github_pr_workflow.command import (
     failure_excerpt,
+    remove_resolved_failures,
     report_failure,
     report_phase,
     run_progress_command,
@@ -626,7 +627,13 @@ def execute_prepared_operation(
                 if check_plan.decision["decision"] == "blocked":
                     raise ValueError("Recorded check evidence blocks reuse: " + check_plan.decision["reason"])
             if check_plan.decision["decision"] == "reuse":
-                return check_plan.reused_result(prepared)
+                result = check_plan.reused_result(prepared)
+                remove_operation_failures(
+                    result, diagnostic_output=diagnostic_output,
+                    diagnostic_owner=(owner_root, action),
+                    completed_steps=tuple(step.position for step in prepared.steps),
+                )
+                return result
             base.update(check_decision="executed", check_reason=check_plan.decision["reason"])
     except (OSError, ValueError) as exc:
         return report_failure({**base, "status": "result_invalid", "message": str(exc)}, **report_options)
@@ -664,6 +671,7 @@ def execute_prepared_operation(
                 else None,
                 diagnostic_output=diagnostic_output,
                 diagnostic_owner=diagnostic_owner,
+                failure_id=f"{prepared.operation}:{step.position}",
                 successful_results=(successful_results, step_results),
                 require_clean_commit=require_clean_commit,
                 repository_commit=repository_commit,
@@ -700,6 +708,11 @@ def execute_prepared_operation(
                 )
             if handoff_result["status"] in FAILED_STATUSES - {"handoff_required"}:
                 return report_failure(handoff_result, **report_options)
+            remove_operation_failures(
+                handoff_result, diagnostic_output=diagnostic_output,
+                diagnostic_owner=(owner_root, action),
+                completed_steps=tuple(item.position for item in prepared.steps),
+            )
             return handoff_result
         if prepared.commit and prepared.category in MUTATION_CATEGORIES:
             try:
@@ -855,12 +868,48 @@ def execute_prepared_operation(
                 "status": "state_changed",
                 "message": "HEAD changed during operation; prepare and validate the new commit.",
             }, **report_options)
+        remove_resolved_failures(
+            base, diagnostic_output=diagnostic_output, repo_root=owner_root,
+            action=action, resolved_failures=(f"{prepared.operation}:{step.position}",),
+        )
     result_value = {
         **base,
         "status": "completed" if prepared.steps else "advisory",
         "steps": completed,
     }
+    remove_operation_failures(
+        result_value, diagnostic_output=diagnostic_output,
+        diagnostic_owner=(owner_root, action),
+    )
     return result_value
+
+
+def remove_operation_failures(
+    result: dict[str, Any], *, diagnostic_output: pathlib.Path | None,
+    diagnostic_owner: tuple[pathlib.Path, str],
+    completed_steps: tuple[int, ...] | None = None,
+) -> None:
+    """Use the executor's successful outcomes, including exact reused passes.
+
+    The requester may also pass a batch or an already accepted operation from
+    Ship's existing store. No-op, advisory, pending and failed results do not
+    resolve work. A handoff must actually finish, not just be declared.
+    """
+    for item in result.get("results", []):
+        remove_operation_failures(
+            item, diagnostic_output=diagnostic_output,
+            diagnostic_owner=diagnostic_owner,
+        )
+    operation = result.get("operation")
+    if (result.get("status") != "completed" or not isinstance(operation, str)
+            or (result.get("handoff") and not result.get("handoff_completed"))):
+        return
+    positions = result.get("steps", []) if completed_steps is None else completed_steps
+    repo_root, action = diagnostic_owner
+    remove_resolved_failures(
+        result, diagnostic_output=diagnostic_output, repo_root=repo_root, action=action,
+        resolved_failures=(operation, *(f"{operation}:{position}" for position in positions)),
+    )
 
 
 def _combined_prerequisites(
@@ -890,6 +939,7 @@ def execute_prepared_operations(
 
     # Resolve every marked check before the first check/build callback. Later
     # phases consume these original plans; no result payload crosses the model.
+    preparation_id = "operation_preparation:" + ",".join(item.operation for item in prepared)
     try:
         prepared = [replace(item, check_plan=reuse_operation_checks.plan_operation(item))
                     if item.check_results is not None and item.check_plan is None else item
@@ -900,13 +950,20 @@ def execute_prepared_operations(
         owner_root, action = diagnostic_owner or (prepared[0].repo_root, "operation")
         failure = report_failure(
             failure, diagnostic_output=diagnostic_output,
-            repo_root=owner_root, action=action, failure_id="operation_preparation",
+            repo_root=owner_root, action=action, failure_id=preparation_id,
             successful_results=successful_results, output_root=prepared[0].repo_root,
         )
         return {**failure, "completed_operations": [],
                 "pending_operations": [item.operation for item in prepared],
                 "results": [failure]}
     results: list[dict[str, object]] = []
+    batch: dict[str, Any] = {"results": results}
+    if prepared:
+        owner_root, action = diagnostic_owner or (prepared[0].repo_root, "operation")
+        remove_resolved_failures(
+            batch, diagnostic_output=diagnostic_output,
+            repo_root=owner_root, action=action, resolved_failures=(preparation_id,),
+        )
     completed: list[str] = []
     for index, operation in enumerate(prepared):
         result = execute_prepared_operation(
@@ -917,6 +974,7 @@ def execute_prepared_operations(
         results.append(result)
         if result["status"] in FAILED_STATUSES:
             return {
+                **batch,
                 **result,
                 "completed_operations": completed,
                 "pending_operations": [item.operation for item in prepared[index:]],
@@ -925,6 +983,7 @@ def execute_prepared_operations(
         if result["status"] != "deferred_handoff":
             completed.append(operation.operation)
     return {
+        **batch,
         "status": "completed",
         "completed_operations": completed,
         "pending_operations": [],

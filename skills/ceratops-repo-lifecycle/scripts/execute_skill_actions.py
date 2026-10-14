@@ -33,6 +33,7 @@ def execute_handoff(
     expected_commit: str | None = None,
     diagnostic_output: pathlib.Path | None = None,
     diagnostic_owner: tuple[pathlib.Path, str] | None = None,
+    failure_id: str | None = None,
     successful_results: Any = (),
     require_clean_commit: Callable[[pathlib.Path, str], None] | None = None,
     repository_commit: Callable[[pathlib.Path], str | None] | None = None,
@@ -48,6 +49,8 @@ def execute_handoff(
     request skill judgment before any command runs. Package prerequisites never
     trigger an implicit build. Repository commit guards are supplied by the
     caller, so this module does not import the operation runner.
+    A supplied failure_id names the requesting SDLC step, keeping failures of
+    different selected skills separate even when they use the same action.
     """
 
     if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*/[a-z0-9]+(?:-[a-z0-9]+)*", route):
@@ -314,7 +317,7 @@ def execute_handoff(
                 return report_failure(
                     failure, diagnostic_output=diagnostic_output,
                     repo_root=owner_root, action=action,
-                    failure_id=f"{route}:{position}",
+                    failure_id=failure_id or f"{route}:{position}",
                     stdout=result.stdout, stderr=result.stderr,
                     successful_results=successful_results,
                     output_root=repo_root,

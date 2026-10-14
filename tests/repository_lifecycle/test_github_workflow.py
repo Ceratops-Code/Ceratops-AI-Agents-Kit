@@ -631,7 +631,7 @@ class ShipTests(unittest.TestCase):
             checkpoint = repo_root / "checkpoint.json"
             with (
                 mock.patch.object(
-                    ship, "_repository_name", return_value="owner/repo"
+                    ship.wait_pr_checks, "resolve_repository_name", return_value="owner/repo"
                 ),
                 mock.patch.object(ship, "_resolve_commit", return_value=self.commit),
                 mock.patch.object(
@@ -1017,7 +1017,7 @@ class ShipTests(unittest.TestCase):
             "validate_readiness",
             return_value=({"head_oid": self.commit, "number": 17}, findings),
         ) as validate:
-            result = ship.wait_for_ci_gate(
+            result = ship.wait_pr_checks.wait_for_ci_gate(
                 "17",
                 pathlib.Path.cwd(),
                 self.commit,
@@ -1045,7 +1045,7 @@ class ShipTests(unittest.TestCase):
                 findings,
             ),
         ) as validate:
-            result = ship.wait_for_ci_gate(
+            result = ship.wait_pr_checks.wait_for_ci_gate(
                 "17",
                 pathlib.Path.cwd(),
                 self.commit,
@@ -1053,7 +1053,7 @@ class ShipTests(unittest.TestCase):
                 interval_seconds=0,
             )
 
-        self.assertFalse(ship._transient_readiness(findings[0]))
+        self.assertFalse(ship.wait_pr_checks._transient_readiness(findings[0]))
         self.assertEqual(result["pending"], 0)
         validate.assert_called_once()
 
@@ -1072,7 +1072,7 @@ class ShipTests(unittest.TestCase):
             findings,
         )
 
-        self.assertTrue(ship._transient_readiness(findings[0]))
+        self.assertTrue(ship.wait_pr_checks._transient_readiness(findings[0]))
 
         opaque = ship.readiness.Finding(
             level="ERROR",
@@ -1087,13 +1087,13 @@ class ShipTests(unittest.TestCase):
             actual=["CI"],
         )
         summary = {"head_oid": self.commit, "number": 17}
-        self.assertTrue(ship._transient_readiness(opaque))
+        self.assertTrue(ship.wait_pr_checks._transient_readiness(opaque))
         with mock.patch.object(
             ship.readiness,
             "validate_readiness",
             side_effect=[(summary, [opaque]), (summary, [passing])],
         ) as validate:
-            result = ship.wait_for_ci_gate(
+            result = ship.wait_pr_checks.wait_for_ci_gate(
                 "17",
                 pathlib.Path.cwd(),
                 self.commit,
@@ -1110,13 +1110,13 @@ class ShipTests(unittest.TestCase):
                 "validate_readiness",
                 side_effect=[(summary, [opaque]), (summary, [opaque])],
             ) as validate,
-            mock.patch.object(ship, "_check_uncertainty_detail", return_value={}),
+            mock.patch.object(ship.wait_pr_checks, "_check_uncertainty_detail", return_value={}),
             self.assertRaisesRegex(
-                ship.ShipBlocked,
+                ship.wait_pr_checks.ShipBlocked,
                 "status-check state remained unclassifiable after 0 seconds",
             ) as blocked,
         ):
-            ship.wait_for_ci_gate(
+            ship.wait_pr_checks.wait_for_ci_gate(
                 "17",
                 pathlib.Path.cwd(),
                 self.commit,
@@ -1135,7 +1135,7 @@ class ShipTests(unittest.TestCase):
             message="One or more status checks are failing.",
             actual=["CI"],
         )
-        surfaced = ship.ShipBlocked("surfaced check failure", {})
+        surfaced = ship.wait_pr_checks.ShipBlocked("surfaced check failure", {})
         with (
             mock.patch.object(
                 ship.readiness,
@@ -1146,10 +1146,10 @@ class ShipTests(unittest.TestCase):
                     (summary, [failed]),
                 ],
             ) as validate,
-            mock.patch.object(ship, "_ci_blocker", return_value=surfaced),
-            self.assertRaisesRegex(ship.ShipBlocked, "surfaced check failure"),
+            mock.patch.object(ship.wait_pr_checks, "_ci_blocker", return_value=surfaced),
+            self.assertRaisesRegex(ship.wait_pr_checks.ShipBlocked, "surfaced check failure"),
         ):
-            ship.wait_for_ci_gate(
+            ship.wait_pr_checks.wait_for_ci_gate(
                 "17",
                 pathlib.Path.cwd(),
                 self.commit,
@@ -1174,8 +1174,8 @@ class ShipTests(unittest.TestCase):
             actual="REVIEW_REQUIRED",
         )
 
-        self.assertFalse(ship._transient_readiness(bypassed))
-        self.assertTrue(ship._transient_readiness(blocking))
+        self.assertFalse(ship.wait_pr_checks._transient_readiness(bypassed))
+        self.assertTrue(ship.wait_pr_checks._transient_readiness(blocking))
         with mock.patch.object(
             ship.readiness,
             "validate_readiness",
@@ -1184,7 +1184,7 @@ class ShipTests(unittest.TestCase):
                 [bypassed],
             ),
         ):
-            result = ship.wait_for_ci_gate(
+            result = ship.wait_pr_checks.wait_for_ci_gate(
                 "17",
                 pathlib.Path.cwd(),
                 self.commit,
@@ -1240,7 +1240,7 @@ class ShipTests(unittest.TestCase):
 
         args = self.args(pathlib.Path.cwd())
         with (
-            mock.patch.object(ship, "wait_for_ci_gate", side_effect=ci_gate),
+            mock.patch.object(ship.wait_pr_checks, "wait_for_ci_gate", side_effect=ci_gate),
             mock.patch.object(
                 ship.codex_review,
                 "wait_for_codex_threads",
@@ -1264,7 +1264,7 @@ class ShipTests(unittest.TestCase):
         args = self.args(pathlib.Path.cwd())
         with (
             mock.patch.object(
-                ship,
+                ship.wait_pr_checks,
                 "wait_for_ci_gate",
                 return_value={
                     "base": "main",
@@ -1312,7 +1312,7 @@ class ShipTests(unittest.TestCase):
                 "wait_for_codex_threads",
                 return_value=preflight,
             ) as review_wait,
-            mock.patch.object(ship, "wait_for_ci_gate") as ci_wait,
+            mock.patch.object(ship.wait_pr_checks, "wait_for_ci_gate") as ci_wait,
             mock.patch.object(
                 ship.readiness,
                 "review_thread_resolution_required",
@@ -1340,7 +1340,7 @@ class ShipTests(unittest.TestCase):
         args = self.args(pathlib.Path.cwd())
         with (
             mock.patch.object(
-                ship,
+                ship.wait_pr_checks,
                 "wait_for_ci_gate",
                 return_value={
                     "base": "main",
@@ -1425,7 +1425,7 @@ class ShipTests(unittest.TestCase):
             unidentifiable_checkpoint.write_text("invalid", encoding="utf-8")
             with (
                 mock.patch.object(
-                    ship, "_repository_name", return_value="owner/repo"
+                    ship.wait_pr_checks, "resolve_repository_name", return_value="owner/repo"
                 ),
                 mock.patch.object(ship, "_resolve_commit", return_value=self.commit),
                 mock.patch.object(
@@ -1541,7 +1541,7 @@ class ShipTests(unittest.TestCase):
             checkpoint.write_text("checkpoint", encoding="utf-8")
             with (
                 mock.patch.object(
-                    ship, "_repository_name", return_value="owner/repo"
+                    ship.wait_pr_checks, "resolve_repository_name", return_value="owner/repo"
                 ),
                 mock.patch.object(ship, "_resolve_commit", return_value=self.commit),
                 mock.patch.object(
@@ -1628,7 +1628,7 @@ class ShipTests(unittest.TestCase):
             checkpoint.write_text("checkpoint", encoding="utf-8")
             with (
                 mock.patch.object(
-                    ship, "_repository_name", return_value="owner/repo"
+                    ship.wait_pr_checks, "resolve_repository_name", return_value="owner/repo"
                 ),
                 mock.patch.object(ship, "_resolve_commit", return_value=self.commit),
                 mock.patch.object(
@@ -1710,7 +1710,7 @@ class ShipTests(unittest.TestCase):
             checkpoint.write_text("checkpoint", encoding="utf-8")
             with (
                 mock.patch.object(
-                    ship, "_repository_name", return_value="owner/repo"
+                    ship.wait_pr_checks, "resolve_repository_name", return_value="owner/repo"
                 ),
                 mock.patch.object(ship, "_resolve_commit", return_value=self.commit),
                 mock.patch.object(
@@ -1754,7 +1754,7 @@ class ShipTests(unittest.TestCase):
             checkpoint.write_text("checkpoint", encoding="utf-8")
             with (
                 mock.patch.object(
-                    ship, "_repository_name", return_value="owner/repo"
+                    ship.wait_pr_checks, "resolve_repository_name", return_value="owner/repo"
                 ),
                 mock.patch.object(ship, "_resolve_commit", return_value=self.commit),
                 mock.patch.object(
@@ -1860,7 +1860,7 @@ class ShipTests(unittest.TestCase):
             checkpoint = repo_root / "checkpoint.json"
             with (
                 mock.patch.object(
-                    ship, "_repository_name", return_value="owner/repo"
+                    ship.wait_pr_checks, "resolve_repository_name", return_value="owner/repo"
                 ),
                 mock.patch.object(ship, "_resolve_commit", return_value=self.commit),
                 mock.patch.object(

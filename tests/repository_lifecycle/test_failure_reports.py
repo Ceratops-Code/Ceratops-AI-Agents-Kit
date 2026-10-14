@@ -10,6 +10,7 @@ import subprocess
 import sys
 from contextlib import nullcontext
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -542,3 +543,359 @@ def test_operation_cli_forwards_report_path_without_high_level_receipt(report_re
     assert json.loads(result.stderr).get("diagnostic_output") == str(path), result.stderr
     assert "complete error" in path.read_text()
     assert json.loads(path.read_text())["schema"] == "ceratops-lifecycle-failure-report.v1"
+
+
+def test_executor_clears_matching_failure_before_next_operation(report_repo):
+    repo, path = report_repo
+    failed = prepared(repo, "tests.unit", "import sys; print('unit failure'); sys.exit(1)")
+    runner.execute_prepared_operation(failed, diagnostic_output=path, diagnostic_owner=(repo, "promote"))
+    assert set(json.loads(path.read_text())["failures"]) == {"tests.unit:1"}
+    passed = prepared(repo, "tests.unit", "print('passed')")
+    later = prepared(repo, "tests.later", (
+        f"import pathlib,sys; assert not pathlib.Path({str(path)!r}).exists(); "
+        "print('later failure'); sys.exit(1)"
+    ))
+    result = runner.execute_prepared_operations(
+        [passed, later], diagnostic_output=path, diagnostic_owner=(repo, "promote"),
+    )
+    assert result["status"] == "tests_failed"
+    assert set(json.loads(path.read_text())["failures"]) == {"tests.later:1"}
+
+
+def test_partial_command_success_preserves_other_failure_and_accepted_file(report_repo):
+    repo, path = report_repo
+    accepted = repo / "accepted.json"
+    accepted.write_text("accepted bytes", encoding="utf-8")
+    save(repo, path, {"tests.unit:1": "old first", "tests.unit:2": "old second"},
+         successful_result_paths=(str(accepted),))
+    operation = prepared(repo, "tests.unit", "print('first passes')")
+    operation = replace(operation, steps=(*operation.steps, runner.PreparedStep(
+        2, (sys.executable, "-c", "import sys; print('second fails'); sys.exit(1)"), repo,
+    )))
+    result = runner.execute_prepared_operation(
+        operation, diagnostic_output=path, diagnostic_owner=(repo, "promote"),
+    )
+    assert result["status"] == "tests_failed"
+    report = json.loads(path.read_text())
+    assert set(report["failures"]) == {"tests.unit:2"}
+    assert report["successful_result_paths"] == [str(accepted)]
+    assert accepted.read_text() == "accepted bytes"
+
+
+@pytest.mark.parametrize("status", ["no_op", "advisory", "deferred_handoff", "handoff_required", "tests_failed"])
+def test_nonpassing_outcomes_do_not_retire_failure(report_repo, status):
+    repo, path = report_repo
+    save(repo, path, {"tests.unit:1": "still needed"})
+    original = path.read_bytes()
+    runner.remove_operation_failures(
+        {"operation": "tests.unit", "status": status, "steps": [1]},
+        diagnostic_output=path, diagnostic_owner=(repo, "promote"),
+    )
+    assert path.read_bytes() == original
+
+
+def test_reused_check_retires_report_without_executing_command(report_repo, monkeypatch):
+    repo, path = report_repo
+    accepted = repo / "accepted.json"
+    accepted.write_text("original passing result", encoding="utf-8")
+    save(repo, path, {"tests.unit:1": "old failure"})
+    operation = prepared(repo, "tests.unit", "raise AssertionError('accepted check must not run')")
+    result = {"operation": "tests.unit", "status": "completed", "steps": [],
+              "check_decision": "reused", "check_result": {"path": str(accepted)}}
+    plan = SimpleNamespace(
+        context={"fingerprint": "same"},
+        store=SimpleNamespace(select=lambda *_args, **_kwargs: {"decision": "reuse"}),
+        reused_result=lambda _prepared: result,
+    )
+    monkeypatch.setattr(runner.reuse_operation_checks, "check_inputs", lambda *_args: {"fingerprint": "same"})
+    operation = replace(operation, check_results={}, check_plan=plan)
+    assert runner.execute_prepared_operation(
+        operation, diagnostic_output=path, diagnostic_owner=(repo, "promote"),
+    ) is result
+    assert not path.exists()
+    assert accepted.read_text() == "original passing result"
+
+
+def test_completed_handoff_uses_selected_operation_failure_identity(report_repo, monkeypatch):
+    repo, path = report_repo
+    operation = replace(
+        prepared(repo, "skills.first.install", ""), handoff_mode="skill",
+        steps=(runner.PreparedStep(1, None, repo, handoff={
+            "lifecycle": "ceratops-skill-lifecycle", "action": "deploy", "inputs": {"skill": "first"},
+        }),),
+    )
+    save(repo, path, {"skills.first.install:1": "first failed", "skills.second.install:1": "second failed"})
+
+    def done(_route, _repo, **kwargs):
+        assert kwargs["failure_id"] == "skills.first.install:1"
+        return {"status": "completed", "steps": [1], "step_results": []}
+
+    monkeypatch.setattr(runner.execute_skill_actions, "execute_handoff", done)
+    result = runner.execute_prepared_operation(
+        operation, diagnostic_output=path, diagnostic_owner=(repo, "promote"),
+    )
+    assert result["handoff_completed"]
+    assert set(json.loads(path.read_text())["failures"]) == {"skills.second.install:1"}
+
+
+def test_ship_retires_saved_delivery_failure_without_repeating_effect(report_repo, monkeypatch):
+    repo, path = report_repo
+    operation = "deliverables.apps.sample.actions.publish"
+    save(repo, path, {operation + ":1": "old publish failure"})
+    result = {"operation": operation, "status": "completed", "steps": [1]}
+    monkeypatch.setattr(ship_repository, "_operation_checkpoint_path", lambda *_args: repo / "stored.json")
+    monkeypatch.setattr(ship_repository, "_operation_identity", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(ship_repository, "_read_operation_checkpoint", lambda *_args: result)
+    monkeypatch.setattr(ship_repository, "prepare_operations", lambda *_args, **_kwargs: pytest.fail("must not republish"))
+    code, outcome, _ = ship_repository._checkpointed_operation_batch(
+        repo_root=repo, contract=repo / "sdlc.yml", operations=[operation],
+        phase="publish", target_branch="release/local", target_commit="a" * 40,
+        synchronized_commit="b" * 40, diagnostic_output=path, diagnostic_owner=(repo, "promote"),
+    )
+    assert code == 0 and outcome["results"] == [result]
+    assert not path.exists()
+
+
+def test_ship_check_result_clears_report_before_delivery(report_repo, monkeypatch):
+    repo, path = report_repo
+    save(repo, path, {"tests.unit:1": "failed"})
+    calls = []
+
+    def passed(argv, **_kwargs):
+        calls.append(argv)
+        return 0, {"status": "completed", "results": [
+            {"operation": "tests.unit", "status": "completed", "steps": [1]},
+        ]}
+
+    monkeypatch.setattr(ship_repository, "run_command_for_json", passed)
+    args = ship_repository.ShipOptions(
+        repo_root=repo, head_branch="release/local", diagnostic_output=path,
+        diagnostic_owner=(repo, "promote"),
+    )
+    assert ship_repository._validate_phase(args, repo, [], phase="before_remote", remote_mutation=False)["status"] == "completed"
+    assert len(calls) == 1 and not path.exists()
+
+
+def test_promote_retires_check_report_before_reporting_ready(tmp_path, monkeypatch):
+    from tests.repository_lifecycle.support import prepare_repository_lifecycle_repo
+
+    repo, _, _, _ = prepare_repository_lifecycle_repo(tmp_path)
+    path = tmp_path / "tmp" / repo.name / repo.name / "_failure.json"
+    save(repo, path, {"tests.unit:1": "failed"})
+    original_json, original_clean = promote.run_command_for_json, promote.git_branches._clean
+    observed = []
+
+    def run(argv, cwd):
+        if str(OPERATION_RUNNER) in argv:
+            return 0, {"status": "completed", "results": [
+                {"operation": "tests.unit", "status": "completed", "steps": [1]},
+            ]}
+        return original_json(argv, cwd)
+
+    def clean(root, phase):
+        if phase == "before reporting ready state":
+            observed.append(not path.exists())
+        return original_clean(root, phase)
+
+    monkeypatch.setattr(promote, "run_command_for_json", run)
+    monkeypatch.setattr(promote.git_branches, "_clean", clean)
+    args = promote.build_parser().parse_args([
+        "--repo-root", str(repo), "--source-branch", "approved", "--no-run-operation",
+        "--diagnostic-output", str(path),
+    ])
+    assert promote.promote(args)["status"] == "ready"
+    assert observed == [True]
+
+
+def test_ci_failure_is_retired_before_review_handoff(report_repo, monkeypatch):
+    repo, path = report_repo
+    args = argparse.Namespace(repo_root=repo, diagnostic_output=path, diagnostic_owner=(repo, "promote"),
+                              interval_seconds=0, base_branch="main")
+    ci_id = "github_checks:example/repository:24"
+    save(repo, path, {ci_id: "old CI failure"})
+    monkeypatch.setattr(ship.wait_pr_checks, "wait_for_ci_gate", lambda *_args, **_kwargs: {
+        "base": "main", "head_oid": "a" * 40,
+    })
+    monkeypatch.setattr(ship.codex_review, "wait_for_codex_threads", lambda *_args, **_kwargs: {})
+
+    def review(*_args, **_kwargs):
+        assert not path.exists()
+        raise ship.wait_pr_checks.ShipBlocked("review needs correction", {"blocker": {"kind": "review_threads"}})
+
+    monkeypatch.setattr(ship, "_enforce_review_thread_gate", review)
+    with pytest.raises(ship.wait_pr_checks.ShipBlocked, match="review needs correction"):
+        ship.run_parallel_gates(args, "24", "example/repository", "a" * 40,
+                                ci_wait_seconds=0, review_wait_seconds=0)
+    assert not path.exists()
+
+
+@pytest.mark.parametrize("workflow", ["promote", "ship", "github-ship"])
+def test_terminal_workflow_cleans_only_its_matching_failure(report_repo, monkeypatch, workflow):
+    repo, path = report_repo
+    if workflow == "promote":
+        module, public, private, failure_id, status = promote, promote.promote, "_promote_with_rollback", "promote", "ready"
+        args = argparse.Namespace(repo_root=repo, diagnostic_output=path)
+        monkeypatch.setattr(promote, "_promotion_inputs", lambda _args: ())
+    elif workflow == "ship":
+        module, public, private, failure_id, status = ship_repository, ship_repository.ship_repository, "_ship_repository", "ship_repository", "shipped"
+        args = ship_repository.ShipOptions(repo_root=repo, head_branch="release/local", diagnostic_output=path,
+                                            diagnostic_owner=(repo, "promote"))
+    else:
+        module, public, private, failure_id, status = ship, ship.ship, "_ship", "github_ship", "already_shipped"
+        args = argparse.Namespace(repo_root=repo, head_branch="release/local", diagnostic_output=path,
+                                  diagnostic_owner=(repo, "promote"))
+    save(repo, path, {failure_id: "previous error", "other-check": "still needed"})
+    monkeypatch.setattr(module, "release_write_context", lambda *_args, **_kwargs: nullcontext())
+    monkeypatch.setattr(module, private, lambda *_args, **_kwargs: {"status": status})
+    assert public(args)["status"] == status
+    assert set(json.loads(path.read_text())["failures"]) == {"other-check"}
+
+
+@pytest.mark.parametrize("partial", [False, True])
+@pytest.mark.parametrize("interrupt_after", [False, True])
+def test_success_cleanup_repeats_after_interrupted_replacement_or_deletion(
+    report_repo, monkeypatch, partial, interrupt_after,
+):
+    repo, path = report_repo
+    failures = {"tests.unit:1": "fixed", **({"tests.other:1": "needed"} if partial else {})}
+    save(repo, path, failures)
+    method = "write_text" if partial else "unlink"
+    original = getattr(pathlib.Path, method)
+    result = {"status": "completed", "operation": "tests.unit", "steps": [1]}
+
+    def interrupted(selected, *args, **kwargs):
+        if selected != path:
+            return original(selected, *args, **kwargs)
+        if interrupt_after:
+            original(selected, *args, **kwargs)
+        raise KeyboardInterrupt("report cleanup interrupted")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(pathlib.Path, method, interrupted)
+        with pytest.raises(KeyboardInterrupt):
+            runner.remove_operation_failures(result, diagnostic_output=path, diagnostic_owner=(repo, "promote"))
+    for _ in range(2):
+        runner.remove_operation_failures(result, diagnostic_output=path, diagnostic_owner=(repo, "promote"))
+    if partial:
+        assert set(json.loads(path.read_text())["failures"]) == {"tests.other:1"}
+    else:
+        assert not path.exists()
+
+
+def test_cleanup_io_error_does_not_turn_success_into_failure(report_repo, monkeypatch):
+    repo, path = report_repo
+    save(repo, path, {"tests.unit:1": "old failure"})
+    result = {"status": "completed", "operation": "tests.unit", "steps": [1]}
+    original = pathlib.Path.unlink
+
+    def unavailable(selected, *args, **kwargs):
+        if selected == path:
+            raise OSError("report is open elsewhere")
+        return original(selected, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(pathlib.Path, "unlink", unavailable)
+        runner.remove_operation_failures(result, diagnostic_output=path, diagnostic_owner=(repo, "promote"))
+    assert result["status"] == "completed" and path.exists()
+    assert "open elsewhere" in result["report_cleanup_error"]
+    runner.remove_operation_failures(result, diagnostic_output=path, diagnostic_owner=(repo, "promote"))
+    assert not path.exists()
+
+
+@pytest.mark.parametrize("active,uncertain", [(1, False), (0, True)])
+def test_success_cleanup_retains_report_until_commands_are_known_stopped(report_repo, active, uncertain):
+    repo, path = report_repo
+    save(repo, path, {"tests.unit:1": "needed while commands may run"})
+    original = path.read_bytes()
+    token = command._COMMAND_COMPLETION.set(command._CommandCompletion(active=active, uncertain=uncertain))
+    result = {"status": "completed", "operation": "tests.unit", "steps": [1]}
+    try:
+        runner.remove_operation_failures(result, diagnostic_output=path, diagnostic_owner=(repo, "promote"))
+        assert path.read_bytes() == original
+    finally:
+        command._COMMAND_COMPLETION.reset(token)
+    runner.remove_operation_failures(result, diagnostic_output=path, diagnostic_owner=(repo, "promote"))
+    assert not path.exists()
+
+
+def test_success_cleanup_does_not_delete_another_actions_report(report_repo):
+    repo, path = report_repo
+    save(repo, path, {"tests.unit:1": "promote needs this"})
+    original = path.read_bytes()
+    result = {"status": "completed", "operation": "tests.unit", "steps": [1]}
+    runner.remove_operation_failures(result, diagnostic_output=path, diagnostic_owner=(repo, "ship"))
+    assert path.read_bytes() == original and result["status"] == "completed"
+
+
+@pytest.mark.parametrize("fail_later", [False, True])
+def test_batch_preparation_cleanup_error_reaches_caller(report_repo, monkeypatch, fail_later):
+    repo, path = report_repo
+    script = "import sys; sys.exit(1)" if fail_later else "print('passed')"
+    operation = prepared(repo, "tests.unit", script)
+
+    def cannot_prepare(_operations):
+        raise ValueError("missing check input")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(runner.reuse_operation_checks, "activate_plans", cannot_prepare)
+        assert runner.execute_prepared_operations(
+            [operation], diagnostic_output=path, diagnostic_owner=(repo, "promote"),
+        )["status"] == "result_invalid"
+    assert set(json.loads(path.read_text())["failures"]) == {"operation_preparation:tests.unit"}
+    original = pathlib.Path.unlink
+
+    def unavailable(selected, *args, **kwargs):
+        if selected == path:
+            raise OSError("cannot remove preparation report")
+        return original(selected, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(pathlib.Path, "unlink", unavailable)
+        result = runner.execute_prepared_operations(
+            [operation], diagnostic_output=path, diagnostic_owner=(repo, "promote"),
+        )
+    assert result["status"] == ("tests_failed" if fail_later else "completed")
+    assert "cannot remove preparation report" in result["report_cleanup_error"]
+
+
+def test_ci_report_uses_same_identity_on_failure_and_success(report_repo, monkeypatch):
+    repo, path = report_repo
+    args = argparse.Namespace(repo_root=repo, diagnostic_output=path, diagnostic_owner=(repo, "promote"),
+                              interval_seconds=0, base_branch="main")
+    monkeypatch.setattr(ship.codex_review, "wait_for_codex_threads", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(ship, "_enforce_review_thread_gate", lambda *_args, **_kwargs: (0, 0))
+
+    def failed(*_args, **_kwargs):
+        raise ship.wait_pr_checks.ShipBlocked("CI failed", {"blocker": {"kind": "ci"}})
+
+    monkeypatch.setattr(ship.wait_pr_checks, "wait_for_ci_gate", failed)
+    with pytest.raises(ship.wait_pr_checks.ShipBlocked, match="CI failed"):
+        ship.run_parallel_gates(args, "24", "example/repository", "a" * 40,
+                                ci_wait_seconds=0, review_wait_seconds=0)
+    assert set(json.loads(path.read_text())["failures"]) == {"github_checks:example/repository:24"}
+    monkeypatch.setattr(ship.wait_pr_checks, "wait_for_ci_gate", lambda *_args, **_kwargs: {"base": "main"})
+    assert ship.run_parallel_gates(args, "24", "example/repository", "b" * 40,
+                                   ci_wait_seconds=0, review_wait_seconds=0)["disposition"] == "passed"
+    assert not path.exists()
+
+
+def test_review_cleanup_error_reaches_gate_caller(report_repo, monkeypatch):
+    repo, path = report_repo
+    args = argparse.Namespace(repo_root=repo, diagnostic_output=path, diagnostic_owner=(repo, "promote"),
+                              interval_seconds=0, base_branch="main")
+    save(repo, path, {"github_review:example/repository:24": "previous review failure"})
+    monkeypatch.setattr(ship.wait_pr_checks, "wait_for_ci_gate", lambda *_args, **_kwargs: {"base": "main"})
+    monkeypatch.setattr(ship.codex_review, "wait_for_codex_threads", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(ship, "_enforce_review_thread_gate", lambda *_args, **_kwargs: (0, 0))
+    original = pathlib.Path.unlink
+
+    def unavailable(selected, *args, **kwargs):
+        if selected == path:
+            raise OSError("cannot remove review report")
+        return original(selected, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "unlink", unavailable)
+    result = ship.run_parallel_gates(args, "24", "example/repository", "a" * 40,
+                                     ci_wait_seconds=0, review_wait_seconds=0)
+    assert result["disposition"] == "passed"
+    assert "cannot remove review report" in result["codex"]["report_cleanup_error"]

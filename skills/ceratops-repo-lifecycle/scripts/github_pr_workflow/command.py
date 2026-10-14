@@ -485,6 +485,45 @@ def successful_result_paths(value: Any) -> tuple[str, ...]:
     return tuple(sorted(paths))
 
 
+def remove_resolved_failures(
+    result: dict[str, Any], *, diagnostic_output: pathlib.Path | None,
+    repo_root: pathlib.Path, action: str, resolved_failures: tuple[str, ...],
+) -> None:
+    """Retire only failures the requesting workflow has just resolved.
+
+    Call after consuming the matching successful result, not on phase entry.
+    IDs name commands/checks, not individual error messages. Partial success
+    rewrites the same report with the remaining diagnostics and original result
+    references. Cleanup trouble is observational: it never turns accepted work
+    into a failed check or asks the caller to repeat its effect.
+    """
+    completion = _COMMAND_COMPLETION.get()
+    if diagnostic_output is None or not resolved_failures or (
+        completion is not None and completion.unfinished()
+    ):
+        return
+    try:
+        selected, owner = _report_scope(diagnostic_output, repo_root, action)
+        previous = _read_failure_report(selected, owner)
+        if not previous or not set(previous["failures"]).intersection(resolved_failures):
+            return
+        remaining = {key: value for key, value in previous["failures"].items()
+                     if key not in resolved_failures}
+        if remaining:
+            write_failure_report(
+                selected, repo_root=repo_root, action=action, failures=remaining,
+                resolved_failures=resolved_failures,
+                successful_result_paths=successful_result_paths(result),
+            )
+        else:
+            remove_failure_report(
+                selected, repo_root=repo_root, action=action,
+                resolved_failures=resolved_failures, commands_stopped=True,
+            )
+    except (OSError, ValueError, CommandError) as exc:
+        result["report_cleanup_error"] = sanitize_for_output(str(exc))
+
+
 def report_phase(phase: str, *, enabled: bool) -> None:
     """Flush an observational phase event; the terminal result remains separate."""
     if enabled:
@@ -579,6 +618,7 @@ def report_failure(
 @contextmanager
 def capture_failure_report(
     diagnostic_output: pathlib.Path | None, *, repo_root: pathlib.Path, action: str,
+    failure_id: str | None = None,
 ):
     """Enrich failures from direct workflow calls without changing their exception types."""
     try:
@@ -612,7 +652,8 @@ def capture_failure_report(
                 payload["exit_code"] = completed.returncode
             exc.payload = report_failure(
                 payload, diagnostic_output=diagnostic_output, repo_root=repo_root,
-                action=action, stdout=completed.stdout if completed else None,
+                action=action, failure_id=failure_id,
+                stdout=completed.stdout if completed else None,
                 stderr=completed.stderr if completed else None,
             )
         raise

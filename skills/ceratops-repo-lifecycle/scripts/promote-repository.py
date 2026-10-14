@@ -33,6 +33,7 @@ from github_pr_workflow.command import (
     capture_failure_report,
     describe_command_failure,
     release_write_context,
+    remove_resolved_failures,
     report_phase,
     require_output,
     require_success,
@@ -47,6 +48,7 @@ from repository_operation import (
     operation_category,
     parse_parameters,
     prepare_operations,
+    remove_operation_failures,
     require_clean_commit,
 )
 from sdlc_results import _unique_result_object
@@ -549,6 +551,10 @@ def _promote(
                 "head": target_commit,
             },
         )
+    remove_operation_failures(
+        validation, diagnostic_output=getattr(args, "diagnostic_output", None),
+        diagnostic_owner=(args.repo_root, "promote"),
+    )
     validation_handoffs = [
         item
         for item in validation["results"]
@@ -665,7 +671,13 @@ def promote(
         getattr(args, "diagnostic_output", None), repo_root=args.repo_root, action="promote",
     ):
         report_phase("promotion", enabled=getattr(args, "diagnostic_output", None) is not None)
-        return _promote_with_rollback(args, timings=timings, inputs=inputs)
+        result = _promote_with_rollback(args, timings=timings, inputs=inputs)
+        if result.get("status") in {"ready", "shipped", "already_shipped"}:
+            remove_resolved_failures(
+                result, diagnostic_output=getattr(args, "diagnostic_output", None),
+                repo_root=args.repo_root, action="promote", resolved_failures=("promote",),
+            )
+        return result
 
 
 def _promote_with_rollback(

@@ -617,7 +617,7 @@ GitHub retry behavior remain unchanged; malformed output keeps its captured
 diagnostics. With `--diagnostic-output`, phase events are flushed as JSON lines
 before the terminal result; the JSON command reader forwards those events.
 
-#### Complete failure reports (3B)
+#### Complete failure reports and successful-work cleanup (3B/4B)
 
 `promote-repository.py`, `ship-repository.py` and
 `python -m github_pr_workflow ship` accept `--diagnostic-output FILE`.
@@ -634,13 +634,16 @@ child report is referenced unchanged and remains owned by that child's helper.
 Without a selected path, or when writing it fails, the complete diagnostics
 remain in the returned error instead of being silently shortened.
 
-The requesting workflow decides which failed checks are now resolved;
-`remove_failure_report()` deletes only its matching managed failure-only file,
-after commands have stopped and every recorded failure is resolved. Thus a tests
-report can be removed when those tests pass even while promotion is unfinished.
-Partial success, an unrelated pass, restarting or changing phase removes nothing.
-Same-work replacement carries forward unresolved failures and successful-result
-paths. Successful or mixed test/build results, receipts, acceptance logs, other
+Promote and Ship now pass actual successful operation results to
+`repository_operation.py::remove_operation_failures()`. The executor also does
+this after each successful command or exact reused check, before starting later
+work. `command.py::remove_resolved_failures()` removes only those command/check
+IDs from the report; it does not interpret individual error messages. Remaining
+failures and successful-result paths stay in the same file. Once none remain,
+`remove_failure_report()` deletes that exact managed file after commands stop.
+Thus corrected tests can clear their report while promotion is still unfinished.
+An unrelated pass, no-op, pending handoff, restart or phase change clears nothing.
+Successful or mixed test/build results, receipts, acceptance logs, other
 actions' files and user-retained files outside managed storage are not cleanup
 targets. A malformed existing file is retained; the current error stays complete
 in the response.
@@ -648,8 +651,13 @@ in the response.
 The direct workflows and both operation execution functions forward the selected
 path. The unnecessary single-operation wrapper is removed. GitHub Ship's CLI
 adapter is now `github_pr_workflow/ship_pull_request.py`; its command is unchanged.
-Step 4B still connects actual success decisions to report removal, 6C handles
-test-runner-owned reports, and 20C/21 connect abandonment and worktree removal.
+GitHub check waiting now lives in `github_pr_workflow/wait_pr_checks.py`; its
+behavior is unchanged. Ship retires a matching PR's CI failure after its checks
+pass, even if review still needs attention. Saved successful delivery results
+also permit cleanup without executing publication or installation again.
+Cleanup errors accompany the successful result without changing it into failure.
+Step 6D handles test-runner-owned reports; 20C/21 connect explicit request
+abandonment/replacement and worktree removal, which are separate cleanup triggers.
 No scheduled cleaner or additional acceptance checks are introduced.
 
 The 2B/3/4 batch remains unmerged through 4C: 3C and 4 connect the remaining
@@ -668,7 +676,7 @@ serialize commands.
 | --- | --- | --- |
 | 1a release declarations | Implemented | Keep current v4/v5 readers; connect exact-output producers later |
 | 1b receipt verification | Implemented v2 verifier plus internal v3/v1 receipt definitions and saved-chain reader | Connect public lifecycle callers in later steps |
-| 1c correction continuity | Implemented and preservation-verified; finalization consumes recorded success without rechecking the checkout | 3B supplies reports; 4B connects success cleanup |
+| 1c correction continuity | Implemented and preservation-verified; finalization consumes recorded success without rechecking the checkout | Reports and matching-success cleanup connected in 3B/4B |
 | 1d build/test/store | Implemented current v2 transaction plus an internal direct-write versioned route: reservations, final artifact paths, committed v3 build receipts, B-to-C result binding, artifact receipts, immutable tag and effect-derived recovery | 2B connects current release writers; public Build and receipt-driven Promote remain pending |
 | 1e.1/4A shared checkpoints | Implemented storage and fresh-invocation discovery without request locks; completion deletes only its own request | 4D removes the empty artifact wrapper/directory; 20C connects dedicated worktree cleanup; old lock files await authorized deployment retirement |
 | 1e.2 skill-change generations | Implemented immutable approvals, states and check results, five descriptive commands, interrupted-write recovery and completion cleanup; new committed receipts use `build_receipt.json` | 2B protects direct-release changes; historical committed receipts retain their recorded names |
@@ -677,7 +685,7 @@ serialize commands.
 | 2A release-lock helper | Implemented internally in `fb6863c`: canonical release lock, immediate busy refusal, nested ownership and durable unfinished-run flag; Windows checks passed, Linux execution unverified | 3A supplies known-stopped unsuccessful exits; 3B supplies reports; 4 connects cleanup |
 | 2B Git separation and release writers | Shared `git_branch_operations.py`; promotion, Ship, release sync, PR preparation and fast-change use the native release lock | Local commit only; do not promote/deploy until steps 3 and 4 finish |
 | 3A direct Ship calls and stopped-attempt release | One callable Ship implementation, external-command-only JSON helper and exception-safe clean lock exits; model corrections run unlocked | Keep the batch unmerged through 4C |
-| 3B complete failure reports | Caller-selected paths, full redacted diagnostics, successful-result references, same-work replacement and guarded removal API | 4B connects actual success callers; 6C/20C/21 connect child-report and abandonment/removal cleanup |
+| 3B/4B failure reports and cleanup | Caller-selected paths, complete redacted diagnostics and successful-result references; actual command/check/delivery successes remove matching failures without repeating accepted work | 6D/20C/21 connect child-report and abandonment/removal cleanup; keep the batch unmerged through 4C |
 | Working-folder attempts and result reuse | Planned | 6/7 connect qualification-level baselines, successful-result reuse, success-only receipts and receipt commits; 8 selects affected units |
 | Merge-back and beta qualification | Planned | 9/22 remove the remote prerequisite for local promotion and activate merge-back, incremental qualification and guarded fast-forward |
 | Public Build and receipt Deploy | Planned | Connect producers/consumers before repository adoption; installation does not rebuild or repeat acceptance tests |

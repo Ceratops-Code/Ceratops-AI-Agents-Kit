@@ -29,6 +29,7 @@ from repository_operation import (
     operation_category,
     prepare_operations,
     read_repository_contract,
+    remove_operation_failures,
     repository_commit,
     require_clean_commit,
 )
@@ -43,6 +44,7 @@ from github_pr_workflow.command import (
     capture_failure_report,
     describe_command_failure,
     release_write_context,
+    remove_resolved_failures,
     report_phase,
     run_command_for_json,
 )
@@ -521,6 +523,10 @@ def _checkpointed_operation_batch(
             )
         else:
             completed_results.append(result)
+            remove_operation_failures(
+                result, diagnostic_output=diagnostic_output,
+                diagnostic_owner=diagnostic_owner or (repo_root, "ship"),
+            )
 
     if first_pending == len(operations):
         return 0, _completed_operation_batch(operations, completed_results), checkpoints
@@ -592,7 +598,7 @@ def _call_github_ship(
     request.pending_work_scope = pending_scope
     try:
         return github_ship.ship(request)
-    except github_ship.ShipBlocked as exc:
+    except github_ship.wait_pr_checks.ShipBlocked as exc:
         raise RepositoryShipError(str(exc), describe_command_failure(exc)) from exc
     except (
         CommandError, github_ship.ShipError, github_ship.ensure_pr.EnsurePrError,
@@ -925,6 +931,10 @@ def _validate_phase(
         )
     if result.get("status") != "completed":
         raise RepositoryShipError("Validation runner returned an incomplete result.")
+    remove_operation_failures(
+        result, diagnostic_output=getattr(args, "diagnostic_output", None),
+        diagnostic_owner=getattr(args, "diagnostic_owner", None) or (args.repo_root, "ship"),
+    )
     return result
 
 
@@ -1002,7 +1012,7 @@ def _synchronized_post_merge_resume(
     head = repository_commit(repo_root)
     if not args.commit or not target_commit or not head or head == target_commit:
         return False
-    repository = github_ship._repository_name(repo_root, args.repo)
+    repository = github_ship.wait_pr_checks.resolve_repository_name(repo_root, args.repo)
     checkpoint_path = github_ship._checkpoint_path(repo_root, repository, target_commit)
     checkpoint: dict[str, Any] | None
     if checkpoint_path.is_file():
@@ -1075,8 +1085,15 @@ def ship_repository(args: argparse.Namespace) -> dict[str, object]:
         confirm_stopped=getattr(args, "confirm_previous_commands_stopped", False),
     ), capture_failure_report(
         getattr(args, "diagnostic_output", None), repo_root=owner_root, action=action,
+        failure_id="ship_repository",
     ):
-        return _ship_repository(args)
+        result = _ship_repository(args)
+        if result.get("status") in {"shipped", "already_shipped"}:
+            remove_resolved_failures(
+                result, diagnostic_output=getattr(args, "diagnostic_output", None),
+                repo_root=owner_root, action=action, resolved_failures=("ship_repository",),
+            )
+        return result
 
 
 def _ship_repository(args: argparse.Namespace) -> dict[str, object]:

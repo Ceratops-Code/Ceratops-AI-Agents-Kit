@@ -98,8 +98,13 @@ whole promotion finishes. Partial success retains the report; same-work
 replacement carries other unresolved failures forward. Restart, phase advance
 and unlock alone remove nothing. Successful/mixed results, receipts, acceptance
 logs, other actions' reports and unmanaged retained files are excluded.
-3B provides this API; 4B connects actual success callers, 6C handles child
-test-runner reports, and 20C/21 connect abandonment and worktree removal.
+4B connects those calls after successful commands, exact reused checks and
+completed operations, before later promotion work. The helper matches
+command/check IDs, not individual error messages. Partial success rewrites only
+the same report, retaining the other failures and successful-result paths.
+Cleanup errors are reported without changing an accepted result into failure.
+6D handles child test-runner reports; 20C/21 connect explicit request
+abandonment/replacement and worktree removal rather than matching-work success.
 
 ### Inputs To Capture
 

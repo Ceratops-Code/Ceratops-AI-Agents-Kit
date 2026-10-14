@@ -777,7 +777,7 @@ flush `ceratops-lifecycle-progress.v1` JSON lines before their terminal result;
 the JSON reader forwards phase events without interpreting them as completion.
 It never switches execution type by filename.
 
-#### Failure-report storage and ownership (3B)
+#### Failure-report storage and ownership (3B/4B)
 
 All three public parsers (`promote-repository.py`, `ship-repository.py`,
 and `python -m github_pr_workflow ship`) accept `--diagnostic-output FILE`.
@@ -823,9 +823,36 @@ Successful/mixed test results, build results, receipts, required acceptance logs
 other worktrees/actions and unmanaged user-retained files are excluded.
 No retention sweep, process discovery or repeat acceptance checks are added.
 
-3B supplies these report APIs and forwarding. Actual check/build/delivery success
-callers remain step 4B, test-runner report lifetime is 6C, and explicit
-abandonment/replacement and worktree-removal connections remain 20C/21.
+4B connects success at the code that consumes each result. Promote and
+`ship_repository.py` pass successful SDLC results to
+`repository_operation.py::remove_operation_failures()`. The executor also calls
+it for an exact reused pass and completed operation, and reports individual
+successful command positions before starting the next command. Deferred/no-op
+work is not a pass. Skill-action failures use the requesting SDLC operation and
+step identity, so completing one selected skill cannot clear another's report.
+Ship's retained delivery results use this same path without repeating effects.
+
+`command.py::remove_resolved_failures()` compares the supplied command/check IDs
+with the report's keys, not its diagnostic prose. Partial success writes the
+remaining failures and accepted-result references directly to the same path;
+complete resolution calls the writing helper's `remove_failure_report()`.
+It retains uncertain writers and files with different ownership or format.
+An I/O error is returned as `report_cleanup_error` on the successful result;
+it does not revoke that success or schedule another check/build/delivery.
+
+`ship.py::run_parallel_gates()` retires the selected repository/PR's CI failure
+after its existing exact-head check succeeds and the concurrent waits finish,
+including when review subsequently needs attention. CI waiting and blocker
+construction live in `wait_pr_checks.py`; polling and gate policy are unchanged.
+Other workflow-level errors clear only at that workflow's terminal success.
+No reader registry or per-error model review is involved. Test-runner-owned
+report cleanup remains 6D; explicit request abandonment/replacement and
+worktree-removal connections remain 20C/21.
+
+The cases in `tests/repository_lifecycle/test_failure_reports.py` cover matching
+success before later work, partial and reused passes, retained delivery results,
+wrong-owner and child-file preservation, and interruption around report writes
+and deletion. The GitHub workflow/shipping suites cover the moved check waiting.
 
 `command.py::release_write_context()` waits through the existing synchronous
 calls in `run_command()` and `repository_operation.py`. A shared in-memory
@@ -840,7 +867,7 @@ leave detached writing workers after returning.
 The automatic attempt ends and unlocks before the model edits code. A fresh
 normal call takes the lock and uses current inputs; clearing `unfinished_run`
 is not successful acceptance or permission to delete checkpoints. 3B supplies
-report handling; actual success cleanup remains 4B. The batch remains unmerged
+report handling and 4B connects matching-success cleanup. The batch remains unmerged
 through 4C;
 ordinary work in other task worktrees stays unlocked.
 

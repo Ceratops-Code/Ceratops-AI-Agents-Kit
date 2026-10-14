@@ -5,7 +5,7 @@ import importlib
 import json
 import pathlib
 import subprocess
-from typing import Any
+from typing import Any, Self
 
 import pytest
 
@@ -369,7 +369,7 @@ def test_integrated_ship_delegates_admin_semantics_to_merge_owner(
         "confirmed_actions_outage",
         lambda: None,
     )
-    monkeypatch.setattr(ship, "_repository_name", lambda *args: "example/repository")
+    monkeypatch.setattr(ship.wait_pr_checks, "resolve_repository_name", lambda *args: "example/repository")
     monkeypatch.setattr(ship, "_resolve_commit", lambda *args: head)
     monkeypatch.setattr(ship, "load_pending_work_scope", lambda *args: (None, None))
     monkeypatch.setattr(
@@ -520,7 +520,7 @@ def test_integrated_ship_delegates_admin_semantics_to_merge_owner(
         ],
         "unresolved_review_thread_count": 1,
     }
-    with pytest.raises(ship.ShipBlocked) as review_blocked:
+    with pytest.raises(ship.wait_pr_checks.ShipBlocked) as review_blocked:
         ship._enforce_review_thread_gate(
             argparse.Namespace(repo_root=repo, base_branch="main"),
             review_result,
@@ -579,8 +579,8 @@ def test_integrated_ship_delegates_admin_semantics_to_merge_owner(
             stderr="",
         ),
     )
-    with pytest.raises(ship.ShipBlocked) as ci_blocked:
-        ship.wait_for_ci_gate(
+    with pytest.raises(ship.wait_pr_checks.ShipBlocked) as ci_blocked:
+        ship.wait_pr_checks.wait_for_ci_gate(
             "24",
             repo,
             head,
@@ -697,22 +697,22 @@ def test_integrated_ship_delegates_admin_semantics_to_merge_owner(
             )
         raise AssertionError(command)
 
-    monkeypatch.setattr(ship.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(ship.wait_pr_checks.time, "monotonic", lambda: clock["now"])
     monkeypatch.setattr(
-        ship.time,
+        ship.wait_pr_checks.time,
         "sleep",
         lambda seconds: clock.__setitem__("now", clock["now"] + seconds),
     )
     monkeypatch.setattr(ship.readiness, "validate_readiness", ambiguous_readiness)
-    monkeypatch.setattr(ship, "run_json_command", uncertainty_json)
+    monkeypatch.setattr(ship.wait_pr_checks, "run_json_command", uncertainty_json)
     monkeypatch.setattr(
         ship.readiness, "run_command",
         lambda command, **kwargs: subprocess.CompletedProcess(
             command, 8, stdout=json.dumps(uncertainty_json(command).data), stderr="",
         ),
     )
-    with pytest.raises(ship.ShipBlocked) as ambiguous_blocked:
-        ship.wait_for_ci_gate(
+    with pytest.raises(ship.wait_pr_checks.ShipBlocked) as ambiguous_blocked:
+        ship.wait_pr_checks.wait_for_ci_gate(
             "24",
             repo,
             head,
@@ -771,7 +771,7 @@ def test_integrated_ship_delegates_admin_semantics_to_merge_owner(
             "explicit pending checks must not use uncertainty diagnostics"
         ),
     )
-    completed = ship.wait_for_ci_gate(
+    completed = ship.wait_pr_checks.wait_for_ci_gate(
         "24",
         repo,
         head,
@@ -817,8 +817,8 @@ def test_integrated_ship_delegates_admin_semantics_to_merge_owner(
             command, 1, stdout="", stderr="no checks reported on the release/local branch",
         ),
     )
-    with pytest.raises(ship.ShipBlocked) as missing_blocked:
-        ship.wait_for_ci_gate(
+    with pytest.raises(ship.wait_pr_checks.ShipBlocked) as missing_blocked:
+        ship.wait_pr_checks.wait_for_ci_gate(
             "24",
             repo,
             head,
@@ -843,7 +843,7 @@ def test_actions_availability_classifies_only_confirmed_outages(
         def __init__(self, payload: dict[str, Any]) -> None:
             self.raw = json.dumps(payload).encode("utf-8")
 
-        def __enter__(self) -> Response:
+        def __enter__(self) -> Self:
             return self
 
         def __exit__(self, *args: object) -> None:
@@ -948,7 +948,7 @@ def test_ship_stops_before_remote_mutation_on_confirmed_actions_outage(
         "restore_unfinished_checkpoints",
         lambda root: events.append("recover"),
     )
-    monkeypatch.setattr(ship, "_repository_name", lambda *args: "example/repository")
+    monkeypatch.setattr(ship.wait_pr_checks, "resolve_repository_name", lambda *args: "example/repository")
     monkeypatch.setattr(ship, "_resolve_commit", lambda *args: head)
     monkeypatch.setattr(ship, "load_pending_work_scope", lambda *args: (None, None))
     monkeypatch.setattr(
@@ -966,7 +966,7 @@ def test_ship_stops_before_remote_mutation_on_confirmed_actions_outage(
         "ensure_pr",
         lambda *args, **kwargs: pytest.fail("outage must stop before PR mutation"),
     )
-    with pytest.raises(ship.ShipBlocked) as blocked:
+    with pytest.raises(ship.wait_pr_checks.ShipBlocked) as blocked:
         ship._ship(
             argparse.Namespace(
                 repo_root=repo,
@@ -1031,7 +1031,7 @@ def test_ship_reconciles_merged_pr_before_actions_outage(
         "confirmed_actions_outage",
         lambda: pytest.fail("merged PR reconciliation must bypass outage probing"),
     )
-    monkeypatch.setattr(ship, "_repository_name", lambda *args: "example/repository")
+    monkeypatch.setattr(ship.wait_pr_checks, "resolve_repository_name", lambda *args: "example/repository")
     monkeypatch.setattr(ship, "_resolve_commit", lambda *args: head)
     monkeypatch.setattr(ship, "load_pending_work_scope", lambda *args: (None, None))
     monkeypatch.setattr(

@@ -99,9 +99,17 @@ commands stop. Tests passing can resolve their report while Ship still has work
 left. Partial success and same-work replacement preserve unresolved failures.
 Restart, phase advance and unlock do not delete reports. Cleanup excludes
 successful/mixed results, receipts, required acceptance logs, other actions'
-files and unmanaged retained reports. Step 4B still connects actual success
-callers, 6C connects test-runner report cleanup, and 20C/21 connect abandonment
-and worktree removal; 3B adds no scheduled cleanup or high-level failed receipt.
+files and unmanaged retained reports. 4B connects successful commands, exact
+reused checks and saved delivery results to this cleanup without repeating work.
+Ship also clears the matching repository/PR's CI failure after its existing
+checks pass and the concurrent waits stop, even if review needs attention.
+The check-waiting code lives in `github_pr_workflow/wait_pr_checks.py`; its polling
+and gate policy are unchanged. The helper compares command/check IDs, not error
+messages. Partial success rewrites the same report with remaining failures;
+cleanup trouble accompanies the success as `report_cleanup_error`.
+6D connects test-runner report cleanup, and 20C/21 connect explicit request
+abandonment/replacement and worktree removal. No scheduled cleanup or high-level
+failed receipt is added.
 
 ### Inputs To Capture
 
