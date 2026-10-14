@@ -325,6 +325,53 @@ def test_usage_leases_are_shared_and_block_retirement(tmp_path, monkeypatch):
         assert removable is True
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows console launch behavior")
+def test_launcher_hides_selected_child_and_allows_fresh_retries(tmp_path, monkeypatch):
+    launcher = importlib.import_module("ceratops_mcp_server_manager.launcher")
+    root = tmp_path / "fixture"
+    script = root / "bin/fixture.py"
+    script.parent.mkdir(parents=True)
+    script.write_text("", encoding="utf-8")
+    selected = {
+        "schema": 1,
+        "mcp_server_id": "fixture",
+        "version": "1.0.0",
+        "manifest_sha256": "a" * 64,
+        "instance": "b" * 32,
+        "module": "fixture_server",
+    }
+    (root / "current.json").write_text(json.dumps(selected), encoding="utf-8")
+    installation = root / "versions/1.0.0" / selected["instance"]
+    (installation / "environment/Scripts").mkdir(parents=True)
+    (installation / "receipt.json").write_text(json.dumps(selected), encoding="utf-8")
+    python = installation / "environment/Scripts/python.exe"
+    python.write_bytes(b"")
+
+    attempts = []
+
+    def run_child(arguments, **options):
+        attempts.append((arguments, options))
+        if len(attempts) == 1:
+            raise OSError("child could not start")
+        return 9 if len(attempts) == 2 else 0
+
+    monkeypatch.setattr(launcher, "__file__", str(script))
+    monkeypatch.setattr(launcher.sys, "argv", [str(script), "--serve"])
+    monkeypatch.setattr(launcher.subprocess, "call", run_child)
+    monkeypatch.setenv("PYTHONPATH", "ignored")
+
+    with pytest.raises(OSError, match="child could not start"):
+        launcher.main()
+    assert launcher.main() == 9
+    assert launcher.main() == 0
+    assert len(attempts) == 3
+    for arguments, options in attempts:
+        assert arguments == [str(python), "-I", "-B", "-m", "fixture_server", "--serve"]
+        assert options["creationflags"] == launcher.subprocess.CREATE_NO_WINDOW
+        assert "PYTHONPATH" not in options["env"]
+        assert {"stdin", "stdout", "stderr"}.isdisjoint(options)
+
+
 @pytest.mark.parametrize("metadata_name", ["example_mcp_server", "Example-MCP-Server", "example.mcp.server", "example__mcp__server"])
 @pytest.mark.parametrize("mcp_server", ["example_mcp_server", "example-mcp-server"])
 def test_underscore_identity_installs_with_normalized_wheel_metadata(deployment, tmp_path, metadata_name, mcp_server):
