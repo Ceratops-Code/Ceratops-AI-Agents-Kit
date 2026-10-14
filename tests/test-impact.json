@@ -151,6 +151,7 @@
     "scripts/.yamllint.yml",
     "scripts/package-lock.json",
     "scripts/package.json",
+    "scripts/result_records.py",
     "scripts/testing/run-tests.py",
     "scripts/testing/runner_requests.py",
     "scripts/testing/pytest-diagnostics.py",
