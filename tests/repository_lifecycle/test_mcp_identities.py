@@ -15,6 +15,7 @@ from tests.repository_lifecycle.test_sdlc_handoffs import (
     _v4_fixture,
     contracts,
     runner,
+    skill_actions,
 )
 
 
@@ -43,8 +44,8 @@ def test_mcp_identity_survives_contract_preparation(tmp_path, version, name):
 @pytest.mark.parametrize("name", ["_server", "server_", "server__name", "Server", "../server"])
 def test_malformed_mcp_names_stop_before_execution(tmp_path, monkeypatch, name):
     calls = []
-    monkeypatch.setattr(runner, "run_progress_command", lambda *a, **k: calls.append(a))
-    result = runner.execute_handoff("ceratops-mcp-server-lifecycle/install", tmp_path,
+    monkeypatch.setattr(skill_actions, "run_progress_command", lambda *a, **k: calls.append(a))
+    result = skill_actions.execute_handoff("ceratops-mcp-server-lifecycle/install", tmp_path,
                                     inputs={"mcp-server": name})
     assert result["status"] == "handoff_required" and calls == []
     fixture = _v4_fixture()
@@ -78,13 +79,13 @@ def test_underscore_identity_reaches_the_authorized_installer(tmp_path, monkeypa
             raise KeyboardInterrupt
         return subprocess.CompletedProcess(argv, 0, "", "")
 
-    monkeypatch.setattr(runner, "run_progress_command", execute)
+    monkeypatch.setattr(skill_actions, "run_progress_command", execute)
     for _ in range(2):
         if interruption:
             with pytest.raises(KeyboardInterrupt):
-                runner.execute_handoff(f"{skill}/install", repo, inputs={"mcp-server": name})
+                skill_actions.execute_handoff(f"{skill}/install", repo, inputs={"mcp-server": name})
         else:
-            assert runner.execute_handoff(f"{skill}/install", repo,
+            assert skill_actions.execute_handoff(f"{skill}/install", repo,
                                           inputs={"mcp-server": name})["status"] == "completed"
     assert len(calls) == (0 if interruption == "before" else 2)
     assert all(argv[-2:] == ["--mcp-server-name", name] for argv in calls)

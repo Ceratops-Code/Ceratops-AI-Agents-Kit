@@ -121,9 +121,27 @@ validation and test results before dependent work proceeds.
 The reusable operation procedure belongs to the repository-lifecycle skill's
 `repository_operation.py`: read the selected repository's YAML, select the
 applicable operations, run commands and gates, and resolve skill-owned
-executable bindings. This avoids each lifecycle helper implementing its own
+executable bindings through `execute_skill_actions.py`. This avoids each
+lifecycle helper implementing its own
 interpretation of those declarations. It does not move repository tests into
 the skill.
+
+`execute_skill_actions.py` belongs to the repository runner, not the invoked
+skill: it calls both managed-skill actions and MCP-server installation. The
+actual source checks and deployment stay in those skills. Each action in
+`references/action-executors.json` declares ordinary `run` or ordered `steps`
+and may also declare a `selected-skill` object with its own `run` or `steps`.
+An explicit `inputs.skill` selects that object and supplies `{skill}`; without
+it, the ordinary form applies. All commands in the chosen form are checked
+before the first command starts. A missing or malformed named-skill form returns
+`handoff_required`, with no fallback to the ordinary form and no partial effects.
+The executor neither identifies skill script filenames nor inserts skill
+selection flags. Source and installed bindings must still agree; installed
+Python commands keep their pinned runtime. Commands run in declared order,
+stop at the first failure, and preserve step results and diagnostic paths.
+The module writes no separate state: existing command-report owners retain
+responsibility for report paths and cleanup. Receipt-only deployment remains
+planned in step 19; the current installer still owns its source-check prerequisite.
 
 The v4/v5 declaration owners are
 `skills/ceratops-repo-lifecycle/references/schemas/sdlc.v5.schema.json` and
@@ -580,7 +598,8 @@ introduced.
 ## Working-folder acceptance methodology (planned)
 
 This section owns the approved target methodology: one release lock for a
-complete automatic promotion or Ship attempt, ordinary work in other worktrees, and explicit
+complete automatic promotion or Ship attempt, ordinary work in other worktrees,
+and explicit
 recovery after an uncertain interruption. Automatic child-process recovery
 is optional future work.
 It does not claim that the complete execution path is
@@ -820,7 +839,8 @@ leave detached writing workers after returning.
 The automatic attempt ends and unlocks before the model edits code. A fresh
 normal call takes the lock and uses current inputs; clearing `unfinished_run`
 is not successful acceptance or permission to delete checkpoints. 3B supplies
-report handling; actual success cleanup remains 4B. The batch remains unmerged through 4C;
+report handling; actual success cleanup remains 4B. The batch remains unmerged
+through 4C;
 ordinary work in other task worktrees stays unlocked.
 
 The current Ship invocation holds the same lock through its CI/review waits,
@@ -1102,7 +1122,8 @@ then fast-forward to the exact accepted commit with an expected-old guard and
 update the owning release checkout/index. A manual release move that bypasses
 the helper returns to merge-back and affected-work selection rather than
 overwriting newer work. These loops remain steps 9/22, not a 3A Git-policy change.
-Normal retries reuse applicable accepted results. Never rebase or discard newer work.
+Normal retries reuse applicable accepted results. Never rebase or discard
+newer work.
 
 Promotion qualifies actual beta artifacts through the shared Build operation.
 After merge-back, run affected qualification and assign a subsequent beta version
@@ -1123,7 +1144,8 @@ capture the requested units, target branch and selected delivery stages first.
 1. Acquire the release lock before fetching or choosing a candidate. Keep the
    same local Ship process and lock through every selected stage below, including
    automatic CI/review waits. End the attempt and unlock when model correction
-   is needed; the next call reacquires and uses current state. Do not deploy during preparation.
+   is needed; the next call reacquires and uses current state. Do not deploy
+   during preparation.
 2. Fetch remote `main`, record its commit and update local `main` without
    overwriting independent or dirty work. Integrate that commit into
    `release/local`: already included means no change; behind-only means
@@ -1585,6 +1607,38 @@ removes only its owned temporary record after validating completion. It
 preserves failed, incomplete, mismatched, or changed records. Cleanup must
 never rerun deployment. A bare `OK` detached from the recorded operation does
 not prove that an arbitrary saved record is eligible for removal.
+
+The skill-lifecycle managed installer owns source-based deployment as one
+callable operation; its CLI only supplies inputs and presents the result.
+Concurrent calls in one Python process are serialized because the existing
+builder keeps its source repository in module variables. Calls restore the
+caller's working directory unless installation retired that directory; this
+uses an in-memory lock, not another lock file or saved operation record.
+Before installation it resolves the source and destination, exact deployment
+mode, selected skill names, and any supplied promotion bindings. It runs the
+existing source-check script with the current interpreter: `full` for an
+all-managed request, or `skill` with the exact explicit or base-derived names.
+Source-check failure prevents the runtime transaction from starting. Inventory,
+removal-only and empty affected-set requests have no source-installation gate.
+The deploy action binding calls this installer once; it does not run a second
+source check outside the installer.
+The source checker's imported `check_skill_runtime_inputs.py` owns checks of
+declared payload paths, shared Python declarations and files destined for the
+installed skills. Each call receives its repository and selection explicitly;
+the helper stores no repository selection, writes no files and adds no CLI.
+Clean Git sources are checked for commit movement before installation and
+before reporting commit-bound completion. Dirty and non-Git source installs
+remain supported, but they carry no commit attestation and cannot complete a
+saved promotion. This flow does not freeze files against simultaneous edits.
+
+The existing runtime transaction remains responsible for destination ownership,
+activation, rollback and retired-output cleanup. The installer adds no storage
+layer, source-check history, implicit package build or deployment retry. A
+successful installation followed by failed promotion cleanup keeps the actual
+completion receipt, complete cleanup error output and cleanup-only command.
+The caller may pass that receipt to the existing finalizer without reinstalling.
+Repository package build/test acceptance remains with the SDLC caller: current
+installer inputs do not independently identify those accepted package results.
 
 MCP server deployment can route to
 `ceratops-mcp-server-lifecycle/install`. Its installed binding invokes the

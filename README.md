@@ -108,10 +108,12 @@ contracts. `skills/ceratops-skill-lifecycle/references/` owns
 skill-design contracts and skill source-doc tracking. The
 `skills-contract-review` action refreshes those contracts against registered
 best-practice evidence; it does not audit skills or run the source validator.
-The `source-validate` action owns deterministic source validation through the
-existing validator in its skill bundle, with `full`, selected `skill`, and
-shared `sections` modes. Deployment requires its passing `full` result for
-unchanged source inputs. The separate `skills-consistency-review` action audits
+The `source-validate` action checks source through the existing helper in its
+skill bundle, with `full`, selected `skill`, and shared `sections` modes.
+The managed installer runs that source check itself before installation: `full`
+for all managed skills, or `skill` for the exact selected or base-derived set.
+Removal-only, empty affected-set and inventory requests do not install source
+and do not run that check. The separate `skills-consistency-review` action audits
 one direct manifest-backed
 installed skill, regardless of its name, against the contracts and checks its
 coupled metadata, action references, automation consumers, helpers, installer,
@@ -150,7 +152,7 @@ without repository deduplication.
 | `skills/ceratops-repo-lifecycle/references/templates/validate-repository.py.tmpl`, `validate.yml.tmpl`, and `run-actionlint.py.tmpl` | Repository-neutral validation templates created only when their target files are absent; new validation setups receive a pinned, checksum-verified actionlint runner, and setups without JavaScript package-manager files also receive locked Markdown dependencies and default rules. Existing tooling, Markdown settings, and exclusive validators are preserved. |
 | `skills/ceratops-repo-lifecycle/scripts/ceratops_repo_compatibility_engine/` | Skill-owned package with the shared compatibility-contract loader, read-only compatibility checks, SDLC-contract validation, rollback-protected Ceratops compatibility application, and version-only bootstrap synchronization; it operates on explicit target repositories and is never copied into them. |
 | `skills/ceratops-repo-lifecycle/references/templates/skill-sections.json.tmpl` | Repository-neutral template for creating a target repository's live `skills/skill-sections.json`; never a live manifest. |
-| `skills/ceratops-skill-lifecycle/scripts/runtime/install-managed-skills.py` | Classifies exact affected sets, owns direct-manifest inventory and explicit prior-owner migration, and invokes one runtime transaction; emits commit-bound completion evidence and finalizes saved promotion handoffs with optional repeated `--deployment-evidence` sibling receipts, without replaying deployment. |
+| `skills/ceratops-skill-lifecycle/scripts/runtime/install-managed-skills.py` | Owns the managed deployment callable and its CLI: checks request inputs and the exact source selection before one runtime transaction; handles inventory and explicit prior-owner migration; emits commit-bound completion evidence and finalizes saved promotion handoffs with optional repeated `--deployment-evidence` sibling receipts. Cleanup failure preserves the installation receipt and cleanup-only call, without reinstalling. |
 | `skills/ceratops-skill-lifecycle/scripts/runtime/managed_runtime_builder.py` | Stages, activates, rolls back, recovers, and cleans one locked selected-skill runtime transaction. |
 | `skills/ceratops-skill-lifecycle/scripts/skill-update-workflow.py` | Prints normal results and errors as UTF-8 under Windows legacy output encodings. Initializes ordinary updates from repeated skill/path groups and UTF-8 command files, or opens caller-owned requests. It discovers one unfinished skill change per worktree, records approved scope against the original baseline, saves immutable state/check generations, and drives verification to one next action. Scope expansion and failed-request replacement preserve the original baseline; exact passed checks are reused, and close consumes saved success without rechecking source. The caller edits, commits and requests promotion/deployment separately; this helper never runs repository tests. |
 | `skills/ceratops-skill-lifecycle/scripts/skill_update_checks.py` | Runs declared checks without a shell, records deterministic search applicability for safe reuse, and carries failure evidence to the update workflow. Failed pytest checks print test identities and reported errors from the same run, preserve complete structured failure details before scratch cleanup, mark bounded output, and use the captured terminal diagnostic when the native report is unavailable. |
@@ -180,10 +182,12 @@ without repository deduplication.
 | `skills/ceratops-repo-lifecycle/scripts/pending-work-cleanup.py` | Checks named directory boundaries, preserves active skill-update state, and removes selected residual and task-temp trees after clearing read-only Windows files and directories without traversing links. |
 | `skills/ceratops-repo-lifecycle/scripts/action.yml` | GitHub composite action that runs declared validation and, by default, tests using the skill-owned SDLC engine; `run-tests: false` permits validation-only CI when tests require an interactive desktop. CI defers skill handoffs and retains failure evidence. |
 | `skills/ceratops-repo-lifecycle/scripts/repository_operation.py` | Single capability runner: resolves complete YAML locations, prevalidates ordered argv/parameters/cwd, runs applicable validation and test gates before deployment or publication, and retains bounded structured step results separately from command completion; skill callers execute registered handoffs and CI defers them. |
+| `skills/ceratops-repo-lifecycle/scripts/execute_skill_actions.py` | Runs a skill action's declared commands for the repository runner. Selects ordinary or named-skill arguments before any command starts, preserves installed/source agreement and pinned Python execution, and returns step results and complete failure-report paths. It calls the owning skill's implementation; it does not install skills itself. |
 | `skills/ceratops-repo-lifecycle/scripts/ship-repository.py` | Public Ship argument parser and JSON/exit-code adapter; calls `github_pr_workflow/ship_repository.py`. |
 | `skills/ceratops-repo-lifecycle/scripts/github_pr_workflow/ship_repository.py` | Callable Ship orchestration and shared inputs/errors, used by both the CLI and Promote: SDLC checks, direct GitHub workflow calls, publication, installation and cleanup. |
 | `skills/ceratops-repo-lifecycle/scripts/rename-repository-path.py` | Plans or applies tracked file renames and exact filename references; accepts explicit or Git-detected rename pairs, updates relative Markdown links, blocks ambiguous references, preserves the index and text bytes outside replacements, and compensates caught file errors. |
 | `skills/ceratops-skill-lifecycle/scripts/skills-consistency-source-validator.py` | Source, metadata, runtime-input, contract, and portability validator invoked by source-validate and explicit skill workflows. It accepts optional skill-local `README.md` design documentation and a matching relative README Skills-table link. Full validation and selected skill-lifecycle validation check the deterministic contract against its closed schema, supported command arguments, and existing helper paths. The schema identifies descriptive fields as annotations; validation never executes contract-supplied commands. |
+| `skills/ceratops-skill-lifecycle/scripts/check_skill_runtime_inputs.py` | Checks runtime payload paths, shared Python declarations, and source files destined for installed skills. Imported by the source checker with an explicit repository and skill selection; writes no files and adds no separate command. |
 | `skills/ceratops-skill-lifecycle/scripts/skill_update_state.py` | Owns update state, filesystem boundaries and cleanup-record validation; successful successor finalization removes only unchanged inherited disposable records and preserves protected inputs. |
 | `skills/ceratops-skill-lifecycle/scripts/fast-change.py` | Classifies exact structured replacements, generates their diff, and owns the eligible direct-release change through declared Markdown lint, exact helper tests, targeted installation, commit, and failure compensation. |
 
@@ -231,7 +235,15 @@ are setup metadata; declaring them does not install dependencies. Bootstrap
 operations perform declared setup, and uv prepares the environment for commands
 invoked through it. SDLC v4/v5 handoffs name a skill/action. For skill callers,
 the engine resolves the installed skill's `references/action-executors.json` and
-runs its declared argv or ordered steps; unresolved routes block dependent work.
+runs its declared argv or ordered steps through `execute_skill_actions.py`.
+Each action keeps its ordinary `run` or `steps`; an optional `selected-skill`
+object declares a separate `run` or `steps` for requests containing `inputs.skill`.
+Only that explicit input supplies `{skill}`. Missing or malformed selected-skill
+commands return `handoff_required` before any command runs, never an all-skills
+fallback. The runner checks every selected command first and does not recognize
+skill script filenames or inject selection flags. Unresolved routes block
+dependent work. Deployment still performs its source check inside the installer;
+receipt-only installation is planned in refactor step 19, not implemented here.
 CI uses `--ci`, never dispatches skills, and reports deferred handoffs
 separately. SDLC versions 1 through 3 are rejected and must be upgraded before
 lifecycle execution.
@@ -457,7 +469,8 @@ do not finalize/reopen between corrections. Finalization consumes the saved
 successful verification, so later source advancement does not repeat its checks.
 The generated-runner result contract and compatibility probe are implemented in
 1e.3. Release invocation locking is connected in 2B and clean unsuccessful exits
-in 3A; 3B supplies reports and 4B connects success cleanup. Affected-check reuse remains step 6, with general ownership
+in 3A; 3B supplies reports and 4B connects success cleanup. Affected-check reuse
+remains step 6, with general ownership
 derivation and an optional Nx trial later.
 
 The 1c preservation checkpoint reverified the unchanged `prepare`, `amend`,
@@ -532,7 +545,8 @@ protected work, the helper writes and flushes `1` in place. The outer owner
 calls `complete(commands_stopped=True)` once its commands have stopped, whether
 the attempt succeeded, failed or needs a model decision. `finally` writes and
 flushes `0` before unlocking, including when propagating an exception. A crash
-or unknown command shutdown leaves uncertainty. A later caller must acquire the native
+or unknown command shutdown leaves uncertainty. A later caller must acquire
+the native
 lock and explicitly confirm that the previous commands stopped before retrying.
 Confirmation cannot bypass a busy lock or a caller-known running command.
 The helper neither launches nor discovers processes. It creates no temporary
@@ -545,7 +559,8 @@ before selecting release work until its synchronous commands finish. Promotion
 calls `github_pr_workflow.ship_repository.ship_repository(ShipOptions(...))`,
 and Ship calls `github_pr_workflow.ship.ship()` directly. Neither call builds
 CLI arguments or captures printed JSON; nested calls retain the same lock.
-The public Ship CLI calls that same implementation. Independent processes cannot borrow it. The lock
+The public Ship CLI calls that same implementation. Independent processes cannot
+borrow it. The lock
 also covers today's CI/review wait, publication and installation calls.
 Synchronization and PR preparation also take it when they can change the primary
 checkout, even while it is on `main`: promotion may switch that checkout to

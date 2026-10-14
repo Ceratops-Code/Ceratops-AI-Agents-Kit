@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import runpy
 import shlex
+import shutil
 import subprocess
 import sys
 
@@ -805,9 +807,178 @@ def test_source_validation_covers_action_assignments(tmp_path: pathlib.Path, mod
     invalid = subprocess.run(command, capture_output=True, text=True, check=False)
     assert invalid.returncode != 0
     assert "unknown section assignment" in invalid.stderr
-    validator = load_source_validator(repo / "skills")
+    runtime_inputs = runpy.run_path(str(VALIDATOR.with_name("check_skill_runtime_inputs.py")))
     manifest["actions"]["alpha-tool"]["references/review.md"] = ["review-policy"]
-    validator["manifest_runtime_input_paths"].__globals__["ROOT"] = repo
-    inputs = validator["manifest_runtime_input_paths"](manifest, [repo / "skills/alpha-tool", repo / "skills/beta-tool"], {"alpha-tool"})
+    inputs = runtime_inputs["manifest_runtime_input_paths"](repo, manifest, [repo / "skills/alpha-tool", repo / "skills/beta-tool"], {"alpha-tool"})
     assert repo / "skills/sections/review-policy.md" in inputs
     assert repo / "skills/sections/review-extra.md" not in inputs
+
+
+@pytest.mark.parametrize("mode", ["sections", "skill", "full"])
+@pytest.mark.parametrize("content", [b"{", b"[]", b"null", b'"text"', b"\xff"])
+def test_source_checker_reports_malformed_manifest(
+    tmp_path: pathlib.Path, mode: str, content: bytes,
+) -> None:
+    repo = tmp_path / "source"
+    create_compatible_repo(repo, "example/malformed", ["alpha-tool"])
+    (repo / "skills/skill-sections.json").write_bytes(content)
+    command = [sys.executable, str(VALIDATOR), "--repo-root", str(repo), "--mode", mode]
+    if mode == "skill":
+        command.extend(["--skill", "alpha-tool"])
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    assert result.returncode == 1
+    assert "skills/skill-sections.json: cannot read manifest" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not result.stdout
+
+
+@pytest.mark.parametrize("mode", ["sections", "skill", "full"])
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("validation_profile", [], "validation_profile must be"),
+        ("skills", {"alpha-tool": [{}]}, "section assignment"),
+        ("sections", [], "sections must be an object"),
+    ],
+)
+def test_source_checker_reports_malformed_manifest_fields(
+    tmp_path: pathlib.Path, mode: str, field: str, value: object, message: str,
+) -> None:
+    repo = tmp_path / "source"
+    create_compatible_repo(repo, "example/shape", ["alpha-tool"])
+    manifest_path = repo / "skills/skill-sections.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest[field] = value
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    command = [sys.executable, str(VALIDATOR), "--repo-root", str(repo), "--mode", mode]
+    if mode == "skill":
+        command.extend(["--skill", "alpha-tool"])
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    assert result.returncode == 1
+    assert message in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+@pytest.mark.parametrize("mode", ["sections", "skill", "full"])
+def test_source_checker_reports_independent_unreadable_skills(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str], mode: str,
+) -> None:
+    repo = tmp_path / "source"
+    create_compatible_repo(repo, "example/unreadable", ["alpha-tool", "beta-tool"])
+    checker = load_source_validator(repo / "skills")
+    original_read = pathlib.Path.read_text
+    unreadable = {repo / "skills" / name / "SKILL.md" for name in ("alpha-tool", "beta-tool")}
+
+    def read_source(path: pathlib.Path, *args, **kwargs):
+        if path in unreadable:
+            raise OSError("fixture read failure")
+        return original_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "read_text", read_source)
+    arguments = ["--repo-root", str(repo), "--mode", mode]
+    if mode == "skill":
+        arguments.extend(["--skill", "alpha-tool", "--skill", "beta-tool"])
+    assert checker["main"](arguments) == 1
+    output = capsys.readouterr()
+    assert "alpha-tool" in output.err and "beta-tool" in output.err
+    assert "fixture read failure" in output.err
+    assert "Traceback" not in output.err
+    assert not output.out
+
+
+@pytest.mark.parametrize("mode", ["sections", "skill", "full"])
+def test_source_checker_reports_unreadable_manifest(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str], mode: str,
+) -> None:
+    repo = tmp_path / "source"
+    create_compatible_repo(repo, "example/unreadable-manifest", ["alpha-tool"])
+    checker = load_source_validator(repo / "skills")
+    original_read = pathlib.Path.read_text
+
+    def read_source(path: pathlib.Path, *args, **kwargs):
+        if path == repo / "skills/skill-sections.json":
+            raise OSError("fixture manifest failure")
+        return original_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "read_text", read_source)
+    arguments = ["--repo-root", str(repo), "--mode", mode]
+    if mode == "skill":
+        arguments.extend(["--skill", "alpha-tool"])
+    assert checker["main"](arguments) == 1
+    output = capsys.readouterr()
+    assert "skills/skill-sections.json: cannot read manifest" in output.err
+    assert "fixture manifest failure" in output.err
+    assert "Traceback" not in output.err
+
+
+@pytest.mark.parametrize("selection", [None, "", "missing-tool", "all"])
+def test_source_checker_bad_selection_never_checks_all_skills(
+    tmp_path: pathlib.Path, selection: str | None,
+) -> None:
+    repo = tmp_path / "source"
+    create_compatible_repo(repo, "example/selection", ["alpha-tool", "beta-tool"])
+    (repo / "skills/beta-tool/SKILL.md").write_text("unselected broken input", encoding="utf-8")
+    command = [sys.executable, str(VALIDATOR), "--repo-root", str(repo), "--mode", "skill"]
+    if selection is not None:
+        command.extend(["--skill", selection])
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    assert result.returncode != 0
+    assert "beta-tool" not in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not result.stdout
+
+
+def test_runtime_input_checks_keep_explicit_root_and_selection(tmp_path: pathlib.Path) -> None:
+    runtime_inputs = runpy.run_path(str(VALIDATOR.with_name("check_skill_runtime_inputs.py")))
+    selected = {"alpha-tool", "missing-tool"}
+    for name in ("first", "second"):
+        repo = tmp_path / name
+        create_compatible_repo(repo, f"example/{name}", ["alpha-tool", "beta-tool"])
+        manifest = json.loads((repo / "skills/skill-sections.json").read_text(encoding="utf-8"))
+        manifest["skills"]["alpha-tool"].append({"bad": "section"})
+        inputs = runtime_inputs["manifest_runtime_input_paths"](
+            repo, manifest, [repo / "skills/alpha-tool", repo / "skills/beta-tool"], selected,
+        )
+        assert selected == {"alpha-tool", "missing-tool"}
+        assert repo / "skills/alpha-tool" in inputs
+        assert repo / "skills/beta-tool" not in inputs
+        assert all(path.is_relative_to(repo) for path in inputs)
+
+
+def test_runtime_input_scan_reports_read_errors_and_preserves_binary_payloads(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_inputs = runpy.run_path(str(VALIDATOR.with_name("check_skill_runtime_inputs.py")))
+    binary = tmp_path / "asset.bin"
+    binary.write_bytes(b"\xff\x00")
+    blocked = [tmp_path / "first.md", tmp_path / "second.md"]
+    for path in blocked:
+        path.write_text("fixture", encoding="utf-8")
+    original_read = pathlib.Path.read_text
+
+    def read_source(path: pathlib.Path, *args, **kwargs):
+        if path in blocked:
+            raise OSError("fixture read failure")
+        return original_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "read_text", read_source)
+    errors = runtime_inputs["check_runtime_input_safety"](tmp_path, [binary, *blocked])
+    assert len(errors) == 2
+    assert all("cannot read runtime input" in error for error in errors)
+    assert any("first.md" in error for error in errors)
+    assert any("second.md" in error for error in errors)
+
+
+def test_source_checker_loads_installed_sibling_helper(tmp_path: pathlib.Path) -> None:
+    installed = tmp_path / "installed" / "scripts"
+    installed.mkdir(parents=True)
+    for source in (VALIDATOR, VALIDATOR.with_name("check_skill_runtime_inputs.py")):
+        shutil.copy2(source, installed / source.name)
+    result = subprocess.run(
+        [sys.executable, str(installed / VALIDATOR.name), "--help"],
+        cwd=tmp_path, capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "--mode" in result.stdout

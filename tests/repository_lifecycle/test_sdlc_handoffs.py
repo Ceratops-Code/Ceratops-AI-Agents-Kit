@@ -30,6 +30,7 @@ from tests.support.processes import run_compatibility_engine
 from tests.support.repositories import ROOT, run_ci_action, run_git
 
 runner = importlib.import_module("repository_operation")
+skill_actions = importlib.import_module("execute_skill_actions")
 storage = importlib.import_module("store_artifacts")
 contracts = importlib.import_module(
     "ceratops_repo_compatibility_engine.sdlc_contract_validation"
@@ -522,7 +523,7 @@ def test_v4_tests_gate_mutations_and_ci_never_dispatches_handoffs(
         calls.append(route)
         return {"status": "completed"}
 
-    monkeypatch.setattr(runner, "execute_handoff", record_handoff)
+    monkeypatch.setattr(skill_actions, "execute_handoff", record_handoff)
     handoff = runner.prepare_operations(
         tmp_path,
         [runner.OperationRequest("deliverables.apps.service.actions.validate")],
@@ -3403,7 +3404,7 @@ def test_registered_skill_executor_is_portable_and_failure_is_not_completion(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    handoffs = runner
+    handoffs = skill_actions
     skill = tmp_path / "skills/example-skill"
     (skill / "references").mkdir(parents=True)
     (skill / "scripts").mkdir()
@@ -3493,7 +3494,7 @@ def test_registered_skill_executor_uses_installed_authorized_source_bundle(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    handoffs = runner
+    handoffs = skill_actions
     codex_home = tmp_path / "codex"
     installed = codex_home / "skills" / "example-skill"
     source_repo = tmp_path / "repository"
@@ -3552,7 +3553,7 @@ def test_tool_install_binding_uses_checkout_metadata_and_propagates_failures(
     failure: str | None,
     selected_mcp_server: str | None,
 ) -> None:
-    handoffs = runner
+    handoffs = skill_actions
     skill = tmp_path / "skills/ceratops-mcp-server-lifecycle/references"
     skill.mkdir(parents=True)
     shutil.copyfile(
@@ -3607,7 +3608,7 @@ def test_tool_install_binding_uses_checkout_metadata_and_propagates_failures(
 def test_tool_install_binding_rejects_unknown_structured_inputs(
     tmp_path: pathlib.Path,
 ) -> None:
-    result = runner.execute_handoff(
+    result = skill_actions.execute_handoff(
         "ceratops-mcp-server-lifecycle/install",
         tmp_path,
         inputs={"mcp-server": "sample-mcp-server", "unexpected": "value"},
@@ -3623,7 +3624,7 @@ def test_tool_install_binding_rejects_unknown_structured_inputs(
 def test_tool_install_binding_defers_package_backed_selection(
     tmp_path: pathlib.Path,
 ) -> None:
-    result = runner.execute_handoff(
+    result = skill_actions.execute_handoff(
         "ceratops-mcp-server-lifecycle/install",
         tmp_path,
         inputs={
@@ -3794,6 +3795,234 @@ def test_tool_install_helper_runs_manager_once_and_attests_selection(
     assert receipt["transaction_id"] == instance
 
 
+def _declared_skill_commands(tmp_path, monkeypatch, action, declaration):
+    """Install matching declarations with deliberately unfamiliar script names."""
+    repo = tmp_path / "repository"
+    source = repo / "skills/ceratops-skill-lifecycle"
+    installed = tmp_path / "codex/skills/ceratops-skill-lifecycle"
+    document = {"version": 1, "actions": {action: declaration}}
+    for root in (source, installed):
+        (root / "references").mkdir(parents=True)
+        (root / "references/action-executors.json").write_text(json.dumps(document))
+    (source / "scripts").mkdir()
+    probe = """import argparse, json, pathlib
+parser = argparse.ArgumentParser()
+parser.add_argument('--repo', type=pathlib.Path, required=True)
+parser.add_argument('--target')
+parser.add_argument('--phase', required=True)
+parser.add_argument('--fail', action='store_true')
+args = parser.parse_args()
+with (args.repo / 'calls.jsonl').open('a') as stream:
+    stream.write(json.dumps({'phase': args.phase, 'skill': args.target}) + chr(10))
+if args.fail:
+    raise SystemExit(9)
+print(json.dumps({'schema': 'fixture.skill-action.v1', 'status': 'passed',
+                  'skill': args.target, 'phase': args.phase}))
+"""
+    for name in ("check_named_sources.py", "copy_named_skills.py"):
+        (source / "scripts" / name).write_text(probe)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    return repo
+
+
+def _declared_skill_argv(action, phase, *, selected):
+    script = "check_named_sources.py" if action == "source-validate" else "copy_named_skills.py"
+    argv = ["{python}", "{skill_root}/scripts/" + script,
+            "--repo", "{repo_root}", "--phase", phase]
+    return [*argv, "--target", "{skill}"] if selected else argv
+
+
+@pytest.mark.parametrize("read_owner", ["source", "installed"])
+@pytest.mark.parametrize("selected", [False, True])
+def test_skill_action_binding_read_failure_stops_before_commands(
+    tmp_path, monkeypatch, read_owner, selected,
+):
+    declaration = {
+        "run": _declared_skill_argv("deploy", "all", selected=False),
+        "selected-skill": {"run": _declared_skill_argv("deploy", "one", selected=True)},
+    }
+    repo = _declared_skill_commands(tmp_path, monkeypatch, "deploy", declaration)
+    root = repo if read_owner == "source" else tmp_path / "codex"
+    broken = root / "skills/ceratops-skill-lifecycle/references/action-executors.json"
+    original_read = pathlib.Path.read_bytes
+    calls = []
+
+    def read_bytes(path):
+        if path == broken:
+            raise PermissionError(f"Cannot read {read_owner} declaration")
+        return original_read(path)
+
+    monkeypatch.setattr(pathlib.Path, "read_bytes", read_bytes)
+    monkeypatch.setattr(skill_actions, "run_progress_command", lambda *a, **k: calls.append(a))
+    result = skill_actions.execute_handoff(
+        "ceratops-skill-lifecycle/deploy", repo,
+        inputs={"skill": "example-skill"} if selected else None,
+    )
+    assert result == {
+        "status": "operation_failed",
+        "handoff": "ceratops-skill-lifecycle/deploy",
+        "message": f"Cannot read {read_owner} declaration",
+    }
+    assert calls == []
+    assert not (repo / "calls.jsonl").exists()
+
+
+@pytest.mark.parametrize("action", ["source-validate", "deploy"])
+@pytest.mark.parametrize("selected", [False, True])
+@pytest.mark.parametrize("form", ["run", "steps"])
+def test_declared_skill_forms_run_exact_arguments_in_order(
+    tmp_path, monkeypatch, action, selected, form,
+):
+    def commands(targeted):
+        first = {"run": _declared_skill_argv(action, "first", selected=targeted)}
+        return first if form == "run" else {"steps": [first, {
+            "run": _declared_skill_argv(action, "second", selected=targeted),
+        }]}
+
+    declaration = {**commands(False), "selected-skill": commands(True)}
+    original = deepcopy(declaration)
+    repo = _declared_skill_commands(tmp_path, monkeypatch, action, declaration)
+    inputs = {"skill": "example-skill", "prerequisite-packages": ["shared-package"]} if selected else None
+    phases = ["first"] if form == "run" else ["first", "second"]
+    for _ in range(2):
+        result = skill_actions.execute_handoff(
+            "ceratops-skill-lifecycle/" + action, repo, inputs=inputs,
+        )
+        assert result["status"] == "completed", result
+        assert result["steps"] == list(range(1, len(phases) + 1))
+        assert [item["result"]["phase"] for item in result["step_results"]] == phases
+    calls = [json.loads(line) for line in (repo / "calls.jsonl").read_text().splitlines()]
+    assert calls == [{"phase": phase, "skill": "example-skill" if selected else None}
+                     for phase in phases] * 2
+    assert declaration == original
+
+
+@pytest.mark.parametrize("action", ["source-validate", "deploy"])
+@pytest.mark.parametrize("problem", [
+    "missing", "null", "empty", "both-forms", "unknown-field", "empty-steps",
+    "bad-second-step", "bad-second-argument", "unknown-input", "unused-skill",
+])
+def test_declared_skill_selection_checks_entire_form_before_any_effect(
+    tmp_path, monkeypatch, action, problem,
+):
+    ordinary = {"run": _declared_skill_argv(action, "all", selected=False)}
+    targeted = {"steps": [
+        {"run": _declared_skill_argv(action, "first", selected=True)},
+        {"run": _declared_skill_argv(action, "second", selected=True)},
+    ]}
+    declaration = {**ordinary, "selected-skill": targeted}
+    if problem == "missing":
+        del declaration["selected-skill"]
+    elif problem == "null":
+        declaration["selected-skill"] = None
+    elif problem == "empty":
+        declaration["selected-skill"] = {}
+    elif problem == "both-forms":
+        targeted["run"] = ordinary["run"]
+    elif problem == "unknown-field":
+        targeted["unexpected"] = "ignored"
+    elif problem == "empty-steps":
+        targeted["steps"] = []
+    elif problem == "bad-second-step":
+        targeted["steps"][1] = {"run": []}
+    elif problem == "bad-second-argument":
+        targeted["steps"][1]["run"].append(None)
+    elif problem == "unknown-input":
+        targeted["steps"][1]["run"].append("{unavailable}")
+    else:
+        declaration["selected-skill"] = ordinary
+    repo = _declared_skill_commands(tmp_path, monkeypatch, action, declaration)
+    for _ in range(2):
+        result = skill_actions.execute_handoff(
+            "ceratops-skill-lifecycle/" + action, repo, inputs={"skill": "example-skill"},
+        )
+        assert result["status"] == "handoff_required", result
+        assert result["steps"] == []
+        assert not (repo / "calls.jsonl").exists()
+
+
+@pytest.mark.parametrize("inputs", [
+    [], {}, {"skill": None}, {"skill": ""}, {"skill": "../outside"},
+    {"skill": "one", "extra": "value"}, {"skill": "one", "prerequisite-packages": "package"},
+    {"skill": "one", "prerequisite-packages": [None]},
+])
+@pytest.mark.parametrize("action", ["source-validate", "deploy"])
+def test_declared_skill_selection_rejects_malformed_inputs_without_commands(
+    tmp_path, monkeypatch, action, inputs,
+):
+    calls = []
+    monkeypatch.setattr(skill_actions, "run_progress_command", lambda *a, **k: calls.append(a))
+    result = skill_actions.execute_handoff(
+        "ceratops-skill-lifecycle/" + action, tmp_path, inputs=inputs,
+    )
+    assert result["status"] == "handoff_required"
+    assert calls == []
+
+
+@pytest.mark.parametrize("action", ["source-validate", "deploy"])
+def test_declared_skill_failure_keeps_success_and_stops_later_effects(tmp_path, monkeypatch, action):
+    declaration = {
+        "run": _declared_skill_argv(action, "all", selected=False),
+        "selected-skill": {"steps": [
+            {"run": _declared_skill_argv(action, "first", selected=True)},
+            {"run": [*_declared_skill_argv(action, "second", selected=True), "--fail"]},
+            {"run": _declared_skill_argv(action, "third", selected=True)},
+        ]},
+    }
+    repo = _declared_skill_commands(tmp_path, monkeypatch, action, declaration)
+    result = skill_actions.execute_handoff(
+        "ceratops-skill-lifecycle/" + action, repo, inputs={"skill": "example-skill"},
+    )
+    assert result["status"] == "operation_failed"
+    assert result["step"] == 2 and result["steps"] == [1]
+    assert result["step_results"][0]["result"]["phase"] == "first"
+    calls = [json.loads(line) for line in (repo / "calls.jsonl").read_text().splitlines()]
+    assert calls == [{"phase": phase, "skill": "example-skill"} for phase in ("first", "second")]
+
+
+@pytest.mark.parametrize("action", ["source-validate", "deploy"])
+@pytest.mark.parametrize("position", [1, 2])
+@pytest.mark.parametrize("interruption", ["before", "after"])
+def test_declared_skill_fresh_calls_keep_selection_after_interruption(
+    tmp_path, monkeypatch, action, position, interruption,
+):
+    declaration = {
+        "run": _declared_skill_argv(action, "all", selected=False),
+        "selected-skill": {"steps": [{
+            "run": _declared_skill_argv(action, phase, selected=True),
+        } for phase in ("first", "second")]},
+    }
+    repo = _declared_skill_commands(tmp_path, monkeypatch, action, declaration)
+    calls = []
+    attempts = 0
+    interrupted = False
+
+    def execute(argv, **_kwargs):
+        nonlocal attempts, interrupted
+        attempts += 1
+        stop = not interrupted and attempts == position
+        if stop and interruption == "before":
+            interrupted = True
+            raise KeyboardInterrupt
+        calls.append(argv)
+        if stop:
+            interrupted = True
+            raise KeyboardInterrupt
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(skill_actions, "run_progress_command", execute)
+    with pytest.raises(KeyboardInterrupt):
+        skill_actions.execute_handoff(
+            "ceratops-skill-lifecycle/" + action, repo, inputs={"skill": "example-skill"},
+        )
+    result = skill_actions.execute_handoff(
+        "ceratops-skill-lifecycle/" + action, repo, inputs={"skill": "example-skill"},
+    )
+    assert result["status"] == "completed"
+    assert len(calls) == position - (interruption == "before") + 2
+    assert all(argv[-2:] == ["--target", "example-skill"] for argv in calls)
+
+
 def _registered_skill_fixture(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> pathlib.Path:
@@ -3870,10 +4099,9 @@ def test_v4_registered_skill_handoff_preserves_selection_prerequisites_and_recei
         json.loads(line) for line in (repo / "calls.jsonl").read_text().splitlines()
     ]
     expected: list[dict[str, str | None]] = [
-        {"mode": "skill", "skill": "claims-catalog-invoice"}
+        {"mode": "skill" if action == "validate" else None,
+         "skill": "claims-catalog-invoice"}
     ]
-    if action == "install":
-        expected.append({"mode": None, "skill": "claims-catalog-invoice"})
     assert calls == expected
     assert result["handoff_completed"] is True
     assert result["handoff_inputs"] == {
@@ -3881,8 +4109,10 @@ def test_v4_registered_skill_handoff_preserves_selection_prerequisites_and_recei
         "prerequisite-packages": ["claims"],
     }
     if action == "install":
-        assert result["steps"] == [1, 2]
-        assert result["step_results"][-1]["step"] == 2
+        # Source checking belongs inside the real installer, not a second
+        # executor step. This fixture observes only the public command call.
+        assert result["steps"] == [1]
+        assert result["step_results"][-1]["step"] == 1
         receipt = result["step_results"][-1]["result"]
         assert receipt["deployed"] == ["claims-catalog-invoice"]
         # The public finalizer must recognize the same completion protocol.
@@ -3944,12 +4174,12 @@ def test_v4_skill_handoff_rejects_unsafe_or_unhandled_work_before_deployment(
     elif problem == "dirty_source":
         (repo / "uncommitted.txt").write_text("must not deploy")
     else:
-        original = runner.run_progress_command
+        original = skill_actions.run_progress_command
 
         def changing(argv, **kwargs):
             result = original(argv, **kwargs)
             if any(
-                str(part).endswith("skills-consistency-source-validator.py")
+                str(part).endswith("install-managed-skills.py")
                 for part in argv
             ):
                 subprocess.run(
@@ -3960,7 +4190,7 @@ def test_v4_skill_handoff_rejects_unsafe_or_unhandled_work_before_deployment(
                 )
             return result
 
-        monkeypatch.setattr(runner, "run_progress_command", changing)
+        monkeypatch.setattr(skill_actions, "run_progress_command", changing)
     result = runner.execute_prepared_operation(prepared)
     assert result["status"] == (
         "state_changed"
@@ -3971,7 +4201,7 @@ def test_v4_skill_handoff_rejects_unsafe_or_unhandled_work_before_deployment(
     if calls.exists():
         assert [
             json.loads(line)["mode"] for line in calls.read_text().splitlines()
-        ] == ["skill"]
+        ] == [None]
 
 
 def test_completed_handoff_record_survives_removed_result_directory(
@@ -3987,6 +4217,9 @@ def test_completed_handoff_record_survives_removed_result_directory(
     module = runpy.run_path(str(PROMOTE_REPOSITORY))
     namespace = module["main"].__globals__
     result_file = tmp_path / "records/promotion.json"
+    # The caller owns this directory; promotion does not create records before
+    # acquiring its release lock. Simulate its removal during completed work.
+    result_file.parent.mkdir()
     result = {
         "status": "ready",
         "head": "a" * 40,

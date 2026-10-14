@@ -33,14 +33,15 @@ from tests.support.repositories import (
 )
 
 
-@pytest.mark.parametrize("failure", [None, "before-finalize", "after-finalize", "missing", "wrong-commit", "duplicate"])
+@pytest.mark.parametrize("failure", [None, "before-finalize", "after-finalize", "failed-finalize", "missing", "wrong-commit", "duplicate"])
 def test_installer_forwards_completed_sibling_receipts_without_reinstalling(
     tmp_path, monkeypatch, capsys, failure,
 ):
     installer = load_runtime_installer()
     builder = installer["runtime_builder"]
     repo = tmp_path / "repo"
-    repo.mkdir()
+    create_compatible_repo(repo, "example/promotion", ["alpha-tool"])
+    monkeypatch.chdir(tmp_path)
     destination = tmp_path / "installed"
     record = tmp_path / "promotion.json"
     record.write_text("promotion")
@@ -62,6 +63,7 @@ def test_installer_forwards_completed_sibling_receipts_without_reinstalling(
     main_globals = installer["main"].__globals__
     monkeypatch.setitem(main_globals, "_source_commit", lambda root: "b" * 40)
     monkeypatch.setitem(main_globals, "_promotion_bindings", lambda *args: [binding])
+    monkeypatch.setitem(main_globals, "_check_deployment_sources", lambda *args: None)
     effects = []
     finalizations = []
 
@@ -78,6 +80,8 @@ def test_installer_forwards_completed_sibling_receipts_without_reinstalling(
         record.unlink(missing_ok=True)
         if failure == "after-finalize":
             raise OSError("finalizer acknowledgement interrupted")
+        if failure == "failed-finalize":
+            return subprocess.CompletedProcess(argv, 7, "full output\n" * 500, "full cause\n" * 500)
         return subprocess.CompletedProcess(argv, 0, "OK", "")
 
     monkeypatch.setattr(builder, "install_transaction", install)
@@ -99,6 +103,22 @@ def test_installer_forwards_completed_sibling_receipts_without_reinstalling(
         assert result["promotion_cleanup"]["status"] == ("completed" if failure is None else "failed")
         if failure:
             assert result["promotion_cleanup"]["replay_required"] is False
+            next_action = result["promotion_cleanup"]["next_action"]
+            completed = json.loads(next_action["stdin"])
+            assert completed["status"] == "completed"
+            assert completed["deployed"] == ["alpha-tool"]
+            assert completed["transaction_id"] == "transaction"
+            assert "promotion_cleanup" not in completed
+            if failure == "failed-finalize":
+                assert result["promotion_cleanup"]["stdout"] == "full output\n" * 500
+                assert result["promotion_cleanup"]["stderr"] == "full cause\n" * 500
+                assert result["promotion_cleanup"]["returncode"] == 7
+            # A cleanup-only repeat consumes the preserved receipt, not the
+            # installer entry point; an interrupted acknowledgement is harmless.
+            failure = None
+            for _ in range(2):
+                assert finalize(next_action["command"], input=next_action["stdin"]).returncode == 0
+            assert effects == ["install"]
     assert (evidence.read_bytes() if evidence.exists() else None) == before
     # The transport preflight is read-only and repeatable; interrupted cleanup
     # retains the actual receipt rather than requesting a second installation.
@@ -119,8 +139,8 @@ def test_runtime_installer_releases_installed_working_directory(
     installed_skill = install_root / skill
     installed_runtime = installed_skill / "scripts" / "runtime"
     shutil.copytree(
-        RUNTIME_INSTALLER.parent,
-        installed_runtime,
+        RUNTIME_INSTALLER.parent.parent,
+        installed_skill / "scripts",
         dirs_exist_ok=True,
     )
     source = repo / "skills" / skill / "SKILL.md"
@@ -134,8 +154,11 @@ def test_runtime_installer_releases_installed_working_directory(
     # runs. Start it outside the target, then exercise the actual installer's
     # change away from an installed working directory in the Python process.
     invocation = (
-        "import os,runpy,sys; os.chdir(sys.argv.pop(1)); "
-        "sys.argv[0]=sys.argv.pop(1); runpy.run_path(sys.argv[0],run_name='__main__')"
+        "import os,pathlib,runpy,sys; os.chdir(sys.argv.pop(1)); "
+        "sys.argv[0]=sys.argv.pop(1); "
+        "source=pathlib.Path(sys.argv[sys.argv.index('--repo-root')+1]); "
+        "code=runpy.run_path(sys.argv[0])['main'](sys.argv[1:]); "
+        "assert pathlib.Path.cwd()==source; raise SystemExit(code)"
     )
     result = subprocess.run(
         [
@@ -159,6 +182,113 @@ def test_runtime_installer_releases_installed_working_directory(
 
     assert result.returncode == 0, result.stderr
     assert "Repository update." in runtime_skill_text(install_root, skill)
+
+
+@pytest.mark.parametrize("source_failure", [False, True])
+def test_managed_deploy_repeated_relative_options_restore_entry_directory(
+    tmp_path, monkeypatch, capsys, source_failure,
+):
+    """Repeat the same caller inputs without resolving them against a prior call."""
+    installer = load_runtime_installer()
+    owner = installer["deploy_managed_skills"].__globals__
+    repo = tmp_path / "source"
+    destination = tmp_path / "installed"
+    create_compatible_repo(repo, "example/relative", ["alpha-tool"])
+    monkeypatch.chdir(tmp_path)
+    checked = []
+
+    def check(source, affected):
+        checked.append(source)
+        assert source == repo and affected.deploy == ("alpha-tool",)
+        if source_failure:
+            raise installer["InstallerError"]("source rejected", phase="source_check")
+
+    monkeypatch.setitem(owner, "_check_deployment_sources", check)
+    options = installer["DeployOptions"](
+        repo_root=pathlib.Path("source"), install_root=pathlib.Path("installed"),
+        skill=("alpha-tool",),
+    )
+    for _ in range(2):
+        result = installer["deploy_managed_skills"](options)
+        assert pathlib.Path.cwd() == tmp_path
+        assert capsys.readouterr().out == ""
+        if source_failure:
+            assert result["status"] == "error" and result["reason"] == "source rejected"
+            assert not destination.exists()
+        else:
+            assert result["status"] == "completed"
+            assert result["repo_root"] == str(repo) and result["install_root"] == str(destination)
+            assert result["deployed"] == ["alpha-tool"]
+            assert runtime_owner(destination, "alpha-tool") == "example/relative"
+    assert checked == [repo, repo]
+
+
+def test_managed_deploy_concurrent_repositories_keep_source_and_receipt_ownership(
+    tmp_path, monkeypatch,
+):
+    """Pause one real staging effect while another caller competes for ownership."""
+    installer = load_runtime_installer()
+    owner = installer["deploy_managed_skills"].__globals__
+    builder = installer["runtime_builder"]
+    monkeypatch.chdir(tmp_path)
+    repos = [tmp_path / name for name in ("first-source", "second-source")]
+    destinations = [tmp_path / name for name in ("first-installed", "second-installed")]
+    names = ("alpha-tool", "beta-tool")
+    for index, repo in enumerate(repos):
+        create_compatible_repo(repo, f"example/source-{index}", [names[index]])
+    monkeypatch.setitem(owner, "_check_deployment_sources", lambda *args: None)
+    first_staging = threading.Event()
+    release_first = threading.Event()
+    second_attempt = threading.Event()
+    deployment_lock = owner["_DEPLOYMENT_LOCK"]
+    counter_lock = threading.Lock()
+    attempts = 0
+
+    class ObservedLock:
+        def __enter__(self):
+            nonlocal attempts
+            with counter_lock:
+                attempts += 1
+                if attempts == 2:
+                    second_attempt.set()
+            deployment_lock.acquire()
+
+        def __exit__(self, *_args):
+            deployment_lock.release()
+
+    monkeypatch.setitem(owner, "_DEPLOYMENT_LOCK", ObservedLock())
+    write_skill = builder.write_expected_skill
+
+    def stage(skill, *args, **kwargs):
+        if skill == "alpha-tool":
+            first_staging.set()
+            assert release_first.wait(10), "first staging was never released"
+        return write_skill(skill, *args, **kwargs)
+
+    monkeypatch.setattr(builder, "write_expected_skill", stage)
+    options = [installer["DeployOptions"](repo_root=repo, install_root=destinations[index],
+                                         skill=(names[index],)) for index, repo in enumerate(repos)]
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(installer["deploy_managed_skills"], options[0])
+        try:
+            assert first_staging.wait(10), "first call did not reach staging"
+            second = executor.submit(installer["deploy_managed_skills"], options[1])
+            assert second_attempt.wait(10), "second call did not contend for deployment ownership"
+            assert not second.done()
+        finally:
+            release_first.set()
+        results = [first.result(timeout=10), second.result(timeout=10)]
+    assert pathlib.Path.cwd() == tmp_path
+    for index, result in enumerate(results):
+        assert result["status"] == "completed"
+        assert result["repo_root"] == str(repos[index])
+        assert result["install_root"] == str(destinations[index])
+        assert result["deployed"] == [names[index]] and result["removed"] == []
+        assert runtime_owner(destinations[index], names[index]) == f"example/source-{index}"
+        installed = json.loads((destinations[index] / names[index] / RUNTIME_MANIFEST).read_text())
+        assert installed["source_repository_root"] == str(repos[index])
+        assert names[index].replace("-", " ").title() in runtime_skill_text(destinations[index], names[index])
+        assert not (destinations[index] / names[1 - index]).exists()
 
 
 @pytest.mark.skipif(shutil.which("uv") is None, reason="uv is required for the installed Python runtime")
@@ -1385,6 +1515,7 @@ def test_installer_preserves_transaction_failures_and_cleanup_evidence(
     monkeypatch.chdir(tmp_path)
     installer = load_runtime_installer()
     builder = installer["runtime_builder"]
+    monkeypatch.setitem(installer["deploy_managed_skills"].__globals__, "_check_deployment_sources", lambda *args: None)
     remove = builder._remove_tree
     rename = builder.rename_with_retry
     install = builder.install_transaction

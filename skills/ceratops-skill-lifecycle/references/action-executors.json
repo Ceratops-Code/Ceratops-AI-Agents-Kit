@@ -9,29 +9,37 @@
         "{repo_root}",
         "--mode",
         "full"
-      ]
+      ],
+      "selected-skill": {
+        "run": [
+          "{python}",
+          "{skill_root}/scripts/skills-consistency-source-validator.py",
+          "--repo-root",
+          "{repo_root}",
+          "--mode",
+          "skill",
+          "--skill",
+          "{skill}"
+        ]
+      }
     },
     "deploy": {
-      "steps": [
-        {
-          "run": [
-            "{python}",
-            "{skill_root}/scripts/skills-consistency-source-validator.py",
-            "--repo-root",
-            "{repo_root}",
-            "--mode",
-            "full"
-          ]
-        },
-        {
-          "run": [
-            "{python}",
-            "{skill_root}/scripts/runtime/install-managed-skills.py",
-            "--repo-root",
-            "{repo_root}"
-          ]
-        }
-      ]
+      "run": [
+        "{python}",
+        "{skill_root}/scripts/runtime/install-managed-skills.py",
+        "--repo-root",
+        "{repo_root}"
+      ],
+      "selected-skill": {
+        "run": [
+          "{python}",
+          "{skill_root}/scripts/runtime/install-managed-skills.py",
+          "--repo-root",
+          "{repo_root}",
+          "--skill",
+          "{skill}"
+        ]
+      }
     }
   }
 }
