@@ -27,6 +27,9 @@
     },
     {
       "$ref": "#/$defs/deploymentResult"
+    },
+    {
+      "$ref": "#/$defs/repositoryCheckResult"
     }
   ],
   "$defs": {
@@ -121,6 +124,9 @@
         "exitCode": {
           "type": "integer",
           "minimum": 0
+        },
+        "provenance": {
+          "$ref": "#/$defs/checkProvenance"
         }
       }
     },
@@ -189,6 +195,9 @@
         },
         "sha256": {
           "$ref": "#/$defs/sha256"
+        },
+        "provenance": {
+          "$ref": "#/$defs/checkProvenance"
         }
       }
     },
@@ -978,6 +987,9 @@
           "items": {
             "$ref": "#/$defs/receiptFile"
           }
+        },
+        "provenance": {
+          "$ref": "#/$defs/checkProvenance"
         }
       }
     },
@@ -1013,6 +1025,9 @@
           "items": {
             "$ref": "#/$defs/receiptFile"
           }
+        },
+        "provenance": {
+          "$ref": "#/$defs/checkProvenance"
         }
       }
     },
@@ -1273,6 +1288,354 @@
               },
               "artifact": {
                 "$ref": "#/$defs/artifact"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "checkProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "result_id",
+        "candidate_id",
+        "check_id",
+        "check_version",
+        "qualificationLevel",
+        "path",
+        "sha256"
+      ],
+      "properties": {
+        "result_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "candidate_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "check_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "check_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "qualificationLevel": {
+          "enum": [
+            "alpha",
+            "beta",
+            "rc",
+            "final"
+          ]
+        },
+        "path": {
+          "$ref": "#/$defs/relativePath"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "repositoryCheckInputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "group",
+        "scope",
+        "qualificationLevel",
+        "workVersion",
+        "checkVersion",
+        "productInputs",
+        "checkInputs",
+        "arguments",
+        "dependencies",
+        "environment",
+        "fingerprint"
+      ],
+      "properties": {
+        "schema": {
+          "const": "ceratops-repository-check-inputs.v1"
+        },
+        "group": {
+          "type": "string",
+          "minLength": 1
+        },
+        "scope": {
+          "type": "object"
+        },
+        "qualificationLevel": {
+          "enum": [
+            "alpha",
+            "beta",
+            "rc",
+            "final"
+          ]
+        },
+        "workVersion": {
+          "$ref": "#/$defs/gitCommit"
+        },
+        "checkVersion": {
+          "$ref": "#/$defs/sha256"
+        },
+        "productInputs": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": {
+            "$ref": "#/$defs/relativePath"
+          },
+          "additionalProperties": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/sha256"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "checkInputs": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": {
+            "$ref": "#/$defs/relativePath"
+          },
+          "additionalProperties": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/sha256"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "arguments": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "dependencies": {
+          "type": "object"
+        },
+        "environment": {
+          "type": "object",
+          "minProperties": 1
+        },
+        "fingerprint": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "repositoryCheckExecution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "startedAt",
+        "finishedAt",
+        "durationSeconds",
+        "workerPid"
+      ],
+      "properties": {
+        "startedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "finishedAt": {
+          "oneOf": [
+            {
+              "type": "string",
+              "format": "date-time"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "durationSeconds": {
+          "oneOf": [
+            {
+              "type": "number",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "workerPid": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "repositoryCheckResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "result_id",
+        "candidate_id",
+        "check_id",
+        "check_version",
+        "status",
+        "exit_code",
+        "invocation"
+      ],
+      "dependentRequired": {
+        "inputs": [
+          "execution"
+        ],
+        "execution": [
+          "inputs"
+        ]
+      },
+      "properties": {
+        "schema": {
+          "const": "ceratops-repository-check-result.v1"
+        },
+        "result_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "candidate_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "check_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "check_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "enum": [
+            "running",
+            "passed",
+            "failed",
+            "interrupted"
+          ]
+        },
+        "exit_code": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "invocation": {
+          "type": "object"
+        },
+        "inputs": {
+          "$ref": "#/$defs/repositoryCheckInputs"
+        },
+        "execution": {
+          "$ref": "#/$defs/repositoryCheckExecution"
+        },
+        "checks": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "running"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "exit_code": {
+                "type": "null"
+              },
+              "execution": {
+                "properties": {
+                  "finishedAt": {
+                    "type": "null"
+                  },
+                  "durationSeconds": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "passed"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "exit_code": {
+                "const": 0
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "enum": [
+                  "failed",
+                  "interrupted"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "exit_code": {
+                "type": "integer",
+                "not": {
+                  "const": 0
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "enum": [
+                  "passed",
+                  "failed",
+                  "interrupted"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "execution": {
+                "properties": {
+                  "finishedAt": {
+                    "type": "string",
+                    "format": "date-time"
+                  },
+                  "durationSeconds": {
+                    "type": "number",
+                    "minimum": 0
+                  }
+                }
               }
             }
           }

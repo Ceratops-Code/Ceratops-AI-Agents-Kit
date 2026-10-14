@@ -1560,3 +1560,23 @@ Releases use `vMAJOR.MINOR.PATCH` tags. See `CHANGELOG.md` for release notes.
 
 This repository publishes source files only. It does not publish Docker images,
 PyPI packages, npm packages, or other runtime artifacts.
+
+## Durable repository check results
+
+SDLC `check-results` declarations connect one repository runner command to
+durable unchanged-input reuse. The operation executor supplies the existing
+five result arguments; the declared runner writes its actual outcome before
+returning. Later promotion/build calls consume eligible original passes while
+new artifact checks still run. Corrupt evidence blocks the operation.
+
+Results live under `<git-common-dir>/ceratops/results/repository-checks/`.
+Existing pending-work scopes retain active candidate references; checkpoints
+and disposable reports are not acceptance authorities. Storage is bounded and
+protects required original passes and newer applicable failures.
+
+`--qualification-level` selects required alpha/beta/rc/final eligibility;
+ordinary checks default to alpha and promotion tests to beta. The portable
+producer, custom runner and scope/retention ownership are described in
+`docs/design-draft.md`, section "Durable unchanged-input check reuse".
+This implements plan 6A and its limited Docs-and-Claims runner adoption;
+remaining affected-check and release/receipt adoption stays pending.

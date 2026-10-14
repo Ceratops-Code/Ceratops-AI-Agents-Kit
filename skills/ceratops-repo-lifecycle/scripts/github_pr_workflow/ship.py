@@ -17,19 +17,19 @@ import pathlib
 import re
 import sys
 import time
-from typing import Any, Mapping
+from collections.abc import Mapping
+from typing import Any
 
 from github_contract_engine.github_api import run_gh_api, run_json_command
 from github_contract_engine.levels import ERROR, WARN
 
 from . import actions_availability, codex_review, ensure_pr, merge, readiness, sync
 from .command import CommandError, require_output, require_success, run_command
+from .preserve_check_references import load_pending_work_scope
 
 PHASES = ("prepared", "pr_ready", "gates_passed", "merged", "synchronized")
 FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-PENDING_WORK_SCOPE_VERSION = 2
-PENDING_SOURCE_STATES = {"retained", "preserved", "deleting"}
 CHECK_UNCERTAINTY_GRACE_SECONDS = 60
 
 
@@ -406,129 +406,6 @@ def _resolve_commit(
         _git(repo_root, "cat-file", "-e", f"{commit}^{{commit}}"), cwd=repo_root
     )
     return commit
-
-
-def _load_pending_work_scope(
-    args: argparse.Namespace,
-    repo_root: pathlib.Path,
-    commit: str,
-) -> tuple[dict[str, Any], dict[str, Any] | None]:
-    """Validate and identity-pin one explicitly selected local-work scope."""
-
-    enabled = getattr(args, "pending_work_check", None)
-    scope_argument = getattr(args, "pending_work_scope", None)
-    if enabled is None:
-        raise ShipError(
-            "Select exactly one of --pending-work-check or "
-            "--no-pending-work-check."
-        )
-    if not enabled:
-        if scope_argument is not None:
-            raise ShipError(
-                "--pending-work-scope cannot be used with "
-                "--no-pending-work-check."
-            )
-        return {"enabled": False}, None
-    if scope_argument is None:
-        raise ShipError(
-            "--pending-work-check requires --pending-work-scope PATH."
-        )
-
-    scope_path = pathlib.Path(scope_argument).expanduser()
-    if not scope_path.is_absolute():
-        scope_path = repo_root / scope_path
-    try:
-        scope_path = scope_path.resolve(strict=True)
-        raw_scope = json.loads(scope_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ShipError(
-            f"Could not read pending-work scope {scope_path}: {exc}"
-        ) from exc
-    expected_fields = {"version", "target_branch", "target_commit", "sources"}
-    if not isinstance(raw_scope, dict) or set(raw_scope) != expected_fields:
-        raise ShipError(
-            "Pending-work scope must contain exactly version, target_branch, "
-            "target_commit, and sources."
-        )
-    raw_sources = raw_scope.get("sources")
-    if (
-        raw_scope.get("version") != PENDING_WORK_SCOPE_VERSION
-        or not isinstance(raw_scope.get("target_branch"), str)
-        or not isinstance(raw_scope.get("target_commit"), str)
-        or not isinstance(raw_sources, list)
-        or not raw_sources
-    ):
-        raise ShipError("Pending-work scope has invalid field values.")
-    target_branch = str(raw_scope["target_branch"])
-    target_commit = str(raw_scope["target_commit"]).lower()
-    if FULL_SHA_RE.fullmatch(target_commit) is None:
-        raise ShipError("Pending-work scope has an invalid target commit.")
-    if target_branch != args.head_branch or target_commit != commit:
-        raise ShipError(
-            "Pending-work scope does not match the exact shipped branch and "
-            "commit."
-        )
-    normalized_sources: list[dict[str, str]] = []
-    source_branches: set[str] = set()
-    for index, raw_source in enumerate(raw_sources, start=1):
-        if not isinstance(raw_source, dict) or set(raw_source) != {
-            "branch",
-            "commit",
-            "state",
-        }:
-            raise ShipError(
-                f"Pending-work source {index} must contain exactly branch, "
-                "commit, and state."
-            )
-        branch = raw_source.get("branch")
-        source_commit = raw_source.get("commit")
-        state = raw_source.get("state")
-        if (
-            not isinstance(branch, str)
-            or not branch
-            or not isinstance(source_commit, str)
-            or FULL_SHA_RE.fullmatch(source_commit.lower()) is None
-            or state not in PENDING_SOURCE_STATES
-            or branch in source_branches
-        ):
-            raise ShipError(f"Pending-work source {index} has invalid field values.")
-        if branch == target_branch:
-            raise ShipError(
-                "Pending-work source branches must not include the target branch."
-            )
-        checked = run_command(
-            ["git", "check-ref-format", "--branch", branch],
-            cwd=repo_root,
-        )
-        if checked.returncode:
-            raise ShipError(
-                f"Pending-work scope contains an invalid branch: {branch!r}."
-            )
-        source_branches.add(branch)
-        normalized_sources.append(
-            {
-                "branch": branch,
-                "commit": source_commit.lower(),
-                "state": str(state),
-            }
-        )
-
-    normalized_scope = {
-        "version": PENDING_WORK_SCOPE_VERSION,
-        "target_branch": target_branch,
-        "target_commit": target_commit,
-        "sources": sorted(normalized_sources, key=lambda source: source["branch"]),
-    }
-    serialized = json.dumps(
-        normalized_scope,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-    identity = {
-        "enabled": True,
-        "scope_sha256": hashlib.sha256(serialized).hexdigest(),
-    }
-    return identity, normalized_scope
 
 
 def _pending_work_findings(
@@ -1727,10 +1604,11 @@ def ship(args: argparse.Namespace) -> dict[str, Any]:
     merge.restore_unfinished_checkpoints(repo_root)
     repository = _repository_name(repo_root, args.repo)
     commit = _resolve_commit(args, repo_root, repository)
-    pending_work_identity, pending_work_scope = _load_pending_work_scope(
+    pending_work_identity, pending_work_scope = load_pending_work_scope(
         args,
         repo_root,
         commit,
+        ShipError,
     )
     checkpoint_path, state = _load_or_create_checkpoint(
         args,

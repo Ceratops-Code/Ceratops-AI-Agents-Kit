@@ -230,6 +230,62 @@
           "type": "string",
           "minLength": 1,
           "pattern": "\\S"
+        },
+        "check-results": {
+          "description": "Declared relevant inputs and execution scope for one durable check runner command.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "product-inputs",
+            "check-inputs"
+          ],
+          "properties": {
+            "product-inputs": {
+              "type": "array",
+              "uniqueItems": true,
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "check-inputs": {
+              "type": "array",
+              "uniqueItems": true,
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "dependencies": {
+              "type": "array",
+              "uniqueItems": true,
+              "minItems": 0,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "environment": {
+              "type": "array",
+              "uniqueItems": true,
+              "minItems": 0,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "tools": {
+              "type": "array",
+              "uniqueItems": true,
+              "minItems": 0,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
         }
       },
       "oneOf": [

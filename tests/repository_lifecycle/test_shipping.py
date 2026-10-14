@@ -228,7 +228,7 @@ def test_repository_ship_metadata_reaches_shared_pr_producer(
     monkeypatch.setattr(ship.merge, "restore_unfinished_checkpoints", lambda root: None)
     monkeypatch.setattr(ship, "_repository_name", lambda *args: "example/repository")
     monkeypatch.setattr(ship, "_resolve_commit", lambda *args: "a" * 40)
-    monkeypatch.setattr(ship, "_load_pending_work_scope", lambda *args: (None, None))
+    monkeypatch.setattr(ship, "load_pending_work_scope", lambda *args: (None, None))
     monkeypatch.setattr(
         ship,
         "_load_or_create_checkpoint",

@@ -19,6 +19,7 @@ from github_pr_workflow import (  # noqa: E402
     dependency_finalization,
     ensure_pr,
     merge,
+    preserve_check_references,
     ship,
     sync,
 )
@@ -516,7 +517,7 @@ class ShipTests(unittest.TestCase):
 
     def pending_scope(self, target_commit: str) -> dict[str, object]:
         return {
-            "version": ship.PENDING_WORK_SCOPE_VERSION,
+            "version": preserve_check_references.PENDING_WORK_SCOPE_VERSION,
             "target_branch": "release/local",
             "target_commit": target_commit,
             "sources": [
@@ -632,7 +633,7 @@ class ShipTests(unittest.TestCase):
                 mock.patch.object(ship, "_resolve_commit", return_value=self.commit),
                 mock.patch.object(
                     ship,
-                    "_load_pending_work_scope",
+                    "load_pending_work_scope",
                     return_value=(
                         state["pending_work"],
                         self.pending_scope(self.commit),
@@ -684,7 +685,7 @@ class ShipTests(unittest.TestCase):
             ship.ShipError,
             "requires --pending-work-scope",
         ):
-            ship._load_pending_work_scope(args, pathlib.Path.cwd(), self.commit)
+            ship.load_pending_work_scope(args, pathlib.Path.cwd(), self.commit, ship.ShipError)
 
         args.pending_work_check = False
         args.pending_work_scope = pathlib.Path("scope.json")
@@ -692,7 +693,7 @@ class ShipTests(unittest.TestCase):
             ship.ShipError,
             "cannot be used",
         ):
-            ship._load_pending_work_scope(args, pathlib.Path.cwd(), self.commit)
+            ship.load_pending_work_scope(args, pathlib.Path.cwd(), self.commit, ship.ShipError)
 
     def test_pending_work_scope_is_normalized_and_hashed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -701,7 +702,7 @@ class ShipTests(unittest.TestCase):
             scope_path.write_text(
                 json.dumps(
                     {
-                        "version": ship.PENDING_WORK_SCOPE_VERSION,
+                        "version": preserve_check_references.PENDING_WORK_SCOPE_VERSION,
                         "target_branch": "release/local",
                         "target_commit": self.commit,
                         "sources": [
@@ -724,10 +725,11 @@ class ShipTests(unittest.TestCase):
             args.pending_work_check = True
             args.pending_work_scope = scope_path
 
-            identity, scope = ship._load_pending_work_scope(
+            identity, scope = ship.load_pending_work_scope(
                 args,
                 repo_root,
                 self.commit,
+                ship.ShipError,
             )
 
         self.assertTrue(identity["enabled"])

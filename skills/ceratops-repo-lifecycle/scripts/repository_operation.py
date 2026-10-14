@@ -26,6 +26,7 @@ from copy import deepcopy
 from dataclasses import dataclass, replace
 from typing import Any
 
+import reuse_operation_checks
 import sdlc_results
 import store_artifacts
 from ceratops_repo_compatibility_engine.sdlc_contract_validation import (
@@ -121,6 +122,9 @@ class PreparedOperation:
     parameters: tuple[tuple[str, str], ...] = ()
     test_context: Mapping[str, str] | None = None
     result_schema: str | None = None
+    check_results: dict[str, Any] | None = None
+    qualification_level: str = "alpha"
+    check_plan: Any = None
 
 
 def _build_test_gate(receipt: Mapping[str, Any], required_tests: Sequence[str]) -> None:
@@ -804,6 +808,7 @@ def prepare_operations(
                 contract_path,
                 tuple(sorted(parameters.items())),
                 result_schema=selected.get("result-schema"),
+                check_results=selected.get("check-results"),
             )
         )
     return prepared
@@ -874,6 +879,25 @@ def _execute_prepared_operation(prepared: PreparedOperation) -> dict[str, object
             "status": "state_changed",
             "message": "HEAD changed after preparation.",
         }
+    check_plan = prepared.check_plan
+    if prepared.check_results is not None and check_plan is None:
+        check_plan = reuse_operation_checks.plan_operation(prepared)
+        reuse_operation_checks.activate_plans([replace(prepared, check_plan=check_plan)])
+    if check_plan is not None:
+        if prepared.check_results is None:
+            raise ValueError("Check plan has no current owned input declaration.")
+        # An earlier callback may have changed declared inputs after the batch
+        # preflight. Read current inputs before consuming that original pass.
+        current = reuse_operation_checks.check_inputs(prepared, prepared.check_results)
+        if current["fingerprint"] != check_plan.context["fingerprint"]:
+            check_plan = reuse_operation_checks.plan_operation(prepared)
+        else:
+            check_plan.decision = check_plan.store.select(current, check_id=prepared.operation)
+            if check_plan.decision["decision"] == "blocked":
+                raise ValueError("Recorded check evidence blocks reuse: " + check_plan.decision["reason"])
+        if check_plan.decision["decision"] == "reuse":
+            return check_plan.reused_result(prepared)
+        base.update(check_decision="executed", check_reason=check_plan.decision["reason"])
     completed: list[int | str] = []
     step_results: list[dict[str, Any]] = []
     for step in prepared.steps:
@@ -951,6 +975,8 @@ def _execute_prepared_operation(prepared: PreparedOperation) -> dict[str, object
         try:
             assert step.argv is not None
             argv = list(step.argv)
+            if check_plan is not None:
+                argv.extend(check_plan.arguments())
             # CreateProcess does not apply PATHEXT to bare npm/pnpm commands.
             # Resolve a bare executable while leaving repository-relative paths
             # bound to the declared cwd and preserving shell-free arguments.
@@ -966,7 +992,7 @@ def _execute_prepared_operation(prepared: PreparedOperation) -> dict[str, object
                 and len(argv) > 1 and argv[1] in {"run", "sync", "lock"}
                 and "--active" not in argv and "--no-project" not in argv
             )
-            if repository_uv or prepared.test_context is not None:
+            if repository_uv or prepared.test_context is not None or check_plan is not None:
                 environment = dict(os.environ)
                 if repository_uv:
                     # Repository-selected environments must not inherit the
@@ -976,11 +1002,20 @@ def _execute_prepared_operation(prepared: PreparedOperation) -> dict[str, object
                     environment["CERATOPS_SDLC_TEST_CONTEXT"] = json.dumps(
                         dict(prepared.test_context)
                     )
+                if check_plan is not None:
+                    environment[reuse_operation_checks.CONTEXT_ENV] = json.dumps(check_plan.context)
                 process_options["env"] = environment
             result = run_progress_command(argv, cwd=step.cwd, **process_options)
             code, stdout, stderr = result.returncode, result.stdout, result.stderr
         except OSError as exc:
             code, stdout, stderr = None, "", str(exc)
+        if check_plan is not None and code is not None:
+            try:
+                base["check_result"] = check_plan.completed(prepared, passed=code == 0)
+            except (OSError, ValueError) as exc:
+                return {**base, "status": "result_invalid", "steps": completed,
+                        "message": f"Declared check result is missing or conflicting: {exc}",
+                        "diagnostic": {"exit_code": code, "message": failure_excerpt(f"{stderr}\n{stdout}")}}
         if code != 0:
             child_results = {}
             for stream, output in (("stdout", stdout), ("stderr", stderr)):
@@ -1061,9 +1096,14 @@ def execute_prepared_operation(prepared: PreparedOperation) -> dict[str, object]
     """Execute one command; lifecycle callers supply ordered prerequisites.
 
     The public CLI, promotion and shipping workflows run validation and tests
-    before deployment. This command executor neither caches nor replays them.
+    before deployment. Marked check commands consume original durable results
+    through the shared reader; repository runners alone write executed outcomes.
     """
-    return _execute_prepared_operation(prepared)
+    try:
+        return _execute_prepared_operation(prepared)
+    except (OSError, ValueError) as exc:
+        return {"operation": prepared.operation, "commit": prepared.commit,
+                "status": "result_invalid", "message": str(exc)}
 
 
 def _combined_prerequisites(
@@ -1088,6 +1128,18 @@ def execute_prepared_operations(
 ) -> dict[str, Any]:
     """Run in order, stopping at the first failure with a bounded pending ledger."""
 
+    # Resolve every marked check before the first check/build callback. Later
+    # phases consume these original plans; no result payload crosses the model.
+    try:
+        prepared = [replace(item, check_plan=reuse_operation_checks.plan_operation(item))
+                    if item.check_results is not None and item.check_plan is None else item
+                    for item in prepared]
+        reuse_operation_checks.activate_plans(list(prepared))
+    except (OSError, ValueError) as exc:
+        failure = {"status": "result_invalid", "message": str(exc)}
+        return {**failure, "completed_operations": [],
+                "pending_operations": [item.operation for item in prepared],
+                "results": [failure]}
     results: list[dict[str, object]] = []
     completed: list[str] = []
     for index, operation in enumerate(prepared):
@@ -1161,6 +1213,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Return pending skill routes without dispatch.",
     )
+    parser.add_argument("--qualification-level", choices=["alpha", "beta", "rc", "final"],
+                        help="Required qualification of newly executed or reused checks; default alpha, beta for promotion tests.")
     parser.add_argument("--evidence-file", type=pathlib.Path)
     parser.add_argument(
         "--commit", help="Require this exact clean Git commit before and after checks."
@@ -1264,6 +1318,9 @@ def main(argv: list[str] | None = None) -> int:
             if requires_validation
             else []
         )
+        level = args.qualification_level or ("beta" if args.test_trigger == "promotion" else "alpha")
+        validations = [replace(item, qualification_level=level) for item in validations]
+        prepared = [replace(item, qualification_level=level) for item in prepared]
         if args.prepare_only:
             result: dict[str, Any] = {
                 "status": "prepared",
@@ -1300,6 +1357,10 @@ def main(argv: list[str] | None = None) -> int:
                     if args.validate or args.tests
                     else execute_prepared_operations(prepared)
                 )
+                check_references = [item["check_result"] for item in checks["results"]
+                                    if item.get("check_result")]
+                if check_references:
+                    result["check_results"] = check_references
                 advisory_checks = [
                     item
                     for item in checks["results"]

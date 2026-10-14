@@ -22,7 +22,7 @@ import sys
 from collections.abc import Callable
 from typing import Any
 
-from github_pr_workflow import ship
+from github_pr_workflow import preserve_check_references, ship
 from github_pr_workflow.command import (
     CommandError,
     require_output,
@@ -44,7 +44,7 @@ _git = _cleanup["_git"]
 _common_git_dir = _cleanup["_common_git_dir"]
 _residual_cleanup_record_path = _cleanup["_residual_cleanup_record_path"]
 _atomic_temporary_path = _cleanup["_atomic_temporary_path"]
-_write_scope = _cleanup["_write_scope"]
+_write_scope = preserve_check_references.write_scope
 _remove_completed_state_file = _cleanup["_remove_completed_state_file"]
 _worktree_thread_id = _cleanup["_worktree_thread_id"]
 _worktree_cleanup_root = _cleanup["_worktree_cleanup_root"]
@@ -209,7 +209,7 @@ def _normalize_legacy_scope(
         _remove_completed_state_file(path)
         return None
     normalized = {
-        "version": ship.PENDING_WORK_SCOPE_VERSION,
+        "version": preserve_check_references.PENDING_WORK_SCOPE_VERSION,
         "target_branch": recorded_branch,
         "target_commit": recorded_commit,
         "sources": normalized_sources,
@@ -235,7 +235,7 @@ def _validated_scope(
         pending_work_scope=path,
         head_branch=target_branch,
     )
-    _, scope = ship._load_pending_work_scope(args, repo_root, target_commit)
+    _, scope = preserve_check_references.load_pending_work_scope(args, repo_root, target_commit, ship.ShipError)
     if scope is None:
         raise PendingWorkError("Pending-work scope unexpectedly disabled its check.")
     if _read_scope(path) != scope:
@@ -507,6 +507,7 @@ def record_scope(
 ) -> dict[str, object]:
     """Atomically advance one integration target's selected source scope."""
 
+    preserve_check_references.expire_stale_check_scopes(repo_root)
     if not source_branches:
         raise PendingWorkError("At least one source branch is required.")
     _validate_branch(repo_root, target_branch)
@@ -536,7 +537,7 @@ def record_scope(
         key=lambda source: source["branch"],
     )
     requested_scope = {
-        "version": ship.PENDING_WORK_SCOPE_VERSION,
+        "version": preserve_check_references.PENDING_WORK_SCOPE_VERSION,
         "target_branch": target_branch,
         "target_commit": target_commit,
         "sources": requested_sources,
@@ -706,7 +707,7 @@ def record_scope(
     )
     merged = sorted(merged_by_branch.values(), key=lambda source: source["branch"])
     scope = {
-        "version": ship.PENDING_WORK_SCOPE_VERSION,
+        "version": preserve_check_references.PENDING_WORK_SCOPE_VERSION,
         "target_branch": target_branch,
         "target_commit": target_commit,
         "sources": merged,
@@ -718,6 +719,7 @@ def record_scope(
         target_branch=target_branch,
         target_commit=target_commit,
     )
+    preserve_check_references.expire_stale_check_scopes(repo_root)
     result: dict[str, object] = {
         "status": "ready",
         "target_branch": target_branch,
@@ -739,6 +741,7 @@ def check_scope(
 ) -> dict[str, object]:
     """Recheck every branch named by one exact persisted scope."""
 
+    preserve_check_references.expire_stale_check_scopes(repo_root)
     expected_path = _scope_path(repo_root, target_branch)
     if path.resolve() != expected_path:
         raise PendingWorkError(
@@ -797,6 +800,7 @@ def prepare_scope(
 ) -> dict[str, object]:
     """Resume the recorded target identity and recheck its selected scope."""
 
+    preserve_check_references.expire_stale_check_scopes(repo_root)
     _validate_branch(repo_root, target_branch)
     path = _scope_path(repo_root, target_branch)
     if not path.exists():
@@ -865,6 +869,11 @@ def finalize_scope(
             "removed": [],
             "pending_work_scope": "",
         }
+    if not _read_scope(path)["sources"]:
+        # There is no source-cleanup batch. Its live branch still owns these
+        # observations until the candidate advances or disappears.
+        return {"status": "finalized", "removed": [], "pending_work_scope": str(path),
+                "retained_check_candidate": True}
     if require_output(
         _git(repo_root, "branch", "--show-current"), cwd=repo_root
     ).strip() != current_branch:

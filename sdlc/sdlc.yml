@@ -36,11 +36,23 @@ repository:
       steps:
         - run: [uv, run, --locked, scripts/testing/run-tests.py, --select-only, --base, "{base}", --head, "{head}"]
     validate:
+      check-results:
+        product-inputs: ["**"]
+        check-inputs: [scripts/validate-repository.py, scripts/result_records.py, skills/ceratops-repo-lifecycle/references/contracts/**, skills/ceratops-repo-lifecycle/scripts/ceratops_repo_compatibility_engine/**]
+        dependencies: [scripts/uv.lock, scripts/package-lock.json]
+        environment: [PATH, CI, GITHUB_ACTIONS, UV_OFFLINE]
+        tools: [uv, git, node, npm, powershell]
       requires:
         capabilities: [uv]
       steps:
         - run: [uv, run, --locked, scripts/validate-repository.py]
     test:
+      check-results:
+        product-inputs: [skills/**, tools/**, mcp-servers/**, sdlc/**, docs/result_records.py.tmpl, README.md, AGENTS.md, .github/**]
+        check-inputs: [scripts/**, tests/**]
+        dependencies: [scripts/uv.lock, scripts/package-lock.json]
+        environment: [PATH, CI, PYTEST_ADDOPTS, GITHUB_ACTIONS, GITHUB_EVENT_NAME, GITHUB_EVENT_PATH, GITHUB_REF_NAME, UV_OFFLINE]
+        tools: [uv, git, node, npm, powershell]
       requires:
         capabilities: [uv]
       steps:

@@ -29,9 +29,10 @@ HEARTBEAT_INTERVAL = 60.0
 
 
 class PytestProcess(subprocess.CompletedProcess[str]):
-    """Carry bounded returned check counts alongside pytest's actual exit code."""
+    """Carry check counts and original outcome references with the actual exit code."""
 
     accepted_checks: dict[str, int] | None = None
+    accepted_result_references: list[dict[str, object]] | None = None
 
 
 class TestProgress:
@@ -254,4 +255,5 @@ def run_pytest(
         if summary_path.is_file():
             summary = json.loads(summary_path.read_text(encoding="utf-8"))
             result.accepted_checks = {key: summary[key] for key in ("collected", "executed", "reused")}
+            result.accepted_result_references = summary.get("result_references", [])
     return result

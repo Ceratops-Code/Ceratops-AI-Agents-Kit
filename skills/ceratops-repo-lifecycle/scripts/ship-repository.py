@@ -20,6 +20,7 @@ from typing import Any
 from ceratops_repo_compatibility_engine.sdlc_contract_validation import (
     operation_entries,
 )
+from github_pr_workflow import preserve_check_references
 from github_pr_workflow import ship as github_ship
 from repository_operation import (
     FAILED_STATUSES,
@@ -340,29 +341,15 @@ def _require_cleanup_safe_caller(
         value = json.loads(scope.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise RepositoryShipError(f"Could not read pending-work scope: {exc}") from exc
-    sources = value.get("sources") if isinstance(value, dict) else None
-    if (
-        not isinstance(value, dict)
-        or value.get("version") != github_ship.PENDING_WORK_SCOPE_VERSION
-        or not isinstance(sources, list)
-        or not sources
-    ):
+    if not isinstance(value, dict):
         raise RepositoryShipError("Pending-work scope has invalid sources.")
-    branches: list[str] = []
-    for source in sources:
-        if (
-            not isinstance(source, dict)
-            or set(source) != {"branch", "commit", "state"}
-            or not isinstance(source.get("branch"), str)
-            or not source["branch"]
-            or not isinstance(source.get("commit"), str)
-            or github_ship.FULL_SHA_RE.fullmatch(source["commit"].lower()) is None
-            or source.get("state") not in github_ship.PENDING_SOURCE_STATES
-        ):
-            raise RepositoryShipError("Pending-work scope has invalid sources.")
-        branches.append(source["branch"])
-    if len(branches) != len(set(branches)):
-        raise RepositoryShipError("Pending-work scope has duplicate sources.")
+    _, selected = preserve_check_references.load_pending_work_scope(
+        argparse.Namespace(pending_work_check=True, pending_work_scope=scope,
+                           head_branch=value.get("target_branch")),
+        repo_root, value.get("target_commit", ""), RepositoryShipError,
+    )
+    assert selected is not None
+    branches = [source["branch"] for source in selected["sources"]]
 
     preserved = {
         (item["branch"], pathlib.Path(item["path"]).resolve())
