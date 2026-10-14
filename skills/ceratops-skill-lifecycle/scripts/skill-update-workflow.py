@@ -965,6 +965,12 @@ def command_run(repo_root: pathlib.Path, caller_use_complete: bool) -> str:
 def command_close_skill_change(repo_root: pathlib.Path) -> None:
     """Consume saved acceptance; retain the completion receipt until cleanup ends."""
     with update_context(repo_root) as context:
+        # Deleting the last receipt and directory are separate effects. A fresh
+        # close of their empty/absent result has nothing left to close; it does
+        # not accept work or bypass checks for any request that still has records.
+        if not any(context.directory.iterdir()):
+            checkpoint_storage().finish_checkpoints(context)
+            return
         receipt = read_record(
             context, "completion_receipt.json",
             repair_tail=(context.directory / "update_request.json").is_file(),

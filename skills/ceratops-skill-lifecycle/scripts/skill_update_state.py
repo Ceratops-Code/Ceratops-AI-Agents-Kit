@@ -1,6 +1,6 @@
 """Immutable skill-change records and filesystem boundaries.
 
-The shared checkpoint helper owns locking and the producer/worktree directory.
+The shared checkpoint helper owns this component's worktree-specific directory.
 This module owns numbered skill-change states, their original approval/baseline,
 and check-result retention. The caller's request file is never cleanup-owned.
 """
@@ -268,7 +268,7 @@ def checkpoint_storage() -> Any:
 
 @contextmanager
 def update_context(repo_root: pathlib.Path) -> Iterator[Any]:
-    """Hold the single skill-update producer lock for the entire command."""
+    """Open this worktree's saved skill-change request without taking a lock."""
     storage = checkpoint_storage()
     try:
         with storage.open_checkpoints(repo_root, OWNER) as context:
@@ -303,7 +303,7 @@ def read_record(context: Any, name: str, *, repair_tail: bool = False) -> dict[s
 
 
 def write_record(context: Any, name: str, value: Mapping[str, Any]) -> None:
-    """The shared helper provides exclusive direct writes and identical retries."""
+    """The shared helper writes immutable records directly and reuses identical data."""
     storage = checkpoint_storage()
     storage.write_checkpoint(context, name, value)
     if storage.read_checkpoint(context, name) != value:

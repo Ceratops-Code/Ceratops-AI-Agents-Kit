@@ -1298,7 +1298,7 @@ def _checkpoint_storage() -> Any:
 
 @contextmanager
 def versioned_artifact_checkpoints(repo_root: pathlib.Path) -> Iterator[Any]:
-    """Hold the cooperating parent writer's lock, independently of child work."""
+    """Open the request directory without a lock; wrapper removal belongs to 4D."""
     checkpoints = _checkpoint_storage()
     try:
         with checkpoints.open_checkpoints(repo_root, ARTIFACT_CHECKPOINT_OWNER) as context:

@@ -117,7 +117,7 @@ repo docs, then update the narrowest correct source that exists.
   commands for unchanged complete inputs and saved searches for unchanged
   declared inputs; an identical successful retry does no check work.
 - The helper discovers one unfinished update per worktree beneath the Git
-  common directory and holds its producer lock. Immutable states and check
+  common directory without a checkpoint or worktree lock. Immutable states and check
   results recover interrupted recording; caller request files remain owned by
   the caller. Do not supply state, evidence or operation-ID paths.
 - Do not use the workflow for skill-local text-only updates.
@@ -170,8 +170,11 @@ repo docs, then update the narrowest correct source that exists.
 - Closing consumes saved success without rechecking the checkout, writes
   `completion_receipt.json`, and removes the operation's checkpoints.
   It preserves caller inputs and unrelated work. Interrupted cleanup resumes
-  from that receipt; successful close also sweeps removed-worktree checkpoints
-  for the same producer. Caller-owned request flows may use the lower-level
+  from that receipt. An absent or empty request is already closed; that no-op
+  writes no acceptance and does not bypass checks for remaining records.
+  Close touches no other worktree's saved request. Dedicated
+  worktree cleanup is connected separately in plan step 20C. Caller-owned
+  request flows may use the lower-level
   `close_skill_change --repo-root WORKTREE` command. Do not close failed or
   incomplete changes.
 - After committing, use `$ceratops-repo-lifecycle` `promote` when only local

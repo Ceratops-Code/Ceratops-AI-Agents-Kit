@@ -62,6 +62,17 @@ normal call reads current inputs. Local exit does not cancel remote CI, and
 clearing the flag does not accept work or delete checkpoints. Complete diagnostic
 files are implemented; new CI receipt/publication behavior remains later work.
 
+Each task worktree belongs to one thread; ordinary editing, checks and builds
+take no worktree or checkpoint lock. Shared request completion removes only
+that request, without scanning other worktrees. 20C still connects exact
+removed/absent-worktree records to the dedicated cleanup script after its
+ownership and stopped-command checks; 4D removes the empty artifact wrapper
+and directory. Release, shared-store and installation locks remain separate.
+Old `skill-updates` and `artifact-versions` per-worktree lock files under
+`<git-common-dir>/ceratops/locks/` await one-time retirement at the next authorized
+deployment after old invocations stop. Files still in use are retained and
+reported; saved requests and unrelated locks are untouched.
+
 ### Complete failure details
 
 Add `--diagnostic-output FILE` to `ship-repository.py`. The direct

@@ -63,6 +63,16 @@ and the existing explicit recovery requirement. Clearing it neither accepts
 failed work nor deletes checkpoints. Complete report forwarding is implemented;
 new phase scheduling and receipt-driven remote work remain later steps.
 
+Each task worktree belongs to one thread; ordinary editing, checks and builds
+take no worktree or checkpoint lock. Shared request storage now removes only
+its own completed request, never another worktree's records. Release locks,
+short shared-store locks and installation locks keep their separate purposes.
+20C still connects dedicated worktree cleanup; 4D removes the empty artifact
+checkpoint wrapper/directory. Old `skill-updates` and `artifact-versions`
+per-worktree files under `<git-common-dir>/ceratops/locks/` await one-time
+retirement at the next authorized deployment after old invocations stop.
+Files still in use are retained and reported; other locks and requests remain.
+
 ### Complete failure details
 
 Add `--diagnostic-output FILE` to the promotion command. FILE is one stable

@@ -9,6 +9,7 @@ import sys
 from typing import Any
 
 import pytest
+from filelock import FileLock
 
 from tests.skill_lifecycle.support import (
     SKILL_UPDATE_WORKFLOW,
@@ -567,29 +568,74 @@ def test_generations_are_bounded_and_original_request_is_retained(tmp_path):
         assert not list(directory.rglob("*.tmp"))
 
 
-def test_completion_receipt_survives_cleanup_interruption(tmp_path, monkeypatch):
-    root, _, _, request, _ = _case(tmp_path)
+@pytest.mark.parametrize("point", [
+    "completion-write", "update_request.json", "states/1.json", "check-result",
+    "states", "check_results", "completion_receipt.json", ".",
+])
+@pytest.mark.parametrize("timing", ["before", "after"])
+def test_completion_receipt_survives_cleanup_interruption(tmp_path, monkeypatch, point, timing):
+    counter = tmp_path / "check-once"
+    checks = [{"kind": "command", "argv": [sys.executable, "-c",
+        f"from pathlib import Path; p=Path({str(counter)!r}); "
+        "assert not p.exists(), 'accepted check repeated'; p.write_text('passed')"]}]
+    root, _, _, request, _ = _case(tmp_path, checks=checks)
     _ok(root, "open_skill_change", request)
     _edit(root)
     _ok(root, "run_skill_checks")
     directory = _directory(root)
     workflow = _workflow(monkeypatch)
-    unlink = pathlib.Path.unlink
+    with monkeypatch.context() as patch:
+        if point == "completion-write":
+            namespace = workflow["command_close_skill_change"].__globals__
+            write = namespace["write_record"]
 
-    def stop(path, *args, **kwargs):
-        if path.parent == directory / "states":
-            raise OSError("cleanup interrupted")
-        return unlink(path, *args, **kwargs)
+            def interrupted_write(context, name, value):
+                assert name == "completion_receipt.json"
+                if timing == "before":
+                    raise OSError("cleanup interrupted")
+                write(context, name, value)
+                raise OSError("cleanup interrupted")
 
-    monkeypatch.setattr(pathlib.Path, "unlink", stop)
-    with pytest.raises(OSError, match="cleanup interrupted"):
-        workflow["command_close_skill_change"](root)
-    assert (directory / "completion_receipt.json").is_file()
-    monkeypatch.setattr(pathlib.Path, "unlink", unlink)
+            patch.setitem(namespace, "write_record", interrupted_write)
+        else:
+            target = (next((directory / "check_results").glob("*.json"))
+                      if point == "check-result" else directory / point)
+            method = "rmdir" if point in {"states", "check_results", "."} else "unlink"
+            delete = getattr(pathlib.Path, method)
+
+            def interrupted_delete(path, *args, **kwargs):
+                if path == target and timing == "before":
+                    raise OSError("cleanup interrupted")
+                result = delete(path, *args, **kwargs)
+                if path == target and timing == "after":
+                    raise OSError("cleanup interrupted")
+                return result
+
+            patch.setattr(pathlib.Path, method, interrupted_delete)
+        with pytest.raises(OSError, match="cleanup interrupted"):
+            workflow["command_close_skill_change"](root)
+    if point == "completion-write":
+        assert (directory / "completion_receipt.json").exists() == (timing == "after")
+    else:
+        assert target.exists() == (timing == "before")
     (root / "later.txt").write_text("keep", encoding="utf-8")
     _ok(root, "close_skill_change")
+    _ok(root, "close_skill_change")
     assert not directory.exists()
+    assert counter.read_text() == "passed"
     assert request.exists() and (root / "later.txt").exists()
+
+
+def test_close_without_request_does_not_accept_or_remove_unfinished_records(tmp_path):
+    root, _, _, request, _ = _case(tmp_path)
+    _ok(root, "close_skill_change")
+    _ok(root, "close_skill_change")
+    _ok(root, "open_skill_change", request)
+    directory = _directory(root)
+    before = {path: path.read_bytes() for path in directory.rglob("*.json")}
+    assert _run(root, "close_skill_change").returncode == 2
+    assert {path: path.read_bytes() for path in directory.rglob("*.json")} == before
+    assert not (directory / "completion_receipt.json").exists()
 
 
 def test_unreadable_tail_is_not_mistaken_for_a_torn_write(tmp_path, monkeypatch):
@@ -624,22 +670,30 @@ def test_broken_completion_after_partial_cleanup_is_preserved(tmp_path, monkeypa
     assert receipt.read_text() == "{"
 
 
-def test_lock_contention_does_not_modify_records(tmp_path, monkeypatch):
+def test_skill_change_ignores_obsolete_checkpoint_lock(tmp_path):
     root, _, _, request, _ = _case(tmp_path)
     _ok(root, "open_skill_change", request)
-    workflow = _workflow(monkeypatch)
-    storage = workflow["checkpoint_storage"]()
     directory = _directory(root)
-    before = {p: p.read_bytes() for p in directory.rglob("*.json")}
-    with storage.open_checkpoints(root, "skill-updates"):
-        result = _run(root, "run_skill_checks")
-    assert result.returncode == 2 and "busy" in result.stderr
-    assert {p: p.read_bytes() for p in directory.rglob("*.json")} == before
+    locks = directory.parents[2] / "locks"
+    assert not locks.exists()
+    old_lock = locks / "skill-updates" / f"{directory.name}.lock"
+    old_lock.parent.mkdir(parents=True)
+    # A retained old file is not consulted or retired by a new helper call.
+    with FileLock(old_lock, timeout=0, preserve_lock_file=True):
+        _edit(root)
+        _ok(root, "run_skill_checks")
+        _ok(root, "close_skill_change")
+    assert not directory.exists()
+    assert old_lock.is_file()
+    assert list(locks.rglob("*.lock")) == [old_lock]
+    assert request.exists()
 
 
-def test_successful_close_cleans_removed_worktree_for_same_producer(tmp_path, monkeypatch):
+@pytest.mark.parametrize("removed", [False, True])
+def test_successful_close_leaves_other_worktree_requests(tmp_path, monkeypatch, removed):
     root, _, _, request, _ = _case(tmp_path)
     _ok(root, "open_skill_change", request)
+    own_records = _directory(root)
     workflow = _workflow(monkeypatch)
     storage = workflow["checkpoint_storage"]()
     primary = pathlib.Path(run_git(root, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()).parent
@@ -648,12 +702,14 @@ def test_successful_close_cleans_removed_worktree_for_same_producer(tmp_path, mo
     with storage.open_checkpoints(orphan, "skill-updates") as context:
         storage.write_checkpoint(context, "update_request.json", {"original": True})
         orphan_records = context.directory
-    assert run_git(primary, "worktree", "remove", str(orphan)).returncode == 0
+    if removed:
+        assert run_git(primary, "worktree", "remove", str(orphan)).returncode == 0
     _edit(root)
     _ok(root, "run_skill_checks")
     assert orphan_records.exists()
     _ok(root, "close_skill_change")
-    assert not orphan_records.exists()
+    assert not own_records.exists()
+    assert json.loads((orphan_records / "update_request.json").read_text()) == {"original": True}
 
 
 @pytest.mark.parametrize("check", [

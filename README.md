@@ -410,10 +410,11 @@ Another worktree may own an independent version. The legacy v2 producer keeps
 its supported full-transaction lock and delete-recognizable-staging behavior;
 that cleanup is never applied to direct versioned output.
 
-The versioned runner uses `manage_checkpoints.py` for its parent-writer lock and
-success cleanup. Reservations remain the recovery authority, so this route does
-not copy them into checkpoint records. After durable completion, cleanup removes
-only checkpoints, never artifacts or receipts. If cleanup fails, a fresh
+The versioned runner still opens a request directory through
+`manage_checkpoints.py`, without a checkpoint lock. Step 4D removes this empty
+wrapper and directory. Reservations remain the recovery authority; this route
+does not copy them into checkpoint records. After durable completion, cleanup
+removes only checkpoints, never artifacts or receipts. If cleanup fails, a fresh
 invocation discovers the attempt from its committed receipt and performs cleanup
 without recreating C, receipts or tags. This does not supervise artifact-writing
 child processes. 3A releases stopped attempts before model corrections;
@@ -447,8 +448,9 @@ The implemented foundation has six separate responsibilities:
   adapters and required artifact tests. Its sibling `store_artifacts.py` owns
   the unchanged v2 store transaction, including the full-lifetime lock,
   measurement, receipt persistence, atomic publication, retention and cleanup.
-- **1e.1 — checkpoint storage:** the shared helper provides discoverable records,
-  native producer locks and scoped cleanup. Domain producers decide recovery;
+- **1e.1/4A — checkpoint storage:** the shared helper provides discoverable records
+  without request locks; successful completion deletes only its own request.
+  Domain producers decide recovery;
   artifact reservations and accepted receipts retain their existing ownership.
 
 The later public Build operation will supply the resolved selection, locked
@@ -490,11 +492,10 @@ artifact operations and `skill-updates` for skill changes. It is not a separate
 command or a saved program counter.
 
 Every worktree in the repository shares the Git common directory. The helper
-derives these paths without a caller-supplied operation ID:
+derives this path without a caller-supplied operation ID:
 
 ```text
 <git-common-dir>/ceratops/operations/<owner>/<worktree-id>/
-<git-common-dir>/ceratops/locks/<owner>/<worktree-id>.lock
 ```
 
 The primary checkout uses `main` as its directory ID regardless of branch name.
@@ -502,22 +503,42 @@ A linked worktree's ID comes from its Git registration name, so another process
 finds the same records even after the worktree moves. One directory holds one
 unfinished request; producers bind it before recording additional essentials.
 
-`open_checkpoints` holds the native lock until context exit, including failure.
+Each task worktree belongs to one thread. Ordinary edits, checks, builds and
+saved requests take no worktree or checkpoint lock. `open_checkpoints` resolves
+the request directory and keeps its context active until exit.
 `read_checkpoint` reads a record; `write_checkpoint` writes immutable JSON
 directly to its final path, reusing identical data and refusing conflicting or
 unreadable data. Same-thread nested calls share the context. Opening or leaving
 it does not delete records. `finish_checkpoints`, called by the outermost
-producer after durable success, removes its records and sweeps only that
-owner's removed-worktree records. A busy orphan lock is skipped until a later
-successful cleanup. A failed Git lookup preserves the records.
+caller after durable success, removes only its own records. Completion does
+not list worktrees or inspect sibling requests, whether their worktrees still
+exist or have been removed. Interrupted own-request deletion can be repeated
+without rerunning accepted checks or builds.
+
+`close_skill_change` treats an absent or empty request as already closed. This
+covers interruption after deleting the last receipt and repeated close calls;
+it records no acceptance and leaves unfinished, nonempty requests subject to
+their existing successful-check requirements.
 
 `discard_worktree_checkpoints` provides the corresponding cleanup across
-owners after confirmed worktree removal; connecting that removal caller remains
-plan step 20. Neither cleanup follows redirected paths or deletes the reusable
-lock files, artifacts, reservations, installations or accepted results. There
-is no scheduled cleaner or sweep at every command start. Artifact operations
+owners after confirmed worktree removal. Step 20C connects it to the dedicated
+cleanup script after ownership and stopped-command checks; until then, absent
+worktrees' records stay. A still-present worktree or failed Git lookup prevents
+that explicit deletion. Neither cleanup follows redirected paths or deletes
+artifacts, reservations, installations or accepted results. There is no
+scheduled cleaner, startup sweep or successful-command orphan sweep. Artifact operations
 keep recovery information in existing reservations/receipts, not duplicate
-checkpoint JSON. Artifact-writing child processes are outside this lock's scope.
+checkpoint JSON.
+
+The next authorized deployment must retire the exact obsolete
+`ceratops/locks/skill-updates/<worktree-id>.lock` and
+`ceratops/locks/artifact-versions/<worktree-id>.lock` files, relative to the Git
+common directory, after old helper invocations stop. Until then those files
+remain; the new helper neither creates, acquires nor removes them. Report any
+still used by old helpers and leave them in place. This is one-time retirement,
+not a recurring scan. Preserve saved requests and release/store/destination
+locks: those protect shared release updates, store metadata and installations,
+not ordinary work in a task worktree.
 
 See the design's [five-function interface table and caller responsibilities](docs/design-draft.md#shared-checkpoint-storage-implemented)
 for arguments, errors, storage limits and cleanup-only retries.
@@ -634,7 +655,8 @@ No scheduled cleaner or additional acceptance checks are introduced.
 The 2B/3/4 batch remains unmerged through 4C: 3C and 4 connect the remaining
 handoffs, cleanup and installation-lock ordering. Do not promote or deploy it
 before that combined exit. No general task-worktree
-lock is introduced. Existing checkpoint locks remain unchanged; installer
+lock is introduced. 4A removes checkpoint locks and completion-triggered scans
+of other worktrees' requests; installer
 destination locks and optional automatic child cleanup are later work.
 See [Release locking and unfinished operations](docs/design-draft.md#release-locking-and-unfinished-operations).
 
@@ -648,7 +670,7 @@ serialize commands.
 | 1b receipt verification | Implemented v2 verifier plus internal v3/v1 receipt definitions and saved-chain reader | Connect public lifecycle callers in later steps |
 | 1c correction continuity | Implemented and preservation-verified; finalization consumes recorded success without rechecking the checkout | 3B supplies reports; 4B connects success cleanup |
 | 1d build/test/store | Implemented current v2 transaction plus an internal direct-write versioned route: reservations, final artifact paths, committed v3 build receipts, B-to-C result binding, artifact receipts, immutable tag and effect-derived recovery | 2B connects current release writers; public Build and receipt-driven Promote remain pending |
-| 1e.1 shared checkpoints | Implemented storage, native producer locking, fresh-invocation discovery and success-triggered orphan cleanup; versioned artifacts and skill updates adopted | Steps 4/20 connect controlled worktree removal; domain cleanup remains with its owners |
+| 1e.1/4A shared checkpoints | Implemented storage and fresh-invocation discovery without request locks; completion deletes only its own request | 4D removes the empty artifact wrapper/directory; 20C connects dedicated worktree cleanup; old lock files await authorized deployment retirement |
 | 1e.2 skill-change generations | Implemented immutable approvals, states and check results, five descriptive commands, interrupted-write recovery and completion cleanup; new committed receipts use `build_receipt.json` | 2B protects direct-release changes; historical committed receipts retain their recorded names |
 | 1e.3 test-result contract | Implemented generated-runner result contract and compatibility probe | 6 connects repository-wide result ownership, retention and affected-check orchestration |
 | Completed-build consumption | Implemented internal v2 reader; recorded acceptance and exact stored paths survive current test/input changes | Connect public receipt-based Deploy in later steps |
@@ -700,8 +722,9 @@ The approved changes below are **planned**, not new behavior of today's commands
 - Local installation failure stops for diagnosis, with no automatic retry.
   Report publication/CI success separately; a local fix permits explicit resume
   from the same files. An artifact fix requires a new version; ordinary compatible
-  bug fixes use a patch version. Successful completion removes its checkpoints
-  and the same producer's confirmed abandoned checkpoints, not other live work.
+  bug fixes use a patch version. Successful completion removes only its own
+  checkpoints. The dedicated worktree cleanup script removes abandoned records
+  after its ownership and stopped-command checks; 20C connects that path.
 
 See [test reuse and affected checks](docs/design-draft.md#acceptance-reuse-and-affected-checks),
 [the complete Ship sequence](docs/design-draft.md#ship-ci-receipts-and-local-installation)
@@ -728,9 +751,9 @@ policy. These are the runtime paths used by the foundation and update workflow:
 | `artifacts/.diagnostics/<unit>/<target>/<alpha\|beta\|stable>.json` | Persistent bounded latest-failure report; versioned `store_artifacts.py` route | Directly replace the one current report for the repository/unit/target/version-class group and verify its bytes. A later write can replace an interrupted invalid record; successful finalization clears the resolved group's report. No helper-owned temporary file is used. |
 | `artifacts/<unit>/<version>/` with optional `<target>/` | Direct final artifact output; artifact producer, finalizer and reader | Production writes into the final version directory after reservation. Valid existing files are measured and reused; changed or missing qualified bytes block completion. The version remains unreadable as completed until every target artifact receipt exists and immutable tag `<unit>/<version>` points to C. Startup and completion retain the current output plus two predecessors per repository/unit/target/class group while protecting reservations. |
 | `artifacts/.locks/store.lock` | Persistent reusable short-section lock; `store_artifacts.py` and `filelock` | Protects reservation, pruning, artifact-receipt and tag mutations only; build and artifact-test work runs outside it. The lock file is reusable and its availability is not recovery evidence. |
-| `<shared-git-directory>/ceratops/operations/<owner>/<worktree-id>/` | Disposable essential records; `manage_checkpoints.py` for `artifact-versions` and `skill-updates` | One unfinished request per producer/worktree. Open retains records; immutable JSON is written directly, identical writes are reused, and unreadable/conflicting records block unless the owner can reconstruct an unreferenced final write. Outermost success removes own records and sweeps only same-owner removed-worktree directories whose locks are free. Opening and failure never sweep. Durable repository acceptance and reservations are not stored here. |
-| `<shared-git-directory>/ceratops/locks/<owner>/<worktree-id>.lock` | Persistent reusable native lock; shared checkpoint helper | Held for the parent helper invocation and released on exit, including failure. Nested calls reuse the context. Lock files remain outside deleted checkpoint directories; busy orphan writers are skipped. No process tracking or scheduled cleanup is introduced. |
-| `operations/skill-updates/<worktree-id>/update_request.json`, `states/<generation>.json`, `check_results/<generation>.json`, `completion_receipt.json` under the shared Git directory's `ceratops/` | Disposable update continuity; `skill-update-workflow.py` | Keep the original request/baseline, current state plus two predecessors and their referenced check results. Write new generations directly; repair only malformed unreferenced tails, never valid conflicts or changed accepted results. Explicit `close_skill_change` consumes saved success, writes the completion receipt, then removes owned checkpoints and sweeps same-producer orphans. The receipt survives interrupted cleanup and is deleted last. Caller input requests remain caller-owned. |
+| `<shared-git-directory>/ceratops/operations/<owner>/<worktree-id>/` | Disposable essential records; `manage_checkpoints.py` for `artifact-versions` and `skill-updates` | One unfinished request per component/worktree, without a request lock. Open retains records; immutable JSON is written directly, identical writes are reused, and unreadable/conflicting records block unless the owner can reconstruct an unreferenced final write. Outermost success removes only its own records. Other worktrees' requests stay until dedicated cleanup is connected in 20C. Durable repository acceptance and reservations are not stored here. |
+| `<shared-git-directory>/ceratops/locks/{skill-updates,artifact-versions}/<worktree-id>.lock` | Obsolete files from the old checkpoint helper | No new creation or use. Retire exact old files at the next authorized deployment after old helper invocations stop; retain/report files still in use. No startup migration or recurring scan. Other locks and saved requests stay untouched. |
+| `operations/skill-updates/<worktree-id>/update_request.json`, `states/<generation>.json`, `check_results/<generation>.json`, `completion_receipt.json` under the shared Git directory's `ceratops/` | Disposable update continuity; `skill-update-workflow.py` | Keep the original request/baseline, current state plus two predecessors and their referenced check results. Write new generations directly; repair only malformed unreferenced tails, never valid conflicts or changed accepted results. Explicit `close_skill_change` consumes saved success, writes the completion receipt, then removes only that request's checkpoints. The receipt survives interrupted cleanup and is deleted last. Caller input requests remain caller-owned. |
 | Update check scratch directories and cleanup records | Temporary check work; `skill_update_scratch.py` | Removed when each check scope exits; recorded unfinished cleanup is retried before another check. Explicit check-output paths remain caller-owned. |
 | Existing test-runner scratch and `.build/test-diagnostics/pytest-failure.json` | Temporary execution scratch and persistent latest-failure report; repository test runner | Scratch is removed when the subprocess exits; failure evidence is rewritten on failure and removed by a successful run at that selected path. The existing runner remains its owner. |
 | Configured `.venv`/dependency environments, `__pycache__`, `.pytest_cache`, `.mypy_cache` and `.ruff_cache` | Persistent reusable development data; uv/Python and the owning check tool | Environments are synchronized to their project lock; cache entries are refreshed or invalidated by their owning tool. They are not bundle inputs or proof of passing artifact tests, and this flow does not purge them. |
@@ -743,9 +766,9 @@ in [the existing design draft](docs/design-draft.md#exact-artifact-bundle-transa
 Checkpoint IDs come from Git registration: `main` for the primary checkout and
 `linked-<SHA-256 of registration name>` for a linked worktree. They survive
 `git worktree move`; callers supply no operation UUID. Externally abandoned
-checkpoints may remain until that producer next succeeds. The shared
+checkpoints stay until the dedicated worktree cleanup script removes them. The shared
 `discard_worktree_checkpoints` interface can remove them across owners after
-confirmed worktree removal; its controlled-removal caller is planned in step 7.
+confirmed worktree removal; its controlled-removal caller is planned in step 20C.
 See [checkpoint interfaces and limits](docs/design-draft.md#shared-checkpoint-storage-implemented).
 
 The test runner writes collection snapshots and failure diagnostics directly to

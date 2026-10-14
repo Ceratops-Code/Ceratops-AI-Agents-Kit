@@ -678,7 +678,8 @@ integrity; passing outcomes come from the actual check execution.
 The shared helper `skills/sections/scripts/hold_write_lock.py` is implemented
 in 2A and connected to release-writing workflows in 2B. It is copied into the
 repository and skill lifecycle runtimes through `skills/skill-sections.json`.
-Existing checkpoint locks and cleanup behavior are unchanged.
+4A removes per-worktree checkpoint locks; completing a request deletes only
+that request's records. Release and shared-store locks remain separate.
 
 `skills/ceratops-repo-lifecycle/scripts/git_branch_operations.py` is an imported
 module, not another command. Promotion and synchronization share local
@@ -853,11 +854,13 @@ and GitHub protection guard their changes. A second local promotion or Ship fail
 immediately, before candidate work starts. No background lock-holder or incoming
 correction-command listener is introduced. Local exit does not cancel remote CI.
 
-Take the release lock before existing producer checkpoint locks and short store
-locks when nested. Do not hold a store lock through tests or human correction.
-Checkpoint cleanup retains its current nonblocking producer lock and never
-deletes this release-lock file. Removing a worktree cannot clear its unfinished
-flag. Commands that ignore the helper, including manual Git, are not protected.
+Each task worktree belongs to one thread. Ordinary editing, checks, builds and
+saved requests do not take worktree or checkpoint locks. Promotion and Ship hold
+the release lock during each automatic attempt, releasing it before model
+corrections. Nested short store locks protect shared metadata only, never tests
+or human correction. Request cleanup never deletes the release-lock file or
+clears its unfinished flag. Commands that ignore the helper, including manual
+Git, are not protected.
 
 Step 6 later applies this same helper to `<destination>/locks/install`, held
 through generation production, activation and owned cleanup. A destination lock
@@ -1207,9 +1210,11 @@ capture the requested units, target branch and selected delivery stages first.
    through the same receipt consumer, with no source build or repeated acceptance
    tests. Take the destination lock inside the still-held release lock; release
    it after activation and owned installer cleanup. Once every selected stage
-   succeeds, record the successful effects, remove this operation's checkpoints
-   and sweep the same producer's confirmed abandoned checkpoints. Then release
-   the outer release lock. Cleanup-only recovery repeats no successful effects.
+   succeeds, record the successful effects and remove only this operation's
+   checkpoints. Dedicated worktree cleanup handles removed/absent worktrees'
+   records after ownership and stopped-command checks; 20C connects that path.
+   Then release the outer release lock. Cleanup-only recovery repeats no
+   successful effects.
 
 If no artifacts need production, reuse selected existing final receipts and report
 applicable checks; create no empty receipt commit or new version tag. Explicitly
@@ -1379,15 +1384,14 @@ tests. The working-folder caller delegates this sequence to the shared finalizer
 not domain recovery or a general workflow engine. The live section manifest maps
 it to `scripts/manage_checkpoints.py` in the installed repository- and
 skill-lifecycle skills. Repository lifecycle and skill lifecycle both use this
-storage. It uses the already pinned native `filelock` dependency
-without soft-lock fallback. No new dependency, operation UUID, phase journal or
-process supervisor is added.
+storage. It takes no native lock: one thread owns each task worktree. The pinned
+`filelock` dependency remains for release, shared-store and installation code.
+No replacement lock, process record, operation UUID or phase journal is added.
 
-Both paths below are relative to the Git common directory:
+The record path is relative to the Git common directory:
 
 ```text
 ceratops/operations/<owner>/<worktree-id>/
-ceratops/locks/<owner>/<worktree-id>.lock
 ```
 
 A producer is the helper responsible for writing these records. Its owner name
@@ -1402,42 +1406,47 @@ including when removing records belonging to a different, removed worktree.
 
 | Interface | Behavior |
 | --- | --- |
-| `open_checkpoints(repo_root, owner)` | Resolve a registered worktree's directory and acquire its native lock without waiting; a busy writer reports `CheckpointError`. Hold until context exit on success or failure. Same-thread nested calls reuse the context; no orphan sweep runs here. |
+| `open_checkpoints(repo_root, owner)` | Resolve this component's registered-worktree directory without creating or acquiring a lock. Same-thread nested calls reuse the context; no cleanup runs here. |
 | `read_checkpoint(context, name)` | Read a relative JSON-object record, or return `None` only when missing. Invalid JSON, duplicate keys, non-finite numbers and oversized records are unreadable, never silently absent. |
 | `write_checkpoint(context, name, data)` | Write directly to the final relative JSON path and flush to disk. Records are immutable, bounded to 2 MiB: an identical write is a no-op; a different or unreadable record blocks. Producers bind their request before saving further essentials, using distinct names for later immutable records. |
-| `finish_checkpoints(context)` | Only the outermost caller, after durable success, removes its records and performs one same-owner orphan sweep. It can be retried as cleanup only. |
-| `discard_worktree_checkpoints(repo_root, worktree_id)` | Refuse a still-present worktree; after confirmed removal, remove only its records across owners whose native locks are free. Plan step 20 connects the controlled-removal caller; this interface alone does not remove a worktree. |
+| `finish_checkpoints(context)` | Only the outermost caller, after durable success, removes this request's directory. It lists neither worktrees nor sibling requests and can be retried as cleanup only. |
+| `discard_worktree_checkpoints(repo_root, worktree_id)` | Refuse a still-present worktree; after confirmed removal, remove only that worktree's records across components, without a checkpoint lock. 20C connects the dedicated cleanup caller after its ownership and stopped-command checks; this interface alone does not remove a worktree. |
 
-The context carries directory and lock information, not a recovery plan, and is
-usable only while `open_checkpoints` holds the lock. Record names are relative
+The context carries directory and nesting information, not a lock or recovery
+plan, and is usable only inside its `open_checkpoints` call. Record names are relative
 JSON paths within that directory. The parent helper alone writes checkpoints;
-child commands return results. Context exit releases the lock on success or
-failure, but does not finish the request or delete records. Only explicit
+child commands return results. Context exit on success or failure does not
+finish the request or delete records. Only explicit
 `finish_checkpoints` after durable success does that; nested callers leave
 this decision to their outermost caller.
 
 Cleanup derives destinations from the common directory, owner and worktree ID,
 never from saved JSON. It refuses links, junctions and hard-linked files rather
-than traversing them. A failed Git or registration lookup preserves the
-potentially live records. Existing worktrees are retained; for a removed
-worktree, cleanup tries its checkpoint lock once without waiting. If busy, it
-leaves the records because the parent may still be running. After acquiring
-the lock it checks the registration again before deletion, protecting a
-worktree that reappeared during cleanup. Lock files remain reusable outside
-deleted trees. No scheduled cleaner or every-command orphan sweep exists.
-Abandoned records may remain until another same-owner operation succeeds;
-controlled worktree-removal integration is still planned in step 20.
+than traversing them. Exact-worktree deletion retains records when Git or its
+registration cannot be read, or when the worktree is still present. It checks
+registration again before each component's deletion in case the worktree has
+reappeared. Own-request completion needs no worktree inventory at all. No
+scheduled cleaner, startup sweep or successful-command orphan sweep exists.
+Absent-worktree records stay until the dedicated cleanup connection in 20C.
+
+Old `ceratops/locks/skill-updates/<worktree-id>.lock` and
+`ceratops/locks/artifact-versions/<worktree-id>.lock` files are obsolete, but the
+new helper does not delete them. At the next authorized deployment, remove only
+those exact files after old helper invocations have stopped. Retain and report
+any still in use. This one-time retirement preserves saved requests and all
+release/store/destination locks; it adds no startup migration or recurring scan.
 
 `repository_operation.py` wraps `reserve_versioned_build`,
 `prepare_versioned_receipt` and `complete_versioned_build` through
 `store_artifacts.versioned_artifact_checkpoints`. Completion then calls
 `store_artifacts.finish_versioned_checkpoints`. These adapters use the shared
 five-function interface; the artifact producer still owns the decision that
-all of the request's units are complete. Within this route, lock order is the
-checkpoint lock first, short artifact-store lock second. This is not a
-whole-worktree execution lock. Unit/version reservations already contain its
-recovery essentials,
-so the artifact route needs no additional checkpoint JSON. Different unfinished
+all of the request's units are complete. The wrapper now takes no checkpoint
+lock; step 4D removes the empty wrapper and its directory creation. Short
+artifact-store locks still protect shared metadata, nested inside an outer
+release lock when called by Promote/Ship. Unit/version reservations already
+contain the recovery essentials, so the artifact route needs no additional
+checkpoint JSON. Different unfinished
 repository/branch/B requests are refused; a request with another pending unit
 does not finish its checkpoints prematurely. New attempts still receive their
 existing receipt attempt ID. Confirmed retries discover it in the reservation,
@@ -1448,20 +1457,20 @@ new commit, rewritten receipt or moved tag.
 
 Successful acceptance stays in its existing receipts, Git and artifact storage.
 Generic checkpoint cleanup cannot delete those, reservations or installations.
-The producer lock does not prove an earlier artifact-writing child has stopped.
 Step 2A provides the shared release-lock helper; 2B connects promotion and other
 release writers. 3A releases stopped attempts before model corrections;
 3B supplies complete reports; controlled cleanup remains in 4/20/21.
-Step 20 connects checkpoint cleanup to worktree removal.
+Step 20C connects checkpoint cleanup to worktree removal.
 Neither helper supervises child processes or adds general worktree locks.
 Artifact-reservation and incomplete-installation cleanup belong to their
 existing owners in planned step 21, not this checkpoint API. The v2 producer
 is unchanged; skill updates use checkpoint storage for immutable generations.
 
-The existing handoff/storage tests cover fresh-process discovery, direct writes,
-conflicting and unreadable records, nesting, native lock contention, worktree
-move/removal, failed lookup, same-owner cleanup, foreign-owner/live-worktree and
-durable-output preservation, and cleanup-only artifact retries. The installed
+The checkpoint and handoff/storage tests cover fresh-process discovery, direct
+writes, conflicting and unreadable records, nesting without locks, worktree
+move/removal, failed lookup, own-request-only cleanup, live-worktree and
+durable-output preservation, and interrupted cleanup without repeated accepted
+work. Old lock files remain untouched by new helper calls. The installed
 runtime test exercises the mapped helper in an isolated interpreter without a
 source-checkout import. These checks establish this boundary, not public Build
 or whole-system recovery.
@@ -1501,22 +1510,24 @@ retired through the existing scope owner after ref deletion. Other entries remai
 untouched. This handoff lets preflight consume a completed interrupted deletion
 without treating the missing branch as unresolved work.
 
-Step 7 extends the implemented checkpoint helper and connects the existing domain
-owners. After successful top-level completion, remove the operation's checkpoints
-and sweep only the same producer's confirmed abandoned unfinished requests. In
-addition to removed worktrees, explicit cancellation/supersession with stopped
-writers can establish abandonment in an existing worktree. Failure, age or a free
-release lock cannot: retain live and diagnosis-paused requests. Try each producer
-lock once; a busy owner is untouched until a later successful cleanup. No scheduled
-cleaner, failure-triggered sweep or sweep at every command is introduced.
+4A implements own-request-only completion without checkpoint locks. Step 20C
+connects the dedicated cleanup script to exact removed/absent worktree records.
+Explicit abandonment or replacement in an existing worktree may remove only
+obsolete records after commands stop and needed replacement information is
+saved; those callers also remain for 20C. Failure, age, restarting or a free
+release lock proves none of these conditions. No scheduled cleaner or
+ordinary-command sweep is introduced.
 
 Before controlled worktree removal, the caller finishes/cancels its commands and
 establishes ownership, unchanged expected refs and absence of later/dirty work.
 Use the release lock so removal cannot take a running promotion/Ship's source or
 release checkout. This does not prove unrelated standalone task commands stopped.
-After actual removal, call the existing cross-owner checkpoint cleanup interface;
-preserve busy owners. External removal is handled by the next successful same-owner
-sweep. Never delete a lock file or clear an unfinished flag to force cleanup.
+After actual removal, call the existing exact-worktree checkpoint cleanup
+interface. For external removal, the same dedicated script must establish
+ownership and stopped commands; uncertain cases stay untouched. Successful
+updates/builds never search for other worktrees' records. No checkpoint lock
+substitutes for these conditions. Never clear a release/destination unfinished
+flag or delete its lock file to force cleanup.
 
 Checkpoint deletion does not own artifact reservations, partial artifacts or
 installation generations. Their producers read existing ownership metadata and
@@ -1526,8 +1537,9 @@ with stale reservation bookkeeping needs cleanup only, not another build/test.
 Installer cleanup uses its destination lock; standalone artifact writers still
 need their own recovery evidence or explicit confirmation that commands stopped.
 
-Successful Ship performs its completion and same-owner abandoned-checkpoint sweep
-after releasing any destination lock but before releasing its outer release lock.
+Successful Ship finishes its own request and invokes dedicated eligible-worktree
+cleanup after releasing any destination lock, before releasing its outer
+release lock.
 Cleanup failure retains only the information needed to finish cleanup; retry
 does not repeat successful tests, builds, merges, publication or installation.
 
@@ -1545,8 +1557,8 @@ they do not rename old files, alter tags or rerun accepted builds/tests.
 
 | Path/group | Owner and lifetime |
 | --- | --- |
-| `ceratops/operations/<owner>/<worktree-id>/` | Shared checkpoint helper; immutable essential records for one unfinished request; retain on open/failure, delete after outermost durable success, then sweep free same-owner removed-worktree entries. No acceptance or copied reservation journal lives here. |
-| `ceratops/locks/<owner>/<worktree-id>.lock` | Shared checkpoint helper; reusable native producer lock held through parent invocation and checkpoint deletion, outside the worktree and record tree; never delete during checkpoint cleanup. |
+| `ceratops/operations/<owner>/<worktree-id>/` | Shared checkpoint helper; immutable essential records for one unfinished request without a lock; retain on open/failure, delete only that request after outermost durable success. 20C connects removed-worktree deletion. No acceptance or copied reservation journal lives here. |
+| `ceratops/locks/{skill-updates,artifact-versions}/<worktree-id>.lock` | Obsolete checkpoint-lock files; no new creation or use. Retire exact files during the next authorized deployment after old invocations stop; retain/report any still in use. No recurring scan or effect on other locks. |
 | `ceratops/locks/release-local` | Implemented internal write-lock helper; one persistent native lock per Git common directory, with an in-place one-byte unfinished-run flag. Clear only after explicit clean completion, never during checkpoint cleanup or worktree removal. Current release writers use it in 2B; steps 3 and 4 complete the batch. |
 | `<destination>/locks/install` | Planned in steps 17–19; use the same helper and unfinished-run flag across source worktrees, through generation production, activation and cleanup. Retain the file; no mandatory OS process groups. |
 | Committed build receipt/evidence | Producer; current record plus at most two predecessors per unit/check group in the checkout; Git commit history supplies historical retrieval without an extra record database |
@@ -1647,8 +1659,8 @@ checkout supplies the MCP server name and version. "SDLC install"
 was shorthand in an earlier answer, not a separate command.
 
 `skill-update-workflow.py` discovers one unfinished update under
-`<git-common-dir>/ceratops/operations/skill-updates/<worktree-id>/` and holds
-the shared producer lock per invocation. No operation UUID or caller-supplied
+`<git-common-dir>/ceratops/operations/skill-updates/<worktree-id>/` without a
+checkpoint or worktree lock. No operation UUID or caller-supplied
 state/evidence paths are required. The caller's request has schema
 `ceratops-skill-update-request.v3` and fields `selected_skills`,
 `allowed_paths`, `change_groups` and non-test `checks`.
@@ -1716,9 +1728,13 @@ Opening retains unfinished work. State append/recovery bounds generations and
 referenced results. Closing consumes saved success without rechecking the live
 checkout, writes the completion receipt, then removes only owned records. The
 receipt makes interrupted deletion resumable even after the original request
-is removed. Successful close invokes the shared same-producer removed-worktree
-sweep; failure/opening does not. No retention marker, sibling write file or
-mutable task-temp state remains. Disposable command scratch stays under
+is removed. If cleanup has removed the final receipt, a fresh close treats the
+empty or absent request as already closed and removes any empty directory.
+It writes no acceptance; a nonempty unfinished request still needs its saved
+successful checks. Closing never enumerates other worktrees or their saved requests;
+20C connects their removal to dedicated worktree cleanup. No retention marker,
+sibling write file or mutable task-temp state remains. Disposable command
+scratch stays under
 `<repo-parent>/tmp/<repo-name>/<worktree-name>`, is never copied into a result
 and is cleaned by `skill_update_scratch.py`; explicit check outputs remain
 caller-owned. Durable repository acceptance belongs to its receipt/result owner,
@@ -1800,7 +1816,7 @@ means the thread's decision is recorded, not that the whole system was audited.
     {"path": "skills/ceratops-repo-lifecycle/references/contracts/ceratops-compatibility-nondeterministic-contract.json", "role": "Internal compatibility review"},
     {"path": "docs/result_records.py.tmpl", "role": "Reference implementation for portable validation, test, and build records"},
     {"path": "skills/skill-sections.json", "role": "Live shared section and payload assignments"},
-    {"path": "skills/sections/scripts/manage_checkpoints.py", "role": "Shared essential checkpoint storage, native producer locks and cleanup"},
+    {"path": "skills/sections/scripts/manage_checkpoints.py", "role": "Shared essential request storage without checkpoint locks; own-request and exact-worktree cleanup"},
     {"path": "skills/sections/scripts/hold_write_lock.py", "role": "Shared native release lock and unfinished-run recovery flag"},
     {"path": "skills/ceratops-repo-lifecycle/scripts/git_branch_operations.py", "role": "Shared local branch/worktree operations; locking remains in workflows"},
     {"path": "skills/ceratops-repo-lifecycle/scripts/repository_operation.py", "role": "Operation execution and internal build transaction"},
