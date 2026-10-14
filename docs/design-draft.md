@@ -459,7 +459,8 @@ checkpoints. Implemented plan 6A binds production identities and bounded result
 retention to
 `<git-common-dir>/ceratops/results/repository-checks/<result-id>.json`.
 The operation/result owner now supplies grouping and lifetime; affected-check
-selection remains later work. Probe records are always discarded after the probe. Pytest basetemp/cache directories are disposable
+selection remains later work. Probe records are always discarded after the probe.
+Pytest basetemp/cache directories are disposable
 execution scratch and never copied or moved into results. Collection snapshots
 and failure diagnostics remain regenerable reports, not acceptance records.
 
@@ -887,7 +888,8 @@ operation owner supplies their final result paths under
 `<git-common-dir>/ceratops/results/repository-checks/<result-id>.json`; results
 are saved before success is returned. They outlive checkpoints and worktrees.
 Implemented plan 6A adds qualification levels and original/reused references to
-the existing schemas, writers and readers together. Historical evidence is not rewritten or
+the existing schemas, writers and readers together. Historical evidence is not
+rewritten or
 assigned an invented level. Retain evidence referenced by active candidates,
 retained receipts or selected unit/target/level baselines; prune unreferenced
 results to current plus two predecessors per check scope/level at startup and
