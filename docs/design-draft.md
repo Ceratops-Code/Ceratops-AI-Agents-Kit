@@ -321,6 +321,11 @@ caller-owned `pytest-results.json` lives inside pytest's isolated temp directory
 carries returned counts and original result references, and is removed by that
 directory's existing owner. Aggregate records retain those child identities,
 check versions and levels without changing the normal counts-only stdout.
+The private `nonreusable_checks` transport carries explicit `reusable: false`
+facts for always-run tests, distributed execution and unrepresented child scope.
+Aggregate records preserve these constraints alongside original child references;
+the shared reader applies them before choosing any matching historical pass.
+They do not change an accepted outcome or assign a new identity to reused work.
 
 This is runner-level reuse with qualified provenance. Release-unit qualification,
 historical baseline selection and broader lifecycle receipt composition remain

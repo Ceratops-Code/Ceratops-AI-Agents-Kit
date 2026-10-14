@@ -450,7 +450,14 @@ class ReusePasses:
         self.executed_passes: dict[str, str] = {}
         self.original_count = 0
         self.references: dict[str, dict[str, Any]] = {}
+        self.nonreusable_checks: dict[str, dict[str, Any]] = {}
         self.current_node: str | None = None
+
+    def _unrepresented(self, nodeid: str, reason: str) -> None:
+        """Keep external or incomplete scope separate from original pass facts."""
+        self.nonreusable_checks[nodeid] = {
+            "id": nodeid, "status": "scope-unrepresented", "reusable": False, "reason": reason,
+        }
 
     @pytest.hookimpl(trylast=True)
     def pytest_collection_modifyitems(self, config: pytest.Config, items: list[pytest.Item]) -> None:
@@ -470,16 +477,24 @@ class ReusePasses:
         for item in items:
             # pytest's distributed workers have different effect/teardown
             # ownership; until represented explicitly they execute normally.
-            if outside_configuration or config.pluginmanager.hasplugin("xdist") or item.get_closest_marker("no_result_reuse"):
+            reason = (
+                "Configuration or fixture inputs are outside the repository." if outside_configuration else
+                "Distributed pytest worker scope is not represented." if config.pluginmanager.hasplugin("xdist") else
+                "The no_result_reuse marker requires fresh execution." if item.get_closest_marker("no_result_reuse") else None
+            )
+            if reason is not None:
+                self._unrepresented(item.nodeid, reason)
                 remaining.append(item)
                 continue
             module = getattr(item, "module", None)
             if not isinstance(module, types.ModuleType):
+                self._unrepresented(item.nodeid, "The collected check has no represented Python module.")
                 remaining.append(item)
                 continue
             try:
                 inputs = self.store.inputs(item.nodeid, fixture_helpers | _module_inputs(module, self.store.root))
-            except ValueError:
+            except ValueError as exc:
+                self._unrepresented(item.nodeid, f"Check input scope is not represented: {exc}")
                 remaining.append(item)
                 continue
             self.inputs_by_node[item.nodeid] = inputs
@@ -535,6 +550,8 @@ class ReusePasses:
                     self.executed_passes[nodeid] = record["result_id"]
 
     def pytest_sessionfinish(self, session: pytest.Session, exitstatus: int) -> None:
+        for nodeid in self.inputs_by_node.keys() - self.references.keys():
+            self._unrepresented(nodeid, "No complete durable child outcome represents this check.")
         # pytest uses NO_TESTS_COLLECTED when every current item was deselected.
         # An actually empty collection, interruption or internal error stays an
         # error; a complete set of accepted passes satisfies this invocation.
@@ -550,6 +567,7 @@ class ReusePasses:
                 "reused": len(self.reused),
                 "executed_passes": self.executed_passes, "reused_passes": self.reused,
                 "result_references": [self.references[key] for key in sorted(self.references)],
+                "nonreusable_checks": [self.nonreusable_checks[key] for key in sorted(self.nonreusable_checks)],
             }))
 
     def pytest_terminal_summary(self, terminalreporter: Any) -> None:
@@ -569,4 +587,8 @@ def pytest_configure(config: pytest.Config) -> None:
     root = pathlib.Path(context["root"])
     if root.resolve() != pathlib.Path.cwd().resolve():
         raise pytest.UsageError("Pytest result-input context names another checkout")
-    config.pluginmanager.register(ReusePasses(ResultStore(root, context)), "executed-pass-reuse")
+    plugin = ReusePasses(ResultStore(root, context))
+    if config.pluginmanager.hasplugin("xdist"):
+        # The controller may never receive collection items from its workers.
+        plugin._unrepresented("pytest-execution-scope", "Distributed pytest worker scope is not represented.")
+    config.pluginmanager.register(plugin, "executed-pass-reuse")

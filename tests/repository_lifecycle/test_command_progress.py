@@ -177,6 +177,7 @@ def test_promotion_streams_real_pytest_progress_through_every_parent(
         ROOT / "scripts" / "testing", repo / "scripts" / "testing",
         ignore=shutil.ignore_patterns("__pycache__"),
     )
+    shutil.copy2(ROOT / "scripts/result_records.py", repo / "scripts/result_records.py")
     tests = repo / "tests"
     tests.mkdir()
     (tests / "test-impact.json").write_text(json.dumps({

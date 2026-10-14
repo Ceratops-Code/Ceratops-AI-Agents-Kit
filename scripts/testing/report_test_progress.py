@@ -33,6 +33,7 @@ class PytestProcess(subprocess.CompletedProcess[str]):
 
     accepted_checks: dict[str, int] | None = None
     accepted_result_references: list[dict[str, object]] | None = None
+    nonreusable_checks: list[dict[str, object]] | None = None
 
 
 class TestProgress:
@@ -256,4 +257,5 @@ def run_pytest(
             summary = json.loads(summary_path.read_text(encoding="utf-8"))
             result.accepted_checks = {key: summary[key] for key in ("collected", "executed", "reused")}
             result.accepted_result_references = summary.get("result_references", [])
+            result.nonreusable_checks = summary.get("nonreusable_checks", [])
     return result

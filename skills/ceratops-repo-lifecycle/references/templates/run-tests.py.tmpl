@@ -21,8 +21,8 @@ import os
 import pathlib
 import platform
 import re
-import shutil
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -291,15 +291,16 @@ def check_current_inputs(context: Mapping[str, Any], root: pathlib.Path) -> None
             or recorded.get("architecture") != platform.machine()):
         raise ValueError("repository check environment changed before completion")
     if "files" in recorded:
-        files = {
+        environment_files = {
             name: _check_environment_file(os.environ.get(name), root)
             for name in rules.get("environment", []) if name == "GITHUB_EVENT_PATH"
         }
-        if files != recorded["files"]:
+        if environment_files != recorded["files"]:
             raise ValueError("repository check environment file changed before completion")
-    tools = {}
+    tools: dict[str, dict[str, str | None]] = {}
     for name in rules.get("tools", []):
         expanded = re.sub(r"\$\{([^}]+)\}", lambda match: os.environ.get(match[1], ""), name)
+        path: pathlib.Path | None
         if "/" in expanded or "\\" in expanded:
             path = pathlib.Path(expanded)
             path = path if path.is_absolute() else root / path

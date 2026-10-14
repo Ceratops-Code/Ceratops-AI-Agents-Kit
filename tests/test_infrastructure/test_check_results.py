@@ -504,3 +504,107 @@ def test_qualified_group_retains_the_original_inherited_child_level(
     assert inherited["qualificationLevel"] == "beta"
     assert inherited["result_id"] == first["result_id"] and inherited["reused"] is True
     assert "result_references" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_aggregate_reuse_preserves_external_input_markers_and_original_child_passes(
+    test_runner_module: Any, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str], mixed: bool,
+) -> None:
+    import uuid
+
+    from tests.test_infrastructure.test_pytest_execution import (
+        _acceptance_repository,
+        _acceptance_test,
+    )
+
+    reader = runpy.run_path(str(ROOT / "skills/ceratops-repo-lifecycle/scripts/retain_check_results.py"))
+    root = _acceptance_repository(tmp_path)
+    counter = tmp_path / "child-effects.log"
+    _acceptance_test(root, "marked", counter, extra="import pytest\n@pytest.mark.no_result_reuse\n")
+    if mixed:
+        _acceptance_test(root, "ordinary", counter)
+    monkeypatch.chdir(root)
+    context = _context(root)
+    context["scope"]["inputRules"].update({"product-inputs": ["production.py"], "check-inputs": ["tests/**"]})
+    context["productInputs"] = {"production.py": hashlib.sha256((root / "production.py").read_bytes()).hexdigest()}
+    context["checkInputs"] = {
+        path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in (root / "tests").rglob("*") if path.is_file()
+    }
+    context["fingerprint"] = reader["fingerprint"](context)
+    monkeypatch.setenv("CERATOPS_REPOSITORY_CHECK_CONTEXT", json.dumps(context))
+    store = reader["CheckResultStore"](root)
+    saved: list[dict[str, Any]] = []
+    original_bytes: dict[pathlib.Path, bytes] = {}
+    for _ in range(2):
+        decision = store.select(context, check_id="repository.actions.test")
+        assert decision["decision"] == "execute"
+        if saved:
+            assert "Unrepresented child scope" in decision["reason"]
+        identity, path = store.new_result_path()
+        assert test_runner_module.execute([
+            "--all", "--result-file", str(path), "--result-id", identity,
+            "--candidate-id", "1" * 40, "--check-id", "repository.actions.test",
+            "--check-version", "2" * 64,
+        ], repo_root=root) == 0
+        record = reader["read_check_result"](path)
+        assert record["status"] == "passed"
+        constraints = [item for item in record["checks"] if item.get("reusable") is False]
+        assert [item["id"] for item in constraints] == ["tests/test_marked.py::test_marked"]
+        saved.append(record)
+        original_bytes[path] = path.read_bytes()
+        if len(saved) == 1:
+            # Historical aggregate producers did not export child scope facts.
+            # Such an older pass must never bypass the explicit current constraint.
+            historical = {**record, "result_id": str(uuid.uuid4()), "checks": []}
+            historical["execution"] = {**record["execution"], "startedAt": "2000-01-01T00:00:00+00:00",
+                                       "finishedAt": "2000-01-01T00:00:00+00:00", "durationSeconds": 0}
+            historical_path = store.directory / f'{historical["result_id"]}.json'
+            historical_path.write_bytes(reader["canonical"](historical))
+    assert counter.read_text().splitlines().count("marked") == 2
+    assert all(path.read_bytes() == raw for path, raw in original_bytes.items())
+    if mixed:
+        assert counter.read_text().splitlines().count("ordinary") == 1
+        original, inherited = (
+            next(item for item in record["checks"] if item.get("status") == "passed")
+            for record in saved
+        )
+        assert inherited["result_id"] == original["result_id"]
+        assert inherited["check_version"] == original["check_version"]
+        assert inherited["reused"] is True
+    # Eligible-pass protection must not pin the older pass when current child
+    # scope prohibits reuse. Ordinary retention still bounds unrelated revisions.
+    for version in range(3):
+        unrelated = json.loads(json.dumps(saved[-1]))
+        unrelated["result_id"] = str(uuid.uuid4())
+        unrelated["check_version"] = f"{version + 4:064x}"
+        unrelated["inputs"]["checkVersion"] = unrelated["check_version"]
+        unrelated["inputs"]["fingerprint"] = reader["fingerprint"](unrelated["inputs"])
+        (store.directory / f'{unrelated["result_id"]}.json').write_bytes(reader["canonical"](unrelated))
+    store.prune()
+    assert not historical_path.exists()
+    assert store.select(context, check_id="repository.actions.test")["decision"] == "execute"
+    assert "result_references" not in capsys.readouterr().out
+
+
+def test_check_reader_rejects_nonboolean_child_reuse_constraint(
+    check_writer: dict[str, Any], tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import uuid
+
+    reader = runpy.run_path(str(ROOT / "skills/ceratops-repo-lifecycle/scripts/retain_check_results.py"))
+    monkeypatch.chdir(tmp_path)
+    context = _context(tmp_path)
+    context["fingerprint"] = reader["fingerprint"](context)
+    monkeypatch.setenv("CERATOPS_REPOSITORY_CHECK_CONTEXT", json.dumps(context))
+    identity = str(uuid.uuid4())
+    path = tmp_path / ".git/ceratops/results/repository-checks" / f"{identity}.json"
+    assert check_writer["run_recorded_check"](
+        lambda: 0, _request(path, identity), {}, checks=lambda: [{"id": "unknown-scope", "reusable": "false"}],
+    ) == 0
+    with pytest.raises(ValueError, match="Reported checks conflict"):
+        reader["read_check_result"](path)
+    assert reader["CheckResultStore"](tmp_path).select(
+        context, check_id="repository.actions.test",
+    )["decision"] == "blocked"

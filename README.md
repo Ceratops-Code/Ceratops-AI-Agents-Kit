@@ -1123,9 +1123,9 @@ custom implementation never briefly created an internal file. Structural-only
 compatibility success is not proof that results are reusable.
 
 Result paths stay outside disposable operation checkpoints. 1e.3 defines this
-runner protocol; 2A.2 connects production selection, ownership and bounded
-retention under `<git-common-dir>/ceratops/results/repository-checks/`.
-Until then, callers own their selected result files and lifetime. Disposable
+runner protocol; implemented plan 6A connects production selection, ownership
+and bounded retention under
+`<git-common-dir>/ceratops/results/repository-checks/`. Disposable
 pytest caches and basetemp directories remain scratch, not acceptance. Cheap
 diagnostics/collection snapshots may be regenerated at their own final paths.
 
@@ -1572,7 +1572,9 @@ new artifact checks still run. Corrupt evidence blocks the operation.
 Results live under `<git-common-dir>/ceratops/results/repository-checks/`.
 Existing pending-work scopes retain active candidate references; checkpoints
 and disposable reports are not acceptance authorities. Storage is bounded and
-protects required original passes and newer applicable failures.
+protects required original passes and newer applicable failures. Checks marked
+`no_result_reuse`, distributed execution and unrepresented child scope also
+prevent aggregate reuse; ordinary child passes keep their original identities.
 
 `--qualification-level` selects required alpha/beta/rc/final eligibility;
 ordinary checks default to alpha and promotion tests to beta. The portable

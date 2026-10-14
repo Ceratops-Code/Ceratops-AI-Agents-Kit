@@ -791,6 +791,10 @@ def test_external_input_marker_and_empty_collection_do_not_borrow_passes(
         result = _acceptance_run(test_runner_module, root)
         assert result.returncode == 0, result.stdout + result.stderr
         assert result.accepted_checks["reused"] == 0
+        assert result.nonreusable_checks == [{
+            "id": "tests/test_example.py::test_example", "status": "scope-unrepresented",
+            "reusable": False, "reason": "The no_result_reuse marker requires fresh execution.",
+        }]
     assert not list(_result_store(root).directory.glob("pytest-attempt-*.json"))
     (root / "tests/test_example.py").unlink()
     empty = _acceptance_run(test_runner_module, root)

@@ -114,7 +114,7 @@ def _plain(path: pathlib.Path) -> None:
 
 
 def _time(value: Any) -> datetime:
-    if not isinstance(value, str):
+    if not isinstance(value, str) or not value:
         raise ValueError("Check execution time is missing.")
     result = datetime.fromisoformat(value.replace("Z", "+00:00"))
     if result.tzinfo is None:
@@ -169,6 +169,8 @@ def _load(path: pathlib.Path) -> tuple[dict[str, Any], bytes]:
     if "checks" in value and (not isinstance(value["checks"], list)
                               or any(not isinstance(item, dict) for item in value["checks"])
                               or any("status" in item and not isinstance(item["status"], str)
+                                     for item in value["checks"])
+                              or any("reusable" in item and type(item["reusable"]) is not bool
                                      for item in value["checks"])
                               or (status == "passed" and any(
                                   item.get("status") in {"failed", "blocked", "interrupted"}
@@ -260,6 +262,11 @@ def retention_group(record: Mapping[str, Any]) -> bytes:
                       inputs["arguments"], inputs["qualificationLevel"]])
 
 
+def _nonreusable(record: Mapping[str, Any]) -> bool:
+    """A successful outcome can still require fresh child scope execution."""
+    return any(item.get("reusable") is False for item in record.get("checks", []))
+
+
 class CheckResultStore:
     """Read/prune the canonical store shared by every worktree of a repository."""
 
@@ -310,6 +317,9 @@ class CheckResultStore:
                     if record["check_id"] == check_id
                     and record["inputs"]["fingerprint"] == request["fingerprint"]]
         matching.sort(key=lambda item: _order(item[1]), reverse=True)
+        if any(_nonreusable(record) for _, record, _ in matching):
+            decision["reason"] = "Unrepresented child scope requires fresh execution."
+            return decision
         failures = [record for _, record, _ in matching
                     if record["status"] in {"failed", "interrupted"}]
         for path, record, _raw in matching:
@@ -384,8 +394,9 @@ class CheckResultStore:
                 if current.returncode or current.stdout.strip() != commit:
                     continue
                 references = candidate["check_results"]
-                if not isinstance(references, list):
-                    raise ValueError("Candidate check references must be a list.")
+                if (not isinstance(references, list)
+                        or any(not isinstance(item, dict) for item in references)):
+                    raise ValueError("Candidate check references must be a list of objects.")
                 for reference in references:
                     if (not isinstance(reference, dict)
                             or set(reference) != {"result_id", "candidate_id", "check_id", "check_version",
@@ -416,8 +427,12 @@ class CheckResultStore:
             with lock:
                 records, invalid = self._records()
                 protected = set(protected_ids) | self._references()
-                requests = [check_context(item) for item in (*self.active_inputs, *active_inputs)]
-                requests.extend(record["inputs"] for _, record, _ in records
+                requests = [(check_context(item), True)
+                            for item in (*self.active_inputs, *active_inputs)]
+                # Historical references retain their exact acceptance and any
+                # applicable failure; they do not create a current candidate
+                # that would pin an additional unreferenced passing version.
+                requests.extend((record["inputs"], False) for _, record, _ in records
                                 if record["result_id"] in protected)
                 groups: dict[bytes, list[tuple[pathlib.Path, dict[str, Any], bytes]]] = {}
                 for item in records:
@@ -425,23 +440,27 @@ class CheckResultStore:
                     inputs = record["inputs"]
                     if record["status"] == "running" and _live(record["execution"]["workerPid"]):
                         protected.add(record["result_id"])
-                        requests.append(inputs)
+                        requests.append((inputs, True))
                     # Rules still participate in the complete applicability
                     # fingerprint. Their revisions are not separate retention
                     # groups: one semantic check scope keeps three versions.
                     group = retention_group(record)
                     groups.setdefault(group, []).append(item)
-                for request in requests:
+                for request, protect_pass in requests:
                     by_check: dict[str, list[dict[str, Any]]] = {}
                     for _, record, _ in records:
                         if record["inputs"]["fingerprint"] == request["fingerprint"]:
                             by_check.setdefault(record["check_id"], []).append(record)
                     for relevant in by_check.values():
+                        constraints = [record for record in relevant if _nonreusable(record)]
+                        if constraints:
+                            protected.add(max(constraints, key=_order)["result_id"])
                         passes = [record for record in relevant if record["status"] == "passed"
+                                  and not constraints
                                   and LEVELS.index(record["inputs"]["qualificationLevel"])
                                   >= LEVELS.index(request["qualificationLevel"])]
                         newest_pass = max((_order(record) for record in passes), default=None)
-                        if passes:
+                        if passes and protect_pass:
                             protected.add(max(passes, key=_order)["result_id"])
                         failures = [record for record in relevant
                                     if record["status"] in {"failed", "interrupted"}
