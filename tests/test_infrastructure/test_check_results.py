@@ -608,3 +608,89 @@ def test_check_reader_rejects_nonboolean_child_reuse_constraint(
     assert reader["CheckResultStore"](tmp_path).select(
         context, check_id="repository.actions.test",
     )["decision"] == "blocked"
+
+
+@pytest.mark.parametrize("boundary", ["complete", "interrupted_teardown", "missing_teardown_report", "marked_skip", "xpass"])
+def test_aggregate_expected_skips_keep_actual_outcomes_and_complete_scope(
+    test_runner_module: Any, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    from tests.test_infrastructure.test_pytest_execution import _acceptance_repository
+
+    reader = runpy.run_path(str(ROOT / "skills/ceratops-repo-lifecycle/scripts/retain_check_results.py"))
+    root = _acceptance_repository(tmp_path)
+    counter = tmp_path / "child-effects.log"
+    marker = "@pytest.mark.no_result_reuse\n" if boundary == "marked_skip" else ""
+    (root / "tests/test_skips.py").write_text(
+        "import pathlib\nimport pytest\n"
+        "@pytest.mark.skip(reason='setup skip reason')\ndef test_setup_skip(): pass\n"
+        + marker + "def test_call_skip(): pytest.skip('call skip reason')\n"
+        f"@pytest.mark.xfail(reason='expected failure reason', strict={boundary != 'xpass'})\n"
+        f"def test_xfail(): {'pass' if boundary == 'xpass' else 'assert False'}\n"
+        "def test_pass():\n"
+        f"    with pathlib.Path({str(counter)!r}).open('a') as output: output.write('passed\\n')\n",
+        encoding="utf-8",
+    )
+    if boundary == "interrupted_teardown":
+        (root / "tests/conftest.py").write_text(
+            "import pytest\n@pytest.fixture(autouse=True)\ndef interrupt_teardown(request):\n"
+            "    yield\n    if request.node.name == 'test_call_skip': raise KeyboardInterrupt('teardown interruption')\n",
+            encoding="utf-8",
+        )
+    elif boundary == "missing_teardown_report":
+        (root / "tests/conftest.py").write_text(
+            "import pytest\n@pytest.hookimpl(tryfirst=True)\ndef pytest_sessionfinish(session):\n"
+            "    plugin = session.config.pluginmanager.get_plugin('executed-pass-reuse')\n"
+            "    if plugin is not None: plugin.phases['tests/test_skips.py::test_call_skip'].pop('teardown')\n",
+            encoding="utf-8",
+        )
+    monkeypatch.chdir(root)
+    context = _context(root)
+    context["scope"]["inputRules"].update({"product-inputs": ["production.py"], "check-inputs": ["tests/**"]})
+    context["productInputs"] = {"production.py": hashlib.sha256((root / "production.py").read_bytes()).hexdigest()}
+    context["checkInputs"] = {
+        path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in (root / "tests").rglob("*") if path.is_file()
+    }
+    context["fingerprint"] = reader["fingerprint"](context)
+    monkeypatch.setenv("CERATOPS_REPOSITORY_CHECK_CONTEXT", json.dumps(context))
+    store = reader["CheckResultStore"](root)
+    identity, path = store.new_result_path()
+    arguments = ["--all", "--result-file", str(path), "--result-id", identity,
+                 "--candidate-id", "1" * 40, "--check-id", "repository.actions.test", "--check-version", "2" * 64]
+    code = test_runner_module.execute(arguments, repo_root=root)
+    assert code == (2 if boundary == "interrupted_teardown" else 0)
+    original = path.read_bytes()
+    record = reader["read_check_result"](path)
+    decision = store.select(context, check_id="repository.actions.test")
+    skips = {item["id"]: item for item in record["checks"] if item.get("status") == "skipped"}
+    nodeid = "tests/test_skips.py::test_call_skip"
+    if boundary == "xpass":
+        nodeid = "tests/test_skips.py::test_xfail"
+    if boundary == "complete":
+        assert decision["decision"] == "reuse" and decision["reference"]["result_id"] == identity
+        assert skips == {
+            "tests/test_skips.py::test_setup_skip": {
+                "id": "tests/test_skips.py::test_setup_skip", "status": "skipped", "reusable": True,
+                "phases": {"setup": "skipped", "teardown": "passed"}, "reason": "Skipped: setup skip reason",
+            },
+            nodeid: {"id": nodeid, "status": "skipped", "reusable": True,
+                     "phases": {"setup": "passed", "call": "skipped", "teardown": "passed"},
+                     "reason": "Skipped: call skip reason"},
+            "tests/test_skips.py::test_xfail": {
+                "id": "tests/test_skips.py::test_xfail", "status": "skipped", "reusable": True,
+                "phases": {"setup": "passed", "call": "xfail", "teardown": "passed"},
+                "reason": "expected failure reason",
+            },
+        }
+        assert test_runner_module.execute(arguments, repo_root=root) == 0
+        assert counter.read_text().splitlines() == ["passed"]
+        assert len([item for item in record["checks"] if "result_id" in item]) == 1
+    else:
+        assert decision["decision"] == "execute" and nodeid not in skips
+        if boundary == "interrupted_teardown":
+            assert record["status"] == "failed"
+            assert any(item.get("status") == "interrupted" for item in record["checks"])
+        else:
+            assert any(item["id"] == nodeid and item.get("reusable") is False for item in record["checks"])
+    assert path.read_bytes() == original

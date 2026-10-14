@@ -451,6 +451,9 @@ class ReusePasses:
         self.original_count = 0
         self.references: dict[str, dict[str, Any]] = {}
         self.nonreusable_checks: dict[str, dict[str, Any]] = {}
+        self.skipped_checks: dict[str, dict[str, Any]] = {}
+        self.skipped_phases: dict[str, set[str]] = {}
+        self.skip_reasons: dict[str, str] = {}
         self.current_node: str | None = None
 
     def _unrepresented(self, nodeid: str, reason: str) -> None:
@@ -519,6 +522,12 @@ class ReusePasses:
             return
         phases = self.phases.setdefault(report.nodeid, {})
         phases[report.when] = "xfail" if hasattr(report, "wasxfail") else report.outcome
+        if report.skipped:
+            self.skipped_phases.setdefault(report.nodeid, set()).add(report.when)
+        if hasattr(report, "wasxfail"):
+            self.skip_reasons[report.nodeid] = str(report.wasxfail)
+        elif report.skipped and isinstance(report.longrepr, tuple):
+            self.skip_reasons[report.nodeid] = str(report.longrepr[2])
         if report.when != "teardown":
             return
         outcome = "passed" if phases == {
@@ -551,7 +560,24 @@ class ReusePasses:
 
     def pytest_sessionfinish(self, session: pytest.Session, exitstatus: int) -> None:
         for nodeid in self.inputs_by_node.keys() - self.references.keys():
-            self._unrepresented(nodeid, "No complete durable child outcome represents this check.")
+            phases = self.phases.get(nodeid, {})
+            completed_skip = phases.get("teardown") == "passed" and (
+                (set(phases) == {"setup", "teardown"} and phases["setup"] in {"skipped", "xfail"}
+                 and "setup" in self.skipped_phases.get(nodeid, set()))
+                or (set(phases) == {"setup", "call", "teardown"} and phases["setup"] == "passed"
+                    and phases["call"] in {"skipped", "xfail"}
+                    and "call" in self.skipped_phases.get(nodeid, set()))
+            )
+            if completed_skip:
+                # A complete expected skip is an observed outcome, never a child
+                # pass or invented result identity. The aggregate keeps the
+                # actual session exit; incomplete teardown still blocks reuse.
+                self.skipped_checks[nodeid] = {
+                    "id": nodeid, "status": "skipped", "reusable": True, "phases": phases,
+                    "reason": self.skip_reasons.get(nodeid, "Pytest reported a completed expected skip."),
+                }
+            else:
+                self._unrepresented(nodeid, "No complete durable child outcome represents this check.")
         # pytest uses NO_TESTS_COLLECTED when every current item was deselected.
         # An actually empty collection, interruption or internal error stays an
         # error; a complete set of accepted passes satisfies this invocation.
@@ -568,6 +594,7 @@ class ReusePasses:
                 "executed_passes": self.executed_passes, "reused_passes": self.reused,
                 "result_references": [self.references[key] for key in sorted(self.references)],
                 "nonreusable_checks": [self.nonreusable_checks[key] for key in sorted(self.nonreusable_checks)],
+                "skipped_checks": [self.skipped_checks[key] for key in sorted(self.skipped_checks)],
             }))
 
     def pytest_terminal_summary(self, terminalreporter: Any) -> None:

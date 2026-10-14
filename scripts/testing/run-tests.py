@@ -1241,6 +1241,7 @@ def execute(
         result = text_runner(command, cwd)
         observed.extend(getattr(result, "accepted_result_references", None) or [])
         observed.extend(getattr(result, "nonreusable_checks", None) or [])
+        observed.extend(getattr(result, "skipped_checks", None) or [])
         return result
 
     return run_recorded_request(args, lambda: execute_selected(

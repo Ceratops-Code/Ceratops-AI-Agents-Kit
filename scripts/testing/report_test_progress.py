@@ -29,11 +29,12 @@ HEARTBEAT_INTERVAL = 60.0
 
 
 class PytestProcess(subprocess.CompletedProcess[str]):
-    """Carry check counts and original outcome references with the actual exit code."""
+    """Carry original references, skip observations and constraints with the actual exit."""
 
     accepted_checks: dict[str, int] | None = None
     accepted_result_references: list[dict[str, object]] | None = None
     nonreusable_checks: list[dict[str, object]] | None = None
+    skipped_checks: list[dict[str, object]] | None = None
 
 
 class TestProgress:
@@ -258,4 +259,5 @@ def run_pytest(
             result.accepted_checks = {key: summary[key] for key in ("collected", "executed", "reused")}
             result.accepted_result_references = summary.get("result_references", [])
             result.nonreusable_checks = summary.get("nonreusable_checks", [])
+            result.skipped_checks = summary.get("skipped_checks", [])
     return result

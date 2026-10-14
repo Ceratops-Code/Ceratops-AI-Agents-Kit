@@ -326,6 +326,10 @@ facts for always-run tests, distributed execution and unrepresented child scope.
 Aggregate records preserve these constraints alongside original child references;
 the shared reader applies them before choosing any matching historical pass.
 They do not change an accepted outcome or assign a new identity to reused work.
+Complete represented setup/call skips and expected failures are carried in
+`skipped_checks` with their actual phase facts and reason. The aggregate keeps
+its actual session outcome and original identity; skipped work never gains a
+passing child identity. Missing or interrupted phase reports still block reuse.
 
 This is runner-level reuse with qualified provenance. Release-unit qualification,
 historical baseline selection and broader lifecycle receipt composition remain
