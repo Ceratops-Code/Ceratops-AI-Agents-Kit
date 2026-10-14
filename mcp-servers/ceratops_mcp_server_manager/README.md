@@ -54,7 +54,7 @@ interpreter that will install the locked dependencies.
 From an active Ceratops-AI-Agents-Kit source checkout:
 
 ```powershell
-uv run --locked scripts/deploy-mcp-server-manager.py --refresh-launchers -
+uv run --locked scripts/deploy-mcp-server-manager.py
 %USERPROFILE%\.codex\mcp\ceratops_mcp_server_manager\bin\ceratops_mcp_server_manager.cmd versions
 ```
 
@@ -68,18 +68,13 @@ It changes no Codex configuration. An incompatible or missing prerequisite fails
 before deployment writes installation files.
 
 The manager's launcher template is copied into each server's own `bin` folder.
-When `launcher.py` changes, name each affected installed server in the manager
-install operation's `refresh_launchers` parameter, as a comma-separated list.
-Use `-` when no other installed server needs a launcher refresh. The repository
-release install operation requires this explicit choice and refreshes only
-those names after selecting the manager release. Direct bootstrap calls can
-omit the flag. A repeat after interruption keeps the selected manager and
-server versions and changes only missing or stale launcher files.
-For direct source installation, pass the same value to `--refresh-launchers`:
-
-```powershell
-uv run --locked scripts/deploy-mcp-server-manager.py --refresh-launchers example_mcp_server
-```
+Manager source installation finds complete, selected server installations in
+the manager-owned `%USERPROFILE%\.codex\mcp` root and brings only missing or
+stale launcher files to that template. It ignores unrelated entries, unselected
+directories, and links without following them. An invalid selected installation
+stops the operation before packaging. A repeat after interruption keeps the
+selected manager and server versions and changes only launcher files still
+missing or stale.
 
 To refresh one installed server later, run the selected manager's stable
 launcher with `refresh-launcher <mcp-server-name>`. This does not rebuild or
@@ -89,7 +84,7 @@ For a one-time move from a previous manager root, name that exact source
 explicitly:
 
 ```powershell
-uv run --locked scripts/deploy-mcp-server-manager.py --refresh-launchers - --import-root <legacy-root>
+uv run --locked scripts/deploy-mcp-server-manager.py --import-root <legacy-root>
 ```
 
 The migration validates and imports only registered immutable artifacts, then

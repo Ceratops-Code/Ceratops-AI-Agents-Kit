@@ -7,8 +7,8 @@ and deployment implementations install its declared name and version. An
 explicit legacy root can contribute validated immutable release catalogs; its
 environments are rebuilt under the current root and the source remains intact.
 This command never installs global prerequisites, edits Codex settings, or
-restarts apps. Repository release deployment explicitly supplies installed
-server launcher targets; direct bootstrap calls may omit them.
+restarts apps. After selecting the manager release, it brings launchers for
+its own installed servers to the source template.
 """
 
 from __future__ import annotations
@@ -272,17 +272,36 @@ def ensure_launchers(layout: Layout) -> None:
     layout.install_launcher(SOURCE / "launcher.py")
 
 
-def launcher_targets(raw: str) -> list[str]:
-    """Require an explicit, duplicate-free list of installed server identities."""
-    if raw == "-":
+def installed_server_names(engine: Engine) -> list[str]:
+    """Find selected servers under the manager-owned root without following links.
+
+    A directory without a current selection is not an installed server. A
+    malformed or incomplete selection fails before manager packaging rather
+    than silently leaving that server's launcher behind.
+    """
+    engine.layout.path()  # Reject linked installation ancestors before scanning.
+    root = engine.layout.root.parent
+    if not root.exists():
         return []
-    names = raw.split(",")
-    if not names or len(names) != len(set(names)):
-        raise DeploymentError("launcher refresh targets must be unique server names")
-    for name in names:
-        token(name)
-        if name == MCP_SERVER_NAME:
-            raise DeploymentError("the manager launcher is refreshed by manager installation")
+    names: list[str] = []
+    for directory in sorted(root.iterdir(), key=lambda path: path.name):
+        if directory.name == MCP_SERVER_NAME:
+            continue
+        try:
+            token(directory.name)
+        except DeploymentError:
+            continue
+        info = directory.lstat()
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+            or getattr(info, "st_file_attributes", 0) & 0x400
+        ):
+            continue
+        if not Layout(directory.name).path("current.json").exists():
+            continue
+        if engine.selected(directory.name) is not None:
+            names.append(directory.name)
     return names
 
 
@@ -330,15 +349,8 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         help="validated legacy MCP root whose immutable catalogs should be imported",
     )
-    parser.add_argument(
-        "--refresh-launchers",
-        default="-",
-        metavar="NAMES|-",
-        help="comma-separated installed server names to refresh after manager installation, or - for no targets",
-    )
     arguments = parser.parse_args([] if argv is None else argv)
     try:
-        targets = launcher_targets(arguments.refresh_launchers)
         runtime = global_runtime()
         engine = Engine()
         migration = None
@@ -349,9 +361,7 @@ def main(argv: list[str] | None = None) -> int:
                 "catalogs": imported,
                 "rehydrated": rehydrate_selected(engine, selections),
             }
-        for name in targets:
-            if engine.selected(name) is None:
-                raise DeploymentError(f"launcher refresh requires an installed MCP server: {name}")
+        targets = installed_server_names(engine)
         result = package_manager(engine, runtime)
         if result["mcp_server_name"] != MCP_SERVER_NAME:
             raise DeploymentError(
