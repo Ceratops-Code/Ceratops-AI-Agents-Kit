@@ -407,6 +407,28 @@ class Engine:
     def update(self, mcp_server_name: str, version: str) -> dict[str, Any]:
         return self._deploy(mcp_server_name, version, require_installed=True)
 
+    def refresh_launcher(self, mcp_server_name: str) -> dict[str, Any]:
+        """Refresh one installed server's launcher without replacing its version.
+
+        The server's deployment lock excludes a concurrent install or update.
+        A missing or incomplete selection is rejected before writing launcher
+        files. Repeating the call repairs a partial two-file refresh.
+        """
+        token(mcp_server_name)
+        layout = Layout(mcp_server_name)
+        if not layout.path("current.json").is_file():
+            raise DeploymentError("launcher refresh requires an installed MCP server")
+        with layout.lock("deployment"):
+            selection = self.selected(mcp_server_name)
+            if selection is None:
+                raise DeploymentError("launcher refresh requires an installed MCP server")
+            changed = layout.install_launcher()
+        return {
+            "mcp_server_name": mcp_server_name,
+            "installed_version": selection["version"],
+            "launcher_updated": changed,
+        }
+
     def _deploy(self, mcp_server_name: str, version: str, *, require_installed: bool) -> dict[str, Any]:
         token(mcp_server_name)
         token(version, "version")

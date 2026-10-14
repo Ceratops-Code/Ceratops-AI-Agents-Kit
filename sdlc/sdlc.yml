@@ -72,8 +72,9 @@ deliverables:
         install:
           requires:
             capabilities: [uv]
+          parameters: [refresh_launchers]
           steps:
-            - run: [uv, run, --locked, scripts/deploy-mcp-server-manager.py]
+            - run: [uv, run, --locked, scripts/deploy-mcp-server-manager.py, --refresh-launchers, "{refresh_launchers}"]
 
     source_search_mcp:
       source: tools

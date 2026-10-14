@@ -866,6 +866,69 @@ def test_manager_source_installer_upgrades_existing_selection(deployment, source
     assert not list(runtime_root.glob("*/staging/*"))
 
 
+@pytest.mark.parametrize("source_package", ["ceratops_mcp_server_manager"], indirect=True)
+def test_manager_install_refreshes_named_launchers_and_resumes_after_failure(
+    deployment, source_package, monkeypatch, capsys
+):
+    engine, _, _ = deployment
+    project, runtime_root, _ = source_package
+    for name in ("fixture", "independent"):
+        make_release(runtime_root, "1.0.0", mcp_server=name)
+        engine.install(name, "1.0.0")
+    fixture_selection = (runtime_root / "fixture/current.json").read_bytes()
+    independent_selection = (runtime_root / "independent/current.json").read_bytes()
+    fixture_launcher = runtime_root / "fixture/bin/fixture.py"
+    independent_launcher = runtime_root / "independent/bin/independent.py"
+    fixture_launcher.write_bytes(b"old template")
+    independent_launcher.write_bytes(b"old template")
+    module = load("deploy-mcp-server-manager")
+    monkeypatch.setattr(module, "SOURCE", project)
+    monkeypatch.setattr(module, "run", lambda *args, **kwargs: "")
+    monkeypatch.setattr(module, "ensure_launchers", lambda layout: None)
+    original_refresh = engine_module.Engine.refresh_launcher
+    failed = False
+
+    def interrupt_second_target(selected_engine, name):
+        nonlocal failed
+        if name == "independent" and not failed:
+            failed = True
+            raise contracts.DeploymentError("target interrupted")
+        return original_refresh(selected_engine, name)
+
+    with monkeypatch.context() as interrupted:
+        interrupted.setattr(engine_module.Engine, "refresh_launcher", interrupt_second_target)
+        assert module.main(["--refresh-launchers", "fixture,independent"]) == 2
+    assert "manager installed; launchers refreshed: fixture" in capsys.readouterr().err
+    manager_selection = engine.selected("ceratops_mcp_server_manager")
+    assert fixture_launcher.read_bytes() != b"old template"
+    assert independent_launcher.read_bytes() == b"old template"
+
+    assert module.main(["--refresh-launchers", "fixture,independent"]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert [item["mcp_server_name"] for item in result["refreshed_launchers"]] == ["fixture", "independent"]
+    assert [item["launcher_updated"] for item in result["refreshed_launchers"]] == [False, True]
+    assert engine.selected("ceratops_mcp_server_manager") == manager_selection
+    assert (runtime_root / "fixture/current.json").read_bytes() == fixture_selection
+    assert (runtime_root / "independent/current.json").read_bytes() == independent_selection
+    assert independent_launcher.read_bytes() == fixture_launcher.read_bytes()
+
+
+def test_launcher_refresh_target_input_is_explicit_and_scoped(tmp_path, monkeypatch, capsys):
+    module = load("deploy-mcp-server-manager")
+    assert module.launcher_targets("-") == []
+    assert module.launcher_targets("none") == ["none"]
+    assert module.launcher_targets("fixture,independent") == ["fixture", "independent"]
+    for raw in ("fixture,fixture", "fixture,", "ceratops_mcp_server_manager", "../outside"):
+        with pytest.raises(contracts.DeploymentError):
+            module.launcher_targets(raw)
+    monkeypatch.setattr(storage, "INSTALL_ROOT", tmp_path / "installed")
+    monkeypatch.setattr(module, "global_runtime", lambda: object())
+    monkeypatch.setattr(module, "package_manager", lambda *_args: pytest.fail("packaging must not start"))
+    assert module.main(["--refresh-launchers", "missing"]) == 2
+    assert "installed MCP server" in capsys.readouterr().err
+    assert not (tmp_path / "installed/missing").exists()
+
+
 @pytest.mark.parametrize("arguments", [
     ["package"], ["package", "--source", ".", "--root", "elsewhere"],
     ["install", "fixture", "1.0.0"], ["install", "--version", "1.0.0"],
@@ -965,7 +1028,7 @@ def test_source_install_stops_before_later_mutation_on_failure(monkeypatch, caps
     monkeypatch.setattr(module, "package_manager", package_manager)
     monkeypatch.setattr(module, "ensure_launchers", ensure_launchers)
     success = state in {"first-install", "already-installed"}
-    assert module.main() == (0 if success else 2)
+    assert module.main(["--refresh-launchers", "-"]) == (0 if success else 2)
     output = capsys.readouterr()
     if success:
         assert events == ["package", "launchers", "install"]

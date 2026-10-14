@@ -54,25 +54,42 @@ interpreter that will install the locked dependencies.
 From an active Ceratops-AI-Agents-Kit source checkout:
 
 ```powershell
-uv run --locked scripts/deploy-mcp-server-manager.py
+uv run --locked scripts/deploy-mcp-server-manager.py --refresh-launchers -
 %USERPROFILE%\.codex\mcp\ceratops_mcp_server_manager\bin\ceratops_mcp_server_manager.cmd versions
 ```
 
-The deployment script installs the source checkout's declared manager version,
-including when a manager is already installed. It validates global
+The deployment script selects the source checkout's declared manager version,
+reusing an exact selected release on retries. It validates global
 prerequisites, builds and registers the source release, prepares the launchers,
 and calls the same packaging and deployment code used after installation. It
 provisions hash-locked Python libraries in temporary storage and removes that
 storage on success or failure; no libraries need to be installed globally.
-It changes no Codex
-configuration. An incompatible or missing prerequisite fails before deployment
-writes installation files.
+It changes no Codex configuration. An incompatible or missing prerequisite fails
+before deployment writes installation files.
+
+The manager's launcher template is copied into each server's own `bin` folder.
+When `launcher.py` changes, name each affected installed server in the manager
+install operation's `refresh_launchers` parameter, as a comma-separated list.
+Use `-` when no other installed server needs a launcher refresh. The repository
+release install operation requires this explicit choice and refreshes only
+those names after selecting the manager release. Direct bootstrap calls can
+omit the flag. A repeat after interruption keeps the selected manager and
+server versions and changes only missing or stale launcher files.
+For direct source installation, pass the same value to `--refresh-launchers`:
+
+```powershell
+uv run --locked scripts/deploy-mcp-server-manager.py --refresh-launchers example_mcp_server
+```
+
+To refresh one installed server later, run the selected manager's stable
+launcher with `refresh-launcher <mcp-server-name>`. This does not rebuild or
+reselect that server's environment.
 
 For a one-time move from a previous manager root, name that exact source
 explicitly:
 
 ```powershell
-uv run --locked scripts/deploy-mcp-server-manager.py --import-root <legacy-root>
+uv run --locked scripts/deploy-mcp-server-manager.py --refresh-launchers - --import-root <legacy-root>
 ```
 
 The migration validates and imports only registered immutable artifacts, then
@@ -88,6 +105,7 @@ rollback state until it is deliberately removed.
 | `install --source <mcp-server-directory> --package-wheel <wheel> --package-lock <lockfile>` | Not exposed | Build the MCP server and install it with the declared package wheel |
 | Not exposed | `install` | `mcp_server_name`, `version` for an exact registered release |
 | `update <mcp-server-name> <version>` | `update` | `mcp_server_name`, `version` |
+| `refresh-launcher <mcp-server-name>` | Not exposed | One installed MCP server whose launcher should use the selected manager's template |
 | `versions [mcp-server-name]` | `versions` | optional `mcp_server_name` |
 
 Omitting a version-inspection name selects `ceratops_mcp_server_manager`.

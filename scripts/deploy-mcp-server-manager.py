@@ -7,7 +7,8 @@ and deployment implementations install its declared name and version. An
 explicit legacy root can contribute validated immutable release catalogs; its
 environments are rebuilt under the current root and the source remains intact.
 This command never installs global prerequisites, edits Codex settings, or
-restarts apps.
+restarts apps. Repository release deployment explicitly supplies installed
+server launcher targets; direct bootstrap calls may omit them.
 """
 
 from __future__ import annotations
@@ -271,6 +272,33 @@ def ensure_launchers(layout: Layout) -> None:
     layout.install_launcher(SOURCE / "launcher.py")
 
 
+def launcher_targets(raw: str) -> list[str]:
+    """Require an explicit, duplicate-free list of installed server identities."""
+    if raw == "-":
+        return []
+    names = raw.split(",")
+    if not names or len(names) != len(set(names)):
+        raise DeploymentError("launcher refresh targets must be unique server names")
+    for name in names:
+        token(name)
+        if name == MCP_SERVER_NAME:
+            raise DeploymentError("the manager launcher is refreshed by manager installation")
+    return names
+
+
+def install_manager_if_needed(engine: Engine, result: dict[str, Any]) -> dict[str, Any]:
+    """Reuse an exact selected release when retrying after a target refresh fails."""
+    current = engine.selected(MCP_SERVER_NAME)
+    if (
+        current is not None
+        and result.get("manifest_sha256") is not None
+        and (current.get("version"), current.get("manifest_sha256"))
+        == (result["version"], result["manifest_sha256"])
+    ):
+        return engine.versions(MCP_SERVER_NAME)
+    return engine.install(result["mcp_server_name"], result["version"])
+
+
 def package_manager(engine: Engine, runtime: Runtime) -> dict:
     """Use the manager's source implementation without preinstalled libraries.
 
@@ -302,8 +330,15 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         help="validated legacy MCP root whose immutable catalogs should be imported",
     )
+    parser.add_argument(
+        "--refresh-launchers",
+        default="-",
+        metavar="NAMES|-",
+        help="comma-separated installed server names to refresh after manager installation, or - for no targets",
+    )
     arguments = parser.parse_args([] if argv is None else argv)
     try:
+        targets = launcher_targets(arguments.refresh_launchers)
         runtime = global_runtime()
         engine = Engine()
         migration = None
@@ -314,13 +349,26 @@ def main(argv: list[str] | None = None) -> int:
                 "catalogs": imported,
                 "rehydrated": rehydrate_selected(engine, selections),
             }
+        for name in targets:
+            if engine.selected(name) is None:
+                raise DeploymentError(f"launcher refresh requires an installed MCP server: {name}")
         result = package_manager(engine, runtime)
         if result["mcp_server_name"] != MCP_SERVER_NAME:
             raise DeploymentError(
                 "source project.name must identify the MCP server manager"
             )
         ensure_launchers(engine.layout)
-        outcome = engine.install(result["mcp_server_name"], result["version"])
+        outcome = install_manager_if_needed(engine, result)
+        refreshed: list[dict[str, Any]] = []
+        for name in targets:
+            try:
+                refreshed.append(engine.refresh_launcher(name))
+            except (DeploymentError, OSError, ValueError, KeyError) as exc:
+                completed = ", ".join(item["mcp_server_name"] for item in refreshed) or "none"
+                raise DeploymentError(
+                    f"manager installed; launchers refreshed: {completed}; refresh failed for {name}: {exc}"
+                ) from exc
+        outcome["refreshed_launchers"] = refreshed
         if migration is not None:
             outcome["migration"] = migration
         print(json.dumps(outcome, sort_keys=True))
