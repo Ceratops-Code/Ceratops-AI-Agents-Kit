@@ -694,3 +694,100 @@ def test_aggregate_expected_skips_keep_actual_outcomes_and_complete_scope(
         else:
             assert any(item["id"] == nodeid and item.get("reusable") is False for item in record["checks"])
     assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize("boundary", [
+    "store_busy", "inputs_changed", "busy_incomplete", "skip_inputs_changed", "xfail_inputs_changed",
+])
+def test_aggregate_owns_complete_passes_when_only_individual_storage_is_busy(
+    test_runner_module: Any, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    from tests.test_infrastructure.test_pytest_execution import (
+        _acceptance_repository,
+        _acceptance_test,
+    )
+
+    reader = runpy.run_path(str(ROOT / "skills/ceratops-repo-lifecycle/scripts/retain_check_results.py"))
+    root = _acceptance_repository(tmp_path)
+    counter = tmp_path / "child-effects.log"
+    extra = "import pytest\n" if boundary in {"skip_inputs_changed", "xfail_inputs_changed"} else ""
+    if boundary == "xfail_inputs_changed":
+        extra += "@pytest.mark.xfail(reason='expected failure with changed inputs', strict=True)\n"
+    _acceptance_test(root, "example", counter, extra=extra)
+    if boundary in {"skip_inputs_changed", "xfail_inputs_changed"}:
+        check = root / "tests/test_example.py"
+        check.write_text(check.read_text() + (
+            "    pytest.skip('expected skip with changed inputs')\n" if boundary == "skip_inputs_changed"
+            else "    assert False, 'expected failure'\n"
+        ), encoding="utf-8")
+    (root / "tests/conftest.py").write_text(
+        "import pytest\nfrom filelock import FileLock\n"
+        f"BOUNDARY = {boundary!r}\nCONFIG = None\nHELD = None\nRESTORE = None\n"
+        "def pytest_configure(config):\n    global CONFIG\n    CONFIG = config\n"
+        "def store(): return CONFIG.pluginmanager.get_plugin('executed-pass-reuse').store\n"
+        "@pytest.hookimpl(wrapper=True)\ndef pytest_runtest_logreport(report):\n"
+        "    if report.when != 'teardown': return (yield)\n"
+        "    if BOUNDARY == 'store_busy':\n"
+        "        with FileLock(store().lock.lock_file): return (yield)\n"
+        "    if BOUNDARY in {'inputs_changed', 'skip_inputs_changed', 'xfail_inputs_changed'}:\n"
+        "        path = store().root / 'production.py'\n        original = path.read_bytes()\n"
+        "        path.write_text('VALUE = 2\\n')\n"
+        "        if BOUNDARY != 'inputs_changed':\n"
+        "            global RESTORE\n            RESTORE = (path, original)\n            return (yield)\n"
+        "        try: return (yield)\n        finally: path.write_bytes(original)\n"
+        "    return (yield)\n"
+        "@pytest.fixture(autouse=True)\ndef interrupt_incomplete():\n"
+        "    yield\n    if BOUNDARY == 'busy_incomplete':\n"
+        "        global HELD\n        HELD = FileLock(store().lock.lock_file)\n        HELD.acquire()\n"
+        "        raise KeyboardInterrupt('interrupted before complete teardown evidence')\n"
+        "@pytest.hookimpl(tryfirst=True)\ndef pytest_sessionfinish(session):\n"
+        "    if RESTORE is not None: RESTORE[0].write_bytes(RESTORE[1])\n"
+        "    if HELD is not None: HELD.release()\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(root)
+    context = _context(root)
+    context["scope"]["inputRules"].update({"product-inputs": ["production.py"], "check-inputs": ["tests/**"]})
+    context["productInputs"] = {"production.py": hashlib.sha256((root / "production.py").read_bytes()).hexdigest()}
+    context["checkInputs"] = {
+        path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in (root / "tests").rglob("*") if path.is_file()
+    }
+    context["fingerprint"] = reader["fingerprint"](context)
+    monkeypatch.setenv("CERATOPS_REPOSITORY_CHECK_CONTEXT", json.dumps(context))
+    store = reader["CheckResultStore"](root)
+    identity, path = store.new_result_path()
+    arguments = ["--all", "--result-file", str(path), "--result-id", identity,
+                 "--candidate-id", "1" * 40, "--check-id", "repository.actions.test", "--check-version", "2" * 64]
+    code = test_runner_module.execute(arguments, repo_root=root)
+    assert code == (2 if boundary == "busy_incomplete" else 0)
+    original = path.read_bytes()
+    record = reader["read_check_result"](path)
+    assert record["result_id"] == identity
+    assert counter.read_text().splitlines() == ["example"]
+    assert not list(store.directory.glob("pytest-attempt-*.json"))
+    decision = store.select(context, check_id="repository.actions.test")
+    if boundary == "store_busy":
+        assert decision["decision"] == "reuse" and decision["reference"]["result_id"] == identity
+        observation, = record["checks"]
+        assert observation["id"] == "tests/test_example.py::test_example"
+        assert observation["status"] == "passed" and observation["reusable"] is True
+        assert observation["phases"] == {"setup": "passed", "call": "passed", "teardown": "passed"}
+        assert observation["qualificationLevel"] == "beta"
+        assert len(observation["check_version"]) == len(observation["inputs_digest"]) == 64
+        assert "result_id" not in observation and "storage is busy" in observation["reason"]
+        assert test_runner_module.execute(arguments, repo_root=root) == 0
+        assert counter.read_text().splitlines() == ["example"]
+    else:
+        assert decision["decision"] == "execute"
+        assert not any(item.get("status") == "passed" for item in record["checks"])
+        constraint, = record["checks"]
+        assert constraint["reusable"] is False
+        if boundary in {"inputs_changed", "skip_inputs_changed", "xfail_inputs_changed"}:
+            assert constraint["reason"] == "Check inputs changed after collection."
+            assert (root / "production.py").read_text() == "VALUE = 1\n"
+            assert not any(item.get("status") == "skipped" for item in record["checks"])
+        else:
+            assert record["status"] == "failed"
+    assert path.read_bytes() == original

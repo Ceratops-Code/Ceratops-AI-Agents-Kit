@@ -35,6 +35,7 @@ class PytestProcess(subprocess.CompletedProcess[str]):
     accepted_result_references: list[dict[str, object]] | None = None
     nonreusable_checks: list[dict[str, object]] | None = None
     skipped_checks: list[dict[str, object]] | None = None
+    passed_checks: list[dict[str, object]] | None = None
 
 
 class TestProgress:
@@ -260,4 +261,5 @@ def run_pytest(
             result.accepted_result_references = summary.get("result_references", [])
             result.nonreusable_checks = summary.get("nonreusable_checks", [])
             result.skipped_checks = summary.get("skipped_checks", [])
+            result.passed_checks = summary.get("passed_checks", [])
     return result

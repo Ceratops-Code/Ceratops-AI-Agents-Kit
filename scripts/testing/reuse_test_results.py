@@ -172,6 +172,7 @@ class ResultStore:
         self.directory.mkdir(parents=True, exist_ok=True)
         self.lock = FileLock(str(self.directory / ".pytest-pass.lock"), timeout=0)
         self.checkout = _digest(str(self.root))
+        self.unsaved_reasons: dict[str, str] = {}
         self.qualification_level = context.get("qualificationLevel")
         if self.qualification_level is not None and self.qualification_level not in LEVELS:
             raise ValueError("unsupported pytest qualification level")
@@ -406,7 +407,9 @@ class ResultStore:
         phases: Mapping[str, str] | None = None, outcome: str = "passed",
     ) -> dict[str, Any] | None:
         """Persist one actual terminal outcome on unchanged original inputs."""
+        self.unsaved_reasons.pop(nodeid, None)
         if not self._current(inputs):
+            self.unsaved_reasons[nodeid] = "inputs-changed"
             return None
         if outcome not in {"passed", "failed", "interrupted"}:
             raise ValueError("pytest attempt requires a terminal outcome")
@@ -433,7 +436,7 @@ class ResultStore:
                 self._prune()
                 return record
         except Timeout:
-            pass
+            self.unsaved_reasons[nodeid] = "store-busy"
         return None
 
 
@@ -452,6 +455,7 @@ class ReusePasses:
         self.references: dict[str, dict[str, Any]] = {}
         self.nonreusable_checks: dict[str, dict[str, Any]] = {}
         self.skipped_checks: dict[str, dict[str, Any]] = {}
+        self.passed_checks: dict[str, dict[str, Any]] = {}
         self.skipped_phases: dict[str, set[str]] = {}
         self.skip_reasons: dict[str, str] = {}
         self.current_node: str | None = None
@@ -460,6 +464,20 @@ class ReusePasses:
         """Keep external or incomplete scope separate from original pass facts."""
         self.nonreusable_checks[nodeid] = {
             "id": nodeid, "status": "scope-unrepresented", "reusable": False, "reason": reason,
+        }
+
+    def _observe_unpersisted_pass(self, nodeid: str, phases: Mapping[str, str]) -> None:
+        """Let the durable aggregate own actual phases when optional storage is busy."""
+        if (self.store.unsaved_reasons.get(nodeid) != "store-busy"
+                or phases != {"setup": "passed", "call": "passed", "teardown": "passed"}):
+            return
+        inputs = self.inputs_by_node[nodeid]
+        self.passed_checks[nodeid] = {
+            "id": nodeid, "status": "passed", "reusable": True, "phases": dict(phases),
+            "reason": "Optional individual result storage is busy; the aggregate owns these actual phases.",
+            "qualificationLevel": self.store.qualification_level,
+            "check_version": _digest({"producer": inputs["producer"], "check_inputs": inputs["check_inputs"]}),
+            "inputs_digest": _digest(inputs),
         }
 
     @pytest.hookimpl(trylast=True)
@@ -533,13 +551,21 @@ class ReusePasses:
         outcome = "passed" if phases == {
             "setup": "passed", "call": "passed", "teardown": "passed",
         } else ("failed" if "failed" in phases.values() else None)
+        if (outcome is None and self.skipped_phases.get(report.nodeid)
+                and not self.store._current(self.inputs_by_node[report.nodeid])):
+            # Save is deliberately absent for expected skips. Bind their actual
+            # phase boundary too; a later restoration cannot erase detected drift.
+            self.store.unsaved_reasons[report.nodeid] = "inputs-changed"
         if outcome is not None:
             record = self.store.save(report.nodeid, self.inputs_by_node[report.nodeid],
                                      phases=phases, outcome=outcome)
+            self.passed_checks.pop(report.nodeid, None)
             if record is not None:
                 self.references[report.nodeid] = self.store.reference(record, reused=False)
                 if outcome == "passed":
                     self.executed_passes[report.nodeid] = record["result_id"]
+            elif outcome == "passed":
+                self._observe_unpersisted_pass(report.nodeid, phases)
 
     def pytest_keyboard_interrupt(self) -> None:
         """Keep completed phase evidence when interruption follows its write."""
@@ -553,13 +579,16 @@ class ReusePasses:
             # completed pass and still fails closed on an incomplete owned write.
             record = self.store.save(nodeid, self.inputs_by_node[nodeid],
                                      phases=phases, outcome=outcome)
+            self.passed_checks.pop(nodeid, None)
             if record is not None:
                 self.references[nodeid] = self.store.reference(record, reused=False)
                 if outcome == "passed":
                     self.executed_passes[nodeid] = record["result_id"]
+            elif outcome == "passed":
+                self._observe_unpersisted_pass(nodeid, phases)
 
     def pytest_sessionfinish(self, session: pytest.Session, exitstatus: int) -> None:
-        for nodeid in self.inputs_by_node.keys() - self.references.keys():
+        for nodeid in self.inputs_by_node.keys() - self.references.keys() - self.passed_checks.keys():
             phases = self.phases.get(nodeid, {})
             completed_skip = phases.get("teardown") == "passed" and (
                 (set(phases) == {"setup", "teardown"} and phases["setup"] in {"skipped", "xfail"}
@@ -568,7 +597,7 @@ class ReusePasses:
                     and phases["call"] in {"skipped", "xfail"}
                     and "call" in self.skipped_phases.get(nodeid, set()))
             )
-            if completed_skip:
+            if completed_skip and self.store.unsaved_reasons.get(nodeid) != "inputs-changed":
                 # A complete expected skip is an observed outcome, never a child
                 # pass or invented result identity. The aggregate keeps the
                 # actual session exit; incomplete teardown still blocks reuse.
@@ -577,7 +606,11 @@ class ReusePasses:
                     "reason": self.skip_reasons.get(nodeid, "Pytest reported a completed expected skip."),
                 }
             else:
-                self._unrepresented(nodeid, "No complete durable child outcome represents this check.")
+                reason = (
+                    "Check inputs changed after collection." if self.store.unsaved_reasons.get(nodeid) == "inputs-changed"
+                    else "No complete durable child outcome represents this check."
+                )
+                self._unrepresented(nodeid, reason)
         # pytest uses NO_TESTS_COLLECTED when every current item was deselected.
         # An actually empty collection, interruption or internal error stays an
         # error; a complete set of accepted passes satisfies this invocation.
@@ -595,6 +628,7 @@ class ReusePasses:
                 "result_references": [self.references[key] for key in sorted(self.references)],
                 "nonreusable_checks": [self.nonreusable_checks[key] for key in sorted(self.nonreusable_checks)],
                 "skipped_checks": [self.skipped_checks[key] for key in sorted(self.skipped_checks)],
+                "passed_checks": [self.passed_checks[key] for key in sorted(self.passed_checks)],
             }))
 
     def pytest_terminal_summary(self, terminalreporter: Any) -> None:

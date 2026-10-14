@@ -330,6 +330,11 @@ Complete represented setup/call skips and expected failures are carried in
 `skipped_checks` with their actual phase facts and reason. The aggregate keeps
 its actual session outcome and original identity; skipped work never gains a
 passing child identity. Missing or interrupted phase reports still block reuse.
+When the optional per-test store is busy, complete represented passing phases
+are carried as `passed_checks` observations owned by the durable aggregate.
+They preserve actual execution facts without inventing individual result IDs.
+Changed input bytes remain a reuse constraint; a busy optimization is distinct
+from incomplete execution evidence.
 
 This is runner-level reuse with qualified provenance. Release-unit qualification,
 historical baseline selection and broader lifecycle receipt composition remain
