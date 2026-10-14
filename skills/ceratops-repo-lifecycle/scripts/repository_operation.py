@@ -26,9 +26,11 @@ from copy import deepcopy
 from dataclasses import dataclass, replace
 from typing import Any
 
+import reuse_operation_checks
 import sdlc_results
 import store_artifacts
 from ceratops_repo_compatibility_engine.sdlc_contract_validation import (
+    MCP_NAME,
     SdlcContractError,
     load_contract,
     operation_entries,
@@ -41,6 +43,7 @@ from github_pr_workflow.command import (
     failure_excerpt,
     report_failure,
     report_phase,
+    run_progress_command,
     track_command_completion,
 )
 from sdlc_results import StepResultError, capture_step_result
@@ -52,7 +55,11 @@ from store_artifacts import (
     PreparedBuildReceipt,
 )
 
-# Public receipt-reader API; storage owns the implementation.
+# Public storage types and reader; storage remains their implementation owner.
+BUILD_BUNDLE_RETENTION = store_artifacts.BUILD_BUNDLE_RETENTION
+CompletedBuild = store_artifacts.CompletedBuild
+CompletedDependency = store_artifacts.CompletedDependency
+RecoveryRequired = store_artifacts.RecoveryRequired
 read_completed_build = store_artifacts.read_completed_build
 
 DEFAULT_CONTRACT = pathlib.Path("sdlc/sdlc.yml")
@@ -113,6 +120,9 @@ class PreparedOperation:
     parameters: tuple[tuple[str, str], ...] = ()
     test_context: Mapping[str, str] | None = None
     result_schema: str | None = None
+    check_results: dict[str, Any] | None = None
+    qualification_level: str = "alpha"
+    check_plan: Any = None
 
 
 def _build_test_gate(receipt: Mapping[str, Any], required_tests: Sequence[str]) -> None:
@@ -364,10 +374,7 @@ def execute_handoff(
             valid_inputs = (
                 not set(inputs) - {"mcp-server", "prerequisite-packages"}
                 and isinstance(selected_mcp_server, str)
-                and re.fullmatch(
-                    r"[a-z0-9]+(?:-[a-z0-9]+)*", selected_mcp_server
-                )
-                is not None
+                and re.fullmatch(MCP_NAME, selected_mcp_server) is not None
                 and isinstance(packages, list)
                 and all(
                     isinstance(name, str)
@@ -572,15 +579,7 @@ def execute_handoff(
                 except OperationError as exc:
                     return {**evidence, "status": "state_changed", "message": str(exc)}
             with track_command_completion():
-                result = subprocess.run(
-                    argv,
-                    cwd=repo_root,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    check=False,
-                )
+                result = run_progress_command(argv, cwd=repo_root)
             if result.returncode:
                 failure = {
                     **evidence,
@@ -820,6 +819,7 @@ def prepare_operations(
                 contract_path,
                 tuple(sorted(parameters.items())),
                 result_schema=selected.get("result-schema"),
+                check_results=selected.get("check-results"),
             )
         )
     return prepared
@@ -905,6 +905,28 @@ def execute_prepared_operation(
             "status": "state_changed",
             "message": "HEAD changed after preparation.",
         }, **report_options)
+    try:
+        check_plan = prepared.check_plan
+        if prepared.check_results is not None and check_plan is None:
+            check_plan = reuse_operation_checks.plan_operation(prepared)
+            reuse_operation_checks.activate_plans([replace(prepared, check_plan=check_plan)])
+        if check_plan is not None:
+            if prepared.check_results is None:
+                raise ValueError("Check plan has no current owned input declaration.")
+            # An earlier callback may have changed declared inputs after the batch
+            # preflight. Read current inputs before consuming that original pass.
+            current = reuse_operation_checks.check_inputs(prepared, prepared.check_results)
+            if current["fingerprint"] != check_plan.context["fingerprint"]:
+                check_plan = reuse_operation_checks.plan_operation(prepared)
+            else:
+                check_plan.decision = check_plan.store.select(current, check_id=prepared.operation)
+                if check_plan.decision["decision"] == "blocked":
+                    raise ValueError("Recorded check evidence blocks reuse: " + check_plan.decision["reason"])
+            if check_plan.decision["decision"] == "reuse":
+                return check_plan.reused_result(prepared)
+            base.update(check_decision="executed", check_reason=check_plan.decision["reason"])
+    except (OSError, ValueError) as exc:
+        return report_failure({**base, "status": "result_invalid", "message": str(exc)}, **report_options)
     completed: list[int | str] = []
     step_results: list[dict[str, Any]] = []
     for step in prepared.steps:
@@ -987,6 +1009,8 @@ def execute_prepared_operation(
         try:
             assert step.argv is not None
             argv = list(step.argv)
+            if check_plan is not None:
+                argv.extend(check_plan.arguments())
             # CreateProcess does not apply PATHEXT to bare npm/pnpm commands.
             # Resolve a bare executable while leaving repository-relative paths
             # bound to the declared cwd and preserving shell-free arguments.
@@ -997,27 +1021,51 @@ def execute_prepared_operation(
             # Context belongs only to this test command, never the parent
             # process or later deployment commands.
             process_options: dict[str, Any] = {}
-            if prepared.test_context is not None:
-                process_options["env"] = {
-                    **os.environ,
-                    "CERATOPS_SDLC_TEST_CONTEXT": json.dumps(
+            repository_uv = (
+                pathlib.Path(argv[0]).stem.lower() == "uv"
+                and len(argv) > 1 and argv[1] in {"run", "sync", "lock"}
+                and "--active" not in argv and "--no-project" not in argv
+            )
+            if repository_uv or prepared.test_context is not None or check_plan is not None:
+                environment = dict(os.environ)
+                if repository_uv:
+                    # Repository-selected environments must not inherit the
+                    # installed lifecycle helper's unrelated active venv.
+                    environment.pop("VIRTUAL_ENV", None)
+                if prepared.test_context is not None:
+                    environment["CERATOPS_SDLC_TEST_CONTEXT"] = json.dumps(
                         dict(prepared.test_context)
-                    ),
-                }
+                    )
+                if check_plan is not None:
+                    environment[reuse_operation_checks.CONTEXT_ENV] = json.dumps(check_plan.context)
+                process_options["env"] = environment
             with track_command_completion():
-                result = subprocess.run(
-                    argv,
-                    cwd=step.cwd,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    check=False,
-                    **process_options,
-                )
+                result = run_progress_command(argv, cwd=step.cwd, **process_options)
             code, stdout, stderr = result.returncode, result.stdout, result.stderr
         except OSError as exc:
             code, stdout, stderr = None, "", str(exc)
+        except ValueError as exc:
+            return report_failure({**base, "status": "result_invalid", "message": str(exc)}, **report_options)
+        if check_plan is not None and code is not None:
+            try:
+                base["check_result"] = check_plan.completed(prepared, passed=code == 0)
+            except (OSError, ValueError) as exc:
+                failure = {
+                    **base, "status": "result_invalid", "steps": completed,
+                    "failed_step": step.position,
+                    "message": f"Declared check result is missing or conflicting: {exc}",
+                    "diagnostic": {
+                        "exit_code": code,
+                        "message": failure_excerpt(f"{stderr}\n{stdout}"),
+                    },
+                }
+                return report_failure(
+                    failure, diagnostic_output=diagnostic_output,
+                    repo_root=owner_root, action=action,
+                    failure_id=f"{prepared.operation}:{step.position}",
+                    stdout=stdout, stderr=stderr, successful_results=successful_results,
+                    output_root=step.cwd,
+                )
         if code != 0:
             child_results = {}
             for stream, output in (("stdout", stdout), ("stderr", stderr)):
@@ -1135,6 +1183,24 @@ def execute_prepared_operations(
 ) -> dict[str, Any]:
     """Run in order, stopping at the first failure with a bounded pending ledger."""
 
+    # Resolve every marked check before the first check/build callback. Later
+    # phases consume these original plans; no result payload crosses the model.
+    try:
+        prepared = [replace(item, check_plan=reuse_operation_checks.plan_operation(item))
+                    if item.check_results is not None and item.check_plan is None else item
+                    for item in prepared]
+        reuse_operation_checks.activate_plans(list(prepared))
+    except (OSError, ValueError) as exc:
+        failure = {"status": "result_invalid", "message": str(exc)}
+        owner_root, action = diagnostic_owner or (prepared[0].repo_root, "operation")
+        failure = report_failure(
+            failure, diagnostic_output=diagnostic_output,
+            repo_root=owner_root, action=action, failure_id="operation_preparation",
+            successful_results=successful_results, output_root=prepared[0].repo_root,
+        )
+        return {**failure, "completed_operations": [],
+                "pending_operations": [item.operation for item in prepared],
+                "results": [failure]}
     results: list[dict[str, object]] = []
     completed: list[str] = []
     for index, operation in enumerate(prepared):
@@ -1212,6 +1278,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Return pending skill routes without dispatch.",
     )
+    parser.add_argument("--qualification-level", choices=["alpha", "beta", "rc", "final"],
+                        help="Required qualification of newly executed or reused checks; default alpha, beta for promotion tests.")
     parser.add_argument("--evidence-file", type=pathlib.Path)
     parser.add_argument("--diagnostic-output", type=pathlib.Path)
     parser.add_argument("--diagnostic-repo-root", type=pathlib.Path)
@@ -1318,6 +1386,9 @@ def main(argv: list[str] | None = None) -> int:
             if requires_validation
             else []
         )
+        level = args.qualification_level or ("beta" if args.test_trigger == "promotion" else "alpha")
+        validations = [replace(item, qualification_level=level) for item in validations]
+        prepared = [replace(item, qualification_level=level) for item in prepared]
         if args.prepare_only:
             result: dict[str, Any] = {
                 "status": "prepared",
@@ -1360,6 +1431,10 @@ def main(argv: list[str] | None = None) -> int:
                         successful_results=checks["results"],
                     )
                 )
+                check_references = [item["check_result"] for item in checks["results"]
+                                    if item.get("check_result")]
+                if check_references:
+                    result["check_results"] = check_references
                 advisory_checks = [
                     item
                     for item in checks["results"]

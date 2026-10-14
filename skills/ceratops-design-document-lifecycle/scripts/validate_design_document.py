@@ -40,7 +40,15 @@ FIELD_ROLES = {
     ],
 }
 TEXT = {"type": "string", "minLength": 1, "pattern": r"\S"}
-VIEW_IDS = {"context", "container", "component", "deployment", "dynamic"}
+VIEW_IDS = {
+    "system_landscape",
+    "context",
+    "container",
+    "component",
+    "code",
+    "deployment",
+    "dynamic",
+}
 
 
 def object_schema(properties: dict[str, Any]) -> dict[str, Any]:
@@ -62,7 +70,15 @@ CONTRACT_SCHEMA = object_schema({
     "captured_on": {"type": "string", "format": "date"},
     "field_roles": {"const": FIELD_ROLES},
     "annotations": object_schema(dict.fromkeys(
-        ("organization", "completeness", "diagrams", "limits", "references"), TEXT,
+        (
+            "organization",
+            "completeness",
+            "diagrams",
+            "c4_defaults",
+            "limits",
+            "references",
+        ),
+        TEXT,
     )),
     "sections": array_schema(object_schema({
         "id": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"},
@@ -116,7 +132,7 @@ def load_contract(path: pathlib.Path = CONTRACT_PATH) -> dict[str, Any]:
         if len(values) != len(set(values)):
             raise ValueError(f"duplicate contract {collection}.{key}")
     if {view["id"] for view in contract["views"]} != VIEW_IDS:
-        raise ValueError("contract must account for all five C4 view decisions")
+        raise ValueError("contract must account for all seven C4 view decisions")
     return contract
 
 

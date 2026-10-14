@@ -45,6 +45,7 @@ from rule_candidate_source import (
     file_hash,
     newline_styles,
     read_source,
+    review_keys_after_renames,
 )
 from rule_graph import (
     ParsedRuleSource,
@@ -1288,7 +1289,7 @@ def _run_pass(
 ) -> tuple[dict[Path, TextSource], dict[Path, str], list[dict[str, object]], bool]:
     stack_paths, targets = _validate_candidate_shape(candidate, expected_context)
     stack_sources = {path: read_source(path, "rule_stack source") for path in stack_paths}
-    _, _, baseline_reviews = validate_stack_texts(
+    baseline_parsed, _, baseline_reviews = validate_stack_texts(
         stack_paths,
         {path: source.text for path, source in stack_sources.items()},
         label="invalid current rule stack",
@@ -1308,10 +1309,16 @@ def _run_pass(
         prospective[source.path] = candidate_text
         target_evidence.append(evidence)
         changed = changed or target_changed
-    _, _, candidate_reviews = validate_stack_texts(
+    candidate_parsed, _, candidate_reviews = validate_stack_texts(
         stack_paths,
         prospective,
         label="invalid candidate rule stack",
+    )
+    baseline_reviews = review_keys_after_renames(
+        baseline_reviews, baseline_parsed, candidate_parsed,
+        history_operations=candidate["history_operations"],
+        history_by_rules={Path(t["rules"]): Path(t["history"])
+                          for t in targets if t["history"] is not None},
     )
     new_reviews = candidate_reviews - baseline_reviews
     if new_reviews:

@@ -19,7 +19,7 @@ or another governing contract.
 | `ceratops-skill-lifecycle` | Route skill-domain work across create, source-validate, deploy, preferred eligible fast-change, update, skills-contract-review, and skills-consistency-review actions. |
 | `ceratops-mcp-server-lifecycle` | Create and package local Python MCP servers, bootstrap the deployment manager, install exact releases, update servers, and inspect versions. |
 | `ceratops-automation-run` | Run recurring automations with shared Ceratops alert, memory, and completion policy. |
-| `ceratops-task-lifecycle` | Route failed-fix-loop breaks, same-thread task resume, whole-task handoff, repository status tables, and closure checks across action references. |
+| `ceratops-task-lifecycle` | Route failed-fix-loop breaks, same-thread task resume, whole-task handoff, aggregate worktree status tables, and closure checks across action references. |
 | `ceratops-code-consistency-audit` | Audit merged refactors for contradictions, docs drift, comment sufficiency, stale follow-through, and merged-only edge cases. |
 
 ## Layout
@@ -70,7 +70,7 @@ tools/
   source_search_mcp.py
   pyproject.toml
   mcp-server.json
-  pylock.toml
+  uv.lock
 ```
 
 Source `SKILL.md` and action-reference files are portable, delta-only
@@ -137,8 +137,10 @@ without repository deduplication.
 | `scripts/deploy-skills.py` | Independent installation and updates; renders selected skills and overlays their files without validation, retirement, or lifecycle runtime calls. |
 | `scripts/deploy-hooks.py` | Independent hook installation and updates; copies the repository hook payloads and merges their registrations while preserving unrelated files and configuration. Does not grant trust or restart Codex. |
 | `scripts/deploy-mcp-server-manager.py` | Install the checkout's declared MCP server manager version, including over an existing installation, from the scripts environment; uses the manager's global Python and uv prerequisites, temporary locked libraries, and packaging and deployment code. Never changes Codex settings. |
-| `scripts/testing/run-tests.py` | Sole test-selection, collection-reconciliation, and pytest-execution owner; validates `tests/test-impact.json`, explains deterministic Git-diff selection, rejects mapping gaps before pytest collection or execution, supports explicit committed-diff, worktree, collection, and `--all` modes, adds `--select-only` to check diff/worktree mapping without pytest, and saves failed-pytest streams and structured pre-test failures with captured command output through `--diagnostic-output`; pytest output remains bounded in the console. |
-| `scripts/testing/pytest-diagnostics.py` | Extracts bounded failure summaries using exact pytest and unittest-subtest identities and source-file evidence, including parameter names containing summary separators; reports nested exception-group messages and assertion differences over source context, excluding captured output. Ambiguous or missing tracebacks use only that test's summary reason. Full diagnostic files remain owned by the runner. |
+| `scripts/testing/run-tests.py` | Sole test-selection, collection-reconciliation, and pytest-execution owner; validates `tests/test-impact.json`, explains deterministic Git-diff selection, rejects mapping gaps before pytest collection or execution, supports explicit committed-diff, worktree, collection, and `--all` modes, adds `--select-only` to check diff/worktree mapping without pytest, and saves failed-pytest streams and structured pre-test failures with captured command output through `--diagnostic-output`; pytest output remains bounded in the console, with live test names and completed counts on stderr. |
+| `scripts/testing/report_test_progress.py` | Pytest hook plugin and execution transport; reports collection, rate-limited current-test/count updates, sixty-second liveness, the actual pytest exit code, and bounded executed/reused check counts without mixing progress into the final stdout JSON or saving execution state. |
+| `scripts/testing/reuse_test_results.py` | Saves completed three-phase pytest passes under Git's shared result directory and reuses exact input matches on fresh calls. Owns immutable pass records, corrupt-file cleanup, writer exclusion and current-plus-two retention per checkout/check. |
+| `scripts/testing/pytest-diagnostics.py` | Extracts bounded failure summaries using exact pytest and unittest-subtest identities and source-file evidence, including parameter names containing summary separators; reports terminal import errors, nested exception-group messages and assertion differences over source context, excluding captured output. Native stderr failures before collection use the explicit `<pytest startup>` identity. Ambiguous or missing test tracebacks use only that test's summary reason. Full diagnostic files remain owned by the runner. |
 | `scripts/run-actionlint.py` | Provisions the pinned, checksum-verified actionlint release inside the scripts environment and validates every GitHub Actions workflow. |
 | `scripts/validate-repository.py` | Local validation coordinator; checks the running Python against `scripts/pyproject.toml`, runs workflow, repository lint and type checks, and captures first-failure evidence. Tests run separately through `scripts/testing/run-tests.py`. |
 | `skills/ceratops-repo-lifecycle/references/templates/deploy-skills.py.tmpl` | Authoritative standalone installer copied into compatible skill repositories as `scripts/deploy-skills.py`; invoke it through uv using the scripts project. |
@@ -148,9 +150,9 @@ without repository deduplication.
 | `skills/ceratops-repo-lifecycle/references/templates/validate-repository.py.tmpl`, `validate.yml.tmpl`, and `run-actionlint.py.tmpl` | Repository-neutral validation templates created only when their target files are absent; new validation setups receive a pinned, checksum-verified actionlint runner, and setups without JavaScript package-manager files also receive locked Markdown dependencies and default rules. Existing tooling, Markdown settings, and exclusive validators are preserved. |
 | `skills/ceratops-repo-lifecycle/scripts/ceratops_repo_compatibility_engine/` | Skill-owned package with the shared compatibility-contract loader, read-only compatibility checks, SDLC-contract validation, rollback-protected Ceratops compatibility application, and version-only bootstrap synchronization; it operates on explicit target repositories and is never copied into them. |
 | `skills/ceratops-repo-lifecycle/references/templates/skill-sections.json.tmpl` | Repository-neutral template for creating a target repository's live `skills/skill-sections.json`; never a live manifest. |
-| `skills/ceratops-skill-lifecycle/scripts/runtime/install-managed-skills.py` | Classifies exact affected sets, owns direct-manifest inventory and explicit prior-owner migration, and invokes one runtime transaction; emits commit-bound completion evidence and can finalize its saved promotion handoff without replaying deployment. |
+| `skills/ceratops-skill-lifecycle/scripts/runtime/install-managed-skills.py` | Classifies exact affected sets, owns direct-manifest inventory and explicit prior-owner migration, and invokes one runtime transaction; emits commit-bound completion evidence and finalizes saved promotion handoffs with optional repeated `--deployment-evidence` sibling receipts, without replaying deployment. |
 | `skills/ceratops-skill-lifecycle/scripts/runtime/managed_runtime_builder.py` | Stages, activates, rolls back, recovers, and cleans one locked selected-skill runtime transaction. |
-| `skills/ceratops-skill-lifecycle/scripts/skill-update-workflow.py` | Initializes ordinary updates from repeated skill/path groups and UTF-8 command files, or opens caller-owned requests. It discovers one unfinished skill change per worktree, records approved scope against the original baseline, saves immutable state/check generations, and drives verification to one next action. Scope expansion and failed-request replacement preserve the original baseline; exact passed checks are reused, and close consumes saved success without rechecking source. The caller edits, commits and requests promotion/deployment separately; this helper never runs repository tests. |
+| `skills/ceratops-skill-lifecycle/scripts/skill-update-workflow.py` | Prints normal results and errors as UTF-8 under Windows legacy output encodings. Initializes ordinary updates from repeated skill/path groups and UTF-8 command files, or opens caller-owned requests. It discovers one unfinished skill change per worktree, records approved scope against the original baseline, saves immutable state/check generations, and drives verification to one next action. Scope expansion and failed-request replacement preserve the original baseline; exact passed checks are reused, and close consumes saved success without rechecking source. The caller edits, commits and requests promotion/deployment separately; this helper never runs repository tests. |
 | `skills/ceratops-skill-lifecycle/scripts/skill_update_checks.py` | Runs declared checks without a shell, records deterministic search applicability for safe reuse, and carries failure evidence to the update workflow. Failed pytest checks print test identities and reported errors from the same run, preserve complete structured failure details before scratch cleanup, mark bounded output, and use the captured terminal diagnostic when the native report is unavailable. |
 | `skills/ceratops-skill-lifecycle/scripts/skill_update_scratch.py` | Supplies subprocess-only temporary-directory settings under the verified task-temp root and removes its unique check folder after success or failure; cleanup errors block verification while preserving check evidence, and recorded residue is retried before new checks. Explicit paths in check arguments remain caller-owned. |
 | `skills/ceratops-credit-savings-analysis/scripts/credit_analysis/session_evidence_collector.py` | Resolves current, named, indexed, and project-identified sessions and collects one complete prepared traversal per analysis, preserving formatted messages, canonical current-source references, bounded nested-command failure provenance, tool and process telemetry, fingerprints, usage, closure, and classification modes. |
@@ -162,6 +164,7 @@ without repository deduplication.
 | `skills/ceratops-credit-savings-analysis/scripts/credit_analysis/report_rendering.py` | Renders full-analysis reports as runs tables with UTC start times, combined avoidable counts, separate unassessed counts, exact omission labels, and token percentages. Direct-result delivery uses retained per-call evidence for the same table. Chat guidance comes from the parent skill Output Contract; the caller selects useful findings across the requested audit while complete findings, risks, accounting, and reviewer records stay in machine evidence. |
 | `skills/ceratops-credit-savings-analysis/scripts/credit_analysis/report_bookkeeping.py` | Owns result-shape validation, surface ordering, temporary-control links, category consolidation, and reviewer-record preservation. Final results retain complete original confirmed findings, risks, control reviews, and category assessments in controller-generated `source_findings`, `source_risks`, and `source_reviews`, checked against accepted reviewer records. Candidate links identify each finding's destination, which must cover its original calls and evidence; retained source findings do not add to savings or finding totals. The controller assembles category summaries from exact accepted checklists, including when resuming a retained older response, and aggregates applicability across reviewed portions without discarding differing assessments. Every distinct risk uncertainty remains in machine evidence. The controller revalidates saved final output before enforcing limits on new attempts and selects the highest-priority complete audit window that fits the reserved review slot. |
 | `skills/ceratops-task-lifecycle/scripts/closure_snapshot.py` | Emits one compact snapshot for explicitly named closure targets, inspects temp-root metadata without traversal unless `--count-temp-files` is requested, and optionally removes exact task-created files validated inside the task temp root. |
+| `skills/ceratops-task-lifecycle/scripts/collect-worktree-status.py` | Collects requested Git worktrees and remaining branches once per repository, joins supported task evidence by exact worktree path, retains coverage gaps, and prepares fixed Markdown tables. Owns one caller-selected report and bounded `.pending`/`.lock` companions; only an explicitly selected fetch changes remote refs. |
 | `skills/ceratops-governance-lifecycle/scripts/apply_rules_update.py` | Prepares complete rule, history and TOML outputs, embeds acceptance in one application request, and applies its saved bytes using integrity comparisons and rollback. Completed-write retries perform no writes or content checks; successful application removes only the declared disposable request. |
 | `skills/ceratops-governance-lifecycle/scripts/validate_rule_candidate.py` | Checks new candidate text once; formatting stability, protected-token preservation and untouched source slices are producer invariants covered by behavior tests. `--accept` freezes complete outputs and original check results, including history-only repairs. |
 | `skills/ceratops-governance-lifecycle/scripts/rule_candidate_source.py` | Owns exact UTF-8 source loading, encoding and line-ending preservation, shared candidate data, and input-integrity checks used by governance validation and application. |
@@ -172,6 +175,7 @@ without repository deduplication.
 | `skills/ceratops-repo-lifecycle/scripts/github_pr_workflow/` | Package CLI for individual PR operations, opt-in scoped branch/stage/commit preparation and checked draft or fork PR publication in `ensure_pr.py`, bounded standalone review and CI inspectors with caller-owned evidence files, shared readiness-owned CI diagnostics, one-call retry-safe review replies and resolutions, decision-complete gate blockers, single-snapshot terminal Actions outage detection, exact-commit checkpointed shipping, four-proof obsolete-prepared-checkpoint cleanup before automatic resume, scoped pending-work checks, concurrent gates, integrated admin merge, reusable-branch restoration, and terminal cleanup. |
 | `skills/ceratops-repo-lifecycle/scripts/promote-repository.py` | Prepares the required local `release/local` promotion branch and rejects repositories where `refs/heads/release` occupies that namespace; promotes selected branches with no deployment or an explicit ordered operation selection; or composes promotion into exact-head shipping with ordered release and deploy selections, finalization, and cleanup; checks live publication before rebasing only task commits while preserving shared history; records outcomes, recreating the output directory at save time when needed, and finalizes verified promotion-only or bound deployment results within the task temp root without replay. |
 | `skills/ceratops-repo-lifecycle/scripts/git_branch_operations.py` | Imported local branch/worktree lookup, checkout restoration, rebase, fast-forward and alignment functions shared by promotion, sync and Ship; no CLI or lock acquisition. |
+| `skills/ceratops-repo-lifecycle/scripts/check_deployment_receipts.py` | Checks closed deployment receipts for promotion finalization, preserving MCP server underscores while keeping skill identities unchanged; rejects mismatched records, unfinished cleanup and duplicate identities without running installation or publication. |
 | `skills/ceratops-repo-lifecycle/scripts/manage-pending-work.py` | Records, checks, automatically resumes the retained target commit, and progressively finalizes the exact selected scope; preflight preserves and reports non-cleanup-eligible worktrees, while eligible residual-worktree and identity-matched task-temp cleanup delegates bounded removal to `pending-work-cleanup.py`. |
 | `skills/ceratops-repo-lifecycle/scripts/pending-work-cleanup.py` | Checks named directory boundaries, preserves active skill-update state, and removes selected residual and task-temp trees after clearing read-only Windows files and directories without traversing links. |
 | `skills/ceratops-repo-lifecycle/scripts/action.yml` | GitHub composite action that runs declared validation and, by default, tests using the skill-owned SDLC engine; `run-tests: false` permits validation-only CI when tests require an interactive desktop. CI defers skill handoffs and retains failure evidence. |
@@ -769,6 +773,11 @@ Worktree removal also clears matching task directories under
 `<repo-parent>/tmp/<repo-name>` by exact worktree name or captured thread UUID.
 Unrelated task directories remain; a temp-removal failure keeps its removal
 record for the next cleanup attempt.
+Standalone `cleanup` accepts `--worktree <absolute-path>` to select one canonical
+task worktree and its associated branch. Preview, removal, unfinished-record
+handling and atomic scratch cleanup stay within that selection; sibling
+worktrees and unchecked-out branches remain outside it. Omitting the option
+keeps repository-wide discovery, including during Ship.
 Before Git removal, exact matching promotion sources become `deleting`; after
 their branch is gone, cleanup retires those entries through the promotion owner.
 Unrelated entries stay intact, and interrupted removal cannot leave a missing
@@ -1125,15 +1134,27 @@ sections, validator, or skill-local source.
 Compatibility templates create `scripts/pyproject.toml`, `scripts/uv.lock`
  and an ignored `scripts/.venv` with a Python matching `requires-python`. This
 separate
-uv project owns tooling dependencies. `pyproject.toml` and `uv.lock` suffice
-for that environment; no parallel requirements file is needed. Existing
-application manifests retain their owners and locations. Dependabot gets
-a `uv` entry for `/scripts` without removing other entries.
+uv project owns tooling dependencies. Python dependencies use `pyproject.toml`
+and `uv.lock`, not requirements files. Package metadata and tool configuration
+belong below the repository root: tooling under `scripts`, applications in their
+own directories. Compatibility reports misplaced files before writing and never
+moves or deletes them automatically. Nested application projects retain their
+owners, dependencies and locks. Dependabot gets a `uv` entry for `/scripts`
+without removing other entries.
+
+The compatibility contract's `configuration_layout` owns the filename patterns
+and excluded dependency/output directories. The runtime planner and structural
+checker share the same read-only layout check. Existing environment checks own
+their locks; an application workspace can share one `uv.lock` across its member
+packages. Git supplies tracked and unignored inputs; isolated non-Git targets
+use a pruned filesystem walk. Custom filenames, application dependency ownership
+and command behavior still require the compatibility review; structural success
+is not proof of their policy fit.
 
 The same project template supplies Ruff lint rules and mypy checking defaults.
-Generated validators select those settings explicitly unless the repository
-provides root tool configuration. Existing settings remain authoritative;
-compatibility adds only absent tool tables.
+Generated checks select the scripts project's settings explicitly. Existing
+settings in that project remain authoritative; compatibility adds only absent
+tool tables. Root-level settings are reported, not silently shadowed.
 
 Initial application resolves the lock and syncs the environment. Later runs
 use the lock; missing dependencies are installed by uv before Python starts,
@@ -1227,9 +1248,9 @@ custom implementation never briefly created an internal file. Structural-only
 compatibility success is not proof that results are reusable.
 
 Result paths stay outside disposable operation checkpoints. 1e.3 defines this
-runner protocol; 6 connects production selection, ownership and bounded
-retention under `<git-common-dir>/ceratops/results/repository-checks/`.
-Until then, callers own their selected result files and lifetime. Disposable
+runner protocol; implemented plan 6A connects production selection, ownership
+and bounded retention under
+`<git-common-dir>/ceratops/results/repository-checks/`. Disposable
 pytest caches and basetemp directories remain scratch, not acceptance. Cheap
 diagnostics/collection snapshots may be regenerated at their own final paths.
 
@@ -1664,3 +1685,25 @@ Releases use `vMAJOR.MINOR.PATCH` tags. See `CHANGELOG.md` for release notes.
 
 This repository publishes source files only. It does not publish Docker images,
 PyPI packages, npm packages, or other runtime artifacts.
+
+## Durable repository check results
+
+SDLC `check-results` declarations connect one repository runner command to
+durable unchanged-input reuse. The operation executor supplies the existing
+five result arguments; the declared runner writes its actual outcome before
+returning. Later promotion/build calls consume eligible original passes while
+new artifact checks still run. Corrupt evidence blocks the operation.
+
+Results live under `<git-common-dir>/ceratops/results/repository-checks/`.
+Existing pending-work scopes retain active candidate references; checkpoints
+and disposable reports are not acceptance authorities. Storage is bounded and
+protects required original passes and newer applicable failures. Checks marked
+`no_result_reuse`, distributed execution and unrepresented child scope also
+prevent aggregate reuse; ordinary child passes keep their original identities.
+
+`--qualification-level` selects required alpha/beta/rc/final eligibility;
+ordinary checks default to alpha and promotion tests to beta. The portable
+producer, custom runner and scope/retention ownership are described in
+`docs/design-draft.md`, section "Durable unchanged-input check reuse".
+This implements plan 6A and its limited Docs-and-Claims runner adoption;
+remaining affected-check and release/receipt adoption stays pending.

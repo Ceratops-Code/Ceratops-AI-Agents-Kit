@@ -27,10 +27,12 @@ VERSION_SCHEMAS = {
     5: SCHEMA.with_name("sdlc.v5.schema.json"),
 }
 NAME = r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*"
+# MCP project names are manager identities, not rewritten SDLC display names.
+MCP_NAME = r"[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*"
 V4_OPERATION_RE = re.compile(
     rf"^(?:repository\.actions\.(?P<repository>bootstrap|validate|test|test-selection)|"
     rf"deliverables\.(?P<kind>packages|apps|mcp-servers|skills|hooks)\."
-    rf"(?P<name>{NAME})\.actions\.(?P<action>validate|test|build|install|publish|verify-publish))$"
+    rf"(?P<name>{MCP_NAME})\.actions\.(?P<action>validate|test|build|install|publish|verify-publish))$"
 )
 V4_ACTIONS_BY_KIND = {
     "packages": frozenset({"validate", "test", "build", "publish", "verify-publish"}),
@@ -103,6 +105,8 @@ def operation_category(location: str, *, version: int = 4) -> str:
     if isinstance(location, str) and (match := V4_OPERATION_RE.fullmatch(location)):
         action = match.group("repository") or match.group("action")
         kind = match.group("kind")
+        if kind not in {None, "mcp-servers"} and re.fullmatch(NAME, match.group("name")) is None:
+            raise SdlcContractError(f"Invalid SDLC operation location: {location}")
         if (
             kind is None
             or action in V4_ACTIONS_BY_KIND[kind]
@@ -263,6 +267,16 @@ def _typed_semantic_errors(value: Mapping[str, Any]) -> list[str]:
                 errors.append(
                     f"handoff must be the single final step at {owner}.actions.{action_name}"
                 )
+            check_results = action.get("check-results")
+            if check_results is not None:
+                steps = action.get("steps", [])
+                if action_name not in {"validate", "test", "tests"} or len(steps) != 1 or "run" not in steps[0]:
+                    errors.append(f"check-results requires one check runner command at {owner}.actions.{action_name}")
+                for key in ("product-inputs", "check-inputs", "dependencies"):
+                    for input_path in check_results.get(key, []):
+                        if (input_path.startswith(("/", "\\")) or "\\" in input_path
+                                or ":" in input_path or ".." in input_path.split("/")):
+                            errors.append(f"check-results {key} must be repository-relative at {owner}.actions.{action_name}")
             declared_result = action.get("result-schema")
             if declared_result is not None:
                 expected_result = V4_RESULT_SCHEMAS.get(action_name)

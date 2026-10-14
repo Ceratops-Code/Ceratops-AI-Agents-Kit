@@ -33,6 +33,81 @@ from tests.support.repositories import (
 )
 
 
+@pytest.mark.parametrize("failure", [None, "before-finalize", "after-finalize", "missing", "wrong-commit", "duplicate"])
+def test_installer_forwards_completed_sibling_receipts_without_reinstalling(
+    tmp_path, monkeypatch, capsys, failure,
+):
+    installer = load_runtime_installer()
+    builder = installer["runtime_builder"]
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    destination = tmp_path / "installed"
+    record = tmp_path / "promotion.json"
+    record.write_text("promotion")
+    binding = {"result_file": str(record), "sha256": "a" * 64,
+               "identity": [1, 2**63 + 17, 3, 4, 5, 1],
+               "operation": "deliverables.skills.alpha-tool.actions.install"}
+    sibling = {**binding, "operation": "deliverables.mcp-servers.source_search_mcp.actions.install"}
+    evidence = tmp_path / "mcp-receipt.json"
+    receipt = {"schema": "ceratops-deployment-completion.v1",
+               "producer": "ceratops-mcp-server-lifecycle/install", "status": "completed",
+               "cleanup_debt": [], "repo_root": str(repo), "commit": "b" * 40,
+               "promotion": sibling}
+    if failure == "wrong-commit":
+        receipt["commit"] = "c" * 40
+    elif failure == "duplicate":
+        receipt["promotion"] = binding
+    if failure != "missing":
+        evidence.write_text(json.dumps(receipt), encoding="utf-8")
+    main_globals = installer["main"].__globals__
+    monkeypatch.setitem(main_globals, "_source_commit", lambda root: "b" * 40)
+    monkeypatch.setitem(main_globals, "_promotion_bindings", lambda *args: [binding])
+    effects = []
+    finalizations = []
+
+    def install(*args, **kwargs):
+        effects.append("install")
+        return builder.TransactionResult("ok", ("alpha-tool",), (), "transaction")
+
+    def finalize(argv, **kwargs):
+        finalizations.append((argv, kwargs["input"]))
+        if failure == "before-finalize":
+            raise OSError("finalizer unavailable")
+        assert argv[-4:] == ["--deployment-evidence", "-", "--deployment-evidence", str(evidence)]
+        assert json.loads(evidence.read_text())["promotion"]["identity"][1] == 2**63 + 17
+        record.unlink(missing_ok=True)
+        if failure == "after-finalize":
+            raise OSError("finalizer acknowledgement interrupted")
+        return subprocess.CompletedProcess(argv, 0, "OK", "")
+
+    monkeypatch.setattr(builder, "install_transaction", install)
+    monkeypatch.setattr(installer["subprocess"], "run", finalize)
+    argv = ["--repo-root", str(repo), "--install-root", str(destination), "--skill", "alpha-tool",
+            "--promotion-result", str(record), "--operation", binding["operation"],
+            "--task-temp-root", str(tmp_path), "--finalize-promotion-with", str(tmp_path / "finalizer.py"),
+            "--deployment-evidence", str(evidence)]
+    before = evidence.read_bytes() if evidence.exists() else None
+    code = installer["main"](argv)
+    output = capsys.readouterr()
+    invalid = failure in {"missing", "wrong-commit", "duplicate"}
+    assert effects == ([] if invalid else ["install"])
+    assert len(finalizations) == (0 if invalid else 1)
+    assert code == (0 if failure is None else (1 if invalid else 2))
+    if not invalid:
+        result = json.loads(output.out if code == 0 else output.err)
+        assert result["promotion"]["identity"][1] == 2**63 + 17
+        assert result["promotion_cleanup"]["status"] == ("completed" if failure is None else "failed")
+        if failure:
+            assert result["promotion_cleanup"]["replay_required"] is False
+    assert (evidence.read_bytes() if evidence.exists() else None) == before
+    # The transport preflight is read-only and repeatable; interrupted cleanup
+    # retains the actual receipt rather than requesting a second installation.
+    if not invalid:
+        args = installer["build_parser"]().parse_args(argv)
+        for _ in range(2):
+            assert installer["_additional_deployment_evidence"](args, repo, "b" * 40, [binding]) == [str(evidence)]
+
+
 def test_runtime_installer_releases_installed_working_directory(
     tmp_path: pathlib.Path,
 ) -> None:
@@ -456,7 +531,7 @@ def test_write_lock_fork_cannot_reuse_parent_ownership(tmp_path, write_locks):
                     os._exit(1)
             except write_locks.WriteLockBusy:
                 os._exit(0)
-            except BaseException:  # noqa: BLE001 - terminate the fork child on any test failure
+            except BaseException:  # Terminate the fork child on any test failure.
                 os._exit(2)
         _, status = os.waitpid(pid, 0)
         assert os.waitstatus_to_exitcode(status) == 0
@@ -1253,7 +1328,7 @@ def test_transaction_cleanup_blocker_keeps_new_batch_and_serializes_writers(
                 install_root,
                 selected=("alpha-tool",),
             )
-        except BaseException as exc:  # noqa: BLE001 - return worker failures to the asserting thread
+        except BaseException as exc:  # Return worker failures to the asserting thread.
             errors.append(exc)
 
     with lock_builder["runtime_lock"](install_root):

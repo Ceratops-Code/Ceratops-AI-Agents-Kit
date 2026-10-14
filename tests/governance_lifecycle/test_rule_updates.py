@@ -505,3 +505,179 @@ def test_rule_candidate_rejects_stale_and_duplicate_expected_old(
     stale = run_rule_candidate_validator(candidate, tmp_path / "stale.json")
     assert stale.returncode == 1
     assert "source-hash" in stale.stderr and "source is stale" in stale.stderr
+
+
+
+def write_review_rename_candidate(
+    root: pathlib.Path, old: str = "HELP-04", new: str = "HELPERS-04",
+) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path, str]:
+    """Produce a real candidate with existing self and relation review markers."""
+    # Keep an old ID in the source path: only structured rule identities move.
+    directory = root / old
+    directory.mkdir()
+    rules = directory / "AGENTS.md"
+    history = directory / "AGENTS.history.json"
+    before = (
+        f"# Rules\n\n- [{old}] Keep the existing enumeration.\n"
+        "  - overlaps: MIDDLE-01\n"
+        "  - self: list-heavy\n\n"
+        "- [MIDDLE-01] Keep the existing overlap.\n\n"
+        "- [KEEP-01] Keep the other rule unchanged.\n"
+    )
+    after = before.replace(f"[{old}]", f"[{new}]")
+    rules.write_text(before, encoding="utf-8", newline="\r\n")
+    history.write_text(json.dumps({"version": 2, "entries": [{
+        "rules": [old, "MIDDLE-01", "KEEP-01"],
+        "decision": f"Keep {old} and its existing markers.",
+        "reason": "Preserve the original rules.",
+        "regression": "Keep unrelated findings blocking.",
+    }]}) + "\n", encoding="utf-8", newline="\r\n")
+    project = root / "project"
+    project.mkdir()
+    local_rules = project / "AGENTS.md"
+    local_rules.write_text("# Project\n\n- [LOCAL-01] Keep the project rule.\n", encoding="utf-8")
+    local_rules.with_name("AGENTS.history.json").write_bytes(history.read_bytes())
+    candidate = root / "candidate.json"
+    write_rule_candidate(candidate, rule_stack=[rules, local_rules], targets=[{
+        "rules": str(rules), "history": str(history),
+        "source_sha256": hashlib.sha256(rules.read_bytes()).hexdigest(),
+        "markdown_policy": None,
+        "replacements": [{"expected_old": before.replace("\n", "\r\n"), "replacement": after}],
+    }])
+    value = json.loads(candidate.read_bytes())
+    value["history_operations"] = [{
+        "operation": "rename", "history": str(history),
+        "renames": [{"old": old, "new": new}], "semantic_replacements": [],
+    }, {
+        "operation": "append", "history": str(history), "entry": {
+            "rules": [new], "decision": "Use the approved new rule identity.",
+            "reason": "Rename the rule without adding review issues.",
+            "regression": "Keep existing markers and reject new issues.",
+        },
+    }]
+    candidate.write_text(json.dumps(value) + "\n", encoding="utf-8")
+    return candidate, rules, history, after
+
+
+@pytest.mark.parametrize("old,new", [("HELP-04", "HELPERS-04"), ("A-01", "Z-01")])
+def test_approved_rename_carries_existing_markers_through_application(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, old: str, new: str,
+) -> None:
+    monkeypatch.syspath_prepend(str(RULE_CANDIDATE_VALIDATOR.parent))
+    import apply_rules_update as application
+
+    candidate, rules, history, after = write_review_rename_candidate(tmp_path, old, new)
+    originals = {path: path.read_bytes() for path in (rules, history)}
+    task_root = tmp_path / "task-temp"
+    task_root.mkdir()
+    request = application.generate_candidate_update_request(candidate, task_root)
+    assert {path: path.read_bytes() for path in originals} == originals
+    accepted = candidate.read_bytes()
+    with mock.patch.object(application, "validate_rule_candidate", side_effect=AssertionError("rechecked accepted work")):
+        application.accept_candidate(candidate, tmp_path / "repeated-evidence.json")
+        assert candidate.read_bytes() == accepted
+        application.apply_update_request(request)
+    assert rules.read_bytes() == after.replace("\n", "\r\n").encode()
+    entries = json.loads(history.read_bytes())["entries"]
+    assert len(entries) == 2 and entries[0]["rules"][0] == new
+    assert entries[0]["decision"] == f"Keep {new} and its existing markers."
+    assert not list(task_root.iterdir())
+    assert not list(rules.parent.glob("*.rules-update.*"))
+
+
+@pytest.mark.parametrize("change", [
+    "undeclared", "wrong-history", "wrong-source", "old-still-present",
+    "duplicate-new", "cascade", "invalid-id", "new-self", "new-rule",
+    "changed-relation", "new-cycle",
+])
+def test_rule_rename_cannot_hide_new_or_unrelated_findings(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, change: str,
+) -> None:
+    monkeypatch.syspath_prepend(str(RULE_CANDIDATE_VALIDATOR.parent))
+    import validate_rule_candidate as producer
+
+    candidate, rules, history, _ = write_review_rename_candidate(tmp_path)
+    value = json.loads(candidate.read_bytes())
+    rename = value["history_operations"][0]
+    fragment = value["targets"][0]["replacements"][0]
+    if change == "undeclared":
+        value["history_operations"] = value["history_operations"][1:]
+    elif change == "wrong-history":
+        rename["history"] = str(tmp_path / "project" / "AGENTS.history.json")
+    elif change == "wrong-source":
+        rename["renames"][0]["old"] = "LOCAL-01"
+    elif change == "old-still-present":
+        fragment["replacement"] += "\n- [HELP-04] Keep another rule.\n"
+    elif change == "duplicate-new":
+        rename["renames"].append({"old": "KEEP-01", "new": "HELPERS-04"})
+    elif change == "cascade":
+        rename["renames"] = [{"old": "HELP-04", "new": "KEEP-01"}, {"old": "KEEP-01", "new": "HELPERS-04"}]
+    elif change == "invalid-id":
+        rename["renames"][0]["new"] = "not a rule ID"
+    elif change == "new-self":
+        fragment["replacement"] += "  - self: list-heavy\n"
+    elif change == "new-rule":
+        fragment["replacement"] += "\n- [NEW-01] Add a new enumeration.\n  - self: list-heavy\n"
+    elif change == "changed-relation":
+        fragment["replacement"] = fragment["replacement"].replace("overlaps: MIDDLE-01", "overlaps: KEEP-01")
+    else:
+        fragment["replacement"] += "  - limits: HELPERS-04\n"
+        fragment["replacement"] = fragment["replacement"].replace("overlaps: MIDDLE-01", "limits: KEEP-01")
+    candidate.write_text(json.dumps(value) + "\n", encoding="utf-8")
+    originals = {path: path.read_bytes() for path in (rules, history, candidate)}
+    expected = {
+        "wrong-history": "rename history has no matching rules target:",
+        "wrong-source": "rename does not match changed rule IDs:",
+        "old-still-present": "rename does not match changed rule IDs:",
+        "duplicate-new": "new IDs must be unique",
+        "cascade": "must not cascade through ID",
+        "invalid-id": ".new is invalid",
+    }.get(change, "new semantic review:")
+    for _ in range(2):
+        with pytest.raises(producer.RuleCandidateValidationError) as failed:
+            producer.validate_rule_candidate(candidate, tmp_path / "failed-evidence.json")
+        assert expected in str(failed.value)
+        assert {path: path.read_bytes() for path in originals} == originals
+    assert json.loads(candidate.read_bytes())["acceptance"] is None
+
+
+@pytest.mark.parametrize("effect", ["rules", "history"])
+@pytest.mark.parametrize("timing", ["before", "after"])
+def test_rule_rename_application_handles_interruption_at_each_write(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, effect: str, timing: str,
+) -> None:
+    monkeypatch.syspath_prepend(str(RULE_CANDIDATE_VALIDATOR.parent))
+    import apply_rules_update as application
+
+    candidate, rules, history, after = write_review_rename_candidate(tmp_path)
+    originals = {path: path.read_bytes() for path in (rules, history)}
+    task_root = tmp_path / "task-temp"
+    task_root.mkdir()
+    request = application.generate_candidate_update_request(candidate, task_root)
+    destination = rules if effect == "rules" else history
+    replace = application.os.replace
+    interrupted = False
+
+    def interrupt_write(source, target):
+        nonlocal interrupted
+        if pathlib.Path(target) == destination and pathlib.Path(source).suffix == ".new":
+            interrupted = True
+            if timing == "after":
+                replace(source, target)
+            raise KeyboardInterrupt("injected write interruption")
+        return replace(source, target)
+
+    with (
+        mock.patch.object(application.os, "replace", side_effect=interrupt_write),
+        pytest.raises(application.ApplicationError, match="update rolled back"),
+    ):
+        application.apply_update_request(request)
+    assert interrupted
+    assert {path: path.read_bytes() for path in originals} == originals
+    assert not list(rules.parent.glob("*.rules-update.*"))
+    # A normal call after rollback reaches the same desired rules and history.
+    application.apply_update_request(request)
+    assert rules.read_bytes() == after.replace("\n", "\r\n").encode()
+    assert len(json.loads(history.read_bytes())["entries"]) == 2
+    assert not list(task_root.iterdir())
+    assert not list(rules.parent.glob("*.rules-update.*"))

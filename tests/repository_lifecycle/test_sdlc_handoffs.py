@@ -3519,7 +3519,7 @@ def test_registered_skill_executor_uses_installed_authorized_source_bundle(
         calls.append(argv)
         return subprocess.CompletedProcess(argv, 0, "", "")
 
-    monkeypatch.setattr(handoffs.subprocess, "run", run)
+    monkeypatch.setattr(handoffs, "run_progress_command", run)
     assert (
         handoffs.execute_handoff("example-skill/check", source_repo)["status"]
         == "completed"
@@ -3574,7 +3574,7 @@ def test_tool_install_binding_uses_checkout_metadata_and_propagates_failures(
             argv, 7 if failure else 0, "OK\n", "candidate failed" if failure else ""
         )
 
-    monkeypatch.setattr(handoffs.subprocess, "run", run)
+    monkeypatch.setattr(handoffs, "run_progress_command", run)
     inputs = (
         {
             "mcp-server": selected_mcp_server,
@@ -3944,7 +3944,7 @@ def test_v4_skill_handoff_rejects_unsafe_or_unhandled_work_before_deployment(
     elif problem == "dirty_source":
         (repo / "uncommitted.txt").write_text("must not deploy")
     else:
-        original = runner.subprocess.run
+        original = runner.run_progress_command
 
         def changing(argv, **kwargs):
             result = original(argv, **kwargs)
@@ -3952,7 +3952,7 @@ def test_v4_skill_handoff_rejects_unsafe_or_unhandled_work_before_deployment(
                 str(part).endswith("skills-consistency-source-validator.py")
                 for part in argv
             ):
-                original(
+                subprocess.run(
                     ["git", "commit", "--allow-empty", "-m", "Concurrent change"],
                     cwd=repo,
                     capture_output=True,
@@ -3960,7 +3960,7 @@ def test_v4_skill_handoff_rejects_unsafe_or_unhandled_work_before_deployment(
                 )
             return result
 
-        monkeypatch.setattr(runner.subprocess, "run", changing)
+        monkeypatch.setattr(runner, "run_progress_command", changing)
     result = runner.execute_prepared_operation(prepared)
     assert result["status"] == (
         "state_changed"

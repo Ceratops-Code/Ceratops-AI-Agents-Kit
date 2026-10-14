@@ -25,6 +25,7 @@ from contextlib import contextmanager
 from typing import Any
 
 import git_branch_operations as git_branches
+from check_deployment_receipts import check_deployment_receipt
 from git_branch_operations import PromotionError, SourceState
 from github_pr_workflow import ship_repository as repository_ship
 from github_pr_workflow.command import (
@@ -690,7 +691,7 @@ def _promote_with_rollback(
                     rollback["release_branch"],
                     rollback["state"],
                 )
-            except Exception as restore_exc:  # noqa: BLE001 - retain both failures
+            except Exception as restore_exc:  # noqa: BLE001 - Preserve both promotion and restoration failures.
                 raise PromotionError(
                     f"Promotion failed: {exc}; restoring the original checkout "
                     f"also failed: {restore_exc}"
@@ -773,85 +774,6 @@ def _receipt_promotion_bindings(receipt: dict[str, Any]) -> list[dict[str, Any]]
     return bindings
 
 
-def _validate_completion(
-    receipt: object,
-    *,
-    repo_root: pathlib.Path,
-    commit: str,
-    outcome: dict[str, Any],
-    binding: dict[str, Any] | None,
-) -> None:
-    """Validate the closed completion protocol without scanning installed files.
-
-    The producer attests its actual transaction. An external handoff receipt
-    must bind the exact saved promotion bytes; inline executed-action evidence
-    is already held by the lifecycle envelope. Neither path replays deployment.
-    """
-    fields = {
-        "schema",
-        "producer",
-        "status",
-        "repo_root",
-        "commit",
-        "install_root",
-        "deployed",
-        "removed",
-        "transaction_id",
-        "cleanup_debt",
-        "promotion",
-    }
-    if (
-        not isinstance(receipt, dict)
-        or not fields.issubset(receipt)
-        or set(receipt) - fields - {"promotion_cleanup"}
-        or receipt.get("schema") != "ceratops-deployment-completion.v1"
-        or receipt.get("status") != "completed"
-        or receipt.get("cleanup_debt") != []
-    ):
-        raise PromotionError(
-            "Deployment completion evidence is failed, incomplete, or has cleanup debt."
-        )
-    if receipt["commit"] != commit or receipt["repo_root"] != str(repo_root):
-        raise PromotionError(
-            "Deployment completion evidence identifies a different repository or commit."
-        )
-    promotion_matches = receipt["promotion"] is None and binding is None
-    if binding is not None:
-        promotion_matches = binding in _receipt_promotion_bindings(receipt)
-    if receipt["producer"] != outcome.get("handoff") or not promotion_matches:
-        raise PromotionError(
-            "Deployment completion evidence does not match this handoff and saved record."
-        )
-    destination = receipt["install_root"]
-    if not isinstance(destination, str) or not pathlib.Path(destination).is_absolute():
-        raise PromotionError(
-            "Deployment completion evidence lacks its installation destination."
-        )
-    if str(_cleanup_path(pathlib.Path(destination))) != destination:
-        raise PromotionError("Deployment completion destination is not canonical.")
-    names: list[str] = []
-    for field in ("deployed", "removed"):
-        values = receipt[field]
-        if not isinstance(values, list) or not all(
-            isinstance(name, str) and re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", name)
-            for name in values
-        ):
-            raise PromotionError(
-                "Deployment completion evidence has invalid skill identities."
-            )
-        names.extend(values)
-    if not names or len(set(names)) != len(names):
-        raise PromotionError(
-            "Deployment completion evidence has missing or duplicate skill identities."
-        )
-    if not isinstance(receipt["transaction_id"], str) or not re.fullmatch(
-        r"[0-9a-f]{32}", receipt["transaction_id"]
-    ):
-        raise PromotionError(
-            "Deployment completion evidence lacks a transaction identity."
-        )
-
-
 def _completed_deployment(
     result: object,
     commit: str,
@@ -921,12 +843,15 @@ def _completed_deployment(
                 raise PromotionError(
                     "External evidence cannot replace an already executed handoff."
                 )
-            _validate_completion(
+            check_deployment_receipt(
                 supplied,
                 repo_root=repo_root,
                 commit=commit,
                 outcome=outcome,
                 binding={**record_binding, "operation": operation},
+                error_type=PromotionError,
+                read_promotion_bindings=_receipt_promotion_bindings,
+                check_destination_path=_cleanup_path,
             )
             # Any preceding repository-owned commands keep their original receipt gate.
             if not outcome.get("steps"):
@@ -955,12 +880,15 @@ def _completed_deployment(
                         "Executed handoff completion steps are incomplete."
                     )
                 assert repo_root is not None
-                _validate_completion(
+                check_deployment_receipt(
                     last["result"],
                     repo_root=repo_root,
                     commit=commit,
                     outcome=outcome,
                     binding=None,
+                    error_type=PromotionError,
+                    read_promotion_bindings=_receipt_promotion_bindings,
+                    check_destination_path=_cleanup_path,
                 )
                 continue
         if (

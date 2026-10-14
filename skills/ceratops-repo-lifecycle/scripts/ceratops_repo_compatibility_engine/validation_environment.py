@@ -6,21 +6,72 @@ the verified target; an existing environment is never recursively discarded.
 """
 
 # Environment setup reports malformed declarations as RuntimeError.
-# ruff: noqa: TRY004
 from __future__ import annotations
 
+import fnmatch
 import os
 import pathlib
 import re
 import shutil
 import subprocess
+import tomllib
 from collections.abc import Mapping
 from typing import Any
 
-import tomllib
 import yaml
 
 from .python_tool_configuration import project_text
+
+
+def repository_configuration_errors(
+    root: pathlib.Path, contract: Mapping[str, Any],
+) -> list[str]:
+    """Report configuration ownership errors without editing target files.
+
+    Root configuration is never silently relocated. Git owns the first-party
+    inventory; isolated non-Git fixtures use a pruned walk. Dependency trees,
+    output directories and filesystem links are not application inputs.
+    Declared environment checks own their locks; workspace members can share
+    one lock. Filename checks cannot establish custom dependency ownership.
+    """
+
+    policy = contract["configuration_layout"]
+    excluded = {name.lower() for name in policy["excluded_directories"]}
+    errors = []
+    for path in sorted(root.iterdir()):
+        if any(fnmatch.fnmatchcase(path.name.lower(), pattern.lower())
+               for pattern in policy["root_file_patterns"]):
+            errors.append(
+                f"repository-root configuration {path.name} must live under scripts "
+                "or its application directory; relocate it in a repository-scoped change"
+            )
+    inventory = subprocess.run(
+        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+        cwd=root, capture_output=True, check=False,
+    )
+    if inventory.returncode == 0:
+        paths = {root / os.fsdecode(value) for value in inventory.stdout.split(b"\0") if value}
+    else:
+        paths = set()
+        for directory, directories, names in os.walk(root, followlinks=False):
+            directories[:] = [name for name in directories if name.lower() not in excluded
+                              and not (pathlib.Path(directory) / name).is_symlink()
+                              and not (pathlib.Path(directory) / name).is_junction()]
+            paths.update(pathlib.Path(directory) / name for name in names)
+    for path in sorted(paths):
+        relative = path.relative_to(root)
+        if excluded.intersection(part.lower() for part in relative.parts) or not path.is_file():
+            continue
+        if any(parent.is_symlink() or parent.is_junction()
+               for parent in (path, *path.parents) if parent != root and root in parent.parents):
+            continue
+        name = path.name.lower()
+        if (any(fnmatch.fnmatchcase(name, pattern.lower())
+                for pattern in policy["python_dependency_file_patterns"])
+                or ("requirements" in [part.lower() for part in relative.parts[:-1]]
+                    and path.suffix.lower() in {".txt", ".in"})):
+            errors.append(f"Python dependency declaration {relative.as_posix()} must use uv with pyproject.toml and uv.lock")
+    return errors
 
 
 def runtime_files(
@@ -31,10 +82,14 @@ def runtime_files(
 ) -> dict[pathlib.Path, str]:
     """Render repository tooling declarations without copying the SDLC engine."""
 
+    if errors := repository_configuration_errors(root, contract):
+        raise RuntimeError("; ".join(errors))
     runtime = contract["runtime"]
     planned_files = planned_files or {}
     files: dict[pathlib.Path, str] = {}
-    dependencies: set[str] = set()
+    # Compatibility inspects native Ruff settings even when a custom runner
+    # owns the repository checks; its locked environment must provide Ruff.
+    dependencies: set[str] = {"ruff"}
     # Preserved runners own their framework dependencies. Only the runner this
     # transaction generates has a known pytest dependency.
     if generate_python_test_runner:
@@ -55,7 +110,7 @@ def runtime_files(
         missing = {name for name in dependencies if name.lower().replace("_", "-") not in names}
         if missing:
             raise RuntimeError("existing validator project must declare: " + ", ".join(sorted(missing)))
-    if not project.is_file() or project.read_text(encoding="utf-8") != rendered:
+    if not project.is_file() or project.read_bytes().decode("utf-8") != rendered:
         files[project] = rendered
     surface = contract["surfaces"]["actionlint_runner"]
     runner = root / surface["path"]

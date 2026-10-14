@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import pathlib
 import runpy
 import subprocess
 import sys
-from typing import Any
+from typing import Any, Self
 
 import pytest
 
@@ -20,6 +21,53 @@ from tests.repository_lifecycle.support import (
 from tests.support.repositories import (
     run_git,
 )
+
+
+@pytest.mark.parametrize(
+    ("check", "expected"),
+    [
+        ({"status": "IN_PROGRESS", "conclusion": "SUCCESS"}, "pending"),
+        ({"status": "COMPLETED", "conclusion": "FAILURE"}, "failed"),
+        ({"status": "COMPLETED", "conclusion": "SUCCESS"}, "passed"),
+        ({"status": "COMPLETED", "conclusion": "NEUTRAL"}, "passed"),
+        ({"status": "COMPLETED", "conclusion": "SKIPPED"}, "passed"),
+        ({"status": "COMPLETED"}, "passed"),
+        ({"state": "PENDING"}, "pending"),
+        ({"state": "SUCCESS"}, "passed"),
+        ({"state": "ERROR"}, "failed"),
+        ({}, "pending"),
+    ],
+)
+def test_dependency_check_projection_preserves_pending_and_failed_gates(
+    monkeypatch: pytest.MonkeyPatch, check: dict[str, str], expected: str,
+) -> None:
+    evidence = load_pr_workflow_module(monkeypatch, "dependency_evidence")
+    assert evidence.project_check(check)["classification"] == expected
+
+
+@pytest.mark.parametrize("payload", [{"version": "2.0.1"}, [{"version": "2.0.1"}]])
+def test_registry_object_fetch_keeps_existing_object_contract(
+    monkeypatch: pytest.MonkeyPatch, payload: Any,
+) -> None:
+    evidence = load_pr_workflow_module(monkeypatch, "dependency_evidence")
+
+    class Response:
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps(payload).encode("utf-8")
+
+    monkeypatch.setattr(evidence.urllib.request, "urlopen", lambda *args, **kwargs: Response())
+    for _ in range(2):
+        if isinstance(payload, dict):
+            assert evidence.fetch_url_json("https://registry.example/package") == payload
+        else:
+            with pytest.raises(evidence.WorkflowError, match="non-object JSON"):
+                evidence.fetch_url_json("https://registry.example/package")
 
 
 @pytest.mark.parametrize(
@@ -347,6 +395,190 @@ def test_dependency_preflight_collects_evidence_after_rebase_wait(
     assert result_pr["decision_gates"]["rebase_repair_required"] == (wait_status == "timed_out")
     assert payload["outcome"]["blocked"] == (wait_status == "failed")
     assert order == ["wait", "ci", "tree"]
+
+
+@pytest.mark.parametrize(
+    ("patched", "reason"),
+    [(None, "no_patched_version_listed"), ("", "no_patched_version_listed"),
+     ("not-a-version", "unparsed_patched_version_range"), ("2.0.2", None)],
+)
+@pytest.mark.parametrize("interruption", ["none", "before_write", "after_write"])
+def test_alert_preflight_distinguishes_missing_patch_and_repeats_after_interruption(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+    patched: str | None, reason: str | None, interruption: str,
+) -> None:
+    queue = load_pr_workflow_module(monkeypatch, "dependency_queue")
+    alert = {"repo": "owner/repo", "number": 8, "package": "extract-zip",
+             "ecosystem": "npm", "patched_versions": patched, "manifest_path": "package.json"}
+    snapshot = {
+        "outcome": {"blocked": False, "queue_present": True},
+        "summary": {"org": "owner", "open_dependabot_alerts": 1},
+        "open_dependabot_prs": [], "open_dependabot_alerts": [alert],
+    }
+    monkeypatch.setattr(queue, "refresh_snapshot", lambda *_: (
+        snapshot, subprocess.CompletedProcess([], 0, "", ""),
+    ))
+    monkeypatch.setattr(queue, "fetch_pr_batch", lambda *_: ({}, []))
+    monkeypatch.setattr(queue, "wait_for_dependabot_rebases", lambda *_: ({}, []))
+    monkeypatch.setattr(queue, "queued_repositories", lambda _: [{"repo": "owner/repo"}])
+    monkeypatch.setattr(queue, "resolve_checkout", lambda *_, **__: {
+        "status": "found", "path": str(tmp_path), "explicit": True,
+    })
+    monkeypatch.setattr(queue, "exact_ci_evidence", lambda _: {"status": "ok"})
+    monkeypatch.setattr(queue, "dependency_tree_evidence", lambda *_: {"status": "ok"})
+    registry_targets: list[str] = []
+
+    def registry(update: dict[str, Any]) -> dict[str, str]:
+        registry_targets.append(update["target_version"])
+        return {"status": "ok"}
+
+    monkeypatch.setattr(queue, "registry_evidence", registry)
+    monkeypatch.setattr(queue, "emit_result", lambda *_: None)
+    original_write = queue.write_json
+    writes = 0
+
+    def write(path: pathlib.Path, payload: dict[str, Any]) -> None:
+        nonlocal writes
+        writes += 1
+        if writes == 1 and interruption == "before_write":
+            raise OSError("interrupted before output")
+        original_write(path, payload)
+        if writes == 1 and interruption == "after_write":
+            raise OSError("interrupted after output")
+
+    monkeypatch.setattr(queue, "write_json", write)
+    output = tmp_path / "preflight.json"
+    argv = ["preflight", "--org", "owner", "--snapshot-helper", str(tmp_path / "snapshot.py"),
+            "--snapshot", str(tmp_path / "snapshot.json"), "--output", str(output),
+            "--workspace-root", str(tmp_path)]
+    assert queue.main(argv) == (0 if interruption == "none" else 1)
+    if interruption != "none":
+        assert output.exists() == (interruption == "after_write")
+    for _ in range(2):
+        assert queue.main(argv) == 0
+        payload = json.loads(output.read_text(encoding="utf-8"))
+        assert payload["outcome"]["blocked"] == (reason is not None)
+        assert payload["summary"]["open_dependabot_alerts"] == 1
+        blockers = payload["blockers"]
+        if reason is None:
+            assert blockers == []
+        else:
+            assert len(blockers) == 1 and blockers[0]["alert"] == 8
+            assert blockers[0]["message"] == reason
+            assert blockers[0]["check"] == (
+                "alert_patch_availability" if reason == "no_patched_version_listed"
+                else "alert_registry_preflight"
+            )
+    assert registry_targets == (["2.0.2"] * 3 if reason is None else [])
+
+
+@pytest.mark.parametrize(
+    "fault", ["none", "missing_release", "duplicate_release", "not_list", "non_final",
+              "missing_checksum", "wrong_url", "before_response", "during_read", "after_read"],
+)
+def test_gradle_registry_checks_exact_release_and_repeats_after_interruption(
+    monkeypatch: pytest.MonkeyPatch, fault: str,
+) -> None:
+    evidence = load_pr_workflow_module(monkeypatch, "dependency_evidence")
+    release: dict[str, Any] = {
+        "version": "9.8.1", "released": True, "final": True, "snapshot": False, "broken": False,
+        "downloadUrl": "https://services.gradle.org/distributions/gradle-9.8.1-bin.zip",
+        "checksum": "a" * 64, "wrapperChecksum": "b" * 64,
+    }
+    payload: Any = [release]
+    if fault == "missing_release":
+        payload = []
+    elif fault == "duplicate_release":
+        payload = [release, release]
+    elif fault == "not_list":
+        payload = release
+    elif fault == "non_final":
+        release["final"] = False
+    elif fault == "missing_checksum":
+        release.pop("wrapperChecksum")
+    elif fault == "wrong_url":
+        release["downloadUrl"] = "https://example.invalid/gradle-9.8.1-bin.zip"
+    attempts = 0
+
+    class Response:
+        def __init__(self, attempt: int) -> None:
+            self.attempt = attempt
+
+        def __enter__(self) -> Self:
+            return self
+
+        def read(self) -> bytes:
+            if self.attempt == 1 and fault == "during_read":
+                raise OSError("interrupted while reading")
+            return json.dumps(payload).encode("utf-8")
+
+        def __exit__(self, *_: object) -> None:
+            if self.attempt == 1 and fault == "after_read":
+                raise OSError("interrupted after response")
+
+    def open_metadata(request: Any, *, timeout: int) -> Response:
+        nonlocal attempts
+        attempts += 1
+        assert request.full_url == "https://services.gradle.org/versions/all"
+        assert timeout == 20
+        if attempts == 1 and fault == "before_response":
+            raise OSError("interrupted before response")
+        return Response(attempts)
+
+    monkeypatch.setattr(evidence.urllib.request, "urlopen", open_metadata)
+    update = evidence.parse_update(
+        "Bump gradle-wrapper from 9.8.0 to 9.8.1",
+        [{"path": "gradle/wrapper/gradle-wrapper.properties"}], [],
+    )
+    assert update["ecosystem"] == "gradle" and update["update_type"] == "patch"
+    interruptions = {"before_response", "during_read", "after_read"}
+    for attempt in range(2):
+        result = evidence.registry_evidence(update)
+        expected_ok = fault == "none" or (fault in interruptions and attempt == 1)
+        assert result["status"] == ("ok" if expected_ok else "blocked")
+        if expected_ok:
+            assert result["version"] == "9.8.1" and result["wrapper_sha256"] == "b" * 64
+    assert attempts == 2
+
+
+@pytest.mark.parametrize(
+    "fault", ["none", "duplicate_url", "missing_checksum", "wrong_url", "missing_jar",
+              "checkout_escape", "noncanonical_property"],
+)
+def test_gradle_wrapper_context_requires_unambiguous_checkout_bound_files(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, fault: str,
+) -> None:
+    evidence = load_pr_workflow_module(monkeypatch, "dependency_evidence")
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    relative = "gradle/wrapper/gradle-wrapper.properties"
+    if fault == "checkout_escape":
+        relative = "../outside/gradle-wrapper.properties"
+    properties = checkout / relative
+    properties.parent.mkdir(parents=True)
+    url = "distributionUrl=https\\://services.gradle.org/distributions/gradle-9.8.0-bin.zip\n"
+    text = url + "distributionSha256Sum=" + "a" * 64 + "\n"
+    if fault == "duplicate_url":
+        text += url
+    elif fault == "missing_checksum":
+        text = url
+    elif fault == "wrong_url":
+        text = text.replace("services.gradle.org", "example.invalid")
+    elif fault == "noncanonical_property":
+        text += "distribution\\u0055rl=https://example.invalid/gradle-9.8.0-bin.zip\n"
+    properties.write_text(text, encoding="utf-8")
+    jar_bytes = b"checkout wrapper context"
+    if fault != "missing_jar":
+        (properties.parent / "gradle-wrapper.jar").write_bytes(jar_bytes)
+    update = {"package": "gradle-wrapper", "ecosystem": "gradle", "target_version": "9.8.1"}
+    for _ in range(2):
+        result = evidence.dependency_tree_evidence(checkout, update, [{"path": relative}], [])
+        assert result["status"] == ("ok" if fault == "none" else "blocked")
+        if fault == "none":
+            assert result["sources"][0]["version"] == "9.8.0"
+            assert result["sources"][0]["wrapper_sha256"] == hashlib.sha256(jar_bytes).hexdigest()
+    unsupported = evidence.parse_update("Bump another-tool from 9.8.0 to 9.8.1", [{"path": relative}], [])
+    assert unsupported["ecosystem"] == "unknown"
 
 
 def test_dependency_merge_runs_absolute_entrypoint_from_target_checkout(

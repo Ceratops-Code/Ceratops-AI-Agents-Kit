@@ -6,7 +6,7 @@ import pathlib
 import runpy
 import subprocess
 import sys
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Any, Self
 
 import pytest
@@ -28,6 +28,23 @@ SCRIPTS = (
     / "scripts"
 )
 THREAD = "019ffd18-edc9-7c81-9a2c-4e07af2b2ca3"
+
+
+@pytest.mark.parametrize("platform", ["nt", "posix"])
+def test_cleanup_record_selection_preserves_platform_path_identity(
+    cleanup: ModuleType, monkeypatch: pytest.MonkeyPatch, platform: str,
+) -> None:
+    monkeypatch.setattr(cleanup, "os", SimpleNamespace(name=platform))
+    selected = pathlib.PurePosixPath("/tasks/Foo")
+    for _ in range(2):
+        assert cleanup._record_selects_worktree({"candidate": {"path": "/tasks/Foo"}}, selected)
+        assert cleanup._record_selects_worktree(
+            {"candidate": {"path": "/tasks/foo"}}, selected,
+        ) == (platform == "nt")
+        assert not cleanup._record_selects_worktree({"candidate": {"path": "/tasks/other"}}, selected)
+    assert cleanup._path_key("//?/C:\\tasks\\Foo") == (
+        "c:/tasks/foo" if platform == "nt" else "//?/C:\\tasks\\Foo"
+    )
 
 
 @pytest.fixture
@@ -87,6 +104,7 @@ def threads(
     monkeypatch.setattr(cleanup, "ThreadCatalog", Catalog)
 
 
+@pytest.mark.parametrize("selected", [False, True])
 @pytest.mark.parametrize(
     "condition,removed",
     [
@@ -108,6 +126,7 @@ def test_repository_wide_cleanup_conditions(
     monkeypatch: pytest.MonkeyPatch,
     condition: str,
     removed: bool,
+    selected: bool,
 ) -> None:
     worktree = task(repository)
     temp_root = repository.parent / "tmp" / repository.name
@@ -152,9 +171,11 @@ def test_repository_wide_cleanup_conditions(
         git(worktree, "commit", "-am", "not shipped")
     if condition == "locked":
         git(repository, "worktree", "lock", str(worktree))
-    options = (
+    options: dict[str, Any] = (
         {"protected_branches": ("codex/candidate",)} if condition == "protected" else {}
     )
+    if selected:
+        options["selected_worktree"] = worktree
     result = cleanup.retire_shipped_work(repository, "main", apply=True, **options)
     assert result["status"] == "completed"
     assert worktree.exists() is not removed
@@ -210,6 +231,225 @@ def test_detached_worktree_and_unchecked_task_branch(
     )
     assert git(repository, "rev-parse", "permanent-bookmark") == git(
         repository, "rev-parse", "main"
+    )
+
+
+@pytest.mark.parametrize("detached", [False, True])
+def test_selected_worktree_cli_excludes_siblings_and_unchecked_branches(
+    cleanup: ModuleType,
+    repository: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    detached: bool,
+) -> None:
+    selected = task(repository, "selected", detached=detached)
+    other = task(repository, "other")
+    git(repository, "branch", "codex/no-checkout")
+    threads(cleanup, monkeypatch, [])
+    args = [
+        "--repo-root",
+        str(repository),
+        "cleanup",
+        "--shipped-ref",
+        "main",
+        "--worktree",
+        str(selected),
+    ]
+    assert cleanup.main(args) == 0
+    preview = json.loads(capsys.readouterr().out)
+    assert [item["path"] for item in preview["candidates"]] == [str(selected)]
+    assert selected.is_dir() and other.is_dir()
+    assert cleanup.main([*args, "--apply"]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == "completed"
+    assert [item["path"] for item in result["removed"]] == [str(selected)]
+    assert not selected.exists() and other.is_dir()
+    assert git(repository, "rev-parse", "codex/other")
+    assert git(repository, "rev-parse", "codex/no-checkout")
+    assert cleanup.main([*args, "--apply"]) == 0
+    repeated = json.loads(capsys.readouterr().out)
+    assert repeated["status"] == "completed" and repeated["removed"] == []
+
+
+@pytest.mark.parametrize("location", ["primary", "root", "outside", "relative"])
+def test_selected_worktree_rejects_paths_outside_its_exact_boundary(
+    cleanup: ModuleType,
+    repository: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    location: str,
+) -> None:
+    worktree = task(repository)
+    threads(cleanup, monkeypatch, [])
+    selected = {
+        "primary": repository,
+        "root": worktree.parent,
+        "outside": repository.parent / "other" / "candidate",
+        "relative": pathlib.Path("candidate"),
+    }[location]
+    with pytest.raises(cleanup.CleanupError, match="Selected worktree"):
+        cleanup.retire_shipped_work(
+            repository, "main", apply=True, selected_worktree=selected
+        )
+    assert worktree.is_dir() and git(repository, "rev-parse", "codex/candidate")
+    assert not (repository / ".git" / "codex").exists()
+
+
+@pytest.mark.parametrize("case_distinct", [False, True])
+def test_selected_worktree_preserves_unrelated_unfinished_removal(
+    cleanup: ModuleType,
+    repository: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case_distinct: bool,
+) -> None:
+    if case_distinct and sys.platform == "win32":
+        pytest.skip("Case-distinct sibling directories require a case-sensitive filesystem")
+    other = task(repository, "Foo" if case_distinct else "other")
+    threads(cleanup, monkeypatch, [])
+    original = cleanup._remove_branch
+
+    def interrupt(*args: Any) -> None:
+        raise cleanup.CleanupError("other target interrupted before ref deletion")
+
+    monkeypatch.setattr(cleanup, "_remove_branch", interrupt)
+    first = cleanup.retire_shipped_work(
+        repository, "main", apply=True, selected_worktree=other
+    )
+    assert first["status"] == "blocked" and not other.exists()
+    monkeypatch.setattr(cleanup, "_remove_branch", original)
+    records = repository / ".git" / "codex" / "repository-lifecycle" / "shipped-cleanup"
+    record = next(records.glob("*.json"))
+    before = record.read_bytes()
+    orphan = records / ("a" * 64 + ".tmp")
+    orphan.write_text("other target's atomic scratch", encoding="utf-8")
+    selected = task(repository, "foo" if case_distinct else "selected")
+    result = cleanup.retire_shipped_work(
+        repository, "main", apply=True, selected_worktree=selected
+    )
+    assert result["status"] == "completed" and not selected.exists()
+    assert record.read_bytes() == before
+    assert orphan.read_text(encoding="utf-8") == "other target's atomic scratch"
+    assert git(repository, "rev-parse", f"codex/{other.name}")
+    resumed = cleanup.retire_shipped_work(
+        repository, "main", apply=True, selected_worktree=other
+    )
+    assert resumed["status"] == "completed" and not record.exists()
+    assert orphan.exists()
+
+
+@pytest.mark.parametrize("when", ["before", "after"])
+@pytest.mark.parametrize(
+    "effect",
+    [
+        "record",
+        "promotion-state",
+        "worktree",
+        "task-temp",
+        "ref",
+        "branch-config",
+        "promotion-retirement",
+        "record-retirement",
+    ],
+)
+def test_selected_cleanup_converges_after_each_effect_interruption(
+    cleanup: ModuleType,
+    repository: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    effect: str,
+    when: str,
+) -> None:
+    selected = task(repository, "selected")
+    other = task(repository, "other")
+    threads(cleanup, monkeypatch, [])
+    git(repository, "branch", "codex/no-checkout")
+    git(repository, "config", "branch.codex/selected.description", "completed task")
+    temp = repository.parent / "tmp" / repository.name / selected.name
+    temp.mkdir(parents=True)
+    (temp / "scratch.txt").write_text("owned scratch", encoding="utf-8")
+    git(repository, "branch", "release/local")
+    manager = cleanup._scope_manager()
+    recorded = manager["record_scope"](
+        repository,
+        target_branch="release/local",
+        target_commit=git(repository, "rev-parse", "main"),
+        source_branches=["codex/selected"],
+    )
+    scope = pathlib.Path(recorded["pending_work_scope"])
+    fired = False
+    native_effects: list[str] = []
+    original_git = cleanup._git
+
+    def at_boundary(operation: Any, *args: Any, **kwargs: Any) -> Any:
+        nonlocal fired
+        if not fired and when == "before":
+            fired = True
+            raise cleanup.CleanupError("interrupted before selected effect")
+        result = operation(*args, **kwargs)
+        if not fired:
+            fired = True
+            raise cleanup.CleanupError("interrupted after selected effect")
+        return result
+
+    def native_git(repo: pathlib.Path, *args: str, **kwargs: Any) -> str:
+        kind = None
+        if args[:2] == ("worktree", "remove"):
+            kind = "worktree"
+        elif args[:2] == ("update-ref", "-d"):
+            kind = "ref"
+        elif args[:3] == ("config", "--local", "--remove-section"):
+            kind = "branch-config"
+
+        def perform() -> str:
+            result = original_git(repo, *args, **kwargs)
+            if kind:
+                native_effects.append(kind)
+            return result
+
+        return at_boundary(perform) if kind == effect else perform()
+
+    monkeypatch.setattr(cleanup, "_git", native_git)
+    functions = {
+        "record": (cleanup, "_save_record"),
+        "promotion-state": (cleanup, "_prepare_promotion_source_retirement"),
+        "promotion-retirement": (cleanup, "_retire_promotion_source"),
+    }
+    if effect in functions:
+        owner, name = functions[effect]
+        original = getattr(owner, name)
+        monkeypatch.setattr(
+            owner, name, lambda *args, **kwargs: at_boundary(original, *args, **kwargs)
+        )
+    elif effect in {"task-temp", "record-retirement"}:
+        name = (
+            "_remove_matching_task_temp_directories"
+            if effect == "task-temp"
+            else "_remove_completed_state_file"
+        )
+        original = cleanup._paths[name]
+        monkeypatch.setitem(
+            cleanup._paths,
+            name,
+            lambda *args, **kwargs: at_boundary(original, *args, **kwargs),
+        )
+    options: dict[str, Any] = {"apply": True, "selected_worktree": selected}
+    first = cleanup.retire_shipped_work(repository, "main", **options)
+    assert fired and first["status"] == "blocked"
+    # Every retry uses the same public operation and current target state.
+    second = cleanup.retire_shipped_work(repository, "main", **options)
+    assert second["status"] == "completed"
+    third = cleanup.retire_shipped_work(repository, "main", **options)
+    assert third["status"] == "completed" and third["removed"] == []
+    assert not selected.exists() and not temp.exists() and not scope.exists()
+    assert native_effects.count("worktree") == 1
+    assert native_effects.count("ref") == 1
+    assert native_effects.count("branch-config") == 1
+    assert other.is_dir()
+    assert git(repository, "rev-parse", "codex/other")
+    assert git(repository, "rev-parse", "codex/no-checkout")
+    assert (
+        run_git(
+            repository, "show-ref", "--verify", "--quiet", "refs/heads/codex/selected"
+        ).returncode
+        == 1
     )
 
 
@@ -361,7 +601,9 @@ def test_task_temp_failure_keeps_removal_record_for_resume(
     def interrupt(*args: Any, **kwargs: Any) -> None:
         raise cleanup.CleanupError("task-temp removal interrupted")
 
-    monkeypatch.setitem(cleanup._paths, "_remove_matching_task_temp_directories", interrupt)
+    monkeypatch.setitem(
+        cleanup._paths, "_remove_matching_task_temp_directories", interrupt
+    )
     first = cleanup.retire_shipped_work(repository, "main", apply=True)
     assert first["status"] == "blocked"
     assert not worktree.exists()
@@ -374,7 +616,9 @@ def test_task_temp_failure_keeps_removal_record_for_resume(
 
     # Recovery retains the captured owner even if its archived chat is removed.
     threads(cleanup, monkeypatch, [])
-    monkeypatch.setitem(cleanup._paths, "_remove_matching_task_temp_directories", original)
+    monkeypatch.setitem(
+        cleanup._paths, "_remove_matching_task_temp_directories", original
+    )
     resumed = cleanup.retire_shipped_work(repository, "main", apply=True)
     assert resumed["status"] == "completed"
     assert not any(directory.exists() for directory in owned_temp)
@@ -895,7 +1139,10 @@ def test_composed_promotion_and_shipping_each_run_their_validation_boundary(
     original_shipping = shipping["run_command_for_json"]
 
     def ship_json(command: list[str], **kwargs: Any) -> tuple[int, dict[str, Any]]:
-        if pathlib.Path(command[1]) in (OPERATION_RUNNER, SHIP_REPOSITORY.with_name("retire_shipped_work.py")):
+        if pathlib.Path(command[1]) in (
+            OPERATION_RUNNER,
+            SHIP_REPOSITORY.with_name("retire_shipped_work.py"),
+        ):
             return original_shipping(command, **kwargs)
         if "prepare" in command:
             return 0, {

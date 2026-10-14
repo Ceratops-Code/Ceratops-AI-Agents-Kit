@@ -27,10 +27,9 @@ credential-bound fixes precisely.
   readiness without running repository validators or tests. It checks the SDLC
   contract and required validation files; missing or invalid required files
   remain findings. External-only health runs no local commands.
-- When the local repository declares artifact identities in a supported
-  `sdlc/sdlc.yml`, the repo checker validates that contract and uses its
-  artifact identities automatically. Caller-supplied
-  `artifact_contracts` remain only for repositories without local declarations.
+- SDLC package artifact fields describe build outputs. Supply
+  `artifact_contracts` for external registry, version, changelog, and
+  release-policy checks when applicable.
 - Report each `content.sdlc_migration` finding as an advisory proposal naming
   the repository, current and recommended SDLC versions, and reason.
   Supported contracts remain usable; automatic migration is outside this action.
@@ -110,6 +109,11 @@ credential-bound fixes precisely.
 #### 4. Repair safe gaps
 
 - Apply low-risk reversible fixes directly.
+- In `RomanOstr/Codex-Desktop-App-Code`, inspect all open Dependabot alerts
+  and bot PRs. Prove upstream-only scope against the official package on
+  `original`; report those items, dismiss their alerts as `tolerable_risk`
+  with an upstream-ownership reason, and close their bot PRs. Keep local-tooling
+  and mixed-scope items in the normal dependency workflow.
 - Treat a successful mutation command as evidence for that exact setting or file
   change; rerun the checker only for uncertain state, asynchronous effects, or a
   broader clean-health claim.

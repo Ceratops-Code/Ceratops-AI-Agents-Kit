@@ -8,8 +8,6 @@ direct child runtime manifests and writes routing evidence to a caller-selected
 file without comparing installed files with source.
 """
 
-# This public executable has a required hyphenated filename.
-# ruff: noqa: N999
 from __future__ import annotations
 
 import argparse
@@ -674,6 +672,8 @@ def _promotion_bindings(
         args.finalize_promotion_with,
     )
     if not any(options):
+        if args.deployment_evidence:
+            raise InstallerError("deployment evidence requires promotion cleanup inputs")
         return None
     if not all(options):
         raise InstallerError(
@@ -746,6 +746,52 @@ def _promotion_bindings(
     return bindings
 
 
+def _additional_deployment_evidence(
+    args: argparse.Namespace, repo_root: pathlib.Path, commit: str | None,
+    promotion: list[dict[str, Any]] | None,
+) -> list[str]:
+    """Reject unavailable or unrelated caller receipts before any installation.
+
+    The repository finalizer owns complete producer-contract checks and record
+    deletion. This transport preflight only binds already-completed sibling
+    handoffs to the same immutable promotion; it never replays their effects.
+    Caller evidence remains caller-owned and is not rewritten or removed here.
+    """
+    paths: list[str] = []
+    seen = {binding["operation"] for binding in promotion or ()}
+    for supplied in args.deployment_evidence or ():
+        path = _plain_path(supplied)
+        if not path.is_file() or path.stat().st_nlink != 1:
+            raise InstallerError("deployment evidence must be an unlinked regular file")
+        record = json.loads(path.read_bytes(), object_pairs_hook=_unique_object)
+        if (
+            not isinstance(record, dict)
+            or record.get("schema") != "ceratops-deployment-completion.v1"
+            or record.get("status") != "completed"
+            or record.get("cleanup_debt") != []
+            or record.get("commit") != commit
+            or record.get("repo_root") != str(repo_root)
+            or not promotion
+        ):
+            raise InstallerError("deployment evidence must describe this completed source commit")
+        bindings = record.get("promotion")
+        bindings = bindings if isinstance(bindings, list) else [bindings]
+        for binding in bindings:
+            if (
+                not isinstance(binding, dict)
+                or any(binding.get(key) != promotion[0][key]
+                       for key in ("result_file", "sha256", "identity"))
+                or not isinstance(binding.get("operation"), str)
+                or binding["operation"] in seen
+            ):
+                raise InstallerError("deployment evidence must bind unique sibling promotion operations")
+            seen.add(binding["operation"])
+        if not bindings:
+            raise InstallerError("deployment evidence has no promotion operation")
+        paths.append(str(path))
+    return paths
+
+
 def _completion_receipt(result: runtime_builder.TransactionResult, repo_root: pathlib.Path,
                         install_root: pathlib.Path, commit: str | None,
                         promotion: list[dict[str, Any]] | None) -> dict[str, Any]:
@@ -788,6 +834,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--task-temp-root", type=pathlib.Path)
     parser.add_argument("--finalize-promotion-with", type=pathlib.Path,
                         help="Caller-selected promotion helper; invoked only for cleanup, never deployment.")
+    parser.add_argument("--deployment-evidence", type=pathlib.Path, action="append",
+                        help="Completed sibling handoff receipt forwarded to promotion cleanup; repeat as needed.")
     return parser
 
 
@@ -805,7 +853,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.remove_skill,
                 args.base_revision, args.previous_runtime_source_id,
                 args.promotion_result, args.operation,
-                args.task_temp_root, args.finalize_promotion_with,
+                args.task_temp_root, args.finalize_promotion_with, args.deployment_evidence,
             )
         ):
             raise SystemExit(
@@ -842,6 +890,7 @@ def main(argv: list[str] | None = None) -> int:
         os.chdir(repo_root)
         commit = _source_commit(repo_root)
         promotion = _promotion_bindings(args, repo_root, commit)
+        deployment_evidence = _additional_deployment_evidence(args, repo_root, commit, promotion)
         if args.base_revision is not None:
             affected = affected_from_base(repo_root, args.base_revision)
         elif args.skill is not None or args.remove_skill is not None:
@@ -894,7 +943,9 @@ def main(argv: list[str] | None = None) -> int:
                 [sys.executable, str(args.finalize_promotion_with), "--repo-root", str(repo_root),
                  "--finalize-result", "--result-file", first_binding["result_file"],
                  "--task-temp-root", str(args.task_temp_root), "--expected-commit", str(commit),
-                 "--deployment-evidence", "-"], input=json.dumps(receipt), cwd=repo_root,
+                 "--deployment-evidence", "-",
+                 *[argument for path in deployment_evidence
+                   for argument in ("--deployment-evidence", path)]], input=json.dumps(receipt), cwd=repo_root,
                 capture_output=True, text=True, check=False,
             )
             receipt["promotion_cleanup"] = {"status": "completed" if finalized.returncode == 0 else "failed",

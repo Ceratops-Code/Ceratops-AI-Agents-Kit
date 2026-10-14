@@ -38,7 +38,11 @@ installation; the manager never downloads its own Python or uv. Each installed
 version has a separate virtual environment for dependencies. Global Python
 must remain available and compatible while these environments are used.
 
-`pylock.toml` records exact dependency versions and artifact hashes. Wheels
+The source's single canonical `pylock.toml` or `uv.lock` records exact dependency
+versions and artifact hashes. Native uv locks are exported with `uv export
+--locked` only inside disposable packaging staging; packaging never refreshes
+them or writes a second source lock. A stale lock or changed source inputs stop
+registration. Wheels
 are installed offline with uv's hash enforcement, followed by dependency and
 package readiness checks. A manager update changes its wheel dependencies;
 global Python and uv remain independently maintained prerequisites.
@@ -199,7 +203,9 @@ directory; a Ceratops-AI-Agents-Kit checkout is not required:
 %USERPROFILE%\.codex\mcp\ceratops_mcp_server_manager\bin\ceratops_mcp_server_manager.cmd package --source <mcp-server-source>
 ```
 
-The first command writes a standard `pylock.toml` for review and commit. The
+The first command refreshes an existing native `uv.lock`, or writes a standard
+`pylock.toml` when no native lock is selected, for review and commit. Having both
+source lockfiles is rejected before packaging. The
 second builds the wheel, fetches compatible hash-locked PyPI dependency wheels,
 and gives each dependency artifact request a 300-second network timeout. It
 installs the exact wheel set in a disposable isolated environment, and requires

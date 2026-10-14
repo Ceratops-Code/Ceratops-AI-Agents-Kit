@@ -8,6 +8,8 @@ import pathlib
 import re
 import subprocess
 import sys
+import threading
+from collections.abc import Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -298,8 +300,12 @@ def run_command_for_json(
     Invalid output retains the complete captured result on the exception and
     the existing bounded public diagnostic in its structured payload.
     """
-    result = run_command(command, cwd=cwd)
-    raw = result.stdout.strip() or result.stderr.strip()
+    with track_command_completion():
+        result = run_progress_command(command, cwd=cwd)
+    error_result = "\n".join(
+        line for line in result.stderr.splitlines() if not line.startswith("[tests] ")
+    ).strip()
+    raw = result.stdout.strip() or error_result
     # Report-enabled helpers use JSON lines for observational phase messages.
     # Forward these events, then decode the terminal result; no filename decides
     # how a program is executed.
@@ -313,7 +319,7 @@ def run_command_for_json(
             break
         report_phase(str(event.get("phase", "")), enabled=True)
         lines.pop(0)
-    raw = "\n".join(lines).strip() or result.stderr.strip()
+    raw = "\n".join(lines).strip() or error_result
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -464,6 +470,11 @@ def successful_result_paths(value: Any) -> tuple[str, ...]:
             for key in ("path", "result_path", "receipt_path", "evidence_file"):
                 if isinstance(value.get(key), str):
                     paths.add(value[key])
+            # Reusable checks retain their original reference without adding a
+            # status to it; the completed operation supplies that status.
+            reference = value.get("check_result")
+            if isinstance(reference, dict) and isinstance(reference.get("path"), str):
+                paths.add(reference["path"])
         for key in ("successful_result_paths", "committedResultPaths"):
             paths.update(item for item in value.get(key, []) if isinstance(item, str))
         for item in value.values():
@@ -634,3 +645,53 @@ def require_success(args: list[str], *, cwd: pathlib.Path) -> None:
     """Require a successful native command while suppressing routine output."""
 
     require_output(args, cwd=cwd)
+
+
+def run_progress_command(
+    args: list[str],
+    *,
+    cwd: pathlib.Path,
+    env: Mapping[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Capture command results and immediately forward declared test-status lines.
+
+    stdout remains exclusively the child's result. stderr is drained concurrently
+    and retained in full for diagnostics; only the runner's ``[tests] `` lines
+    reach the live display. No status controls execution, acceptance or repetition.
+    """
+    stderr: list[str] = []
+    read_errors: list[OSError] = []
+    with subprocess.Popen(
+        args, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8", errors="replace",
+    ) as process:
+        assert process.stdout is not None and process.stderr is not None
+
+        def drain() -> None:
+            assert process.stderr is not None
+            try:
+                for line in process.stderr:
+                    stderr.append(line)
+                    if line.startswith("[tests] "):
+                        try:
+                            sys.stderr.write(line)
+                            sys.stderr.flush()
+                        except (OSError, ValueError):
+                            pass  # A closed observer must not block pipe drainage.
+            except OSError as exc:
+                read_errors.append(exc)
+
+        reader = threading.Thread(target=drain, daemon=True)
+        reader.start()
+        try:
+            stdout = process.stdout.read()
+            code = process.wait()
+        except BaseException:
+            process.kill()
+            process.wait()
+            raise
+        finally:
+            reader.join()
+        if read_errors:
+            raise read_errors[0]
+    return subprocess.CompletedProcess(args, code, stdout, "".join(stderr))

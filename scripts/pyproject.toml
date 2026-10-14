@@ -3,16 +3,16 @@ name = "ceratops-ai-agents-kit-tooling"
 version = "0.0.0"
 requires-python = ">=3.14,<3.15"
 dependencies = [
-  "filelock==4.0.8",
+  "filelock==4.0.12",
   "PyYAML==6.0.3",
   "jsonschema==4.26.0",
   "markdown-it-py==4.2.0",
-  "mcp==2.2.0",
-  "mypy==2.3.1",
+  "mcp==2.3.0",
+  "mypy==2.4.0",
   "packaging==26.3",
   "pytest==9.1.1",
-  "ruff==0.16.9",
-  "tzdata==2026.4",
+  "ruff==0.16.10",
+  "tzdata==2026.5",
   "yamllint==1.38.0"
 ]
 
@@ -26,7 +26,15 @@ members = []
 target-version = "py314"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "B"]
+select = [
+  "E", "F", "I", "B",
+  # Credentials, disabled HTTPS checks, and shell execution.
+  "S105", "S106", "S107", "S501", "S602", "S604", "S605",
+  # Blocking network, process, filesystem, input, and sleep calls in async code.
+  "ASYNC210", "ASYNC212", "ASYNC220", "ASYNC221", "ASYNC222",
+  "ASYNC230", "ASYNC240", "ASYNC250", "ASYNC251",
+  "DTZ003", "DTZ004", "DTZ005", "DTZ006", "UP", "RUF100",
+]
 ignore = ["E501"]
 
 [tool.mypy]

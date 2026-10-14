@@ -12,22 +12,26 @@ overwrites a valid failed or interrupted attempt. Pytest scratch is disposable.
 from __future__ import annotations
 
 import argparse
+import datetime
+import fnmatch
+import hashlib
+import importlib.metadata
 import json
 import os
 import pathlib
+import platform
+import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
+from collections.abc import Callable, Mapping
 from typing import Any
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 DEFAULT_TARGETS = __TEST_TARGETS__
-RESULT_SCHEMA = "ceratops-repository-check-result.v1"
-CONTRACT_SCHEMA = "ceratops-test-result-contract.v1"
-IDENTITY_FIELDS = ("result_id", "candidate_id", "check_id", "check_version")
-
-
 def without_basetemp(arguments: list[str]) -> list[str]:
     """Remove inherited locations before pytest validates every occurrence."""
     options = iter(arguments)
@@ -40,7 +44,18 @@ def without_basetemp(arguments: list[str]) -> list[str]:
     return retained
 
 
+# Repository check runner interface
+# This shared contract is also emitted as the standard runner's self-contained
+# writer. Repository-specific source/build record APIs above remain independent.
+CHECK_RESULT_SCHEMA = "ceratops-repository-check-result.v1"
+CONTRACT_SCHEMA = "ceratops-test-result-contract.v1"
+CHECK_CONTEXT_ENV = "CERATOPS_REPOSITORY_CHECK_CONTEXT"
+CHECK_CONTEXT_SCHEMA = "ceratops-repository-check-inputs.v1"
+IDENTITY_FIELDS = ("result_id", "candidate_id", "check_id", "check_version")
+
+
 def canonical(value: Any) -> bytes:
+    """Serialize finite, unambiguous JSON directly to the selected final file."""
     return (json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
 
 
@@ -58,7 +73,7 @@ def _nonfinite(value: str) -> Any:
 
 
 def result_path(value: pathlib.Path) -> pathlib.Path:
-    """Reject redirected output; the caller already owns this exact final path."""
+    """Reject redirected output; the operation owner selects this final path."""
     path = value.absolute()
     for part in (path, *path.parents):
         if part.is_symlink() or part.is_junction():
@@ -69,7 +84,7 @@ def result_path(value: pathlib.Path) -> pathlib.Path:
 
 
 def read_result(path: pathlib.Path) -> tuple[bool, Any]:
-    """Only unparsable/unaccepted bytes can be recreated; I/O errors propagate."""
+    """Only unparsable/unaccepted bytes can be repaired; I/O errors propagate."""
     try:
         raw = path.read_bytes()
     except FileNotFoundError:
@@ -83,7 +98,7 @@ def read_result(path: pathlib.Path) -> tuple[bool, Any]:
 
 
 def write_result(path: pathlib.Path, value: dict[str, Any], *, exclusive: bool) -> None:
-    """Flush and verify the final file; no rename, duplicate or write-side cache."""
+    """Flush the final file without creating a staging sibling or result copy."""
     raw = canonical(value)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("xb" if exclusive else "wb") as stream:
@@ -94,21 +109,311 @@ def write_result(path: pathlib.Path, value: dict[str, Any], *, exclusive: bool) 
         raise ValueError("result changed during writing")
 
 
-def prepare_result(path: pathlib.Path, expected: dict[str, Any], *, repair_unaccepted: bool) -> bool:
-    """Return True for exact acceptance; otherwise claim an unaccepted output."""
+def _execution_fields(value: Any, *, completed: bool) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "startedAt", "finishedAt", "durationSeconds", "workerPid",
+    }:
+        return False
+    if type(value["workerPid"]) is not int or value["workerPid"] <= 0:
+        return False
+    try:
+        start = datetime.datetime.fromisoformat(value["startedAt"])
+        if start.utcoffset() != datetime.timedelta(0):
+            return False
+        if completed:
+            finish = datetime.datetime.fromisoformat(value["finishedAt"])
+            return (finish.utcoffset() == datetime.timedelta(0) and finish >= start
+                    and type(value["durationSeconds"]) in (int, float)
+                    and value["durationSeconds"] >= 0)
+        return value["finishedAt"] is None and value["durationSeconds"] is None
+    except (TypeError, ValueError):
+        return False
+
+
+def prepare_result(
+    path: pathlib.Path, expected: dict[str, Any], *, repair_unaccepted: bool,
+    execution: dict[str, Any] | None = None,
+) -> bool:
+    """Reuse exact acceptance or claim a new attempt without replacing history."""
     exists, saved = read_result(path)
     if saved is not None:
-        passed = {**expected, "status": "passed", "exit_code": 0}
-        if (saved == passed and type(saved.get("exit_code")) is int
-                and path.read_bytes() == canonical(passed)):
+        allowed = set(expected) | {"status", "exit_code"}
+        if "inputs" in expected:
+            allowed.add("execution")
+        if isinstance(saved, dict) and "checks" in saved:
+            allowed.add("checks")
+        if (isinstance(saved, dict) and set(saved) == allowed
+                and all(saved.get(key) == value for key, value in expected.items())
+                and saved.get("status") == "passed"
+                and type(saved.get("exit_code")) is int and saved["exit_code"] == 0
+                and ("inputs" not in expected or _execution_fields(saved.get("execution"), completed=True))
+                and ("checks" not in saved or (isinstance(saved["checks"], list)
+                     and all(isinstance(item, dict) and item.get("status") not in {
+                         "failed", "blocked", "interrupted",
+                     } for item in saved["checks"])))
+                and path.read_bytes() == canonical(saved)):
             return True
         if isinstance(saved, dict) and all(saved.get(key) == value for key, value in expected.items()):
             raise ValueError("saved result is not acceptance; use a new result ID and path")
         raise ValueError("result identity or content conflicts with the request")
     if exists and not repair_unaccepted:
         raise ValueError("malformed result requires caller confirmation that it was never accepted: --repair-unaccepted-result")
-    write_result(path, {**expected, "status": "running", "exit_code": None}, exclusive=not exists)
+    running = {**expected, "status": "running", "exit_code": None}
+    if execution is not None:
+        running["execution"] = execution
+    write_result(path, running, exclusive=not exists)
     return False
+
+
+def add_result_arguments(parser: argparse.ArgumentParser) -> None:
+    """Expose completed 1e.3's caller-owned identity and final-path interface."""
+    parser.add_argument("--result-file", type=pathlib.Path, help="Operation-owned final JSON file.")
+    for field in IDENTITY_FIELDS:
+        parser.add_argument("--" + field.replace("_", "-"))
+    parser.add_argument("--describe-test-results", action="store_true", help="Print the supported result contract.")
+    parser.add_argument("--repair-unaccepted-result", action="store_true", help="Caller confirms a malformed owned result was never accepted.")
+    parser.add_argument("--probe-command", help="JSON argv for a controlled compatibility probe; uses the actual result writer.")
+
+
+def describe_result_contract() -> None:
+    print(json.dumps({"schema": CONTRACT_SCHEMA, "result_schema": CHECK_RESULT_SCHEMA}, sort_keys=True))
+
+
+def check_result_context(check_version: str) -> dict[str, Any] | None:
+    """Read authoritative scheduling inputs; absent historical scope stays absent."""
+    raw = os.environ.get(CHECK_CONTEXT_ENV)
+    if raw is None:
+        return None
+    context = json.loads(raw, object_pairs_hook=_object, parse_constant=_nonfinite)
+    fields = {
+        "schema", "group", "scope", "qualificationLevel", "workVersion", "checkVersion",
+        "productInputs", "checkInputs", "arguments", "dependencies", "environment", "fingerprint",
+    }
+    if (not isinstance(context, dict) or set(context) != fields
+            or context["schema"] != CHECK_CONTEXT_SCHEMA
+            or not isinstance(context["qualificationLevel"], str)
+            or context["qualificationLevel"] not in {"alpha", "beta", "rc", "final"}
+            or context["checkVersion"] != check_version
+            or not all(isinstance(context[key], str) and context[key].strip()
+                       for key in ("group", "workVersion", "checkVersion"))
+            or not isinstance(context["scope"], dict)
+            or not all(isinstance(context[key], dict)
+                       for key in ("productInputs", "checkInputs", "dependencies", "environment"))
+            or not isinstance(context["arguments"], list)
+            or not all(isinstance(item, str) for item in context["arguments"])
+            or not isinstance(context["fingerprint"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", context["fingerprint"]) is None):
+        raise ValueError("repository check context is incomplete or conflicts with the requested check version")
+    canonical(context)
+    return context
+
+
+def _check_file_digest(root: pathlib.Path, name: str) -> str | None:
+    path = root / name
+    if not path.resolve().is_relative_to(root):
+        raise ValueError("repository check input escapes the checkout")
+    if not path.exists():
+        return None
+    if path.is_symlink() or path.is_junction() or not path.is_file():
+        raise ValueError("repository check input must be a regular owned file")
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def _check_inventory(root: pathlib.Path, patterns: list[str], files: list[str]) -> dict[str, Any]:
+    def matches(name: str, pattern: str) -> bool:
+        return fnmatch.fnmatchcase(name, pattern) or (
+            pattern.startswith("**/") and fnmatch.fnmatchcase(name, pattern[3:]))
+    names = {name for name in files if any(matches(name, rule) for rule in patterns)}
+    names.update(rule for rule in patterns if not any(char in rule for char in "*?["))
+    return {name: _check_file_digest(root, name) for name in sorted(names)}
+
+
+def _check_environment_value(value: str | None, root: pathlib.Path) -> str | None:
+    """Keep owned checkout relocation out of declared environment identities."""
+    if value is None:
+        return None
+    resolved = str(root.resolve())
+    prefixes = sorted({resolved, resolved.replace("\\", "/"), resolved.replace("/", "\\")},
+                      key=len, reverse=True)
+    pattern = "(?:" + "|".join(re.escape(prefix) for prefix in prefixes) + r")(?=[\\/;:]|$)"
+    flags = re.IGNORECASE if os.name == "nt" else 0
+    return re.sub(pattern, lambda _match: "${REPO_ROOT}", value, flags=flags)
+
+
+def _check_environment_file(value: str | None, root: pathlib.Path) -> str | None:
+    """Bind the explicitly declared event-file pointer to its current bytes."""
+    if not value:
+        return None
+    path = pathlib.Path(value)
+    path = path if path.is_absolute() else root / path
+    if not path.exists():
+        return None
+    path = path.resolve(strict=True)
+    if not path.is_file():
+        raise ValueError("declared environment file must be a regular file")
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def check_current_inputs(context: Mapping[str, Any], root: pathlib.Path) -> None:
+    """Reject edits, new/deleted owned files and execution-scope drift.
+
+    These are integrity/input comparisons, never a second execution of accepted
+    checks. Both boundaries use the existing operation declaration, not another
+    dependency graph. A check that changes its own declared inputs cannot pass.
+    """
+    rules = context["scope"].get("inputRules")
+    if (not isinstance(rules, dict)
+            or not all(isinstance(rules.get(key), list) and rules[key]
+                       and all(isinstance(item, str) and item for item in rules[key])
+                       for key in ("product-inputs", "check-inputs"))):
+        raise ValueError("repository check input ownership is incomplete")
+    result = subprocess.run(
+        ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+        cwd=root, capture_output=True, text=True, check=False,
+    )
+    if result.returncode:
+        raise ValueError("cannot inspect repository check input inventory")
+    files = sorted(set(result.stdout.split("\0")) - {""})
+    for field, key in (("productInputs", "product-inputs"), ("checkInputs", "check-inputs")):
+        if _check_inventory(root, rules[key], files) != context[field]:
+            raise ValueError("repository check " + field + " changed before completion")
+    dependencies = {name: _check_file_digest(root, name) for name in rules.get("dependencies", [])}
+    if dependencies != context["dependencies"] or any(value is None for value in dependencies.values()):
+        raise ValueError("repository check dependencies changed before completion")
+    recorded = context["environment"]
+    variables = {
+        name: hashlib.sha256(canonical(_check_environment_value(os.environ.get(name), root))).hexdigest()
+        for name in rules.get("environment", [])
+    }
+    if (recorded.get("variables") != variables or recorded.get("platform") != platform.system()
+            or recorded.get("architecture") != platform.machine()):
+        raise ValueError("repository check environment changed before completion")
+    if "files" in recorded:
+        environment_files = {
+            name: _check_environment_file(os.environ.get(name), root)
+            for name in rules.get("environment", []) if name == "GITHUB_EVENT_PATH"
+        }
+        if environment_files != recorded["files"]:
+            raise ValueError("repository check environment file changed before completion")
+    tools: dict[str, dict[str, str | None]] = {}
+    for name in rules.get("tools", []):
+        expanded = re.sub(r"\$\{([^}]+)\}", lambda match: os.environ.get(match[1], ""), name)
+        path: pathlib.Path | None
+        if "/" in expanded or "\\" in expanded:
+            path = pathlib.Path(expanded)
+            path = path if path.is_absolute() else root / path
+        else:
+            found = shutil.which(expanded)
+            path = pathlib.Path(found) if found else None
+        if path is not None and not path.exists():
+            path = None
+        if path is not None:
+            path = path.resolve(strict=True)
+        if path is not None and (path.is_symlink() or path.is_junction() or not path.is_file()):
+            raise ValueError("repository check tool must be a regular file")
+        tools[name] = {"sha256": hashlib.sha256(path.read_bytes()).hexdigest() if path is not None else None}
+    if recorded.get("tools") != tools:
+        raise ValueError("repository check tools changed before completion")
+    if recorded.get("runtime"):
+        runtime = {
+            "python": platform.python_version(), "implementation": platform.python_implementation(),
+            "packages": sorted(
+                [dist.metadata["Name"].lower(), dist.version]
+                for dist in importlib.metadata.distributions()
+            ),
+        }
+        if runtime != recorded["runtime"]:
+            raise ValueError("repository check locked runtime differs from the selected runtime")
+
+
+def run_recorded_check(
+    callback: Callable[[], int], args: argparse.Namespace, invocation: Mapping[str, Any],
+    *, checks: Callable[[], Any] | None = None, repo_root: pathlib.Path | None = None,
+) -> int:
+    """Write actual runner outcomes before success and preserve original attempts.
+
+    The shared operation owner allocates identity, inputs, path and retention;
+    this producer never invents acceptance from Git metadata or another runner.
+    Without result arguments the existing disposable invocation is preserved.
+    """
+    supplied = [getattr(args, "result_file", None) is not None,
+                *(getattr(args, field, None) is not None for field in IDENTITY_FIELDS)]
+    if not any(supplied):
+        if getattr(args, "repair_unaccepted_result", False) or getattr(args, "probe_command", None):
+            print("repair-unaccepted-result and probe-command require result arguments", file=sys.stderr)
+            return 2
+        return callback()
+    path: pathlib.Path | None = None
+    try:
+        if not all(supplied):
+            raise ValueError("result-file, result-id, candidate-id, check-id and check-version must be supplied together")
+        if any(not getattr(args, field).strip() for field in IDENTITY_FIELDS):
+            raise ValueError("result identities must not be empty")
+        context = check_result_context(args.check_version)
+        expected = {
+            "schema": CHECK_RESULT_SCHEMA,
+            **{field: getattr(args, field) for field in IDENTITY_FIELDS},
+            "invocation": dict(invocation),
+        }
+        started = datetime.datetime.now(datetime.UTC)
+        monotonic_start = time.monotonic()
+        execution = {
+            "startedAt": started.isoformat(), "finishedAt": None,
+            "durationSeconds": None, "workerPid": os.getpid(),
+        } if context is not None else None
+        if context is not None:
+            expected["inputs"] = context
+        root = (repo_root or pathlib.Path.cwd()).resolve()
+        if context is not None:
+            check_current_inputs(context, root)
+        path = result_path(args.result_file)
+        prepare: dict[str, Any] = {"repair_unaccepted": getattr(args, "repair_unaccepted_result", False)}
+        if execution is not None:
+            prepare["execution"] = execution
+        if prepare_result(path, expected, **prepare):
+            print("OK")
+            return 0
+        running = {**expected, "status": "running", "exit_code": None}
+        if execution is not None:
+            running["execution"] = execution
+        failure: BaseException | None = None
+        try:
+            if context is not None:
+                check_current_inputs(context, root)
+            code = callback()
+            if context is not None:
+                check_current_inputs(context, root)
+            if type(code) is not int:
+                raise ValueError("check callback must return an integer exit code")
+            code = code if code >= 0 else 1
+            status = "passed" if code == 0 else "failed"
+        except KeyboardInterrupt:
+            code, status = 130, "interrupted"
+        except SystemExit as exc:
+            code = exc.code if type(exc.code) is int else (0 if exc.code is None else 1)
+            code = code if code >= 0 else 1
+            status = "passed" if code == 0 else "failed"
+        except BaseException as exc:
+            code, status, failure = 1, "failed", exc
+        completed = {**expected, "status": status, "exit_code": code}
+        if execution is not None:
+            completed["execution"] = {
+                **execution, "finishedAt": datetime.datetime.now(datetime.UTC).isoformat(),
+                "durationSeconds": max(0.0, time.monotonic() - monotonic_start),
+            }
+        if checks is not None:
+            completed["checks"] = checks()
+        if read_result(path)[1] != running:
+            raise ValueError("running result changed; refusing to overwrite it")
+        write_result(path, completed, exclusive=False)
+        if failure is not None:
+            raise failure
+        return code
+    except (OSError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
 
 
 def execute_check(args: argparse.Namespace, targets: list[str], inherited: list[str]) -> int:
@@ -121,6 +426,7 @@ def execute_check(args: argparse.Namespace, targets: list[str], inherited: list[
     with tempfile.TemporaryDirectory(prefix="repository-tests-") as directory:
         temporary = pathlib.Path(directory)
         environment = os.environ.copy()
+        environment.pop(CHECK_CONTEXT_ENV, None)
         environment["PYTHONPYCACHEPREFIX"] = str(temporary / "python-cache")
         environment["PYTEST_ADDOPTS"] = shlex.join(inherited)
         command = args.probe_command or [
@@ -136,29 +442,13 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("targets", nargs="*", help="Repository-relative test files or directories.")
     parser.add_argument("--pytest-arg", action="append", default=[], help="Repeat using --pytest-arg=VALUE.")
-    parser.add_argument("--result-file", type=pathlib.Path, help="Caller-owned final JSON file.")
-    for field in IDENTITY_FIELDS:
-        parser.add_argument("--" + field.replace("_", "-"))
-    parser.add_argument("--describe-test-results", action="store_true", help="Print the supported result contract.")
-    parser.add_argument("--repair-unaccepted-result", action="store_true", help="Caller confirms a malformed owned result was never accepted.")
-    parser.add_argument("--probe-command", help="JSON argv for a controlled compatibility probe; uses the real result writer.")
+    add_result_arguments(parser)
     args = parser.parse_args(argv)
     if args.describe_test_results:
-        print(json.dumps({"schema": CONTRACT_SCHEMA, "result_schema": RESULT_SCHEMA}, sort_keys=True))
+        describe_result_contract()
         return 0
-    supplied = [args.result_file is not None, *(getattr(args, field) is not None for field in IDENTITY_FIELDS)]
-    if any(supplied) and not all(supplied):
-        parser.error("result-file, result-id, candidate-id, check-id and check-version must be supplied together")
-    if args.repair_unaccepted_result and not all(supplied):
-        parser.error("repair-unaccepted-result requires result arguments")
-    if all(supplied) and any(not getattr(args, field).strip() for field in IDENTITY_FIELDS):
-        parser.error("result identities must not be empty")
-    path = None
-    expected: dict[str, Any] = {}
     try:
         if args.probe_command is not None:
-            if not all(supplied):
-                raise ValueError("probe-command requires result arguments")
             args.probe_command = json.loads(args.probe_command)
             if (not isinstance(args.probe_command, list) or not args.probe_command
                     or any(not isinstance(item, str) or "\0" in item for item in args.probe_command)
@@ -166,36 +456,13 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("probe-command must be a nonempty JSON argv")
         inherited = without_basetemp(shlex.split(os.environ.get("PYTEST_ADDOPTS", "")))
         targets = args.targets or DEFAULT_TARGETS
-        expected = {
-            "schema": RESULT_SCHEMA,
-            **{field: getattr(args, field) for field in IDENTITY_FIELDS},
-            "invocation": {
-                "targets": [] if args.probe_command else targets,
-                "pytest_args": [] if args.probe_command else without_basetemp(args.pytest_arg),
-                "pytest_addopts": [] if args.probe_command else inherited,
-                "probe_command": args.probe_command,
-            },
+        invocation = {
+            "targets": [] if args.probe_command else targets,
+            "pytest_args": [] if args.probe_command else without_basetemp(args.pytest_arg),
+            "pytest_addopts": [] if args.probe_command else inherited,
+            "probe_command": args.probe_command,
         }
-        if args.result_file is not None:
-            path = result_path(args.result_file)
-            if prepare_result(path, expected, repair_unaccepted=args.repair_unaccepted_result):
-                print("OK")
-                return 0
-        status = "failed"
-        try:
-            code = execute_check(args, targets, inherited)
-            status = "passed" if code == 0 else "failed"
-        except KeyboardInterrupt:
-            code, status = 130, "interrupted"
-        except (OSError, ValueError) as exc:
-            print(str(exc), file=sys.stderr)
-            code = 1
-        if path is not None:
-            running = {**expected, "status": "running", "exit_code": None}
-            if read_result(path)[1] != running:
-                raise ValueError("running result changed; refusing to overwrite it")
-            write_result(path, {**expected, "status": status, "exit_code": code}, exclusive=False)
-        return code
+        return run_recorded_check(lambda: execute_check(args, targets, inherited), args, invocation, repo_root=ROOT)
     except (OSError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 2

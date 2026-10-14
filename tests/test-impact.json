@@ -134,7 +134,7 @@
         "tools/source_search_mcp.py",
         "tools/pyproject.toml",
         "tools/mcp-server.json",
-        "tools/pylock.toml"
+        "tools/uv.lock"
       ],
       "suites": [
         "test-infrastructure"
@@ -151,10 +151,13 @@
     "scripts/.yamllint.yml",
     "scripts/package-lock.json",
     "scripts/package.json",
+    "scripts/result_records.py",
     "scripts/testing/run-tests.py",
     "scripts/testing/runner_requests.py",
     "scripts/testing/pytest-diagnostics.py",
     "scripts/testing/pytest-environment.py",
+    "scripts/testing/report_test_progress.py",
+    "scripts/testing/reuse_test_results.py",
     "scripts/run-actionlint.py",
     "scripts/validate-repository.py",
     "skills/ceratops-automation-run/**",

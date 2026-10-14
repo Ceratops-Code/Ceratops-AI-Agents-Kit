@@ -206,6 +206,61 @@ def _setup(
     return repo, loaded, args, log, state, commands
 
 
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        [],
+        ["--title", "Complete Dev Tools catalog"],
+        ["--body", "Collection policy.\n\nDeploy configuration.\n"],
+        ["--title", "Caller title", "--body", "Exact description"],
+        ["--body", ""],
+    ],
+)
+def test_repository_ship_metadata_reaches_shared_pr_producer(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    metadata: list[str],
+) -> None:
+    repo, loaded, _, _, _, _ = _setup(tmp_path, contract=False)
+    ship = load_pr_workflow_module(monkeypatch, "ship")
+    args = loaded["build_parser"]().parse_args(
+        ["--repo-root", str(repo), "--head-branch", "release/local", *metadata]
+    )
+    events: list[str] = []
+    monkeypatch.setattr(ship.merge, "restore_unfinished_checkpoints", lambda root: None)
+    monkeypatch.setattr(ship, "_repository_name", lambda *args: "example/repository")
+    monkeypatch.setattr(ship, "_resolve_commit", lambda *args: "a" * 40)
+    monkeypatch.setattr(ship, "load_pending_work_scope", lambda *args: (None, None))
+    monkeypatch.setattr(
+        ship,
+        "_load_or_create_checkpoint",
+        lambda *args: (tmp_path / "checkpoint.json", {"phase": "prepared"}),
+    )
+    monkeypatch.setattr(
+        ship,
+        "_enforce_actions_availability",
+        lambda *args: events.append("availability"),
+    )
+
+    class ProducerReached(Exception):
+        pass
+
+    def ensure(arguments: argparse.Namespace) -> None:
+        assert events == ["availability"]
+        assert arguments.title == args.title
+        assert arguments.body == args.body
+        assert arguments.head_branch == "release/local"
+        assert arguments.base_branch == "main"
+        assert arguments.remote_name == "origin"
+        events.append("producer")
+        raise ProducerReached
+
+    monkeypatch.setattr(ship.ensure_pr, "ensure_pr", ensure)
+    with pytest.raises(ProducerReached):
+        loaded["_call_github_ship"](args, repo, None, "a" * 40)
+    assert events == ["availability", "producer"]
+
+
 def test_repository_ship_rejects_release_namespace_conflict(
     tmp_path: pathlib.Path,
 ) -> None:
@@ -339,7 +394,7 @@ def test_repository_ship_checkpoints_each_operation_before_the_next(
     original = loaded["execute_prepared_operation"]
     count = 0
 
-    def execute(prepared: Any) -> dict[str, Any]:
+    def execute(prepared: Any, **kwargs: Any) -> dict[str, Any]:
         nonlocal count
         if prepared.category == category:
             count += 1
@@ -355,7 +410,7 @@ def test_repository_ship_checkpoints_each_operation_before_the_next(
                 assert selected[0]["position"] == 1
                 assert selected[0]["result"].get("step_results", []) == expected_results
                 raise RuntimeError("interrupted between operations")
-        return original(prepared)
+        return original(prepared, **kwargs)
 
     loaded["_checkpointed_operation_batch"].__globals__[
         "execute_prepared_operation"

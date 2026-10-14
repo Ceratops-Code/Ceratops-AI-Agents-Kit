@@ -1,7 +1,7 @@
 {
   "source_docs_version": 1,
   "name": "ceratops_github_contract_source_docs",
-  "captured_on": "2026-09-21",
+  "captured_on": "2026-10-11",
   "policy": {
     "use_order": [
       "official_docs",
@@ -714,11 +714,46 @@
       "url": "https://pkg.go.dev/cmd/go#hdr-Test_packages"
     },
     {
+      "id": "validation.go.vet",
+      "scope": [
+        "repository_validation"
+      ],
+      "url": "https://pkg.go.dev/cmd/vet"
+    },
+    {
+      "id": "validation.cargo.fmt",
+      "scope": [
+        "repository_validation"
+      ],
+      "url": "https://doc.rust-lang.org/cargo/commands/cargo-fmt.html"
+    },
+    {
+      "id": "validation.cargo.clippy",
+      "scope": [
+        "repository_validation"
+      ],
+      "url": "https://doc.rust-lang.org/clippy/usage.html"
+    },
+    {
       "id": "validation.cargo.test",
       "scope": [
         "repository_validation"
       ],
       "url": "https://doc.rust-lang.org/cargo/commands/cargo-test.html"
+    },
+    {
+      "id": "validation.dotnet.format",
+      "scope": [
+        "repository_validation"
+      ],
+      "url": "https://learn.microsoft.com/en-us/dotnet/core/tools/dotnet-format"
+    },
+    {
+      "id": "validation.shellcheck",
+      "scope": [
+        "repository_validation"
+      ],
+      "url": "https://www.shellcheck.net/"
     },
     {
       "id": "validation.discovery.megalinter",

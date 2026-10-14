@@ -29,11 +29,19 @@ Sol analysis children.
   retains one batch containing each thread's completed-run suffix in
   `(as_of - DAYS, as_of]`, usage, ledger, and redacted semantics. It records
   self-exclusion, empty windows, non-suffix windows, and source failures
-  explicitly. Use its retained semantics for Ledger Review step 2. For step 4,
-  write `ceratops-credit-quick-classifications.v1` with a `threads` list
-  containing each ready `thread_id` and its collector-shaped `classification`,
-  then run `python scripts/credit-analysis-workflow.py quick-validate --batch
-  BATCH --classifications CLASSIFICATIONS --output RESULT`. The helper rechecks
+  explicitly. For Ledger Review step 2, run `python
+  scripts/credit-analysis-workflow.py inspect-quick-calls --batch BATCH
+  --thread THREAD_ID --turn TURN_ID --first-call FIRST --call-count COUNT`.
+  Take thread and turn IDs from the batch, FIRST from the next unread call
+  index, and COUNT from 1–50. Follow `next_call` when more evidence is needed.
+  For step 4, supply explicit judgments in caller-owned DECISIONS using
+  `ceratops-credit-quick-decisions.v1`: each thread has `thread_id` and
+  collector-shaped `runs`. Run `python scripts/credit-analysis-workflow.py
+  build-quick-classifications --batch BATCH --decisions DECISIONS --output
+  CLASSIFICATIONS`, then `python scripts/credit-analysis-workflow.py
+  quick-validate --batch BATCH --classifications CLASSIFICATIONS --output
+  RESULT`. Keep these caller-selected paths inside the task temp
+  root. The helper rechecks
   each source and exact window, validates every call once, and totals only
   accepted classifications. Missing, invalid, or changed sources remain
   unassessed. Retain the batch and result as caller-owned evidence; these

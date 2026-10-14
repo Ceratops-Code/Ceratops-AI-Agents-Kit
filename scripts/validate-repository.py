@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
 import platform
+import runpy
 import subprocess
 import sys
 import tomllib
@@ -22,6 +24,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 COMMAND_NOT_FOUND_EXIT_CODE = 127
+_result_writer = runpy.run_path(str(pathlib.Path(__file__).resolve().parent / "result_records.py"))
 
 
 @dataclass(frozen=True)
@@ -80,6 +83,9 @@ def run_process(
 ) -> subprocess.CompletedProcess[str]:
     """Run one child without a shell and capture all diagnostic output."""
 
+    environment = dict(os.environ)
+    # This runner alone owns its assigned outcome, including for nested tools.
+    environment.pop("CERATOPS_REPOSITORY_CHECK_CONTEXT", None)
     return subprocess.run(
         list(command),
         cwd=cwd,
@@ -87,6 +93,7 @@ def run_process(
         text=True,
         encoding="utf-8",
         errors="replace",
+        env=environment,
         check=False,
     )
 
@@ -199,6 +206,7 @@ def run_checks(
     evidence_file: pathlib.Path,
     *,
     process_runner: ProcessRunner = run_process,
+    outcomes: list[dict[str, object]] | None = None,
 ) -> Failure | None:
     """Run checks in order and return immediately after the first failure."""
 
@@ -212,6 +220,13 @@ def run_checks(
                 "",
                 f"{type(exc).__name__}: {exc}",
             )
+        if outcomes is not None:
+            outcomes.append({
+                "id": check.name,
+                "platform": check.platform,
+                "status": "passed" if result.returncode == 0 else "failed",
+                "exit_code": result.returncode,
+            })
         if result.returncode == 0:
             continue
 
@@ -267,36 +282,13 @@ def cleanup_evidence(
             raise
 
 
-def main(
-    argv: Sequence[str] | None = None,
+def execute_checks(
+    arguments: Sequence[str], parsed: argparse.Namespace, evidence_file: pathlib.Path,
+    repo_root: pathlib.Path, outcomes: list[dict[str, object]],
     *,
     process_runner: ProcessRunner = run_process,
 ) -> int:
-    """Resolve caller paths, execute validation, and emit one bounded result."""
-
-    arguments = list(sys.argv[1:] if argv is None else argv)
-    repo_root = pathlib.Path(__file__).resolve().parents[1]
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--evidence-file", type=pathlib.Path)
-    parsed, unexpected = parser.parse_known_args(arguments)
-    evidence_file = (
-        parsed.evidence_file.expanduser().resolve()
-        if parsed.evidence_file
-        else repo_root
-        / ".build"
-        / "deploy-validation"
-        / "repository-validation.log"
-    )
-    if unexpected:
-        payload: dict[str, object] = {
-            "check": "configuration",
-            "exit_code": 2,
-            "evidence_file": str(evidence_file),
-        }
-        payload["unexpected_arguments"] = unexpected
-        print(json.dumps(payload, separators=(",", ":"), ensure_ascii=True))
-        return 2
-
+    """Execute the ordered catalog while preserving its compact failure contract."""
     failure: Failure | None
     try:
         require_repository_python(repo_root)
@@ -320,11 +312,14 @@ def main(
             evidence_error=evidence_error,
             details={"reason": reason},
         )
+        outcomes.append({"id": check.name, "status": "failed", "exit_code": 2})
     else:
+        outcomes.append({"id": "python-requirement", "status": "passed", "exit_code": 0})
         failure = run_checks(
             build_checks(repo_root),
             evidence_file,
             process_runner=process_runner,
+            outcomes=outcomes,
         )
     if failure is None:
         try:
@@ -333,6 +328,7 @@ def main(
                 prune_default_parent=parsed.evidence_file is None,
             )
         except OSError as exc:
+            outcomes.append({"id": "evidence-cleanup", "status": "failed", "exit_code": 1})
             print(
                 json.dumps(
                     {
@@ -355,6 +351,62 @@ def main(
         )
     )
     return failure.exit_code if failure.exit_code > 0 else 1
+
+
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    process_runner: ProcessRunner = run_process,
+) -> int:
+    """Keep ordinary checks disposable and publish assigned actual outcomes."""
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    repo_root = pathlib.Path(__file__).resolve().parents[1]
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--evidence-file", type=pathlib.Path)
+    _result_writer["add_result_arguments"](parser)
+    parsed, unexpected = parser.parse_known_args(arguments)
+    evidence_file = (
+        parsed.evidence_file.expanduser().resolve()
+        if parsed.evidence_file
+        else repo_root / ".build" / "deploy-validation" / "repository-validation.log"
+    )
+    if unexpected:
+        payload: dict[str, object] = {
+            "check": "configuration", "exit_code": 2,
+            "evidence_file": str(evidence_file), "unexpected_arguments": unexpected,
+        }
+        print(json.dumps(payload, separators=(",", ":"), ensure_ascii=True))
+        return 2
+    if parsed.describe_test_results:
+        _result_writer["describe_result_contract"]()
+        return 0
+    if parsed.probe_command is not None:
+        try:
+            parsed.probe_command = json.loads(parsed.probe_command)
+            if (not isinstance(parsed.probe_command, list) or not parsed.probe_command
+                    or any(not isinstance(item, str) or "\0" in item for item in parsed.probe_command)
+                    or not parsed.probe_command[0]):
+                raise ValueError("probe-command must be a nonempty JSON argv")
+        except ValueError as exc:
+            print(json.dumps({"check": "configuration", "exit_code": 2, "reason": str(exc)}, separators=(",", ":")))
+            return 2
+    outcomes: list[dict[str, object]] = []
+
+    def execute() -> int:
+        if parsed.probe_command is not None:
+            result = process_runner(tuple(parsed.probe_command), repo_root)
+            outcomes.append({"id": "probe", "status": "passed" if result.returncode == 0 else "failed", "exit_code": result.returncode})
+            return result.returncode if result.returncode >= 0 else 1
+        return execute_checks(arguments, parsed, evidence_file, repo_root, outcomes, process_runner=process_runner)
+
+    invocation = {
+        "checks": [] if parsed.probe_command else [
+            {"id": check.name, "platform": check.platform, "command": list(check.command)}
+            for check in build_checks(repo_root)
+        ],
+        "probe_command": parsed.probe_command,
+    }
+    return _result_writer["run_recorded_check"](execute, parsed, invocation, checks=lambda: outcomes, repo_root=repo_root)
 
 
 if __name__ == "__main__":

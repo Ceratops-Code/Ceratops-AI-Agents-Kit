@@ -813,8 +813,9 @@ def test_quick_batch_collects_and_validates_without_model_processes(tmp_path, mo
     selection, sessions = _quick_batch_case(tmp_path, monkeypatch)
     original = [session.read_bytes() for session in sessions]
     load_credit_analysis_workflow_module()
-    from credit_analysis import command_line_interface as cli
     import subprocess
+
+    from credit_analysis import command_line_interface as cli
 
     def no_process(*args, **kwargs):
         pytest.fail("quick batch must not launch model or helper processes")
@@ -992,3 +993,296 @@ def test_quick_window_cli_preserves_suffix_and_input_validation(tmp_path):
     write_json_file(usage, value)
     result = run_credit_analysis_workflow("quick-window", "--days", "3", "--as-of", "2026-08-02T00:00:00Z", "--usage-evidence", str(usage))
     assert result.returncode == 2 and "completed-run suffix" in result.stderr
+
+
+def _quick_command_case(tmp_path, monkeypatch):
+    import subprocess
+
+    load_credit_analysis_workflow_module()
+    from credit_analysis import command_line_interface as cli
+
+    def no_process(*args, **kwargs):
+        pytest.fail("quick commands must not launch model or helper processes")
+
+    selection, _ = _quick_batch_case(tmp_path, monkeypatch)
+    monkeypatch.setattr(subprocess, "Popen", no_process)
+    path = tmp_path / "batch.json"
+    cli.command_quick_collect(selection, path)
+    batch = json.loads(path.read_text())
+    decisions = {"schema": "ceratops-credit-quick-decisions.v1", "threads": [
+        {"thread_id": item["thread_id"], "runs": item["classification"]["runs"]}
+        for item in _quick_classifications(batch)["threads"]
+    ]}
+    decision_path = tmp_path / "decisions.json"
+    write_json_file(decision_path, decisions)
+    return cli, path, batch, decision_path, decisions
+
+
+def test_quick_call_views_page_retained_evidence_with_bounded_stdout(tmp_path, monkeypatch, capsys):
+    cli, path, batch, _, _ = _quick_command_case(tmp_path, monkeypatch)
+    item = batch["threads"][0]
+    run = item["semantic"]["selected_runs"][0]
+    run["user_messages"] = [{"message_id": "prompt-1", "text": "界" * 1_000}]
+    for call in run["calls"]:
+        call["user_message_ids"] = ["prompt-1"]
+        call["semantic_actions"] = [{"kind": "message", "name": "assistant", "summary": "界" * 1_000}] * 12
+    write_json_file(path, batch)
+    monkeypatch.setattr(cli, "_quick_snapshot", lambda *_: pytest.fail("reader reopened live evidence"))
+    args = ["inspect-quick-calls", "--batch", str(path), "--thread", item["thread_id"],
+            "--turn", run["turn_id"], "--call-count", "2", "--text-limit", "64", "--max-bytes", "4000"]
+    before = {p: p.read_bytes() for p in tmp_path.iterdir() if p.is_file()}
+    for _ in range(2):
+        assert cli.main(args) == 0
+        stdout = capsys.readouterr().out
+        assert len(stdout.encode()) <= 4_000
+        result = json.loads(stdout)
+        assert result["calls"][0]["index"] == 1
+        assert result["next_call"] == len(result["calls"]) + 1
+        assert result["calls"][0]["omitted_actions"] == 2
+        assert len(result["user_messages"][0]["text"].encode()) <= 64
+        assert result["user_messages"][0]["text"].endswith("...")
+        assert result["calls"][0]["tokens"] == item["ledger"]["runs"][0]["calls"][0]["tokens"]
+    final = cli.command_inspect_quick_calls(path, item["thread_id"], run["turn_id"], first_call=3)
+    assert [call["index"] for call in final["calls"]] == [3] and final["next_call"] is None
+    assert {p: p.read_bytes() for p in before} == before
+
+
+@pytest.mark.parametrize("case", ["thread", "turn", "range", "count", "text", "bytes", "budget", "gap", "broken"])
+def test_quick_call_views_keep_bad_ranges_and_gaps_explicit(tmp_path, monkeypatch, capsys, case):
+    cli, path, batch, _, _ = _quick_command_case(tmp_path, monkeypatch)
+    item = batch["threads"][0]
+    thread, turn, extra = item["thread_id"], "turn-1", []
+    if case == "thread":
+        thread = "00000000-0000-4000-8000-000000000999"
+    elif case == "turn":
+        turn = "unknown"
+    elif case in {"range", "count", "text", "bytes"}:
+        extra = {"range": ["--first-call", "99"], "count": ["--call-count", "51"],
+                 "text": ["--text-limit", "1"], "bytes": ["--max-bytes", "999"]}[case]
+    elif case == "budget":
+        item["semantic"]["selected_runs"][0]["calls"][0]["semantic_actions"] = [
+            {"kind": "message", "summary": "x" * 2_000}
+        ] * 10
+        extra = ["--max-bytes", "1000"]
+    elif case == "gap":
+        item.update(status="unassessed", error="source unavailable")
+    else:
+        del item["semantic"]
+    write_json_file(path, batch)
+    code = cli.main(["inspect-quick-calls", "--batch", str(path), "--thread", thread, "--turn", turn, *extra])
+    output = capsys.readouterr()
+    if case == "gap":
+        assert code == 0 and json.loads(output.out) == {
+            "thread_id": thread, "status": "unassessed", "error": "source unavailable",
+        }
+    else:
+        assert code == 2 and not output.out and output.err.startswith("error:")
+
+
+def test_quick_assembly_and_totals_keep_model_judgments_and_unique_call_owners(tmp_path, monkeypatch):
+    cli, path, batch, decisions, _ = _quick_command_case(tmp_path, monkeypatch)
+    classifications, result_path = tmp_path / "classifications.json", tmp_path / "result.json"
+    receipt = cli.command_build_quick_classifications(path, decisions, classifications)
+    assert receipt["threads"] == 2 and receipt["unclassified_threads"] == 0
+    assert json.loads(classifications.read_text()) == _quick_classifications(batch)
+    receipt = cli.command_quick_validate(path, classifications, result_path)
+    assert receipt["totals"]["model_calls"] == 12
+    result = json.loads(result_path.read_text())
+    categories = {item["category"]: item for item in result["categories"]}
+    assert categories["necessary"]["model_calls"] == 8
+    for category in ("avoidable_implemented", "avoidable_unimplemented"):
+        assert categories[category]["model_calls"] == 2
+        assert categories[category]["total_tokens"] == 24
+    controls = {item["control"]: item for item in result["controls"]}
+    assert set(controls) == {"reuse the read", "batch validation"}
+    for control in controls.values():
+        assert control["model_calls"] == 2 and control["input_tokens"] == 20
+        assert control["cached_input_tokens"] == 4 and control["total_tokens"] == 24
+        assert len({tuple(call.values()) for call in control["calls"]}) == 2
+    assert sum(item["total_tokens"] for item in categories.values()) == result["totals"]["total_tokens"]
+    for operation in (
+        lambda: cli.command_build_quick_classifications(path, decisions, classifications),
+        lambda: cli.command_quick_validate(path, classifications, result_path),
+    ):
+        before = {p: p.read_bytes() for p in (classifications, result_path)}
+        with pytest.raises(cli.CreditAnalysisError, match="refusing to overwrite"):
+            operation()
+        assert {p: p.read_bytes() for p in before} == before
+
+
+@pytest.mark.parametrize("case", ["missing-thread", "missing-call", "overlap", "category", "control", "changed", "missing-source"])
+def test_quick_assembly_never_fills_missing_judgments_or_counts_rejected_calls(tmp_path, monkeypatch, case):
+    cli, path, batch, decision_path, decisions = _quick_command_case(tmp_path, monkeypatch)
+    first = decisions["threads"][0]
+    groups = first["runs"][0]["groups"]
+    if case == "missing-thread":
+        decisions["threads"].pop(0)
+    elif case == "missing-call":
+        groups.pop(0)
+    elif case == "overlap":
+        groups[1]["indices"].append(1)
+    elif case == "category":
+        groups[0]["category"] = "guess"
+    elif case == "control":
+        del groups[1]["control"]
+    elif case == "changed":
+        session = pathlib.Path(batch["threads"][0]["ledger"]["session"])
+        rows = [json.loads(line) for line in session.read_text().splitlines()]
+        token = next(row for row in rows if row.get("payload", {}).get("type") == "token_count")
+        token["payload"]["info"]["last_token_usage"]["input_tokens"] += 1
+        session.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+    else:
+        pathlib.Path(batch["threads"][0]["ledger"]["session"]).unlink()
+    write_json_file(decision_path, decisions)
+    output, result_path = tmp_path / "classifications.json", tmp_path / "result.json"
+    cli.command_build_quick_classifications(path, decision_path, output)
+    assembled = json.loads(output.read_text())
+    if case == "missing-thread":
+        assert len(assembled["threads"]) == 1
+    else:
+        assert assembled["threads"][0]["classification"]["runs"] == first["runs"]
+    cli.command_quick_validate(path, output, result_path)
+    result = json.loads(result_path.read_text())
+    assert [record["status"] for record in result["threads"]] == ["unassessed", "validated"]
+    assert result["totals"]["threads"] == 1 and result["totals"]["model_calls"] == 6
+    assert sum(item["model_calls"] for item in result["categories"]) == 6
+    assert all(control["model_calls"] == 1 for control in result["controls"])
+
+
+@pytest.mark.parametrize("effect", ["create", "write", "flush", "stdout"])
+@pytest.mark.parametrize("after", [False, True])
+def test_quick_output_interruptions_preserve_inputs_and_fresh_call_contract(
+    tmp_path, monkeypatch, capsys, effect, after, *, operation="build-quick-classifications",
+):
+    cli, path, batch, decisions, _ = _quick_command_case(tmp_path, monkeypatch)
+    output = tmp_path / "output.json"
+    source = decisions
+    args = [operation, "--batch", str(path), "--decisions", str(decisions), "--output", str(output)]
+    if operation == "quick-collect":
+        source = tmp_path / "frozen-selection.json"
+        write_json_file(source, batch["selection"])
+        args = [operation, "--selection", str(source), "--output", str(output)]
+    elif operation == "quick-validate":
+        source = tmp_path / "classifications.json"
+        cli.command_build_quick_classifications(path, decisions, source)
+        args = [operation, "--batch", str(path), "--classifications", str(source), "--output", str(output)]
+    inputs = {p: p.read_bytes() for p in (path, decisions, source)}
+    if effect == "create" and after:
+        owner, name = cli.os, "write"
+        original = owner.write
+
+        def interrupted(*args, **kwargs):
+            raise KeyboardInterrupt
+    else:
+        owner, name = (cli, "print") if effect == "stdout" else (cli.os, {"create": "open", "write": "write", "flush": "fsync"}[effect])
+        original = getattr(owner, name, print)
+
+        def interrupted(*args, **kwargs):
+            if after:
+                original(*args, **kwargs)
+            raise KeyboardInterrupt
+    with monkeypatch.context() as patch:
+        patch.setattr(owner, name, interrupted, raising=False)
+        with pytest.raises(KeyboardInterrupt):
+            cli.main(args)
+    capsys.readouterr()
+    assert {p: p.read_bytes() for p in inputs} == inputs
+    if effect == "stdout":
+        retained = output.read_bytes()
+        assert cli.main(args) == 2
+        assert output.read_bytes() == retained
+    else:
+        assert not output.exists()
+        assert cli.main(args) == 0
+        assert json.loads(output.read_text())["threads"]
+
+
+@pytest.mark.parametrize("operation", ["quick-collect", "quick-validate"])
+@pytest.mark.parametrize("effect", ["create", "write", "flush", "stdout"])
+@pytest.mark.parametrize("after", [False, True])
+def test_quick_peer_outputs_share_the_interruption_and_repeat_contract(
+    tmp_path, monkeypatch, capsys, operation, effect, after,
+):
+    test_quick_output_interruptions_preserve_inputs_and_fresh_call_contract(
+        tmp_path, monkeypatch, capsys, effect, after, operation=operation,
+    )
+
+
+@pytest.mark.parametrize("excess", [0, 1])
+def test_quick_last_call_null_cursor_obeys_the_entire_stdout_byte_limit(tmp_path, monkeypatch, capsys, excess):
+    cli, path, batch, _, _ = _quick_command_case(tmp_path, monkeypatch)
+    thread = batch["threads"][0]
+    run = thread["semantic"]["selected_runs"][-1]
+    run["user_messages"] = []
+    run["calls"][0]["user_message_ids"] = []
+    run["calls"][0]["semantic_actions"] = [{"kind": "message", "summary": ""}]
+    write_json_file(path, batch)
+    preview = cli.command_inspect_quick_calls(path, thread["thread_id"], run["turn_id"])
+    base_size = len(json.dumps(preview, separators=(",", ":")).encode()) + 1
+    run["calls"][0]["semantic_actions"][0]["summary"] = "x" * (1_000 - base_size + excess)
+    write_json_file(path, batch)
+    code = cli.main(["inspect-quick-calls", "--batch", str(path), "--thread", thread["thread_id"],
+                     "--turn", run["turn_id"], "--text-limit", "2000", "--max-bytes", "1000"])
+    output = capsys.readouterr()
+    assert code == (2 if excess else 0)
+    if excess:
+        assert not output.out and "one call exceeds max-bytes" in output.err
+    else:
+        assert len(output.out.encode()) == 1_000 and json.loads(output.out)["next_call"] is None
+
+
+@pytest.mark.parametrize("status", ["excluded-current", "no-completed-runs", "unassessed"])
+def test_quick_assembly_and_correction_totals_preserve_nonready_coverage(tmp_path, monkeypatch, status):
+    cli, path, batch, decision_path, decisions = _quick_command_case(tmp_path, monkeypatch)
+    batch["threads"][0].update(status=status, error="source unavailable")
+    batch["selection"]["exclusions"] = [{"thread_id": "unresolved-index-entry", "reason": "unresolvable-session-or-metadata"}]
+    decisions["threads"].pop(0)
+    write_json_file(path, batch)
+    write_json_file(decision_path, decisions)
+    classifications, result_path = tmp_path / "classifications.json", tmp_path / "result.json"
+    cli.command_build_quick_classifications(path, decision_path, classifications)
+    cli.command_quick_validate(path, classifications, result_path)
+    result = json.loads(result_path.read_text())
+    assert result["selection"] == batch["selection"]
+    assert [record["status"] for record in result["threads"]] == [status, "validated"]
+    assert result["totals"]["model_calls"] == 6
+    assert all(control["model_calls"] == 1 for control in result["controls"])
+    if status == "unassessed":
+        assert result["threads"][0]["error"] == "source unavailable"
+
+
+def test_quick_gap_view_bounds_escaped_error_text(tmp_path, monkeypatch, capsys):
+    cli, path, batch, _, _ = _quick_command_case(tmp_path, monkeypatch)
+    item = batch["threads"][0]
+    item.update(status="unassessed", error="\x00界" * 2_000)
+    write_json_file(path, batch)
+    assert cli.main(["inspect-quick-calls", "--batch", str(path), "--thread", item["thread_id"],
+                     "--turn", "turn-1", "--max-bytes", "1000", "--text-limit", "2000"]) == 0
+    output = capsys.readouterr().out
+    assert len(output.encode()) <= 1_000
+    assert json.loads(output)["error"].endswith("...")
+
+
+@pytest.mark.parametrize("after", [False, True])
+def test_quick_view_stdout_interruptions_are_safe_to_repeat(tmp_path, monkeypatch, capsys, after):
+    cli, path, batch, _, _ = _quick_command_case(tmp_path, monkeypatch)
+    before = path.read_bytes()
+    args = ["inspect-quick-calls", "--batch", str(path), "--thread", batch["threads"][0]["thread_id"],
+            "--turn", "turn-1", "--call-count", "1"]
+    original = print
+
+    def interrupted(*args, **kwargs):
+        if after:
+            original(*args, **kwargs)
+        raise KeyboardInterrupt
+
+    with monkeypatch.context() as patch:
+        patch.setattr(cli, "print", interrupted, raising=False)
+        with pytest.raises(KeyboardInterrupt):
+            cli.main(args)
+    interrupted_output = capsys.readouterr().out
+    assert cli.main(args) == 0
+    fresh = capsys.readouterr().out
+    assert json.loads(fresh)["calls"][0]["index"] == 1
+    assert not interrupted_output if not after else interrupted_output == fresh
+    assert path.read_bytes() == before

@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from .thread_review_orchestration import *
 from .single_surface_analysis import *
-from .single_surface_analysis import _exclusive_json, _load_evidence_collector
+from .single_surface_analysis import _canonical_bytes, _exclusive_json, _load_evidence_collector
 
 
 def command_select_recent(
@@ -174,6 +174,35 @@ def _quick_output(path: pathlib.Path) -> pathlib.Path:
     return target
 
 
+def _write_quick_output(path: pathlib.Path, value: Any) -> None:
+    """Write one immutable caller artifact; unwind only this invocation's file.
+
+    Exclusive creation preserves peer/user outputs. A caught interruption or I/O
+    failure closes and removes our incomplete output, making a fresh call safe.
+    An already completed output remains immutable, including after lost stdout.
+    """
+    payload = _canonical_bytes(value)
+    descriptor = os.open(
+        path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600,
+    )
+    complete = False
+    try:
+        offset = 0
+        while offset < len(payload):
+            written = os.write(descriptor, payload[offset:])
+            if not written:
+                raise OSError("quick output write made no progress")
+            offset += written
+        os.fsync(descriptor)
+        complete = True
+    finally:
+        try:
+            os.close(descriptor)
+        finally:
+            if not complete:
+                path.unlink(missing_ok=True)
+
+
 def _quick_selection(value: dict[str, Any]) -> dict[str, dict[str, Any]]:
     """Validate operational scope; index and project fields are annotations."""
     if value.get("schema") != "ceratops-credit-quick-selection.v1":
@@ -280,8 +309,187 @@ def command_quick_collect(
     batch = {"schema": "ceratops-credit-quick-batch.v1", "selection": selection,
              "classification_input": collector.classification_input_contract(),
              "threads": records}
-    _exclusive_json(target, batch, "quick batch")
+    _write_quick_output(target, batch)
     return _quick_receipt(batch, target)
+
+
+def _quick_batch(path: pathlib.Path) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    """Bind retained records to their frozen selection, without reopening sources."""
+    batch = _quick_document(path, "ceratops-credit-quick-batch.v1")
+    selection = batch.get("selection")
+    if not isinstance(selection, dict):
+        raise CreditAnalysisError("batch selection is invalid")
+    sources = _quick_selection(selection)
+    threads = _quick_threads(batch.get("threads"))
+    if list(threads) != list(sources):
+        raise CreditAnalysisError("batch threads do not match the selection")
+    return batch, threads
+
+
+def _quick_text(value: str, limit: int) -> str:
+    """Bound UTF-8 text while making omitted content explicit."""
+    encoded = value.encode("utf-8")
+    if len(encoded) <= limit:
+        return value
+    return encoded[:limit - 3].decode("utf-8", errors="ignore") + "..."
+
+
+def command_inspect_quick_calls(
+    batch_path: pathlib.Path, thread_id: str, turn_id: str,
+    *, first_call: int = 1, call_count: int = 10,
+    text_limit: int = 500, max_bytes: int = 16_000,
+) -> dict[str, Any]:
+    """Page retained redacted calls; never read live sessions or launch models.
+
+    Call and byte limits bound the entire stdout payload. Prompt IDs retain
+    their call relationship; omitted calls/actions and shortened text remain
+    visible so a preview cannot masquerade as complete evidence.
+    """
+    if not 1 <= first_call or not 1 <= call_count <= 50:
+        raise CreditAnalysisError("first-call must be positive; call-count must be 1..50")
+    if not 32 <= text_limit <= 2_000 or not 1_000 <= max_bytes <= 64_000:
+        raise CreditAnalysisError("text-limit must be 32..2000; max-bytes must be 1000..64000")
+    _, threads = _quick_batch(batch_path)
+    item = threads.get(thread_id)
+    if item is None:
+        raise CreditAnalysisError("thread is outside the retained batch")
+    if item.get("status") not in {"ready", "unassessed", "excluded-current", "no-completed-runs"}:
+        raise CreditAnalysisError("batch thread status is invalid")
+    result: dict[str, Any] = {"thread_id": thread_id, "status": item.get("status")}
+    if item.get("status") != "ready":
+        if "error" in item:
+            # JSON escaping can use six bytes per source byte. Leave ample
+            # fixed-field space even at the smallest allowed stdout budget.
+            result["error"] = _quick_text(str(item["error"]), min(text_limit, (max_bytes - 200) // 6))
+        return result
+    ledger_runs = {run["turn_id"]: run for run in item["ledger"]["runs"]}
+    semantic_runs = {run["turn_id"]: run for run in item["semantic"]["selected_runs"]}
+    if turn_id not in ledger_runs or turn_id not in semantic_runs:
+        raise CreditAnalysisError("turn is outside the retained thread window")
+    run, semantic = ledger_runs[turn_id], semantic_runs[turn_id]
+    if (len(run["calls"]) != run["model_calls"]
+            or len(semantic["calls"]) != run["model_calls"]):
+        raise CreditAnalysisError("retained semantic and ledger call counts differ")
+    if first_call > run["model_calls"]:
+        raise CreditAnalysisError("first-call is outside the retained run")
+    messages = {message["message_id"]: message for message in semantic["user_messages"]}
+    result.update(
+        turn_id=turn_id, model_calls=run["model_calls"], first_call=first_call,
+        next_call=first_call, calls=[], user_messages=[],
+    )
+    included_messages: set[str] = set()
+    stop = min(first_call - 1 + call_count, run["model_calls"])
+    for offset in range(first_call - 1, stop):
+        call, evidence = run["calls"][offset], semantic["calls"][offset]
+        if call["index"] != offset + 1 or evidence["index"] != call["index"]:
+            raise CreditAnalysisError("retained semantic and ledger call identities differ")
+        actions = [
+            {key: _quick_text(value, text_limit) if isinstance(value, str) else value
+             for key, value in action.items()}
+            for action in evidence["semantic_actions"][:10]
+        ]
+        preview = {"index": call["index"], "tokens": call["tokens"],
+                   "user_message_ids": evidence["user_message_ids"], "actions": actions,
+                   "omitted_actions": max(0, len(evidence["semantic_actions"]) - len(actions))}
+        new_ids = set(evidence["user_message_ids"]) - included_messages
+        if new_ids - messages.keys():
+            raise CreditAnalysisError("retained call references an unavailable user message")
+        added_messages = [
+            {"message_id": identity, "text": _quick_text(messages[identity]["text"], text_limit)}
+            for identity in messages if identity in new_ids
+        ]
+        next_call = call["index"] + 1
+        candidate = {**result, "calls": [*result["calls"], preview],
+                     "user_messages": [*result["user_messages"], *added_messages],
+                     "next_call": next_call if next_call <= run["model_calls"] else None}
+        if len(json.dumps(candidate, separators=(",", ":")).encode("utf-8")) + 1 > max_bytes:
+            break
+        result = candidate
+        included_messages.update(new_ids)
+    if not result["calls"]:
+        raise CreditAnalysisError("one call exceeds max-bytes; lower text-limit or increase max-bytes")
+    return result
+
+
+def command_build_quick_classifications(
+    batch_path: pathlib.Path, decisions_path: pathlib.Path, output_path: pathlib.Path,
+) -> dict[str, Any]:
+    """Wrap explicit per-thread/run judgments in the collector's input shape.
+
+    This is assembly, not acceptance: quick-validate owns the single live-source
+    and exact-call-coverage check. Missing decisions are retained as gaps; no
+    default category or inferred control is ever inserted. The caller owns the
+    write-once output and its eventual cleanup, like the adjacent batch commands.
+    """
+    target = _quick_output(output_path)
+    batch, threads = _quick_batch(batch_path)
+    decisions = _quick_document(decisions_path, "ceratops-credit-quick-decisions.v1")
+    supplied = _quick_threads(decisions.get("threads"))
+    ready = {identity for identity, item in threads.items() if item.get("status") == "ready"}
+    if set(supplied) - ready:
+        raise CreditAnalysisError("decisions contain a thread outside the ready batch")
+    collector = _load_evidence_collector()
+    classifications = []
+    for identity, item in supplied.items():
+        runs = item.get("runs")
+        if not isinstance(runs, list) or any(not isinstance(run, dict) for run in runs):
+            raise CreditAnalysisError("thread decisions require a run object list")
+        classifications.append({
+            "thread_id": identity,
+            "classification": {"schema": collector.CLASSIFICATIONS_SCHEMA,
+                               "session": threads[identity]["ledger"]["session"],
+                               "runs": runs},
+        })
+    output = {"schema": "ceratops-credit-quick-classifications.v1",
+              "threads": classifications}
+    _write_quick_output(target, output)
+    return {"output": str(target), "threads": len(classifications),
+            "unclassified_threads": len(ready - supplied.keys()),
+            "selection_exclusions": len(batch["selection"]["exclusions"])}
+
+
+def _quick_classification_totals(
+    records: list[dict[str, Any]], threads: dict[str, dict[str, Any]], collector: Any,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Count accepted call identities once, grouping corrections across threads.
+
+    This consumes the existing coverage acceptance; it does not repeat it or
+    count risk-only evidence. Input tokens already include cached input tokens,
+    so token fields stay separate rather than being added into a new spend unit.
+    """
+    def empty() -> dict[str, int]:
+        return dict.fromkeys(("model_calls", *collector.TOKEN_FIELDS), 0)
+
+    categories = {category: empty() for category in collector.classification_input_contract()["categories"]}
+    controls: dict[str, dict[str, Any]] = {}
+    for record in records:
+        if record["status"] != "validated":
+            continue
+        runs = {run["turn_id"]: run for run in threads[record["thread_id"]]["ledger"]["runs"]}
+        for run in record["classification"]["runs"]:
+            calls = {call["index"]: call for call in runs[run["turn_id"]]["calls"]}
+            for group in run["groups"]:
+                category = group["category"]
+                control = None
+                if category != "necessary":
+                    name = group["control"].strip()
+                    control = controls.setdefault(name, {"control": name, **empty(), "categories": {}, "calls": []})
+                for index in group["indices"]:
+                    increments = {"model_calls": 1, **{
+                        field: calls[index]["tokens"].get(field, 0) for field in collector.TOKEN_FIELDS
+                    }}
+                    for key, count in increments.items():
+                        categories[category][key] += count
+                        if control is not None:
+                            control[key] += count
+                    if control is not None:
+                        category_totals = control["categories"].setdefault(category, empty())
+                        for key, count in increments.items():
+                            category_totals[key] += count
+                        control["calls"].append({"thread_id": record["thread_id"],
+                                                 "turn_id": run["turn_id"], "index": index})
+    return ([{"category": category, **totals} for category, totals in categories.items()],
+            [controls[name] for name in sorted(controls)])
 
 
 def command_quick_validate(
@@ -295,14 +503,9 @@ def command_quick_validate(
     incomplete, invalid, or changed sources remain visible as unassessed.
     """
     target = _quick_output(output_path)
-    batch = _quick_document(batch_path, "ceratops-credit-quick-batch.v1")
-    selection = batch.get("selection")
-    if not isinstance(selection, dict):
-        raise CreditAnalysisError("batch selection is invalid")
+    batch, threads = _quick_batch(batch_path)
+    selection = batch["selection"]
     sources = _quick_selection(selection)
-    threads = _quick_threads(batch.get("threads"))
-    if list(threads) != list(sources):
-        raise CreditAnalysisError("batch threads do not match the selection")
     decisions = _quick_document(
         classifications_path, "ceratops-credit-quick-classifications.v1",
     )
@@ -344,10 +547,11 @@ def command_quick_validate(
         elif status == "unassessed":
             record["error"] = item.get("error", "source was not collected")
         records.append(record)
+    categories, controls = _quick_classification_totals(records, threads, collector)
     result = {"schema": "ceratops-credit-quick-result.v1", "selection": selection,
               "batch": str(batch_path.expanduser().resolve(strict=True)),
-              "threads": records, "totals": totals}
-    _exclusive_json(target, result, "quick result")
+              "threads": records, "totals": totals, "categories": categories, "controls": controls}
+    _write_quick_output(target, result)
     return _quick_receipt(result, target)
 
 
@@ -375,6 +579,18 @@ def build_parser() -> argparse.ArgumentParser:
     quick_collect.add_argument("--output", required=True, type=pathlib.Path)
     quick_collect.add_argument("--include-current", action="store_true")
     quick_collect.add_argument("--pricing-profile", type=pathlib.Path)
+    inspect_calls = commands.add_parser("inspect-quick-calls")
+    inspect_calls.add_argument("--batch", required=True, type=pathlib.Path)
+    inspect_calls.add_argument("--thread", required=True)
+    inspect_calls.add_argument("--turn", required=True)
+    inspect_calls.add_argument("--first-call", type=int, default=1)
+    inspect_calls.add_argument("--call-count", type=int, default=10)
+    inspect_calls.add_argument("--text-limit", type=int, default=500)
+    inspect_calls.add_argument("--max-bytes", type=int, default=16_000)
+    build_classifications = commands.add_parser("build-quick-classifications")
+    build_classifications.add_argument("--batch", required=True, type=pathlib.Path)
+    build_classifications.add_argument("--decisions", required=True, type=pathlib.Path)
+    build_classifications.add_argument("--output", required=True, type=pathlib.Path)
     quick_validate = commands.add_parser("quick-validate")
     quick_validate.add_argument("--batch", required=True, type=pathlib.Path)
     quick_validate.add_argument("--classifications", required=True, type=pathlib.Path)
@@ -409,9 +625,16 @@ def main(argv: list[str] | None = None) -> int:
             )
         elif args.command == "quick-validate":
             output = command_quick_validate(args.batch, args.classifications, args.output)
+        elif args.command == "inspect-quick-calls":
+            output = command_inspect_quick_calls(
+                args.batch, args.thread, args.turn, first_call=args.first_call,
+                call_count=args.call_count, text_limit=args.text_limit, max_bytes=args.max_bytes,
+            )
+        elif args.command == "build-quick-classifications":
+            output = command_build_quick_classifications(args.batch, args.decisions, args.output)
         else:
             raise CreditAnalysisError("unsupported command")
-    except (CreditAnalysisError, OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
+    except (CreditAnalysisError, OSError, RuntimeError, ValueError, TypeError, KeyError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     if output == "OK":

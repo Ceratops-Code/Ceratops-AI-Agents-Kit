@@ -284,7 +284,7 @@ def test_non_release_sync_does_not_take_repository_wide_lock(tmp_path, monkeypat
 @pytest.mark.parametrize("caller", ["promotion", "ship"])
 def test_ship_handoff_keeps_same_process_lock(tmp_path, monkeypatch, caller):
     """Both direct calls reuse the outer lock without entering either CLI."""
-    from github_pr_workflow import ship, ship_repository
+    from github_pr_workflow import ship, ship_pull_request, ship_repository
     repo, _, _, _ = prepare_repository_lifecycle_repo(tmp_path)
     locks = workflow_command.release_lock_module()
     scope = tmp_path / "scope.json"
@@ -316,7 +316,7 @@ def test_ship_handoff_keeps_same_process_lock(tmp_path, monkeypatch, caller):
         monkeypatch.setattr(ship_repository, "ship_repository", child)
     else:
         monkeypatch.setattr(ship, "ship", child)
-    monkeypatch.setattr(ship, "main", lambda *_args: pytest.fail("direct call entered a CLI"))
+    monkeypatch.setattr(ship_pull_request, "main", lambda *_args: pytest.fail("direct call entered a CLI"))
     monkeypatch.setattr(runpy, "run_path", lambda *_args: pytest.fail("direct call loaded a script"))
     with locks.hold_write_lock(locks.release_lock_path(repo)) as owned:
         assert call() == result
@@ -626,7 +626,7 @@ def test_repository_ship_metadata_reaches_shared_pr_producer(
     monkeypatch.setattr(ship.merge, "restore_unfinished_checkpoints", lambda root: None)
     monkeypatch.setattr(ship, "_repository_name", lambda *args: "example/repository")
     monkeypatch.setattr(ship, "_resolve_commit", lambda *args: "a" * 40)
-    monkeypatch.setattr(ship, "_load_pending_work_scope", lambda *args: (None, None))
+    monkeypatch.setattr(ship, "load_pending_work_scope", lambda *args: (None, None))
     monkeypatch.setattr(
         ship,
         "_load_or_create_checkpoint",
@@ -718,7 +718,10 @@ def test_ship_cli_and_callable_share_inputs_results_and_clean_exit(tmp_path, mon
     repo, _, _, _ = prepare_repository_lifecycle_repo(tmp_path)
     options = module.ShipOptions(repo_root=repo, head_branch="release/local")
     arguments = ["--repo-root", str(repo), "--head-branch", "release/local"]
-    assert vars(cli["build_parser"]().parse_args(arguments)) == vars(options)
+    parsed_options = vars(cli["build_parser"]().parse_args(arguments))
+    assert parsed_options.pop("diagnostic_action") == "ship"
+    assert parsed_options.pop("diagnostic_repo_root") is None
+    assert parsed_options == vars(options)
     payload = {
         "status": outcome, "message": "ordinary cause or decision",
         "candidate": "current", "completed": ["source-check"],
@@ -767,7 +770,7 @@ def test_operation_runner_reports_command_shutdown_to_release_owner(tmp_path, mo
         steps=tuple(operations.PreparedStep(index, (name,), repo)
                     for index, name in enumerate(("fixture", "dependent"))),
     )
-    original_run = operations.subprocess.run
+    original_run = operations.run_progress_command
     attempted = []
 
     def run(argv, **kwargs):
@@ -778,7 +781,7 @@ def test_operation_runner_reports_command_shutdown_to_release_owner(tmp_path, mo
             raise OSError("command launcher lost its outcome")
         return subprocess.CompletedProcess(argv, 7, "", "source test failed")
 
-    monkeypatch.setattr(operations.subprocess, "run", run)
+    monkeypatch.setattr(operations, "run_progress_command", run)
     for _ in range(2):
         with workflow_command.release_write_context(repo):
             result = operations.execute_prepared_operation(prepared)

@@ -1,7 +1,7 @@
 {
   "source_docs_version": 1,
   "name": "ceratops_skill_contract_source_docs",
-  "captured_on": "2026-05-14",
+  "captured_on": "2026-10-11",
   "policy": {
     "use_order": [
       "official_docs",
@@ -95,19 +95,6 @@
         "error recovery",
         "formula and render verification",
         "concise final-output discipline"
-      ]
-    },
-    {
-      "id": "ref.openai.github_yeet",
-      "path": "$CODEX_HOME/plugins/cache/openai-curated/*/*/skills/yeet/SKILL.md",
-      "scope": [
-        "skill"
-      ],
-      "focus": [
-        "publish-flow scope confirmation",
-        "credential prerequisites",
-        "git and PR sequencing",
-        "write-safety boundaries"
       ]
     }
   ],

@@ -2,11 +2,22 @@
   "contract_format_version": 1,
   "kind": "repository_validation_contract",
   "name": "ceratops_repository_validation_contract",
-  "captured_on": "2026-09-20",
+  "captured_on": "2026-10-11",
   "source_docs_ref": "github-contract-source-docs.json",
   "source_doc_scopes": [
     "repository_validation"
   ],
+  "ruff_policy": {
+    "target-version": "py314",
+    "select": [
+      "E", "F", "I", "B",
+      "S105", "S106", "S107", "S501", "S602", "S604", "S605",
+      "ASYNC210", "ASYNC212", "ASYNC220", "ASYNC221", "ASYNC222",
+      "ASYNC230", "ASYNC240", "ASYNC250", "ASYNC251",
+      "DTZ003", "DTZ004", "DTZ005", "DTZ006", "UP", "RUF100"
+    ],
+    "ignore": ["E501"]
+  },
   "coverage_requirements": [
     {
       "id": "android-gradle",
@@ -26,6 +37,87 @@
       "required_prerequisites": [
         "jdk",
         "android-sdk"
+      ],
+      "require_repository_entrypoint": true
+    },
+    {
+      "id": "go-module",
+      "when": [
+        {
+          "kind": "path-any",
+          "value": [
+            "**/go.mod"
+          ]
+        }
+      ],
+      "operation_category": "validate",
+      "required_capabilities": [
+        "go-vet"
+      ],
+      "required_prerequisites": [
+        "go"
+      ],
+      "require_repository_entrypoint": true
+    },
+    {
+      "id": "rust-cargo",
+      "when": [
+        {
+          "kind": "path-any",
+          "value": [
+            "**/Cargo.toml"
+          ]
+        }
+      ],
+      "operation_category": "validate",
+      "required_capabilities": [
+        "rustfmt-check",
+        "rust-clippy"
+      ],
+      "required_prerequisites": [
+        "rustfmt",
+        "clippy"
+      ],
+      "require_repository_entrypoint": true
+    },
+    {
+      "id": "dotnet",
+      "when": [
+        {
+          "kind": "path-any",
+          "value": [
+            "**/*.sln",
+            "**/*.csproj",
+            "**/*.fsproj",
+            "**/*.vbproj"
+          ]
+        }
+      ],
+      "operation_category": "validate",
+      "required_capabilities": [
+        "dotnet-format-check"
+      ],
+      "required_prerequisites": [
+        "dotnet-sdk"
+      ],
+      "require_repository_entrypoint": true
+    },
+    {
+      "id": "shell",
+      "when": [
+        {
+          "kind": "path-any",
+          "value": [
+            "**/*.sh"
+          ]
+        }
+      ],
+      "operation_category": "validate",
+      "required_capabilities": [
+        "shellcheck"
+      ],
+      "required_prerequisites": [
+        "shellcheck"
       ],
       "require_repository_entrypoint": true
     }

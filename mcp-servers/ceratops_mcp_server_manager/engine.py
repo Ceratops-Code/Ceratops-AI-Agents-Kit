@@ -20,7 +20,7 @@ import zipfile
 from dataclasses import dataclass
 from email.parser import BytesParser
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, TextIO
 
 from . import MCP_SERVER_NAME, __version__
 from .contracts import (
@@ -143,7 +143,7 @@ def wheel_metadata(path: Path) -> tuple[str, str]:
 
 
 async def _published_tool_schemas(
-    executable: Path, module: str, candidate: Path, env: dict[str, str]
+    executable: Path, module: str, candidate: Path, env: dict[str, str], errlog: TextIO
 ) -> dict[str, dict[str, Any]]:
     """Read the production server's actual MCP list_tools schemas over stdio."""
 
@@ -160,21 +160,20 @@ async def _published_tool_schemas(
     )
     published: dict[str, dict[str, Any]] = {}
     try:
-        with open(os.devnull, "w", encoding="utf-8") as errlog:
-            async with stdio_client(parameters, errlog=errlog) as streams:
-                async with ClientSession(*streams, read_timeout_seconds=30) as session:
-                    await session.initialize()
-                    cursor = None
-                    for _ in range(256):
-                        params = types.PaginatedRequestParams(cursor=cursor) if cursor else None
-                        result = await session.list_tools(params=params)
-                        for tool in result.tools:
-                            if tool.name in published:
-                                raise DeploymentError("duplicate published MCP tool name")
-                            published[tool.name] = tool.input_schema
-                        cursor = result.next_cursor
-                        if cursor is None:
-                            return published
+        async with stdio_client(parameters, errlog=errlog) as streams:
+            async with ClientSession(*streams, read_timeout_seconds=30) as session:
+                await session.initialize()
+                cursor = None
+                for _ in range(256):
+                    params = types.PaginatedRequestParams(cursor=cursor) if cursor else None
+                    result = await session.list_tools(params=params)
+                    for tool in result.tools:
+                        if tool.name in published:
+                            raise DeploymentError("duplicate published MCP tool name")
+                        published[tool.name] = tool.input_schema
+                    cursor = result.next_cursor
+                    if cursor is None:
+                        return published
     except DeploymentError:
         raise
     except Exception as exc:
@@ -239,14 +238,14 @@ def _schema_probe_main(arguments: list[str]) -> int:
         print("invalid internal schema probe paths", file=sys.stderr)
         return 2
     try:
-        published = asyncio.run(
-            _published_tool_schemas(
-                executable,
-                arguments[2],
-                candidate,
-                dict(os.environ),
+        # Open and close the synchronous stream outside the event loop. Its
+        # lifetime encloses the complete probe, including failure/cancellation.
+        with open(os.devnull, "w", encoding="utf-8") as errlog:
+            published = asyncio.run(
+                _published_tool_schemas(
+                    executable, arguments[2], candidate, dict(os.environ), errlog,
+                )
             )
-        )
     except (DeploymentError, OSError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 2

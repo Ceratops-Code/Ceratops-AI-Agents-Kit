@@ -370,11 +370,19 @@ def prepared(repo, operation, script):
     )
 
 
-def test_operation_list_saves_large_failure_and_preserves_prior_success(report_repo):
+@pytest.mark.parametrize("reference_kind", ["receipt", "completed-check", "failed-check"])
+def test_operation_list_saves_large_failure_and_preserves_prior_success(report_repo, reference_kind):
     repo, path = report_repo
     accepted = repo / "accepted.json"
     accepted.write_text("original accepted bytes", encoding="utf-8")
     receipt = {"schema": "example-result.v1", "status": "passed", "path": str(accepted)}
+    if reference_kind != "receipt":
+        receipt = {
+            "schema": "example-result.v1",
+            "status": "completed" if reference_kind == "completed-check" else "tests_failed",
+            "check_result": {"path": str(accepted), "result_id": "original-check"},
+        }
+    expected_paths = [] if reference_kind == "failed-check" else [str(accepted)]
     operations = [
         prepared(repo, "tests.first", f"print({json.dumps(receipt)!r})"),
         prepared(repo, "tests.second", "import sys; print('first failure'); print('x'*2100000); print('last failure'); sys.exit(1)"),
@@ -391,7 +399,7 @@ def test_operation_list_saves_large_failure_and_preserves_prior_success(report_r
         report = json.loads(path.read_text())
         details = report["failures"]["tests.second:1"]
         assert "x" * 2100000 in details["command_output"]["stdout"]
-        assert report["successful_result_paths"] == [str(accepted)]
+        assert report["successful_result_paths"] == expected_paths
         assert len(json.dumps(result)) < 10000
     assert accepted.read_text() == "original accepted bytes"
 
@@ -445,7 +453,7 @@ def test_operation_error_keeps_chosen_path_and_does_not_start_later_work(report_
 def test_json_command_forwards_phase_events_and_decodes_failure(monkeypatch, capsys):
     event = {"schema": "ceratops-lifecycle-progress.v1", "phase": "tests"}
     payload = {"status": "tests_failed", "message": "failure", "diagnostic_output": "report.json"}
-    monkeypatch.setattr(command, "run_command", lambda *_args, **_kwargs: subprocess.CompletedProcess(
+    monkeypatch.setattr(command, "run_progress_command", lambda *_args, **_kwargs: subprocess.CompletedProcess(
         ["tool"], 1, json.dumps(event) + "\n", json.dumps(payload),
     ))
     code, result = command.run_command_for_json(["tool"], pathlib.Path.cwd())

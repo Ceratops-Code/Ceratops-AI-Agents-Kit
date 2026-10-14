@@ -98,9 +98,16 @@ Infer the source identity from stable repository evidence before asking.
 - Generate a missing validator and CI workflow only from checks declared in
   `references/contracts/repository-validation-contract.json`; obtain approval
   before adding an undeclared check.
+- Keep package metadata and tool configuration below the repository root.
+  Use `scripts` for repository tooling and each application's directory for
+  its manifests. Report misplaced files before writing; moving existing
+  application files requires a repository-scoped change.
+- Use uv with `pyproject.toml` and `uv.lock` for Python dependencies, without
+  requirements-based declarations. The compatibility contract owns the
+  structural checks; review custom declarations against the same policy.
 - Generate one uv project, lock and `.venv` under `scripts`; uv selects the
-  declared Python and installs locked dependencies. Keep application manifests
-  in their existing locations.
+  declared Python and installs locked dependencies. Preserve compliant
+  application manifests at their existing nested paths.
 - Run repository Python entrypoints through `uv run --locked <script.py>`.
   Keep their project and lock in `scripts`; uv owns Python selection and
   dependency synchronization. Do not inject environment bootstrap code.
