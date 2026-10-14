@@ -52,9 +52,10 @@ def environment_files(declaration: dict[str, Any], root: pathlib.Path) -> dict[s
 
 
 def read_environment(root: pathlib.Path, declaration: dict[str, Any], *, runtime: bool) -> dict[str, Any]:
-    tools = {}
+    tools: dict[str, dict[str, str | None]] = {}
     for name in declaration.get("tools", []):
         expanded = re.sub(r"\$\{([^}]+)\}", lambda match: os.environ.get(match[1], ""), name)
+        path: pathlib.Path | None
         if "/" in expanded or "\\" in expanded:
             path = pathlib.Path(expanded)
             path = path if path.is_absolute() else root / path

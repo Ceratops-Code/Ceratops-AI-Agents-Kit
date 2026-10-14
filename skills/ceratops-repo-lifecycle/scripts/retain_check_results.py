@@ -115,7 +115,7 @@ def _plain(path: pathlib.Path) -> None:
 
 def _time(value: Any) -> datetime:
     if not isinstance(value, str):
-        raise ValueError("Check execution time is missing.")  # noqa: TRY004 - persisted evidence errors use ValueError.
+        raise ValueError("Check execution time is missing.")
     result = datetime.fromisoformat(value.replace("Z", "+00:00"))
     if result.tzinfo is None:
         raise ValueError("Check execution time requires a timezone.")
@@ -183,7 +183,7 @@ def _load(path: pathlib.Path) -> tuple[dict[str, Any], bytes]:
     else:
         finished = _time(execution.get("finishedAt"))
         duration = execution.get("durationSeconds")
-        if (finished < started or type(duration) not in {int, float}
+        if (finished < started or duration is None or type(duration) not in {int, float}
                 or duration < 0
                 or abs((finished - started).total_seconds() - duration) > max(1, duration * .01)):
             raise ValueError("Check execution duration conflicts with its times.")
@@ -198,12 +198,13 @@ def _live(pid: int) -> bool:
         import ctypes
         from ctypes import wintypes
 
-        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        ctypes_api: Any = ctypes
+        kernel = ctypes_api.WinDLL("kernel32", use_last_error=True)
         kernel.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
         kernel.OpenProcess.restype = wintypes.HANDLE
         handle = kernel.OpenProcess(0x1000, False, pid)
         if not handle:
-            return ctypes.get_last_error() == 5
+            return ctypes_api.get_last_error() == 5
         try:
             code = wintypes.DWORD()
             kernel.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
@@ -277,7 +278,8 @@ class CheckResultStore:
         return identity, self.directory / f"{identity}.json"
 
     def _records(self) -> tuple[list[tuple[pathlib.Path, dict[str, Any], bytes]], list[pathlib.Path]]:
-        records, invalid = [], []
+        records: list[tuple[pathlib.Path, dict[str, Any], bytes]] = []
+        invalid: list[pathlib.Path] = []
         if not self.directory.exists():
             return records, invalid
         _plain(self.directory / ".store-sentinel")
@@ -383,7 +385,7 @@ class CheckResultStore:
                     continue
                 references = candidate["check_results"]
                 if not isinstance(references, list):
-                    raise ValueError("Candidate check references must be a list.")  # noqa: TRY004 - shared evidence error contract.
+                    raise ValueError("Candidate check references must be a list.")
                 for reference in references:
                     if (not isinstance(reference, dict)
                             or set(reference) != {"result_id", "candidate_id", "check_id", "check_version",

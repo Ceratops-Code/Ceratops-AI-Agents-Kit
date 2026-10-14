@@ -175,6 +175,10 @@ def test_declared_writer_interrupted_effects_never_invent_an_execution(
     write = run.__globals__["write_result"]
     calls: list[bool] = []
 
+    def actual_check() -> int:
+        calls.append(True)
+        return 0
+
     def fault(path: pathlib.Path, value: dict[str, Any], *, exclusive: bool) -> None:
         effect = "running" if exclusive else "completed"
         if boundary == "before_" + effect:
@@ -185,7 +189,7 @@ def test_declared_writer_interrupted_effects_never_invent_an_execution(
 
     monkeypatch.setitem(run.__globals__, "write_result", fault)
     path = tmp_path / ".git/result.json"
-    assert run(lambda: calls.append(True) or 0, _request(path), {}) == 2
+    assert run(actual_check, _request(path), {}) == 2
     assert calls == ([] if boundary.endswith("running") else [True])
     monkeypatch.setitem(run.__globals__, "write_result", write)
     if path.exists():
@@ -195,7 +199,7 @@ def test_declared_writer_interrupted_effects_never_invent_an_execution(
         )
         assert path.read_bytes() == saved
     else:
-        assert run(lambda: calls.append(True) or 0, _request(path), {}) == 0
+        assert run(actual_check, _request(path), {}) == 0
 
 
 def test_custom_runner_exposes_existing_result_interface_without_changing_selection(
@@ -439,7 +443,7 @@ def test_qualified_group_retains_the_original_inherited_child_level(
         path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
         for path in (root / "tests").rglob("*") if path.is_file()
     }
-    saved = []
+    saved: list[dict[str, Any]] = []
     for level in ("beta", "alpha"):
         context["qualificationLevel"] = level
         monkeypatch.setenv("CERATOPS_REPOSITORY_CHECK_CONTEXT", json.dumps(context))
