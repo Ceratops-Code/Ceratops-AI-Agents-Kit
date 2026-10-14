@@ -110,9 +110,9 @@ def main() -> int:
                 raise ValueError("MCP server receipt mismatch")
             python = checked(directory / "environment" / "Scripts" / "python.exe")
             env = {k: v for k, v in os.environ.items() if not k.upper().startswith(("PYTHON", "PIP_", "UV_"))}
-            child_process_options = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
             return subprocess.call([str(python), "-I", "-B", "-m", selected["module"], *sys.argv[1:]],
-                                   env=env, **child_process_options)
+                                   env=env, creationflags=creationflags)
 
 
 if __name__ == "__main__":
