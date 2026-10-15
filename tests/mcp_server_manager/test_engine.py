@@ -439,7 +439,7 @@ def test_launcher_connects_hidden_child_standard_streams_and_releases_lease(tmp_
             capture_output=True,
             text=True,
             timeout=15,
-            creationflags=subprocess.CREATE_NO_WINDOW,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             check=False,
         )
         assert result.returncode == exit_code, (result.stdout, result.stderr)
