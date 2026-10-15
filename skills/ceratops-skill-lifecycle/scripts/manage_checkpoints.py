@@ -1,4 +1,4 @@
-"""Store essential, disposable records for one component and task worktree.
+"""Store essential, disposable records for the skill-update workflow.
 
 Records are immutable JSON objects, written directly to their final names. The
 producer decides what needs saving and when its durable result proves success;

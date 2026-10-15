@@ -15,8 +15,8 @@ from filelock import FileLock
 from tests.repository_lifecycle.support import REPOSITORY_LIFECYCLE_SCRIPTS
 from tests.support.repositories import run_git
 
-SHARED_SCRIPTS = REPOSITORY_LIFECYCLE_SCRIPTS.parents[1] / "sections" / "scripts"
-sys.path.insert(0, str(SHARED_SCRIPTS))
+SKILL_SCRIPTS = REPOSITORY_LIFECYCLE_SCRIPTS.parents[1] / "ceratops-skill-lifecycle" / "scripts"
+sys.path.insert(0, str(SKILL_SCRIPTS))
 cp = importlib.import_module("manage_checkpoints")
 
 
@@ -100,7 +100,7 @@ def test_checkpoints_discover_direct_records_and_nest_without_locks(tmp_path, mo
          " assert cp.read_checkpoint(c,'request.json') == {'request':'first'}\n"
          " print(c.worktree_id)\n"
          " cp.finish_checkpoints(c)\n",
-         str(SHARED_SCRIPTS), str(repository)],
+         str(SKILL_SCRIPTS), str(repository)],
         capture_output=True, text=True, check=False,
     )
     assert fresh.returncode == 0, fresh.stderr

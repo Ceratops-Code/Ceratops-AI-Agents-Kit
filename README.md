@@ -471,8 +471,8 @@ The later public Build operation will supply the resolved selection, locked
 inputs, adapters, and required artifact tests. This foundation does not yet
 build real packages, alter existing deployment, or connect Promote/Ship.
 The storage module is packaged automatically with the owning skill's scripts.
-The manifest maps the shared checkpoint source from `skills/sections/scripts/`
-to `scripts/manage_checkpoints.py` in skill lifecycle. Artifact storage has no
+Skill lifecycle includes its own `scripts/manage_checkpoints.py` directly;
+it no longer uses a shared payload mapping. Artifact storage has no
 checkpoint-helper dependency. No
 receipt schema, index or artifact-search command is introduced.
 Dependency locking remains separate from first-party artifact identity.
@@ -496,10 +496,10 @@ path: the active record, original baseline, approved monotonic scope additions,
 repeated correction generations and recorded-success finalizer remain the
 implemented behavior.
 
-### Shared checkpoint storage (1e.1)
+### Skill-update checkpoint storage (1e.1, corrected in 4D)
 
 The imported helper
-[`manage_checkpoints.py`](skills/sections/scripts/manage_checkpoints.py)
+[`manage_checkpoints.py`](skills/ceratops-skill-lifecycle/scripts/manage_checkpoints.py)
 stores disposable records for the code that writes them, called their
 **producer**. Skill changes use the fixed owner name `skill-updates`.
 Artifact operations no longer open an empty checkpoint directory. It is not a separate

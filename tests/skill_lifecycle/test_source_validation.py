@@ -386,6 +386,14 @@ def test_source_validator_ignores_shared_sections_directory(tmp_path: pathlib.Pa
     assert result.stdout.strip() == "ok: sections 1"
 
 
+def test_live_runtime_payloads_match_their_current_skill_owners() -> None:
+    runtime_inputs = runpy.run_path(str(VALIDATOR.with_name("check_skill_runtime_inputs.py")))
+    manifest = json.loads(LIVE_SECTION_MANIFEST.read_text(encoding="utf-8"))
+    assert runtime_inputs["check_runtime_payloads"](
+        ROOT, manifest, set(manifest["skills"]),
+    ) == []
+
+
 def test_skill_sections_template_contains_no_live_repository_inventory() -> None:
     template = json.loads(SECTION_MANIFEST_TEMPLATE.read_text(encoding="utf-8"))
     live = json.loads(LIVE_SECTION_MANIFEST.read_text(encoding="utf-8"))

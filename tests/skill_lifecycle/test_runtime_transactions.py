@@ -343,7 +343,13 @@ def test_installed_repo_lifecycle_helpers_use_regular_runtime(
     ).is_file()
     copied = subprocess.run(
         [str(interpreter), "-I", "-c",
-         ("import pathlib,sys; sys.path.insert(0,sys.argv[1]); import hold_write_lock as locks;\n"
+         ("import pathlib,sys; sys.path.insert(0,sys.argv[1]); import hold_write_lock as locks; "
+         "import skill_update_state; cp=skill_update_state.checkpoint_storage();\n"
+         "with cp.open_checkpoints(pathlib.Path(sys.argv[2]), 'skill-updates') as records:\n"
+         " cp.write_checkpoint(records, 'request.json', {'source':'installed'})\n"
+         " assert cp.read_checkpoint(records, 'request.json') == {'source':'installed'}\n"
+         " cp.finish_checkpoints(records)\n"
+         " assert not records.directory.exists()\n"
          "with locks.hold_write_lock(locks.release_lock_path(pathlib.Path(sys.argv[2]))) as lock:\n"
          " lock.complete(commands_stopped=True)\n"),
          str(install_root / "ceratops-skill-lifecycle" / "scripts"), str(repo)],

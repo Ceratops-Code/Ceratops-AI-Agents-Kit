@@ -1423,11 +1423,12 @@ of completed obsolete reservations; uncertain records stay. No recurring
 migration detector is installed. The source/helper split changes no receipt
 format or release/destination lock.
 
-### Shared checkpoint storage (implemented)
+### Skill-update checkpoint storage (implemented)
 
-`skills/sections/scripts/manage_checkpoints.py` owns disposable essential records,
-not domain recovery or a general workflow engine. The live section manifest maps
-it to `scripts/manage_checkpoints.py` in the installed skill-lifecycle skill.
+`skills/ceratops-skill-lifecycle/scripts/manage_checkpoints.py` owns disposable
+essential records, not domain recovery or a general workflow engine. It is
+included directly in the installed skill-lifecycle bundle, without a shared
+payload mapping, because no other skill consumes it after 4D.
 Artifact storage no longer depends on this helper. It takes no native lock:
 one thread owns each task worktree. The pinned
 `filelock` dependency remains for release, shared-store and installation code.
@@ -1854,7 +1855,7 @@ means the thread's decision is recorded, not that the whole system was audited.
     {"path": "skills/ceratops-repo-lifecycle/references/contracts/ceratops-compatibility-nondeterministic-contract.json", "role": "Internal compatibility review"},
     {"path": "docs/result_records.py.tmpl", "role": "Reference implementation for portable validation, test, and build records"},
     {"path": "skills/skill-sections.json", "role": "Live shared section and payload assignments"},
-    {"path": "skills/sections/scripts/manage_checkpoints.py", "role": "Shared essential request storage without checkpoint locks; own-request and exact-worktree cleanup"},
+    {"path": "skills/ceratops-skill-lifecycle/scripts/manage_checkpoints.py", "role": "Skill-update request storage without checkpoint locks; own-request and exact-worktree cleanup"},
     {"path": "skills/ceratops-repo-lifecycle/scripts/complete_artifact_builds.py", "role": "Qualified build receipts and result-only commit, artifact receipt and immutable tag completion"},
     {"path": "skills/sections/scripts/hold_write_lock.py", "role": "Shared native release lock and unfinished-run recovery flag"},
     {"path": "skills/ceratops-repo-lifecycle/scripts/git_branch_operations.py", "role": "Shared local branch/worktree operations; locking remains in workflows"},
