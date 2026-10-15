@@ -111,8 +111,11 @@ def main() -> int:
             python = checked(directory / "environment" / "Scripts" / "python.exe")
             env = {k: v for k, v in os.environ.items() if not k.upper().startswith(("PYTHON", "PIP_", "UV_"))}
             creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+            # Hidden Windows children need explicit standard handles to keep
+            # the host's stdio transport connected; general inheritance is insufficient.
             return subprocess.call([str(python), "-I", "-B", "-m", selected["module"], *sys.argv[1:]],
-                                   env=env, creationflags=creationflags)
+                                   env=env, creationflags=creationflags,
+                                   stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr)
 
 
 if __name__ == "__main__":

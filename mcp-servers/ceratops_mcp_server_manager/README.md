@@ -68,6 +68,9 @@ It changes no Codex configuration. An incompatible or missing prerequisite fails
 before deployment writes installation files.
 
 The manager's launcher template is copied into each server's own `bin` folder.
+It starts the selected environment with explicit input, output, and error streams,
+so hidden Windows processes retain the host's stdio connection. The launcher
+holds its usage lease until that child exits and returns the child's exit status.
 Manager source installation finds complete, selected server installations in
 the manager-owned `%USERPROFILE%\.codex\mcp` root and brings only missing or
 stale launcher files to that template. It ignores unrelated entries, unselected

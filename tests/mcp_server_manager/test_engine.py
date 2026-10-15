@@ -9,7 +9,9 @@ import importlib.util
 import io
 import json
 import os
+import subprocess
 import sys
+import venv
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -335,7 +337,8 @@ def test_usage_leases_are_shared_and_block_retirement(tmp_path, monkeypatch):
 def test_launcher_hides_selected_child_and_allows_fresh_retries(tmp_path, monkeypatch):
     monkeypatch.setattr(storage, "INSTALL_ROOT", tmp_path)
     root = tmp_path / "fixture"
-    storage.Layout("fixture").install_launcher()
+    layout = storage.Layout("fixture")
+    layout.install_launcher()
     script = root / "bin/fixture.py"
     spec = importlib.util.spec_from_file_location("installed_fixture_launcher", script)
     assert spec is not None and spec.loader is not None
@@ -360,25 +363,92 @@ def test_launcher_hides_selected_child_and_allows_fresh_retries(tmp_path, monkey
 
     def run_child(arguments, **options):
         attempts.append((arguments, options))
+        with layout._retirement_lease(installation) as removable:
+            assert removable is False
         if len(attempts) == 1:
             raise OSError("child could not start")
-        return 9 if len(attempts) == 2 else 0
+        if len(attempts) == 2:
+            raise KeyboardInterrupt
+        return 9 if len(attempts) == 3 else 0
 
     monkeypatch.setattr(launcher, "__file__", str(script))
     monkeypatch.setattr(launcher.sys, "argv", [str(script), "--serve"])
     monkeypatch.setattr(launcher.subprocess, "call", run_child)
     monkeypatch.setenv("PYTHONPATH", "ignored")
 
-    with pytest.raises(OSError, match="child could not start"):
-        launcher.main()
-    assert launcher.main() == 9
-    assert launcher.main() == 0
-    assert len(attempts) == 3
+    # Fail before starting, interrupt the child call, then retry fresh.
+    for failure in (OSError, KeyboardInterrupt):
+        with pytest.raises(failure):
+            launcher.main()
+        with layout._retirement_lease(installation) as removable:
+            assert removable is True
+    for exit_code in (9, 0):
+        assert launcher.main() == exit_code
+        with layout._retirement_lease(installation) as removable:
+            assert removable is True
+    assert len(attempts) == 4
     for arguments, options in attempts:
         assert arguments == [str(python), "-I", "-B", "-m", "fixture_server", "--serve"]
         assert options["creationflags"] == launcher.subprocess.CREATE_NO_WINDOW
         assert "PYTHONPATH" not in options["env"]
-        assert {"stdin", "stdout", "stderr"}.isdisjoint(options)
+        assert options["stdin"] is launcher.sys.stdin
+        assert options["stdout"] is launcher.sys.stdout
+        assert options["stderr"] is launcher.sys.stderr
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows hidden stdio transport")
+def test_launcher_connects_hidden_child_standard_streams_and_releases_lease(tmp_path, monkeypatch):
+    """Exercise real pipes, argument and exit forwarding, and fresh launches."""
+    monkeypatch.setattr(storage, "INSTALL_ROOT", tmp_path)
+    layout = storage.Layout("fixture")
+    layout.install_launcher()
+    selected = {
+        "schema": 1,
+        "mcp_server_id": "fixture",
+        "version": "1.0.0",
+        "manifest_sha256": "a" * 64,
+        "instance": "b" * 32,
+        "module": "fixture_server",
+    }
+    installation = layout.directory("versions", "1.0.0", selected["instance"])
+    (installation / "receipt.json").write_text(json.dumps(selected), encoding="utf-8")
+    layout.path("current.json").write_text(json.dumps(selected), encoding="utf-8")
+    environment = installation / "environment"
+    venv.EnvBuilder(with_pip=False).create(environment)
+    site_packages = environment / "Lib/site-packages"
+    # A bounded reader lets the broken launcher fail without leaving a child
+    # waiting indefinitely on disconnected stdin after the test controller exits.
+    (site_packages / "fixture_server.py").write_text(
+        "import json, sys, threading\n"
+        "def reply():\n"
+        "    request = json.loads(sys.stdin.readline())\n"
+        "    print(json.dumps({'request': request, 'arguments': sys.argv[1:]}), flush=True)\n"
+        "    print('fixture diagnostic', file=sys.stderr, flush=True)\n"
+        "reader = threading.Thread(target=reply, daemon=True)\n"
+        "reader.start()\n"
+        "reader.join(5)\n"
+        "raise SystemExit(124 if reader.is_alive() else int(sys.argv[1]))\n",
+        encoding="utf-8",
+    )
+    command = [sys.executable, "-I", "-B", str(layout.path("bin", "fixture.py"))]
+    for exit_code in (9, 0, 0):
+        request = {"attempt": exit_code}
+        result = subprocess.run(
+            [*command, str(exit_code)],
+            input=json.dumps(request) + "\n",
+            capture_output=True,
+            text=True,
+            timeout=15,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+            check=False,
+        )
+        assert result.returncode == exit_code, (result.stdout, result.stderr)
+        assert json.loads(result.stdout) == {
+            "request": request, "arguments": [str(exit_code)],
+        }
+        assert result.stderr.strip() == "fixture diagnostic"
+        with layout._retirement_lease(installation) as removable:
+            assert removable is True
 
 
 @pytest.mark.parametrize("metadata_name", ["example_mcp_server", "Example-MCP-Server", "example.mcp.server", "example__mcp__server"])
