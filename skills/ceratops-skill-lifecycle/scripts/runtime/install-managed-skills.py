@@ -32,6 +32,7 @@ scripts_root = str(pathlib.Path(__file__).resolve().parents[1])
 sys.path.insert(0, scripts_root)
 try:
     from runtime import managed_runtime_builder as runtime_builder
+    from runtime import prepare_python_runtime as python_environments
 finally:
     sys.path.remove(scripts_root)
 
@@ -599,7 +600,7 @@ def runtime_inventory(runtime_root: pathlib.Path) -> dict[str, object]:
     if runtime_root.is_dir():
         for skill_dir in sorted(runtime_root.iterdir()):
             if (
-                runtime_builder._unsafe_link(skill_dir)
+                python_environments.is_runtime_link(skill_dir)
                 or not skill_dir.is_dir()
                 or not (skill_dir / MANIFEST_NAME).is_file()
             ):
