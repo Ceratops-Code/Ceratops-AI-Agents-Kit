@@ -114,7 +114,7 @@ MCP server identifiers keep the exact project name, including underscores;
 other SDLC deliverable names remain hyphenated.
 The manager owns artifacts, isolated environments, selection, locks, and bounded
 retention under `$HOME/.codex/mcp/source_search_mcp`: activation keeps the selected
-version and at most two inactive predecessors, deferring live leased environments.
+version and at most one inactive predecessor, deferring live leased environments.
 The server itself writes no search state. `--deployment-check` reports installed
 package metadata, local ripgrep readiness, and the canonical tool schemas;
 `--mcp` starts STDIO. Both are transport administration, not extra search tools.
@@ -228,6 +228,27 @@ Use `scripts/deploy-hooks.py` when runtime installation is intended. Editing
 this source does not change an already installed helper.
 
 ## Decision Model
+
+The command runner and native probes share
+`command-probe.py::worktree_command_environment()`. Before starting a command,
+it derives `<repo-parent>/tmp/<repo-name>/<worktree-folder-name>` from Git and
+supplies `CERATOPS_TASK_TEMP_ROOT`, `TEMP`, `TMP`, and `TMPDIR` to the child.
+A child executing in the primary checkout retains its inherited task directory;
+starting in another worktree selects that worktree's directory. Commands with
+neither a Git checkout nor an originating worktree keep their existing
+environment. No generated machine path is written to tracked configuration.
+
+The initializer owns one directory container per registered worktree, creates
+it when first needed, and reuses it after interruption. Commands own their
+scratch and report contents and their cleanup. Worktree retirement remains
+owned by the existing task cleanup workflow; initialization never sweeps other
+worktrees' output. Shell execution and native probes both receive the same
+environment, including simple commands routed by the hook.
+
+The hook passes the session's original checkout path through its internal
+`--task-worktree` argument. That context survives a command starting in the
+primary checkout. An explicit command directory in another linked worktree
+selects that worktree; a non-repository chat falls back to the command directory.
 
 Hook mode first recognizes only closed, static read-only probe forms. It routes
 standalone `rg`, exact Git ref and ancestor probes, and exact

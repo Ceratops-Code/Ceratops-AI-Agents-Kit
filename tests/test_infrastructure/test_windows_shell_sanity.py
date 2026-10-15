@@ -18,6 +18,8 @@ from unittest import mock
 
 import pytest
 
+from tests.support.repositories import run_git
+
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "hooks" / "windows-shell-sanity.py"
 SPEC = importlib.util.spec_from_file_location("windows_shell_sanity", SCRIPT)
@@ -34,7 +36,187 @@ sys.modules[PROBE_SPEC.name] = PROBE
 PROBE_SPEC.loader.exec_module(PROBE)
 
 
+def make_environment_worktree(root):
+    primary = root / "example"
+    primary.mkdir()
+    for arguments in (
+        ("init", "-b", "main"),
+        ("config", "user.email", "tests@example.invalid"),
+        ("config", "user.name", "Environment tests"),
+        ("commit", "--allow-empty", "-m", "fixture"),
+    ):
+        assert run_git(primary, *arguments).returncode == 0
+    worktree = root / "worktrees" / primary.name / "task-one"
+    assert run_git(primary, "worktree", "add", "-b", "task-one", str(worktree)).returncode == 0
+    return primary, worktree, root / "tmp" / primary.name / worktree.name
+
+
+def test_worktree_environment_computes_all_temp_values_and_preserves_other_values(tmp_path):
+    _, worktree, expected = make_environment_worktree(tmp_path)
+    baseline = {**os.environ, "KEEP_SENTINEL": "keep"}
+    first = PROBE.worktree_command_environment(str(worktree), baseline)
+    second = PROBE.worktree_command_environment(str(worktree), first)
+    assert first == second
+    assert baseline["KEEP_SENTINEL"] == first["KEEP_SENTINEL"] == "keep"
+    for name in ("CERATOPS_TASK_TEMP_ROOT", "TEMP", "TMP", "TMPDIR"):
+        assert first[name] == str(expected)
+    assert expected.is_dir() and not list(expected.iterdir())
+
+
+def test_worktree_environment_preserves_task_in_primary_and_switches_for_other_worktree(tmp_path):
+    primary, worktree, expected = make_environment_worktree(tmp_path)
+    first = PROBE.worktree_command_environment(str(worktree))
+    assert PROBE.worktree_command_environment(str(primary), first) == first
+    other = worktree.with_name("task-two")
+    assert run_git(primary, "worktree", "add", "-b", "task-two", str(other)).returncode == 0
+    second = PROBE.worktree_command_environment(str(other), first)
+    assert second["CERATOPS_TASK_TEMP_ROOT"] == str(expected.with_name("task-two"))
+    assert first["CERATOPS_TASK_TEMP_ROOT"] == str(expected)
+
+
+def test_worktree_environment_primary_session_uses_explicit_worktree_command_directory(tmp_path):
+    primary, worktree, expected = make_environment_worktree(tmp_path)
+    environment = PROBE.worktree_command_environment(str(worktree), task_worktree=str(primary))
+    assert environment["CERATOPS_TASK_TEMP_ROOT"] == str(expected)
+
+
+def test_worktree_environment_explicit_linked_worktree_selects_its_own_directory(tmp_path):
+    primary, worktree, expected = make_environment_worktree(tmp_path)
+    other = worktree.with_name("task-two")
+    assert run_git(primary, "worktree", "add", "-b", "task-two", str(other)).returncode == 0
+    environment = PROBE.worktree_command_environment(str(other), task_worktree=str(worktree))
+    assert environment["CERATOPS_TASK_TEMP_ROOT"] == str(expected.with_name("task-two"))
+
+
+@pytest.mark.parametrize("interrupt_after", [False, True])
+def test_worktree_environment_repeats_after_interrupted_directory_creation(
+    tmp_path, monkeypatch, interrupt_after,
+):
+    _, worktree, expected = make_environment_worktree(tmp_path)
+    original = pathlib.Path.mkdir
+
+    def interrupted(selected, *args, **kwargs):
+        if selected != expected:
+            return original(selected, *args, **kwargs)
+        if interrupt_after:
+            original(selected, *args, **kwargs)
+        raise KeyboardInterrupt("task directory creation interrupted")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(pathlib.Path, "mkdir", interrupted)
+        with pytest.raises(KeyboardInterrupt):
+            PROBE.worktree_command_environment(str(worktree))
+    for _ in range(2):
+        assert PROBE.worktree_command_environment(str(worktree))["CERATOPS_TASK_TEMP_ROOT"] == str(expected)
+    assert not list(expected.iterdir())
+
+
+def test_worktree_environment_replaces_foreign_inheritance_without_touching_foreign_directory(tmp_path):
+    primary, _, expected = make_environment_worktree(tmp_path)
+    foreign = tmp_path / "unrelated" / "task-one"
+    environment = PROBE.worktree_command_environment(str(primary), {
+        **os.environ, "CERATOPS_TASK_TEMP_ROOT": str(foreign),
+    })
+    assert environment["CERATOPS_TASK_TEMP_ROOT"] == str(expected.with_name(primary.name))
+    assert not foreign.exists()
+
+
+@pytest.mark.parametrize("duplicate_primary", [False, True])
+def test_worktree_environment_rejects_two_worktrees_sharing_one_temp_directory_name(tmp_path, duplicate_primary):
+    primary, worktree, expected = make_environment_worktree(tmp_path)
+    duplicate = worktree.with_name(primary.name) if duplicate_primary else worktree.parent / "nested" / worktree.name
+    assert run_git(primary, "worktree", "add", "-b", "duplicate-name", str(duplicate)).returncode == 0
+    baseline = dict(os.environ)
+    baseline.pop("CERATOPS_TASK_TEMP_ROOT", None)
+    for caller in (primary if duplicate_primary else worktree, duplicate):
+        with pytest.raises(PROBE.ProbeError, match="exactly one registered worktree"):
+            PROBE.worktree_command_environment(str(caller), baseline)
+    assert not expected.with_name(duplicate.name).exists()
+
+
+def test_worktree_environment_non_repository_preserves_environment_without_output(tmp_path):
+    baseline = {**os.environ, "KEEP_SENTINEL": "keep"}
+    assert PROBE.worktree_command_environment(str(tmp_path), baseline) == baseline
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("originating_checkout", ["primary", "worktree"])
+def test_worktree_environment_preserves_origin_outside_repository(tmp_path, originating_checkout):
+    primary, worktree, expected = make_environment_worktree(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    origin = primary if originating_checkout == "primary" else worktree
+    environment = PROBE.worktree_command_environment(str(outside), task_worktree=str(origin))
+    assert environment["CERATOPS_TASK_TEMP_ROOT"] == str(expected.with_name(origin.name))
+
+
+def test_worktree_environment_reaches_native_child_process(tmp_path):
+    _, worktree, expected = make_environment_worktree(tmp_path)
+    environment = PROBE.worktree_command_environment(str(worktree))
+    completed = PROBE._run([
+        sys.executable, "-c",
+        "import json,os; print(json.dumps({k:os.environ[k] for k in "
+        "('CERATOPS_TASK_TEMP_ROOT','TEMP','TMP','TMPDIR')}))",
+    ], environment=environment)
+    assert completed.returncode == 0, completed.stderr
+    assert set(json.loads(completed.stdout).values()) == {str(expected)}
+
+
+def test_worktree_environment_is_supplied_by_probe_cli(tmp_path, monkeypatch, capsys):
+    primary, worktree, expected = make_environment_worktree(tmp_path)
+    monkeypatch.chdir(primary)
+    supplied = []
+
+    def probe(_argv, **kwargs):
+        supplied.append(kwargs["environment"])
+        return subprocess.CompletedProcess(_argv, 0, "match", "")
+
+    monkeypatch.setattr(PROBE, "_run", probe)
+    request = {"schema": PROBE.REQUEST_SCHEMA, "mode": "search", "argv": ["rg", "match"]}
+    encoded = base64.b64encode(json.dumps(request).encode()).decode()
+    assert PROBE.main(["--task-worktree", str(worktree), "--encoded-request", encoded]) == 0
+    assert json.loads(capsys.readouterr().out)["ok"]
+    assert supplied[0]["CERATOPS_TASK_TEMP_ROOT"] == str(expected)
+
+
+@pytest.mark.skipif(shutil.which("powershell") is None, reason="Windows PowerShell required")
+def test_worktree_environment_survives_primary_checkout_in_public_shell_command(tmp_path):
+    primary, worktree, expected = make_environment_worktree(tmp_path)
+    command = (
+        "Set-Location -LiteralPath '" + str(primary).replace("'", "''") + "'\n"
+        "@{root=$env:CERATOPS_TASK_TEMP_ROOT; temp=$env:TEMP; tmp=$env:TMP; "
+        "tmpdir=$env:TMPDIR} | ConvertTo-Json -Compress"
+    )
+    completed = subprocess.run(
+        [sys.executable, str(SCRIPT), "--command", command],
+        cwd=worktree, capture_output=True, text=True, check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert set(json.loads(completed.stdout).values()) == {str(expected)}
+
+
+@pytest.mark.skipif(shutil.which("powershell") is None, reason="Windows PowerShell required")
+def test_worktree_environment_uses_task_origin_when_shell_starts_in_primary(tmp_path):
+    primary, worktree, expected = make_environment_worktree(tmp_path)
+    completed = subprocess.run([
+        sys.executable, str(SCRIPT), "--task-worktree", str(worktree),
+        "--cwd", str(primary), "--command", "Write-Output $env:CERATOPS_TASK_TEMP_ROOT",
+    ], cwd=primary, capture_output=True, text=True, check=False)
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == str(expected)
+
+
 class WindowsShellSanityTests(unittest.TestCase):
+    def setUp(self):
+        # The real Git/process tests above cover environment setup. These unit
+        # tests mock only PowerShell and must not intercept Git metadata calls.
+        context = mock.patch.object(
+            SANITY, "_worktree_environment",
+            side_effect=lambda _cwd, environment, _task=None: environment,
+        )
+        context.start()
+        self.addCleanup(context.stop)
+
     @staticmethod
     def hook_result(
         command: str,
@@ -804,7 +986,8 @@ class ProjectPythonRedirectionTests(unittest.TestCase):
         ):
             payload = WindowsShellSanityTests.hook_result(command, cwd=str(cwd))
 
-        self.assertIsNone(payload)
+        assert payload is not None
+        self.assertEqual(WindowsShellSanityTests.rewritten_command(payload), command)
 
     def test_existing_utf8_rewrite_composes_with_python_substitution(self):
         cwd = self.project_paths["Docs-and-Claims"]["main"]
@@ -948,7 +1131,8 @@ class ProjectPythonRedirectionTests(unittest.TestCase):
                 cwd=str(self.out_of_scope_repository),
             )
 
-        self.assertIsNone(payload)
+        assert payload is not None
+        self.assertEqual(WindowsShellSanityTests.rewritten_command(payload), command)
 
 
 class TestHookDeployment:
@@ -995,7 +1179,10 @@ class TestHookDeployment:
                 for handler in group["hooks"]:
                     executed = self.run_handler(handler, event, tmp_path)
                     assert executed.returncode == 0, executed.stderr
-                    assert executed.stdout.strip() in {"", "OK"}
+                    if executed.stdout.strip() not in {"", "OK"}:
+                        output = json.loads(executed.stdout)["hookSpecificOutput"]
+                        assert output["permissionDecision"] == "allow"
+                        assert WindowsShellSanityTests.rewritten_command({"hookSpecificOutput": output}) == "Write-Output hello"
                     registered += 1
         assert registered == (5 if os.name == "nt" else 4)
         first = config["hooks"]["PreToolUse"][0]["hooks"][0]

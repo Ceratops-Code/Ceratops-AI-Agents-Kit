@@ -19,10 +19,11 @@ import ntpath
 import os
 import pathlib
 import re
+import runpy
 import subprocess
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Sequence
 
 ANNOTATE = "annotate-on-failure"
 BLOCK = "block"
@@ -132,13 +133,13 @@ NEW_ITEM_LITERALPATH_RE = re.compile(
     r"\bNew-Item\b[^\r\n;|]*\s-LiteralPath\b",
     re.IGNORECASE,
 )
-PS_PATH_TOKEN = (
+PS_PATH_PATTERN = (
     r"(?:'(?:''|[^'])*'|\"(?:`\"|[^\"])*\"|"
     r"\$[A-Za-z_][\w:]*|[^\s;|)]+)"
 )
 NEW_ITEM_LITERALPATH_VALUE_RE = re.compile(
     rf"\bNew-Item\b[^\r\n;|]*?\s(?P<parameter>-LiteralPath)\s+"
-    rf"(?P<path>{PS_PATH_TOKEN})",
+    rf"(?P<path>{PS_PATH_PATTERN})",
     re.IGNORECASE,
 )
 SELECT_INDEX_BARE_RANGE_RE = re.compile(
@@ -156,7 +157,7 @@ POWERSHELL_RANGE_LIST_RE = re.compile(
 )
 UNGUARDED_TEST_PATH_READ_RE = re.compile(
     rf"\bTest-Path\b[^\r\n;|]*\s-LiteralPath\s+"
-    rf"(?P<path>{PS_PATH_TOKEN})[^\r\n;|]*"
+    rf"(?P<path>{PS_PATH_PATTERN})[^\r\n;|]*"
     rf"(?:;|\r?\n)\s*\bGet-Content\b[^\r\n;|]*"
     rf"\s-LiteralPath\s+(?P=path)(?:\s|;|\||$)",
     re.IGNORECASE,
@@ -585,6 +586,11 @@ def requires_utility_module_preflight(command: str, powershell: str) -> bool:
     )
 
 
+def _worktree_environment(cwd: str | None, environment: dict[str, str] | None, task_worktree: str | None = None) -> dict[str, str]:
+    probe = runpy.run_path(str(pathlib.Path(__file__).with_name(COMMAND_PROBE_NAME)))
+    return probe["worktree_command_environment"](cwd, environment, task_worktree=task_worktree)
+
+
 def _static_probe_pipeline(command: str) -> list[list[str]] | None:
     """Parse the closed literal PowerShell subset accepted for command probes."""
 
@@ -697,16 +703,17 @@ def probe_request_for_command(command: str) -> dict[str, object] | None:
     return None
 
 
-def wrapped_probe_request(request: dict[str, object]) -> str:
+def wrapped_probe_request(request: dict[str, object], task_worktree: str | None = None) -> str:
     """Encode one validated-shape probe request for the sibling helper."""
 
     encoded = base64.b64encode(
         json.dumps(request, separators=(",", ":"), sort_keys=True).encode("utf-8")
     ).decode("ascii")
     helper = pathlib.Path(__file__).resolve().with_name(COMMAND_PROBE_NAME)
+    task_option = f"--task-worktree {powershell_quote(task_worktree)} " if task_worktree else ""
     return (
         f"& {powershell_quote(sys.executable)} {powershell_quote(str(helper))} "
-        f"--encoded-request {powershell_quote(encoded)}"
+        f"{task_option}--encoded-request {powershell_quote(encoded)}"
     )
 
 
@@ -986,7 +993,7 @@ def plan_python_redirects(
     return rewrites
 
 
-def wrapped_command(command: str, interpreter: str | None = None) -> str:
+def wrapped_command(command: str, interpreter: str | None = None, task_worktree: str | None = None) -> str:
     """Encode a command so the hook rewrite cannot execute its syntax."""
 
     encoded = base64.b64encode(command.encode("utf-8")).decode("ascii")
@@ -994,9 +1001,10 @@ def wrapped_command(command: str, interpreter: str | None = None) -> str:
     wrapper_python = interpreter or sys.executable
     # Legacy Windows PowerShell loses embedded quotes when invoking Python.
     shell_option = "--powershell pwsh " if interpreter is not None else ""
+    task_option = f"--task-worktree {powershell_quote(task_worktree)} " if task_worktree else ""
     return (
         f"& {powershell_quote(wrapper_python)} {powershell_quote(script)} "
-        f"{shell_option}--encoded-command {powershell_quote(encoded)}"
+        f"{task_option}{shell_option}--encoded-command {powershell_quote(encoded)}"
     )
 
 
@@ -1019,11 +1027,13 @@ def is_wrapped_command(command: str) -> bool:
         for script, argument in scripts:
             prefix = (
                 f"& {powershell_quote(interpreter)} {powershell_quote(script)} "
-                f"{argument} "
             )
             if not command.startswith(prefix):
                 continue
-            encoded = command[len(prefix) :]
+            remaining = re.sub(r"^--task-worktree '(?:[^']|'')*' ", "", command[len(prefix):], count=1)
+            if not remaining.startswith(argument + " "):
+                continue
+            encoded = remaining[len(argument) + 1:]
             if (
                 len(encoded) < 3
                 or not encoded.startswith("'")
@@ -1074,6 +1084,7 @@ def run_hook() -> int:
     if is_wrapped_command(command):
         return 0
 
+    task_worktree = event.get("cwd") if isinstance(event.get("cwd"), str) else None
     probe_request = probe_request_for_command(command)
     if probe_request is not None:
         helper = pathlib.Path(__file__).resolve().with_name(COMMAND_PROBE_NAME)
@@ -1091,7 +1102,7 @@ def run_hook() -> int:
             )
             return 0
         updated_input = dict(tool_input)
-        updated_input["command"] = wrapped_probe_request(probe_request)
+        updated_input["command"] = wrapped_probe_request(probe_request, task_worktree)
         print(
             json.dumps(
                 hook_payload("allow", updatedInput=updated_input),
@@ -1184,11 +1195,13 @@ def run_hook() -> int:
         analysis.command != command
         or _annotations(analysis.findings)
         or should_route_through_helper(analysis.command)
+        or isinstance(event.get("cwd"), str)
     ):
         updated_input = dict(tool_input)
         updated_input["command"] = wrapped_command(
             analysis.command,
             pc_python,
+            task_worktree,
         )
         fields: dict[str, object] = {"updatedInput": updated_input}
         if python_redirected:
@@ -1305,10 +1318,19 @@ def execute_powershell(
     cwd: str | None,
     powershell: str,
     annotations: Sequence[dict[str, str]] = (),
+    task_worktree: str | None = None,
 ) -> int:
     """Execute one command and append matched guidance only after failure."""
 
     environment = windows_powershell_environment(powershell)
+    try:
+        environment = _worktree_environment(cwd, environment, task_worktree)
+    except (OSError, ValueError, RuntimeError) as exc:
+        print(json.dumps({
+            "ok": False, "operation": "worktree_environment",
+            "target": cwd or str(pathlib.Path.cwd()), "error": str(exc),
+        }, sort_keys=True), file=sys.stderr)
+        return 2
     if requires_utility_module_preflight(command, powershell):
         preflight = base64.b64encode(
             _without_progress(POWERSHELL_UTILITY_PREFLIGHT).encode("utf-16le")
@@ -1412,6 +1434,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON errors.")
     parser.add_argument("--cwd", help="Working directory for command execution.")
+    parser.add_argument("--task-worktree", help="Original task directory supplied by the hook.")
     parser.add_argument(
         "--powershell",
         default="powershell",
@@ -1455,6 +1478,7 @@ def main(argv: list[str] | None = None) -> int:
         args.cwd,
         args.powershell,
         _annotations(analysis.findings),
+        task_worktree=args.task_worktree,
     )
 
 

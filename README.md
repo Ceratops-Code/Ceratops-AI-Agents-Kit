@@ -663,6 +663,13 @@ ambiguous directories cannot authorize report writes or deletion. The existing
 caller-selected layout applies when the variable is absent; this reader does
 not initialize the command environment.
 
+The shared command runner initializes this value automatically through
+`hooks/command-probe.py::worktree_command_environment()`, for both shell commands
+and native probes. It derives the task directory from the actual Git worktree,
+supplies the same directory through `TEMP`, `TMP`, and `TMPDIR`, and preserves the
+task context when a child executes in the primary checkout. Each producer owns
+its files and cleanup; initialization only owns the reusable directory container.
+
 `command.py` writes complete secret-redacted failures directly to that file
 before returning a short error with `diagnostic_output`. It references existing
 successful test/build result files without copying them. An existing complete
