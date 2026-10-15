@@ -236,8 +236,15 @@ operations perform declared setup, and uv prepares the environment for commands
 invoked through it. SDLC v4/v5 handoffs name a skill/action. For skill callers,
 the engine resolves the installed skill's `references/action-executors.json` and
 runs its declared argv or ordered steps through `execute_skill_actions.py`.
-Each action keeps its ordinary `run` or `steps`; an optional `selected-skill`
-object declares a separate `run` or `steps` for requests containing `inputs.skill`.
+Each action declares `run`, ordered `steps`, or an explicit Python `call`.
+A `call` names its skill-relative `path`, public `function`, `request` type and
+CLI `args`; the existing parser supplies that request, and the same callable
+serves the standalone CLI. This form shares the caller's release lock instead
+of starting an installer process that would compete with its parent.
+Installed calls require the caller's interpreter to match the skill's pinned
+runtime. An optional `selected-skill` object declares a separate form for
+requests containing `inputs.skill`; `selected-mcp-server` supplies
+`{mcp_server}` for MCP installation.
 Only that explicit input supplies `{skill}`. Missing or malformed selected-skill
 commands return `handoff_required` before any command runs, never an all-skills
 fallback. The runner checks every selected command first and does not recognize
@@ -660,12 +667,21 @@ Step 6D handles test-runner-owned reports; 20C/21 connect explicit request
 abandonment/replacement and worktree removal, which are separate cleanup triggers.
 No scheduled cleaner or additional acceptance checks are introduced.
 
-The 2B/3/4 batch remains unmerged through 4C: 3C and 4 connect the remaining
-handoffs, cleanup and installation-lock ordering. Do not promote or deploy it
-before that combined exit. No general task-worktree
-lock is introduced. 4A removes checkpoint locks and completion-triggered scans
-of other worktrees' requests; installer
-destination locks and optional automatic child cleanup are later work.
+4C places installation after completed promotion, outside the code that can
+restore the previous release commit. Plain Promote unlocks after its local
+cleanup. Promote-and-deploy retains release protection while the current
+installer reads that exact selected commit; installation failure reports the
+completed promotion and never reverses it or retries installation. Ship retains
+its outer lock through its current installation and cleanup. Standalone skill/MCP
+installation protects the release source too, but never locks a task worktree.
+The existing installer takes its destination lock inside release protection;
+it cannot start Promote/Ship while holding that destination lock. Explicit
+in-process installer calls share ownership with Promote, Ship and fast-change.
+The combined 2B/3A–3C/4A–4C tests gate promotion/deployment of this batch.
+Artifact-only installation remains steps 17–19/22/27B: only then can deployment
+stop reading the checkout and release protection end before installation.
+4A removes checkpoint locks and scans of other worktrees' requests; optional
+automatic child cleanup remains later work.
 See [Release locking and unfinished operations](docs/design-draft.md#release-locking-and-unfinished-operations).
 
 `uv run --locked` is unrelated: it requires the existing dependency versions

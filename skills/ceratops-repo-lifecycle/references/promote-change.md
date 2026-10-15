@@ -63,6 +63,19 @@ and the existing explicit recovery requirement. Clearing it neither accepts
 failed work nor deletes checkpoints. Complete report forwarding is implemented;
 new phase scheduling and receipt-driven remote work remain later steps.
 
+Installation runs after promotion has completed, outside the code that can
+restore the previous release commit. Plain Promote finishes local cleanup and
+unlocks. Promote-and-deploy retains the lock while today's installer reads the
+already selected commit; it does not select a newer one. Installation failure
+reports the completed promotion and original cause without undoing promotion
+or retrying installation. Composed Ship keeps the outer lock through its own
+installation and cleanup. Standalone skill/MCP installation protects a release
+source too, never a task worktree. Installers take their destination locks only
+after release protection, and never invoke Promote/Ship inside them. Explicit
+Python action declarations call the same installer used by its CLI, sharing
+outer ownership without filename-based dispatch. Artifact-only installation
+and earlier release unlock remain steps 17–19/22/27B.
+
 Each task worktree belongs to one thread; ordinary editing, checks and builds
 take no worktree or checkpoint lock. Shared request storage now removes only
 its own completed request, never another worktree's records. Release locks,

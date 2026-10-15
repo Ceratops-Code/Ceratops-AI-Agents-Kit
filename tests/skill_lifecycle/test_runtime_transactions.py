@@ -66,12 +66,15 @@ def test_installer_forwards_completed_sibling_receipts_without_reinstalling(
     monkeypatch.setitem(main_globals, "_check_deployment_sources", lambda *args: None)
     effects = []
     finalizations = []
+    run_command = subprocess.run
 
     def install(*args, **kwargs):
         effects.append("install")
         return builder.TransactionResult("ok", ("alpha-tool",), (), "transaction")
 
     def finalize(argv, **kwargs):
+        if argv[0] == "git":
+            return run_command(argv, **kwargs)
         finalizations.append((argv, kwargs["input"]))
         if failure == "before-finalize":
             raise OSError("finalizer unavailable")
@@ -143,6 +146,8 @@ def test_runtime_installer_releases_installed_working_directory(
         installed_skill / "scripts",
         dirs_exist_ok=True,
     )
+    shutil.copy2(ROOT / "skills/sections/scripts/hold_write_lock.py",
+                 installed_skill / "scripts/hold_write_lock.py")
     source = repo / "skills" / skill / "SKILL.md"
     source.write_text(
         source.read_text(encoding="utf-8") + "\nRepository update.\n",
@@ -487,7 +492,8 @@ def test_write_lock_cleanup_failure_preserves_original_error(
 ):
     path = tmp_path / "release-local"
     original = ValueError("required check failed")
-    original.payload = {"status": "error", "message": str(original)}
+    payload = {"status": "error", "message": str(original)}
+    original.__dict__["payload"] = payload
     save = write_locks._save_unfinished
     unlock = write_locks.unlock_descriptor
     close = write_locks.os.close
@@ -517,10 +523,11 @@ def test_write_lock_cleanup_failure_preserves_original_error(
                 owned.complete(commands_stopped=True)
     assert raised.value is original
     assert str(raised.value) == "required check failed"
-    assert original.cleanup_errors == original.payload["cleanup_errors"]
-    assert original.__notes__ and original.cleanup_errors
+    cleanup_errors = original.__dict__["cleanup_errors"]
+    assert cleanup_errors == payload["cleanup_errors"]
+    assert original.__notes__ and cleanup_errors
     if failure == "unlock_and_close":
-        assert original.cleanup_errors == [
+        assert cleanup_errors == [
             "OSError: injected unlock failure", "OSError: injected close failure",
         ]
     assert path.read_bytes() == (b"1" if failure == "clear" else b"0")

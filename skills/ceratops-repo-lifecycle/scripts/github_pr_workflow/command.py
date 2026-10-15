@@ -45,6 +45,10 @@ _SUCCESS_STATES = {
 class CommandError(RuntimeError):
     """A required command failed; its complete captured result remains available."""
 
+    cleanup_errors: list[str]
+    release_not_started: bool
+    payload: dict[str, Any]
+
     def __init__(
         self, message: str, *, completed: subprocess.CompletedProcess[str] | None = None,
     ) -> None:
@@ -83,7 +87,7 @@ def track_command_completion():
     try:
         yield
     except BaseException as exc:
-        exc.local_commands_stopped = False
+        exc.__dict__["local_commands_stopped"] = False
         if completion is not None:
             completion.uncertain = True
         raise
@@ -630,7 +634,7 @@ def capture_failure_report(
                 raise
             if isinstance(payload.get("blocker"), dict) and payload["blocker"].get("kind") == "review_threads":
                 raise
-            cause = exc
+            cause: BaseException | None = exc
             seen = set()
             causes = []
             completed = None
@@ -650,7 +654,7 @@ def capture_failure_report(
             if completed is not None:
                 payload["command"] = completed.args
                 payload["exit_code"] = completed.returncode
-            exc.payload = report_failure(
+            exc.__dict__["payload"] = report_failure(
                 payload, diagnostic_output=diagnostic_output, repo_root=repo_root,
                 action=action, failure_id=failure_id,
                 stdout=completed.stdout if completed else None,

@@ -11,6 +11,7 @@ import sys
 from contextlib import nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -317,13 +318,14 @@ def test_wrapped_command_failure_keeps_original_output_and_cleanup_cause(report_
             raise error
         except command.CommandError as cause:
             outer = RuntimeError("rollback also failed")
-            outer.cleanup_errors = ["cleanup cause"]
+            outer.__dict__["cleanup_errors"] = ["cleanup cause"]
             raise outer from cause
     report = json.loads(path.read_text())["failures"]["promote"]
     assert report["command_output"]["stdout"] == completed.stdout
     assert report["cleanup_errors"] == ["cleanup cause"]
-    assert caught.value.payload["diagnostic_output"] == str(path)
-    assert "causes" not in caught.value.payload
+    payload = caught.value.__dict__["payload"]
+    assert payload["diagnostic_output"] == str(path)
+    assert "causes" not in payload
 
 
 @pytest.mark.parametrize("module,extra", [
@@ -376,7 +378,7 @@ def test_operation_list_saves_large_failure_and_preserves_prior_success(report_r
     repo, path = report_repo
     accepted = repo / "accepted.json"
     accepted.write_text("original accepted bytes", encoding="utf-8")
-    receipt = {"schema": "example-result.v1", "status": "passed", "path": str(accepted)}
+    receipt: dict[str, Any] = {"schema": "example-result.v1", "status": "passed", "path": str(accepted)}
     if reference_kind != "receipt":
         receipt = {
             "schema": "example-result.v1",

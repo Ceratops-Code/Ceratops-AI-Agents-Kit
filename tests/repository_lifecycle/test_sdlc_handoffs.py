@@ -3307,7 +3307,7 @@ def test_registered_skill_executor_uses_installed_authorized_source_bundle(
 
 @pytest.mark.parametrize("failure", [None, "candidate", "missing_manager"])
 @pytest.mark.parametrize("selected_mcp_server", [None, "sample-mcp-server"])
-def test_tool_install_binding_uses_checkout_metadata_and_propagates_failures(
+def test_mcp_install_binding_passes_checkout_and_server_to_callable(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
     failure: str | None,
@@ -3323,19 +3323,19 @@ def test_tool_install_binding_uses_checkout_metadata_and_propagates_failures(
     source = tmp_path / "repo with spaces & punctuation/skills/ceratops-mcp-server-lifecycle"
     (source / "references").mkdir(parents=True)
     shutil.copyfile(skill / "action-executors.json", source / "references/action-executors.json")
+    (source / "scripts").mkdir()
+    (source / "scripts/install-mcp-server.py").write_text("# Callable replaced by the test.\n")
     monkeypatch.setenv("CODEX_HOME", str(tmp_path))
     repo = tmp_path / "repo with spaces & punctuation"
     calls = []
 
-    def run(argv, **kwargs):
-        calls.append((argv, kwargs))
+    def run(root, declaration, argv):
+        calls.append((root, declaration, argv))
         if failure == "missing_manager":
             raise FileNotFoundError("manager launcher missing")
-        return subprocess.CompletedProcess(
-            argv, 7 if failure else 0, "OK\n", "candidate failed" if failure else ""
-        )
+        return {"status": "failed" if failure else "completed", "message": "candidate failed"}
 
-    monkeypatch.setattr(handoffs, "run_progress_command", run)
+    monkeypatch.setattr(handoffs, "_call_action", run)
     inputs = (
         {
             "mcp-server": selected_mcp_server,
@@ -3350,19 +3350,13 @@ def test_tool_install_binding_uses_checkout_metadata_and_propagates_failures(
         inputs=inputs,
     )
     assert result["status"] == ("operation_failed" if failure else "completed")
-    expected = [
-        sys.executable,
-        "-I",
-        "-B",
-        str(source) + "/scripts/install-mcp-server.py",
-        "--repo-root",
-        str(repo),
-    ]
+    expected = ["--repo-root", str(repo)]
     if selected_mcp_server is not None:
         expected.extend(["--mcp-server-name", selected_mcp_server])
-    assert calls[0][0] == expected
-    assert calls[0][1]["cwd"] == repo
-    assert not calls[0][1].get("shell", False)
+    assert calls[0][0] == source
+    assert calls[0][1]["function"] == "install_mcp_server"
+    assert calls[0][1]["request"] == "InstallOptions"
+    assert calls[0][2] == expected
 
 
 def test_tool_install_binding_rejects_unknown_structured_inputs(
@@ -3666,7 +3660,7 @@ def test_declared_skill_selection_checks_entire_form_before_any_effect(
     tmp_path, monkeypatch, action, problem,
 ):
     ordinary = {"run": _declared_skill_argv(action, "all", selected=False)}
-    targeted = {"steps": [
+    targeted: dict[str, Any] = {"steps": [
         {"run": _declared_skill_argv(action, "first", selected=True)},
         {"run": _declared_skill_argv(action, "second", selected=True)},
     ]}
@@ -3786,7 +3780,7 @@ def test_declared_skill_fresh_calls_keep_selection_after_interruption(
 def _registered_skill_fixture(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> pathlib.Path:
-    """Use real subprocesses with fixture lifecycle CLIs that enforce selection."""
+    """Use the declared command/call forms with fixtures that enforce selection."""
     repo = tmp_path / "source"
     source = repo / "skills/ceratops-skill-lifecycle"
     installed = tmp_path / "codex/skills/ceratops-skill-lifecycle"
@@ -3798,23 +3792,28 @@ def _registered_skill_fixture(
         (skill / "references/action-executors.json").write_bytes(binding)
     (source / "scripts/runtime").mkdir(parents=True)
     probe = """import argparse, json, pathlib, subprocess
-parser = argparse.ArgumentParser()
-parser.add_argument('--repo-root', type=pathlib.Path, required=True)
-parser.add_argument('--mode')
-parser.add_argument('--skill', required=True)
-args = parser.parse_args()
-with (args.repo_root / 'calls.jsonl').open('a') as stream:
-    stream.write(json.dumps({'mode': args.mode, 'skill': args.skill}) + chr(10))
-if args.mode is not None:
-    assert args.mode == 'skill'
-else:
+from types import SimpleNamespace as DeployOptions
+def build_parser():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--repo-root', type=pathlib.Path, required=True)
+    parser.add_argument('--mode')
+    parser.add_argument('--skill', required=True)
+    return parser
+def deploy_managed_skills(args):
+    with (args.repo_root / 'calls.jsonl').open('a') as stream:
+        stream.write(json.dumps({'mode': args.mode, 'skill': args.skill}) + chr(10))
+    if args.mode is not None:
+        assert args.mode == 'skill'
+        return 'OK'
     commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=args.repo_root, text=True).strip()
-    print(json.dumps({'schema': 'ceratops-deployment-completion.v1',
+    return {'schema': 'ceratops-deployment-completion.v1',
         'producer': 'ceratops-skill-lifecycle/deploy', 'status': 'completed',
         'repo_root': str(args.repo_root), 'commit': commit,
         'install_root': str(args.repo_root.parent / 'installed'),
         'deployed': [args.skill], 'removed': [], 'transaction_id': 'a' * 32,
-        'cleanup_debt': [], 'promotion': None}))
+        'cleanup_debt': [], 'promotion': None}
+if __name__ == '__main__':
+    print(json.dumps(deploy_managed_skills(build_parser().parse_args())))
 """
     for script in (
         "scripts/skills-consistency-source-validator.py",
@@ -3934,23 +3933,17 @@ def test_v4_skill_handoff_rejects_unsafe_or_unhandled_work_before_deployment(
     elif problem == "dirty_source":
         (repo / "uncommitted.txt").write_text("must not deploy")
     else:
-        original = skill_actions.run_progress_command
+        original = skill_actions._call_action
 
-        def changing(argv, **kwargs):
-            result = original(argv, **kwargs)
-            if any(
-                str(part).endswith("install-managed-skills.py")
-                for part in argv
-            ):
-                subprocess.run(
-                    ["git", "commit", "--allow-empty", "-m", "Concurrent change"],
-                    cwd=repo,
-                    capture_output=True,
-                    check=True,
-                )
+        def changing(root, declaration, argv):
+            result = original(root, declaration, argv)
+            subprocess.run(
+                ["git", "commit", "--allow-empty", "-m", "Concurrent change"],
+                cwd=repo, capture_output=True, check=True,
+            )
             return result
 
-        monkeypatch.setattr(skill_actions, "run_progress_command", changing)
+        monkeypatch.setattr(skill_actions, "_call_action", changing)
     result = runner.execute_prepared_operation(prepared)
     assert result["status"] == (
         "state_changed"

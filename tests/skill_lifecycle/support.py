@@ -25,7 +25,7 @@ FAST_CHANGE = LIFECYCLE_SOURCE / "scripts" / "fast-change.py"
 SKILL_UPDATE_WORKFLOW = LIFECYCLE_SOURCE / "scripts" / "skill-update-workflow.py"
 RUNTIME_MANIFEST = ".runtime-manifest.json"
 RUNTIME_MANIFEST_SCHEMA = "ceratops-runtime-skill.v3"
-INSTALLER_VERSION = 18
+INSTALLER_VERSION = 19
 
 
 def prepare_fast_change_repo(tmp_path: pathlib.Path) -> pathlib.Path:
@@ -69,11 +69,18 @@ def prepare_fast_change_repo(tmp_path: pathlib.Path) -> pathlib.Path:
     )
     runtime.mkdir(parents=True)
     (runtime / "install-managed-skills.py").write_text(
-        "import os, pathlib, sys\n"
-        "log = pathlib.Path(__file__).resolve().parents[5] / 'install.log'\n"
-        "with log.open('a', encoding='utf-8') as stream:\n"
-        "    stream.write(' '.join(sys.argv[1:]) + '\\n')\n"
-        "raise SystemExit(1 if os.environ.get('FAST_INSTALL_FAIL') else 0)\n",
+        "import os, pathlib\n"
+        "from types import SimpleNamespace as DeployOptions\n"
+        "def deploy_managed_skills(options):\n"
+        "    log = pathlib.Path(__file__).resolve().parents[5] / 'install.log'\n"
+        "    argv = ['--repo-root', str(options.repo_root)]\n"
+        "    if options.install_root is not None:\n"
+        "        argv.extend(['--install-root', str(options.install_root)])\n"
+        "    for skill in options.skill:\n"
+        "        argv.extend(['--skill', skill])\n"
+        "    with log.open('a', encoding='utf-8') as stream:\n"
+        "        stream.write(' '.join(argv) + '\\n')\n"
+        "    return {'status': 'failed' if os.environ.get('FAST_INSTALL_FAIL') else 'completed'}\n",
         encoding="utf-8",
         newline="\n",
     )

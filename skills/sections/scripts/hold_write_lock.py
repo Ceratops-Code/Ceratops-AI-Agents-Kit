@@ -1,6 +1,7 @@
 """Hold a native write lock and remember an operation that did not finish cleanly.
 
-This internal helper does not run commands. Release-writing workflows use it.
+Release writers and source-reading installers share this helper. Its Git
+lookups locate the source lock; operation commands remain caller-owned.
 Callers own command lifetimes and explicit recovery confirmation. The lock file
 is permanent infrastructure: its first byte is the fixed-size ``unfinished_run``
 Boolean (ASCII 0/1), not a checkpoint, lease, PID record or acceptance result.
@@ -46,7 +47,7 @@ def attach_cleanup_failure(error: BaseException, cleanup_error: BaseException) -
         *getattr(error, "cleanup_errors", ()), detail,
         *getattr(cleanup_error, "cleanup_errors", ()),
     ]
-    error.cleanup_errors = failures
+    error.__dict__["cleanup_errors"] = failures
     error.add_note(f"Cleanup also failed: {detail}")
     payload = getattr(error, "payload", None)
     if isinstance(payload, dict):
@@ -66,6 +67,57 @@ def release_lock_path(repo_root: pathlib.Path) -> pathlib.Path:
     except OSError as exc:
         raise WriteLockError(f"Cannot locate the release lock: {exc}") from exc
     return common / "ceratops" / "locks" / "release-local"
+
+
+@contextmanager
+def hold_release_source(repo_root: pathlib.Path) -> Iterator[WriteLockContext | None]:
+    """Protect an installer's mutable release source, never its task worktree.
+
+    The primary checkout may switch from main to release/local during promotion,
+    so protect it too. Non-Git sources remain supported. Installers must finish
+    their foreground commands before returning; an explicitly unknown stop keeps
+    the unfinished flag. Nested callers share the acquiring thread's ownership.
+    Destination locking belongs inside this context, in the installer itself.
+    """
+    root = pathlib.Path(repo_root).resolve()
+    result = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
+        capture_output=True, text=True, check=False,
+    )
+    if (result.returncode == 128 and "not a git repository" in result.stderr
+            and not (root / ".git").exists()) or (
+        result.returncode == 0 and pathlib.Path(result.stdout.strip()).resolve() != root
+    ):
+        yield None
+        return
+    if result.returncode:
+        raise WriteLockError(f"Cannot inspect installation source: {result.stderr.strip()}")
+    path = release_lock_path(root)
+    if root != path.parents[3]:
+        branch = subprocess.run(
+            ["git", "-C", str(root), "branch", "--show-current"],
+            capture_output=True, text=True, check=False,
+        )
+        if branch.returncode:
+            raise WriteLockError(f"Cannot inspect source branch: {branch.stderr.strip()}")
+        if branch.stdout.strip() != "release/local":
+            yield None
+            return
+    with hold_write_lock(path) as owned:
+        error = None
+        try:
+            yield owned
+        except BaseException as exc:
+            error = exc
+            raise
+        finally:
+            if owned.outermost and getattr(error, "local_commands_stopped", None) is not False:
+                try:
+                    owned.complete(commands_stopped=True)
+                except BaseException as cleanup_error:
+                    if error is None:
+                        raise
+                    attach_cleanup_failure(error, cleanup_error)
 
 
 def _contexts() -> dict[pathlib.Path, WriteLockContext]:
@@ -157,6 +209,7 @@ def hold_write_lock(
     # must still name this exact regular file after acquisition.
     canonical = supplied.parent.resolve() / supplied.name
     active = _contexts()
+    context: WriteLockContext | None = None
     if canonical in active:
         context = active[canonical]
         context._completed = False
@@ -172,7 +225,6 @@ def hold_write_lock(
     descriptor: int | None = None
     held = False
     owner_pid = os.getpid()
-    context: WriteLockContext | None = None
     operation_error: BaseException | None = None
     try:
         try:
@@ -217,6 +269,7 @@ def hold_write_lock(
         # must still clear the flag when its caller confirmed clean shutdown.
         try:
             if context is not None and context._completed:
+                assert descriptor is not None  # A context is created only after acquisition.
                 if os.getpid() != owner_pid:
                     raise WriteLockError("A forked child cannot complete its parent's operation.")
                 if context._running():

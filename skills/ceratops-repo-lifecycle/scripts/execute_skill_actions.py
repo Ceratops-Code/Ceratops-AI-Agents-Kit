@@ -6,6 +6,8 @@ or source checking. The skill's command owns those effects and their cleanup.
 
 from __future__ import annotations
 
+import hashlib
+import importlib.util
 import json
 import os
 import pathlib
@@ -23,6 +25,36 @@ from github_pr_workflow.command import (
 )
 from sdlc_results import capture_step_result
 from store_artifacts import OperationError
+
+
+def _call_action(root: pathlib.Path, declaration: Mapping[str, Any], arguments: list[str]) -> Any:
+    """Call an explicitly declared Python entry point; never infer one from argv.
+
+    The installed action declaration authorizes this source before dispatch.
+    Its existing CLI parser and request type retain argument handling. Keeping
+    the call in this process lets an installer share its caller's release lock.
+    """
+    path = root / declaration["path"]
+    name = "_ceratops_action_" + hashlib.sha256(str(path.resolve()).encode()).hexdigest()
+    module = sys.modules.get(name)
+    if module is None:
+        spec = importlib.util.spec_from_file_location(name, path)
+        if spec is None or spec.loader is None:
+            raise ValueError("Declared action module cannot be loaded")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            sys.modules.pop(name, None)
+            raise
+    try:
+        options = module.build_parser().parse_args(arguments)
+    except SystemExit as exc:
+        raise ValueError("Declared action arguments were not accepted") from exc
+    request = getattr(module, declaration["request"])(**vars(options))
+    with track_command_completion():
+        return getattr(module, declaration["function"])(request)
 
 
 def execute_handoff(
@@ -44,8 +76,8 @@ def execute_handoff(
     identical source binding when one exists; CI callers never invoke this
     function. Installed Python steps use their pinned immutable runtime.
     Skill selection chooses the binding's explicit selected-skill form; no
-    script filename or argument convention determines that form. The existing
-    MCP adapter remains separate. Unknown inputs and malformed selected commands
+    script filename or argument convention determines either selected form.
+    Unknown inputs and malformed selected commands
     request skill judgment before any command runs. Package prerequisites never
     trigger an implicit build. Repository commit guards are supplied by the
     caller, so this module does not import the operation runner.
@@ -188,15 +220,38 @@ def execute_handoff(
                 "message": "This action requires skill judgment.",
             }
         if (not isinstance(entry, dict)
-                or set(entry) - {"selected-skill"} not in ({"run"}, {"steps"})):
-            raise ValueError("Executor must declare run or ordered steps")
-        if selected_skill is not None:
-            selected_entry = entry.get("selected-skill")
+                or set(entry) - {"selected-skill", "selected-mcp-server"}
+                not in ({"run"}, {"steps"}, {"call"})):
+            raise ValueError("Executor must declare run, ordered steps or a Python call")
+        selector = ("selected-skill" if selected_skill is not None else
+                    "selected-mcp-server" if selected_mcp_server is not None else None)
+        if selector is not None:
+            selected_entry = entry.get(selector)
             if (not isinstance(selected_entry, dict)
-                    or set(selected_entry) not in ({"run"}, {"steps"})):
-                raise ValueError("Action has no usable selected-skill command form")
+                    or set(selected_entry) not in ({"run"}, {"steps"}, {"call"})):
+                raise ValueError(f"Action has no usable {selector} form")
             entry = selected_entry
-        steps = [{"run": entry["run"]}] if "run" in entry else entry["steps"]
+        call = entry.get("call")
+        if call is not None:
+            if (not isinstance(call, dict) or set(call) != {"path", "function", "request", "args"}
+                    or not isinstance(call["path"], str)
+                    or any(not isinstance(call[key], str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", call[key])
+                           for key in ("function", "request"))):
+                raise ValueError("Python call must name its path, function, request type and args")
+            relative = pathlib.PurePosixPath(call["path"])
+            path = root.joinpath(*relative.parts)
+            if (relative.is_absolute() or ".." in relative.parts or "\\" in call["path"]
+                    or relative.suffix != ".py" or path.is_symlink() or not path.is_file()
+                    or not path.resolve().is_relative_to(root.resolve())):
+                raise ValueError("Python action must name a file inside its skill")
+            if not uses_source_bundle:
+                metadata = installed_root / ".runtime-manifest.json"
+                manifest = json.loads(metadata.read_text(encoding="utf-8"))
+                if pathlib.Path(manifest["python_runtime"]).resolve() != pathlib.Path(sys.executable).resolve():
+                    raise ValueError("Python action requires the caller to use its pinned runtime")
+            steps = [{"run": call["args"]}]
+        else:
+            steps = [{"run": entry["run"]}] if "run" in entry else entry["steps"]
         if not isinstance(steps, list) or not steps:
             raise ValueError("Executor steps must be nonempty")
         values = {
@@ -206,8 +261,11 @@ def execute_handoff(
         }
         if selected_skill is not None:
             values["{skill}"] = selected_skill
+        if selected_mcp_server is not None:
+            values["{mcp_server}"] = selected_mcp_server
         commands: list[list[str]] = []
         uses_skill_input = False
+        uses_mcp_input = False
         # Prepare every step before side effects. The skill owns the whole
         # deterministic action, including its preconditions and cleanup.
         for step in steps:
@@ -226,23 +284,11 @@ def execute_handoff(
                 if any(token not in values for token in tokens):
                     raise ValueError("Executor command contains an unavailable input")
                 uses_skill_input |= "{skill}" in tokens
+                uses_mcp_input |= "{mcp_server}" in tokens
                 for token, value in values.items():
                     argument = argument.replace(token, value)
                 argv.append(argument)
-            if selected_mcp_server is not None:
-                script = step["run"][3] if len(step["run"]) > 3 else ""
-                if (
-                    script
-                    != "{skill_root}/scripts/install-mcp-server.py"
-                    or "--mcp-server-name" in argv
-                ):
-                    return {
-                        **evidence,
-                        "status": "handoff_required",
-                        "message": "Binding command does not support structured MCP server selection.",
-                    }
-                argv.extend(["--mcp-server-name", selected_mcp_server])
-            if step["run"][0] == "{python}" and not uses_source_bundle:
+            if call is None and step["run"][0] == "{python}" and not uses_source_bundle:
                 uv = shutil.which("uv")
                 metadata = installed_root / ".runtime-manifest.json"
                 if metadata.is_symlink() or not metadata.is_file() or uv is None:
@@ -284,14 +330,16 @@ def execute_handoff(
             commands.append(argv)
         if selected_skill is not None and not uses_skill_input:
             raise ValueError("Selected-skill commands must use the requested {skill}")
+        if selected_mcp_server is not None and not uses_mcp_input:
+            raise ValueError("Selected-MCP commands must use the requested {mcp_server}")
         if expected_commit is not None and (
             require_clean_commit is None or repository_commit is None
         ):
             raise ValueError("Repository commit guards are required for protected actions")
-    except (OSError, ValueError, TypeError, AttributeError) as exc:
+    except (OSError, ValueError, TypeError, AttributeError, KeyError) as exc:
         return {
             **evidence,
-            "status": "handoff_required" if selected_skill is not None else "operation_failed",
+            "status": "handoff_required" if selected_skill is not None or selected_mcp_server is not None else "operation_failed",
             "message": str(exc),
         }
     try:
@@ -302,28 +350,43 @@ def execute_handoff(
                     require_clean_commit(repo_root, expected_commit)
                 except OperationError as exc:
                     return {**evidence, "status": "state_changed", "message": str(exc)}
-            with track_command_completion():
-                result = run_progress_command(argv, cwd=repo_root)
-            if result.returncode:
+            captured = None
+            if call is not None:
+                outcome = _call_action(root, call, argv)
+                if outcome == "OK":
+                    code, stdout, stderr = 0, "OK", ""
+                elif isinstance(outcome, dict):
+                    failed_cleanup = outcome.get("promotion_cleanup", {}).get("status") == "failed"
+                    code = 0 if outcome.get("status") in {"completed", "no_op"} and not failed_cleanup else 1
+                    stdout, stderr = json.dumps(outcome), ""
+                    captured = {"result": outcome} if "schema" in outcome else {}
+                else:
+                    raise ValueError("Python action must return its completion record or OK")
+            else:
+                with track_command_completion():
+                    result = run_progress_command(argv, cwd=repo_root)
+                code, stdout, stderr = result.returncode, result.stdout, result.stderr
+            if code:
                 failure = {
                     **evidence,
                     "status": "operation_failed",
                     "step": position,
-                    "exit_code": result.returncode,
-                    "stderr_tail": result.stderr[-4096:],
-                    "stdout_tail": result.stdout[-4096:],
+                    "exit_code": code,
+                    "stderr_tail": stderr[-4096:],
+                    "stdout_tail": stdout[-4096:],
                 }
                 owner_root, action = diagnostic_owner or (repo_root, "operation")
                 return report_failure(
                     failure, diagnostic_output=diagnostic_output,
                     repo_root=owner_root, action=action,
                     failure_id=failure_id or f"{route}:{position}",
-                    stdout=result.stdout, stderr=result.stderr,
+                    stdout=stdout, stderr=stderr,
                     successful_results=successful_results,
                     output_root=repo_root,
                 )
             completed.append(position)
-            captured = capture_step_result(result.stdout)
+            if captured is None:
+                captured = capture_step_result(stdout)
             if captured:
                 receipts.append({"step": position, **captured})
                 evidence["step_results"] = receipts

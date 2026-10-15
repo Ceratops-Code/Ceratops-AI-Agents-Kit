@@ -1010,7 +1010,12 @@ def test_repository_ship_absent_default_contract_is_no_op_and_finalizes(
     _, pending_scope, _ = state["github_request"]
     assert (pending_scope is not None) is scope_present
     received = []
-    monkeypatch.setattr(loaded["github_ship"], "ship", lambda request: received.append(request) or {})
+
+    def receive(request):
+        received.append(request)
+        return {}
+
+    monkeypatch.setattr(loaded["github_ship"], "ship", receive)
     args.review_replies_request = tmp_path / "review-replies.json"
     loaded["_call_github_ship"](args, repo, pending_scope, None)
     assert received[0].review_replies_request == args.review_replies_request

@@ -887,7 +887,7 @@ def execute_prepared_operation(
 def remove_operation_failures(
     result: dict[str, Any], *, diagnostic_output: pathlib.Path | None,
     diagnostic_owner: tuple[pathlib.Path, str],
-    completed_steps: tuple[int, ...] | None = None,
+    completed_steps: tuple[int | str, ...] | None = None,
 ) -> None:
     """Use the executor's successful outcomes, including exact reused passes.
 

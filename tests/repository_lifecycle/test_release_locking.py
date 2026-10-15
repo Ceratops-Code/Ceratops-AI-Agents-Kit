@@ -24,11 +24,160 @@ from tests.repository_lifecycle.support import (
     prepare_divergent_promotion_repo,
     prepare_repository_lifecycle_repo,
 )
-from tests.skill_lifecycle.support import FAST_CHANGE, fast_change_request
+from tests.skill_lifecycle.support import (
+    FAST_CHANGE,
+    RUNTIME_INSTALLER,
+    fast_change_request,
+    load_runtime_installer,
+)
 from tests.support.repositories import run_git
 
 # The support module selects the source scripts before importing the workflow.
 workflow_command = importlib.import_module("github_pr_workflow.command")
+
+
+@pytest.mark.parametrize("installer", ["skill", "mcp"])
+def test_standalone_source_installation_refuses_busy_release(tmp_path, installer):
+    repo, _, _, environment = prepare_repository_lifecycle_repo(tmp_path)
+    script = (RUNTIME_INSTALLER if installer == "skill" else
+              PROMOTE_REPOSITORY.parents[2] / "ceratops-mcp-server-lifecycle/scripts/install-mcp-server.py")
+    locks = workflow_command.release_lock_module()
+    with workflow_command.release_write_context(repo):
+        for _ in range(2):
+            result = subprocess.run(
+                [sys.executable, str(script), "--repo-root", str(repo)],
+                env=environment, capture_output=True, text=True, check=False, timeout=15,
+            )
+            assert result.returncode == 1, result.stdout + result.stderr
+            assert "busy" in result.stdout + result.stderr
+    assert locks.release_lock_path(repo).read_bytes() == b"0"
+
+
+@pytest.mark.parametrize("installer", ["skill", "mcp"])
+@pytest.mark.parametrize("ending", ["completed", "before_install", "after_install", "unknown_stop"])
+def test_source_installers_share_release_and_report_stopped_commands(tmp_path, monkeypatch, installer, ending):
+    repo, _, _, _ = prepare_repository_lifecycle_repo(tmp_path)
+    entry = pathlib.Path.cwd()
+    effects = []
+    if installer == "skill":
+        module = load_runtime_installer()
+        call = module["deploy_managed_skills"]
+        request = module["DeployOptions"](repo_root=repo, skill=["example"], install_root=tmp_path / "installed")
+        monkeypatch.setitem(call.__globals__, "_deployment_scope", lambda *a: module["AffectedSet"](("example",), ()))
+        monkeypatch.setitem(call.__globals__, "_check_deployment_sources", lambda *a: _compete(repo))
+        target, name = module["runtime_builder"], "install_transaction"
+        accepted = module["runtime_builder"].TransactionResult("ok", ("example",), (), "test")
+    else:
+        script = PROMOTE_REPOSITORY.parents[2] / "ceratops-mcp-server-lifecycle/scripts/install-mcp-server.py"
+        module = runpy.run_path(str(script))
+        call = module["install_mcp_server"]
+        request = module["InstallOptions"](repo_root=repo)
+        monkeypatch.setitem(call.__globals__, "_selected_transaction", lambda _: ("example", "test"))
+        target, name, accepted = call.__globals__, "_install", {"status": "completed"}
+
+    def install(*_args, **_kwargs):
+        _compete(repo)  # Release precedes the installer's destination work.
+        if ending in {"before_install", "unknown_stop"}:
+            failure = OSError("installation stopped before activation")
+            if ending == "unknown_stop":
+                failure.__dict__["local_commands_stopped"] = False
+            raise failure
+        effects.append("installed")
+        if ending == "after_install":
+            raise OSError("installation lost its result after activation")
+        return accepted
+
+    if isinstance(target, dict):
+        monkeypatch.setitem(target, name, install)
+    else:
+        monkeypatch.setattr(target, name, install)
+    for attempt in range(2):
+        if ending == "unknown_stop":
+            with pytest.raises(OSError, match="before activation"):
+                call(request)
+        else:
+            result = call(request)
+            failure_status = "error" if installer == "skill" else "failed"
+            assert result["status"] == ("completed" if ending == "completed" else failure_status), result
+        assert pathlib.Path.cwd() == entry
+        assert len(effects) == (attempt + 1 if ending in {"completed", "after_install"} else 0)
+        locks = workflow_command.release_lock_module()
+        assert locks.release_lock_path(repo).read_bytes() == (b"1" if ending == "unknown_stop" else b"0")
+        if ending == "unknown_stop":
+            with workflow_command.release_write_context(repo, confirm_stopped=True):
+                pass
+
+
+def test_source_installation_does_not_lock_a_task_worktree(tmp_path):
+    repo, _, _, _ = prepare_repository_lifecycle_repo(tmp_path)
+    task = tmp_path / "task"
+    assert run_git(repo, "worktree", "add", "-b", "ordinary-task", str(task)).returncode == 0
+    locks = workflow_command.release_lock_module()
+    for _ in range(2):
+        with locks.hold_release_source(task) as owned:
+            assert owned is None
+            with workflow_command.release_write_context(repo):
+                pass
+
+
+@pytest.mark.parametrize("source", [False, True])
+@pytest.mark.parametrize("selected", [False, True])
+@pytest.mark.parametrize("ending", ["completed", "failed", "unknown_stop"])
+def test_declared_install_call_shares_outer_release_lock(tmp_path, monkeypatch, source, selected, ending):
+    import execute_skill_actions as actions
+
+    repo, _, _, _ = prepare_repository_lifecycle_repo(tmp_path)
+    installed = tmp_path / "codex/skills/ceratops-skill-lifecycle"
+    bundle = repo / "skills/ceratops-skill-lifecycle" if source else installed
+    call: dict[str, Any] = {"path": "scripts/install_fixture.py", "function": "install_skill",
+            "request": "InstallOptions", "args": ["--repo-root", "{repo_root}", "--ending", ending]}
+    document = {"version": 1, "actions": {"deploy": {
+        "call": call, "selected-skill": {"call": {
+            **call, "args": [*call["args"], "--skill", "{skill}"],
+        }},
+    }}}
+    for root in {bundle, installed}:
+        (root / "references").mkdir(parents=True)
+        (root / "references/action-executors.json").write_text(json.dumps(document))
+    (installed / ".runtime-manifest.json").write_text(json.dumps({"python_runtime": sys.executable}))
+    (bundle / "scripts").mkdir()
+    (bundle / call["path"]).write_text('''import argparse, pathlib
+from types import SimpleNamespace as InstallOptions
+from hold_write_lock import hold_release_source
+def build_parser():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--repo-root', type=pathlib.Path)
+    parser.add_argument('--skill')
+    parser.add_argument('--ending')
+    return parser
+def install_skill(options):
+    with hold_release_source(options.repo_root) as owned:
+        if options.ending == 'unknown_stop':
+            error = OSError('command shutdown is unknown')
+            error.local_commands_stopped = False
+            raise error
+        return {'schema': 'fixture.install.v1', 'status': options.ending,
+                'skill': options.skill, 'outermost': owned.outermost}
+''')
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    monkeypatch.setattr(actions, "run_progress_command", lambda *a, **k: pytest.fail("call launched a subprocess"))
+    for _ in range(2):
+        with workflow_command.release_write_context(repo):
+            result = actions.execute_handoff("ceratops-skill-lifecycle/deploy", repo,
+                                             inputs={"skill": "example"} if selected else None)
+            assert result["status"] == ("completed" if ending == "completed" else "operation_failed"), result
+            if ending == "completed":
+                steps = result["step_results"]
+                assert isinstance(steps, list)
+                receipt = steps[0]["result"]
+                assert receipt["skill"] == ("example" if selected else None)
+                assert receipt["outermost"] is False
+            _compete(repo)
+        locks = workflow_command.release_lock_module()
+        assert locks.release_lock_path(repo).read_bytes() == (b"1" if ending == "unknown_stop" else b"0")
+        if ending == "unknown_stop":
+            with workflow_command.release_write_context(repo, confirm_stopped=True):
+                pass
 
 
 def _compete(repo):
@@ -149,11 +298,68 @@ def test_stopped_promotion_exception_allows_a_fresh_call(tmp_path, monkeypatch):
     assert locks.release_lock_path(repo).read_bytes() == b"0"
 
 
+@pytest.mark.parametrize("ending", ["completed", "failed", "before_install", "after_install"])
+def test_installation_cannot_undo_completed_promotion(tmp_path, monkeypatch, ending):
+    """The accepted release survives install failures; its source stays locked."""
+    repo, approved_head, _, _ = prepare_repository_lifecycle_repo(tmp_path)
+    module = runpy.run_path(str(PROMOTE_REPOSITORY))
+    promote = module["promote"]
+    operation = "deliverables.apps.sample.actions.install"
+    args = module["build_parser"]().parse_args([
+        "--repo-root", str(repo), "--source-branch", "approved",
+        "--run-operation", operation,
+    ])
+    installed = []
+    calls = []
+
+    def install(prepared, **_kwargs):
+        _compete(repo)
+        assert len(prepared) == 1
+        assert prepared[0].operation == operation
+        assert prepared[0].commit == approved_head
+        assert run_git(repo, "rev-parse", "release/local").stdout.strip() == approved_head
+        calls.append(prepared[0].commit)
+        if ending == "before_install":
+            raise OSError("installer did not start")
+        installed.append(approved_head)
+        if ending == "after_install":
+            raise OSError("installer lost its result after activation")
+        return {
+            "status": "operation_failed" if ending == "failed" else "completed",
+            "message": "installation result",
+            "results": [{"operation": operation, "status": "completed", "steps": [1]}],
+        }
+
+    def unexpected_rollback(*_args, **_kwargs):
+        pytest.fail("installation failure rolled back accepted promotion")
+
+    monkeypatch.setitem(promote.__globals__, "execute_prepared_operations", install)
+    monkeypatch.setattr(module["git_branches"], "_restore_release_checkout", unexpected_rollback)
+    for attempt in range(2):
+        if ending == "completed":
+            result = promote(args)
+            assert result["head"] == approved_head
+            assert result["operations"]["completed_operations"] == [operation]
+        else:
+            with pytest.raises(module["PromotionError"]) as failure:
+                promote(args)
+            assert failure.value.payload["phase"] == "deployment"
+            assert failure.value.payload["promotion"]["head"] == approved_head
+            assert failure.value.payload["promotion"]["status"] == "ready"
+        assert len(calls) == attempt + 1  # No automatic installation retry.
+        assert len(installed) == (0 if ending == "before_install" else attempt + 1)
+        assert run_git(repo, "rev-parse", "release/local").stdout.strip() == approved_head
+        assert run_git(repo, "status", "--porcelain").stdout == ""
+        assert workflow_command.release_lock_module().release_lock_path(repo).read_bytes() == b"0"
+        with workflow_command.release_write_context(repo):
+            pass
+
+
 @pytest.mark.parametrize("ending", ["return", "failed_check", "exception", "timeout"])
 def test_release_context_finishes_command_before_unlock(tmp_path, monkeypatch, ending):
     repo, _, _, _ = prepare_repository_lifecycle_repo(tmp_path)
     locks = workflow_command.release_lock_module()
-    events = []
+    events: list[str] = []
     original_unlock = locks.unlock_descriptor
 
     def finished_unlock(fd):
@@ -296,12 +502,16 @@ def test_ship_handoff_keeps_same_process_lock(tmp_path, monkeypatch, caller):
     if caller == "promotion":
         module = runpy.run_path(str(PROMOTE_REPOSITORY))
         args = module["build_parser"]().parse_args(["--repo-root", str(repo), "--prepare-release-only"])
-        call = lambda: module["_ship_after_promotion"](
-            args, repo, target_commit="a" * 40, pending_work_scope=str(scope),
-        )
+
+        def call():
+            return module["_ship_after_promotion"](
+                args, repo, target_commit="a" * 40, pending_work_scope=str(scope),
+            )
     else:
         args = ship_repository.ShipOptions(repo_root=repo, head_branch="release/local")
-        call = lambda: ship_repository._call_github_ship(args, repo, scope, "a" * 40)
+
+        def call():
+            return ship_repository._call_github_ship(args, repo, scope, "a" * 40)
 
     def child(request):
         assert request.repo_root == repo

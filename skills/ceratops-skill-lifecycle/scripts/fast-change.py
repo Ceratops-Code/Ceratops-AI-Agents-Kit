@@ -19,6 +19,7 @@ import json
 import os
 import pathlib
 import re
+import runpy
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
@@ -694,47 +695,22 @@ def _cleanup_successful_request(spec: ChangeSpec) -> dict[str, str]:
     return {"request": "removed", "task_temp_root": task_status}
 
 
-def _installer_command(spec: ChangeSpec) -> list[str]:
-    command = [
-        sys.executable,
-        str(_runtime_installer(spec.repo_root)),
-        "--repo-root",
-        str(spec.repo_root),
-    ]
-    if spec.install_root is not None:
-        command.extend(("--install-root", str(spec.install_root)))
-    for skill in spec.selected_skills:
-        command.extend(("--skill", skill))
-    return command
-
-
 def _run_installer(spec: ChangeSpec) -> bool:
-    """Run the installer once and report whether activation likely committed."""
+    """Call the normal installer once while sharing this thread's release lock."""
 
-    result = _run(_installer_command(spec), cwd=spec.repo_root)
-    if result.returncode == 0:
+    installer = runpy.run_path(str(_runtime_installer(spec.repo_root)))
+    result = installer["deploy_managed_skills"](installer["DeployOptions"](
+        repo_root=spec.repo_root, install_root=spec.install_root,
+        skill=spec.selected_skills,
+    ))
+    if result == "OK" or (isinstance(result, Mapping)
+                          and result.get("status") in {"completed", "no_op"}):
         return True
-    raw = (result.stderr or result.stdout).strip()
-    activated = False
-    candidates = [raw]
-    if "{" in raw:
-        candidates.append(raw[raw.find("{") :])
-    for candidate in candidates:
-        try:
-            payload = json.loads(candidate)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(payload, Mapping):
-            rollback = str(payload.get("rollback", ""))
-            activated = payload.get("status") == "cleanup_blocked" or (
-                rollback.startswith("incomplete")
-            )
-        break
-    error = FastChangeError(
-        f"targeted installation failed: {raw}"
-        if raw
-        else "targeted installation failed"
+    activated = isinstance(result, Mapping) and (
+        result.get("status") == "cleanup_blocked"
+        or str(result.get("rollback", "")).startswith("incomplete")
     )
+    error = FastChangeError(f"targeted installation failed: {json.dumps(result)}")
     error.runtime_activated = activated
     raise error
 

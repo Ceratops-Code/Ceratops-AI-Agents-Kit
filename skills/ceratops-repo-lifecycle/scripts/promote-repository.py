@@ -22,7 +22,7 @@ import sys
 import tempfile
 import time
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, NamedTuple
 
 import git_branch_operations as git_branches
 from check_deployment_receipts import check_deployment_receipt
@@ -58,6 +58,15 @@ PENDING_MANAGER = SCRIPT_ROOT / "manage-pending-work.py"
 OPERATION_RUNNER = SCRIPT_ROOT / "repository_operation.py"
 RELEASE_BRANCH = "release/local"
 DEFAULT_SDLC_CONTRACT = pathlib.Path("sdlc/sdlc.yml")
+
+
+class CompletedPromotion(NamedTuple):
+    """Accepted release and its frozen installation selection, not a new request."""
+
+    result: dict[str, object]
+    repo_root: pathlib.Path
+    operations: list[PreparedOperation]
+    source_checks: dict[str, Any]
 
 
 def _remap_repo_owned_path(
@@ -402,8 +411,8 @@ def _promote(
     timings: dict[str, float] | None = None,
     rollback: dict[str, Any],
     inputs: tuple[pathlib.Path, list[str], bool, dict[str, str]],
-) -> dict[str, object]:
-    """Prepare a release branch, record selected work, and optionally deploy."""
+) -> dict[str, object] | CompletedPromotion:
+    """Complete release integration and checks, leaving installation to the caller."""
 
     if timings is None:
         timings = {}
@@ -555,74 +564,8 @@ def _promote(
         validation, diagnostic_output=getattr(args, "diagnostic_output", None),
         diagnostic_owner=(args.repo_root, "promote"),
     )
-    validation_handoffs = [
-        item
-        for item in validation["results"]
-        if item.get("handoff") and not item.get("handoff_completed")
-    ]
-    operations: dict[str, Any] | None = None
-    handoffs: list[dict[str, str]] = []
-    if args.run_operation is not None:
-        with _timed_phase(timings, "deployment", diagnostic_output=getattr(args, "diagnostic_output", None)):
-            try:
-                require_clean_commit(repo_root, target_commit)
-                operations = execute_prepared_operations(
-                    prepared_operations,
-                    diagnostic_output=getattr(args, "diagnostic_output", None),
-                    diagnostic_owner=(args.repo_root, "promote"),
-                    successful_results=validation["results"],
-                )
-                if validation_handoffs:
-                    operations["validation_handoffs"] = validation_handoffs
-            except (OperationError, OSError, ValueError) as exc:
-                operations = describe_command_failure(exc)
-        if operations["status"] != "completed":
-            raise PromotionError(
-                str(operations.get("message", "Deployment failed.")),
-                {
-                    **operations,
-                    "phase": "deployment",
-                    "remote_mutation": False,
-                    "pending_work_scope": record["pending_work_scope"],
-                },
-            )
-        for operation_result in operations.get("results", []):
-            if operation_result.get("status") == "deferred_handoff":
-                declaration = operation_result.get("handoff")
-                if not isinstance(declaration, dict):
-                    raise PromotionError("Deferred deployment handoff is malformed.")
-                lifecycle = declaration.get("lifecycle")
-                action = declaration.get("action")
-                inputs = declaration.get("inputs", {})
-                if (
-                    not isinstance(lifecycle, str)
-                    or not lifecycle
-                    or not isinstance(action, str)
-                    or not action
-                    or not isinstance(inputs, dict)
-                ):
-                    raise PromotionError("Deferred deployment handoff is malformed.")
-                operation_result.update(
-                    status="completed",
-                    handoff=f"{lifecycle}/{action}",
-                    handoff_inputs=dict(inputs),
-                )
-            if operation_result.get("handoff") and not operation_result.get(
-                "handoff_completed"
-            ):
-                handoffs.append(
-                    {
-                        "operation": operation_result["operation"],
-                        "handoff": operation_result["handoff"],
-                    }
-                )
-        operations["completed_operations"] = [
-            operation_result["operation"]
-            for operation_result in operations.get("results", [])
-        ]
-        operations.pop("deferred_handoffs", None)
-
-    git_branches._clean(repo_root, "before reporting ready state")
+    if args.run_operation is None:
+        git_branches._clean(repo_root, "before reporting ready state")
     pending_work_scope = record["pending_work_scope"]
     if ship_after_promotion:
         # Shipping owns its resumable retained state and may already have made
@@ -642,12 +585,10 @@ def _promote(
         "merged_branches": merged,
         "rebased_branches": rebased,
         "pending_work_scope": pending_work_scope,
-        "operations": operations,
+        "operations": None,
     }
     if record.get("preserved_sources"):
         result["preserved_sources"] = record["preserved_sources"]
-    if handoffs:
-        result["handoffs"] = handoffs
     validation_handoffs = [
         item
         for item in validation["results"]
@@ -656,6 +597,8 @@ def _promote(
     if validation_handoffs:
         result["validation_handoffs"] = validation_handoffs
     rollback.clear()
+    if args.run_operation is not None:
+        return CompletedPromotion(result, repo_root, prepared_operations, validation)
     return result
 
 
@@ -671,24 +614,117 @@ def promote(
         getattr(args, "diagnostic_output", None), repo_root=args.repo_root, action="promote",
     ):
         report_phase("promotion", enabled=getattr(args, "diagnostic_output", None) is not None)
-        result = _promote_with_rollback(args, timings=timings, inputs=inputs)
+        outcome = _promote_with_rollback(args, timings=timings, inputs=inputs)
+        result = outcome.result if isinstance(outcome, CompletedPromotion) else outcome
         if result.get("status") in {"ready", "shipped", "already_shipped"}:
             remove_resolved_failures(
                 result, diagnostic_output=getattr(args, "diagnostic_output", None),
                 repo_root=args.repo_root, action="promote", resolved_failures=("promote",),
             )
+        if isinstance(outcome, CompletedPromotion):
+            # Integration is already accepted. Keep release protected while the
+            # current installer reads it, but never roll it back for install errors.
+            return _deploy_completed_promotion(args, outcome, timings=timings)
         return result
+
+
+def _deploy_completed_promotion(
+    args: argparse.Namespace, accepted: CompletedPromotion,
+    *, timings: dict[str, float] | None = None,
+) -> dict[str, object]:
+    """Install the accepted commit once; failures retain completed promotion."""
+
+    repo_root = accepted.repo_root
+    target_commit = str(accepted.result["head"])
+    prepared_operations = accepted.operations
+    validation = accepted.source_checks
+    validation_handoffs = accepted.result.get("validation_handoffs", [])
+    timings = {} if timings is None else timings
+    handoffs: list[dict[str, str]] = []
+    with _timed_phase(timings, "deployment", diagnostic_output=getattr(args, "diagnostic_output", None)):
+        try:
+            require_clean_commit(repo_root, target_commit)
+            operations = execute_prepared_operations(
+                prepared_operations,
+                diagnostic_output=getattr(args, "diagnostic_output", None),
+                diagnostic_owner=(args.repo_root, "promote"),
+                successful_results=validation["results"],
+            )
+            if validation_handoffs:
+                operations["validation_handoffs"] = validation_handoffs
+        except (OperationError, OSError, ValueError) as exc:
+            operations = describe_command_failure(exc)
+    if operations["status"] != "completed":
+        raise PromotionError(
+            str(operations.get("message", "Deployment failed.")),
+            {
+                **operations,
+                "phase": "deployment",
+                "remote_mutation": False,
+                "pending_work_scope": accepted.result["pending_work_scope"],
+                "promotion": dict(accepted.result),
+            },
+        )
+    for operation_result in operations.get("results", []):
+        if operation_result.get("status") == "deferred_handoff":
+            declaration = operation_result.get("handoff")
+            if not isinstance(declaration, dict):
+                raise PromotionError("Deferred deployment handoff is malformed.")
+            lifecycle = declaration.get("lifecycle")
+            action = declaration.get("action")
+            inputs = declaration.get("inputs", {})
+            if (
+                not isinstance(lifecycle, str)
+                or not lifecycle
+                or not isinstance(action, str)
+                or not action
+                or not isinstance(inputs, dict)
+            ):
+                raise PromotionError("Deferred deployment handoff is malformed.")
+            operation_result.update(
+                status="completed",
+                handoff=f"{lifecycle}/{action}",
+                handoff_inputs=dict(inputs),
+            )
+        if operation_result.get("handoff") and not operation_result.get(
+            "handoff_completed"
+        ):
+            handoffs.append(
+                {
+                    "operation": operation_result["operation"],
+                    "handoff": operation_result["handoff"],
+                }
+            )
+    operations["completed_operations"] = [
+        operation_result["operation"]
+        for operation_result in operations.get("results", [])
+    ]
+    operations.pop("deferred_handoffs", None)
+
+    try:
+        git_branches._clean(repo_root, "before reporting ready state")
+    except PromotionError as exc:
+        raise PromotionError(str(exc), {
+            **describe_command_failure(exc), "phase": "deployment",
+            "promotion": dict(accepted.result), "operations": operations,
+            "remote_mutation": False,
+        }) from exc
+    result = {**accepted.result, "operations": operations}
+    if handoffs:
+        result["handoffs"] = handoffs
+    return result
 
 
 def _promote_with_rollback(
     args: argparse.Namespace, *, timings: dict[str, float] | None = None,
     inputs: tuple[pathlib.Path, list[str], bool, dict[str, str]],
-) -> dict[str, object]:
-    """Run promotion and restore the primary checkout after local failure.
+) -> dict[str, object] | CompletedPromotion:
+    """Run promotion and restore the primary checkout after integration failure.
 
     A linked task worktree is only the source-branch owner. The mutable release
     transaction runs in the primary checkout and rolls that checkout and its
-    local main/release refs back if any pre-shipping step fails.
+    local main/release refs back if integration or its required checks fail.
+    Installation runs only after this function returns a completed promotion.
     """
 
     rollback: dict[str, Any] = {}
@@ -703,7 +739,7 @@ def _promote_with_rollback(
                     rollback["release_branch"],
                     rollback["state"],
                 )
-            except Exception as restore_exc:  # noqa: BLE001 - Preserve both promotion and restoration failures.
+            except Exception as restore_exc:  # Preserve both promotion and restoration failures.
                 raise PromotionError(
                     f"Promotion failed: {exc}; restoring the original checkout "
                     f"also failed: {restore_exc}"

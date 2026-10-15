@@ -298,8 +298,8 @@ def test_interrupted_transport_stops_its_child_and_allows_a_fresh_call(
             self.child.__enter__()
             return self
 
-        def __exit__(self, *args: object) -> Any:
-            return self.child.__exit__(*args)
+        def __exit__(self, exc_type, exc_value, traceback) -> Any:
+            return self.child.__exit__(exc_type, exc_value, traceback)
 
         def kill(self) -> None:
             self.child.kill()

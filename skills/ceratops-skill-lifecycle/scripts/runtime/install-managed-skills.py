@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import hashlib
+import importlib
 import json
 import os
 import pathlib
@@ -21,6 +22,7 @@ import subprocess
 import sys
 import threading
 from collections.abc import Mapping, Sequence
+from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass, replace
 from typing import Any, cast
 
@@ -34,6 +36,13 @@ finally:
     sys.path.remove(scripts_root)
 
 BUNDLE_ROOT = pathlib.Path(__file__).resolve().parents[2]
+if not (BUNDLE_ROOT / ".runtime-manifest.json").is_file():
+    shared_scripts = str(BUNDLE_ROOT.parent / "sections" / "scripts")
+    if shared_scripts not in sys.path:
+        sys.path.insert(0, shared_scripts)
+else:
+    sys.path.insert(0, str(BUNDLE_ROOT / "scripts"))
+source_locks = importlib.import_module("hold_write_lock")
 MANIFEST_RELATIVE = pathlib.PurePosixPath("skills/skill-sections.json")
 MANIFEST_NAME = ".runtime-manifest.json"
 RUNTIME_MANIFEST_SCHEMA = "ceratops-runtime-skill.v3"
@@ -1001,7 +1010,16 @@ def deploy_managed_skills(args: DeployOptions) -> dict[str, Any] | str:
     at source so Windows can release the old installed directory.
     """
 
-    with _DEPLOYMENT_LOCK:
+    # Lock release before taking the in-process builder mutex or its destination
+    # lock. Inventory and task-worktree sources need no release protection.
+    source_context = (source_locks.hold_release_source(args.repo_root)
+                      if args.repo_root is not None else nullcontext())
+    with ExitStack() as locks:
+        try:
+            locks.enter_context(source_context)
+        except source_locks.WriteLockError as exc:
+            return InstallerError(str(exc), phase="source_lock").result()
+        locks.enter_context(_DEPLOYMENT_LOCK)
         entry_directory = pathlib.Path.cwd()
         entry_identity = entry_directory.stat()
         try:
@@ -1048,6 +1066,8 @@ def deploy_managed_skills(args: DeployOptions) -> dict[str, Any] | str:
                     previous_runtime_source_id=args.previous_runtime_source_id,
                 )
             except (InstallerError, runtime_builder.TransactionError, OSError, ValueError) as exc:
+                if getattr(exc, "local_commands_stopped", None) is False:
+                    raise  # Preserve uncertain command shutdown for the release owner.
                 if isinstance(exc, (runtime_builder.TransactionError, InstallerError)):
                     return exc.result()
                 return InstallerError(str(exc)).result()

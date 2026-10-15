@@ -61,10 +61,14 @@ def test_underscore_identity_reaches_the_authorized_installer(tmp_path, monkeypa
     repo = tmp_path / "repo"
     installed = tmp_path / "codex/skills" / skill
     source = repo / "skills" / skill
-    binding = {"version": 1, "actions": {"install": {"run": [
+    arguments = [
         "{python}", "-I", "-B", "{skill_root}/scripts/install-mcp-server.py",
         "--repo-root", "{repo_root}",
-    ]}}}
+    ]
+    binding = {"version": 1, "actions": {"install": {
+        "run": arguments,
+        "selected-mcp-server": {"run": [*arguments, "--mcp-server-name", "{mcp_server}"]},
+    }}}
     for root in (installed, source):
         (root / "references").mkdir(parents=True)
         (root / "references/action-executors.json").write_text(json.dumps(binding), encoding="utf-8")

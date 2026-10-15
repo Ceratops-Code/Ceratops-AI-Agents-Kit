@@ -65,6 +65,12 @@
         "target": "scripts/hold_write_lock.py"
       }
     ],
+    "ceratops-mcp-server-lifecycle": [
+      {
+        "source": "skills/sections/scripts/hold_write_lock.py",
+        "target": "scripts/hold_write_lock.py"
+      }
+    ],
     "*": []
   },
   "python_runtime_skills": [

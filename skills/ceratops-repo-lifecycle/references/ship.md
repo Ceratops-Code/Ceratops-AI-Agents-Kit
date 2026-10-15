@@ -62,6 +62,17 @@ normal call reads current inputs. Local exit does not cancel remote CI, and
 clearing the flag does not accept work or delete checkpoints. Complete diagnostic
 files are implemented; new CI receipt/publication behavior remains later work.
 
+The current installation call stays inside Ship's outer release protection,
+including when Promote called Ship. Its prepared selection and commit remain
+unchanged. The installer acquires its destination lock afterward and releases
+it before the release lock; it never calls Promote/Ship while holding that
+destination lock. Explicit Python action declarations share outer ownership
+with the same callable used by standalone skill/MCP installation. Those direct
+calls protect release sources, not task worktrees. Installation failure reports
+completed promotion/publication effects and the original cause without undoing
+them or automatically retrying. Today's installer still reads source; the
+artifact-only switch and earlier release unlock belong to 17–19/22/27B.
+
 Each task worktree belongs to one thread; ordinary editing, checks and builds
 take no worktree or checkpoint lock. Shared request completion removes only
 that request, without scanning other worktrees. 20C still connects exact

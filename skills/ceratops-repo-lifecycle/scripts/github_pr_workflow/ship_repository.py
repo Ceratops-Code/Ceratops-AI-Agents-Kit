@@ -754,7 +754,7 @@ def _pending_command(
 
 
 def _resume_ship_command(
-    args: argparse.Namespace,
+    args: ShipOptions,
     repo_root: pathlib.Path,
     target_commit: str,
 ) -> list[str]:
@@ -823,7 +823,7 @@ def _resume_ship_command(
 
 
 def _phase_recovery(
-    args: argparse.Namespace,
+    args: ShipOptions,
     *,
     repo_root: pathlib.Path,
     shipped: dict[str, Any],
@@ -894,7 +894,7 @@ def _phase_recovery(
 
 
 def _validate_phase(
-    args: argparse.Namespace,
+    args: ShipOptions,
     repo_root: pathlib.Path,
     operations: list[str],
     *,
@@ -939,7 +939,7 @@ def _validate_phase(
 
 
 def _test_selection_phase(
-    args: argparse.Namespace, repo_root: pathlib.Path, expected_head: str | None,
+    args: ShipOptions, repo_root: pathlib.Path, expected_head: str | None,
 ) -> dict[str, Any] | None:
     """Check the repository's CI diff selection immediately before GitHub work.
 
@@ -1002,7 +1002,7 @@ def _test_selection_phase(
 
 
 def _synchronized_post_merge_resume(
-    args: argparse.Namespace, repo_root: pathlib.Path, target_commit: str | None,
+    args: ShipOptions, repo_root: pathlib.Path, target_commit: str | None,
 ) -> bool:
     """Recognize a recorded merge already synchronized to both local branches.
 
@@ -1026,7 +1026,7 @@ def _synchronized_post_merge_resume(
         # deployment, and finalization; recover from its exact-PR evidence.
         try:
             checkpoint = github_ship._merged_pr_checkpoint(
-                args, repo_root, repository, target_commit, {},
+                argparse.Namespace(**vars(args)), repo_root, repository, target_commit, {},
             )
         except github_ship.ShipError as exc:
             raise RepositoryShipError(str(exc)) from exc
@@ -1067,7 +1067,7 @@ def _synchronized_post_merge_resume(
     return True
 
 
-def ship_repository(args: argparse.Namespace) -> dict[str, object]:
+def ship_repository(args: ShipOptions) -> dict[str, object]:
     """Hold the release lock through this complete synchronous Ship invocation."""
     repo_root = args.repo_root.expanduser().resolve(strict=True)
     if args.head_branch != RELEASE_BRANCH:
@@ -1096,7 +1096,7 @@ def ship_repository(args: argparse.Namespace) -> dict[str, object]:
         return result
 
 
-def _ship_repository(args: argparse.Namespace) -> dict[str, object]:
+def _ship_repository(args: ShipOptions) -> dict[str, object]:
     """Run complete shipping, release publication, deployment, and cleanup."""
 
     repo_root = args.repo_root.expanduser().resolve(strict=True)

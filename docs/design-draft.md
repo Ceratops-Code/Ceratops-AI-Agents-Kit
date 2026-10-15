@@ -129,8 +129,14 @@ the skill.
 `execute_skill_actions.py` belongs to the repository runner, not the invoked
 skill: it calls both managed-skill actions and MCP-server installation. The
 actual source checks and deployment stay in those skills. Each action in
-`references/action-executors.json` declares ordinary `run` or ordered `steps`
-and may also declare a `selected-skill` object with its own `run` or `steps`.
+`references/action-executors.json` declares ordinary `run`, ordered `steps`, or
+an explicit Python `call` with skill-relative `path`, public `function`,
+`request` type and CLI `args`. The parser builds that request for the same
+callable used by the standalone CLI. Calls preserve structured return values
+without printed-JSON transport and share the acquiring thread's release lock.
+Installed calls require the skill's pinned interpreter. The action may declare
+`selected-skill` or `selected-mcp-server` with its own form; the latter supplies
+`{mcp_server}` for MCP installation.
 An explicit `inputs.skill` selects that object and supplies `{skill}`; without
 it, the ordinary form applies. All commands in the chosen form are checked
 before the first command starts. A missing or malformed named-skill form returns
@@ -867,9 +873,22 @@ leave detached writing workers after returning.
 The automatic attempt ends and unlocks before the model edits code. A fresh
 normal call takes the lock and uses current inputs; clearing `unfinished_run`
 is not successful acceptance or permission to delete checkpoints. 3B supplies
-report handling and 4B connects matching-success cleanup. The batch remains unmerged
-through 4C;
-ordinary work in other task worktrees stays unlocked.
+report handling and 4B connects matching-success cleanup. 4C completes installation
+call ordering; its combined tests gate merging this batch. Ordinary work in
+other task worktrees stays unlocked.
+
+Promotion returns the accepted result, selected commit and prepared installation
+operations before installation starts. `promote()` calls those operations outside
+`_promote_with_rollback()`, retaining release protection because today's installers
+still read source. Installation failure preserves the completed promotion and
+original diagnostics; there is no automatic retry. Plain Promote unlocks after
+local cleanup. Ship retains its outer ownership through installation and cleanup;
+nested Promote and installers do not release it. Standalone skill/MCP calls use
+`hold_release_source()` for the primary or release checkout, never a task worktree.
+They acquire release before the existing destination lock and finish their local
+commands before unlocking. Destination code never starts a release writer.
+Artifact-only installers remain steps 17–19; 22/27B switch callers and allow
+release unlock before installation without exposing a mutable checkout.
 
 The current Ship invocation holds the same lock through its CI/review waits,
 local synchronization, selected publication, installation and completion calls.
