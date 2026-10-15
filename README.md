@@ -391,40 +391,50 @@ a recorded file rather than compared with today's working folder. Missing,
 unfinished, failed, malformed, wrong-identity or corrupt records and files fail
 closed. This reader is internal and does not yet switch public deployment.
 
-The separate internal versioned route starts only after the operation owner has
-created pre-test checkpoint B and completed build-independent checks. One short
-store-lock section reserves the complete unit/version/required-target set for a
-single attempt. Builds continue in the existing worktree and write directly to
-that version's final target directories; `measure_versioned_artifact` records
-the bytes artifact tests consume. After successful qualification,
-`prepare_versioned_receipt` rechecks every retained artifact, dependency and
-evidence file and writes each target's canonical v3 receipt directly to its
-final worktree path. `complete_versioned_build` validates declared inputs and
-all prepared bytes, creates or recovers exact result-only commit C, writes every
-artifact receipt and creates the immutable version tag. It derives recovery from
-the reservation and validated final effects; it has no pending journal or
-helper-owned output staging.
+The internal versioned route selects its final directory before preparing source
+versions or commit B. `allocate_versioned_build` exclusively creates
+`<git-common-dir>/ceratops/artifacts/<unit>/<version>/` for all required targets.
+An occupied directory or existing version tag advances an alpha/beta number;
+other filesystem errors retain their cause. An occupied final version requires
+a new explicit version choice. No allocation lock, hash suffix or separate
+reservation file is used.
 
-An existing reservation can be resumed only when recovery explicitly selects
-the same repository, worktree, unit, version, targets and B. The saved attempt ID
-is discovered when omitted; a supplied ID must match. New reservations still
-require their receipt attempt ID, not a separate checkpoint operation ID. Any
-partial, unreadable or mismatched ownership state reports `recovery_required`;
-an available lock, missing process or elapsed time never adopts or deletes it.
-One worktree has one unfinished artifact request, grouped by repository, branch
-and B. It may reserve multiple units, with one unfinished version per unit.
-Another worktree may own an independent version. The legacy v2 producer keeps
-its supported full-transaction lock and delete-recognizable-staging behavior;
-that cleanup is never applied to direct versioned output.
+The caller embeds the selected version in its sources, commits B, then calls
+`bind_versioned_build_inputs` before writing artifacts. The version directory's
+`build_request.json` records repository, registered worktree, branch, unit,
+version, targets, the existing receipt attempt identity, allocation commit,
+declared input paths and B. Before binding, B is null. A fresh allocation call
+reuses an unfinished same-worktree request only when its requested selection
+and current inputs match; changed inputs select another prerelease directory.
+Unreadable ownership remains untouched and is returned in
+`uncertain_directories`. These are observations, not saved execution progress.
 
-The versioned runner calls artifact storage directly. It creates neither an
-artifact checkpoint directory nor a worktree lock: one thread owns each task
-worktree. Reservations and receipts contain the required retry inputs; 4E
-replaces reservations with a request inside the final version directory. A
-cleanup-only retry discovers completed work from its receipt and tag, without
-recreating commits or receipts. Old empty artifact checkpoint directories await
-one-time retirement during the next authorized deployment; unknown nonempty
-directories and still-used files remain untouched.
+`store_artifacts.py` owns allocation and storage.
+`complete_artifact_builds.py` owns prepared receipts and result-only commit C,
+artifact receipts and the immutable tag. Completion uses `read_versioned_build`
+to select existing requests/receipts without allocating or rebuilding.
+Successful tag completion removes `build_request.json` and resolved diagnostics;
+a cleanup-only call preserves the accepted files, commit and tag. One bounded
+failure report per version/target lives at
+`<version>/.diagnostics/<target>.json`; it is not acceptance evidence.
+
+Only cross-version retention uses the short store lock. Startup tries cleanup
+without waiting; completion performs remaining cleanup under that lock.
+Unfinished requests and untagged directories are excluded. The current bound
+remains three completed outputs per repository/unit/target/version class; the
+later 4F retention policy is not active yet. Immutable tags prevent reuse even
+after package bytes are pruned. Release and installation-destination locks are
+unchanged.
+
+This supersedes 1d/1e's reservation mechanism. The internal route has no artifact
+checkpoint directory or worktree lock; one thread owns each task worktree.
+Public Build/Promote adoption remains steps 16/22. The supported v2 route keeps
+its existing full-transaction lock and staging until its later retirement.
+During the authorized deployment, retire only old empty checkpoint directories
+and obsolete locks after old invocations stop. Transfer any still-needed old
+reservation into its matching version request, or remove a completed reservation
+only from its receipt/tag evidence; retain uncertain data. No recurring
+old-path scan or compatibility wrapper is added.
 
 ### Exact-artifact foundation and update methodology
 
@@ -455,7 +465,7 @@ The implemented foundation has six separate responsibilities:
 - **1e.1/4A — checkpoint storage:** the shared helper provides discoverable records
   without request locks; successful completion deletes only its own request.
   Domain producers decide recovery;
-  artifact reservations and accepted receipts retain their existing ownership.
+  version-local build requests and accepted receipts retain their ownership.
 
 The later public Build operation will supply the resolved selection, locked
 inputs, adapters, and required artifact tests. This foundation does not yet
@@ -529,9 +539,9 @@ owners after confirmed worktree removal. Step 20C connects it to the dedicated
 cleanup script after ownership and stopped-command checks; until then, absent
 worktrees' records stay. A still-present worktree or failed Git lookup prevents
 that explicit deletion. Neither cleanup follows redirected paths or deletes
-artifacts, reservations, installations or accepted results. There is no
+artifacts, build requests, installations or accepted results. There is no
 scheduled cleaner, startup sweep or successful-command orphan sweep. Artifact operations
-keep recovery information in existing reservations/receipts, not duplicate
+keep desired inputs and acceptance in build requests/receipts, not duplicate
 checkpoint JSON.
 
 The next authorized deployment must retire the exact obsolete
@@ -690,7 +700,7 @@ serialize commands.
 | 1a release declarations | Implemented | Keep current v4/v5 readers; connect exact-output producers later |
 | 1b receipt verification | Implemented v2 verifier plus internal v3/v1 receipt definitions and saved-chain reader | Connect public lifecycle callers in later steps |
 | 1c correction continuity | Implemented and preservation-verified; finalization consumes recorded success without rechecking the checkout | Reports and matching-success cleanup connected in 3B/4B |
-| 1d build/test/store | Implemented current v2 transaction plus an internal direct-write versioned route: reservations, final artifact paths, committed v3 build receipts, B-to-C result binding, artifact receipts, immutable tag and effect-derived recovery | 2B connects current release writers; public Build and receipt-driven Promote remain pending |
+| 1d/4D/4E build/test/store | Implemented v2 transaction and internal directory-first production with version-local requests, exact B-to-C receipts and immutable tags | Public Build and receipt-driven Promote remain in 16/22; 4F retention remains pending |
 | 1e.1/4A shared checkpoints | Implemented storage and fresh-invocation discovery without request locks; completion deletes only its own request | 4D removes the empty artifact wrapper/directory; 20C connects dedicated worktree cleanup; old lock files await authorized deployment retirement |
 | 1e.2 skill-change generations | Implemented immutable approvals, states and check results, five descriptive commands, interrupted-write recovery and completion cleanup; new committed receipts use `build_receipt.json` | 2B protects direct-release changes; historical committed receipts retain their recorded names |
 | 1e.3 test-result contract | Implemented generated-runner result contract and compatibility probe | 6 connects repository-wide result ownership, retention and affected-check orchestration |
@@ -767,12 +777,12 @@ policy. These are the runtime paths used by the foundation and update workflow:
 | `builds/`, `.staging/`, `.locks/`, `.diagnostics/` and `.locks/store.lock` | Persistent bounded infrastructure for the current v2 route; `store_artifacts.py` and `filelock` | One repository lock serializes that route's complete build/test/store transaction and cleanup ownership. The file remains reusable; the OS releases the held lock on normal exit or process death. No per-build lock history accumulates. |
 | `.staging/<build-key>/work/` and `bundle/` | Temporary private work for the current v2 route; `store_artifacts.py` | Removed on success or failure. At every v2 transaction startup, while holding the repository lock, remove every recognizable staging directory left by an earlier instance. Preserve unrecognized entries and report cleanup failure. |
 | `.diagnostics/<release-group-key>.json` and its `.tmp` write file | Persistent latest-failure report and temporary write for the current v2 route; `store_artifacts.py` | Atomically overwrite the group's report on failure and remove it after successful new publication. At v2 production startup remove interrupted `.tmp` writes. The completed-build reader does not rewrite diagnostics. Reports contain bounded excerpts and are never artifact-test evidence. |
-| `<shared-git-directory>/ceratops/artifacts/.reservations/<unit>/<version>.json` | Persistent unfinished ownership; versioned `store_artifacts.py` route | Written directly and read back under the short store lock before output production. One attempt owns the complete required-target set, branch, B and declared inputs. A matching record is reusable only during explicit recovery; malformed or conflicting ownership blocks. Remove it only after every artifact receipt and the immutable tag exist. |
+| `<shared-git-directory>/ceratops/artifacts/<unit>/<version>/build_request.json` | Version-local desired inputs; `store_artifacts.py` | Written immediately after exclusive directory creation, then bound to B before output. Same-worktree current-input matches can reuse it. Remove only after receipt/tag completion; retain unfinished or uncertain requests for controlled abandonment/removal cleanup. |
 | `.build/<unit>/<version>/build_receipt.json` with an optional `<target>/` | Direct final worktree result; operation runner | Qualification validates the final artifact/evidence bytes and writes the canonical receipt directly. A byte-identical valid file is reused, an invalid interrupted write is replaced, and a different valid receipt blocks. C commits these exact result paths without including unrelated staged work. Historical versions are read at the exact saved path/hash, including `receipt.json`; no old tag or receipt is rewritten. |
-| `artifacts/.diagnostics/<unit>/<target>/<alpha\|beta\|stable>.json` | Persistent bounded latest-failure report; versioned `store_artifacts.py` route | Directly replace the one current report for the repository/unit/target/version-class group and verify its bytes. A later write can replace an interrupted invalid record; successful finalization clears the resolved group's report. No helper-owned temporary file is used. |
-| `artifacts/<unit>/<version>/` with optional `<target>/` | Direct final artifact output; artifact producer, finalizer and reader | Production writes into the final version directory after reservation. Valid existing files are measured and reused; changed or missing qualified bytes block completion. The version remains unreadable as completed until every target artifact receipt exists and immutable tag `<unit>/<version>` points to C. Startup and completion retain the current output plus two predecessors per repository/unit/target/class group while protecting reservations. |
-| `artifacts/.locks/store.lock` | Persistent reusable short-section lock; `store_artifacts.py` and `filelock` | Protects reservation, pruning, artifact-receipt and tag mutations only; build and artifact-test work runs outside it. The lock file is reusable and its availability is not recovery evidence. |
-| `<shared-git-directory>/ceratops/operations/<owner>/<worktree-id>/` | Disposable essential records; `manage_checkpoints.py` for `artifact-versions` and `skill-updates` | One unfinished request per component/worktree, without a request lock. Open retains records; immutable JSON is written directly, identical writes are reused, and unreadable/conflicting records block unless the owner can reconstruct an unreferenced final write. Outermost success removes only its own records. Other worktrees' requests stay until dedicated cleanup is connected in 20C. Durable repository acceptance and reservations are not stored here. |
+| `artifacts/<unit>/<version>/.diagnostics/<target>.json` | One bounded current failure report per version/target; `complete_artifact_builds.py` | Direct writes replace older or interrupted diagnostics. Receipt/tag completion removes resolved reports. No temporary copy or cross-version write lock. |
+| `artifacts/<unit>/<version>/` with optional `<target>/` | Final output; allocator, builder and completion owner | Exclusive directory creation selects the version before source version preparation and B. Existing tags stay occupied after byte pruning. Untagged directories and outstanding requests stay out of retention. Completion binds every target receipt and the tag to C; current retention keeps three per repository/unit/target/class until 4F. |
+| `artifacts/.locks/store.lock` | Persistent native cross-version cleanup lock; `store_artifacts.py` and `filelock` | Protects retention selection/deletion only. Allocation never waits on it; request, receipt and tag writes do not hold it. Not a worktree lock or allocation reservation. |
+| `<shared-git-directory>/ceratops/operations/skill-updates/<worktree-id>/` | Disposable skill-change records; `manage_checkpoints.py` | One unfinished request per worktree, without a request lock. Immutable direct records retain required scope and successful checks; outermost completion deletes only its own records. Dedicated removed-worktree cleanup is connected in 20C. Artifact operations do not use this directory. |
 | `<shared-git-directory>/ceratops/locks/{skill-updates,artifact-versions}/<worktree-id>.lock` | Obsolete files from the old checkpoint helper | No new creation or use. Retire exact old files at the next authorized deployment after old helper invocations stop; retain/report files still in use. No startup migration or recurring scan. Other locks and saved requests stay untouched. |
 | `operations/skill-updates/<worktree-id>/update_request.json`, `states/<generation>.json`, `check_results/<generation>.json`, `completion_receipt.json` under the shared Git directory's `ceratops/` | Disposable update continuity; `skill-update-workflow.py` | Keep the original request/baseline, current state plus two predecessors and their referenced check results. Write new generations directly; repair only malformed unreferenced tails, never valid conflicts or changed accepted results. Explicit `close_skill_change` consumes saved success, writes the completion receipt, then removes only that request's checkpoints. The receipt survives interrupted cleanup and is deleted last. Caller input requests remain caller-owned. |
 | Update check scratch directories and cleanup records | Temporary check work; `skill_update_scratch.py` | Removed when each check scope exits; recorded unfinished cleanup is retried before another check. Explicit check-output paths remain caller-owned. |

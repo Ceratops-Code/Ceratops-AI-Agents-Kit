@@ -26,6 +26,7 @@ from copy import deepcopy
 from dataclasses import dataclass, replace
 from typing import Any
 
+import complete_artifact_builds
 import execute_skill_actions
 import reuse_operation_checks
 import sdlc_results
@@ -39,6 +40,7 @@ from ceratops_repo_compatibility_engine.sdlc_contract_validation import (
 from ceratops_repo_compatibility_engine.sdlc_contract_validation import (
     operation_category as contract_operation_category,
 )
+from complete_artifact_builds import CompletedArtifactVersion, PreparedBuildReceipt
 from github_pr_workflow.command import (
     failure_excerpt,
     remove_resolved_failures,
@@ -51,9 +53,7 @@ from sdlc_results import StepResultError, capture_step_result
 from store_artifacts import (
     ArtifactVersionTransaction,
     BuildProduct,
-    CompletedArtifactVersion,
     OperationError,
-    PreparedBuildReceipt,
 )
 
 # Public storage types and reader; storage remains their implementation owner.
@@ -243,39 +243,38 @@ def build_bundle(
                 raise
 
 
-def reserve_versioned_build(
-    repo_root: pathlib.Path,
-    *,
-    repository: str,
-    release_unit: str,
-    version: str,
-    required_targets: Sequence[str],
-    attempt_id: str | None = None,
-    pre_test_commit: str,
+def allocate_versioned_build(
+    repo_root: pathlib.Path, *, repository: str, release_unit: str, version: str,
+    required_targets: Sequence[str], attempt_id: str | None = None,
     declared_input_paths: Sequence[str] = (),
-    recovery_confirmed: bool = False,
-) -> ArtifactVersionTransaction:
-    """Begin the internal post-B versioned storage route.
+) -> store_artifacts.ArtifactVersionAllocation:
+    """Choose the final version before source version/pin preparation and commit B.
 
-    The operation owner creates checkpoint B and completes build-independent
-    checks before calling this boundary. The returned output/work paths belong
-    exclusively to the recorded attempt; source remains in the existing
-    worktree. On an explicitly confirmed retry, omit attempt_id to discover the
-    reservation (or completed receipt after success). One thread owns the
-    worktree; no separate checkpoint directory or worktree lock is needed.
-    Public Build routing remains disconnected until steps 16/22.
+    The caller uses the returned version in every member, commits B, then calls
+    bind_versioned_build_inputs before building. Public adoption is in 16/22.
     """
-
-    return store_artifacts.reserve_versioned_artifacts(
-        repo_root,
-        repository=repository,
-        release_unit=release_unit,
-        version=version,
-        required_targets=required_targets,
-        attempt_id=attempt_id,
-        pre_test_commit=pre_test_commit,
+    return store_artifacts.allocate_artifact_version(
+        repo_root, repository=repository, release_unit=release_unit, version=version,
+        required_targets=required_targets, attempt_id=attempt_id,
         declared_input_paths=declared_input_paths,
-        recovery_confirmed=recovery_confirmed,
+    )
+
+
+def bind_versioned_build_inputs(
+    allocation: store_artifacts.ArtifactVersionAllocation, *, pre_test_commit: str,
+) -> ArtifactVersionTransaction:
+    """Bind checkpoint B before any adapter writes outputs for this version."""
+    return store_artifacts.bind_artifact_inputs(allocation, pre_test_commit=pre_test_commit)
+
+
+def read_versioned_build(
+    repo_root: pathlib.Path, *, repository: str, release_unit: str, version: str,
+    required_targets: Sequence[str],
+) -> ArtifactVersionTransaction:
+    """Read a request or completed receipts for completion-only work; never allocate."""
+    return complete_artifact_builds.read_artifact_build(
+        repo_root, repository=repository, release_unit=release_unit,
+        version=version, required_targets=required_targets,
     )
 
 
@@ -298,7 +297,7 @@ def prepare_versioned_receipt(
 ) -> PreparedBuildReceipt:
     """Write one qualified target receipt to its final worktree path."""
 
-    return store_artifacts.prepare_versioned_build_receipt(transaction, target, receipt)
+    return complete_artifact_builds.prepare_versioned_build_receipt(transaction, target, receipt)
 
 
 def complete_versioned_build(
@@ -307,7 +306,7 @@ def complete_versioned_build(
 ) -> CompletedArtifactVersion:
     """Create or recover C, bind every target, and create the version tag."""
 
-    return store_artifacts.complete_versioned_artifacts(transaction, prepared_receipts)
+    return complete_artifact_builds.complete_versioned_artifacts(transaction, prepared_receipts)
 
 
 

@@ -210,6 +210,51 @@ def test_checkpoint_calls_ignore_and_preserve_obsolete_lock_files(tmp_path, owne
     assert {path for path in lock_root.rglob("*") if path.is_file()} == {*retained, old_lock}
 
 
+
+def test_checkpoint_completion_preserves_other_process_records_and_old_lock(tmp_path):
+    repository, _commit = _versioned_repository(tmp_path)
+    removed = _checkpoint_worktree(repository, tmp_path / "removed-writer")
+    with cp.open_checkpoints(removed, "skill-updates") as other:
+        cp.write_checkpoint(other, "request.json", {"keep": "old invocation"})
+    old_lock = other.common_dir / "ceratops/locks/skill-updates" / f"{other.worktree_id}.lock"
+    old_lock.parent.mkdir(parents=True)
+    program = (
+        "import os,sys; from filelock import FileLock\n"
+        "with FileLock(sys.argv[1],timeout=0,preserve_lock_file=True):\n"
+        " print('locked',flush=True); input(); os._exit(17)\n"
+    )
+    worker = subprocess.Popen(
+        [sys.executable, "-c", program, str(old_lock)], stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        assert worker.stdout is not None
+        assert worker.stdout.readline().strip() == "locked"
+        assert run_git(repository, "worktree", "remove", str(removed)).returncode == 0
+        with cp.open_checkpoints(repository, "skill-updates") as own:
+            cp.write_checkpoint(own, "request.json", {"done": True})
+            cp.finish_checkpoints(own)
+            cp.finish_checkpoints(own)
+        assert (other.directory / "request.json").is_file()
+        assert old_lock.is_file()
+        from filelock import Timeout
+        with pytest.raises(Timeout), FileLock(old_lock, timeout=0, preserve_lock_file=True):
+            pytest.fail("Another process's native lock was lost.")
+        worker.communicate(input="crash\n", timeout=10)
+        assert worker.returncode == 17
+        # A crashed holder no longer owns the native lock; the old filename
+        # remains for one-time authorized retirement, not normal request cleanup.
+        with FileLock(old_lock, timeout=0, preserve_lock_file=True):
+            assert (other.directory / "request.json").is_file()
+        cp.discard_worktree_checkpoints(repository, other.worktree_id)
+        cp.discard_worktree_checkpoints(repository, other.worktree_id)
+        assert not other.directory.exists() and old_lock.is_file()
+    finally:
+        if worker.poll() is None:
+            worker.kill()
+        worker.wait(timeout=10)
+
+
 def test_checkpoints_follow_registration_across_worktree_move_and_external_removal(tmp_path) -> None:
     repository, _commit = _versioned_repository(tmp_path)
     original = _checkpoint_worktree(repository, tmp_path / "original")
