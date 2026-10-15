@@ -136,7 +136,8 @@ def test_incomplete_ownership_blocks_the_batch_before_any_callback(
         assert result["diagnostic_output"] == str(report_path)
         assert report["owner"]["action"] == "promote"
         assert report["successful_result_paths"] == [str(accepted)]
-        assert "ownership" in report["failures"]["operation_preparation"]["message"]
+        preparation_id = f"operation_preparation:{valid.operation},{invalid.operation}"
+        assert "ownership" in report["failures"][preparation_id]["message"]
     else:
         assert not report_path.exists()
     assert accepted.read_text() == "original accepted bytes"

@@ -80,10 +80,20 @@ def hold_release_source(repo_root: pathlib.Path) -> Iterator[WriteLockContext | 
     Destination locking belongs inside this context, in the installer itself.
     """
     root = pathlib.Path(repo_root).resolve()
-    result = subprocess.run(
-        ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
-        capture_output=True, text=True, check=False,
-    )
+    # Only a checkout root has a .git directory or linked-worktree pointer.
+    # Plain skill sources have no release branch to protect; keep their request
+    # checks and source-check command independent of Git. lexists preserves the
+    # error path for broken metadata links instead of treating them as absent.
+    if not os.path.lexists(root / ".git"):
+        yield None
+        return
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, check=False,
+        )
+    except OSError as exc:
+        raise WriteLockError(f"Cannot inspect installation source: {exc}") from exc
     if (result.returncode == 128 and "not a git repository" in result.stderr
             and not (root / ".git").exists()) or (
         result.returncode == 0 and pathlib.Path(result.stdout.strip()).resolve() != root
@@ -94,10 +104,13 @@ def hold_release_source(repo_root: pathlib.Path) -> Iterator[WriteLockContext | 
         raise WriteLockError(f"Cannot inspect installation source: {result.stderr.strip()}")
     path = release_lock_path(root)
     if root != path.parents[3]:
-        branch = subprocess.run(
-            ["git", "-C", str(root), "branch", "--show-current"],
-            capture_output=True, text=True, check=False,
-        )
+        try:
+            branch = subprocess.run(
+                ["git", "-C", str(root), "branch", "--show-current"],
+                capture_output=True, text=True, check=False,
+            )
+        except OSError as exc:
+            raise WriteLockError(f"Cannot inspect source branch: {exc}") from exc
         if branch.returncode:
             raise WriteLockError(f"Cannot inspect source branch: {branch.stderr.strip()}")
         if branch.stdout.strip() != "release/local":

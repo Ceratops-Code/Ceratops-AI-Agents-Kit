@@ -108,6 +108,38 @@ def test_source_installers_share_release_and_report_stopped_commands(tmp_path, m
                 pass
 
 
+@pytest.mark.parametrize("ending", ["completed", "failed"])
+def test_non_git_installation_source_needs_no_git_probe(tmp_path, monkeypatch, ending):
+    locks = workflow_command.release_lock_module()
+    monkeypatch.setattr(locks.subprocess, "run", lambda *args, **kwargs: pytest.fail("non-Git source queried Git"))
+    for _ in range(2):
+        try:
+            with locks.hold_release_source(tmp_path) as owned:
+                assert owned is None
+                if ending == "failed":
+                    raise RuntimeError("original source failure")
+        except RuntimeError as exc:
+            assert ending == "failed" and str(exc) == "original source failure"
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_git_source_probe_launch_failure_keeps_its_cause(tmp_path, monkeypatch):
+    (tmp_path / ".git").mkdir()
+    locks = workflow_command.release_lock_module()
+    cause = OSError("Git could not start")
+
+    def fail(*args, **kwargs):
+        raise cause
+
+    monkeypatch.setattr(locks.subprocess, "run", fail)
+    for _ in range(2):
+        with pytest.raises(locks.WriteLockError, match="Git could not start") as raised:
+            with locks.hold_release_source(tmp_path):
+                pytest.fail("source probe failure entered installation")
+        assert raised.value.__cause__ is cause
+    assert list((tmp_path / ".git").iterdir()) == []
+
+
 def test_source_installation_does_not_lock_a_task_worktree(tmp_path):
     repo, _, _, _ = prepare_repository_lifecycle_repo(tmp_path)
     task = tmp_path / "task"

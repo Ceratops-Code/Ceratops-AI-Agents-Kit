@@ -84,8 +84,8 @@ def test_bind_observed_outcome_is_idempotent_and_retains_live_candidate(reposito
     )
     assert finalized["retained_check_candidate"] is True
     assert path.read_bytes() == original_scope
-    wrapper = runpy.run_path(str(support.SHIP_REPOSITORY))
-    wrapper["_require_cleanup_safe_caller"](repo, path, [])
+    shipping = support.load_pr_workflow_module(monkeypatch, "ship_repository")
+    shipping._require_cleanup_safe_caller(repo, path, [])
 
 
 def test_mixed_source_scope_preserves_same_target_and_releases_finalized_pin(repository):

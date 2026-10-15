@@ -554,7 +554,7 @@ not a recurring scan. Preserve saved requests and release/store/destination
 locks: those protect shared release updates, store metadata and installations,
 not ordinary work in a task worktree.
 
-See the design's [five-function interface table and caller responsibilities](docs/design-draft.md#shared-checkpoint-storage-implemented)
+See the design's [five-function interface table and caller responsibilities](docs/design-draft.md#skill-update-checkpoint-storage-implemented)
 for arguments, errors, storage limits and cleanup-only retries.
 
 ### Working-folder lifecycle refactor status
@@ -681,6 +681,7 @@ installer reads that exact selected commit; installation failure reports the
 completed promotion and never reverses it or retries installation. Ship retains
 its outer lock through its current installation and cleanup. Standalone skill/MCP
 installation protects the release source too, but never locks a task worktree.
+Plain source directories without Git metadata skip Git lock discovery entirely.
 The existing installer takes its destination lock inside release protection;
 it cannot start Promote/Ship while holding that destination lock. Explicit
 in-process installer calls share ownership with Promote, Ship and fast-change.
