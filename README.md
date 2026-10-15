@@ -654,6 +654,15 @@ The caller selects a stable file under
 separate files; retries reuse the same path. The path is independent of
 promotion's unchanged `--result-file`.
 
+When the calling environment supplies `CERATOPS_TASK_TEMP_ROOT`, `command.py`
+uses that absolute directory for report ownership and cleanup. It must be one
+task directory directly beneath `<repo-parent>/tmp/<repo-name>/` and identify
+one existing registered worktree. The report retains that worktree's identity
+when execution moves to the primary checkout. Invalid, redirected, foreign, or
+ambiguous directories cannot authorize report writes or deletion. The existing
+caller-selected layout applies when the variable is absent; this reader does
+not initialize the command environment.
+
 `command.py` writes complete secret-redacted failures directly to that file
 before returning a short error with `diagnostic_output`. It references existing
 successful test/build result files without copying them. An existing complete

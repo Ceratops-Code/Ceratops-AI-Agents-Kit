@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import pathlib
 import re
 import subprocess
@@ -314,6 +315,35 @@ def _report_scope(
     ).splitlines()
     common, checkout = (pathlib.Path(value).resolve() for value in git_paths)
     task_root = common.parent.parent / "tmp" / common.parent.name / root.name
+    if (configured := os.environ.get("CERATOPS_TASK_TEMP_ROOT")) is not None:
+        # Execution may move to the primary checkout. The supplied task root
+        # still identifies the original registered worktree and its report.
+        task_root = pathlib.Path(configured).expanduser()
+        expected_parent = common.parent.parent / "tmp" / common.parent.name
+        if (not task_root.is_absolute() or task_root.parent != expected_parent
+                or task_root.resolve() != task_root
+                or (task_root.exists() and not task_root.is_dir())):
+            raise ValueError(
+                f"CERATOPS_TASK_TEMP_ROOT must name one task directory inside {expected_parent}."
+            )
+        registered = require_output(
+            ["git", "worktree", "list", "--porcelain", "-z"], cwd=root,
+        )
+        owners = [
+            pathlib.Path(field.removeprefix("worktree "))
+            for field in registered.split("\0")
+            if field.startswith("worktree ")
+            and pathlib.Path(field.removeprefix("worktree ")).name == task_root.name
+        ]
+        if len(owners) != 1 or not owners[0].is_dir():
+            raise ValueError(
+                "CERATOPS_TASK_TEMP_ROOT must identify exactly one existing registered worktree."
+            )
+        task_worktree = owners[0].resolve(strict=True)
+        checkout = pathlib.Path(require_output(
+            ["git", "rev-parse", "--path-format=absolute", "--absolute-git-dir"],
+            cwd=task_worktree,
+        )).resolve(strict=True)
     selected = path.expanduser().absolute()
     # Never follow a redirected parent when writing or deleting diagnostics.
     if (not action or selected.resolve() != selected

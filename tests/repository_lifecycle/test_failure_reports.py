@@ -27,6 +27,13 @@ ship_repository = importlib.import_module("github_pr_workflow.ship_repository")
 ship_pull_request = importlib.import_module("github_pr_workflow.ship_pull_request")
 
 
+@pytest.fixture(autouse=True)
+def isolated_report_environment(monkeypatch):
+    # Fixture repositories have their own task roots, independent of the
+    # worktree environment that launched this test process.
+    monkeypatch.delenv("CERATOPS_TASK_TEMP_ROOT", raising=False)
+
+
 @pytest.fixture
 def report_repo(tmp_path):
     repo = tmp_path / "example"
@@ -56,6 +63,116 @@ def remove(repo, path, resolved=("tests:unit",), action="promote"):
         path, repo_root=repo, action=action, resolved_failures=resolved,
         commands_stopped=True,
     )
+
+
+def report_primary_checkout(repo):
+    result = run_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    assert result.returncode == 0
+    return pathlib.Path(result.stdout.strip()).parent
+
+
+@pytest.mark.parametrize("action", ["promote", "ship", "build", "repository_operation"])
+def test_task_temp_environment_keeps_owner_when_execution_uses_primary_checkout(
+    report_repo, monkeypatch, action,
+):
+    repo, path = report_repo
+    primary = report_primary_checkout(repo)
+    monkeypatch.setenv("CERATOPS_TASK_TEMP_ROOT", str(path.parent))
+    for caller in (repo, primary, primary):
+        command.write_failure_report(
+            path, repo_root=caller, action=action,
+            failures={"tests:unit": "same task failure"},
+        )
+    expected = run_git(repo, "rev-parse", "--absolute-git-dir")
+    assert expected.returncode == 0
+    report = json.loads(path.read_text())
+    assert report["owner"]["worktree"] == str(pathlib.Path(expected.stdout.strip()).resolve())
+    for _ in range(2):
+        assert command.remove_failure_report(
+            path, repo_root=primary, action=action,
+            resolved_failures=("tests:unit",), commands_stopped=True,
+        )
+    assert not path.exists()
+
+
+@pytest.mark.parametrize("invalid", ["foreign", "relative", "unregistered", "empty"])
+def test_task_temp_environment_rejects_invalid_directory_without_touching_report(
+    report_repo, tmp_path, monkeypatch, invalid,
+):
+    repo, path = report_repo
+    save(repo, path)
+    original = path.read_bytes()
+    values = {
+        "foreign": str(tmp_path / "tmp" / "other-repository" / "report-task"),
+        "relative": "tmp/example/report-task",
+        "unregistered": str(path.parent.with_name("missing-task")),
+        "empty": "",
+    }
+    monkeypatch.setenv("CERATOPS_TASK_TEMP_ROOT", values[invalid])
+    with pytest.raises(ValueError, match="CERATOPS_TASK_TEMP_ROOT"):
+        save(repo, path)
+    assert not remove(repo, path)
+    assert path.read_bytes() == original
+
+
+def test_task_temp_environment_keeps_parallel_worktree_reports_separate(
+    report_repo, tmp_path, monkeypatch,
+):
+    repo, path = report_repo
+    primary = report_primary_checkout(repo)
+    other = tmp_path / "worktrees" / "example" / "other-task"
+    assert run_git(repo, "worktree", "add", "-b", "other-task", str(other)).returncode == 0
+    other_path = path.parent.with_name("other-task") / path.name
+    monkeypatch.setenv("CERATOPS_TASK_TEMP_ROOT", str(path.parent))
+    save(repo, path)
+    original = path.read_bytes()
+    monkeypatch.setenv("CERATOPS_TASK_TEMP_ROOT", str(other_path.parent))
+    save(primary, other_path)
+    other_original = other_path.read_bytes()
+    assert not remove(primary, path)
+    assert path.read_bytes() == original
+    assert other_path.read_bytes() == other_original
+    assert remove(primary, other_path)
+    monkeypatch.setenv("CERATOPS_TASK_TEMP_ROOT", str(path.parent))
+    assert remove(primary, path)
+
+
+@pytest.mark.parametrize("effect", ["mkdir", "write_text", "unlink"])
+@pytest.mark.parametrize("interrupt_after", [False, True])
+def test_task_temp_environment_repeats_after_interrupted_report_effect(
+    report_repo, monkeypatch, effect, interrupt_after,
+):
+    repo, path = report_repo
+    primary = report_primary_checkout(repo)
+    monkeypatch.setenv("CERATOPS_TASK_TEMP_ROOT", str(path.parent))
+    if effect == "unlink":
+        save(repo, path)
+    original = getattr(pathlib.Path, effect)
+    target = path.parent if effect == "mkdir" else path
+
+    def interrupted(selected, *args, **kwargs):
+        if selected != target:
+            return original(selected, *args, **kwargs)
+        if interrupt_after:
+            original(selected, *args, **kwargs)
+        raise KeyboardInterrupt("task report effect interrupted")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(pathlib.Path, effect, interrupted)
+        with pytest.raises(KeyboardInterrupt):
+            if effect == "unlink":
+                remove(primary, path)
+            else:
+                save(repo, path)
+    for _ in range(2):
+        if effect == "unlink":
+            assert remove(primary, path)
+        else:
+            save(primary, path)
+    if effect != "unlink":
+        assert json.loads(path.read_text())["failures"]
+        assert remove(primary, path)
+    assert not path.exists()
 
 
 def test_complete_redacted_report_before_short_response(report_repo):
