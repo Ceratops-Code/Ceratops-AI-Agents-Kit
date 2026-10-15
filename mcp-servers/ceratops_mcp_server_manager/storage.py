@@ -161,14 +161,28 @@ class Layout:
         finally:
             temporary.unlink(missing_ok=True)
 
-    def install_launcher(self, source: Path | None = None) -> None:
-        """Install the stable launcher and command shim for this MCP server."""
+    def install_launcher(self, source: Path | None = None) -> bool:
+        """Bring both stable launcher files to the selected template, one file at a time.
+
+        A repeat after interruption changes only files that are still missing or
+        stale. Each replacement is atomic; a failure leaves the selected server
+        environment and its current.json untouched.
+        """
         source = source or Path(__file__).with_name("launcher.py")
         payload = source.read_bytes()
         self.directory("bin")
-        self.atomic_bytes(self.path("bin", f"{self.root.name}.py"), payload)
         command = f'@echo off\r\npython -I -B "%~dp0{self.root.name}.py" %*\r\n'.encode()
-        self.atomic_bytes(self.path("bin", f"{self.root.name}.cmd"), command)
+        changed = False
+        for name, contents in (
+            (f"{self.root.name}.py", payload),
+            (f"{self.root.name}.cmd", command),
+        ):
+            target = self.path("bin", name)
+            if target.is_file() and target.read_bytes() == contents:
+                continue
+            self.atomic_bytes(target, contents)
+            changed = True
+        return changed
 
     def _remove_tree(self, path: Path) -> None:
         self.path(*path.relative_to(self.root).parts)

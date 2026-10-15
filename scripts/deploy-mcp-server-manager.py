@@ -7,7 +7,8 @@ and deployment implementations install its declared name and version. An
 explicit legacy root can contribute validated immutable release catalogs; its
 environments are rebuilt under the current root and the source remains intact.
 This command never installs global prerequisites, edits Codex settings, or
-restarts apps.
+restarts apps. After selecting the manager release, it brings launchers for
+its own installed servers to the source template.
 """
 
 from __future__ import annotations
@@ -271,6 +272,52 @@ def ensure_launchers(layout: Layout) -> None:
     layout.install_launcher(SOURCE / "launcher.py")
 
 
+def installed_server_names(engine: Engine) -> list[str]:
+    """Find selected servers under the manager-owned root without following links.
+
+    A directory without a current selection is not an installed server. A
+    malformed or incomplete selection fails before manager packaging rather
+    than silently leaving that server's launcher behind.
+    """
+    engine.layout.path()  # Reject linked installation ancestors before scanning.
+    root = engine.layout.root.parent
+    if not root.exists():
+        return []
+    names: list[str] = []
+    for directory in sorted(root.iterdir(), key=lambda path: path.name):
+        if directory.name == MCP_SERVER_NAME:
+            continue
+        try:
+            token(directory.name)
+        except DeploymentError:
+            continue
+        info = directory.lstat()
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+            or getattr(info, "st_file_attributes", 0) & 0x400
+        ):
+            continue
+        if not Layout(directory.name).path("current.json").exists():
+            continue
+        if engine.selected(directory.name) is not None:
+            names.append(directory.name)
+    return names
+
+
+def install_manager_if_needed(engine: Engine, result: dict[str, Any]) -> dict[str, Any]:
+    """Reuse an exact selected release when retrying after a target refresh fails."""
+    current = engine.selected(MCP_SERVER_NAME)
+    if (
+        current is not None
+        and result.get("manifest_sha256") is not None
+        and (current.get("version"), current.get("manifest_sha256"))
+        == (result["version"], result["manifest_sha256"])
+    ):
+        return engine.versions(MCP_SERVER_NAME)
+    return engine.install(result["mcp_server_name"], result["version"])
+
+
 def package_manager(engine: Engine, runtime: Runtime) -> dict:
     """Use the manager's source implementation without preinstalled libraries.
 
@@ -314,13 +361,24 @@ def main(argv: list[str] | None = None) -> int:
                 "catalogs": imported,
                 "rehydrated": rehydrate_selected(engine, selections),
             }
+        targets = installed_server_names(engine)
         result = package_manager(engine, runtime)
         if result["mcp_server_name"] != MCP_SERVER_NAME:
             raise DeploymentError(
                 "source project.name must identify the MCP server manager"
             )
         ensure_launchers(engine.layout)
-        outcome = engine.install(result["mcp_server_name"], result["version"])
+        outcome = install_manager_if_needed(engine, result)
+        refreshed: list[dict[str, Any]] = []
+        for name in targets:
+            try:
+                refreshed.append(engine.refresh_launcher(name))
+            except (DeploymentError, OSError, ValueError, KeyError) as exc:
+                completed = ", ".join(item["mcp_server_name"] for item in refreshed) or "none"
+                raise DeploymentError(
+                    f"manager installed; launchers refreshed: {completed}; refresh failed for {name}: {exc}"
+                ) from exc
+        outcome["refreshed_launchers"] = refreshed
         if migration is not None:
             outcome["migration"] = migration
         print(json.dumps(outcome, sort_keys=True))

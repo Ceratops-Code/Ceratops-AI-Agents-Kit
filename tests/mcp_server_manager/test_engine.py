@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import importlib
+import importlib.util
 import io
 import json
 import os
@@ -325,6 +326,56 @@ def test_usage_leases_are_shared_and_block_retirement(tmp_path, monkeypatch):
         assert removable is True
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows console launch behavior")
+def test_launcher_hides_selected_child_and_allows_fresh_retries(tmp_path, monkeypatch):
+    monkeypatch.setattr(storage, "INSTALL_ROOT", tmp_path)
+    root = tmp_path / "fixture"
+    storage.Layout("fixture").install_launcher()
+    script = root / "bin/fixture.py"
+    spec = importlib.util.spec_from_file_location("installed_fixture_launcher", script)
+    assert spec is not None and spec.loader is not None
+    launcher = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(launcher)
+    selected = {
+        "schema": 1,
+        "mcp_server_id": "fixture",
+        "version": "1.0.0",
+        "manifest_sha256": "a" * 64,
+        "instance": "b" * 32,
+        "module": "fixture_server",
+    }
+    (root / "current.json").write_text(json.dumps(selected), encoding="utf-8")
+    installation = root / "versions/1.0.0" / selected["instance"]
+    (installation / "environment/Scripts").mkdir(parents=True)
+    (installation / "receipt.json").write_text(json.dumps(selected), encoding="utf-8")
+    python = installation / "environment/Scripts/python.exe"
+    python.write_bytes(b"")
+
+    attempts = []
+
+    def run_child(arguments, **options):
+        attempts.append((arguments, options))
+        if len(attempts) == 1:
+            raise OSError("child could not start")
+        return 9 if len(attempts) == 2 else 0
+
+    monkeypatch.setattr(launcher, "__file__", str(script))
+    monkeypatch.setattr(launcher.sys, "argv", [str(script), "--serve"])
+    monkeypatch.setattr(launcher.subprocess, "call", run_child)
+    monkeypatch.setenv("PYTHONPATH", "ignored")
+
+    with pytest.raises(OSError, match="child could not start"):
+        launcher.main()
+    assert launcher.main() == 9
+    assert launcher.main() == 0
+    assert len(attempts) == 3
+    for arguments, options in attempts:
+        assert arguments == [str(python), "-I", "-B", "-m", "fixture_server", "--serve"]
+        assert options["creationflags"] == launcher.subprocess.CREATE_NO_WINDOW
+        assert "PYTHONPATH" not in options["env"]
+        assert {"stdin", "stdout", "stderr"}.isdisjoint(options)
+
+
 @pytest.mark.parametrize("metadata_name", ["example_mcp_server", "Example-MCP-Server", "example.mcp.server", "example__mcp__server"])
 @pytest.mark.parametrize("mcp_server", ["example_mcp_server", "example-mcp-server"])
 def test_underscore_identity_installs_with_normalized_wheel_metadata(deployment, tmp_path, metadata_name, mcp_server):
@@ -501,6 +552,77 @@ def test_cli_uses_shared_engine_and_rejects_extra_operation(deployment, tmp_path
         cli.main(["rollback", "fixture"])
     with pytest.raises(SystemExit):
         cli.main(["update", "fixture", "1.0.0", "--root", "C:/escape"])
+
+
+def test_refresh_launcher_changes_only_named_installed_server(deployment, tmp_path, capsys):
+    engine, calls, _ = deployment
+    make_release(tmp_path, "1.0.0")
+    make_release(tmp_path, "1.0.0", mcp_server="independent")
+    engine.install("fixture", "1.0.0")
+    engine.install("independent", "1.0.0")
+    selected = (tmp_path / "fixture/current.json").read_bytes()
+    independent = (tmp_path / "independent/bin/independent.py").read_bytes()
+    launcher = tmp_path / "fixture/bin/fixture.py"
+    command = tmp_path / "fixture/bin/fixture.cmd"
+    launcher.write_bytes(b"stale Python launcher")
+    command.write_bytes(b"stale command launcher")
+    prior_calls = len(calls)
+
+    assert cli.main(["refresh-launcher", "fixture"]) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "mcp_server_name": "fixture",
+        "installed_version": "1.0.0",
+        "launcher_updated": True,
+    }
+    assert launcher.is_file() and launcher.stat().st_size > 0
+    assert command.read_bytes().startswith(b"@echo off\r\npython -I -B")
+    assert (tmp_path / "fixture/current.json").read_bytes() == selected
+    assert (tmp_path / "independent/bin/independent.py").read_bytes() == independent
+    assert len(calls) == prior_calls
+    assert engine.refresh_launcher("fixture")["launcher_updated"] is False
+
+
+@pytest.mark.parametrize("file_name", ["fixture.py", "fixture.cmd"])
+@pytest.mark.parametrize("interrupt", ["before", "after"])
+def test_refresh_launcher_resumes_each_file_effect(
+    deployment, tmp_path, monkeypatch, file_name, interrupt
+):
+    engine, _, _ = deployment
+    make_release(tmp_path, "1.0.0")
+    engine.install("fixture", "1.0.0")
+    selected = (tmp_path / "fixture/current.json").read_bytes()
+    launcher = tmp_path / "fixture/bin/fixture.py"
+    command = tmp_path / "fixture/bin/fixture.cmd"
+    launcher.write_bytes(b"stale Python launcher")
+    command.write_bytes(b"stale command launcher")
+    atomic_bytes = storage.Layout.atomic_bytes
+
+    def interrupted_write(layout, target, contents):
+        if target.name == file_name and interrupt == "before":
+            raise OSError("interrupted before launcher replacement")
+        atomic_bytes(layout, target, contents)
+        if target.name == file_name and interrupt == "after":
+            raise OSError("interrupted after launcher replacement")
+
+    with monkeypatch.context() as interrupted:
+        interrupted.setattr(storage.Layout, "atomic_bytes", interrupted_write)
+        with pytest.raises(OSError, match="interrupted"):
+            engine.refresh_launcher("fixture")
+
+    assert engine.refresh_launcher("fixture")["launcher_updated"] is (interrupt == "before" or file_name == "fixture.py")
+    assert launcher.is_file() and launcher.stat().st_size > 0
+    assert command.read_bytes().startswith(b"@echo off\r\npython -I -B")
+    assert (tmp_path / "fixture/current.json").read_bytes() == selected
+    assert not list((tmp_path / "fixture/bin").glob("*.tmp"))
+    with monkeypatch.context() as repeated:
+        repeated.setattr(storage.Layout, "atomic_bytes", lambda *_args: pytest.fail("unchanged launcher rewritten"))
+        assert engine.refresh_launcher("fixture")["launcher_updated"] is False
+
+
+def test_refresh_launcher_rejects_uninstalled_target_without_creating_root(deployment, tmp_path):
+    with pytest.raises(contracts.DeploymentError, match="installed MCP server"):
+        deployment[0].refresh_launcher("missing")
+    assert not (tmp_path / "missing").exists()
 
 
 def test_linked_root_is_rejected(tmp_path, monkeypatch):
