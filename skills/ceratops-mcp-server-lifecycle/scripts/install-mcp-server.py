@@ -16,6 +16,7 @@ import json
 import os
 import pathlib
 import re
+import subprocess
 import sys
 from typing import Any, NamedTuple
 
@@ -48,6 +49,8 @@ MANAGER_RESULT_FIELDS = {
 
 class InstallCompletionError(RuntimeError):
     """The manager result cannot establish one exact completed installation."""
+
+    command_failure: dict[str, Any]
 
 
 class InstallOptions(NamedTuple):
@@ -108,7 +111,9 @@ def _git(repo_root: pathlib.Path, *arguments: str) -> str:
         check=False,
     )
     if result.returncode:
-        raise InstallCompletionError("could not inspect the deployment source")
+        failure = InstallCompletionError("could not inspect the deployment source")
+        failure.command_failure = source_locks.command_failure_details(result, target=repo_root)
+        raise failure
     return result.stdout.strip()
 
 
@@ -206,9 +211,8 @@ def _manager_payload(path: pathlib.Path) -> dict[str, Any]:
     return _json_object(_plain_file(path, "manager result").read_bytes(), "manager result")
 
 
-def _install(args: InstallOptions, repo_root: pathlib.Path) -> dict[str, Any]:
-    if not MANAGER.is_file() or _is_link(MANAGER):
-        raise InstallCompletionError("mcp-server-manager launcher is unavailable")
+def _install(args: InstallOptions, repo_root: pathlib.Path) -> subprocess.CompletedProcess[str]:
+    """Run once; keep the process result until completion evidence is consumed."""
     source = (args.source or repo_root).expanduser().resolve()
     command = [
         sys.executable,
@@ -235,7 +239,13 @@ def _install(args: InstallOptions, repo_root: pathlib.Path) -> dict[str, Any]:
                 str(args.package_lock.expanduser().resolve()),
             ]
         )
-    result = source_locks.run_protected_command(
+    if not MANAGER.is_file() or _is_link(MANAGER):
+        failure = InstallCompletionError("mcp-server-manager launcher is unavailable")
+        failure.command_failure = source_locks.command_failure_details(
+            failure, command=command, target=repo_root,
+        )
+        raise failure
+    return source_locks.run_protected_command(
         command,
         cwd=repo_root,
         capture_output=True,
@@ -244,10 +254,67 @@ def _install(args: InstallOptions, repo_root: pathlib.Path) -> dict[str, Any]:
         errors="replace",
         check=False,
     )
-    if result.returncode:
-        detail = source_locks.command_failure_details(result, target=repo_root)
-        raise InstallCompletionError("MCP server installation failed: " + json.dumps(detail))
-    return _json_object(result.stdout, "mcp-server-manager result")
+
+
+def _installation_failure(
+    args: InstallOptions, repo_root: pathlib.Path, error: Exception,
+    process: subprocess.CompletedProcess[str] | None, payload: dict[str, Any], phase: str,
+) -> dict[str, Any]:
+    """Report observations, never infer a rollback from missing completion JSON.
+
+    Diagnostics live in the callable result / CLI stderr, not a new receipt or
+    report store. The enclosing repository operation owns any saved report.
+    Retained manager JSON cannot establish an earlier command or its streams.
+    """
+    recorded: dict[str, Any] = {}
+    command_error: BaseException = error
+    causes = []
+    cleanup_errors: list[str] = []
+    commands_stopped = True
+    cause: BaseException | None = error
+    seen: set[int] = set()
+    while cause is not None and id(cause) not in seen:
+        seen.add(id(cause))
+        causes.append({"type": type(cause).__name__, "message": str(cause)})
+        if not recorded and (command_detail := getattr(cause, "command_failure", None)):
+            recorded = command_detail
+            command_error = cause
+        cleanup_errors.extend(getattr(cause, "cleanup_errors", ()))
+        commands_stopped = commands_stopped and getattr(cause, "local_commands_stopped", None) is not False
+        cause = cause.__cause__ or (None if cause.__suppress_context__ else cause.__context__)
+    context = {
+        "operation": "install_mcp_server", "message": str(error),
+        "mcp_server_name": args.mcp_server_name or payload.get("mcp_server_name") or
+        "[unavailable: no selected server name was supplied or returned]",
+        "python_runtime": sys.executable, "working_directory": str(repo_root),
+        "manager_result": str(args.manager_result) if args.manager_result is not None else None,
+        "phase": phase, "causes": causes, "cleanup_errors": cleanup_errors,
+        "installation_outcome": "completed" if phase == "completion_receipt" else "unknown",
+    }
+    detail = source_locks.command_failure_details(
+        process if process is not None else error, target=repo_root,
+        command=process.args if process is not None else recorded.get("command", []),
+        context=context,
+    )
+    detail.update(recorded)
+    if process is None:
+        if not detail["command"]:
+            detail["command"] = "[unavailable: no command was launched by this call]"
+        if detail["returncode"] is None:
+            detail["exit_status_note"] = "[unavailable: no process exit status was obtained]"
+        for stream in ("stdout", "stderr"):
+            if (detail[stream] == f"[no {stream}]" and detail["returncode"] is None
+                    and getattr(command_error, stream, None) is None):
+                detail[stream] = f"[unavailable: no {stream} was captured]"
+        if args.manager_result is not None:
+            detail["context"]["python_runtime"] = "[unavailable: retained result has no runtime information]"
+    detail.update(detail.pop("context"))
+    message = detail.pop("message")
+    return {
+        "status": "failed", "message": message, "diagnostics": detail,
+        # Returning an error result must not present uncertain writers as stopped.
+        "local_commands_stopped": commands_stopped,
+    }
 
 
 def _selected_transaction(payload: dict[str, Any]) -> tuple[str, str]:
@@ -344,6 +411,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def install_mcp_server(args: InstallOptions) -> dict[str, Any]:
     """Install once under release protection, returning its exact completion."""
+    repo_root = args.repo_root
+    process: subprocess.CompletedProcess[str] | None = None
+    payload: dict[str, Any] = {}
+    phase = "preparation"
     try:
         repo_root = args.repo_root.expanduser().resolve(strict=True)
         if not repo_root.is_dir():
@@ -381,13 +452,23 @@ def install_mcp_server(args: InstallOptions) -> dict[str, Any]:
                         raise InstallCompletionError(
                             "manager-result cannot be combined with installation inputs"
                         )
+                    phase = "manager_response"
                     payload = _manager_payload(args.manager_result)
                     if args.mcp_server_name is not None and payload.get("mcp_server_name") != args.mcp_server_name:
                         raise InstallCompletionError(
                             "selected MCP server differs from the retained manager result"
                         )
                 else:
-                    payload = _install(args, repo_root)
+                    phase = "manager_launch"
+                    process = _install(args, repo_root)
+                    phase = "manager_exit"
+                    if process.returncode:
+                        raise InstallCompletionError(
+                            f"MCP installation command exited with status {process.returncode}"
+                        )
+                    phase = "manager_response"
+                    payload = _json_object(process.stdout, "mcp-server-manager result")
+                phase = "installation_receipt"
                 mcp_server_name, transaction_id = _selected_transaction(payload)
                 receipt = {
                     "schema": "ceratops-deployment-completion.v1",
@@ -402,6 +483,7 @@ def install_mcp_server(args: InstallOptions) -> dict[str, Any]:
                     "cleanup_debt": [],
                     "promotion": promotion,
                 }
+                phase = "completion_receipt"
                 if output is not None:
                     _write_output(output, receipt)
                 return receipt
@@ -409,11 +491,9 @@ def install_mcp_server(args: InstallOptions) -> dict[str, Any]:
                 os.chdir(entry_directory)
     except (
         InstallCompletionError, OSError, ValueError, KeyError, TypeError,
-        source_locks.WriteLockError,
+        source_locks.WriteLockError, subprocess.SubprocessError,
     ) as exc:
-        if getattr(exc, "local_commands_stopped", None) is False:
-            raise
-        return {"status": "failed", "message": str(exc)}
+        return _installation_failure(args, repo_root, exc, process, payload, phase)
 
 
 def main(argv: list[str] | None = None) -> int:

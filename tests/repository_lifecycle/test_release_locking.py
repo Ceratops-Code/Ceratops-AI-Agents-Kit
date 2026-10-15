@@ -97,7 +97,9 @@ def test_source_installers_share_release_and_report_stopped_commands(tmp_path, m
         call = module["install_mcp_server"]
         request = module["InstallOptions"](repo_root=repo)
         monkeypatch.setitem(call.__globals__, "_selected_transaction", lambda _: ("example", "test"))
-        target, name, accepted = call.__globals__, "_install", {"status": "completed"}
+        target, name, accepted = call.__globals__, "_install", subprocess.CompletedProcess(
+            [sys.executable, "manager", "install"], 0, '{"status":"completed"}', "",
+        )
 
     def install(*_args, **_kwargs):
         _compete(repo)  # Release precedes the installer's destination work.
@@ -116,13 +118,15 @@ def test_source_installers_share_release_and_report_stopped_commands(tmp_path, m
     else:
         monkeypatch.setattr(target, name, install)
     for attempt in range(2):
-        if ending == "unknown_stop":
+        if ending == "unknown_stop" and installer == "skill":
             with pytest.raises(OSError, match="before activation"):
                 call(request)
         else:
             result = call(request)
             failure_status = "error" if installer == "skill" else "failed"
             assert result["status"] == ("completed" if ending == "completed" else failure_status), result
+            if ending == "unknown_stop":
+                assert result["local_commands_stopped"] is False
         assert pathlib.Path.cwd() == entry
         assert len(effects) == (attempt + 1 if ending in {"completed", "after_install"} else 0)
         locks = workflow_command.release_lock_module()

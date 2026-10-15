@@ -29,8 +29,20 @@ keeps its editable source under `mcp-servers/`. Every deployed MCP server owns
 `%USERPROFILE%\.codex\mcp\<mcp-server-name>` with its packages, environments,
 and state; Python and uv are validated global prerequisites. Its CLI and local
 MCP adapters share
-one engine. The MCP server lifecycle skill contains instructions only; the existing
-skill installer continues to own `.codex` skill deployment.
+one engine. The MCP server lifecycle skill supplies its action instructions and
+`scripts/install-mcp-server.py`, which calls that manager and reports completion;
+the existing skill installer continues to own `.codex` skill deployment.
+
+The MCP installation callable returns failure JSON; its CLI writes the same JSON
+to stderr and exits 1. `diagnostics` names the selected server, command arguments,
+Python runtime, working directory, exit status, causes and separate stdout/stderr.
+Empty streams and unavailable information are explicit; secrets are redacted.
+Malformed completion output, even after exit 0, means the installation outcome
+is unknown, not that installation did nothing. The helper never retries it.
+If installation receipts already matched but writing the completion output fails,
+the error reports installation as completed. Successful receipt fields are unchanged.
+No new diagnostic files are created here; the repository operation owns any saved
+failure report.
 
 ```text
 skills/

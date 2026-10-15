@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import runpy
+import secrets
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -134,7 +136,7 @@ def _make_mcp_receipt_case(tmp_path, name):
                            accepted=accepted)
 
 
-def _receipt_cli(case, script, arguments, effect=None, phase=None):
+def _receipt_cli(case, script, arguments, effect=None, phase=None, python_runtime=None):
     """Run the public CLI, injecting interruption only at one output boundary."""
     code = """import json, os, pathlib, runpy, sys
 settings = json.loads(sys.argv[1])
@@ -142,6 +144,8 @@ script = pathlib.Path(sys.argv[2])
 sys.path.insert(0, settings['imports'])
 sys.path.insert(0, str(script.parent))
 pathlib.Path.home = classmethod(lambda cls: pathlib.Path(settings['home']))
+if settings['python_runtime'] is not None:
+    sys.executable = settings['python_runtime']
 target = pathlib.Path(settings['target'])
 phase = settings['phase']
 if settings['effect'] == 'replace':
@@ -170,6 +174,7 @@ sys.argv = [str(script), *sys.argv[3:]]
 runpy.run_path(str(script), run_name='__main__')
 """
     settings = {"home": str(case.home), "effect": effect, "phase": phase,
+                "python_runtime": python_runtime,
                 "target": str(case.record if effect == "unlink" else case.output),
                 "imports": str(ROOT / "skills/ceratops-repo-lifecycle/scripts")}
     return subprocess.run([sys.executable, "-c", code, json.dumps(settings),
@@ -202,6 +207,7 @@ def test_mcp_receipt_cli_survives_repeat_and_effect_interruptions(tmp_path, name
         phase = interruption.split("-")[1]
         failed = _receipt_cli(case, writer, _receipt_writer_arguments(case), "replace", phase)
         assert failed.returncode == 1 and case.record.exists()
+        assert json.loads(failed.stderr)["diagnostics"]["installation_outcome"] == "completed"
         assert case.output.exists() == (phase == "after")
         assert not list(case.task.glob(".*.tmp"))
     for _ in range(2):
@@ -278,3 +284,176 @@ def test_receipt_destination_stops_before_manager_resolution(tmp_path, bound):
                     else "requires a bound promotion result")
         assert expected in message
         assert not case.output.exists()
+
+
+def _manager_command_case(tmp_path, mode):
+    """A real child writes installation files, then emits the selected response."""
+    case = _make_mcp_receipt_case(tmp_path, "source_search_mcp")
+    manager = case.home / ".codex/mcp/ceratops_mcp_server_manager/bin/ceratops_mcp_server_manager.py"
+    manager.parent.mkdir(parents=True)
+    payload = json.loads(case.manager.read_text(encoding="utf-8"))
+    selection = json.loads(case.current.read_text(encoding="utf-8"))
+    case.current.unlink()
+    case.accepted.unlink()
+    settings = {"mode": mode, "current": str(case.current), "receipt": str(case.accepted),
+                "calls": str(case.task / "manager-calls.txt"), "selection": selection,
+                "payload": payload}
+    manager.write_text("import json, os, pathlib, sys\nsettings = " + repr(settings) + "\n" + """
+mode = settings['mode']
+with pathlib.Path(settings['calls']).open('a', encoding='utf-8') as calls:
+    calls.write('install\\n')
+# The observable effect precedes the broken response, including nonzero exits.
+selection = dict(settings['selection'])
+if mode == 'receipt_mismatch':
+    selection['version'] = '9.9.9'
+for key in ('current', 'receipt'):
+    pathlib.Path(settings[key]).write_text(json.dumps(selection), encoding='utf-8')
+secret = os.environ['MCP_INSTALL_TEST_TOKEN']
+if mode in ('reported', 'stdout_only'):
+    print(json.dumps({'error': 'manager failed', 'detail': secret}))
+if mode in ('reported', 'stderr_only', 'malformed', 'wrong_fields', 'receipt_mismatch'):
+    print('manager stderr: token=' + secret, file=sys.stderr)
+if mode in ('reported', 'silent', 'stdout_only', 'stderr_only'):
+    raise SystemExit(23)
+if mode == 'malformed':
+    print('installation changed; response broken: ' + secret)
+elif mode == 'wrong_fields':
+    print(json.dumps({'mcp_server_name': 'source_search_mcp', 'extra': secret}))
+else:
+    print(json.dumps(settings['payload']))
+""", encoding="utf-8")
+    case.launcher = manager
+    return case
+
+
+@pytest.mark.parametrize("entrypoint", ["callable", "cli"])
+@pytest.mark.parametrize("mode", ["reported", "silent", "stdout_only", "stderr_only",
+                                  "malformed", "wrong_fields", "receipt_mismatch", "launch", "success"])
+def test_mcp_install_preserves_command_facts_without_retry(tmp_path, monkeypatch, entrypoint, mode):
+    case = _manager_command_case(tmp_path, mode)
+    secret = secrets.token_hex(16)
+    monkeypatch.setenv("MCP_INSTALL_TEST_TOKEN", secret)
+    script = ROOT / "skills/ceratops-mcp-server-lifecycle/scripts/install-mcp-server.py"
+    arguments = ["--repo-root", str(case.repo), "--mcp-server-name", "source_search_mcp",
+                 "--promotion-result", str(case.record), "--operation", case.operation,
+                 "--evidence-output", str(case.output)]
+    runtime = str(tmp_path / f"{secret}-missing-python.exe") if mode == "launch" else sys.executable
+    reported_runtime = runtime.replace(secret, "[REDACTED]")
+    module = runpy.run_path(str(script))
+    call = module["install_mcp_server"]
+    if entrypoint == "callable":
+        monkeypatch.setitem(call.__globals__, "INSTALL_ROOT", case.home / ".codex/mcp")
+        monkeypatch.setitem(call.__globals__, "MANAGER", case.launcher)
+        monkeypatch.setattr(sys, "executable", runtime)
+    for attempt in range(1, 3):
+        if entrypoint == "callable":
+            result = call(module["InstallOptions"](**vars(module["build_parser"]().parse_args(arguments))))
+        else:
+            completed = _receipt_cli(case, script, arguments, python_runtime=runtime)
+            assert completed.returncode == (0 if mode == "success" else 1), completed.stderr
+            assert (completed.stderr if mode == "success" else completed.stdout) == ""
+            result = json.loads(completed.stdout if mode == "success" else completed.stderr)
+        assert secret not in json.dumps(result)
+        assert case.record.exists()
+        calls = case.task / "manager-calls.txt"
+        assert (calls.read_text().count("install\n") if calls.exists() else 0) == (0 if mode == "launch" else attempt)
+        assert case.current.exists() == (mode != "launch")
+        assert case.accepted.exists() == (mode != "launch")
+        if mode == "success":
+            assert result == {
+                "schema": "ceratops-deployment-completion.v1",
+                "producer": "ceratops-mcp-server-lifecycle/install", "status": "completed",
+                "repo_root": str(case.repo), "commit": case.commit,
+                "install_root": str(case.home / ".codex/mcp"), "deployed": ["source_search_mcp"],
+                "removed": [], "transaction_id": "b" * 32, "cleanup_debt": [],
+                "promotion": result["promotion"],
+            }
+            assert json.loads(case.output.read_text()) == result
+            continue
+        assert result["status"] == "failed" and not case.output.exists()
+        details = result["diagnostics"]
+        assert details["mcp_server_name"] == "source_search_mcp"
+        assert details["python_runtime"] == reported_runtime
+        assert details["working_directory"] == str(case.repo)
+        assert details["command"] == [reported_runtime, "-I", "-B", str(case.launcher), "install",
+                                      "--source", str(case.repo), "--mcp-server-name", "source_search_mcp"]
+        assert details["installation_outcome"] == "unknown"
+        assert details["causes"][0]["message"] == result["message"]
+        if mode == "launch":
+            assert details["returncode"] is None and "unavailable" in details["exit_status_note"]
+            assert "unavailable" in details["stdout"] and "unavailable" in details["stderr"]
+            assert details["causes"][0]["type"] == "FileNotFoundError"
+            assert result["local_commands_stopped"] is False
+            # This fixture's executable does not exist. Explicitly acknowledge
+            # that no writer started before the next independent test attempt.
+            locks = module["source_locks"]
+            lock_path = locks.release_lock_path(case.repo)
+            assert lock_path.read_bytes() == b"1"
+            with locks.hold_write_attempt(lock_path, confirm_previous_commands_stopped=True):
+                pass
+        else:
+            nonzero = mode in {"reported", "silent", "stdout_only", "stderr_only"}
+            assert details["returncode"] == (23 if nonzero else 0)
+            assert result["local_commands_stopped"] is True
+            if mode in {"silent", "stderr_only"}:
+                assert details["stdout"] == "[no stdout]"
+            else:
+                assert details["stdout"] != "[no stdout]"
+            if mode in {"silent", "stdout_only"}:
+                assert details["stderr"] == "[no stderr]"
+            else:
+                assert details["stderr"] == "manager stderr: token=[REDACTED]\n"
+        if mode == "reported":
+            assert json.loads(details["stdout"])["error"] == "manager failed"
+            assert "status 23" in result["message"]
+        if mode == "malformed":
+            assert details["phase"] == "manager_response"
+            assert details["stdout"] == "installation changed; response broken: [REDACTED]\n"
+            assert details["causes"][1]["type"] == "JSONDecodeError"
+
+
+def test_mcp_retained_result_reports_unavailable_process_information(tmp_path, monkeypatch):
+    case = _make_mcp_receipt_case(tmp_path, "source_search_mcp")
+    monkeypatch.setenv("MCP_INSTALL_TEST_TOKEN", "mcp-test-private-value")
+    case.manager.write_text('{"mcp-test-private-value": 1, "mcp-test-private-value": 2}')
+    script = ROOT / "skills/ceratops-mcp-server-lifecycle/scripts/install-mcp-server.py"
+    result = _receipt_cli(case, script, _receipt_writer_arguments(case))
+    assert result.returncode == 1 and "mcp-test-private-value" not in result.stderr
+    details = json.loads(result.stderr)["diagnostics"]
+    assert "[REDACTED]" in details["causes"][0]["message"]
+    assert details["returncode"] is None and details["installation_outcome"] == "unknown"
+    for field in ("command", "python_runtime", "mcp_server_name", "stdout", "stderr"):
+        assert "unavailable" in details[field]
+    assert not case.output.exists() and case.current.exists() and case.accepted.exists()
+
+
+def test_mcp_wrapped_launch_error_keeps_cause_streams_and_uncertain_stop(tmp_path, monkeypatch):
+    case = _make_mcp_receipt_case(tmp_path, "source_search_mcp")
+    module = runpy.run_path(str(ROOT / "skills/ceratops-mcp-server-lifecycle/scripts/install-mcp-server.py"))
+    call = module["install_mcp_server"]
+    credential = secrets.token_hex(16)
+    monkeypatch.setenv("MCP_INSTALL_TEST_TOKEN", credential)
+    command = [sys.executable, "-I", "-B", "manager.py", "install"]
+
+    def fail_launch(*_args):
+        try:
+            failure = subprocess.TimeoutExpired(command, 1, output=b"partial stdout", stderr=b"")
+            failure.__dict__["local_commands_stopped"] = False
+            failure.__dict__["command_failure"] = module["source_locks"].command_failure_details(
+                failure, command=command, target=case.repo,
+            )
+            raise failure
+        except subprocess.TimeoutExpired as exc:
+            module["source_locks"].attach_cleanup_failure(exc, OSError(f"cleanup: {credential}"))
+            raise OSError("caller cleanup interrupted") from exc
+
+    monkeypatch.setitem(call.__globals__, "_install", fail_launch)
+    result = call(module["InstallOptions"](repo_root=case.repo, mcp_server_name="source_search_mcp"))
+    assert result["status"] == "failed" and result["local_commands_stopped"] is False
+    details = result["diagnostics"]
+    assert details["command"] == command and details["returncode"] is None
+    assert details["stdout"] == "partial stdout" and details["stderr"] == "[no stderr]"
+    assert details["causes"][0]["message"] == "caller cleanup interrupted"
+    assert details["causes"][1]["type"] == "TimeoutExpired"
+    assert details["cleanup_errors"] == ["OSError: cleanup: [REDACTED]"]
+    assert credential not in json.dumps(result)

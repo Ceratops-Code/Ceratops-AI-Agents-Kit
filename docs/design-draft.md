@@ -1715,6 +1715,31 @@ installed manager with `--source` set to the selected repository. That
 checkout supplies the MCP server name and version. "SDLC install"
 was shorthand in an earlier answer, not a separate command.
 
+The MCP skill's `scripts/install-mcp-server.py` retains the manager process result
+until its response and installation receipts have been consumed. Both its callable
+and CLI report launch errors, nonzero exits and malformed responses through the
+same failure JSON (`status`, `message`, `diagnostics`, `local_commands_stopped`);
+the CLI uses stderr and exit 1. Diagnostics contain the selected server, exact
+argument vector, Python runtime, working directory, process exit status, exception
+causes and separate complete stdout/stderr. Shared `command_failure_details()`
+redacts credentials from command data and contextual fields. Empty captured
+streams use `[no stdout]` / `[no stderr]`; a missing process result or a retained
+manager JSON file leaves unavailable process facts explicitly labeled.
+
+An exit-0 process can have changed the installation before emitting malformed
+JSON. Until the active selection and immutable receipt match, failures therefore
+report `installation_outcome: unknown`, without retrying or assuming rollback.
+After they match, failure to write completion evidence reports `completed` for
+the installation, while the overall helper still reports failure. Successful
+`ceratops-deployment-completion.v1` receipts remain unchanged. Launch uncertainty
+still leaves the existing unfinished-run flag set; returning structured diagnostics
+does not clear it. This helper adds no report files or failed receipts: diagnostics
+live in its return value or CLI stderr. An enclosing repository operation owns any
+saved report and its existing cleanup rules. Behavior cases in
+`tests/repository_lifecycle/test_mcp_identities.py` exercise both entry points,
+repeated calls, redaction, silent exits and broken output after installation files
+were written; release-lock cases cover interruption before and after command effects.
+
 `skill-update-workflow.py` discovers one unfinished update under
 `<git-common-dir>/ceratops/operations/skill-updates/<worktree-id>/` without a
 checkpoint or worktree lock. No operation UUID or caller-supplied

@@ -3683,7 +3683,7 @@ def test_tool_install_helper_runs_manager_once_and_attests_selection(
 
     def install(args, source_root):
         calls.append((args.mcp_server_name, source_root))
-        return payload
+        return subprocess.CompletedProcess([sys.executable, "manager", "install"], 0, json.dumps(payload), "")
 
     monkeypatch.setitem(helper["main"].__globals__, "INSTALL_ROOT", install_root)
     monkeypatch.setitem(helper["main"].__globals__, "_install", install)

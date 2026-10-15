@@ -91,8 +91,11 @@ def run_protected_command(*args: Any, check: bool = False, **kwargs: Any) -> sub
     return result
 
 
-def command_failure_details(result: Any, *, target: Any, command: Any = None) -> dict[str, Any]:
-    """Keep both streams and invocation, hiding credential values in diagnostics."""
+def command_failure_details(
+    result: Any, *, target: Any, command: Any = None,
+    context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Keep invocation and streams; redact caller context through the same filter."""
     invocation = command if command is not None else getattr(result, "cmd", getattr(result, "args", []))
     secrets = [value for key, value in os.environ.items()
                if len(value) >= 4 and re.search(r"TOKEN|PASSWORD|SECRET|API_KEY|CREDENTIAL", key, re.I)]
@@ -105,8 +108,12 @@ def command_failure_details(result: Any, *, target: Any, command: Any = None) ->
                 secrets.append(matched[1])
 
     def clean(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {str(key): clean(item) for key, item in value.items()}
         if isinstance(value, (list, tuple)):
             return [clean(item) for item in value]
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
         text = value.decode("utf-8", errors="replace") if isinstance(value, bytes) else str(value)
         for secret in secrets:
             if secret:
@@ -126,6 +133,7 @@ def command_failure_details(result: Any, *, target: Any, command: Any = None) ->
         "stdout": clean(getattr(result, "stdout", None) or "[no stdout]"),
         "stderr": clean(getattr(result, "stderr", None) or "[no stderr]"),
         **({"error": clean(str(result))} if isinstance(result, BaseException) else {}),
+        **({"context": clean(context)} if context is not None else {}),
     }
 
 
