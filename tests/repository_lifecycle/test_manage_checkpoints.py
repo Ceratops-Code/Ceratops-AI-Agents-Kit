@@ -15,7 +15,9 @@ from filelock import FileLock
 from tests.repository_lifecycle.support import REPOSITORY_LIFECYCLE_SCRIPTS
 from tests.support.repositories import run_git
 
-storage = importlib.import_module("store_artifacts")
+SHARED_SCRIPTS = REPOSITORY_LIFECYCLE_SCRIPTS.parents[1] / "sections" / "scripts"
+sys.path.insert(0, str(SHARED_SCRIPTS))
+cp = importlib.import_module("manage_checkpoints")
 
 
 def _repository(repo: pathlib.Path) -> str:
@@ -63,7 +65,6 @@ def _checkpoint_worktree(repository: pathlib.Path, path: pathlib.Path) -> pathli
 
 def test_checkpoints_discover_direct_records_and_nest_without_locks(tmp_path, monkeypatch) -> None:
     repository, _commit = _versioned_repository(tmp_path)
-    cp = storage._checkpoint_storage()
 
     def no_replace(*args, **kwargs):
         pytest.fail("Checkpoint writes must not publish a temporary copy.")
@@ -93,13 +94,13 @@ def test_checkpoints_discover_direct_records_and_nest_without_locks(tmp_path, mo
         cp.read_checkpoint(context, "request.json")
     fresh = subprocess.run(
         [sys.executable, "-c",
-         "import pathlib,sys; sys.path.insert(0,sys.argv[1]); import store_artifacts; "
-         "cp=store_artifacts._checkpoint_storage(); repo=pathlib.Path(sys.argv[2]);\n"
+         "import pathlib,sys; sys.path.insert(0,sys.argv[1]); import manage_checkpoints as cp; "
+         "repo=pathlib.Path(sys.argv[2]);\n"
          "with cp.open_checkpoints(repo, 'artifact-versions') as c:\n"
          " assert cp.read_checkpoint(c,'request.json') == {'request':'first'}\n"
          " print(c.worktree_id)\n"
          " cp.finish_checkpoints(c)\n",
-         str(REPOSITORY_LIFECYCLE_SCRIPTS), str(repository)],
+         str(SHARED_SCRIPTS), str(repository)],
         capture_output=True, text=True, check=False,
     )
     assert fresh.returncode == 0, fresh.stderr
@@ -111,7 +112,6 @@ def test_checkpoints_discover_direct_records_and_nest_without_locks(tmp_path, mo
 @pytest.mark.parametrize("raw", [b"{", b"null", b'{"a":1,"a":2}', b'{"a":NaN}', b'{"a":1e999}', b"\xff"])
 def test_checkpoints_never_treat_unreadable_records_as_absent(tmp_path, raw) -> None:
     repository, _commit = _versioned_repository(tmp_path)
-    cp = storage._checkpoint_storage()
     with cp.open_checkpoints(repository, "artifact-versions") as context:
         assert cp.read_checkpoint(context, "request.json") is None
         path = context.directory / "request.json"
@@ -125,7 +125,6 @@ def test_checkpoints_never_treat_unreadable_records_as_absent(tmp_path, raw) -> 
 
 def test_checkpoint_completion_removes_only_own_request_without_inventory(tmp_path, monkeypatch) -> None:
     repository, _commit = _versioned_repository(tmp_path)
-    cp = storage._checkpoint_storage()
     removed = _checkpoint_worktree(repository, tmp_path / "removed")
     live = _checkpoint_worktree(repository, tmp_path / "live")
     contexts = {}
@@ -181,7 +180,6 @@ def test_checkpoint_completion_removes_only_own_request_without_inventory(tmp_pa
 def test_checkpoint_calls_ignore_and_preserve_obsolete_lock_files(tmp_path, owner) -> None:
     repository, _commit = _versioned_repository(tmp_path)
     removed = _checkpoint_worktree(repository, tmp_path / "removed")
-    cp = storage._checkpoint_storage()
     with cp.open_checkpoints(removed, owner) as context:
         cp.write_checkpoint(context, "request.json", {"keep": True})
     lock_root = context.common_dir / "ceratops/locks"
@@ -215,7 +213,6 @@ def test_checkpoint_calls_ignore_and_preserve_obsolete_lock_files(tmp_path, owne
 def test_checkpoints_follow_registration_across_worktree_move_and_external_removal(tmp_path) -> None:
     repository, _commit = _versioned_repository(tmp_path)
     original = _checkpoint_worktree(repository, tmp_path / "original")
-    cp = storage._checkpoint_storage()
     with cp.open_checkpoints(original, "artifact-versions") as first:
         cp.write_checkpoint(first, "request.json", {"intent": "unchanged"})
     moved = tmp_path / "moved"
@@ -235,7 +232,6 @@ def test_checkpoints_follow_registration_across_worktree_move_and_external_remov
 def test_checkpoint_discard_preserves_a_reappearing_worktree(tmp_path, monkeypatch) -> None:
     repository, _commit = _versioned_repository(tmp_path)
     worktree = _checkpoint_worktree(repository, tmp_path / "reappearing")
-    cp = storage._checkpoint_storage()
     with cp.open_checkpoints(worktree, "artifact-versions") as orphan:
         cp.write_checkpoint(orphan, "request.json", {"keep": True})
     assert run_git(repository, "worktree", "remove", str(worktree)).returncode == 0
@@ -260,7 +256,6 @@ def test_checkpoint_discard_preserves_a_reappearing_worktree(tmp_path, monkeypat
 def test_checkpoint_discard_keeps_records_when_git_lookup_fails(tmp_path, monkeypatch, failed_lookup):
     repository, _commit = _versioned_repository(tmp_path)
     removed = _checkpoint_worktree(repository, tmp_path / "removed")
-    cp = storage._checkpoint_storage()
     with cp.open_checkpoints(removed, "skill-updates") as context:
         cp.write_checkpoint(context, "request.json", {"keep": True})
     assert run_git(repository, "worktree", "remove", str(removed)).returncode == 0
@@ -288,7 +283,6 @@ def test_checkpoint_discard_keeps_records_when_git_lookup_fails(tmp_path, monkey
 @pytest.mark.parametrize("timing", ["before", "after"])
 def test_checkpoint_completion_repeats_after_each_delete(tmp_path, monkeypatch, point, timing):
     repository, _commit = _versioned_repository(tmp_path)
-    cp = storage._checkpoint_storage()
     with cp.open_checkpoints(repository, "skill-updates") as unrelated:
         cp.write_checkpoint(unrelated, "request.json", {"keep": True})
     with cp.open_checkpoints(repository, "artifact-versions") as context:
@@ -322,7 +316,6 @@ def test_checkpoint_completion_repeats_after_each_delete(tmp_path, monkeypatch, 
 @pytest.mark.parametrize("name", ["../outside.json", "/outside.json", "states/../outside.json", "states\\1.json", "a//b.json"])
 def test_checkpoints_reject_redirected_record_paths(tmp_path, name) -> None:
     repository, _commit = _versioned_repository(tmp_path)
-    cp = storage._checkpoint_storage()
     with cp.open_checkpoints(repository, "artifact-versions") as context:
         with pytest.raises(cp.CheckpointError):
             cp.write_checkpoint(context, name, {"intent": "unsafe"})
@@ -331,7 +324,6 @@ def test_checkpoints_reject_redirected_record_paths(tmp_path, name) -> None:
 
 def test_checkpoints_do_not_traverse_linked_files_during_reads_writes_or_cleanup(tmp_path) -> None:
     repository, _commit = _versioned_repository(tmp_path)
-    cp = storage._checkpoint_storage()
     outside = tmp_path / "outside.json"
     outside.write_bytes(b'{"keep":true}')
     with cp.open_checkpoints(repository, "artifact-versions") as context:
@@ -350,7 +342,6 @@ def test_checkpoints_do_not_traverse_linked_files_during_reads_writes_or_cleanup
 
 def test_checkpoints_do_not_traverse_directory_links_during_cleanup(tmp_path) -> None:
     repository, _commit = _versioned_repository(tmp_path)
-    cp = storage._checkpoint_storage()
     outside = tmp_path / "outside"
     outside.mkdir()
     sentinel = outside / "keep.json"

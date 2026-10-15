@@ -1249,7 +1249,7 @@ def _checkpoint_child(repository: pathlib.Path, body: str, *arguments: str):
         [sys.executable, "-c",
          "import pathlib,sys,json; sys.path.insert(0,sys.argv[1]); "
          "import store_artifacts,repository_operation; "
-         "cp=store_artifacts._checkpoint_storage(); repo=pathlib.Path(sys.argv[2]);\n" + body,
+         "repo=pathlib.Path(sys.argv[2]);\n" + body,
          str(REPOSITORY_LIFECYCLE_SCRIPTS), str(repository), *arguments],
         capture_output=True, text=True, check=False,
     )
@@ -1633,9 +1633,8 @@ def test_versioned_fresh_instance_discovers_attempt_and_reuses_prepared_results(
     assert fresh.stdout.strip() == transaction.attempt_id
     assert transaction.reservation_path.read_bytes() == reserved_bytes
     assert all(path.stat().st_mtime_ns == mtime for path, mtime in mtimes.items())
-    cp = storage._checkpoint_storage()
-    with cp.open_checkpoints(repository, "artifact-versions") as context:
-        assert not list(context.directory.iterdir())  # No second reservation journal.
+    assert not (transaction.store.parent / "operations/artifact-versions").exists()
+    assert not (transaction.store.parent / "locks/artifact-versions").exists()
     with pytest.raises(storage.RecoveryRequired, match="explicit recovery"):
         runner.reserve_versioned_build(repository, repository=transaction.repository,
             release_unit=transaction.release_unit, version=transaction.version,
@@ -1648,13 +1647,13 @@ def test_versioned_fresh_instance_discovers_attempt_and_reuses_prepared_results(
             pre_test_commit=changed, attempt_id="different-request")
 
 
-def test_versioned_nested_completion_leaves_cleanup_to_outermost_owner(tmp_path) -> None:
+def test_versioned_completion_needs_no_checkpoint_directory(tmp_path) -> None:
     repository, _checkpoint, transaction, prepared, _receipts = _prepared_versioned_completion(tmp_path)
-    with storage.versioned_artifact_checkpoints(repository) as context:
-        runner.complete_versioned_build(transaction, prepared)
-        assert context.directory.is_dir()
-        storage.finish_versioned_checkpoints(transaction, context)
-        assert not context.directory.exists()
+    first = runner.complete_versioned_build(transaction, prepared)
+    second = runner.complete_versioned_build(transaction, prepared)
+    assert first == second
+    assert not (transaction.store.parent / "operations/artifact-versions").exists()
+    assert not (transaction.store.parent / "locks/artifact-versions").exists()
 
 
 def test_versioned_request_may_own_multiple_units_without_premature_cleanup(tmp_path) -> None:
@@ -1662,25 +1661,20 @@ def test_versioned_request_may_own_multiple_units_without_premature_cleanup(tmp_
     other = runner.reserve_versioned_build(repository, repository=transaction.repository,
         release_unit="other-unit", version="1.0.0", required_targets=["any"],
         pre_test_commit=checkpoint, attempt_id="other-unit-attempt")
-    with storage.versioned_artifact_checkpoints(repository) as context:
-        directory = context.directory
     runner.complete_versioned_build(transaction, prepared)
-    assert directory.is_dir() and other.reservation_path.is_file()
+    assert other.reservation_path.is_file()
+    assert not (transaction.store.parent / "operations/artifact-versions").exists()
 
 
 def test_versioned_cleanup_failure_retries_without_repeating_completed_effects(tmp_path, monkeypatch) -> None:
     repository, checkpoint, transaction, prepared, _receipts = _prepared_versioned_completion(tmp_path)
-    cp = storage._checkpoint_storage()
-    with cp.open_checkpoints(repository, "artifact-versions") as context:
-        directory = context.directory
     with monkeypatch.context() as patch:
-        def failed_cleanup(context):
-            raise cp.CheckpointError("cleanup interrupted")
-        patch.setattr(cp, "finish_checkpoints", failed_cleanup)
-        with pytest.raises(storage.RecoveryRequired, match="cleanup interrupted"):
+        def failed_cleanup(*args):
+            raise storage.OperationError("cleanup interrupted")
+        patch.setattr(storage, "_prune_completed_artifacts", failed_cleanup)
+        with pytest.raises(storage.OperationError, match="cleanup interrupted"):
             runner.complete_versioned_build(transaction, prepared)
     final = run_git(repository, "rev-parse", "HEAD").stdout.strip()
-    assert directory.exists()
     assert not transaction.reservation_path.exists()
     mtimes = {path: path.stat().st_mtime_ns for path in transaction.version_root.rglob("*") if path.is_file()}
     # Completed results are Git data; a cleanup retry must not need the mutable
@@ -1699,7 +1693,7 @@ def test_versioned_cleanup_failure_retries_without_repeating_completed_effects(t
     assert run_git(repository, "rev-parse", "HEAD").stdout.strip() == final
     assert prepared[0].worktree_path.read_bytes() == b"unrelated subsequent work"
     assert all(path.stat().st_mtime_ns == mtime for path, mtime in mtimes.items())
-    assert not directory.exists()
+    assert not (transaction.store.parent / "operations/artifact-versions").exists()
 
 
 @pytest.mark.parametrize("interruption", ["after-commit", "after-receipts", "after-tag"])

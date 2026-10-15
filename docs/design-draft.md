@@ -1428,9 +1428,9 @@ tests. The working-folder caller delegates this sequence to the shared finalizer
 
 `skills/sections/scripts/manage_checkpoints.py` owns disposable essential records,
 not domain recovery or a general workflow engine. The live section manifest maps
-it to `scripts/manage_checkpoints.py` in the installed repository- and
-skill-lifecycle skills. Repository lifecycle and skill lifecycle both use this
-storage. It takes no native lock: one thread owns each task worktree. The pinned
+it to `scripts/manage_checkpoints.py` in the installed skill-lifecycle skill.
+Artifact storage no longer depends on this helper. It takes no native lock:
+one thread owns each task worktree. The pinned
 `filelock` dependency remains for release, shared-store and installation code.
 No replacement lock, process record, operation UUID or phase journal is added.
 
@@ -1441,8 +1441,8 @@ ceratops/operations/<owner>/<worktree-id>/
 ```
 
 A producer is the helper responsible for writing these records. Its owner name
-is fixed in code: `artifact-versions` for the versioned artifact route and
-`skill-updates` for skill changes. The primary checkout's directory ID is
+is fixed in code: `skill-updates` for skill changes.
+The primary checkout's directory ID is
 `main`, regardless of its branch. A linked worktree uses `linked-` plus SHA-256
 of its Git registration directory name after `os.path.normcase`. Git keeps that
 name when a worktree moves. This is a directory identity, not a new operation
@@ -1482,24 +1482,16 @@ those exact files after old helper invocations have stopped. Retain and report
 any still in use. This one-time retirement preserves saved requests and all
 release/store/destination locks; it adds no startup migration or recurring scan.
 
-`repository_operation.py` wraps `reserve_versioned_build`,
-`prepare_versioned_receipt` and `complete_versioned_build` through
-`store_artifacts.versioned_artifact_checkpoints`. Completion then calls
-`store_artifacts.finish_versioned_checkpoints`. These adapters use the shared
-five-function interface; the artifact producer still owns the decision that
-all of the request's units are complete. The wrapper now takes no checkpoint
-lock; step 4D removes the empty wrapper and its directory creation. Short
-artifact-store locks still protect shared metadata, nested inside an outer
-release lock when called by Promote/Ship. Unit/version reservations already
-contain the recovery essentials, so the artifact route needs no additional
-checkpoint JSON. Different unfinished
-repository/branch/B requests are refused; a request with another pending unit
-does not finish its checkpoints prematurely. New attempts still receive their
-existing receipt attempt ID. Confirmed retries discover it in the reservation,
-or in the committed build receipt if durable completion already removed the
-reservation. Once the tag and receipt chain prove completion, a retry performs
-only remaining cleanup: no prepared-worktree dependency, repeated build/test,
-new commit, rewritten receipt or moved tag.
+`repository_operation.py` calls artifact storage directly for reservation,
+receipt preparation and completion. These calls create no empty checkpoint
+directory or per-worktree lock. Existing reservations and receipts supply retry
+inputs; 4E replaces reservations with a request in the final version directory.
+The current short store lock still protects shared metadata. Promote/Ship retain
+their outer release lock. A completed receipt/tag chain permits cleanup-only
+retries without mutable worktree receipts, repeated builds/tests, new commits,
+rewritten receipts or moved tags. At the next authorized deployment, retire old
+empty `ceratops/operations/artifact-versions/<worktree-id>/` directories after
+old invocations stop; retain unknown nonempty directories and still-used files.
 
 Successful acceptance stays in its existing receipts, Git and artifact storage.
 Generic checkpoint cleanup cannot delete those, reservations or installations.

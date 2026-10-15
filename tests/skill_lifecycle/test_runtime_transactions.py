@@ -307,7 +307,7 @@ def test_installed_repo_lifecycle_helpers_use_regular_runtime(
     skill = install_root / "ceratops-repo-lifecycle"
     assert (skill / "scripts" / "pending-work-cleanup.py").is_file()
     assert (skill / "scripts" / "store_artifacts.py").is_file()
-    assert (skill / "scripts" / "manage_checkpoints.py").is_file()
+    assert not (skill / "scripts" / "manage_checkpoints.py").exists()
     assert (skill / "scripts" / "hold_write_lock.py").is_file()
     runtime = json.loads((skill / RUNTIME_MANIFEST).read_text(encoding="utf-8"))
     interpreter = pathlib.Path(runtime["python_runtime"])
@@ -328,13 +328,7 @@ def test_installed_repo_lifecycle_helpers_use_regular_runtime(
         [str(interpreter), "-I", "-c",
          ("import pathlib,sys; sys.path.insert(0,sys.argv[1]); import store_artifacts,hold_write_lock,git_branch_operations; "
          "from github_pr_workflow.ship_repository import ShipOptions,ship_repository; "
-         "assert ShipOptions(repo_root=pathlib.Path(sys.argv[2]),head_branch='release/local').base_branch=='main'; "
-         "cp=store_artifacts._checkpoint_storage(); "
-         "assert pathlib.Path(cp.__file__).parent==pathlib.Path(sys.argv[1]);\n"
-         "with cp.open_checkpoints(pathlib.Path(sys.argv[2]),'artifact-versions') as context:\n"
-         " cp.write_checkpoint(context,'request.json',{'request':'installed'})\n"
-         " assert cp.read_checkpoint(context,'request.json')=={'request':'installed'}\n"
-         " cp.finish_checkpoints(context)\n"
+         "assert ShipOptions(repo_root=pathlib.Path(sys.argv[2]),head_branch='release/local').base_branch=='main'\n"
          "with hold_write_lock.hold_write_lock(hold_write_lock.release_lock_path(pathlib.Path(sys.argv[2]))) as lock:\n"
          " lock.complete(commands_stopped=True)\n"),
          str(skill / "scripts"), str(repo)],

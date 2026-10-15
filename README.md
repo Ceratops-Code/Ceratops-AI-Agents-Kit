@@ -417,17 +417,14 @@ Another worktree may own an independent version. The legacy v2 producer keeps
 its supported full-transaction lock and delete-recognizable-staging behavior;
 that cleanup is never applied to direct versioned output.
 
-The versioned runner still opens a request directory through
-`manage_checkpoints.py`, without a checkpoint lock. Step 4D removes this empty
-wrapper and directory. Reservations remain the recovery authority; this route
-does not copy them into checkpoint records. After durable completion, cleanup
-removes only checkpoints, never artifacts or receipts. If cleanup fails, a fresh
-invocation discovers the attempt from its committed receipt and performs cleanup
-without recreating C, receipts or tags. This does not supervise artifact-writing
-child processes. 3A releases stopped attempts before model corrections;
-3B supplies complete reports; controlled cleanup remains in 4/20/21.
-See [shared checkpoint storage](#shared-checkpoint-storage-1e1)
-for its interfaces and cleanup boundaries.
+The versioned runner calls artifact storage directly. It creates neither an
+artifact checkpoint directory nor a worktree lock: one thread owns each task
+worktree. Reservations and receipts contain the required retry inputs; 4E
+replaces reservations with a request inside the final version directory. A
+cleanup-only retry discovers completed work from its receipt and tag, without
+recreating commits or receipts. Old empty artifact checkpoint directories await
+one-time retirement during the next authorized deployment; unknown nonempty
+directories and still-used files remain untouched.
 
 ### Exact-artifact foundation and update methodology
 
@@ -465,8 +462,8 @@ inputs, adapters, and required artifact tests. This foundation does not yet
 build real packages, alter existing deployment, or connect Promote/Ship.
 The storage module is packaged automatically with the owning skill's scripts.
 The manifest maps the shared checkpoint source from `skills/sections/scripts/`
-to `scripts/manage_checkpoints.py` in both repository and skill lifecycle.
-Repository lifecycle and skill lifecycle both use this storage. No
+to `scripts/manage_checkpoints.py` in skill lifecycle. Artifact storage has no
+checkpoint-helper dependency. No
 receipt schema, index or artifact-search command is introduced.
 Dependency locking remains separate from first-party artifact identity.
 
@@ -494,8 +491,8 @@ implemented behavior.
 The imported helper
 [`manage_checkpoints.py`](skills/sections/scripts/manage_checkpoints.py)
 stores disposable records for the code that writes them, called their
-**producer**. The fixed owner names are `artifact-versions` for versioned
-artifact operations and `skill-updates` for skill changes. It is not a separate
+**producer**. Skill changes use the fixed owner name `skill-updates`.
+Artifact operations no longer open an empty checkpoint directory. It is not a separate
 command or a saved program counter.
 
 Every worktree in the repository shares the Git common directory. The helper

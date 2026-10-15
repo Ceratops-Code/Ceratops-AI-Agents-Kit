@@ -12,7 +12,6 @@ barrier. It keeps no helper-owned staging, pending, or temporary copy.
 from __future__ import annotations
 
 import hashlib
-import importlib
 import json
 import os
 import pathlib
@@ -20,12 +19,10 @@ import re
 import shutil
 import stat
 import subprocess
-import sys
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
-from functools import lru_cache
 from typing import Any
 
 import sdlc_results
@@ -47,7 +44,6 @@ FULL_VERSION_RE = re.compile(
     r"(?:\+[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)*)?$"
 )
 ARTIFACT_RESERVATION_SCHEMA = "ceratops-artifact-reservation.v2"
-ARTIFACT_CHECKPOINT_OWNER = "artifact-versions"
 
 
 class OperationError(RuntimeError):
@@ -1279,53 +1275,6 @@ def _prune_completed_artifacts(
                 )
                 if not any(output.version_root.iterdir()):
                     output.version_root.rmdir()
-
-
-@lru_cache(maxsize=1)
-def _checkpoint_storage() -> Any:
-    """Use the mapped runtime sibling, or the shared source during development.
-
-    Installed skills never reach back into a source checkout. Keep this import
-    lazy so the still-independent v2 route does not acquire checkpoint behavior.
-    """
-    skill = pathlib.Path(__file__).resolve().parent.parent
-    if not (skill / ".runtime-manifest.json").is_file():
-        source = str(skill.parent / "sections" / "scripts")
-        if source not in sys.path:
-            sys.path.insert(0, source)
-    return importlib.import_module("manage_checkpoints")
-
-
-@contextmanager
-def versioned_artifact_checkpoints(repo_root: pathlib.Path) -> Iterator[Any]:
-    """Open the request directory without a lock; wrapper removal belongs to 4D."""
-    checkpoints = _checkpoint_storage()
-    try:
-        with checkpoints.open_checkpoints(repo_root, ARTIFACT_CHECKPOINT_OWNER) as context:
-            yield context
-    except checkpoints.CheckpointError as exc:
-        raise RecoveryRequired(str(exc)) from exc
-
-
-def finish_versioned_checkpoints(
-    transaction: ArtifactVersionTransaction, context: Any,
-) -> None:
-    """Finish only the outermost request after all its reservations are complete.
-
-    Reservations already carry the recovery essentials, so this producer writes
-    no duplicate checkpoint record. Other unit/version members of the same
-    request keep the directory until the last member succeeds.
-    """
-    if not context.outermost:
-        return
-    with _locked_artifact_store(transaction.lock_path):
-        remaining = _scan_transaction_records(transaction.store)
-        if any(
-            os.path.normcase(str(record["worktree"])) == os.path.normcase(str(transaction.repo_root))
-            for record in remaining.values()
-        ):
-            return
-    _checkpoint_storage().finish_checkpoints(context)
 
 
 def reserve_versioned_artifacts(

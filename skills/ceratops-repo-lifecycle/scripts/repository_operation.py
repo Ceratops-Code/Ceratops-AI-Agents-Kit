@@ -261,23 +261,22 @@ def reserve_versioned_build(
     checks before calling this boundary. The returned output/work paths belong
     exclusively to the recorded attempt; source remains in the existing
     worktree. On an explicitly confirmed retry, omit attempt_id to discover the
-    reservation (or completed receipt after success). The producer lock does not
-    establish that an earlier artifact-writing child stopped; 2A owns that gate.
-    Public Build routing remains intentionally disconnected until 2A.
+    reservation (or completed receipt after success). One thread owns the
+    worktree; no separate checkpoint directory or worktree lock is needed.
+    Public Build routing remains disconnected until steps 16/22.
     """
 
-    with store_artifacts.versioned_artifact_checkpoints(repo_root):
-        return store_artifacts.reserve_versioned_artifacts(
-            repo_root,
-            repository=repository,
-            release_unit=release_unit,
-            version=version,
-            required_targets=required_targets,
-            attempt_id=attempt_id,
-            pre_test_commit=pre_test_commit,
-            declared_input_paths=declared_input_paths,
-            recovery_confirmed=recovery_confirmed,
-        )
+    return store_artifacts.reserve_versioned_artifacts(
+        repo_root,
+        repository=repository,
+        release_unit=release_unit,
+        version=version,
+        required_targets=required_targets,
+        attempt_id=attempt_id,
+        pre_test_commit=pre_test_commit,
+        declared_input_paths=declared_input_paths,
+        recovery_confirmed=recovery_confirmed,
+    )
 
 
 def measure_versioned_artifact(
@@ -299,10 +298,7 @@ def prepare_versioned_receipt(
 ) -> PreparedBuildReceipt:
     """Write one qualified target receipt to its final worktree path."""
 
-    with store_artifacts.versioned_artifact_checkpoints(transaction.repo_root):
-        return store_artifacts.prepare_versioned_build_receipt(
-            transaction, target, receipt
-        )
+    return store_artifacts.prepare_versioned_build_receipt(transaction, target, receipt)
 
 
 def complete_versioned_build(
@@ -311,12 +307,7 @@ def complete_versioned_build(
 ) -> CompletedArtifactVersion:
     """Create or recover C, bind every target, and create the version tag."""
 
-    with store_artifacts.versioned_artifact_checkpoints(transaction.repo_root) as context:
-        completed = store_artifacts.complete_versioned_artifacts(
-            transaction, prepared_receipts
-        )
-        store_artifacts.finish_versioned_checkpoints(transaction, context)
-        return completed
+    return store_artifacts.complete_versioned_artifacts(transaction, prepared_receipts)
 
 
 
