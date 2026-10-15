@@ -26,7 +26,7 @@ from .contracts import DeploymentError, active, read_json, registry, token
 
 INSTALL_ROOT = Path.home() / ".codex" / "mcp"
 ABANDONED_SECONDS = 24 * 60 * 60
-RETAINED_INSTALLATIONS = 3
+RETAINED_VERSIONS = 2
 
 
 @dataclass(frozen=True)
@@ -304,8 +304,8 @@ class Layout:
                  protected_artifacts: set[tuple[str, str]] | None = None) -> dict[str, list[str]]:
         """Bound producer-owned installations and packages under held deployment lock.
 
-        Current plus the two newest complete predecessors are retained. Extra
-        live instances are deferred. Incomplete installations and unselected
+        The selected instance and newest complete different version are retained.
+        Duplicate and older live instances are deferred. Incomplete installations and unselected
         artifacts receive a 24-hour recovery window before removal.
         """
         protected_artifacts = set(protected_artifacts or ())
@@ -322,15 +322,27 @@ class Layout:
             except (DeploymentError, OSError, ValueError, KeyError):
                 current_path = None
         keep = {item.path for item in complete if item.path == current_path}
+        retained_versions = {item.receipt["version"] for item in complete if item.path in keep}
         predecessors = sorted(
             (item for item in complete if item.path != current_path),
             key=lambda item: (item.completed_ns, item.receipt["version"], item.receipt["instance"]),
             reverse=True,
         )
-        keep.update(item.path for item in predecessors[: RETAINED_INSTALLATIONS - 1])
+        for item in predecessors:
+            if len(retained_versions) >= RETAINED_VERSIONS:
+                break
+            if item.receipt["version"] not in retained_versions:
+                keep.add(item.path)
+                retained_versions.add(item.receipt["version"])
+        # A prepared candidate must never retire the still-published selection.
+        # Post-activation maintenance can remove its duplicate instance safely.
+        if selected is not None and current_file.exists():
+            published = active(read_json(current_file), self.root.name)
+            keep.add(self.path("versions", published["version"], published["instance"]))
         running, uncertain = running_python_paths()
         removed: list[str] = []
         deferred: list[str] = []
+        errors: list[str] = []
         retired_artifacts: set[tuple[str, str]] = set()
         now = time.time()
 
@@ -351,8 +363,9 @@ class Layout:
                     release = (item.receipt["version"], item.receipt["manifest_sha256"])
                     protected_artifacts.discard(release)
                     retired_artifacts.add(release)
-                except (DeploymentError, OSError):
+                except (DeploymentError, OSError) as exc:
                     deferred.append(str(item.path))
+                    errors.append(f"remove installation {item.path}: {exc}")
 
         for candidate in incomplete:
             try:
@@ -368,8 +381,24 @@ class Layout:
                 try:
                     self.remove_candidate(candidate)
                     removed.append(str(candidate))
-                except (DeploymentError, OSError):
+                except (DeploymentError, OSError) as exc:
                     deferred.append(str(candidate))
+                    errors.append(f"remove incomplete installation {candidate}: {exc}")
+
+        # An interruption can leave an empty version directory after its
+        # last instance was removed. Only numeric empty groups are owned here.
+        versions_root = self.path("versions")
+        if versions_root.is_dir():
+            for version_root in versions_root.iterdir():
+                if not re.fullmatch(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", version_root.name):
+                    continue
+                try:
+                    self.path("versions", version_root.name)
+                    if version_root.is_dir() and not any(version_root.iterdir()):
+                        version_root.rmdir()
+                except (DeploymentError, OSError) as exc:
+                    deferred.append(str(version_root))
+                    errors.append(f"remove empty version group {version_root}: {exc}")
 
         # Re-scan because failed or live removals must keep their release bytes.
         for item in self._installations()[0]:
@@ -379,8 +408,9 @@ class Layout:
             if catalog_path.exists():
                 try:
                     catalog = registry(read_json(catalog_path), self.root.name)
-                except (DeploymentError, OSError, ValueError, KeyError):
-                    return {"removed": removed, "deferred": deferred}
+                except (DeploymentError, OSError, ValueError, KeyError) as exc:
+                    errors.append(f"read registry {catalog_path}: {exc}")
+                    return {"removed": removed, "deferred": deferred, "errors": errors}
                 changed = False
                 for version, manifest_hash in list(catalog["versions"].items()):
                     artifact = self.path("artifacts", version, manifest_hash)
@@ -401,8 +431,9 @@ class Layout:
                             version_root.rmdir()
                         del catalog["versions"][version]
                         changed = True
-                    except (DeploymentError, OSError):
+                    except (DeploymentError, OSError) as exc:
                         deferred.append(str(artifact))
+                        errors.append(f"remove registered artifact {artifact}: {exc}")
                 registered = {(version, value) for version, value in catalog["versions"].items()}
                 artifacts = self.path("artifacts")
                 if artifacts.is_dir():
@@ -425,13 +456,14 @@ class Layout:
                                 if old:
                                     self._remove_tree(artifact)
                                     removed.append(str(artifact))
-                            except (DeploymentError, OSError):
+                            except (DeploymentError, OSError) as exc:
                                 deferred.append(str(artifact))
+                                errors.append(f"remove orphaned artifact {artifact}: {exc}")
                         if version_root.is_dir() and not any(version_root.iterdir()):
                             version_root.rmdir()
                 if changed:
                     self.atomic_json(catalog_path, registry(catalog, self.root.name))
-        return {"removed": removed, "deferred": deferred}
+        return {"removed": removed, "deferred": deferred, "errors": errors}
 
     @contextlib.contextmanager
     def lock(self, name: str):

@@ -20,7 +20,7 @@ from tests.mcp_server_manager.test_engine import (
     storage,
 )
 from tests.mcp_server_manager.test_engine import (
-    deployment as deployment,  # noqa: PLC0414 - explicit pytest fixture re-export
+    deployment as deployment,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -53,6 +53,9 @@ def test_child_environment_retains_profile_for_user_owned_install_root(tmp_path,
     assert probe.returncode == 0, probe.stderr
     assert Path(probe.stdout.strip()) == Path.home()
     assert "HOME" not in environment
+    assert Path(environment["UV_CACHE_DIR"]) == tmp_path / "temporary/uv-cache"
+    assert environment["UV_LINK_MODE"] == "copy"
+    assert not (tmp_path / "installed/fixture/cache").exists()
 
 
 def test_legacy_catalog_import_rehydrates_without_copying_environments(
@@ -202,6 +205,9 @@ def source_package(tmp_path, monkeypatch, request):
         if command[0] == "git":
             return RUN_COMMAND(command, **kwargs)
         calls.append((command, kwargs))
+        cache = Path(kwargs["env"]["UV_CACHE_DIR"])
+        cache.mkdir(parents=True, exist_ok=True)
+        (cache / "dependency.bin").write_bytes(b"unpacked wheel")
         if command[1] == "lock":
             return ""
         if "compile" in command:
@@ -261,7 +267,7 @@ def test_dependency_download_uses_five_minute_timeout_and_enforces_hash(
     def download(request_url, *, timeout):
         requests.append((request_url, timeout))
         response = io.BytesIO(b"corrupt archive" if corrupt else expected)
-        setattr(response, "url", url)
+        response.url = url  # type: ignore[attr-defined]
         return response
 
     monkeypatch.setattr(package_module.urllib.request, "urlopen", download)
@@ -978,7 +984,7 @@ def test_cli_package_requires_explicit_source_and_rejects_extra_inputs(arguments
     assert "error:" in capsys.readouterr().err
 
 
-def test_cli_package_failure_keeps_bounded_diagnostics(monkeypatch, capsys):
+def test_cli_package_failure_keeps_complete_diagnostics(monkeypatch, capsys):
     def fail(*args, **kwargs):
         raise contracts.DeploymentError("x" * 5000 + " useful diagnostic")
 
@@ -986,7 +992,7 @@ def test_cli_package_failure_keeps_bounded_diagnostics(monkeypatch, capsys):
     assert cli.main(["package", "--source", "."]) == 2
     output = capsys.readouterr()
     diagnostic = json.loads(output.err)["error"]
-    assert output.out == "" and len(diagnostic) == 1800
+    assert output.out == "" and diagnostic == "x" * 5000 + " useful diagnostic"
     assert diagnostic.endswith("useful diagnostic")
 
 
@@ -1131,3 +1137,13 @@ raise SystemExit(main([sys.argv[5], '--source', sys.argv[3]]))
     assert json.loads(result.stdout)["mcp_server_name"] == "fixture"
     assert (store / "fixture/registry.json").is_file()
     assert not (store / "fixture/current.json").exists()
+
+
+def test_package_cache_is_removed_with_operation_scratch(source_package):
+    project, runtime_root, calls = source_package
+    package_module.package(project)
+    caches = {Path(kwargs["env"]["UV_CACHE_DIR"]) for _, kwargs in calls}
+    assert caches and all(path.name == "uv-cache" for path in caches)
+    assert all(path.is_relative_to(runtime_root / "fixture/staging") for path in caches)
+    assert all(not path.exists() for path in caches)
+    assert not (runtime_root / "fixture/cache").exists()

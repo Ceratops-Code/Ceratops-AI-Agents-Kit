@@ -38,13 +38,17 @@ from .storage import INSTALL_ROOT, Layout
 
 
 def child_environment(layout: Layout, temporary: Path) -> dict[str, str]:
-    """Do not inherit Python, pip, uv, proxy, or user-site execution overrides."""
+    """Isolate child settings and keep uv cache inside caller-owned scratch.
+
+    Installations use copies, so deleting scratch never invalidates an accepted
+    environment. The package or deployment owner removes scratch on exit.
+    """
     env = {k: v for k, v in os.environ.items() if k.upper() in {"SYSTEMROOT", "WINDIR", "COMSPEC"}}
     env.update({
         "PATH": str(Path(sys.executable).parent),
         "USERPROFILE": str(Path.home()),
         "TEMP": str(temporary), "TMP": str(temporary),
-        "UV_CACHE_DIR": str(layout.directory("cache")),
+        "UV_CACHE_DIR": str(temporary / "uv-cache"),
         "UV_PYTHON_DOWNLOADS": "never", "UV_NO_CONFIG": "1",
         "UV_LINK_MODE": "copy", "PYTHONDONTWRITEBYTECODE": "1",
     })
@@ -58,10 +62,44 @@ def run(command: list[str], *, cwd: Path, env: dict[str, str], timeout: int = 12
                                 timeout=timeout, check=False,
                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise DeploymentError(f"candidate command unavailable or timed out: {Path(command[0]).name}") from exc
+        raise DeploymentError(command_failure(command, cwd, env, exc=exc)) from exc
     if result.returncode:
-        raise DeploymentError(f"candidate validation failed: {result.stderr[-1800:].strip()}")
+        raise DeploymentError(command_failure(command, cwd, env, result=result))
     return result.stdout
+
+
+def command_failure(command: list[str], cwd: Path, env: dict[str, str], *,
+                    result: subprocess.CompletedProcess | None = None,
+                    exc: OSError | subprocess.TimeoutExpired | None = None) -> str:
+    """Keep complete child failure evidence while removing supplied secrets."""
+    secret_flag = re.compile(r"--?(?:token|password|secret|api[-_]?key|authorization)$", re.IGNORECASE)
+    secrets = [value for name, value in env.items()
+               if len(value) >= 4 and re.search(r"token|password|secret|credential|api.?key", name, re.IGNORECASE)]
+    secrets.extend(command[index + 1] for index, item in enumerate(command[:-1]) if secret_flag.fullmatch(item))
+
+    def redact(value: Any, absent: str) -> str:
+        if value is None or value == "" or value == b"":
+            return absent
+        text = value.decode("utf-8", errors="replace") if isinstance(value, bytes) else str(value)
+        for secret in secrets:
+            if secret:
+                text = text.replace(secret, "<redacted>")
+        text = re.sub(r"(https?://)[^/@\s]+:[^/@\s]+@", r"\1<redacted>@", text)
+        return re.sub(r"(?i)((?:token|password|secret|api[-_]?key)\s*[=:]\s*)[^\s\"',]+", r"\1<redacted>", text)
+
+    stdout = result.stdout if result is not None else getattr(exc, "stdout", None)
+    stderr = result.stderr if result is not None else getattr(exc, "stderr", None)
+    return json.dumps({
+        "operation": "candidate-command", "target": str(cwd),
+        "runtime": redact(command[0], "<no runtime>"),
+        "invocation": [redact(item, "") for item in command],
+        "exit_status": result.returncode if result is not None else (
+            "timeout" if isinstance(exc, subprocess.TimeoutExpired) else "not_started"
+        ),
+        "error": redact(exc, "<no exception>"),
+        "stdout": redact(stdout, "<no stdout>"),
+        "stderr": redact(stderr, "<no stderr>"),
+    }, ensure_ascii=False)
 
 
 @dataclass(frozen=True)
@@ -423,10 +461,12 @@ class Engine:
             if selection is None:
                 raise DeploymentError("launcher refresh requires an installed MCP server")
             changed = layout.install_launcher()
+            maintenance = layout.maintain()
         return {
             "mcp_server_name": mcp_server_name,
             "installed_version": selection["version"],
             "launcher_updated": changed,
+            "maintenance": maintenance,
         }
 
     def _deploy(self, mcp_server_name: str, version: str, *, require_installed: bool) -> dict[str, Any]:
@@ -443,7 +483,12 @@ class Engine:
             sha256 = catalog["versions"].get(version)
             if sha256 is None:
                 raise DeploymentError("exact MCP server version is not registered")
-            layout.maintain(protected_artifacts={(version, sha256)})
+            initial_maintenance = layout.maintain(protected_artifacts={(version, sha256)})
+            if previous is not None and (previous["version"], previous["manifest_sha256"]) == (version, sha256):
+                # Immutable accepted work is reused; a fresh call repairs only
+                # launcher and retention state instead of rebuilding it.
+                layout.install_launcher()
+                return self._deployment_outcome(mcp_server_name, version, sha256, initial_maintenance)
             manifest_path = layout.path("artifacts", version, sha256, "manifest.json")
             if digest(manifest_path) != sha256:
                 raise DeploymentError("manifest digest mismatch")
@@ -459,24 +504,42 @@ class Engine:
             runtime = global_runtime()
             instance = uuid.uuid4().hex
             candidate = layout.directory("versions", version, instance)
+            selection = {"schema": 1, "mcp_server_id": mcp_server_name, "version": version, "manifest_sha256": sha256,
+                         "instance": instance, "module": release["module"]}
             committed = False
             try:
                 preflight_release(layout, release, wheel_paths, candidate, runtime)
                 layout.remove_scratch(candidate / "tmp")
-                selection = {"schema": 1, "mcp_server_id": mcp_server_name, "version": version, "manifest_sha256": sha256,
-                             "instance": instance, "module": release["module"]}
                 layout.atomic_json(candidate / "receipt.json", selection)
                 layout.install_launcher()
-                layout.maintain(selected=selection)
                 layout.atomic_json(layout.path("current.json"), selection)
                 committed = True
             finally:
                 if not committed:
-                    layout.remove_candidate(candidate)
-            # No fallible post-commit registry reads:  a successful activation is success.
-            running = self.running_version if mcp_server_name == MCP_SERVER_NAME else None
-            return {"mcp_server_name": mcp_server_name, "installed_version": version, "running_version": running,
-                    "manifest_sha256": sha256, "reconnection_required": bool(running and running != version)}
+                    # An interruption can occur after atomic replacement took
+                    # effect. Inspect the target before retiring the candidate.
+                    try:
+                        published = read_json(layout.path("current.json")) if layout.path("current.json").exists() else None
+                    except (DeploymentError, OSError, ValueError):
+                        published = selection  # Unknown selection must keep its possible environment.
+                    if published != selection:
+                        layout.remove_candidate(candidate)
+            # Cleanup failure does not turn a completed activation into a failed
+            # install. Return the debt so a normal fresh call can finish it.
+            try:
+                maintenance = layout.maintain(selected=selection)
+            except (DeploymentError, OSError, ValueError, KeyError) as exc:
+                maintenance = {"removed": [], "deferred": [str(layout.root)],
+                               "errors": [f"maintain installation {layout.root}: {exc}"]}
+            maintenance["removed"] = initial_maintenance["removed"] + maintenance["removed"]
+            return self._deployment_outcome(mcp_server_name, version, sha256, maintenance)
+
+    def _deployment_outcome(self, name: str, version: str, sha256: str,
+                            maintenance: dict[str, list[str]]) -> dict[str, Any]:
+        running = self.running_version if name == MCP_SERVER_NAME else None
+        return {"mcp_server_name": name, "installed_version": version, "running_version": running,
+                "manifest_sha256": sha256, "reconnection_required": bool(running and running != version),
+                "maintenance": maintenance}
 
 
 if __name__ == "__main__":

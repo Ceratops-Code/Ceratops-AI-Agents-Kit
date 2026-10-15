@@ -15,7 +15,7 @@ stays outside the wheel.
 
 Editable source belongs in the MCP server's owning repository. Each MCP server
 owns a separate directory under `%USERPROFILE%\.codex\mcp`, including its
-packages, environments, version selection, registry, cache, and locks. The
+packages, environments, version selection, registry, and locks. The
 manager's directory is
 `%USERPROFILE%\.codex\mcp\ceratops_mcp_server_manager`. The skill installer
 separately owns skill deployment.
@@ -78,7 +78,7 @@ missing or stale.
 
 To refresh one installed server later, run the selected manager's stable
 launcher with `refresh-launcher <mcp-server-name>`. This does not rebuild or
-reselect that server's environment.
+reselect that server's environment; it also applies the two-version retention policy.
 
 For a one-time move from a previous manager root, name that exact source
 explicitly:
@@ -268,8 +268,21 @@ to work because their leased environments are retained.
 Every successful activation installs or refreshes that MCP server's stable launcher.
 The launcher selects `current.json` and holds an instance lease for the child
 process lifetime. At deployment startup and after a completed package or
-activation, the manager retains the selected environment and two newest
-complete predecessors. Older live environments are deferred. Incomplete
+activation, the manager retains the selected environment and the newest
+complete different version. Older and duplicate live environments are deferred.
+Repeated installation of the selected immutable release reuses that accepted
+environment and repairs only launcher and retention state. Launcher refresh also
+applies retention, so manager deployment updates all selected servers without
+reinstalling them. Maintenance reports removed paths, deferred live paths, and
+operation/target/error details for cleanup failures.
+
+The package operation owns each `staging/package_*/uv-cache` and bootstrap owns
+`staging/bootstrap_*/uv-cache`; their enclosing temporary directories are removed
+on exit. Deployment owns `versions/<version>/<instance>/tmp/uv-cache`; it is
+removed before activation or with a failed candidate. uv copies files into an
+accepted environment, so those environments do not depend on cache lifetime.
+No persistent per-server `cache` directory is produced. Old caches can be cleared
+with uv's cache-clean operation after outstanding deployments stop. Incomplete
 environments and unselected or orphaned packages receive a 24-hour recovery
 window; after that they and any registry entries are removed. Reparse points and
 unclassified paths are never cleanup targets.

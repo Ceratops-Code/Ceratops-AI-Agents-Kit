@@ -217,7 +217,7 @@ def package(source: Path, *, lock_only: bool = False,
     with tempfile.TemporaryDirectory(prefix="package_", dir=layout.path("staging")) as work:
         temporary = Path(work)
         env = {k: v for k, v in os.environ.items() if not k.upper().startswith(("UV_", "PIP_", "PYTHON"))}
-        env.update({"UV_CACHE_DIR": str(layout.directory("cache")), "UV_NO_CONFIG": "1", "UV_PYTHON_DOWNLOADS": "never", "TEMP": work, "TMP": work})
+        env.update({"UV_CACHE_DIR": str(temporary / "uv-cache"), "UV_NO_CONFIG": "1", "UV_PYTHON_DOWNLOADS": "never", "TEMP": work, "TMP": work})
         lock = package_lock if package_lock is not None else source / source_lock_name
         if package_lock is None and (lock.exists() or lock.is_symlink()):
             source_file(source, source_lock_name)

@@ -384,7 +384,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(outcome, sort_keys=True))
         return 0
     except (DeploymentError, OSError, ValueError, KeyError, subprocess.TimeoutExpired) as exc:
-        print(str(exc)[-1800:], file=sys.stderr)
+        print(str(exc), file=sys.stderr)
         return 2
 
 
