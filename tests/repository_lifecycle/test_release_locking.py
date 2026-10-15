@@ -13,6 +13,7 @@ import sys
 from typing import Any
 
 import pytest
+import yaml
 
 from tests.repository_lifecycle.support import (
     MANAGE_PENDING_WORK,
@@ -34,6 +35,29 @@ from tests.support.repositories import run_git
 
 # The support module selects the source scripts before importing the workflow.
 workflow_command = importlib.import_module("github_pr_workflow.command")
+
+
+def test_protected_command_preserves_failure_streams_without_retaining_stopped_flag(tmp_path, monkeypatch):
+    locks = workflow_command.release_lock_module()
+    monkeypatch.setenv("FIXTURE_API_TOKEN", "environment-secret")
+    command = [sys.executable, "-c", "import sys; print('environment-secret'); print('child failure',file=sys.stderr); sys.exit(7)",
+               "--password", "argument-secret"]
+    path = tmp_path / "release-local"
+    for _ in range(2):
+        with pytest.raises(subprocess.CalledProcessError) as raised:
+            with locks.hold_write_attempt(path):
+                locks.run_protected_command(command, cwd=tmp_path, capture_output=True, text=True, check=True)
+        assert path.read_bytes() == b"0"
+        detail = locks.command_failure_details(raised.value, target=tmp_path)
+        assert detail["returncode"] == 7
+        assert detail["command"][0] == sys.executable
+        assert detail["target"] == str(tmp_path)
+        assert detail["stdout"].strip() == "[REDACTED]"
+        assert detail["stderr"].strip() == "child failure"
+        assert "argument-secret" not in json.dumps(detail)
+        assert "environment-secret" not in json.dumps(detail)
+    empty = locks.command_failure_details(subprocess.CompletedProcess(command, 1, "", ""), target=tmp_path)
+    assert empty["stdout"] == "[no stdout]" and empty["stderr"] == "[no stderr]"
 
 
 @pytest.mark.parametrize("installer", ["skill", "mcp"])
@@ -228,6 +252,144 @@ def _compete(repo):
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "busy"
+
+
+@pytest.mark.parametrize("ending", ["completed", "failed"])
+def test_local_promotion_executes_declared_selected_skill_installer(tmp_path, monkeypatch, ending):
+    """Exercise preparation, SDLC dispatch and the declared call, not a batch stub."""
+    repo, _, log, _ = prepare_repository_lifecycle_repo(
+        tmp_path, handoff="ceratops-skill-lifecycle/deploy",
+    )
+    contract = repo / "sdlc/sdlc.yml"
+    document = yaml.safe_load(contract.read_text())
+    document["deliverables"]["apps"]["sample"]["actions"]["install"]["steps"][-1]["handoff"]["inputs"] = {"skill": "example"}
+    contract.write_text(yaml.safe_dump(document))
+    assert run_git(repo, "add", "sdlc/sdlc.yml").returncode == 0
+    assert run_git(repo, "commit", "-m", "Select installation").returncode == 0
+    head = run_git(repo, "rev-parse", "HEAD").stdout.strip()
+    bundle = tmp_path / "codex/skills/ceratops-skill-lifecycle"
+    (bundle / "references").mkdir(parents=True)
+    (bundle / "scripts").mkdir()
+    call = {"path": "scripts/install_fixture.py", "function": "install_skill",
+            "request": "InstallOptions", "args": ["--repo-root", "{repo_root}", "--skill", "{skill}"]}
+    (bundle / "references/action-executors.json").write_text(json.dumps({
+        "version": 1, "actions": {"deploy": {"call": call, "selected-skill": {"call": call}}},
+    }))
+    (bundle / ".runtime-manifest.json").write_text(json.dumps({"python_runtime": sys.executable}))
+    (bundle / call["path"]).write_text('''import argparse, os, pathlib
+from types import SimpleNamespace as InstallOptions
+from hold_write_lock import hold_release_source
+def build_parser():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--repo-root', type=pathlib.Path)
+    parser.add_argument('--skill')
+    return parser
+def install_skill(options):
+    with hold_release_source(options.repo_root) as owned:
+        assert not owned.outermost
+        path = pathlib.Path(os.environ['INSTALL_TEST_LOG'])
+        with path.open('a') as output:
+            output.write(options.skill + '\\n')
+        return {'schema': 'fixture.install.v1', 'status': os.environ['INSTALL_TEST_ENDING']}
+''')
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    monkeypatch.setenv("DEPLOY_TEST_LOG", str(log))
+    monkeypatch.setenv("INSTALL_TEST_LOG", str(tmp_path / "installed.log"))
+    monkeypatch.setenv("INSTALL_TEST_ENDING", ending)
+    module = runpy.run_path(str(PROMOTE_REPOSITORY))
+    operation = "deliverables.apps.sample.actions.install"
+    args = module["build_parser"]().parse_args([
+        "--repo-root", str(repo), "--source-branch", "approved", "--run-operation", operation,
+    ])
+    for attempt in range(2):
+        if ending == "completed":
+            result = module["promote"](args)
+            installed = result["operations"]["results"][0]
+            assert installed["status"] == "completed" and installed["handoff_completed"] is True
+            assert installed["steps"] == [1, 2]
+            assert "handoffs" not in result
+        else:
+            with pytest.raises(module["PromotionError"]) as raised:
+                module["promote"](args)
+            assert raised.value.payload["phase"] == "deployment"
+            assert raised.value.payload["promotion"]["head"] == head
+        assert (tmp_path / "installed.log").read_text().splitlines() == ["example"] * (attempt + 1)
+        assert run_git(repo, "rev-parse", "release/local").stdout.strip() == head
+        assert workflow_command.release_lock_module().release_lock_path(repo).read_bytes() == b"0"
+
+
+@pytest.mark.parametrize("status", ["deferred_handoff", "handoff_required", "completed"])
+def test_promotion_never_turns_an_unexecuted_handoff_into_success(tmp_path, monkeypatch, status):
+    repo, head, _, _ = prepare_repository_lifecycle_repo(tmp_path)
+    module = runpy.run_path(str(PROMOTE_REPOSITORY))
+    deploy = module["_deploy_completed_promotion"]
+    operations = {"status": "completed", "results": [{
+        "operation": "fixture.install", "status": status, "steps": [],
+        "handoff": "ceratops-skill-lifecycle/deploy",
+    }], "deferred_handoffs": ["fixture.install"]}
+    monkeypatch.setitem(deploy.__globals__, "execute_prepared_operations", lambda *a, **k: operations)
+    accepted = module["CompletedPromotion"]({"status": "ready", "head": head, "pending_work_scope": "fixture"},
+                                           repo, [], {"results": []})
+    args = argparse.Namespace(repo_root=repo)
+    for _ in range(2):
+        with pytest.raises(module["PromotionError"]) as raised:
+            deploy(args, accepted)
+        assert raised.value.payload["results"][0]["status"] == status
+        assert "completed_operations" not in operations
+
+
+@pytest.mark.parametrize("launcher", ["skill_check", "skill_runtime", "mcp"])
+@pytest.mark.parametrize("ending", ["timeout", "os_error", "interrupt"])
+@pytest.mark.parametrize("effect", [False, True])
+def test_installer_launch_failures_keep_unfinished_flag(tmp_path, monkeypatch, launcher, ending, effect):
+    """Raw launchers, not manually annotated errors, must leave the warning set."""
+    repo, _, _, _ = prepare_repository_lifecycle_repo(tmp_path)
+    locks = workflow_command.release_lock_module()
+    original_run = subprocess.run
+    effects = []
+
+    def interrupted(command, **kwargs):
+        if pathlib.Path(str(command[0])).stem.lower() == "git":
+            return original_run(command, **kwargs)
+        if effect:
+            effects.append("child effect")
+        if ending == "timeout":
+            raise subprocess.TimeoutExpired(command, 1, output="partial stdout", stderr="partial stderr")
+        if ending == "os_error":
+            raise OSError("launcher lost the command result")
+        raise KeyboardInterrupt("interrupted foreground wait")
+
+    if launcher == "mcp":
+        module = runpy.run_path(str(PROMOTE_REPOSITORY.parents[2] / "ceratops-mcp-server-lifecycle/scripts/install-mcp-server.py"))
+        call, request = module["install_mcp_server"], module["InstallOptions"](repo_root=repo)
+    else:
+        module = load_runtime_installer()
+        call = module["deploy_managed_skills"]
+        request = module["DeployOptions"](repo_root=repo, skill=["example"], install_root=tmp_path / "installed")
+        monkeypatch.setitem(call.__globals__, "_deployment_scope", lambda *a: module["AffectedSet"](("example",), ()))
+        if launcher == "skill_runtime":
+            monkeypatch.setitem(call.__globals__, "_check_deployment_sources", lambda *a: None)
+            project = repo / "skills/sections/python"
+            project.mkdir(parents=True)
+            (project / "pyproject.toml").write_text("[project]\nname='fixture'\nversion='0.0.0'\n")
+            (project / "uv.lock").write_text("fixture lock")
+            environments = module["runtime_builder"].python_environments
+            monkeypatch.setattr(module["runtime_builder"], "install_transaction",
+                                lambda *a, **k: environments.prepare_python_runtime(repo, request.install_root))
+    monkeypatch.setattr(subprocess, "run", interrupted)
+    for attempt in range(2):
+        try:
+            outcome = call(request)
+        except (OSError, subprocess.TimeoutExpired, KeyboardInterrupt):
+            pass
+        else:
+            assert outcome["status"] in {"error", "failed"}, outcome
+        assert len(effects) == (attempt + 1 if effect else 0)
+        assert locks.release_lock_path(repo).read_bytes() == b"1"
+        with pytest.raises(locks.WriteLockRecoveryRequired), locks.hold_release_source(repo):
+            pytest.fail("interrupted installer was treated as stopped")
+        with locks.hold_write_attempt(locks.release_lock_path(repo), confirm_previous_commands_stopped=True):
+            pass
 
 
 @pytest.mark.parametrize("command", ["promote", "prepare", "ship", "github-ship", "sync", "sync-main", "pr", "pr-primary", "fast-change"])

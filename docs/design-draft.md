@@ -12,8 +12,9 @@ methodology and design detail. README records implemented capabilities and curre
 output lifetimes; the refactor plan records delivery order. The working-folder
 methodology below distinguishes implemented versioned storage, receipt preparation,
 final-commit binding, completion tags, effect-derived recovery and shared
-checkpoint storage and an internal release-lock helper from planned full-promotion
-protection and public lifecycle routing.
+checkpoint storage and connected release-lock protection from planned
+receipt-driven public lifecycle routing. Steps through 4E and standalone 6A are
+implemented; later phase scheduling and artifact-only installation remain planned.
 
 The intended users are agents and CI working on Ceratops-compatible
 repositories, including repositories other than Ceratops-AI-Agents-Kit and
@@ -72,6 +73,14 @@ test bodies and their implementation remain repository-specific.
 | Repository Python scripts and tests | `scripts/pyproject.toml` and `scripts/uv.lock` | uv selects the required Python and prepares ignored `scripts/.venv`; repository entrypoints use this project. |
 | Installed Ceratops skill helpers | Source-only declarations under `skills/sections/python` | Deployment prepares a versioned venv under `$CODEX_HOME/runtimes/ceratops/versions/`; each installed skill manifest pins its interpreter. After manifest activation, the owner retains the selected version plus two predecessors, deferring cleanup for manifest-pinned or running interpreters. Direct uv commands run helpers. |
 | Installed external MCP servers | The selected server's declarations and installer | The MCP server manager owns the installed server environment, separately from the shared skill environment. |
+
+`skills/ceratops-skill-lifecycle/scripts/runtime/prepare_python_runtime.py` owns
+Python-environment creation, interpreter selection and retention for managed
+installation. `managed_runtime_builder.py` still owns skill generation and its
+installation transaction. The split introduces no new storage paths or retention
+policy: the environment owner keeps the selected version and two predecessors,
+preserving versions referenced by installed manifests or running interpreters.
+Its foreground commands use the same command-stop tracking as the installer.
 
 One environment does not need both requirements files and a pyproject dependency
 list. The thread selected pyproject plus its lockfile and removal of the root
@@ -734,6 +743,8 @@ The internal interface is:
 | --- | --- |
 | `release_lock_path(repo_root)` | Discover the shared repository release-lock path without mutating Git or contacting a remote. |
 | `hold_write_lock(path, ...)` | Acquire once, resolve saved uncertainty, durably set the flag, then yield ownership. |
+| `hold_write_attempt(path, ...)` | Wrap one synchronous operation; clear the flag after stopped failures as well as success, preserving uncertain launcher exits. |
+| `run_protected_command(...)` | Run a foreground command and retain an uncertain stop through caught or wrapped exceptions; attach the invocation and both output streams to launch errors. |
 | `context.complete(commands_stopped=True)` | Outermost caller reports that its writing commands stopped, independently of success. Clear the flag before native unlock on normal or exceptional exit. |
 
 A write or flush failure before entry prevents protected work. A crash or exit
@@ -852,7 +863,7 @@ including when review subsequently needs attention. CI waiting and blocker
 construction live in `wait_pr_checks.py`; polling and gate policy are unchanged.
 Other workflow-level errors clear only at that workflow's terminal success.
 No reader registry or per-error model review is involved. Test-runner-owned
-report cleanup remains 6D; explicit request abandonment/replacement and
+report cleanup remains 6E; explicit request abandonment/replacement and
 worktree-removal connections remain 20C/21.
 
 The cases in `tests/repository_lifecycle/test_failure_reports.py` cover matching
@@ -861,8 +872,9 @@ wrong-owner and child-file preservation, and interruption around report writes
 and deletion. The GitHub workflow/shipping suites cover the moved check waiting.
 
 `command.py::release_write_context()` waits through the existing synchronous
-calls in `run_command()` and `repository_operation.py`. A shared in-memory
-counter records whether those calls returned; a launcher exception keeps shutdown
+calls in `run_command()` and `repository_operation.py`. `hold_write_lock.py`
+owns the shared in-memory command counter used by repository workflows,
+standalone installers and fast-change. A launcher exception keeps shutdown
 uncertain even if caught. No process registry, new waiting system or saved cursor
 is introduced. In `finally`, the outer invocation reports confirmed shutdown
 before native unlock, including after failed checks, decisions or controller
@@ -874,11 +886,14 @@ The automatic attempt ends and unlocks before the model edits code. A fresh
 normal call takes the lock and uses current inputs; clearing `unfinished_run`
 is not successful acceptance or permission to delete checkpoints. 3B supplies
 report handling and 4B connects matching-success cleanup. 4C completes installation
-call ordering; its combined tests gate merging this batch. Ordinary work in
+call ordering. These steps through 4E are implemented and locally delivered;
+standalone 6A is implemented too. Ordinary work in
 other task worktrees stays unlocked.
 
 Promotion returns the accepted result, selected commit and prepared installation
-operations before installation starts. `promote()` calls those operations outside
+operations in skill mode before installation starts. The executor invokes the
+declared installer and preserves its actual result; CI-mode deferral is not
+installation success. `promote()` calls those operations outside
 `_promote_with_rollback()`, retaining release protection because today's installers
 still read source. Installation failure preserves the completed promotion and
 original diagnostics; there is no automatic retry. Plain Promote unlocks after
@@ -911,15 +926,15 @@ or human correction. Request cleanup never deletes the release-lock file or
 clears its unfinished flag. Commands that ignore the helper, including manual
 Git, are not protected.
 
-Step 6 later applies this same helper to `<destination>/locks/install`, held
-through generation production, activation and owned cleanup. A destination lock
-must not acquire the release lock in reverse order. Ordinary Promote-and-deploy
-releases the release lock before installation. Ship retains its outer release
-lock and takes the destination lock inside it, releasing the destination lock
-before completion cleanup and the release lock. Installation failure stops
-automatic execution; stop commands and release locks cleanly, or retain the
-unfinished flag if shutdown is uncertain. Explicit later resume reacquires the
-locks. Installer adoption is not part of 2A.
+Steps 17–19 later apply the helper to artifact-only destination installation,
+held through generation production, activation and owned cleanup. A destination
+lock must not acquire the release lock in reverse order. Until that adoption,
+Promote-and-deploy and Ship retain release protection while installers read the
+checkout, taking the destination lock inside it. Installation failure leaves
+completed promotion intact and stops automatic execution. Known-stopped command
+failures clear the unfinished flag; an interrupted launcher keeps it even when
+its caller catches or wraps the error. Explicit later calls reacquire the lock.
+Fast-change does not reverse files while a command may still be writing them.
 Optional step 5 may automate abandoned-command cleanup;
 ordinary use does not depend on it.
 
@@ -935,8 +950,8 @@ coverage is present but Linux execution has not been exercised here.
 `tests/repository_lifecycle/test_release_locking.py` covers competing release
 commands, nested workflow ownership, refusal before candidate changes, explicit
 recovery, direct versus external Ship calls, known-stopped unsuccessful exits,
-unknown shutdown and ordinary non-release work. Complete report forwarding and
-optional command supervision remain deferred.
+unknown shutdown and ordinary non-release work. Report forwarding is implemented;
+only optional command supervision remains deferred.
 
 ### Build receipt, artifact receipt and version
 
@@ -970,8 +985,8 @@ Both formats use sorted compact JSON encoded as UTF-8 followed by one LF.
 validate that representation and return the original bytes plus their direct
 SHA-256; readers never parse and reserialize data to establish the stored hash.
 The definitions, readers and versioned storage/finalization producer are
-implemented internally. Full-promotion release-lock integration and public
-lifecycle routing remain pending. The internal producer can
+implemented internally. Release-lock integration is implemented; public receipt-driven
+lifecycle routing remains pending. The internal producer can
 reserve, prepare and commit exact build-receipt bytes, bind direct stored output
 through artifact receipts and create the completion tag; the chain reader
 verifies that completed C/store record without rerunning acceptance.
@@ -1860,7 +1875,8 @@ means the thread's decision is recorded, not that the whole system was audited.
     {"path": "skills/skill-sections.json", "role": "Live shared section and payload assignments"},
     {"path": "skills/ceratops-skill-lifecycle/scripts/manage_checkpoints.py", "role": "Skill-update request storage without checkpoint locks; own-request and exact-worktree cleanup"},
     {"path": "skills/ceratops-repo-lifecycle/scripts/complete_artifact_builds.py", "role": "Qualified build receipts and result-only commit, artifact receipt and immutable tag completion"},
-    {"path": "skills/sections/scripts/hold_write_lock.py", "role": "Shared native release lock and unfinished-run recovery flag"},
+    {"path": "skills/sections/scripts/hold_write_lock.py", "role": "Shared native release lock, command-stop tracking and unfinished-run recovery flag"},
+    {"path": "skills/ceratops-skill-lifecycle/scripts/runtime/prepare_python_runtime.py", "role": "Managed installer Python-environment creation and bounded retention"},
     {"path": "skills/ceratops-repo-lifecycle/scripts/git_branch_operations.py", "role": "Shared local branch/worktree operations; locking remains in workflows"},
     {"path": "skills/ceratops-repo-lifecycle/scripts/repository_operation.py", "role": "Operation execution and internal build transaction"},
     {"path": "skills/ceratops-repo-lifecycle/scripts/sdlc_results.py", "role": "Read-only build receipt verification"},

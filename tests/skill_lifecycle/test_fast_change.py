@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import runpy
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -19,6 +21,67 @@ from tests.skill_lifecycle.support import (
 from tests.support.repositories import (
     run_git,
 )
+
+
+def test_direct_fast_change_stopped_failure_releases_for_next_call(tmp_path, monkeypatch):
+    repo = prepare_fast_change_repo(tmp_path)
+    module = runpy.run_path(str(FAST_CHANGE))
+    execute = module["execute"]
+
+    def failed_check(_spec):
+        module["_checked"]([sys.executable, "-c", "raise SystemExit(7)"],
+                           cwd=repo, failure="fixture failed")
+
+    monkeypatch.setitem(execute.__globals__, "_execute", failed_check)
+    spec = SimpleNamespace(repo_root=repo)
+    for _ in range(2):
+        with pytest.raises(module["FastChangeError"], match="fixture failed"):
+            execute(spec)
+        assert (repo / ".git/ceratops/locks/release-local").read_bytes() == b"0"
+    monkeypatch.setitem(execute.__globals__, "_execute", lambda _spec: {"status": "committed"})
+    assert execute(spec)["status"] == "committed"
+
+
+@pytest.mark.parametrize("child_effect", [False, True])
+def test_fast_change_does_not_reverse_files_after_interrupted_launcher(tmp_path, monkeypatch, child_effect):
+    repo = prepare_fast_change_repo(tmp_path)
+    module = runpy.run_path(str(FAST_CHANGE))
+    execute = module["execute"]
+    body = module["_execute"]
+    locks = module["_release_lock_module"]()
+    path = repo / "skills/alpha-tool/notes.txt"
+    effects = []
+    original_run = subprocess.run
+
+    def interrupted(command, **kwargs):
+        if command[0] != "fixture-writer":
+            return original_run(command, **kwargs)
+        if child_effect:
+            effects.append("child effect")
+        raise subprocess.TimeoutExpired(command, 1)
+
+    def git(_root, *arguments, **kwargs):
+        if arguments[0] == "apply":
+            path.write_text("new source")
+            return ""
+        return module["_checked"](["fixture-writer"], cwd=repo, failure="interrupted check")
+
+    monkeypatch.setattr(subprocess, "run", interrupted)
+    monkeypatch.setitem(body.__globals__, "_git", git)
+    monkeypatch.setitem(body.__globals__, "_working_paths", lambda _root: {"skills/alpha-tool/notes.txt"})
+    monkeypatch.setitem(body.__globals__, "_reverse_patch", lambda *a, **k: pytest.fail("raced an unknown writer"))
+    spec = SimpleNamespace(repo_root=repo, patch="fixture", paths=("skills/alpha-tool/notes.txt",))
+    for attempt in range(2):
+        with pytest.raises(module["FastChangeError"]) as raised:
+            execute(spec)
+        failure = json.loads(str(raised.value))
+        assert failure["compensation"] == ["not_attempted_while_commands_may_be_running"]
+        assert failure["reason"]["command"] == ["fixture-writer"]
+        assert path.read_text() == "new source"
+        assert len(effects) == (attempt + 1 if child_effect else 0)
+        assert locks.release_lock_path(repo).read_bytes() == b"1"
+        with locks.hold_write_attempt(locks.release_lock_path(repo), confirm_previous_commands_stopped=True):
+            pass
 
 
 @pytest.mark.parametrize("package_directory", [".", "scripts"])
@@ -118,8 +181,14 @@ def test_fast_change_commits_cohesive_rules_only_multi_skill_scope(
     detail = json.loads(failed_lint.stderr)["detail"]
     assert detail["phase"] == "markdown_lint"
     assert detail["compensation"] == ["source_restored"]
+    assert (repo / ".git/ceratops/locks/release-local").read_bytes() == b"0"
     preserved_requests = list(canonical_requests.rglob("request.json"))
     assert len(preserved_requests) == 1
+    repeated = subprocess.run([sys.executable, str(FAST_CHANGE), "--request", str(preserved_requests[0])],
+                              capture_output=True, text=True, check=False)
+    assert repeated.returncode == 1
+    assert json.loads(repeated.stderr)["detail"]["phase"] == "markdown_lint"
+    assert (repo / ".git/ceratops/locks/release-local").read_bytes() == b"0"
 
     if os.name != "nt":
         symlink_task = canonical_requests / "symlink-request"

@@ -16,7 +16,6 @@ import json
 import os
 import pathlib
 import re
-import subprocess
 import sys
 from typing import Any, NamedTuple
 
@@ -100,7 +99,7 @@ def _plain_file(path: pathlib.Path, label: str) -> pathlib.Path:
 
 
 def _git(repo_root: pathlib.Path, *arguments: str) -> str:
-    result = subprocess.run(
+    result = source_locks.run_protected_command(
         ["git", "-C", str(repo_root), *arguments],
         capture_output=True,
         text=True,
@@ -236,7 +235,7 @@ def _install(args: InstallOptions, repo_root: pathlib.Path) -> dict[str, Any]:
                 str(args.package_lock.expanduser().resolve()),
             ]
         )
-    result = subprocess.run(
+    result = source_locks.run_protected_command(
         command,
         cwd=repo_root,
         capture_output=True,
@@ -246,10 +245,8 @@ def _install(args: InstallOptions, repo_root: pathlib.Path) -> dict[str, Any]:
         check=False,
     )
     if result.returncode:
-        detail = (result.stderr.strip() or result.stdout.strip())[-4096:]
-        raise InstallCompletionError(
-            detail or f"MCP server manager exited with {result.returncode}"
-        )
+        detail = source_locks.command_failure_details(result, target=repo_root)
+        raise InstallCompletionError("MCP server installation failed: " + json.dumps(detail))
     return _json_object(result.stdout, "mcp-server-manager result")
 
 

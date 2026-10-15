@@ -11,8 +11,6 @@ import sys
 import threading
 from collections.abc import Mapping
 from contextlib import contextmanager
-from contextvars import ContextVar
-from dataclasses import dataclass
 from functools import cache
 from typing import Any
 
@@ -56,46 +54,6 @@ class CommandError(RuntimeError):
         self.completed = completed
 
 
-@dataclass
-class _CommandCompletion:
-    """Only synchronous call state; no process discovery or saved progress."""
-
-    active: int = 0
-    uncertain: bool = False
-
-    def unfinished(self) -> bool:
-        return self.uncertain or self.active != 0
-
-
-_COMMAND_COMPLETION: ContextVar[_CommandCompletion | None] = ContextVar(
-    "release_command_completion", default=None,
-)
-
-
-@contextmanager
-def track_command_completion():
-    """Observe an existing foreground wait without managing another process.
-
-    A returned CompletedProcess establishes that the command ended. If the
-    launcher itself raises, it supplies no such result: retain uncertainty,
-    even if a caller catches the error and continues. In particular, killing a
-    timed-out controller does not establish that its writing children stopped.
-    """
-    completion = _COMMAND_COMPLETION.get()
-    if completion is not None:
-        completion.active += 1
-    try:
-        yield
-    except BaseException as exc:
-        exc.__dict__["local_commands_stopped"] = False
-        if completion is not None:
-            completion.uncertain = True
-        raise
-    finally:
-        if completion is not None:
-            completion.active -= 1
-
-
 @cache
 def release_lock_module() -> Any:
     """Load the installed sibling, or the declared shared source in development."""
@@ -127,31 +85,10 @@ def release_write_context(repo_root, *, required=True, confirm_stopped=False, af
         ):
             yield None
             return
-        completion = _COMMAND_COMPLETION.get() or _CommandCompletion()
-        with locks.hold_write_lock(
-            lock_path,
-            confirm_previous_commands_stopped=confirm_stopped,
-            commands_running=completion.unfinished,
+        with locks.hold_write_attempt(
+            lock_path, confirm_previous_commands_stopped=confirm_stopped,
         ) as owned:
-            token = _COMMAND_COMPLETION.set(completion)
-            operation_error = None
-            try:
-                yield owned
-            except BaseException as exc:
-                operation_error = exc
-                if getattr(exc, "local_commands_stopped", None) is False:
-                    completion.uncertain = True
-                raise
-            finally:
-                try:
-                    if owned.outermost and not completion.unfinished():
-                        owned.complete(commands_stopped=True)
-                except BaseException as cleanup_error:
-                    if operation_error is None:
-                        raise
-                    locks.attach_cleanup_failure(operation_error, cleanup_error)
-                finally:
-                    _COMMAND_COMPLETION.reset(token)
+            yield owned
     except locks.WriteLockError as exc:
         error = CommandError(str(exc))
         if failures := getattr(exc, "cleanup_errors", None):
@@ -282,7 +219,7 @@ def run_command(
 ) -> subprocess.CompletedProcess[str]:
     """Run one command without shell expansion or inherited noisy output."""
 
-    with track_command_completion():
+    with release_lock_module().track_command_completion():
         return run_github_command(
             args,
             retry_safe=github_read_command(args),
@@ -304,7 +241,7 @@ def run_command_for_json(
     Invalid output retains the complete captured result on the exception and
     the existing bounded public diagnostic in its structured payload.
     """
-    with track_command_completion():
+    with release_lock_module().track_command_completion():
         result = run_progress_command(command, cwd=cwd)
     error_result = "\n".join(
         line for line in result.stderr.splitlines() if not line.startswith("[tests] ")
@@ -501,9 +438,8 @@ def remove_resolved_failures(
     references. Cleanup trouble is observational: it never turns accepted work
     into a failed check or asks the caller to repeat its effect.
     """
-    completion = _COMMAND_COMPLETION.get()
     if diagnostic_output is None or not resolved_failures or (
-        completion is not None and completion.unfinished()
+        not release_lock_module().local_commands_stopped()
     ):
         return
     try:

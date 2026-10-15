@@ -19,9 +19,9 @@ from typing import Any
 
 from ceratops_repo_compatibility_engine.sdlc_contract_validation import MCP_NAME
 from github_pr_workflow.command import (
+    release_lock_module,
     report_failure,
     run_progress_command,
-    track_command_completion,
 )
 from sdlc_results import capture_step_result
 from store_artifacts import OperationError
@@ -53,7 +53,7 @@ def _call_action(root: pathlib.Path, declaration: Mapping[str, Any], arguments: 
     except SystemExit as exc:
         raise ValueError("Declared action arguments were not accepted") from exc
     request = getattr(module, declaration["request"])(**vars(options))
-    with track_command_completion():
+    with release_lock_module().track_command_completion():
         return getattr(module, declaration["function"])(request)
 
 
@@ -363,7 +363,7 @@ def execute_handoff(
                 else:
                     raise ValueError("Python action must return its completion record or OK")
             else:
-                with track_command_completion():
+                with release_lock_module().track_command_completion():
                     result = run_progress_command(argv, cwd=repo_root)
                 code, stdout, stderr = result.returncode, result.stdout, result.stderr
             if code:

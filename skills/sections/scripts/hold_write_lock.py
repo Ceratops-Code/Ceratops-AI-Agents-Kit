@@ -10,18 +10,160 @@ Never remove, replace or truncate it, including during checkpoint cleanup.
 
 from __future__ import annotations
 
+import json
 import os
 import pathlib
+import re
 import stat
 import subprocess
 import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
+from typing import Any
 
 from filelock import lock_descriptor, unlock_descriptor
 
 _ACTIVE = threading.local()
+
+
+@dataclass
+class _CommandCompletion:
+    """Only synchronous call state; no process discovery or saved progress."""
+
+    active: int = 0
+    uncertain: bool = False
+
+    def unfinished(self) -> bool:
+        return self.uncertain or self.active != 0
+
+
+_COMMAND_COMPLETION: ContextVar[_CommandCompletion | None] = ContextVar(
+    "release_command_completion", default=None,
+)
+
+
+@contextmanager
+def track_command_completion():
+    """Observe an existing foreground wait without managing another process.
+
+    A returned CompletedProcess establishes that the command ended. If the
+    launcher itself raises, it supplies no such result: retain uncertainty,
+    even if a caller catches the error and continues. In particular, killing a
+    timed-out controller does not establish that its writing children stopped.
+    """
+    completion = _COMMAND_COMPLETION.get()
+    if completion is not None:
+        completion.active += 1
+    try:
+        yield
+    except BaseException as exc:
+        exc.__dict__["local_commands_stopped"] = False
+        if completion is not None:
+            completion.uncertain = True
+        raise
+    finally:
+        if completion is not None:
+            completion.active -= 1
+
+
+def local_commands_stopped() -> bool:
+    """Whether this attempt has no active command or uncertain launcher exit."""
+    completion = _COMMAND_COMPLETION.get()
+    return completion is None or not completion.unfinished()
+
+
+def run_protected_command(*args: Any, check: bool = False, **kwargs: Any) -> subprocess.CompletedProcess[Any]:
+    """Run a foreground command and retain interruption state until lock exit."""
+    try:
+        with track_command_completion():
+            result = subprocess.run(*args, check=False, **kwargs)
+    except BaseException as exc:
+        detail = command_failure_details(exc, command=args[0] if args else kwargs.get("args"),
+                                         target=kwargs.get("cwd", pathlib.Path.cwd()))
+        exc.__dict__["command_failure"] = detail
+        exc.add_note(json.dumps(detail))
+        raise
+    # A nonzero exit is still a stopped command, including check=True callers.
+    if check:
+        result.check_returncode()
+    return result
+
+
+def command_failure_details(result: Any, *, target: Any, command: Any = None) -> dict[str, Any]:
+    """Keep both streams and invocation, hiding credential values in diagnostics."""
+    invocation = command if command is not None else getattr(result, "cmd", getattr(result, "args", []))
+    secrets = [value for key, value in os.environ.items()
+               if len(value) >= 4 and re.search(r"TOKEN|PASSWORD|SECRET|API_KEY|CREDENTIAL", key, re.I)]
+    if isinstance(invocation, (list, tuple)):
+        for index, value in enumerate(invocation):
+            if index and re.fullmatch(r"--?(?:token|password|secret|api[-_]key|authorization)", str(invocation[index - 1]), re.I):
+                secrets.append(str(value))
+            matched = re.match(r"--?(?:token|password|secret|api[-_]key)=(.+)", str(value), re.I)
+            if matched:
+                secrets.append(matched[1])
+
+    def clean(value: Any) -> Any:
+        if isinstance(value, (list, tuple)):
+            return [clean(item) for item in value]
+        text = value.decode("utf-8", errors="replace") if isinstance(value, bytes) else str(value)
+        for secret in secrets:
+            if secret:
+                text = text.replace(secret, "[REDACTED]")
+        text = re.sub(r"(?i)(https?://)[^\s/@:]+:[^\s/@]+@", r"\1[REDACTED]@", text)
+        return re.sub(r"(?i)((?:token|password|secret|api[_-]?key|authorization)[\s:=]+)(?:bearer\s+)?[^\s,;]+",
+                      r"\1[REDACTED]", text)
+
+    if isinstance(invocation, (list, tuple)):
+        invocation = list(invocation)
+        for index in range(1, len(invocation)):
+            if re.fullmatch(r"--?(?:token|password|secret|api[-_]key|authorization)", str(invocation[index - 1]), re.I):
+                invocation[index] = "[REDACTED]"
+    return {
+        "command": clean(invocation), "target": clean(target),
+        "returncode": getattr(result, "returncode", None),
+        "stdout": clean(getattr(result, "stdout", None) or "[no stdout]"),
+        "stderr": clean(getattr(result, "stderr", None) or "[no stderr]"),
+        **({"error": clean(str(result))} if isinstance(result, BaseException) else {}),
+    }
+
+
+@contextmanager
+def hold_write_attempt(path: pathlib.Path, *, confirm_previous_commands_stopped: bool = False):
+    """Release a finished attempt even on failure; preserve unknown command stops.
+
+    Nested Python workflows share the same in-memory command observation. This
+    observes their existing waits, without discovering or supervising processes.
+    Only the outer owner records a clean end before the native lock is released.
+    """
+    completion = _COMMAND_COMPLETION.get() or _CommandCompletion()
+    canonical = pathlib.Path(path).absolute()
+    canonical = canonical.parent.resolve() / canonical.name
+    nested = canonical in _contexts()
+    with hold_write_lock(
+        path, confirm_previous_commands_stopped=confirm_previous_commands_stopped,
+        commands_running=None if nested else completion.unfinished,
+    ) as owned:
+        token = _COMMAND_COMPLETION.set(completion)
+        operation_error = None
+        try:
+            yield owned
+        except BaseException as exc:
+            operation_error = exc
+            if getattr(exc, "local_commands_stopped", None) is False:
+                completion.uncertain = True
+            raise
+        finally:
+            try:
+                if owned.outermost and not completion.unfinished():
+                    owned.complete(commands_stopped=True)
+            except BaseException as cleanup_error:
+                if operation_error is None:
+                    raise
+                attach_cleanup_failure(operation_error, cleanup_error)
+            finally:
+                _COMMAND_COMPLETION.reset(token)
 
 
 class WriteLockError(RuntimeError):
@@ -116,21 +258,8 @@ def hold_release_source(repo_root: pathlib.Path) -> Iterator[WriteLockContext | 
         if branch.stdout.strip() != "release/local":
             yield None
             return
-    with hold_write_lock(path) as owned:
-        error = None
-        try:
-            yield owned
-        except BaseException as exc:
-            error = exc
-            raise
-        finally:
-            if owned.outermost and getattr(error, "local_commands_stopped", None) is not False:
-                try:
-                    owned.complete(commands_stopped=True)
-                except BaseException as cleanup_error:
-                    if error is None:
-                        raise
-                    attach_cleanup_failure(error, cleanup_error)
+    with hold_write_attempt(path) as owned:
+        yield owned
 
 
 def _contexts() -> dict[pathlib.Path, WriteLockContext]:

@@ -43,11 +43,11 @@ from ceratops_repo_compatibility_engine.sdlc_contract_validation import (
 from complete_artifact_builds import CompletedArtifactVersion, PreparedBuildReceipt
 from github_pr_workflow.command import (
     failure_excerpt,
+    release_lock_module,
     remove_resolved_failures,
     report_failure,
     report_phase,
     run_progress_command,
-    track_command_completion,
 )
 from sdlc_results import StepResultError, capture_step_result
 from store_artifacts import (
@@ -747,7 +747,7 @@ def execute_prepared_operation(
                 if check_plan is not None:
                     environment[reuse_operation_checks.CONTEXT_ENV] = json.dumps(check_plan.context)
                 process_options["env"] = environment
-            with track_command_completion():
+            with release_lock_module().track_command_completion():
                 result = run_progress_command(argv, cwd=step.cwd, **process_options)
             code, stdout, stderr = result.returncode, result.stdout, result.stderr
         except OSError as exc:

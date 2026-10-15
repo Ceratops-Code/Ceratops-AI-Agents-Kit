@@ -136,7 +136,7 @@ def _run(
     input_text: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     if input_text is not None:
-        raw = subprocess.run(
+        raw = _release_lock_module().run_protected_command(
             list(arguments),
             cwd=cwd,
             input=input_text.encode("utf-8"),
@@ -149,7 +149,7 @@ def _run(
             raw.stdout.decode("utf-8", errors="replace"),
             raw.stderr.decode("utf-8", errors="replace"),
         )
-    return subprocess.run(
+    return _release_lock_module().run_protected_command(
         list(arguments),
         cwd=cwd,
         capture_output=True,
@@ -167,8 +167,8 @@ def _checked(
 ) -> str:
     result = _run(arguments, cwd=cwd, input_text=input_text)
     if result.returncode:
-        detail = (result.stderr or result.stdout).strip()
-        raise FastChangeError(f"{failure}: {detail}" if detail else failure)
+        detail = _release_lock_module().command_failure_details(result, target=cwd)
+        raise FastChangeError(f"{failure}: {json.dumps(detail)}")
     return result.stdout.strip()
 
 
@@ -330,7 +330,7 @@ def _edit_specs(value: object) -> tuple[EditSpec, ...]:
 def _indexed_text(repo_root: pathlib.Path, path: str) -> str:
     """Read one exact indexed UTF-8 blob without mutating the clean worktree."""
 
-    result = subprocess.run(
+    result = _release_lock_module().run_protected_command(
         ["git", "-C", str(repo_root), "show", f":{path}"],
         cwd=repo_root,
         capture_output=True,
@@ -735,17 +735,22 @@ def _reverse_patch(spec: ChangeSpec, *, staged: bool) -> None:
     )
 
 
-@contextmanager
-def _release_write_context(repo_root, *, confirm_stopped=False):
-    """Use the mapped shared lock, never reach into another installed skill."""
+def _release_lock_module():
+    """Resolve the same lock owner for workflow exits and command launches."""
     skill = pathlib.Path(__file__).resolve().parent.parent
     if not (skill / ".runtime-manifest.json").is_file():
         source = str(skill.parent / "sections" / "scripts")
         if source not in sys.path:
             sys.path.insert(0, source)
-    locks = importlib.import_module("hold_write_lock")
+    return importlib.import_module("hold_write_lock")
+
+
+@contextmanager
+def _release_write_context(repo_root, *, confirm_stopped=False):
+    """Use the shared stopped-command exit rule for success and failure."""
+    locks = _release_lock_module()
     try:
-        with locks.hold_write_lock(
+        with locks.hold_write_attempt(
             locks.release_lock_path(repo_root),
             confirm_previous_commands_stopped=confirm_stopped,
         ) as owned:
@@ -756,11 +761,8 @@ def _release_write_context(repo_root, *, confirm_stopped=False):
 
 def execute(spec: ChangeSpec) -> dict[str, object]:
     """Protect direct callers as well as the full command's nested invocation."""
-    with _release_write_context(spec.repo_root) as owned:
-        result = _execute(spec)
-        if owned.outermost:
-            owned.complete(commands_stopped=True)
-        return result
+    with _release_write_context(spec.repo_root):
+        return _execute(spec)
 
 
 def _execute(spec: ChangeSpec) -> dict[str, object]:
@@ -855,6 +857,13 @@ def _execute(spec: ChangeSpec) -> dict[str, object]:
             "skills": list(spec.selected_skills),
         }
     except (FastChangeError, OSError, subprocess.SubprocessError) as exc:
+        if not _release_lock_module().local_commands_stopped():
+            # Reversing files while an interrupted launcher may still have a
+            # writer alive can race that writer. Preserve the request and flag.
+            raise FastChangeError(json.dumps({
+                "phase": phase, "reason": getattr(exc, "command_failure", str(exc)),
+                "compensation": ["not_attempted_while_commands_may_be_running"],
+            }, separators=(",", ":"))) from exc
         if committed:
             raise FastChangeError(
                 json.dumps(
@@ -961,10 +970,8 @@ def main(argv: list[str] | None = None) -> int:
         _request_scope(request_path, repo_root)
         with _release_write_context(
             repo_root, confirm_stopped=args.confirm_previous_commands_stopped,
-        ) as owned:
+        ):
             code, result = _run_request(request_path, repo_root)
-            if code == 0 or code == 2:
-                owned.complete(commands_stopped=True)
     except DecisionRequired as exc:
         code, result = 2, _rejected_request(request_path, exc)
     except (FastChangeError, OSError, ValueError) as exc:

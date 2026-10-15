@@ -686,7 +686,7 @@ def test_runtime_pruning_preserves_every_live_version_class(
         interpreter_name = "runtime_interpreter_path"
         process_probe = "running_process_paths"
     else:
-        runtime = load_runtime_builder()
+        runtime = vars(load_runtime_builder()["python_environments"])
         interpreter_name = "_runtime_interpreter_path"
         process_probe = "_running_process_paths"
 

@@ -539,7 +539,7 @@ def _promote(
                         for name in args.run_operation
                     ],
                     args.sdlc_contract,
-                    context="ci",
+                    context="skill",
                 )
             validation_code, validation = run_command_for_json(
                 _validation_command(args, repo_root, target_commit),
@@ -640,7 +640,6 @@ def _deploy_completed_promotion(
     validation = accepted.source_checks
     validation_handoffs = accepted.result.get("validation_handoffs", [])
     timings = {} if timings is None else timings
-    handoffs: list[dict[str, str]] = []
     with _timed_phase(timings, "deployment", diagnostic_output=getattr(args, "diagnostic_output", None)):
         try:
             require_clean_commit(repo_root, target_commit)
@@ -666,35 +665,13 @@ def _deploy_completed_promotion(
             },
         )
     for operation_result in operations.get("results", []):
-        if operation_result.get("status") == "deferred_handoff":
-            declaration = operation_result.get("handoff")
-            if not isinstance(declaration, dict):
-                raise PromotionError("Deferred deployment handoff is malformed.")
-            lifecycle = declaration.get("lifecycle")
-            action = declaration.get("action")
-            inputs = declaration.get("inputs", {})
-            if (
-                not isinstance(lifecycle, str)
-                or not lifecycle
-                or not isinstance(action, str)
-                or not action
-                or not isinstance(inputs, dict)
-            ):
-                raise PromotionError("Deferred deployment handoff is malformed.")
-            operation_result.update(
-                status="completed",
-                handoff=f"{lifecycle}/{action}",
-                handoff_inputs=dict(inputs),
-            )
-        if operation_result.get("handoff") and not operation_result.get(
-            "handoff_completed"
+        if operation_result.get("status") not in {"completed", "no_op"} or (
+            operation_result.get("handoff") and not operation_result.get("handoff_completed")
         ):
-            handoffs.append(
-                {
-                    "operation": operation_result["operation"],
-                    "handoff": operation_result["handoff"],
-                }
-            )
+            raise PromotionError("Deployment operation did not complete.", {
+                **operations, "phase": "deployment", "promotion": dict(accepted.result),
+                "remote_mutation": False,
+            })
     operations["completed_operations"] = [
         operation_result["operation"]
         for operation_result in operations.get("results", [])
@@ -710,8 +687,6 @@ def _deploy_completed_promotion(
             "remote_mutation": False,
         }) from exc
     result = {**accepted.result, "operations": operations}
-    if handoffs:
-        result["handoffs"] = handoffs
     return result
 
 

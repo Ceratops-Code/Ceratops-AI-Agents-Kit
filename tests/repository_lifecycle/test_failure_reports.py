@@ -809,13 +809,13 @@ def test_success_cleanup_retains_report_until_commands_are_known_stopped(report_
     repo, path = report_repo
     save(repo, path, {"tests.unit:1": "needed while commands may run"})
     original = path.read_bytes()
-    token = command._COMMAND_COMPLETION.set(command._CommandCompletion(active=active, uncertain=uncertain))
+    token = command.release_lock_module()._COMMAND_COMPLETION.set(command.release_lock_module()._CommandCompletion(active=active, uncertain=uncertain))
     result = {"status": "completed", "operation": "tests.unit", "steps": [1]}
     try:
         runner.remove_operation_failures(result, diagnostic_output=path, diagnostic_owner=(repo, "promote"))
         assert path.read_bytes() == original
     finally:
-        command._COMMAND_COMPLETION.reset(token)
+        command.release_lock_module()._COMMAND_COMPLETION.reset(token)
     runner.remove_operation_failures(result, diagnostic_output=path, diagnostic_owner=(repo, "promote"))
     assert not path.exists()
 

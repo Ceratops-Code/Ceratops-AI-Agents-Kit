@@ -152,7 +152,7 @@ def default_install_root() -> pathlib.Path:
 def _git(
     repo_root: pathlib.Path, *arguments: str, text: bool = True
 ) -> subprocess.CompletedProcess[Any]:
-    result = subprocess.run(
+    result = source_locks.run_protected_command(
         ["git", "-C", str(repo_root), *arguments],
         capture_output=True,
         text=text,
@@ -175,7 +175,7 @@ def _git_text(repo_root: pathlib.Path, *arguments: str) -> str:
 def _git_file(
     repo_root: pathlib.Path, revision: str, path: str
 ) -> str | None:
-    result = subprocess.run(
+    result = source_locks.run_protected_command(
         ["git", "-C", str(repo_root), "show", f"{revision}:{path}"],
         capture_output=True,
         text=True,
@@ -183,7 +183,7 @@ def _git_file(
     )
     if result.returncode == 0:
         return result.stdout
-    existence = subprocess.run(
+    existence = source_locks.run_protected_command(
         ["git", "-C", str(repo_root), "cat-file", "-e", f"{revision}:{path}"],
         capture_output=True,
         text=True,
@@ -665,7 +665,7 @@ def _source_commit(repo_root: pathlib.Path) -> str | None:
     Ordinary uncommitted installations remain supported, but their receipts
     cannot finalize a promotion. No installed-content scan is needed.
     """
-    result = subprocess.run(["git", "-C", str(repo_root), "rev-parse", "--show-toplevel"],
+    result = source_locks.run_protected_command(["git", "-C", str(repo_root), "rev-parse", "--show-toplevel"],
                             capture_output=True, text=True, check=False)
     if result.returncode == 128:
         return None
@@ -984,16 +984,15 @@ def _check_deployment_sources(repo_root: pathlib.Path, affected: AffectedSet) ->
         raise InstallerError("source checker is unavailable in the selected lifecycle bundle",
                              phase="source_check", details={"command": command})
     try:
-        result = subprocess.run(command, cwd=repo_root, capture_output=True, text=True,
+        result = source_locks.run_protected_command(command, cwd=repo_root, capture_output=True, text=True,
                                 encoding="utf-8", errors="replace", check=False,
                                 env={**os.environ, "PYTHONIOENCODING": "utf-8"})
     except OSError as exc:
         raise InstallerError(str(exc), phase="source_check",
-                             details={"command": command, "returncode": None, "stdout": "", "stderr": str(exc)}) from exc
+                             details=source_locks.command_failure_details(exc, target=repo_root, command=command)) from exc
     if result.returncode:
         raise InstallerError(f"source check failed with exit code {result.returncode}", phase="source_check",
-                             details={"command": command, "returncode": result.returncode,
-                                      "stdout": result.stdout, "stderr": result.stderr})
+                             details=source_locks.command_failure_details(result, target=repo_root))
 
 
 def deploy_managed_skills(args: DeployOptions) -> dict[str, Any] | str:
@@ -1088,7 +1087,7 @@ def deploy_managed_skills(args: DeployOptions) -> dict[str, Any] | str:
                              for argument in ("--deployment-evidence", path)]]
                 receipt_input = json.dumps(receipt)
                 try:
-                    finalized = subprocess.run(command, input=receipt_input, cwd=repo_root,
+                    finalized = source_locks.run_protected_command(command, input=receipt_input, cwd=repo_root,
                                                capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
                                                env={**os.environ, "PYTHONIOENCODING": "utf-8"})
                     cleanup: dict[str, Any] = {"status": "completed" if finalized.returncode == 0 else "failed",
