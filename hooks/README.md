@@ -229,26 +229,9 @@ this source does not change an already installed helper.
 
 ## Decision Model
 
-The command runner and native probes share
-`command-probe.py::worktree_command_environment()`. Before starting a command,
-it derives `<repo-parent>/tmp/<repo-name>/<worktree-folder-name>` from Git and
-supplies `CERATOPS_TASK_TEMP_ROOT`, `TEMP`, `TMP`, and `TMPDIR` to the child.
-A child executing in the primary checkout retains its inherited task directory;
-starting in another worktree selects that worktree's directory. Commands with
-neither a Git checkout nor an originating worktree keep their existing
-environment. No generated machine path is written to tracked configuration.
-
-The initializer owns one directory container per registered worktree, creates
-it when first needed, and reuses it after interruption. Commands own their
-scratch and report contents and their cleanup. Worktree retirement remains
-owned by the existing task cleanup workflow; initialization never sweeps other
-worktrees' output. Shell execution and native probes both receive the same
-environment, including simple commands routed by the hook.
-
-The hook passes the session's original checkout path through its internal
-`--task-worktree` argument. That context survives a command starting in the
-primary checkout. An explicit command directory in another linked worktree
-selects that worktree; a non-repository chat falls back to the command directory.
+Native command roots are configured by the standalone skills installer and
+supplied by Codex through `shell_environment_policy.set`. This preflight does
+not initialize temporary directories or change command environment settings.
 
 Hook mode first recognizes only closed, static read-only probe forms. It routes
 standalone `rg`, exact Git ref and ancestor probes, and exact

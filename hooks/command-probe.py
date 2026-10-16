@@ -15,8 +15,6 @@ import base64
 import binascii
 import json
 import ntpath
-import os
-import pathlib
 import subprocess
 from collections.abc import Mapping, Sequence
 
@@ -27,85 +25,6 @@ MAX_ERROR_DETAIL = 1_000
 
 class ProbeError(RuntimeError):
     """One invalid request or unavailable probe executable."""
-
-
-def _environment_git(arguments: Sequence[str], cwd: str | None) -> str | None:
-    """Read current Git context and preserve operational failure evidence."""
-    argv = ["git", *arguments]
-    try:
-        completed = subprocess.run(
-            argv, cwd=cwd, capture_output=True, text=True,
-            encoding="utf-8", errors="replace", check=False,
-        )
-    except OSError as exc:
-        raise ProbeError(
-            f"worktree_environment: command={argv!r}, target={cwd!r}, "
-            f"exit_code=<unavailable>, stdout=<absent>, stderr=<absent>, error={exc}"
-        ) from exc
-    if completed.returncode:
-        if "not a git repository" in completed.stderr.casefold():
-            return None
-        raise ProbeError(
-            f"worktree_environment: command={argv!r}, target={cwd!r}, "
-            f"exit_code={completed.returncode}, "
-            f"stdout={completed.stdout or '<absent>'!r}, "
-            f"stderr={completed.stderr or '<absent>'!r}"
-        )
-    return completed.stdout
-
-
-def _environment_worktree(cwd: str | None) -> tuple[pathlib.Path, pathlib.Path] | None:
-    context = _environment_git(
-        ["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir"], cwd,
-    )
-    if context is None:
-        return None
-    paths = context.splitlines()
-    if len(paths) != 2:
-        raise ProbeError("worktree_environment: Git returned incomplete checkout paths.")
-    return pathlib.Path(paths[0]).resolve(strict=True), pathlib.Path(paths[1]).resolve(strict=True)
-
-
-def worktree_command_environment(
-    cwd: str | None = None, environment: Mapping[str, str] | None = None,
-    task_worktree: str | None = None,
-) -> dict[str, str]:
-    """Supply one derived task directory to shell commands and native probes.
-
-    The task directory is a container owned by its registered worktree. Child
-    producers retain ownership of their scratch and reports; this function
-    never deletes their output or another worktree's directory. A primary-
-    checkout child retains its inherited task, while a command started in a
-    different worktree receives that worktree's directory.
-    """
-    selected = dict(os.environ if environment is None else environment)
-    context = _environment_worktree(cwd)
-    if task_worktree and (context is None or context[0] == context[1].parent):
-        origin = _environment_worktree(task_worktree)
-        if origin is not None and (context is None or origin[1] == context[1]):
-            context = origin
-    if context is None:
-        return selected
-    worktree, common = context
-    parent = common.parent.parent / "tmp" / common.parent.name
-    inherited = selected.get("CERATOPS_TASK_TEMP_ROOT")
-    task_root = parent / worktree.name
-    if inherited and worktree == common.parent:
-        inherited_root = pathlib.Path(inherited)
-        if inherited_root.is_absolute() and inherited_root.parent == parent:
-            task_root = inherited_root
-    if (not task_root.is_absolute() or task_root.parent != parent
-            or task_root.resolve() != task_root):
-        raise ProbeError(f"CERATOPS_TASK_TEMP_ROOT must name one task directory inside {parent}.")
-    registered = _environment_git(["worktree", "list", "--porcelain", "-z"], str(worktree))
-    owners = [field for field in (registered or "").split("\0")
-              if field.startswith("worktree ") and pathlib.Path(field[9:]).name == task_root.name]
-    if len(owners) != 1 or not pathlib.Path(owners[0][9:]).is_dir():
-        raise ProbeError("CERATOPS_TASK_TEMP_ROOT must identify exactly one registered worktree.")
-    task_root.mkdir(parents=True, exist_ok=True)
-    for name in ("CERATOPS_TASK_TEMP_ROOT", "TEMP", "TMP", "TMPDIR"):
-        selected[name] = str(task_root)
-    return selected
 
 
 def _closed_fields(value: Mapping[str, object], allowed: set[str]) -> None:
@@ -203,8 +122,7 @@ def decode_request(encoded: str) -> dict[str, object]:
 
 
 def _run(
-    argv: Sequence[str], *, input_text: str | None = None,
-    environment: Mapping[str, str] | None = None,
+    argv: Sequence[str], *, input_text: str | None = None
 ) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(
@@ -215,7 +133,6 @@ def _run(
             encoding="utf-8",
             errors="replace",
             check=False,
-            **({"env": dict(environment)} if environment is not None else {}),
         )
     except FileNotFoundError as exc:
         raise ProbeError(f"probe executable is unavailable: {argv[0]}") from exc
@@ -263,24 +180,21 @@ def _failure(
     return payload, completed.returncode if 1 <= completed.returncode <= 255 else 2
 
 
-def execute_request(
-    request: Mapping[str, object], *, environment: Mapping[str, str] | None = None,
-) -> tuple[dict[str, object], int]:
+def execute_request(request: Mapping[str, object]) -> tuple[dict[str, object], int]:
     """Execute one validated probe request without shell interpretation."""
 
     validated = validate_request(request)
-    options = {"environment": environment} if environment is not None else {}
     mode = str(validated["mode"])
     if mode == "tracked-search":
-        producer = _run(validated["producer_argv"], **options)
+        producer = _run(validated["producer_argv"])
         if producer.returncode:
             return _failure(mode, producer)
-        completed = _run(validated["search_argv"], input_text=producer.stdout, **options)
+        completed = _run(validated["search_argv"], input_text=producer.stdout)
         if completed.returncode in {0, 1}:
             return _success(mode, "matched", completed.returncode == 0, completed)
         return _failure(mode, completed)
 
-    completed = _run(validated["argv"], **options)
+    completed = _run(validated["argv"])
     if completed.returncode not in {0, 1}:
         return _failure(mode, completed)
     predicate = {
@@ -294,13 +208,11 @@ def execute_request(
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--encoded-request", required=True)
-    parser.add_argument("--task-worktree", help="Original task directory supplied by the hook.")
     args = parser.parse_args(argv)
     try:
         request = decode_request(args.encoded_request)
-        environment = worktree_command_environment(task_worktree=args.task_worktree)
-        payload, returncode = execute_request(request, environment=environment)
-    except (ProbeError, OSError, ValueError) as exc:
+        payload, returncode = execute_request(request)
+    except ProbeError as exc:
         payload = {
             "schema": RESULT_SCHEMA,
             "ok": False,

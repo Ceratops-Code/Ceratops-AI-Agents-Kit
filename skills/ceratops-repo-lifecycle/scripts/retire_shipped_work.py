@@ -7,7 +7,8 @@ The cleanup owner keeps one unfinished JSON record per exact path/ref below
 ``<git-common-dir>/codex/repository-lifecycle/shipped-cleanup``. Records disappear
 after removal; a reusable native lock serializes this owner's cleanup calls.
 After worktree removal, the same record owns matching task directories under
-``<repo-parent>/tmp/<repo-name>`` until temporary data and refs are both retired.
+``<CERATOPS_TASK_TEMP_ROOT>/<repo-name>`` until temporary data and refs are both
+retired; the default base is ``<projects-root>/tmp``.
 No remote refs, accepted artifacts, installations or unrelated temp files change.
 """
 
@@ -576,7 +577,7 @@ def _finish_record(
         ):
             raise CleanupError("Recorded worktree is locked or dirty.")
         _paths["_validate_worktree_path"](path, root, allow_inaccessible=False)
-    task_temp_root = repo.parent / "tmp" / repo.name
+    task_temp_root = _paths["project_task_temp_root"](repo)
     if path is not None and task_temp_root != task_temp_root.resolve():
         raise CleanupError("Task-temp root is redirected.")
     if item["branch"]:

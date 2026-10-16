@@ -94,12 +94,16 @@ def test_non_windows_environment_keeps_git_and_explicit_pytest_options(
         "GIT_CONFIG_COUNT": "untouched",
         "GIT_TEMPLATE_DIR": "custom-template",
         "UNRELATED": "preserved",
+        "CERATOPS_PROJECTS_ROOT": str(tmp_path / "projects"),
+        "CERATOPS_TASK_TEMP_ROOT": str(tmp_path / "tmp"),
     }
     with test_runner_module.pytest_environment.isolated_environment(
         tmp_path,
         environ=caller,
         windows=False,
     ) as child:
+        assert "CERATOPS_PROJECTS_ROOT" not in child
+        assert "CERATOPS_TASK_TEMP_ROOT" not in child
         for key in (
             "GIT_CONFIG_COUNT",
             "GIT_TEMPLATE_DIR",

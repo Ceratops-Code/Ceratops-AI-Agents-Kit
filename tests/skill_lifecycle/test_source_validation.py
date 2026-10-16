@@ -8,10 +8,13 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tomllib
 
 import pytest
 
 from tests.skill_lifecycle.support import (
+    BOOTSTRAP,
+    INSTALLER_TEMPLATE,
     LIVE_SECTION_MANIFEST,
     SECTION_MANIFEST_TEMPLATE,
     VALIDATOR,
@@ -22,6 +25,7 @@ from tests.skill_lifecycle.support import (
 from tests.support.repositories import (
     ROOT,
     create_compatible_repo,
+    run_git,
 )
 
 CONSISTENCY_REVIEW_PACKET = (
@@ -33,12 +37,23 @@ CONSISTENCY_REVIEW_PACKET = (
 )
 
 
+def write_profile_roots(installed: pathlib.Path) -> pathlib.Path:
+    config = installed.parent.parent / "config.toml"
+    values = {"CERATOPS_PROJECTS_ROOT": str(config.parent / "projects"),
+              "CERATOPS_TASK_TEMP_ROOT": str(config.parent / "tmp")}
+    config.write_text("[shell_environment_policy.set]\n" + "".join(
+        name + " = " + json.dumps(value) + "\n" for name, value in values.items()
+    ), encoding="utf-8")
+    return config
+
+
 def test_consistency_review_packet_resolves_one_installed_skill(
     tmp_path: pathlib.Path,
 ) -> None:
     skill = "ceratops-task-lifecycle"
     installed = tmp_path / "installed" / skill
     installed.mkdir(parents=True)
+    write_profile_roots(installed)
     source_manifest = json.loads(
         (ROOT / "skills" / "skill-sections.json").read_text(encoding="utf-8")
     )
@@ -97,6 +112,7 @@ def test_consistency_review_packet_resolves_one_installed_skill(
     assert "scripts/collect-worktree-status.py" in packet["surfaces"]["helpers"]
     assert packet["surfaces"]["automation_consumers"] == [str(consumer.resolve())]
     assert packet["blockers"] == []
+    assert packet["codex_configuration"]["status"] == "passed"
 
 
 def test_consistency_review_packet_uses_tracked_helpers_and_repo_resources(
@@ -138,6 +154,7 @@ def test_consistency_review_packet_uses_tracked_helpers_and_repo_resources(
     (cache / "helper.pyc").write_bytes(b"generated-cache")
     installed = tmp_path / "installed" / skill
     installed.mkdir(parents=True)
+    write_profile_roots(installed)
     (installed / ".runtime-manifest.json").write_text(
         json.dumps(
             {
@@ -181,6 +198,226 @@ def test_consistency_review_packet_uses_tracked_helpers_and_repo_resources(
         "skills/beta-tool/references/contracts/shared.json"
     ]
     assert packet["blockers"] == []
+
+
+@pytest.mark.parametrize("renderer", [BOOTSTRAP, INSTALLER_TEMPLATE], ids=["repository", "compatible"])
+def test_bootstrap_native_roots_preserve_profile_and_repeat(tmp_path, renderer):
+    repo = tmp_path / "source"
+    create_compatible_repo(repo, "test-source", ["alpha-tool"])
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    config = profile / "config.toml"
+    chosen = tmp_path / "chosen projects"
+    original = (
+        "# retained comment\r\n[features]\r\nhooks = false\r\n"
+        "[shell_environment_policy.set]\r\nUNRELATED = 'kept'\r\n"
+        "CERATOPS_PROJECTS_ROOT = " + json.dumps(str(chosen)) + " # custom root\r\n"
+    ).encode()
+    config.write_bytes(original)
+    abandoned = profile / "skills" / (".ceratops-bootstrap-stage-" + "a" * 32)
+    abandoned.mkdir(parents=True)
+    (abandoned / "old-output").write_text("orphan", encoding="utf-8")
+    retained = profile / "skills" / ".retained.txt"
+    retained.write_text("user data", encoding="utf-8")
+    argv = [sys.executable, str(renderer), "--repo-root", str(repo),
+            "--install-root", str(profile / "skills")]
+    for _ in range(2):
+        result = subprocess.run(argv, capture_output=True, text=True, check=False)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "OK"
+        if _ == 0:
+            first = config.read_bytes()
+            timestamp = config.stat().st_mtime_ns
+        else:
+            assert config.read_bytes() == first and config.stat().st_mtime_ns == timestamp
+    document = tomllib.loads(config.read_text())
+    assert document["features"] == {"hooks": False}
+    settings = document["shell_environment_policy"]["set"]
+    assert settings == {"UNRELATED": "kept", "CERATOPS_PROJECTS_ROOT": str(chosen),
+                        "CERATOPS_TASK_TEMP_ROOT": str(chosen / "tmp")}
+    assert b"# retained comment\r\n" in first and b"# custom root\r\n" in first
+    assert first.count(b"\r\n") == first.count(b"\n")
+    assert not chosen.exists() and not (profile / "hooks.json").exists()
+    assert not abandoned.exists() and retained.read_text() == "user data"
+    audit = runpy.run_path(str(CONSISTENCY_REVIEW_PACKET))
+    blockers: list[str] = []
+    evidence = audit["configured_root_settings"](profile / "skills" / "alpha-tool", blockers)
+    assert evidence["status"] == "passed" and blockers == []
+
+
+@pytest.mark.parametrize("renderer", [BOOTSTRAP, INSTALLER_TEMPLATE], ids=["repository", "compatible"])
+@pytest.mark.parametrize("invalid", ["malformed", "scalar", "relative", "empty", "overlap"])
+def test_bootstrap_bad_native_roots_stop_before_installation(tmp_path, renderer, invalid):
+    repo = tmp_path / "source"
+    create_compatible_repo(repo, "test-source", ["alpha-tool"])
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    config = profile / "config.toml"
+    content = {
+        "malformed": "[broken",
+        "scalar": "shell_environment_policy = 1\n",
+        "relative": '[shell_environment_policy.set]\nCERATOPS_PROJECTS_ROOT = "relative"\n',
+        "empty": '[shell_environment_policy.set]\nCERATOPS_TASK_TEMP_ROOT = ""\n',
+        "overlap": "[shell_environment_policy.set]\nCERATOPS_TASK_TEMP_ROOT = "
+                   + json.dumps(str(repo.parent)) + "\n",
+    }[invalid].encode()
+    config.write_bytes(content)
+    result = subprocess.run([
+        sys.executable, str(renderer), "--repo-root", str(repo),
+        "--install-root", str(profile / "skills"),
+    ], capture_output=True, text=True, check=False)
+    assert result.returncode == 1 and str(config) in result.stderr
+    assert config.read_bytes() == content and not (profile / "skills").exists()
+
+
+@pytest.mark.parametrize("renderer", [BOOTSTRAP, INSTALLER_TEMPLATE], ids=["repository", "compatible"])
+def test_bootstrap_native_roots_use_primary_checkout_and_explicit_environment(tmp_path, renderer, monkeypatch):
+    repo = tmp_path / "source"
+    create_compatible_repo(repo, "test-source", ["alpha-tool"])
+    for arguments in (("init", "-b", "main"), ("config", "user.email", "tests@example.invalid"),
+                      ("config", "user.name", "Root tests"), ("add", "."),
+                      ("commit", "--allow-empty", "-m", "fixture")):
+        assert run_git(repo, *arguments).returncode == 0
+    linked = tmp_path / "worktrees" / repo.name / "task"
+    assert run_git(repo, "worktree", "add", "-b", "task", str(linked)).returncode == 0
+    installer = runpy.run_path(str(renderer))
+    destination = tmp_path / "profile" / "skills"
+    plan = installer["prepare_codex_root_settings"](linked, destination)
+    defaults = tomllib.loads(plan[2].decode())["shell_environment_policy"]["set"]
+    assert defaults == {"CERATOPS_PROJECTS_ROOT": str(repo.parent),
+                        "CERATOPS_TASK_TEMP_ROOT": str(repo.parent / "tmp")}
+    monkeypatch.setenv("CERATOPS_PROJECTS_ROOT", str(tmp_path / "ci projects"))
+    monkeypatch.setenv("CERATOPS_TASK_TEMP_ROOT", str(tmp_path / "runner temporary"))
+    plan = installer["prepare_codex_root_settings"](linked, destination)
+    explicit = tomllib.loads(plan[2].decode())["shell_environment_policy"]["set"]
+    assert explicit["CERATOPS_PROJECTS_ROOT"] == str(tmp_path / "ci projects")
+    assert explicit["CERATOPS_TASK_TEMP_ROOT"] == str(tmp_path / "runner temporary")
+    assert not destination.parent.exists()
+
+
+@pytest.mark.parametrize("renderer", [BOOTSTRAP, INSTALLER_TEMPLATE], ids=["repository", "compatible"])
+@pytest.mark.parametrize("effect", ["copytree", "write_bytes", "replace"])
+@pytest.mark.parametrize("after", [False, True])
+def test_bootstrap_native_roots_repeat_after_interrupted_effect(tmp_path, monkeypatch, renderer, effect, after):
+    repo = tmp_path / "source"
+    create_compatible_repo(repo, "test-source", ["alpha-tool"])
+    profile = tmp_path / "profile"
+    destination = profile / "skills"
+    installer = runpy.run_path(str(renderer))
+    monkeypatch.setattr(sys, "argv", [str(renderer), "--repo-root", str(repo),
+                                    "--install-root", str(destination)])
+    owner = {"copytree": shutil, "write_bytes": pathlib.Path, "replace": os}[effect]
+    original = getattr(owner, effect)
+
+    def interrupted(*args, **kwargs):
+        target = pathlib.Path(args[1] if effect in {"copytree", "replace"} else args[0])
+        selected = target == destination / "alpha-tool" if effect == "copytree" else (
+            target == profile / "config.toml" if effect == "replace" else target.name == "_config.toml"
+        )
+        if not selected:
+            return original(*args, **kwargs)
+        if after:
+            original(*args, **kwargs)
+        raise KeyboardInterrupt("bootstrap effect interrupted")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(owner, effect, interrupted)
+        with pytest.raises(KeyboardInterrupt):
+            installer["main"]()
+    for _ in range(2):
+        assert installer["main"]() == 0
+    roots = tomllib.loads((profile / "config.toml").read_text())["shell_environment_policy"]["set"]
+    assert roots["CERATOPS_PROJECTS_ROOT"] == str(repo.parent)
+    assert roots["CERATOPS_TASK_TEMP_ROOT"] == str(repo.parent / "tmp")
+    assert not (destination / ".ceratops-bootstrap.lock").exists()
+    assert not list(destination.glob(".ceratops-bootstrap-stage-*"))
+
+
+@pytest.mark.parametrize("problem", ["missing-file", "malformed", "missing-key", "empty", "relative", "wrong-type"])
+def test_skills_audit_requires_roots_in_native_config_even_when_inherited(tmp_path, monkeypatch, problem):
+    installed = tmp_path / "skills" / "alpha-tool"
+    installed.mkdir(parents=True)
+    config = write_profile_roots(installed)
+    values: dict[str, object] = {"CERATOPS_PROJECTS_ROOT": str(tmp_path / "projects"),
+                                "CERATOPS_TASK_TEMP_ROOT": str(tmp_path / "tmp")}
+    for name, value in values.items():
+        monkeypatch.setenv(name, str(value))
+    if problem == "missing-file":
+        config.unlink()
+    elif problem == "malformed":
+        config.write_text("[broken", encoding="utf-8")
+    else:
+        if problem == "missing-key":
+            values.pop("CERATOPS_TASK_TEMP_ROOT")
+        else:
+            values["CERATOPS_TASK_TEMP_ROOT"] = {"empty": "", "relative": "tmp", "wrong-type": 42}[problem]
+        config.write_text("[shell_environment_policy.set]\n" + "".join(
+            name + " = " + json.dumps(value) + "\n" for name, value in values.items()
+        ), encoding="utf-8")
+    before = config.read_bytes() if config.exists() else None
+    audit = runpy.run_path(str(CONSISTENCY_REVIEW_PACKET))
+    blockers: list[str] = []
+    evidence = audit["configured_root_settings"](installed, blockers)
+    assert evidence["status"] == "failed" and blockers and str(config) in blockers[0]
+    assert (config.read_bytes() if config.exists() else None) == before
+
+
+@pytest.mark.parametrize("renderer", [BOOTSTRAP, INSTALLER_TEMPLATE], ids=["repository", "compatible"])
+def test_bootstrap_native_roots_preserve_concurrent_profile_changes(tmp_path, renderer, monkeypatch, capsys):
+    repo = tmp_path / "source"
+    create_compatible_repo(repo, "test-source", ["alpha-tool"])
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    config = profile / "config.toml"
+    config.write_text("[features]\nhooks = false\n", encoding="utf-8")
+    concurrent = "[features]\nhooks = true # concurrent Codex edit\n"
+    destination = profile / "skills"
+    installer = runpy.run_path(str(renderer))
+    monkeypatch.setattr(sys, "argv", [str(renderer), "--repo-root", str(repo),
+                                    "--install-root", str(destination)])
+    original = shutil.copytree
+
+    def concurrent_edit(source, target, *args, **kwargs):
+        result = original(source, target, *args, **kwargs)
+        if pathlib.Path(target) == destination / "alpha-tool":
+            config.write_text(concurrent, encoding="utf-8")
+        return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(shutil, "copytree", concurrent_edit)
+        assert installer["main"]() == 1
+    assert config.read_text() == concurrent
+    assert "changed during installation" in capsys.readouterr().err
+    assert installer["main"]() == 0
+    document = tomllib.loads(config.read_text())
+    assert document["features"]["hooks"] is True
+    assert document["shell_environment_policy"]["set"]["CERATOPS_PROJECTS_ROOT"] == str(repo.parent)
+
+
+@pytest.mark.parametrize("failure", ["exit", "spawn"])
+def test_bootstrap_native_root_failure_keeps_git_invocation_and_streams(tmp_path, monkeypatch, capsys, failure):
+    repo = tmp_path / "source"
+    create_compatible_repo(repo, "test-source", ["alpha-tool"])
+    destination = tmp_path / "profile" / "skills"
+    installer = runpy.run_path(str(BOOTSTRAP))
+    monkeypatch.setattr(sys, "argv", [str(BOOTSTRAP), "--repo-root", str(repo),
+                                    "--install-root", str(destination)])
+
+    def failed(argv, **kwargs):
+        if failure == "spawn":
+            raise OSError("Git spawn failed")
+        return subprocess.CompletedProcess(argv, 7, "captured-output", "captured-error")
+
+    monkeypatch.setattr(subprocess, "run", failed)
+    assert installer["main"]() == 1
+    error = capsys.readouterr().err
+    assert "Codex root settings" in error and str(destination.parent / "config.toml") in error
+    assert "command=['git'" in error and repr(str(repo)) in error
+    if failure == "exit":
+        assert "exit_code=7" in error and "captured-output" in error and "captured-error" in error
+    else:
+        assert "exit_code=<unavailable>" in error and "stdout=<absent>" in error and "stderr=<absent>" in error
+    assert not destination.parent.exists()
 
 
 @pytest.mark.parametrize(

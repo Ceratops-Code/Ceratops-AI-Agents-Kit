@@ -119,6 +119,10 @@ def isolated_environment(
     incomplete cleanup instead of silently claiming success.
     """
     child = dict(os.environ if environ is None else environ)
+    # Fixture repositories own their roots. Host/CI storage settings must not
+    # redirect fixture writes or cleanup into the caller's real directories.
+    for variable in ("CERATOPS_PROJECTS_ROOT", "CERATOPS_TASK_TEMP_ROOT"):
+        child.pop(variable, None)
     parent = pathlib.Path(child.get("PYTEST_DEBUG_TEMPROOT") or tempfile.gettempdir())
     parent = (cwd / parent).resolve()
     with tempfile.TemporaryDirectory(prefix="aas-", dir=parent) as directory:

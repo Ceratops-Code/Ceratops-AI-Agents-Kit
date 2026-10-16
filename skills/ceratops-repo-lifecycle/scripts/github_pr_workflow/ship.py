@@ -33,6 +33,7 @@ from . import (
 )
 from .command import (
     capture_failure_report,
+    project_task_temp_root,
     release_write_context,
     remove_resolved_failures,
     report_phase,
@@ -1019,7 +1020,7 @@ def _review_request_scope(
         resolved = expanded.resolve(strict=require_file)
     except OSError as exc:
         raise ShipError(f"Review replies request is unavailable: {exc}") from exc
-    canonical_path = repo_root.parent / "tmp" / repo_root.name
+    canonical_path = project_task_temp_root(repo_root)
     if canonical_path.is_symlink():
         raise ShipError("Canonical review-request root must not be a link.")
     canonical_root = canonical_path.resolve()

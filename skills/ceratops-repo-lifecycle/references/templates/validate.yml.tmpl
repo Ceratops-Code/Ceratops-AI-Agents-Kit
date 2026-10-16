@@ -15,6 +15,9 @@ jobs:
       # __SETUP_STEPS__
       - name: Validate and test through SDLC
         uses: __CI_ACTION__
+        env:
+          CERATOPS_PROJECTS_ROOT: ${{ github.workspace }}/..
+          CERATOPS_TASK_TEMP_ROOT: ${{ runner.temp }}
         with:
           repo-root: __CI_REPO_ROOT__
           evidence-file: __CI_EVIDENCE__

@@ -4,8 +4,9 @@
 This independent installer renders selected skills in a temporary staging
 directory, then copies them over existing installations. It runs no skill or
 repository validation and retains destination-only files and unselected skills.
-Only input parsing and path safety constrain copying. A copy failure can leave
-partial updates; this helper cleans only its own staging directory and lock.
+Native command root settings are prepared before runtime setup or skill copies.
+Their profile update is atomic and preserves unrelated settings. A copy failure
+can leave partial skill updates; this helper cleans its own staging and lock.
 """
 
 from __future__ import annotations
@@ -22,8 +23,11 @@ import subprocess
 import sys
 import tempfile
 import uuid
-from collections.abc import Mapping, Sequence
-from typing import cast
+from collections.abc import Mapping, MutableMapping, Sequence
+from typing import Any, cast
+
+import tomlkit
+from tomlkit.exceptions import ParseError
 
 INSTALLER_VERSION = 19
 MANIFEST_NAME = ".runtime-manifest.json"
@@ -883,6 +887,104 @@ def remove_legacy_skill_runtime(skill_root: pathlib.Path) -> None:
         project.rmdir()
 
 
+def prepare_codex_root_settings(
+    repo_root: pathlib.Path, install_root: pathlib.Path,
+) -> tuple[pathlib.Path, bytes | None, bytes]:
+    """Prepare missing native command settings without changing the profile.
+
+    The profile owns one current config.toml, with no backup history. Existing
+    absolute settings and unrelated TOML are retained. Git identifies the
+    primary checkout when this installer runs from a linked worktree; an
+    unpacked non-Git source uses its explicitly selected repository directory.
+    """
+    config = install_root.parent / "config.toml"
+    if (config.parent.exists() and unsafe_link(config.parent)) or (config.exists() and (
+        unsafe_link(config) or not config.is_file() or config.stat().st_nlink != 1
+    )) or config.is_symlink():
+        raise ValueError(f"Codex root settings require a regular config file: {config}")
+    try:
+        original = config.read_bytes() if config.exists() else None
+        document = tomlkit.parse(original.decode("utf-8-sig") if original is not None else "")
+    except (OSError, UnicodeError, ParseError) as exc:
+        raise ValueError(f"Codex root settings could not be read from {config}: {exc}") from exc
+    policy = cast(Any, document.setdefault("shell_environment_policy", tomlkit.table()))
+    if not isinstance(policy, MutableMapping):
+        raise ValueError(f"shell_environment_policy must be a table in {config}")
+    settings = cast(Any, policy.setdefault("set", tomlkit.table()))
+    if not isinstance(settings, MutableMapping):
+        raise ValueError(f"shell_environment_policy.set must be a table in {config}")
+    primary = repo_root
+    if shutil.which("git") is not None:
+        argv = ["git", "-C", str(repo_root), "worktree", "list", "--porcelain", "-z"]
+        try:
+            result = subprocess.run(
+                argv, capture_output=True, text=True, encoding="utf-8",
+                errors="replace", check=False,
+            )
+        except OSError as exc:
+            raise RuntimeError(
+                f"Codex root settings for {config}: command={argv!r}, exit_code=<unavailable>, "
+                f"stdout=<absent>, stderr=<absent>, error={exc}"
+            ) from exc
+        if result.returncode and "not a git repository" not in result.stderr.casefold():
+            raise RuntimeError(
+                f"Codex root settings for {config}: command={argv!r}, "
+                f"exit_code={result.returncode}, stdout={result.stdout or '<absent>'!r}, "
+                f"stderr={result.stderr or '<absent>'!r}"
+            )
+        if not result.returncode:
+            registered = [field[9:] for field in result.stdout.split("\0") if field.startswith("worktree ")]
+            if not registered:
+                raise RuntimeError(f"Codex root settings for {config}: Git returned no checkout.")
+            primary = pathlib.Path(registered[0]).resolve(strict=True)
+    elif (repo_root / ".git").exists():
+        raise RuntimeError(f"Codex root settings for {config}: Git is required for this checkout.")
+    changed = False
+    defaults = {"CERATOPS_PROJECTS_ROOT": str(primary.parent)}
+    for name in ("CERATOPS_PROJECTS_ROOT", "CERATOPS_TASK_TEMP_ROOT"):
+        if name == "CERATOPS_TASK_TEMP_ROOT":
+            defaults[name] = str(pathlib.Path(str(settings["CERATOPS_PROJECTS_ROOT"])) / "tmp")
+        value = settings.get(name, os.environ.get(name, defaults[name]))
+        if not isinstance(value, str) or not value.strip() or not pathlib.Path(value).is_absolute():
+            raise ValueError(f"Codex root setting {name} must be an absolute directory in {config}")
+        if name not in settings:
+            settings[name] = str(pathlib.Path(value).resolve())
+            changed = True
+    namespace = pathlib.Path(str(settings["CERATOPS_TASK_TEMP_ROOT"])) / primary.name
+    if namespace == primary or namespace in primary.parents or primary in namespace.parents:
+        raise ValueError(f"Codex temp root settings must not overlap the source checkout: {config}")
+    if not changed:
+        assert original is not None
+        return config, original, original
+    rendered = tomlkit.dumps(document)
+    if original is not None and b"\r\n" in original and original.count(b"\r\n") == original.count(b"\n"):
+        rendered = rendered.replace("\r\n", "\n").replace("\n", "\r\n")
+    encoded = rendered.encode("utf-8")
+    if original is not None and original.startswith(b"\xef\xbb\xbf"):
+        encoded = b"\xef\xbb\xbf" + encoded
+    return config, original, encoded
+
+
+def write_codex_root_settings(
+    staging: pathlib.Path, prepared: tuple[pathlib.Path, bytes | None, bytes],
+) -> None:
+    """Atomically publish this installer's two native command defaults.
+
+    The bootstrap lock protects staging. A profile change observed before
+    publication stops installation; other profile writers do not share this
+    lock. Ordinary stage cleanup owns temporary config bytes.
+    """
+    config, original, rendered = prepared
+    if original == rendered:
+        return
+    current = config.read_bytes() if config.exists() else None
+    if config.is_symlink() or (config.exists() and unsafe_link(config)) or current != original:
+        raise RuntimeError(f"Codex root settings changed during installation: {config}")
+    scratch = staging / "_config.toml"
+    scratch.write_bytes(rendered)
+    os.replace(scratch, config)
+
+
 def install_batch(
     repo_root: pathlib.Path,
     install_root: pathlib.Path,
@@ -890,10 +992,13 @@ def install_batch(
     manifest: Mapping[str, object],
     python_runtime: pathlib.Path | None,
     python_skills: set[str],
+    *,
+    root_settings: tuple[pathlib.Path, bytes | None, bytes] | None = None,
 ) -> None:
     """Render and overlay selected skills, preserving all destination-only data."""
 
     action_assignments(repo_root, manifest, set(skills) if skills else None)
+    root_settings = root_settings or prepare_codex_root_settings(repo_root, install_root)
     install_root.mkdir(parents=True, exist_ok=True)
     lock = install_root / LOCK_NAME
     staging = install_root / f".ceratops-bootstrap-stage-{uuid.uuid4().hex}"
@@ -901,6 +1006,10 @@ def install_batch(
     try:
         lock.mkdir()
         lock_created = True
+        # Under this exclusive lock, reserved old staging names cannot be live.
+        for abandoned in install_root.iterdir():
+            if STAGE_RE.fullmatch(abandoned.name):
+                remove_stage(abandoned, install_root)
         staging.mkdir()
         for skill in skills:
             build_skill(
@@ -916,6 +1025,7 @@ def install_batch(
         for skill in skills:
             shutil.copytree(staging / skill, install_root / skill, dirs_exist_ok=True)
             remove_legacy_skill_runtime(install_root / skill)
+        write_codex_root_settings(staging, root_settings)
         if python_runtime is not None:
             try:
                 prune_python_runtime_versions(install_root, python_runtime)
@@ -970,6 +1080,9 @@ def main() -> int:
         manifest = read_manifest(repo_root)
         skills = declared_skills(manifest, args.skill)
         action_assignments(repo_root, manifest, set(skills) if args.skill else None)
+        root_settings = prepare_codex_root_settings(repo_root, destination)
+        python_skills: set[str] = set()
+        python_runtime: pathlib.Path | None = None
         if skills:
             python_skills = declared_python_skills(repo_root, manifest, skills)
             python_runtime = (
@@ -977,9 +1090,10 @@ def main() -> int:
             )
             if python_skills and python_runtime is None:
                 raise ValueError("declared Python skills require the source locked project")
-            install_batch(
-                repo_root, destination, skills, manifest, python_runtime, python_skills,
-            )
+        install_batch(
+            repo_root, destination, skills, manifest, python_runtime, python_skills,
+            root_settings=root_settings,
+        )
     except (
         OSError,
         UnicodeError,

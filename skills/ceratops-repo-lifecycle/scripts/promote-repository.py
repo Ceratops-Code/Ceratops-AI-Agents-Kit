@@ -32,6 +32,7 @@ from github_pr_workflow.command import (
     CommandError,
     capture_failure_report,
     describe_command_failure,
+    project_task_temp_root,
     release_write_context,
     remove_resolved_failures,
     report_phase,
@@ -1044,7 +1045,7 @@ def finalize_result(args: argparse.Namespace) -> None:
         )
     primary_root = common_dir.parent
     task_root = _cleanup_path(args.task_temp_root)
-    expected_parent = primary_root.parent / "tmp" / primary_root.name
+    expected_parent = project_task_temp_root(primary_root)
     if not task_root.is_dir() or task_root.parent != expected_parent:
         raise PromotionError(
             f"task-temp-root must be one existing task directory under {expected_parent}."

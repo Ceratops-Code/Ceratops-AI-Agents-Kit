@@ -148,7 +148,7 @@ without repository deduplication.
 | `tools/source_search_mcp.py` | Read-only local STDIO `source_search` adapter using the pinned MCP SDK; exposes overview, complete paginated files, and selected-file inspect within an 8,000-byte tool-result ceiling. The MCP lifecycle skill packages and installs its declared release. See [installation and search semantics](hooks/README.md#bounded-source-search). |
 | `hooks/preserve-eol-for-apply-patch-tool.py` | Preserves each updated text file's existing encoding and uniform line-ending convention around `apply_patch`. |
 | `hooks/windows-shell-sanity.py` | Repository-owned source for the user-global Windows PowerShell preflight; rewrites exact command defects, annotates ordinary failures, and blocks unreliable or policy-prohibited forms. |
-| `scripts/deploy-skills.py` | Independent installation and updates; renders selected skills and overlays their files without validation, retirement, or lifecycle runtime calls. |
+| `scripts/deploy-skills.py` | Independent installation and updates; renders selected skills, overlays their files, and adds missing native command roots. See [native command roots](#native-command-roots). |
 | `scripts/deploy-hooks.py` | Independent hook installation and updates; copies the repository hook payloads and merges their registrations while preserving unrelated files and configuration. Does not grant trust or restart Codex. |
 | `scripts/deploy-mcp-server-manager.py` | Install the checkout's declared MCP server manager version, including over an existing installation, from the scripts environment; uses the manager's global Python and uv prerequisites, temporary locked libraries, and packaging and deployment code. Never changes Codex settings. |
 | `scripts/testing/run-tests.py` | Sole test-selection, collection-reconciliation, and pytest-execution owner; validates `tests/test-impact.json`, explains deterministic Git-diff selection, rejects mapping gaps before pytest collection or execution, supports explicit committed-diff, worktree, collection, and `--all` modes, adds `--select-only` to check diff/worktree mapping without pytest, and saves failed-pytest streams and structured pre-test failures with captured command output through `--diagnostic-output`; pytest output remains bounded in the console, with live test names and completed counts on stderr. |
@@ -649,26 +649,19 @@ before the terminal result; the JSON command reader forwards those events.
 `promote-repository.py`, `ship-repository.py` and
 `python -m github_pr_workflow ship` accept `--diagnostic-output FILE`.
 The caller selects a stable file under
-`<repo-parent>/tmp/<repo-name>/<calling-worktree-name>/`, for example
+`<shared-temp-base>/<repo-name>/<calling-worktree-name>/`, for example
 `_promote_failure.json` or `_ship_failure.json`. Separate top-level actions use
 separate files; retries reuse the same path. The path is independent of
 promotion's unchanged `--result-file`.
 
-When the calling environment supplies `CERATOPS_TASK_TEMP_ROOT`, `command.py`
-uses that absolute directory for report ownership and cleanup. It must be one
-task directory directly beneath `<repo-parent>/tmp/<repo-name>/` and identify
-one existing registered worktree. The report retains that worktree's identity
-when execution moves to the primary checkout. Invalid, redirected, foreign, or
-ambiguous directories cannot authorize report writes or deletion. The existing
-caller-selected layout applies when the variable is absent; this reader does
-not initialize the command environment.
-
-The shared command runner initializes this value automatically through
-`hooks/command-probe.py::worktree_command_environment()`, for both shell commands
-and native probes. It derives the task directory from the actual Git worktree,
-supplies the same directory through `TEMP`, `TMP`, and `TMPDIR`, and preserves the
-task context when a child executes in the primary checkout. Each producer owns
-its files and cleanup; initialization only owns the reusable directory container.
+`CERATOPS_TASK_TEMP_ROOT` supplies the shared temporary base. Without it,
+`command.py::project_task_temp_root()` uses `<projects-root>/tmp`, where
+`CERATOPS_PROJECTS_ROOT` overrides the primary checkout's parent directory.
+Reports add the primary repository name and one registered worktree name.
+The report's selected path preserves its owning worktree when execution moves
+to the primary checkout. Invalid, redirected, foreign, or ambiguous paths
+cannot authorize report writes or deletion. The environment does not carry
+worktree identity, and the command runner does not initialize these settings.
 
 `command.py` writes complete secret-redacted failures directly to that file
 before returning a short error with `diagnostic_output`. It references existing
@@ -1809,3 +1802,40 @@ producer, custom runner and scope/retention ownership are described in
 `docs/design-draft.md`, section "Durable unchanged-input check reuse".
 This implements plan 6A and its limited Docs-and-Claims runner adoption;
 remaining affected-check and release/receipt adoption stays pending.
+
+## Native command roots
+
+The standalone bootstrap (`scripts/deploy-skills.py` and its authoritative
+template) owns two entries in the selected profile's
+`config.toml`, under `shell_environment_policy.set`:
+
+| Variable | Default on a local PC | GitHub CI value |
+| --- | --- | --- |
+| `CERATOPS_PROJECTS_ROOT` | Parent of the primary Git checkout | Parent of `GITHUB_WORKSPACE` |
+| `CERATOPS_TASK_TEMP_ROOT` | `<projects-root>/tmp` | `RUNNER_TEMP` |
+
+The installer identifies the primary checkout through Git when started in a
+linked worktree. An unpacked source uses its selected source directory.
+Existing absolute settings take precedence; otherwise inherited values take
+precedence over derived defaults. Only missing keys are written. Comments,
+line endings and unrelated settings are retained. Malformed configuration or
+relative roots stop installation before skill copies. Roots cannot place a
+project's temporary namespace inside its source checkout.
+
+The selected profile is the parent of the skill installation root, normally
+`$CODEX_HOME`. It retains one current configuration document and no backup
+history. Publication uses a temporary file in the installer's reserved staging
+directory and an atomic replacement. A configuration change detected before
+publication stops installation. Success and failure remove current
+staging; startup removes abandoned reserved staging under the bootstrap lock.
+
+Codex supplies the saved variables to shell commands. CI supplies them to its
+SDLC step directly; fixture test processes discard inherited host roots.
+Producers own `<shared-temp-base>/<project>/<worktree>` and their contents.
+The installer creates no project temp directories, and no hook initializes
+these variables. Worktree retirement uses the same configured base.
+
+The skills consistency review packet reads both values directly from the
+selected installed skill's profile `config.toml`. Missing, unreadable, empty,
+relative or non-string settings are blockers even when inherited environment
+variables happen to be present. The audit never edits the profile.
