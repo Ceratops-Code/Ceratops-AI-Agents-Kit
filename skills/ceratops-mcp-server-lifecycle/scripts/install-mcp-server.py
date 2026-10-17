@@ -318,8 +318,19 @@ def _installation_failure(
 
 
 def _selected_transaction(payload: dict[str, Any]) -> tuple[str, str]:
-    if set(payload) != MANAGER_RESULT_FIELDS:
+    # The selection proof is unchanged by the manager's optional retention report.
+    # Keep required identity fields and reject unrelated protocol additions.
+    if not MANAGER_RESULT_FIELDS.issubset(payload) or set(payload) - MANAGER_RESULT_FIELDS - {"maintenance"}:
         raise InstallCompletionError("mcp-server-manager result fields changed")
+    if "maintenance" in payload:
+        maintenance = payload["maintenance"]
+        if (
+            not isinstance(maintenance, dict)
+            or set(maintenance) != {"removed", "deferred", "errors"}
+            or any(not isinstance(items, list) or any(not isinstance(item, str) for item in items)
+                   for items in maintenance.values())
+        ):
+            raise InstallCompletionError("mcp-server-manager maintenance report is incomplete")
     mcp_server_name = payload.get("mcp_server_name")
     version = payload.get("installed_version")
     digest = payload.get("manifest_sha256")
@@ -480,7 +491,7 @@ def install_mcp_server(args: InstallOptions) -> dict[str, Any]:
                     "deployed": [mcp_server_name],
                     "removed": [],
                     "transaction_id": transaction_id,
-                    "cleanup_debt": [],
+                    "cleanup_debt": list(payload.get("maintenance", {}).get("errors", [])),
                     "promotion": promotion,
                 }
                 phase = "completion_receipt"

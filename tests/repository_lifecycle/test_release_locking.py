@@ -151,6 +151,78 @@ def test_non_git_installation_source_needs_no_git_probe(tmp_path, monkeypatch, e
     assert list(tmp_path.iterdir()) == []
 
 
+@pytest.mark.parametrize("case", [
+    "legacy", "maintenance", "maintenance_errors", "unknown_field", "missing_identity",
+    "maintenance_null", "maintenance_extra_key", "maintenance_invalid_item",
+    "selection_mismatch", "receipt_mismatch",
+])
+def test_mcp_installation_completion_reads_maintenance_without_reinstall(tmp_path, monkeypatch, case):
+    """Report the installed selection repeatedly, retaining maintenance failures."""
+    repo, _, _, _ = prepare_repository_lifecycle_repo(tmp_path)
+    script = PROMOTE_REPOSITORY.parents[2] / "ceratops-mcp-server-lifecycle/scripts/install-mcp-server.py"
+    module = runpy.run_path(str(script))
+    call = module["install_mcp_server"]
+    install_root = tmp_path / "installed"
+    monkeypatch.setitem(call.__globals__, "INSTALL_ROOT", install_root)
+    monkeypatch.setitem(call.__globals__, "_install", lambda *args: pytest.fail("completion repeated installation"))
+    instance = "b" * 32
+    server = install_root / "example"
+    immutable = server / "versions/1.2.3" / instance
+    immutable.mkdir(parents=True)
+    selected = {"schema": 1, "mcp_server_id": "example", "version": "1.2.3",
+                "manifest_sha256": "a" * 64, "instance": instance, "module": "example"}
+    current = server / "current.json"
+    receipt = immutable / "receipt.json"
+    current.write_text(json.dumps(selected), encoding="utf-8")
+    receipt.write_text(json.dumps(selected), encoding="utf-8")
+    payload: dict[str, Any] = {"installed_version": "1.2.3", "manifest_sha256": "a" * 64,
+               "reconnection_required": False, "running_version": None, "mcp_server_name": "example"}
+    if case != "legacy":
+        payload["maintenance"] = {"removed": ["old-version"], "deferred": ["leased-version"], "errors": []}
+    expected_error = None
+    expected_debt = []
+    if case == "maintenance_errors":
+        expected_debt = ["old-version removal failed"]
+        payload["maintenance"]["errors"] = expected_debt
+    elif case == "unknown_field":
+        payload["unexpected"] = True
+        expected_error = "result fields changed"
+    elif case == "missing_identity":
+        payload.pop("installed_version")
+        expected_error = "result fields changed"
+    elif case == "maintenance_null":
+        payload["maintenance"] = None
+        expected_error = "maintenance report is incomplete"
+    elif case == "maintenance_extra_key":
+        payload["maintenance"]["unexpected"] = []
+        expected_error = "maintenance report is incomplete"
+    elif case == "maintenance_invalid_item":
+        payload["maintenance"]["errors"] = [42]
+        expected_error = "maintenance report is incomplete"
+    elif case == "selection_mismatch":
+        payload["manifest_sha256"] = "c" * 64
+        expected_error = "active MCP server selection does not match"
+    elif case == "receipt_mismatch":
+        receipt.write_text(json.dumps({**selected, "version": "9.9.9"}), encoding="utf-8")
+        expected_error = "immutable MCP server receipt does not match"
+    result_path = tmp_path / "manager-result.json"
+    result_path.write_text(json.dumps(payload), encoding="utf-8")
+    request = module["InstallOptions"](repo_root=repo, mcp_server_name="example", manager_result=result_path)
+    before = current.read_bytes(), receipt.read_bytes()
+    for _ in range(2):
+        result = call(request)
+        if expected_error:
+            assert result["status"] == "failed", result
+            assert expected_error in result["message"]
+            assert result["diagnostics"]["operation"] == "install_mcp_server"
+        else:
+            assert result["status"] == "completed", result
+            assert result["deployed"] == ["example"]
+            assert result["transaction_id"] == instance
+            assert result["cleanup_debt"] == expected_debt
+        assert (current.read_bytes(), receipt.read_bytes()) == before
+
+
 def test_git_source_probe_launch_failure_keeps_its_cause(tmp_path, monkeypatch):
     (tmp_path / ".git").mkdir()
     locks = workflow_command.release_lock_module()
