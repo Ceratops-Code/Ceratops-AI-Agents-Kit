@@ -27,6 +27,16 @@ first.
   dependency-finalize --snapshot-helper PATH --sync-helper PATH
   --preflight PATH --snapshot PATH --sync-output PATH --output PATH
   [--approved-pr PR] [--admin]`
+- (D) Automation preflight, from this skill's root:
+  `python scripts/github_pr_workflow/__main__.py dependency-preflight
+  --automation-dir PATH`.
+- (D) Automation finalization, from this skill's root:
+  `python scripts/github_pr_workflow/__main__.py dependency-finalize
+  --automation-dir PATH [--approved-pr PR] [--admin]`.
+- `PATH` is the caller's installed automation directory. The entrypoint
+  reads its repository-scope configuration and binds its independent adapters;
+  explicit options override defaults. It owns current-report retirement and
+  dated unavailable-state reports, preserving genuine blocked queue results.
 - Queue preflight owns batched PR projection and registry, dependency-tree,
   engine/API, and exact-CI evidence. Finalization owns preflight-approved head
   binding, bounded readiness waits, live revalidation, blocker fingerprints,
