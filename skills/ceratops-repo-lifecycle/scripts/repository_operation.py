@@ -624,6 +624,9 @@ def execute_prepared_operation(
         base["prerequisites"] = dict(prepared.prerequisites)
     if prepared.no_op_reason is not None:
         return {**base, "status": "no_op", "reason": prepared.no_op_reason}
+    if prepared.result_commit_field and not re.fullmatch(r"[0-9a-f]{40}", prepared.commit or ""):
+        return report_failure({**base, "status": "result_invalid", "message":
+            f"A commit-reporting build requires an existing 40-character Git HEAD in {prepared.repo_root}."}, **report_options)
     report_phase(prepared.operation, enabled=diagnostic_output is not None)
     if repository_commit(prepared.repo_root) != prepared.commit:
         return report_failure({

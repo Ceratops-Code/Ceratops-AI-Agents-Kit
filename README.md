@@ -274,6 +274,7 @@ clean final Git HEAD descended from the prepared commit. The operation keeps
 `commit` as its input identity and reports `result_commit` separately; existing
 check acceptance keeps its original identities. Such a build must be the last
 selected operation, so later work needs a fresh call with current Git inputs.
+A missing supported starting Git HEAD stops the build before any command runs.
 Malformed output retains completed effects and blocks continuation; it never
 causes automatic replay. Other actions retain the frozen-HEAD guard. This narrow
 contract does not allocate versions or replace native package records.

@@ -362,6 +362,37 @@ def test_sdlc_v5_build_reports_its_clean_final_commit(tmp_path, capsys):
     assert result["results"][-1]["result_commit"] == run_git(tmp_path, "rev-parse", "HEAD").stdout.strip()
 
 
+@pytest.mark.parametrize("declared", [False, True])
+def test_commit_reporting_requires_starting_git_before_any_build_effect(tmp_path, capsys, declared):
+    program = (
+        "import json; from pathlib import Path; p=Path('artifact'); "
+        "p.write_text('built') if not p.exists() else None; "
+        "print(json.dumps({'schema':'native-build-result.v1','status':'OK','resultCommit':'a'*40}))"
+    )
+    build = {"requires": {"capabilities": []}, "steps": [{"run": [sys.executable, "-c", program]}]}
+    if declared:
+        build["result-commit-field"] = "resultCommit"
+    document = {
+        "version": 4, "kind": "ceratops-sdlc",
+        "repository": {"capabilities": {}, "actions": {"validate": _no_op(), "test": _no_op()}},
+        "deliverables": {"packages": {"sample": {
+            "source": ".", "project": "sdlc/sdlc.yml", "prerequisites": [],
+            "artifact": {"type": "python-wheel", "distribution": "sample",
+                         "output-directory": "dist", "filename-pattern": "*.whl"},
+            "actions": {"validate": _no_op(), "test": _no_op(), "build": build},
+        }}},
+    }
+    write_sdlc_contract(tmp_path).write_text(json.dumps(document))
+    for _ in range(2):
+        code, result = _native_build(tmp_path, capsys)
+        assert code == (1 if declared else 0), result
+        assert (tmp_path / "artifact").exists() is not declared
+        if declared:
+            assert result["status"] == "result_invalid"
+            assert "requires an existing 40-character Git HEAD" in result["message"]
+            assert result["steps"] == []
+
+
 @pytest.mark.parametrize("boundary", ["before-artifact", "after-artifact", "before-commit", "after-commit"])
 def test_interrupted_build_uses_current_git_and_package_state_on_fresh_call(tmp_path, capsys, monkeypatch, boundary):
     _committing_build(tmp_path)
