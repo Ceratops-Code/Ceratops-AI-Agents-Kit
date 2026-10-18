@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import pathlib
 import runpy
@@ -73,40 +74,87 @@ def test_init_and_run_drive_utf8_proposal_without_caller_json(
     assert initialized.returncode == 0, initialized.stderr
     pending = json.loads(initialized.stdout)
     assert pending["next_action"] == "assess_candidate_then_run"
+    template = pending["review_input_template"]
+    assert template["candidate"]["path"] == pending["candidate"]
+    assert template["candidate"]["edit_existing_file"] is True
+    assert template["candidate"]["preserve_other_fields"] is True
+    assert template["candidate"]["editable_fields"]["history_operations"] == []
+    assert template["assessment"]["path"] == pending["assessment"]
+    assert template["assessment"]["format"] == "nonempty UTF-8 text"
+    assert template["submit"]["choices"] == {
+        "outcome": ["improved", "no-improvement"],
+        "regressions": ["passed", "failed"],
+    }
     candidate = json.loads(pathlib.Path(pending["candidate"]).read_text(encoding="utf-8"))
     assert candidate["targets"][0]["replacements"][0]["replacement"] == inputs[
         "replacement"
     ]
     assert not list(task_temp_root.glob(".proposal-init-*"))
 
+    def artifacts() -> dict[pathlib.Path, bytes]:
+        return {path: path.read_bytes() for path in task_temp_root.rglob("*") if path.is_file()}
+
+    # The only new effect is stdout. A lost response on either side of that
+    # effect must leave the same review available through the normal command.
+    before_status = artifacts()
+    with mock.patch.object(sys, "path", [str(PROPOSAL_WORKFLOW.parent), *sys.path]):
+        workflow = runpy.run_path(str(PROPOSAL_WORKFLOW))
+    original_print = print
+    for after_output in (False, True):
+        output = io.StringIO()
+
+        def interrupted_print(*args: object, **kwargs: Any) -> None:
+            if after_output:
+                original_print(*args, **kwargs)
+            raise BrokenPipeError("interrupted review response")
+
+        with mock.patch.object(sys, "stdout", output), mock.patch(
+            "builtins.print", side_effect=interrupted_print
+        ), pytest.raises(BrokenPipeError, match="interrupted review response"):
+            workflow["main"](["run", "--state", pending["state"]])
+        if after_output:
+            assert json.loads(output.getvalue())["review_input_template"] == template
+        else:
+            assert output.getvalue() == ""
+        assert artifacts() == before_status
+        status = subprocess.run(
+            [sys.executable, str(PROPOSAL_WORKFLOW), "run", "--state", pending["state"]],
+            capture_output=True, text=True, check=False,
+        )
+        assert status.returncode == 0, status.stderr
+        assert json.loads(status.stdout)["review_input_template"] == template
+        assert artifacts() == before_status
+
+    # An unfinished candidate must not hide the instructions needed to fix it.
+    candidate_path = pathlib.Path(pending["candidate"])
+    candidate_bytes = candidate_path.read_bytes()
+    candidate_path.write_text("{unfinished", encoding="utf-8")
     status = subprocess.run(
         [sys.executable, str(PROPOSAL_WORKFLOW), "run", "--state", pending["state"]],
-        capture_output=True,
-        text=True,
-        check=False,
+        capture_output=True, text=True, check=False,
     )
-    assert status.returncode == 0
-    assert json.loads(status.stdout)["next_action"] == "assess_candidate_then_run"
+    assert status.returncode == 0, status.stderr
+    assert json.loads(status.stdout)["review_input_template"] == template
+    assert candidate_path.read_text(encoding="utf-8") == "{unfinished"
+    candidate_path.write_bytes(candidate_bytes)
+
+    submission = [
+        {"<outcome>": "improved", "<regressions>": "passed",
+         pending["assessment"]: str(paths["assessment"])}.get(value, value)
+        for value in template["submit"]["command"]
+    ]
     advanced = subprocess.run(
-        [
-            sys.executable,
-            str(PROPOSAL_WORKFLOW),
-            "run",
-            "--state",
-            pending["state"],
-            "--assessment-file",
-            str(paths["assessment"]),
-            "--outcome",
-            "improved",
-            "--regressions",
-            "passed",
-        ],
+        submission,
         capture_output=True,
         text=True,
         check=False,
     )
     assert advanced.returncode == 0, advanced.stderr
     progress = json.loads(advanced.stdout)
+    assert progress["review_input_template"]["candidate"]["path"] == progress["pending"]["candidate"]
+    assert progress["review_input_template"]["candidate"]["editable_fields"]["history_operations"] == []
+    assert "acceptance" not in progress["review_input_template"]["candidate"]
+    assert "outputs" not in progress["review_input_template"]["candidate"]
     accepted_candidate = pathlib.Path(pending["candidate"])
     for _ in range(3):
         pathlib.Path(progress["pending"]["candidate"]).write_bytes(
@@ -152,6 +200,90 @@ def test_init_and_run_drive_utf8_proposal_without_caller_json(
     assert not list(task_temp_root.iterdir())
 
 
+def test_review_template_history_example_can_be_submitted(tmp_path: pathlib.Path) -> None:
+    task_temp_root = tmp_path / "task-temp"
+    task_temp_root.mkdir()
+    target_dir = tmp_path / "governed"
+    target_dir.mkdir()
+    target_repository_markdown_policy(target_dir)
+    target = target_dir / "AGENTS.md"
+    old_rule = "- [DEMO-01] Preserve original scope."
+    target.write_text(f"# Rules\n\n{old_rule}\n", encoding="utf-8")
+    history = target_dir / "AGENTS.history.json"
+    history.write_text(json.dumps({"version": 2, "entries": [{
+        "rules": ["DEMO-01"], "decision": "Preserve original scope.",
+        "reason": "Keep the initial boundary.", "regression": "Scope must remain explicit.",
+    }]}), encoding="utf-8")
+    paths = {}
+    for name, value in {
+        "failure": "The scope should follow the declaration.\n",
+        "regressions": "Preserve the explicit scope boundary.\n",
+        "expected": old_rule,
+        "replacement": "- [DEMO-01] Preserve declared scope.",
+    }.items():
+        paths[name] = tmp_path / f"{name}.txt"
+        paths[name].write_text(value, encoding="utf-8")
+    initialized = subprocess.run(
+        [sys.executable, str(PROPOSAL_WORKFLOW), "init",
+         "--task-temp-root", str(task_temp_root),
+         "--failure-file", str(paths["failure"]),
+         "--regressions-file", str(paths["regressions"]),
+         "--context", str(target), str(history), "DEMO-01",
+         "--replacement", str(target), str(history),
+         str(paths["expected"]), str(paths["replacement"])],
+        capture_output=True, text=True, check=False,
+    )
+    assert initialized.returncode == 0, initialized.stderr
+    pending = json.loads(initialized.stdout)
+    template = pending["review_input_template"]
+    operations = template["candidate"]["editable_fields"]["history_operations"]
+    assert len(operations) == 1 and pathlib.Path(operations[0]["history"]) == history.resolve()
+    assert operations[0]["operation"] == "append"
+    assert set(operations[0]["entry"]) == {"rules", "decision", "reason", "regression"}
+    operations[0]["entry"] = {
+        "rules": ["DEMO-01"], "decision": "Preserve declared scope.",
+        "reason": "Use the declaration as the boundary.",
+        "regression": "Scope remains explicit.",
+    }
+    candidate_path = pathlib.Path(pending["candidate"])
+    candidate = json.loads(candidate_path.read_bytes())
+    candidate["history_operations"] = operations
+    candidate_path.write_text(json.dumps(candidate), encoding="utf-8")
+    pathlib.Path(template["assessment"]["path"]).write_text(
+        "The candidate follows the declaration and keeps the explicit boundary.\n",
+        encoding="utf-8",
+    )
+    submission = [
+        {"<outcome>": "improved", "<regressions>": "passed"}.get(value, value)
+        for value in template["submit"]["command"]
+    ]
+    submitted = subprocess.run(submission, capture_output=True, text=True, check=False)
+    assert submitted.returncode == 0, submitted.stderr
+    assert json.loads(submitted.stdout)["next_action"] == "assess_candidate_then_run"
+    assert json.loads(candidate_path.read_bytes())["acceptance"]["regressions"] == "passed"
+    assert old_rule in target.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("context_record", [None, {"value": {"targets": [{"history": []}]}}])
+def test_review_template_reports_bad_context_without_changing_files(
+    tmp_path: pathlib.Path, context_record: object,
+) -> None:
+    with mock.patch.object(sys, "path", [str(PROPOSAL_WORKFLOW.parent), *sys.path]):
+        workflow = runpy.run_path(str(PROPOSAL_WORKFLOW))
+    state = tmp_path / "state.json"
+    controller = {"validation_context": context_record}
+    state.write_text(json.dumps(controller), encoding="utf-8")
+    candidate = tmp_path / "candidate.json"
+    candidate.write_text("{unfinished", encoding="utf-8")
+    before = {path: path.read_bytes() for path in tmp_path.iterdir()}
+    with pytest.raises(workflow["ProposalWorkflowError"], match="cannot describe pending review") as error:
+        workflow["_annotated_status"]({
+            "candidate": str(candidate), "assessment": str(tmp_path / "assessment.md"),
+        }, state=state, controller=controller)
+    assert str(state) in str(error.value)
+    assert {path: path.read_bytes() for path in tmp_path.iterdir()} == before
+
+
 def test_driver_reports_iteration_limit_as_interrupted() -> None:
     with mock.patch.object(sys, "path", [str(PROPOSAL_WORKFLOW.parent), *sys.path]):
         workflow = runpy.run_path(str(PROPOSAL_WORKFLOW))
@@ -161,6 +293,12 @@ def test_driver_reports_iteration_limit_as_interrupted() -> None:
         )
     )
     assert status["next_action"] == "report_iteration_limit_interruption"
+    assert "review_input_template" not in status
+    completed = json.loads(workflow["_annotated_status"]({
+        "complete": True, "review_input_template": {"stale": True},
+    }))
+    assert completed["next_action"] == "generate-update-request"
+    assert "review_input_template" not in completed
 
 
 def test_init_rejects_cap_below_accepted_convergence_minimum(

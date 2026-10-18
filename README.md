@@ -183,7 +183,8 @@ without repository deduplication.
 | `skills/ceratops-governance-lifecycle/scripts/apply_rules_update.py` | Prepares complete rule, history and TOML outputs, embeds acceptance in one application request, and applies its saved bytes using integrity comparisons and rollback. Completed-write retries perform no writes or content checks; successful application removes only the declared disposable request. |
 | `skills/ceratops-governance-lifecycle/scripts/validate_rule_candidate.py` | Checks new candidate text once; formatting stability, protected-token preservation and untouched source slices are producer invariants covered by behavior tests. `--accept` freezes complete outputs and original check results, including history-only repairs. |
 | `skills/ceratops-governance-lifecycle/scripts/rule_candidate_source.py` | Owns exact UTF-8 source loading, encoding and line-ending preservation, shared candidate data, and input-integrity checks used by governance validation and application. |
-| `skills/ceratops-governance-lifecycle/scripts/proposal-workflow.py` | Initializes exact proposals and records semantic decisions. At convergence, its driver generates one application request and invokes the updater when authorized. Proposal-only runs retain that file for approval; generation or application failures retain recovery inputs. Successful completion cleans owned iteration artifacts and preserves caller inputs. |
+| `skills/ceratops-governance-lifecycle/scripts/proposal-workflow.py` | Initializes exact proposals and records semantic decisions. Pending review output includes candidate edit fields, applicable history-entry examples, the assessment format, and a submission command. At convergence, its driver generates one application request and invokes the updater when authorized. Proposal-only runs retain that file for approval; generation or application failures retain recovery inputs. Successful completion cleans owned iteration artifacts and preserves caller inputs. |
+| `skills/ceratops-governance-lifecycle/scripts/read_proposal_requests.py` | Owns proposal request and construction-source input checks, exact source reading, and task-temp path boundaries. The command driver owns iteration effects, publication, acceptance, and cleanup. |
 | `skills/ceratops-governance-lifecycle/scripts/iteration_controller.py` | Opens structured candidates, invokes mechanical validation before recording, retains the exact validated champion, enforces stopping, and safely finalizes owned artifacts. |
 | `skills/ceratops-governance-lifecycle/scripts/rule_graph.py` | Parses canonical AGENTS rules and rejects structural syntax or rule-local explicit-user override escape clauses. |
 | `skills/ceratops-repo-lifecycle/scripts/github_contract_engine/` | Package CLI for compact local audit snapshots, contract evaluation, shared GitHub API access, sanitized evidence, and evidence-gated CodeQL disposition. |
@@ -897,7 +898,14 @@ root, UTF-8 failure and regression files, repeated `--context RULES HISTORY
 RULE_IDS`, and repeated `--replacement RULES HISTORY EXPECTED_FILE
 REPLACEMENT_FILE`. Use `-` for a source without history. The helper constructs
 and prepares the closed request and emits the candidate paths plus one
-`next_action`. Run `proposal-workflow.py run --state STATE` to inspect that
+`next_action`. Pending review responses also include the annotation-only
+`review_input_template` for the caller:
+editable candidate fields, append-entry examples for target companion histories,
+nonempty UTF-8 assessment text, and the next submission command with its allowed
+choices. This description comes from the saved target context, remains available
+while a candidate is unfinished, and omits frozen acceptance outputs. Reading it
+does not change proposal files. Completed and interrupted responses omit it.
+Run `proposal-workflow.py run --state STATE` to inspect that
 action, or add `--assessment-file FILE --outcome OUTCOME --regressions RESULT`
 to submit the semantic decision without writing workflow JSON by hand.
 
