@@ -204,6 +204,11 @@
             "$ref": "#/$defs/parameter"
           }
         },
+        "result-commit-field": {
+          "description": "Top-level field in the final build command's structured stdout naming its exact final Git commit. Successful status must be OK or passed; the runner requires clean descendant HEAD and preserves the prepared commit separately.",
+          "type": "string",
+          "pattern": "^[A-Za-z][A-Za-z0-9_]*$"
+        },
         "result-schema": {
           "description": "Required structured stdout from the final run step. The repository operation runner validates the complete object and requires a passed terminal status.",
           "enum": [

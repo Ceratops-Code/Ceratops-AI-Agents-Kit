@@ -124,6 +124,7 @@ class PreparedOperation:
     check_results: dict[str, Any] | None = None
     qualification_level: str = "alpha"
     check_plan: Any = None
+    result_commit_field: str | None = None
 
 
 def _build_test_gate(receipt: Mapping[str, Any], required_tests: Sequence[str]) -> None:
@@ -514,8 +515,11 @@ def prepare_operations(
                 tuple(sorted(parameters.items())),
                 result_schema=selected.get("result-schema"),
                 check_results=selected.get("check-results"),
+                result_commit_field=selected.get("result-commit-field"),
             )
         )
+    if any(item.result_commit_field for item in prepared[:-1]):
+        raise OperationError("A build returning its final commit must be the last selected operation.")
     return prepared
 
 
@@ -562,6 +566,34 @@ def validation_operations(
 
 def _bounded_tail(value: str | None) -> list[str]:
     return (value or "")[-FAILURE_TAIL_CHARS:].splitlines()[-FAILURE_TAIL_LINES:]
+
+
+def require_build_result_commit(prepared: PreparedOperation, captured: Mapping[str, Any]) -> str:
+    """Bind a declared native build result to a clean descendant of its input HEAD.
+
+    This accepts only a terminal build's reported Git effect. It neither grants
+    the new commit the input commit's test acceptance nor authorizes later steps.
+    A fresh invocation reads current Git state after an interrupted producer.
+    """
+    result = captured.get("result", {})
+    commit = result.get(prepared.result_commit_field)
+    if (prepared.category != "build" or not prepared.commit
+            or result.get("status") not in {"OK", "passed"}
+            or not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit)):
+        raise StepResultError("Declared build result must report a successful terminal status and exact final Git commit.")
+    try:
+        require_clean_commit(prepared.repo_root, commit)
+    except OperationError as exc:
+        raise StepResultError(f"Reported build commit does not match clean HEAD: {exc}") from exc
+    argv = ["git", "-C", str(prepared.repo_root), "merge-base", "--is-ancestor", prepared.commit, commit]
+    ancestry = subprocess.run(argv, capture_output=True, text=True, check=False)
+    if ancestry.returncode != 0:
+        raise StepResultError(
+            f"Reported build commit is not a descendant of the prepared commit; "
+            f"invocation={argv!r}; exit={ancestry.returncode}; "
+            f"stdout={ancestry.stdout or '<absent>'}; stderr={ancestry.stderr or '<absent>'}"
+        )
+    return commit
 
 
 def execute_prepared_operation(
@@ -825,6 +857,8 @@ def execute_prepared_operation(
                 expected_schema=expected_schema,
                 expected_stage=expected_stage if expected_schema else None,
             )
+            if prepared.result_commit_field and step is prepared.steps[-1]:
+                base["result_commit"] = require_build_result_commit(prepared, captured)
         except StepResultError as exc:
             failure = {
                 **base,
@@ -851,7 +885,8 @@ def execute_prepared_operation(
             # The shared list also preserves earlier receipts on later failures
             # or commit drift, before any subsequent side effect is attempted.
             base["step_results"] = step_results
-        if repository_commit(prepared.repo_root) != prepared.commit:
+        expected_commit = base.get("result_commit", prepared.commit)
+        if repository_commit(prepared.repo_root) != expected_commit:
             return report_failure({
                 **base,
                 "steps": completed,
@@ -931,6 +966,8 @@ def execute_prepared_operations(
     # phases consume these original plans; no result payload crosses the model.
     preparation_id = "operation_preparation:" + ",".join(item.operation for item in prepared)
     try:
+        if any(item.result_commit_field for item in prepared[:-1]):
+            raise ValueError("A build returning its final commit must be the last selected operation.")
         prepared = [replace(item, check_plan=reuse_operation_checks.plan_operation(item))
                     if item.check_results is not None and item.check_plan is None else item
                     for item in prepared]

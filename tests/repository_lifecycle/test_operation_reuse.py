@@ -279,3 +279,161 @@ def test_locked_child_path_tools_and_python_match_the_actual_producer(tmp_path):
     assert result["check_decision"] == "executed"
     assert runner.execute_prepared_operation(operation)["check_decision"] == "reused"
     assert (tmp_path / "source-checks.txt").read_text() == "x"
+
+
+def _committing_build(root: pathlib.Path, *, declared=True):
+    """Use a convergent native producer; ignored package bytes survive interruption."""
+    _fixture(root)
+    producer = '''import json, os, pathlib, subprocess, sys
+def git(*args):
+    return subprocess.run(['git', *args], check=True, capture_output=True, text=True).stdout.strip()
+def boundary(name):
+    if os.environ.get('BUILD_TEST_INTERRUPT') == name:
+        sys.exit(12)
+artifact = pathlib.Path('wheel.bin')
+if not artifact.exists():
+    boundary('before-artifact')
+    artifact.write_bytes(b'wheel')
+    boundary('after-artifact')
+    boundary('before-commit')
+    git('commit', '--allow-empty', '-m', 'native package built')
+    boundary('after-commit')
+commit = git('rev-parse', 'HEAD')
+mode = os.environ.get('BUILD_TEST_RESULT', '')
+if mode == 'dirty':
+    pathlib.Path('source.py').write_text('uncommitted change')
+if mode == 'wrong':
+    commit = 'f' * 40
+if mode == 'malformed':
+    commit = 'HEAD'
+payload = {'schema': 'native-build-result.v1', 'status': 'OK', 'resultCommit': commit}
+if mode == 'missing':
+    payload.pop('resultCommit')
+if mode == 'failed':
+    payload['status'] = 'failed'
+print('{' if mode == 'partial' else json.dumps(payload))
+'''
+    (root / "scripts/build.py").write_text(producer, encoding="utf-8")
+    contract = root / "sdlc/sdlc.yml"
+    data = json.loads(contract.read_text())
+    build = data["deliverables"]["packages"]["sample"]["actions"]["build"]
+    build["steps"] = [{"run": [sys.executable, "scripts/build.py"]}]
+    if declared:
+        build["result-commit-field"] = "resultCommit"
+    contract.write_text(json.dumps(data))
+    assert run_git(root, "add", ".").returncode == 0
+    assert run_git(root, "commit", "-m", "declare native build").returncode == 0
+    return run_git(root, "rev-parse", "HEAD").stdout.strip()
+
+
+BUILD_OPERATION = "deliverables.packages.sample.actions.build"
+
+
+def _native_build(root: pathlib.Path, capsys):
+    code = runner.main(["--repo-root", str(root), "--return-handoffs", "--operation", BUILD_OPERATION])
+    output = capsys.readouterr()
+    return code, json.loads(output.out if code == 0 else output.err)
+
+
+def test_declared_build_reports_final_commit_and_repeats_without_new_effects(tmp_path, capsys):
+    initial = _committing_build(tmp_path)
+    code, first = _native_build(tmp_path, capsys)
+    assert code == 0, first
+    operation = first["results"][-1]
+    final = run_git(tmp_path, "rev-parse", "HEAD").stdout.strip()
+    assert operation["commit"] == initial
+    assert operation["result_commit"] == final != initial
+    assert operation["step_results"][-1]["result"]["resultCommit"] == final
+    assert _native_build(tmp_path, capsys)[0] == 0
+    assert run_git(tmp_path, "rev-parse", "HEAD").stdout.strip() == final
+    assert (tmp_path / "source-checks.txt").read_text() == "x"
+
+
+def test_sdlc_v5_build_reports_its_clean_final_commit(tmp_path, capsys):
+    _committing_build(tmp_path)
+    contract = tmp_path / "sdlc/sdlc.yml"
+    data = json.loads(contract.read_text())
+    data["version"] = 5
+    contract.write_text(json.dumps(data))
+    assert run_git(tmp_path, "add", ".").returncode == 0
+    assert run_git(tmp_path, "commit", "-m", "use SDLC v5").returncode == 0
+    code, result = _native_build(tmp_path, capsys)
+    assert code == 0, result
+    assert result["results"][-1]["result_commit"] == run_git(tmp_path, "rev-parse", "HEAD").stdout.strip()
+
+
+@pytest.mark.parametrize("boundary", ["before-artifact", "after-artifact", "before-commit", "after-commit"])
+def test_interrupted_build_uses_current_git_and_package_state_on_fresh_call(tmp_path, capsys, monkeypatch, boundary):
+    _committing_build(tmp_path)
+    monkeypatch.setenv("BUILD_TEST_INTERRUPT", boundary)
+    code, interrupted = _native_build(tmp_path, capsys)
+    assert code == 1 and interrupted["status"] == "operation_failed", interrupted
+    monkeypatch.delenv("BUILD_TEST_INTERRUPT")
+    code, fresh = _native_build(tmp_path, capsys)
+    assert code == 0, fresh
+    final = run_git(tmp_path, "rev-parse", "HEAD").stdout.strip()
+    assert fresh["results"][-1]["result_commit"] == final
+    assert (tmp_path / "wheel.bin").read_bytes() == b"wheel"
+    assert _native_build(tmp_path, capsys)[0] == 0
+    assert run_git(tmp_path, "rev-parse", "HEAD").stdout.strip() == final
+
+
+@pytest.mark.parametrize("mode", ["missing", "wrong", "malformed", "failed", "partial", "dirty"])
+def test_reported_commit_requires_complete_success_and_clean_matching_head(tmp_path, capsys, monkeypatch, mode):
+    _committing_build(tmp_path)
+    monkeypatch.setenv("BUILD_TEST_RESULT", mode)
+    code, result = _native_build(tmp_path, capsys)
+    assert code == 1 and result["status"] == "result_invalid", result
+    assert (tmp_path / "wheel.bin").read_bytes() == b"wheel"
+    assert "Do not replay" in result["message"]
+
+
+def test_undeclared_build_still_rejects_head_changes_and_keeps_completed_result(tmp_path, capsys):
+    _committing_build(tmp_path, declared=False)
+    code, result = _native_build(tmp_path, capsys)
+    assert code == 1 and result["status"] == "state_changed", result
+    assert result["step_results"][-1]["result"]["resultCommit"] == run_git(tmp_path, "rev-parse", "HEAD").stdout.strip()
+
+
+def test_returned_commit_must_descend_from_prepared_commit(tmp_path, monkeypatch):
+    initial = _committing_build(tmp_path)
+    prepared = runner.prepare_operations(tmp_path, [runner.OperationRequest(BUILD_OPERATION)])[0]
+    tree = run_git(tmp_path, "rev-parse", "HEAD^{tree}").stdout.strip()
+    unrelated = subprocess.run(["git", "-C", str(tmp_path), "commit-tree", tree, "-m", "unrelated root"],
+                               capture_output=True, text=True, check=True).stdout.strip()
+    actual = runner.run_progress_command
+
+    def diverge(*args, **kwargs):
+        result = actual(*args, **kwargs)
+        assert run_git(tmp_path, "update-ref", "HEAD", unrelated).returncode == 0
+        result.stdout = json.dumps({"schema": "native-build-result.v1", "status": "OK", "resultCommit": unrelated})
+        return result
+
+    monkeypatch.setattr(runner, "run_progress_command", diverge)
+    result = runner.execute_prepared_operation(prepared)
+    assert result["status"] == "result_invalid", result
+    assert "not a descendant" in result["diagnostic"]["message"]
+    assert result["commit"] == initial
+
+
+@pytest.mark.parametrize("version", [4, 5])
+@pytest.mark.parametrize("change", ["non-build", "handoff", "bad-field", "later-operation"])
+def test_commit_declaration_blocks_unsafe_flow_before_effects(tmp_path, version, change):
+    _committing_build(tmp_path)
+    path = tmp_path / "sdlc/sdlc.yml"
+    data = json.loads(path.read_text())
+    data["version"] = version
+    actions = data["deliverables"]["packages"]["sample"]["actions"]
+    if change == "non-build":
+        actions["test"] = actions.pop("build")
+    elif change == "handoff":
+        actions["build"]["steps"] = [{"handoff": {"lifecycle": "ceratops-skill-lifecycle", "action": "deploy", "inputs": {"skill": "sample"}}}]
+    elif change == "bad-field":
+        actions["build"]["result-commit-field"] = "nested.commit"
+    path.write_text(json.dumps(data))
+    requests = [runner.OperationRequest(BUILD_OPERATION)]
+    if change == "later-operation":
+        requests.append(runner.OperationRequest("repository.actions.test"))
+    with pytest.raises(runner.OperationError):
+        runner.prepare_operations(tmp_path, requests)
+    assert not (tmp_path / "wheel.bin").exists()

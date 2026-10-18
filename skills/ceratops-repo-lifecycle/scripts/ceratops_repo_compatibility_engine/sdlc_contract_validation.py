@@ -278,6 +278,12 @@ def _typed_semantic_errors(value: Mapping[str, Any]) -> list[str]:
                                 or ":" in input_path or ".." in input_path.split("/")):
                             errors.append(f"check-results {key} must be repository-relative at {owner}.actions.{action_name}")
             declared_result = action.get("result-schema")
+            if action.get("result-commit-field") is not None:
+                steps = action.get("steps", [])
+                if action_name != "build" or not steps or "run" not in steps[-1] or handoff_positions:
+                    errors.append(
+                        f"result-commit-field requires a build ending in a run step at {owner}.actions.{action_name}"
+                    )
             if declared_result is not None:
                 expected_result = V4_RESULT_SCHEMAS.get(action_name)
                 if expected_result is None:

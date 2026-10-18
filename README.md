@@ -267,6 +267,16 @@ receipt-only installation is planned in refactor step 19, not implemented here.
 CI uses `--ci`, never dispatches skills, and reports deferred handoffs
 separately. SDLC versions 1 through 3 are rejected and must be upgraded before
 lifecycle execution.
+An SDLC v4/v5 `build` may declare `result-commit-field: resultCommit` when its
+final command commits native build records. Its complete JSON stdout must have
+a nonempty `schema`, status `OK` or `passed`, and that field naming the exact
+clean final Git HEAD descended from the prepared commit. The operation keeps
+`commit` as its input identity and reports `result_commit` separately; existing
+check acceptance keeps its original identities. Such a build must be the last
+selected operation, so later work needs a fresh call with current Git inputs.
+Malformed output retains completed effects and blocks continuation; it never
+causes automatic replay. Other actions retain the frozen-HEAD guard. This narrow
+contract does not allocate versions or replace native package records.
 Ceratops skill handoffs are declared on each named skill. Skill source
 validation at `deliverables.skills.<name>.actions.validate` hands off to
 `ceratops-skill-lifecycle/source-validate`; its skill-owned binding invokes the
