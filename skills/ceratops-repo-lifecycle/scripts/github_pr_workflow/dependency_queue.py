@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
 import re
 import subprocess
@@ -521,6 +522,7 @@ def build_parser() -> argparse.ArgumentParser:
         "preflight",
         help="Build the snapshot and pre-edit dependency evidence.",
     )
+    preflight_parser.add_argument("--automation-dir", type=pathlib.Path, help="Supply scope and required adapter/output paths from this directory; explicit options override defaults.")
     preflight_parser.add_argument("--org", required=True)
     preflight_parser.add_argument("--exclude-repo", action="append", default=[])
     preflight_parser.add_argument(
@@ -539,6 +541,7 @@ def build_parser() -> argparse.ArgumentParser:
         "finalize",
         help="Wait, merge approved PRs, refresh the queue, and sync checkouts.",
     )
+    finalize_parser.add_argument("--automation-dir", type=pathlib.Path, help="Supply scope and required adapter/output paths from this directory; explicit options override defaults.")
     finalize_parser.add_argument("--approved-pr", action="append", default=[])
     finalize_parser.add_argument("--org")
     finalize_parser.add_argument("--admin", action="store_true")
@@ -556,8 +559,140 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def automation_arguments(arguments: list[str], root: pathlib.Path) -> list[str]:
+    """Bind caller-owned scope and adapter paths inside an automation directory.
+
+    The skill owns execution; the automation supplies data and independent
+    snapshot/sync adapters. Explicit CLI options follow these defaults and win.
+    No installed skill discovery, subprocess launch, or Python path changes occur.
+    """
+
+    scope = json.loads((root / "github-repository-scopes.json").read_text(encoding="utf-8"))
+    owner = scope.get("default_owner") if isinstance(scope, dict) else None
+    if not isinstance(owner, str) or not owner.strip():
+        raise WorkflowError("automation scope must declare a nonempty default_owner")
+    defaults = [
+        "--org", owner.strip(),
+        "--snapshot-helper", str(root / "dependabot-repository-queue-snapshot.py"),
+        "--snapshot", str(root / "dependabot-repository-queue-snapshot.json"),
+    ]
+    if arguments[0] == "preflight":
+        defaults += ["--output", str(root / "dependabot-repository-preflight.json")]
+    else:
+        defaults += [
+            "--sync-helper", str(root / "sync-local-repo-checkouts.py"),
+            "--preflight", str(root / "dependabot-repository-preflight.json"),
+            "--sync-output", str(root / "local-checkout-sync.json"),
+            "--output", str(root / "dependabot-repository-finalize.json"),
+        ]
+    return [arguments[0], *defaults, *arguments[1:]]
+
+
+def failure_partial_path(output: pathlib.Path) -> pathlib.Path:
+    """Return the sole transient file owned by this report's atomic writer."""
+
+    return output.with_name(f".{output.name}.failed.tmp")
+
+
+def clear_automation_report(output: pathlib.Path) -> None:
+    """Retire only the selected report and its own unfinished failure write."""
+
+    output.unlink(missing_ok=True)
+    failure_partial_path(output).unlink(missing_ok=True)
+
+
+def usable_automation_report(output: pathlib.Path, action: str) -> bool:
+    """Accept current handler results, including genuine blocked queues."""
+
+    try:
+        report = json.loads(output.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return False
+    return (
+        isinstance(report, dict)
+        and report.get("schema") == f"ceratops-repo-lifecycle/dependency-{action}.v1"
+        and isinstance(report.get("generated_at"), str)
+        and isinstance(report.get("outcome"), dict)
+        and isinstance(report.get("summary"), dict)
+    )
+
+
+def write_automation_failure(
+    output: pathlib.Path, action: str, started_at: str, exit_code: int, error: str
+) -> None:
+    """Publish a fresh unavailable-state result; never reuse prior queue claims.
+
+    Each automation retains one current report per phase. Startup retires the
+    previous final result and this phase's selected result. Failure writing owns
+    only the adjacent partial, removes it after success, and replaces atomically.
+    A fresh ordinary call clears any partial left by an uncatchable termination.
+    """
+
+    report = {
+        "schema": f"ceratops-repo-lifecycle/dependency-{action}-failure.v1",
+        "generated_at": utc_now(), "started_at": started_at,
+        "outcome": {"routine": False, "attention_required": True, "blocked": True},
+        "summary": {"status": "failed", "queue_state": "unavailable"},
+        "failure": {
+            "phase": action, "target": str(output),
+            "exit_code": exit_code, "message": error,
+        },
+    }
+    output.parent.mkdir(parents=True, exist_ok=True)
+    partial = failure_partial_path(output)
+    try:
+        partial.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(partial, output)
+    finally:
+        partial.unlink(missing_ok=True)
+
+
+def run_automation(arguments: list[str], root: pathlib.Path, output: pathlib.Path) -> int:
+    """Own the automation report boundary around the existing in-process handlers."""
+
+    action = arguments[0]
+    started_at = utc_now()
+    handler_started = False
+    error = ""
+    try:
+        if action == "preflight":
+            clear_automation_report(root / "dependabot-repository-finalize.json")
+        clear_automation_report(output)
+        args = build_parser().parse_args(automation_arguments(arguments, root))
+        handler_started = True
+        exit_code = int(args.handler(args))
+    except SystemExit as exc:
+        exit_code = int(exc.code) if isinstance(exc.code, int) else 1
+        error = f"Dependency CLI argument parsing exited with code {exit_code}; see parser error."
+    except (OSError, ValueError, WorkflowError, subprocess.SubprocessError, KeyboardInterrupt) as exc:
+        exit_code = 130 if isinstance(exc, KeyboardInterrupt) else 1
+        error = (type(exc).__name__ + ": " + re.sub(r"\s+", " ", str(exc)))[:500]
+    if not (handler_started and usable_automation_report(output, action)):
+        exit_code = exit_code or 1
+        error = error or f"Dependency {action} exited with code {exit_code} without a usable result."
+        try:
+            write_automation_failure(output, action, started_at, exit_code, error)
+        except OSError as exc:
+            error = f"{error} Failure report unavailable: {exc}"[:500]
+    if error:
+        print(json.dumps({"status": "error", "result": str(output), "message": error}, separators=(",", ":")), file=sys.stderr)
+    return exit_code
+
+
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    # Help remains a read-only operation even when the preset directory is absent.
+    if not any(value in {"-h", "--help"} for value in arguments):
+        probe = argparse.ArgumentParser(add_help=False)
+        probe.add_argument("action", choices=("preflight", "finalize"))
+        probe.add_argument("--automation-dir", type=pathlib.Path)
+        probe.add_argument("--output", type=pathlib.Path)
+        preset, _ = probe.parse_known_args(arguments)
+        if preset.automation_dir is not None:
+            root = preset.automation_dir.resolve()
+            output = preset.output or root / f"dependabot-repository-{preset.action}.json"
+            return run_automation(arguments, root, output)
+    args = build_parser().parse_args(arguments)
     try:
         return int(args.handler(args))
     except (OSError, ValueError, json.JSONDecodeError, WorkflowError, subprocess.SubprocessError) as exc:

@@ -8,6 +8,7 @@ import runpy
 import subprocess
 import sys
 from typing import Any, Self
+from unittest.mock import Mock
 
 import pytest
 
@@ -1359,3 +1360,140 @@ def test_merge_cli_emits_compact_critical_json(
     )
     assert module.returncode == 0, module.stderr
     assert "GitHub PR workflows" in module.stdout
+
+
+@pytest.fixture
+def dependency_automation(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> Any:
+    queue = load_pr_workflow_module(monkeypatch, "dependency_queue")
+    cli = load_pr_workflow_module(monkeypatch, "cli")
+    root = tmp_path / "automation"
+    root.mkdir()
+    (root / "github-repository-scopes.json").write_text(json.dumps({"default_owner": "scope-owner"}))
+    record = {"generated_at": queue.utc_now(), "outcome": {"blocked": True}, "summary": {"open_alerts": 3}}
+    def report(phase: str) -> dict[str, Any]:
+        return {**record, "schema": f"ceratops-repo-lifecycle/dependency-{phase}.v1"}
+    def call(phase: str, *options: str) -> int:
+        return cli.main([f"dependency-{phase}", "--automation-dir", str(root), *options])
+    return queue, root, report, call
+
+
+@pytest.mark.parametrize("phase", ["preflight", "finalize"])
+@pytest.mark.parametrize("custom", [False, True])
+def test_dependency_automation_public_entrypoint_keeps_scope_options_and_reports(dependency_automation: Any, monkeypatch: pytest.MonkeyPatch, phase: str, custom: bool) -> None:
+    queue, root, report, call = dependency_automation
+    selected = root / ("chosen.json" if custom else f"dependabot-repository-{phase}.json")
+    final = root / "dependabot-repository-finalize.json"
+    options = ["--output", str(selected)] if custom else []
+    if phase == "finalize":
+        options += ["--approved-pr", "https://github.com/scope-owner/repo/pull/1", "--admin", "--wait-seconds", "7"]
+    def handler(args: argparse.Namespace) -> int:
+        assert args.org == "scope-owner" and args.output == selected
+        assert args.snapshot_helper == root / "dependabot-repository-queue-snapshot.py"
+        assert args.snapshot == root / "dependabot-repository-queue-snapshot.json"
+        assert not selected.exists() and not queue.failure_partial_path(selected).exists()
+        if phase == "finalize":
+            assert args.admin and args.wait_seconds == 7 and len(args.approved_pr) == 1
+            assert args.sync_helper == root / "sync-local-repo-checkouts.py"
+        else:
+            assert not final.exists()
+        selected.write_text(json.dumps(report(phase)))
+        return 0
+    monkeypatch.setattr(queue, phase, handler)
+    for _ in range(2):
+        selected.write_text("stale selected result")
+        queue.failure_partial_path(selected).write_text("stale partial")
+        if phase == "preflight":
+            final.write_text("stale final result")
+        assert call(phase, *options) == 0
+        assert json.loads(selected.read_text()) == report(phase)
+
+
+@pytest.mark.parametrize("phase", ["preflight", "finalize"])
+@pytest.mark.parametrize("failure", ["absent", "malformed", "error", "blocked", "before", "after", "scope", "arguments", "unwritable"])
+def test_dependency_automation_failure_boundaries_preserve_current_results(dependency_automation: Any, monkeypatch: pytest.MonkeyPatch, phase: str, failure: str, capsys: pytest.CaptureFixture[str]) -> None:
+    queue, root, report, call = dependency_automation
+    output = root / f"dependabot-repository-{phase}.json"
+    def handler(args: argparse.Namespace) -> int:
+        if failure == "before":
+            raise KeyboardInterrupt
+        if failure in {"blocked", "after"}:
+            output.write_text(json.dumps(report(phase)))
+        if failure == "after":
+            raise KeyboardInterrupt
+        if failure == "malformed":
+            output.write_text("{")
+        if failure == "error":
+            raise OSError("specific failure evidence")
+        return 1 if failure == "blocked" else 0
+    monkeypatch.setattr(queue, phase, handler)
+    if failure == "scope":
+        (root / "github-repository-scopes.json").write_text("{}")
+    if failure == "unwritable":
+        monkeypatch.setattr(queue, "write_automation_failure", Mock(side_effect=OSError("disk full")))
+    for _ in range(2):
+        output.write_text(json.dumps(report(phase)))
+        assert call(phase, *(["--unknown-option"] if failure == "arguments" else [])) == (130 if failure in {"before", "after"} else 2 if failure == "arguments" else 1)
+        if failure == "unwritable":
+            assert not output.exists() and "disk full" in capsys.readouterr().err
+            continue
+        result = json.loads(output.read_text())
+        if failure in {"blocked", "after"}:
+            assert result == report(phase)
+        else:
+            assert result["summary"]["queue_state"] == "unavailable"
+            assert result["failure"]["phase"] == phase and result["failure"]["target"] == str(output)
+        assert not queue.failure_partial_path(output).exists()
+
+
+@pytest.mark.parametrize("phase", ["preflight", "finalize"])
+@pytest.mark.parametrize("target_name", ["output", "partial", "final", "final_partial"])
+@pytest.mark.parametrize("after", [False, True])
+def test_dependency_automation_interrupted_retirement_converges(dependency_automation: Any, monkeypatch: pytest.MonkeyPatch, phase: str, target_name: str, after: bool) -> None:
+    queue, root, report, call = dependency_automation
+    output = root / f"dependabot-repository-{phase}.json"
+    final = root / "dependabot-repository-finalize.json"
+    target = {"output": output, "partial": queue.failure_partial_path(output), "final": final, "final_partial": queue.failure_partial_path(final)}[target_name]
+    original = pathlib.Path.unlink
+    output.write_text(json.dumps(report(phase)))
+    target.write_text("stale")
+    interrupted = False
+    def unlink(path: pathlib.Path, *args: Any, **kwargs: Any) -> None:
+        nonlocal interrupted
+        if path == target and not interrupted:
+            interrupted = True
+            if after:
+                original(path, *args, **kwargs)
+            raise KeyboardInterrupt
+        original(path, *args, **kwargs)
+    monkeypatch.setattr(queue, phase, lambda args: 0)
+    with monkeypatch.context() as scoped:
+        scoped.setattr(pathlib.Path, "unlink", unlink)
+        assert call(phase) == 130
+    assert json.loads(output.read_text())["summary"]["queue_state"] == "unavailable"
+    assert call(phase) == 1 and not queue.failure_partial_path(output).exists()
+
+
+@pytest.mark.parametrize("effect", ["mkdir", "write", "replace", "cleanup"])
+@pytest.mark.parametrize("after", [False, True])
+def test_dependency_automation_interrupted_failure_publication_converges(dependency_automation: Any, monkeypatch: pytest.MonkeyPatch, effect: str, after: bool) -> None:
+    queue, root, _report, call = dependency_automation
+    output = root / "report" / "final.json"
+    owner, name = (queue.os, "replace") if effect == "replace" else (pathlib.Path, {"mkdir": "mkdir", "write": "write_text", "cleanup": "unlink"}[effect])
+    original = getattr(owner, name)
+    interrupted = False
+    def operation(*args: Any, **kwargs: Any) -> Any:
+        nonlocal interrupted
+        if not interrupted:
+            interrupted = True
+            if after:
+                original(*args, **kwargs)
+            raise KeyboardInterrupt
+        return original(*args, **kwargs)
+    with monkeypatch.context() as scoped:
+        scoped.setattr(owner, name, operation)
+        with pytest.raises(KeyboardInterrupt):
+            queue.write_automation_failure(output, "finalize", queue.utc_now(), 1, "failed")
+    monkeypatch.setattr(queue, "finalize", lambda args: 0)
+    assert call("finalize", "--output", str(output)) == 1
+    assert json.loads(output.read_text())["failure"]["exit_code"] == 1
+    assert not queue.failure_partial_path(output).exists()
