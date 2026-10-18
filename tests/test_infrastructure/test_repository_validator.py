@@ -483,7 +483,9 @@ def test_repository_entrypoints_run_through_uv(
         script.write_text(template.replace("__TEST_TARGETS__", "[]").replace("__CHECK_DEFINITIONS__", "[]"), encoding="utf-8")
         project_template = ROOT / "skills/ceratops-repo-lifecycle/references/templates/validation-pyproject.toml.tmpl"
         (scripts / "pyproject.toml").write_text(
-            project_template.read_text(encoding="utf-8").replace("__DEPENDENCIES__", "[]"), encoding="utf-8",
+            project_template.read_text(encoding="utf-8").replace(
+                "__DEPENDENCIES__", json.dumps(metadata["project"]["dependencies"]),
+            ), encoding="utf-8",
         )
         locked = subprocess.run(["uv", "lock", "--project", str(scripts)], capture_output=True, text=True)
         assert locked.returncode == 0, locked.stderr
