@@ -147,6 +147,20 @@ class DependencyFinalizationTests(unittest.TestCase):
         self.assertEqual(payload["summary"]["blocked_prs"], 2)
         self.assertTrue(all("release checks failed" in b["message"] for b in payload["blockers"]))
 
+    def test_source_review_delegates_admin_policy_without_merging(self):
+        head = "a" * 40
+        url = "https://github.com/owner/repo/pull/1"
+        for admin in (False, True):
+            with (
+                self.subTest(admin=admin),
+                mock.patch.object(merge, "_validate_readiness", return_value={"head_oid": head, "base": "main"}) as gate,
+                mock.patch.object(codex_review, "wait_for_codex_threads", return_value={"head_oid": head}),
+                mock.patch.object(flow, "run_command") as command,
+            ):
+                flow.review_dependency_source("owner/repo", 1, ROOT, head, admin=admin, wait_seconds=0, interval_seconds=1)
+                self.assertEqual(gate.call_args_list, [mock.call(url, ROOT, allow_admin_review_bypass=admin)] * 2)
+                command.assert_not_called()
+
     def test_source_review_checks_the_exact_head_before_and_after_wait(self):
         head = "a" * 40
         with (
@@ -297,10 +311,13 @@ class DependencyPublicationTests(unittest.TestCase):
 
             def publish(arguments, cwd):
                 def ship():
+                    self.assertEqual(pathlib.Path(arguments[1]), GH_SCRIPTS / "promote-repository.py")
+                    self.assertEqual(cwd, primary)
                     self.assertIn("--ship-after-promotion", arguments)
                     self.assertEqual(arguments[arguments.index("--release-branch") + 1], "release/local")
-                    self.git(cwd, "push", "origin", "HEAD:main")
-                    tip = self.git(cwd, "rev-parse", "HEAD")
+                    source = arguments[arguments.index("--source-branch") + 1]
+                    self.git(cwd, "push", "origin", f"{source}:main")
+                    tip = self.git(cwd, "rev-parse", source)
                     self.git(primary, "update-ref", "refs/heads/release/local", tip)
                     publications.append(tip)
                     return 0, {"status": "ready", "ship": {"status": "shipped"}}

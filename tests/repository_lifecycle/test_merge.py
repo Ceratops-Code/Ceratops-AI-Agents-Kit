@@ -563,27 +563,6 @@ def test_gradle_wrapper_context_requires_unambiguous_checkout_bound_files(
     assert unsupported["ecosystem"] == "unknown"
 
 
-def test_dependency_merge_runs_absolute_entrypoint_from_target_checkout(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    finalization = load_pr_workflow_module(monkeypatch, "dependency_finalization")
-    calls = []
-
-    def run(command: list[str], **kwargs: Any):
-        calls.append((command, kwargs))
-        return subprocess.CompletedProcess(command, 0, '{"status":"merged"}', "")
-
-    monkeypatch.setattr(finalization, "run_command", run)
-    result, error = finalization.merge_pr(
-        "owner/repo", 1, tmp_path, "merge",
-        expected_head="a" * 40, admin=False, wait_seconds=0, interval_seconds=1,
-    )
-    assert error is None and result["status"] == "merged"
-    assert pathlib.Path(calls[0][0][1]) == PR_WORKFLOW_ENTRYPOINT
-    assert calls[0][1]["cwd"] == tmp_path
-    assert "--expected-head" in calls[0][0]
-
-
 @pytest.mark.parametrize("enabled", [True, False])
 def test_read_admin_enforcement_preserves_boolean_state(
     tmp_path: pathlib.Path,
