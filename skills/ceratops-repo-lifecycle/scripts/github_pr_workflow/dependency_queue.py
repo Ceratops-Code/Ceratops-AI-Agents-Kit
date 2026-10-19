@@ -543,6 +543,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     finalize_parser.add_argument("--automation-dir", type=pathlib.Path, help="Supply scope and required adapter/output paths from this directory; explicit options override defaults.")
     finalize_parser.add_argument("--approved-pr", action="append", default=[])
+    finalize_parser.add_argument("--task-name", default="dependency-maintenance", help="Canonical thread worktree and branch identity.")
+    finalize_parser.add_argument("--include-unpublished-release", action="append", default=[], metavar="OWNER/REPO=COMMIT", help="Explicit authority to include unrelated work at this exact release commit.")
     finalize_parser.add_argument("--org")
     finalize_parser.add_argument("--admin", action="store_true")
     finalize_parser.add_argument("--merge-method", choices=("auto", "merge", "squash", "rebase"), default="auto")
@@ -580,6 +582,7 @@ def automation_arguments(arguments: list[str], root: pathlib.Path) -> list[str]:
         defaults += ["--output", str(root / "dependabot-repository-preflight.json")]
     else:
         defaults += [
+            "--task-name", root.name,
             "--sync-helper", str(root / "sync-local-repo-checkouts.py"),
             "--preflight", str(root / "dependabot-repository-preflight.json"),
             "--sync-output", str(root / "local-checkout-sync.json"),

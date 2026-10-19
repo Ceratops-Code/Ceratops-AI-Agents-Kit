@@ -22,6 +22,16 @@ or another governing contract.
 | `ceratops-task-lifecycle` | Route failed-fix-loop breaks, same-thread task resume, whole-task handoff, aggregate worktree status tables, and closure checks across action references. |
 | `ceratops-code-consistency-audit` | Audit merged refactors for contradictions, docs drift, comment sufficiency, stale follow-through, and merged-only edge cases. |
 
+Dependency queue finalization stages approved PR heads together in a thread
+worktree and publishes through `release/local` using the existing promotion
+and shipping workflow. It processes every eligible update in a repository;
+changed PR heads still need new preflight approval. The
+`--include-unpublished-release OWNER/REPO=COMMIT` option carries explicit
+authority for unrelated work at that exact release commit. Fresh calls inspect
+current Git and GitHub state after interruption, without replaying a completed
+publication. Automation scope, snapshot/sync adapters and report paths remain
+caller-owned through `--automation-dir`.
+
 ## Layout
 
 The independent [MCP server deployment manager](mcp-servers/ceratops_mcp_server_manager/README.md)
