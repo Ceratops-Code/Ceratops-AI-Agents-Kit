@@ -354,7 +354,7 @@ def test_dependency_preflight_collects_evidence_after_rebase_wait(
 
     monkeypatch.setattr(queue, "exact_ci_evidence", ci)
     monkeypatch.setattr(queue, "registry_evidence", lambda _: {"status": "ok"})
-    annotations = {
+    annotations: dict[str, Any] = {
         "status": "unavailable" if annotation_state == "unavailable" else "ok",
         "counts": {"warning": int(annotation_state == "warning"), "failure": 0, "notice": 1},
         "annotations": [], "error": "GitHub messages unavailable",
@@ -431,7 +431,7 @@ def test_dependency_ci_annotations_keep_successful_job_warnings_and_read_failure
                    {"annotation_level": "failure", "message": "failed input"}]
     if mode == "overflow":
         annotations = [{**warning, "message": "x" * 2001}] * 101
-    check = {"id": 42, "head_sha": "b" * 40 if mode == "wrong_head" else head,
+    check: dict[str, Any] = {"id": 42, "head_sha": "b" * 40 if mode == "wrong_head" else head,
              "name": "ci", "conclusion": "success", "html_url": "https://github.com/owner/repo/runs/42",
              "output": {"annotations_count": len(annotations)}}
     calls: list[list[str]] = []
