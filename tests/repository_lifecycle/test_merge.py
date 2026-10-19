@@ -302,8 +302,11 @@ def test_dependency_selected_cleanup_reuses_manager_and_preserves_unapproved_wor
 
 
 @pytest.mark.parametrize("wait_status", ["ready", "timed_out", "failed"])
+@pytest.mark.parametrize("annotation_state", ["clear", "warning", "unavailable"])
+@pytest.mark.parametrize("interruption", ["none", "before_write", "after_write"])
 def test_dependency_preflight_collects_evidence_after_rebase_wait(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, wait_status: str,
+    annotation_state: str, interruption: str,
 ) -> None:
     queue = load_pr_workflow_module(monkeypatch, "dependency_queue")
     common = load_pr_workflow_module(monkeypatch, "dependency_common")
@@ -351,6 +354,17 @@ def test_dependency_preflight_collects_evidence_after_rebase_wait(
 
     monkeypatch.setattr(queue, "exact_ci_evidence", ci)
     monkeypatch.setattr(queue, "registry_evidence", lambda _: {"status": "ok"})
+    annotations = {
+        "status": "unavailable" if annotation_state == "unavailable" else "ok",
+        "counts": {"warning": int(annotation_state == "warning"), "failure": 0, "notice": 1},
+        "annotations": [], "error": "GitHub messages unavailable",
+    }
+
+    def messages(repo: str, head: str):
+        assert repo == "owner/repo" and head == new["head_oid"]
+        return annotations
+
+    monkeypatch.setattr(queue, "fetch_ci_annotations", messages)
 
     def tree(checkout: pathlib.Path, update: dict[str, Any], files: list[Any], alerts: list[Any]):
         assert files == new["files"]
@@ -368,6 +382,20 @@ def test_dependency_preflight_collects_evidence_after_rebase_wait(
         "--workspace-root", str(tmp_path),
         "--checkout", f"owner/repo={tmp_path}",
     ])
+    write = queue.write_json
+
+    def interrupted_write(path: pathlib.Path, payload: dict[str, Any]):
+        if interruption == "after_write":
+            write(path, payload)
+        raise RuntimeError("interrupted report write")
+
+    if interruption != "none":
+        monkeypatch.setattr(queue, "write_json", interrupted_write)
+        with pytest.raises(RuntimeError, match="interrupted report write"):
+            queue.preflight(args)
+        assert output.exists() == (interruption == "after_write")
+        monkeypatch.setattr(queue, "write_json", write)
+        order.clear()
     assert queue.preflight(args) == 0
     payload = json.loads(output.read_text(encoding="utf-8"))
     repository = payload["repositories"][0]
@@ -375,8 +403,96 @@ def test_dependency_preflight_collects_evidence_after_rebase_wait(
     result_pr = repository["pull_requests"][0]
     assert result_pr["live"]["head_oid"] == "b" * 40
     assert result_pr["decision_gates"]["rebase_repair_required"] == (wait_status == "timed_out")
-    assert payload["outcome"]["blocked"] == (wait_status == "failed")
+    assert result_pr["ci_annotations"] == annotations
+    assert result_pr["decision_gates"]["ci_warning_review_required"] == (annotation_state == "warning")
+    assert payload["summary"]["ci_warning_annotations"] == int(annotation_state == "warning")
+    assert payload["summary"]["ci_annotation_reads_unavailable"] == int(annotation_state == "unavailable")
+    assert payload["outcome"]["blocked"] == (wait_status == "failed" or annotation_state == "unavailable")
     assert order == ["wait", "ci", "tree"]
+    order.clear()
+    assert queue.preflight(args) == 0
+    repeated = json.loads(output.read_text(encoding="utf-8"))
+    assert repeated["repositories"] == payload["repositories"]
+    assert repeated["summary"] == payload["summary"]
+
+
+@pytest.mark.parametrize(
+    "mode", ["passed", "empty", "overflow", "denied", "timeout", "bad_json", "wrong_head",
+             "missing_page", "missing_annotations", "bad_annotation", "bad_count"],
+)
+def test_dependency_ci_annotations_keep_successful_job_warnings_and_read_failures(
+    monkeypatch: pytest.MonkeyPatch, mode: str,
+) -> None:
+    evidence = load_pr_workflow_module(monkeypatch, "dependency_evidence")
+    head = "a" * 40
+    warning = {"annotation_level": "warning", "message": "deprecated input", "path": "ci.yml",
+               "start_line": 7, "end_line": 8, "title": "Deprecation"}
+    annotations = [warning, {"annotation_level": "notice", "message": "runner update"},
+                   {"annotation_level": "failure", "message": "failed input"}]
+    if mode == "overflow":
+        annotations = [{**warning, "message": "x" * 2001}] * 101
+    check = {"id": 42, "head_sha": "b" * 40 if mode == "wrong_head" else head,
+             "name": "ci", "conclusion": "success", "html_url": "https://github.com/owner/repo/runs/42",
+             "output": {"annotations_count": len(annotations)}}
+    calls: list[list[str]] = []
+
+    def query(command: list[str], **kwargs: Any):
+        calls.append(command)
+        assert command[-2:] == ["--paginate", "--slurp"]
+        assert 0 < kwargs["timeout"] <= 30
+        if "/commits/" in command[2]:
+            assert f"/commits/{head}/" in command[2]
+            payload: Any = [{"total_count": 0 if mode == "empty" else 1,
+                             "check_runs": [] if mode in {"empty", "missing_page"} else [check]}]
+            if mode == "bad_count":
+                check["output"]["annotations_count"] = -1
+        else:
+            assert command[2] == "repos/owner/repo/check-runs/42/annotations?per_page=100"
+            if mode == "timeout":
+                raise subprocess.TimeoutExpired(command, 30)
+            if mode == "denied":
+                return subprocess.CompletedProcess(command, 1, "", "HTTP 403")
+            if mode == "bad_json":
+                return subprocess.CompletedProcess(command, 0, "broken JSON", "")
+            payload = [annotations[:100], annotations[100:]] if mode == "overflow" else [annotations]
+            if mode == "missing_annotations":
+                payload = [[]]
+            elif mode == "bad_annotation":
+                payload = [[{"annotation_level": "surprise", "message": "bad"}]]
+        return subprocess.CompletedProcess(command, 0, json.dumps(payload), "")
+
+    monkeypatch.setattr(evidence, "run_command", query)
+    first = evidence.fetch_ci_annotations("owner/repo", head)
+    repeated = evidence.fetch_ci_annotations("owner/repo", head)
+    assert repeated == first
+    assert first["head_oid"] == head
+    if mode in {"passed", "overflow"}:
+        assert first["status"] == "ok"
+        assert first["counts"]["warning"] == (101 if mode == "overflow" else 1)
+        assert first["annotations"][0]["check_conclusion"] == "success"
+        assert first["annotations"][0]["path"] == "ci.yml"
+        assert first["annotations"][0]["start_line"] == 7
+        assert first["annotations"][0]["check_run_id"] == 42
+        if mode == "overflow":
+            assert len(first["annotations"]) == 50 and first["omitted_annotations"] == 51
+            assert first["annotations"][0]["message_truncated"]
+            assert len(first["annotations"][0]["message"]) == 2000
+        else:
+            assert first["counts"] == {"warning": 1, "failure": 1, "notice": 1}
+            assert len(first["annotations"]) == 2
+    elif mode == "empty":
+        assert first["status"] == "ok" and first["check_runs"] == 0
+        assert first["counts"] == {"warning": 0, "failure": 0, "notice": 0}
+        assert len(calls) == 2
+    else:
+        assert first["status"] == "unavailable" and first["error"]
+        if mode == "denied":
+            failure = json.loads(first["error"])
+            assert failure["exit_status"] == 1 and failure["stderr"] == "HTTP 403"
+            assert failure["stdout"] == "<absent>" and failure["invocation"][0] == "gh"
+    calls.clear()
+    assert evidence.fetch_ci_annotations("owner/repo", "")["status"] == "unavailable"
+    assert not calls
 
 
 @pytest.mark.parametrize(

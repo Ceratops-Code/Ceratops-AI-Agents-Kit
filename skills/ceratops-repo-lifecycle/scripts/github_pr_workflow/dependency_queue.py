@@ -31,6 +31,7 @@ from .dependency_evidence import (
     branch_freshness,
     dependency_tree_evidence,
     exact_ci_evidence,
+    fetch_ci_annotations,
     fetch_pr_batch,
     fetch_pr_body,
     minimum_patched_version,
@@ -233,7 +234,7 @@ def preflight(args: argparse.Namespace) -> int:
         if isinstance(pr, dict):
             prs_by_repo[str(pr.get("repo") or "").lower()].append(pr)
 
-    repositories = []
+    repositories: list[dict[str, Any]] = []
     for repo in queued_repositories(snapshot):
         full_name = str(repo.get("repo") or repo.get("full_name") or "")
         key = full_name.lower()
@@ -344,6 +345,12 @@ def preflight(args: argparse.Namespace) -> int:
                 )
                 live = {}
             changed_files = live.get("files", [])
+            ci_annotations = fetch_ci_annotations(full_name, str(live.get("head_oid") or ""))
+            if ci_annotations["status"] != "ok":
+                repo_blockers.append({
+                    "repo": full_name, "pr": number, "check": "ci_annotations_preflight",
+                    "message": ci_annotations.get("error") or "CI annotations unavailable",
+                })
             title = str(live.get("title") or pr.get("title") or "")
             updates = [parse_update(title, changed_files, repo_alerts)]
             if not updates[0].get("package") and live and isinstance(number, int):
@@ -442,7 +449,11 @@ def preflight(args: argparse.Namespace) -> int:
                     "update": update_summary,
                     "registry": registry,
                     "dependency_tree": dependency_tree,
+                    "ci_annotations": ci_annotations,
                     "decision_gates": {
+                        "ci_warning_review_required": bool(
+                            ci_annotations["counts"]["warning"] or ci_annotations["counts"]["failure"]
+                        ),
                         "rebase_repair_required": (
                             as_object(live.get("rebase_wait")).get("status") == "timed_out"
                         ),
@@ -490,6 +501,18 @@ def preflight(args: argparse.Namespace) -> int:
         ),
         "scoped_preflight_blockers": sum(
             blocker_scope(item) != "global" for item in blockers
+        ),
+        "ci_warning_annotations": sum(
+            pr["ci_annotations"]["counts"]["warning"]
+            for repo in repositories for pr in repo["pull_requests"]
+        ),
+        "ci_failure_annotations": sum(
+            pr["ci_annotations"]["counts"]["failure"]
+            for repo in repositories for pr in repo["pull_requests"]
+        ),
+        "ci_annotation_reads_unavailable": sum(
+            pr["ci_annotations"]["status"] != "ok"
+            for repo in repositories for pr in repo["pull_requests"]
         ),
     }
     queue_present = bool(snapshot.get("outcome", {}).get("queue_present"))
