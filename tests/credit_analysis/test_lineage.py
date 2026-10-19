@@ -213,6 +213,23 @@ def test_misunderstanding_reconstructed_copies_and_current_reader_versions(tmp_p
     assert len(result) == 1
     assert result[0]["text"] == "What?"
     assert result[0]["source_versions"][0]["text"] == "Old request"
+    multiple = []
+    for source_format in ("app", "rollout"):
+        for index, text in enumerate(("What?", "Approve")):
+            record = audit_sources.message(task, "user", text, "2026-09-01T00:00:00Z", turn,
+                                           f"{source_format}-{index}", f"{source_format}-multi:{index}", index)
+            record["source_format"] = source_format
+            multiple.append(record)
+    merged = audit_sources.unique_records(multiple)
+    assert [record["text"] for record in merged] == ["What?", "Approve"]
+    assert all(len(record["source_versions"]) == 1 for record in merged)
+    repeated = []
+    for source_format, index in (("app", 0), ("app", 1), ("rollout", 0)):
+        record = audit_sources.message(task, "user", "What?", "2026-09-01T00:00:00Z", turn,
+                                       f"{source_format}-{index}", f"{source_format}-repeated:{index}", index)
+        record["source_format"] = source_format
+        repeated.append(record)
+    assert all(not record.get("source_versions") for record in audit_sources.unique_records(repeated))
     annotation = '<!-- <response-annotations>[]</response-annotations> -->\n1. What?\n2. *Quoted WTF*\n ──────\nPlease proceed.'
     visible, _, _ = audit_sources.visible_text(annotation)
     assert "1. What?" in visible and "Quoted WTF" not in visible

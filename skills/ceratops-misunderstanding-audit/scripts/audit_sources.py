@@ -344,8 +344,18 @@ def unique_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         # Preserve raw edits/retries as versions, not extra logical messages.
         matches = app_users.get((record["task"]["id"], record["turn_id"]), [])
         by_item = {item["item_id"]: item for item in matches}
-        if record.get("source_format") == "rollout" and record["role"] == "user" and not record["injected"] and len(by_item) == 1:
+        owner = by_item.get(record["item_id"])
+        if owner is None and len(by_item) == 1:
             owner = next(iter(by_item.values()))
+        if owner is None:
+            # A turn can contain a request plus several approval replies. The
+            # app may replace their item IDs; one exact text match within this
+            # same task/turn establishes its owner. Repeated equal text remains
+            # ambiguous and is not merged by this fallback.
+            same_text = [item for item in by_item.values() if item["text"] == record["text"]]
+            if len(same_text) == 1:
+                owner = same_text[0]
+        if record.get("source_format") == "rollout" and record["role"] == "user" and not record["injected"] and owner is not None:
             owner.setdefault("source_versions", []).append({key: record[key] for key in ("text", "visible_text", "timestamp", "item_id", "locations")})
             owner["locations"].extend(record["locations"])
         else:
