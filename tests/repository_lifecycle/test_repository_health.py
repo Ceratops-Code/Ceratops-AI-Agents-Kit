@@ -43,11 +43,14 @@ repository_scopes = sys.modules['collect_repository_targets']
 class RepositoryHealthTests(unittest.TestCase):
     """Exercise scope selection, contract isolation, evidence, and exact cleanup."""
 
+    git: str
+
     @classmethod
     def setUpClass(cls) -> None:
-        cls.git = shutil.which("git")
-        if cls.git is None:
+        git = shutil.which("git")
+        if git is None:
             raise unittest.SkipTest("Git is required for repository preflight tests")
+        cls.git = git
 
 
     def init_repo(self, parent: pathlib.Path, name: str = "repository") -> pathlib.Path:

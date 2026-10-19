@@ -42,11 +42,14 @@ preflight = load_module('prepare_repository_audit', PREFLIGHT_PATH)
 class RepositoryAuditPreflightTests(unittest.TestCase):
     """Exercise filesystem safety, runtime discovery, and declared checks."""
 
+    git: str
+
     @classmethod
     def setUpClass(cls) -> None:
-        cls.git = shutil.which("git")
-        if cls.git is None:
+        git = shutil.which("git")
+        if git is None:
             raise unittest.SkipTest("Git is required for repository preflight tests")
+        cls.git = git
 
 
     def init_repo(self, parent: pathlib.Path, name: str = "repository") -> pathlib.Path:

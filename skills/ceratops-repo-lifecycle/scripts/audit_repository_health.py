@@ -862,7 +862,7 @@ def compact_contract_result(
     findings: list[dict[str, Any]] = []
     approved_drift_count = 0
     result_counts: dict[str, Any] = {}
-    community_profile = {
+    community_profile: dict[str, int | None] = {
         "health_percentage": None,
         "target_percentage": None,
     }

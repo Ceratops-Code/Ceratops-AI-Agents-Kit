@@ -22,10 +22,12 @@ import stat
 import subprocess
 import sys
 from collections.abc import Callable, Mapping, Sequence
-from typing import Any
+from types import ModuleType
+from typing import Any, NoReturn
 
 try:
-    import tomllib
+    import tomllib as _tomllib
+    tomllib: ModuleType | None = _tomllib
 except ModuleNotFoundError:  # pragma: no cover - exercised by the bootstrap gate.
     tomllib = None
 
@@ -116,7 +118,7 @@ class PreflightError(RuntimeError):
 class CompactArgumentParser(argparse.ArgumentParser):
     """Convert argparse failures into the helper's JSON error contract."""
 
-    def error(self, message: str) -> None:
+    def error(self, message: str) -> NoReturn:
         raise PreflightError("invalid_arguments", message, exit_code=2)
 
 
@@ -601,7 +603,7 @@ def pyproject_validators(path: pathlib.Path, source: str) -> list[dict[str, obje
         table = nested_table(data, table_path)
         if table is not None:
             cwd = config_cwd(source)
-            selected_argv = argv
+            selected_argv: tuple[str, ...] = argv
             if name == "mypy":
                 cwd, selected_argv = mypy_execution(path, source, table)
             results.append(
@@ -613,8 +615,8 @@ def pyproject_validators(path: pathlib.Path, source: str) -> list[dict[str, obje
                     argv=selected_argv,
                 )
             )
-    for table_path, prefix in PYPROJECT_TASK_TABLES:
-        table = nested_table(data, table_path)
+    for task_table_path, prefix in PYPROJECT_TASK_TABLES:
+        table = nested_table(data, task_table_path)
         if table is None:
             continue
         for name in sorted(table):
