@@ -219,7 +219,7 @@ def test_promote_repository_requires_an_explicit_deployment_choice(
         assert not log.exists()
     elif expected_handoff is not None:
         assert finalized.returncode == 1
-        assert "not a successful" in json.loads(finalized.stderr)["message"]
+        assert "lacks bound completion evidence" in json.loads(finalized.stderr)["message"]
         assert result_file.read_bytes() == data
         assert log.read_text(encoding="utf-8") == "no-base\n"
     else:
@@ -676,10 +676,12 @@ def test_completion_receipt_requires_unique_promotion_binding_batch() -> None:
             parse({"promotion": invalid})
 
 
+@pytest.mark.parametrize("record_kind", ["ready", "pending", "pending-command"])
 def test_managed_installer_finalizes_multiple_handoffs_once(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    record_kind: str,
 ) -> None:
     from tests.skill_lifecycle.support import load_runtime_installer
     from tests.support.repositories import create_compatible_repo
@@ -713,6 +715,11 @@ def test_managed_installer_finalizes_multiple_handoffs_once(
         }
         for skill in skills
     }
+    pending = record_kind != "ready"
+    if record_kind == "pending-command":
+        applications["beta-tool-deployment"]["actions"]["install"]["steps"].insert(0, {
+            "run": [sys.executable, "-c", "raise SystemExit('unexecuted repository command')"],
+        })
     write_sdlc_contract(repo, deliverables={"apps": applications})
     assert run_git(repo, "add", ".").returncode == 0
     assert run_git(repo, "commit", "-m", "managed deployment batch").returncode == 0
@@ -731,8 +738,12 @@ def test_managed_installer_finalizes_multiple_handoffs_once(
         "approved",
         "--result-file",
         str(record),
-        "--no-run-operation",
     ]
+    if pending:
+        for operation in operations:
+            promotion_command.extend(("--run-operation", operation))
+    else:
+        promotion_command.append("--no-run-operation")
     promoted = subprocess.run(
         promotion_command,
         env=environment,
@@ -740,12 +751,21 @@ def test_managed_installer_finalizes_multiple_handoffs_once(
         text=True,
         check=False,
     )
-    assert promoted.returncode == 0, promoted.stderr
-    promotion = _write_saved_handoff_record(record, [
-        {"status": "advisory", "operation": operation, "steps": [],
-         "handoff": "ceratops-skill-lifecycle/deploy", "handoff_inputs": {"skill": skill}}
-        for operation, skill in zip(operations, skills, strict=True)
-    ])
+    if pending:
+        assert promoted.returncode == 1, promoted.stdout
+        saved = json.loads(record.read_text(encoding="utf-8"))
+        assert saved["status"] == "handoff_required"
+        assert saved["operations"]["completed_operations"] == []
+        assert saved["operations"]["pending_operations"] == operations
+        assert [item["status"] for item in saved["operations"]["results"]] == ["handoff_required"] * (1 if record_kind == "pending-command" else 2)
+        promotion = saved["promotion"]
+    else:
+        assert promoted.returncode == 0, promoted.stderr
+        promotion = _write_saved_handoff_record(record, [
+            {"status": "advisory", "operation": operation, "steps": [],
+             "handoff": "ceratops-skill-lifecycle/deploy", "handoff_inputs": {"skill": skill}}
+            for operation, skill in zip(operations, skills, strict=True)
+        ])
     destination = tmp_path / "installed"
     loaded = load_runtime_installer()
 
@@ -767,6 +787,32 @@ def test_managed_installer_finalizes_multiple_handoffs_once(
         for operation in selected_operations:
             arguments.extend(("--operation", operation))
         return arguments
+
+    if record_kind == "pending-command":
+        original = record.read_bytes()
+        assert loaded["main"](installer_arguments(*operations)) == 1
+        assert "selected pending skill deployment" in json.loads(capsys.readouterr().err)["reason"]
+        finalizer = runpy.run_path(str(PROMOTE_REPOSITORY))
+        with pytest.raises(finalizer["PromotionError"], match="missing or ambiguous"):
+            finalizer["_completed_deployment"](saved, promotion["head"])
+        assert record.read_bytes() == original and not destination.exists()
+        return
+
+    if pending:
+        original = record.read_bytes()
+        for fault in ("failure", "commit", "unfinished"):
+            altered = json.loads(original)
+            if fault == "failure":
+                altered["status"] = "operation_failed"
+            elif fault == "commit":
+                altered["promotion"]["head"] = "0" * 40
+            else:
+                altered["operations"]["results"][0]["status"] = "operation_failed"
+            record.write_text(json.dumps(altered), encoding="utf-8")
+            assert loaded["main"](installer_arguments(*operations)) == 1
+            assert json.loads(capsys.readouterr().err)["status"] == "error"
+            assert not destination.exists()
+        record.write_bytes(original)
 
     assert loaded["main"](installer_arguments(operations[0], operations[0])) == 1
     duplicate = json.loads(capsys.readouterr().err)

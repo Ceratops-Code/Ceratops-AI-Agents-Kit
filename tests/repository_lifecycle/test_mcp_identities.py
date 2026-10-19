@@ -356,10 +356,21 @@ def _receipt_finalizer_arguments(case):
 
 
 @pytest.mark.parametrize("name", ["source_search_mcp", "sample-mcp-server"])
+@pytest.mark.parametrize("pending", [False, True])
 @pytest.mark.parametrize("interruption", [None, "replace-before", "replace-after",
                                           "unlink-before", "unlink-after"])
-def test_mcp_receipt_cli_survives_repeat_and_effect_interruptions(tmp_path, name, interruption):
+def test_mcp_receipt_cli_survives_repeat_and_effect_interruptions(tmp_path, name, interruption, pending):
     case = _make_mcp_receipt_case(tmp_path, name)
+    if pending:
+        promotion = json.loads(case.record.read_text(encoding="utf-8"))
+        operations = promotion.pop("operations")
+        operations.update(status="handoff_required", completed_operations=[],
+                          pending_operations=[case.operation])
+        operations["results"][0]["status"] = "handoff_required"
+        case.record.write_text(json.dumps({
+            "status": "handoff_required", "phase": "deployment",
+            "promotion": promotion, "operations": operations,
+        }), encoding="utf-8")
     writer = ROOT / "skills/ceratops-mcp-server-lifecycle/scripts/install-mcp-server.py"
     finalizer = ROOT / "skills/ceratops-repo-lifecycle/scripts/promote-repository.py"
     accepted = (case.current.read_bytes(), case.accepted.read_bytes())
@@ -393,11 +404,56 @@ def test_mcp_receipt_cli_survives_repeat_and_effect_interruptions(tmp_path, name
     assert case.manager.exists() and case.output.exists()
 
 
+@pytest.mark.parametrize("fault", ["failure", "commit", "route", "duplicate", "selection", "unfinished"])
+def test_mcp_pending_handoff_rejects_unrelated_or_failed_work(tmp_path, fault):
+    case = _make_mcp_receipt_case(tmp_path, "source_search_mcp")
+    promotion = json.loads(case.record.read_text(encoding="utf-8"))
+    operations = promotion.pop("operations")
+    operations.update(status="handoff_required", completed_operations=[],
+                      pending_operations=[case.operation])
+    outcome = operations["results"][0]
+    outcome["status"] = "handoff_required"
+    record = {"status": "handoff_required", "phase": "deployment",
+              "promotion": promotion, "operations": operations}
+    if fault == "failure":
+        record["status"] = "operation_failed"
+    elif fault == "commit":
+        promotion["head"] = "0" * 40
+    elif fault == "route":
+        outcome["handoff"] = "ceratops-skill-lifecycle/deploy"
+    elif fault == "duplicate":
+        operations["results"].append(dict(outcome))
+    elif fault == "selection":
+        operations["pending_operations"] = ["another-operation"]
+    else:
+        outcome["status"] = "operation_failed"
+    case.record.write_text(json.dumps(record), encoding="utf-8")
+    original = case.record.read_bytes()
+    writer = ROOT / "skills/ceratops-mcp-server-lifecycle/scripts/install-mcp-server.py"
+    finalizer = ROOT / "skills/ceratops-repo-lifecycle/scripts/promote-repository.py"
+    for _ in range(2):
+        failed = _receipt_cli(case, writer, _receipt_writer_arguments(case))
+        assert failed.returncode == 1 and not case.output.exists()
+        failed = _receipt_cli(case, finalizer, _receipt_finalizer_arguments(case))
+        assert failed.returncode == 1 and case.record.read_bytes() == original
+
+
 @pytest.mark.parametrize("fault", ["malformed-mcp-name", "skill-underscore", "commit", "debt"])
-def test_mcp_receipt_cli_keeps_invalid_or_unfinished_records(tmp_path, fault):
+@pytest.mark.parametrize("pending", [False, True])
+def test_mcp_receipt_cli_keeps_invalid_or_unfinished_records(tmp_path, fault, pending):
     import hashlib
 
     case = _make_mcp_receipt_case(tmp_path, "source_search_mcp")
+    if pending:
+        promotion = json.loads(case.record.read_text(encoding="utf-8"))
+        operations = promotion.pop("operations")
+        operations.update(status="handoff_required", completed_operations=[],
+                          pending_operations=[case.operation])
+        operations["results"][0]["status"] = "handoff_required"
+        case.record.write_text(json.dumps({
+            "status": "handoff_required", "phase": "deployment",
+            "promotion": promotion, "operations": operations,
+        }), encoding="utf-8")
     writer = ROOT / "skills/ceratops-mcp-server-lifecycle/scripts/install-mcp-server.py"
     finalizer = ROOT / "skills/ceratops-repo-lifecycle/scripts/promote-repository.py"
     result = _receipt_cli(case, writer, _receipt_writer_arguments(case))

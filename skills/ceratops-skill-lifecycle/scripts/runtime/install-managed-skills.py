@@ -748,10 +748,15 @@ def _promotion_bindings(
     if [getattr(path.stat(), field) for field in identity_fields] != identity:
         raise InstallerError("promotion record changed during preflight")
     record = json.loads(data, object_pairs_hook=_unique_object)
-    if not isinstance(record, dict) or record.get("status") != "ready" or record.get("head") != commit:
+    pending = isinstance(record, dict) and record.get("status") == "handoff_required" and record.get("phase") == "deployment"
+    promotion = record.get("promotion") if pending else record
+    if not isinstance(promotion, dict) or promotion.get("status") != "ready" or promotion.get("head") != commit:
         raise InstallerError("promotion record does not identify this ready source commit")
     operations = record.get("operations")
-    if not isinstance(operations, dict) or operations.get("status") != "completed" or operations.get("pending_operations") != []:
+    if (not isinstance(operations, dict)
+            or operations.get("status") != ("handoff_required" if pending else "completed")
+            or not isinstance(operations.get("pending_operations"), list)
+            or (not pending and operations["pending_operations"] != [])):
         raise InstallerError("promotion record has incomplete repository operations")
     if not isinstance(operations.get("results"), list):
         raise InstallerError("promotion operation results are missing")
@@ -766,12 +771,13 @@ def _promotion_bindings(
             len(matches) != 1
             or matches[0].get("handoff") != "ceratops-skill-lifecycle/deploy"
             or matches[0].get("handoff_completed")
+            or (pending and operation not in operations["pending_operations"])
         ):
             raise InstallerError(
                 "promotion record does not contain the selected pending skill deployment"
             )
         if (
-            matches[0].get("status") not in {"completed", "advisory"}
+            matches[0].get("status") not in ({"handoff_required"} if pending else {"completed", "advisory"})
             or matches[0].get("commit") != commit
             or (
                 matches[0].get("status") == "advisory"

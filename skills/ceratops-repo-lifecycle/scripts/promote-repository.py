@@ -629,6 +629,39 @@ def promote(
         return result
 
 
+def _pending_installation_results(
+    operations: dict[str, Any], prepared: list[PreparedOperation],
+) -> dict[str, Any]:
+    """Retain the frozen handoff selection without claiming its effects ran.
+
+    A later operation can be handed to its installer only when it consists
+    entirely of one handoff. Unexecuted repository commands remain incomplete.
+    """
+    outcomes = {item["operation"]: item for item in operations.get("results", [])}
+    for selected in prepared:
+        if selected.operation not in operations.get("pending_operations", []):
+            continue
+        observed = outcomes.get(selected.operation)
+        if not selected.steps or not selected.steps[-1].handoff:
+            continue
+        if observed is None and len(selected.steps) != 1:
+            continue
+        observed = dict(observed or {})
+        handoff = observed.get("handoff")
+        if not isinstance(handoff, dict):
+            handoff = dict(selected.steps[-1].handoff)
+        outcomes[selected.operation] = {
+            **observed, "operation": selected.operation, "commit": selected.commit,
+            "status": "handoff_required", "steps": observed.get("steps", []),
+            "handoff": f"{handoff['lifecycle']}/{handoff['action']}",
+            "handoff_inputs": observed.get("handoff_inputs", handoff.get("inputs", {})),
+        }
+    return {**operations, "results": [
+        outcomes[selected.operation] for selected in prepared
+        if selected.operation in outcomes
+    ]}
+
+
 def _deploy_completed_promotion(
     args: argparse.Namespace, accepted: CompletedPromotion,
     *, timings: dict[str, float] | None = None,
@@ -655,6 +688,8 @@ def _deploy_completed_promotion(
         except (OperationError, OSError, ValueError) as exc:
             operations = describe_command_failure(exc)
     if operations["status"] != "completed":
+        if operations["status"] == "handoff_required":
+            operations = _pending_installation_results(operations, prepared_operations)
         raise PromotionError(
             str(operations.get("message", "Deployment failed.")),
             {
@@ -663,6 +698,7 @@ def _deploy_completed_promotion(
                 "remote_mutation": False,
                 "pending_work_scope": accepted.result["pending_work_scope"],
                 "promotion": dict(accepted.result),
+                "operations": operations,
             },
         )
     for operation_result in operations.get("results", []):
@@ -815,47 +851,64 @@ def _completed_deployment(
     The runner records steps only after zero exits; structured output is optional
     and its receipts form an ordered subset of those completed steps.
     """
-    if not isinstance(result, dict) or result.get("status") != "ready":
+    pending_handoffs = (
+        isinstance(result, dict) and result.get("status") == "handoff_required"
+        and result.get("phase") == "deployment"
+    )
+    promotion = result.get("promotion") if pending_handoffs else result
+    if not isinstance(promotion, dict) or promotion.get("status") != "ready":
         raise PromotionError("Result is not a successful promote-and-deploy outcome.")
-    if result.get("head") != commit:
+    if promotion.get("head") != commit:
         raise PromotionError("Result head does not match expected-commit.")
-    if release_branch is not None and result.get("release_branch") != release_branch:
+    if release_branch is not None and promotion.get("release_branch") != release_branch:
         raise PromotionError(
             "Result promotion branch does not match finalization inputs."
         )
     operations = result.get("operations")
     if (
         not isinstance(operations, dict)
-        or operations.get("status") != "completed"
-        or operations.get("pending_operations") != []
+        or operations.get("status") != ("handoff_required" if pending_handoffs else "completed")
+        or (not pending_handoffs and operations.get("pending_operations") != [])
     ):
         raise PromotionError("Deployment is missing or incomplete; retain the result.")
     completed = operations.get("completed_operations")
+    pending = operations.get("pending_operations")
     outcomes = operations.get("results")
+    if not isinstance(pending, list) or (pending_handoffs and not pending):
+        raise PromotionError("Pending deployment operations are missing or ambiguous.")
+    selected = completed + pending if isinstance(completed, list) else None
     if (
-        not isinstance(completed, list)
-        or not completed
-        or not all(isinstance(item, str) and item for item in completed)
-        or len(set(completed)) != len(completed)
+        not isinstance(selected, list)
+        or not selected
+        or not all(isinstance(item, str) and item for item in selected)
+        or len(set(selected)) != len(selected)
         or not isinstance(outcomes, list)
-        or len(outcomes) != len(completed)
+        or len(outcomes) != len(selected)
     ):
         raise PromotionError(
             "Completed deployment operations are missing or ambiguous."
         )
     external = dict(external or {})
-    for operation, outcome in zip(completed, outcomes, strict=True):
+    for operation, outcome in zip(selected, outcomes, strict=True):
         supplied = external.pop(operation, None)
+        if operation in pending and supplied is None:
+            raise PromotionError("Deployment handoff lacks bound completion evidence.")
         bound_advisory = (
             supplied is not None
             and isinstance(outcome, dict)
             and outcome.get("status") == "advisory"
             and outcome.get("steps") == []
         )
+        bound_pending = (
+            pending_handoffs and operation in pending and supplied is not None
+            and isinstance(outcome, dict) and outcome.get("status") == "handoff_required"
+            and bool(outcome.get("handoff")) and not outcome.get("handoff_completed")
+        )
         if (
             not isinstance(outcome, dict)
             or outcome.get("operation") != operation
-            or (outcome.get("status") != "completed" and not bound_advisory)
+            or (outcome.get("status") != "completed" and not bound_advisory and not bound_pending)
+            or (operation in pending and not bound_pending)
             or outcome.get("commit") != commit
         ):
             raise PromotionError(

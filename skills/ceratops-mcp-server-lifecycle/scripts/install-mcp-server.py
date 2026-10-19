@@ -171,15 +171,18 @@ def _promotion_binding(
     if [getattr(path.stat(), field) for field in identity_fields] != identity:
         raise InstallCompletionError("promotion result changed while being read")
     record = _json_object(data, "promotion result")
-    if record.get("status") != "ready" or record.get("head") != commit:
+    pending = record.get("status") == "handoff_required" and record.get("phase") == "deployment"
+    promotion = record.get("promotion") if pending else record
+    if not isinstance(promotion, dict) or promotion.get("status") != "ready" or promotion.get("head") != commit:
         raise InstallCompletionError(
             "promotion result does not identify this ready source commit"
         )
     operations = record.get("operations")
     if (
         not isinstance(operations, dict)
-        or operations.get("status") != "completed"
-        or operations.get("pending_operations") != []
+        or operations.get("status") != ("handoff_required" if pending else "completed")
+        or not isinstance(operations.get("pending_operations"), list)
+        or (operation not in operations["pending_operations"] if pending else operations["pending_operations"] != [])
         or not isinstance(operations.get("results"), list)
     ):
         raise InstallCompletionError("promotion operations are incomplete")
@@ -192,7 +195,7 @@ def _promotion_binding(
         len(matches) != 1
         or matches[0].get("handoff") != "ceratops-mcp-server-lifecycle/install"
         or matches[0].get("handoff_completed")
-        or matches[0].get("status") not in {"completed", "advisory"}
+        or matches[0].get("status") not in ({"handoff_required"} if pending else {"completed", "advisory"})
         or matches[0].get("commit") != commit
         or (matches[0].get("status") == "advisory" and matches[0].get("steps"))
     ):
