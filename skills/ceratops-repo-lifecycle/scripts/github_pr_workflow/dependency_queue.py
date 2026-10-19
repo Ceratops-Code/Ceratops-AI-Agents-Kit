@@ -570,7 +570,7 @@ def build_parser() -> argparse.ArgumentParser:
     finalize_parser.add_argument("--include-unpublished-release", action="append", default=[], metavar="OWNER/REPO=COMMIT", help="Explicit authority to include unrelated work at this exact release commit.")
     finalize_parser.add_argument("--org")
     finalize_parser.add_argument("--admin", action="store_true")
-    finalize_parser.add_argument("--merge-method", choices=("auto", "merge", "squash", "rebase"), default="auto")
+    finalize_parser.add_argument("--merge-method", choices=("auto", "merge"), default="auto", help="Release publication preserves approved commits through a merge commit.")
     finalize_parser.add_argument("--wait-seconds", type=int, default=600)
     finalize_parser.add_argument("--interval-seconds", type=int, default=15)
     finalize_parser.add_argument("--workspace-root", type=pathlib.Path, default=default_workspace_root())

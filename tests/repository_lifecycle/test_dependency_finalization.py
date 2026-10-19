@@ -15,11 +15,27 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 GH_SCRIPTS = ROOT / "skills" / "ceratops-repo-lifecycle" / "scripts"
 sys.path.insert(0, str(GH_SCRIPTS))
 
-from github_pr_workflow import dependency_finalization as flow
 from github_pr_workflow import codex_review, merge, readiness
+from github_pr_workflow import dependency_finalization as flow
 
 
 class DependencyFinalizationTests(unittest.TestCase):
+    def test_release_policy_never_accepts_squash_or_rebase(self):
+        from github_pr_workflow import dependency_queue
+
+        for merge_allowed in (False, True):
+            policy = {"mergeCommitAllowed": merge_allowed, "squashMergeAllowed": True, "rebaseMergeAllowed": True}
+            for requested in ("auto", "merge", "squash", "rebase"):
+                self.assertEqual(flow.choose_merge_method(policy, requested),
+                                 "merge" if merge_allowed and requested in {"auto", "merge"} else None)
+        for requested in ("squash", "rebase"):
+            with self.subTest(requested=requested), contextlib.redirect_stderr(None), self.assertRaises(SystemExit):
+                dependency_queue.build_parser().parse_args([
+                    "finalize", "--merge-method", requested, "--snapshot-helper", "snapshot.py",
+                    "--sync-helper", "sync.py", "--preflight", "preflight.json", "--snapshot", "snapshot.json",
+                    "--sync-output", "sync.json", "--output", "output.json",
+                ])
+
     @staticmethod
     def live(head: str, *, failed: bool = False) -> dict[str, Any]:
         return {

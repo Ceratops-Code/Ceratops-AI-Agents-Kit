@@ -438,6 +438,9 @@ def test_installer_launch_failures_keep_unfinished_flag(tmp_path, monkeypatch, l
     if launcher == "mcp":
         module = runpy.run_path(str(PROMOTE_REPOSITORY.parents[2] / "ceratops-mcp-server-lifecycle/scripts/install-mcp-server.py"))
         call, request = module["install_mcp_server"], module["InstallOptions"](repo_root=repo)
+        manager = tmp_path / "_manager.py"
+        manager.write_text("raise RuntimeError('fixture launcher must be intercepted')\n")
+        monkeypatch.setitem(call.__globals__, "MANAGER", manager)
     else:
         module = load_runtime_installer()
         call = module["deploy_managed_skills"]

@@ -216,17 +216,8 @@ def snapshot_open_pr_keys(
 
 
 def choose_merge_method(policy: dict[str, Any], requested: str) -> str | None:
-    allowed = {
-        "merge": bool(policy.get("mergeCommitAllowed")),
-        "squash": bool(policy.get("squashMergeAllowed")),
-        "rebase": bool(policy.get("rebaseMergeAllowed")),
-    }
-    if requested != "auto":
-        return requested if allowed.get(requested) else None
-    for method in ("merge", "squash", "rebase"):
-        if allowed[method]:
-            return method
-    return None
+    """Match Ship's merge commit and preserve every approved source ancestor."""
+    return "merge" if requested in {"auto", "merge"} and policy.get("mergeCommitAllowed") else None
 
 
 def merge_helper_directory() -> pathlib.Path:
@@ -748,7 +739,7 @@ def finalize(args: argparse.Namespace) -> int:
                 "repo": repo,
                 "pr": number,
                 "check": "merge_method",
-                "message": f"requested merge method {args.merge_method!r} is not allowed",
+                "message": "release publication requires merge commits; squash and rebase discard approved source ancestry",
             }
             blockers.append(blocker)
             results.append({**blocker, "status": "blocked"})
