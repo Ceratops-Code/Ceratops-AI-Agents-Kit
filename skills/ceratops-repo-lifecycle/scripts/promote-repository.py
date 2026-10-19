@@ -851,8 +851,10 @@ def _completed_deployment(
     The runner records steps only after zero exits; structured output is optional
     and its receipts form an ordered subset of those completed steps.
     """
+    if not isinstance(result, dict):
+        raise PromotionError("Result is not a successful promote-and-deploy outcome.")
     pending_handoffs = (
-        isinstance(result, dict) and result.get("status") == "handoff_required"
+        result.get("status") == "handoff_required"
         and result.get("phase") == "deployment"
     )
     promotion = result.get("promotion") if pending_handoffs else result

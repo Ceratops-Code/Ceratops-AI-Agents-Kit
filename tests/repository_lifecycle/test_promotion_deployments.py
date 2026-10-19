@@ -689,7 +689,7 @@ def test_managed_installer_finalizes_multiple_handoffs_once(
     repo, _, _, environment = prepare_repository_lifecycle_repo(tmp_path)
     skills = ["alpha-tool", "beta-tool"]
     create_compatible_repo(repo, "example/completion-batch", skills)
-    applications = {
+    applications: dict[str, Any] = {
         f"{skill}-deployment": {
             "source": ".",
             "manifest": "README.md",
