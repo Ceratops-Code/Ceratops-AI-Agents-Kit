@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import pathlib
 import runpy
 import secrets
 import subprocess
@@ -19,6 +20,165 @@ from tests.repository_lifecycle.test_sdlc_handoffs import (
     runner,
     skill_actions,
 )
+
+
+def _package_mcp_case(tmp_path, monkeypatch, problem=None):
+    """Match the real failure: prerequisites exist only on the SDLC deliverable."""
+    repo = tmp_path / "repository with spaces"
+    repo.mkdir()
+    fixture = _v4_fixture()
+    server_name = "insurance-claims-mcp-server"
+    source = repo / "mcp-servers" / server_name
+    source.mkdir(parents=True)
+    server = fixture["deliverables"]["mcp-servers"][server_name]
+    server["source"] = str(source.relative_to(repo)).replace("\\", "/")
+    server["manifest"] = server["source"] + "/mcp-server.json"
+    mcp_project = source / "pyproject.toml"
+    mcp_project.write_text(
+        '[project]\nname = "insurance-claims-mcp-server"\nversion = "1.0.1"\n'
+        'dependencies = ["claims-tool==1.0.0"]\n', encoding="utf-8",
+    )
+    package = repo / "packages/claims"
+    package.mkdir(parents=True)
+    project = package / "pyproject.toml"
+    project.write_text('[project]\nname = "claims-tool"\nversion = "1.0.0"\n', encoding="utf-8")
+    lock = package / "uv.lock"
+    lock.write_text("version = 1\n", encoding="utf-8")
+    outputs = repo / "dist/claims"
+    outputs.mkdir(parents=True)
+    wheel = outputs / "claims_tool-1.0.0-py3-none-any.whl"
+    wheel.write_bytes(b"existing wheel; the manager owns its content acceptance")
+    if problem == "missing-wheel":
+        wheel.unlink()
+    elif problem == "stale-wheel":
+        wheel.rename(outputs / "claims_tool-0.9.0-py3-none-any.whl")
+    elif problem == "multiple-wheels":
+        (outputs / "claims_tool-1.0.0-1-py3-none-any.whl").write_bytes(b"another build")
+    elif problem == "missing-lock":
+        lock.unlink()
+    elif problem == "ambiguous-lock":
+        (package / "pylock.toml").write_text("lock-version = '1.0'\n", encoding="utf-8")
+    elif problem == "pin-mismatch":
+        mcp_project.write_text(mcp_project.read_text().replace("==1.0.0", "==0.9.0"), encoding="utf-8")
+    elif problem == "wrong-project":
+        project.write_text(project.read_text().replace("claims-tool", "unrelated-tool"), encoding="utf-8")
+    elif problem == "wrong-server":
+        mcp_project.write_text(mcp_project.read_text().replace(server_name, "unrelated-server"), encoding="utf-8")
+    elif problem == "missing-project":
+        project.unlink()
+    elif problem == "no-direct-pin":
+        mcp_project.write_text(mcp_project.read_text().replace("claims-tool", "unrelated-tool"), encoding="utf-8")
+    elif problem == "unpinned-package":
+        mcp_project.write_text(mcp_project.read_text().replace("==1.0.0", ">=1.0.0"), encoding="utf-8")
+    elif problem == "multiple-direct":
+        mcp_project.write_text(mcp_project.read_text().replace(
+            '"claims-tool==1.0.0"', '"claims-tool==1.0.0", "core-tool==2.0.0"'), encoding="utf-8")
+        core = repo / "packages/core"
+        core.mkdir()
+        (core / "pyproject.toml").write_text('[project]\nname = "core-tool"\nversion = "2.0.0"\n', encoding="utf-8")
+        (core / "uv.lock").write_text("version = 1\n", encoding="utf-8")
+        (repo / "dist/core").mkdir()
+        (repo / "dist/core/core_tool-2.0.0-py3-none-any.whl").write_bytes(b"existing second package")
+    elif problem in {"linked-wheel", "linked-project"}:
+        linked = wheel if problem == "linked-wheel" else mcp_project
+        outside = tmp_path / ("_external.whl" if problem == "linked-wheel" else "_external.toml")
+        outside.write_bytes(linked.read_bytes())
+        linked.unlink()
+        try:
+            linked.symlink_to(outside)
+        except OSError as exc:
+            pytest.skip(f"This host cannot create the linked-path fixture: {exc}")
+    elif problem == "source-only":
+        server["prerequisites"] = []
+    (repo / "sdlc").mkdir()
+    (repo / "sdlc/sdlc.yml").write_text(json.dumps(fixture), encoding="utf-8")
+    binding_path = pathlib.Path("skills/ceratops-mcp-server-lifecycle/references/action-executors.json")
+    for base in (repo, tmp_path / "codex"):
+        binding = base / binding_path
+        binding.parent.mkdir(parents=True)
+        binding.write_bytes((ROOT / binding_path).read_bytes())
+    callable_path = repo / "skills/ceratops-mcp-server-lifecycle/scripts/install-mcp-server.py"
+    callable_path.parent.mkdir()
+    callable_path.write_text("# The test replaces the external installation boundary.\n", encoding="utf-8")
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    _repository(repo)
+    return SimpleNamespace(repo=repo, source=source, wheel=wheel, lock=lock, name=server_name,
+                           operation=f"deliverables.mcp-servers.{server_name}.actions.install",
+                           target=tmp_path / "installed-selection.json")
+
+
+@pytest.mark.parametrize("interruption", [None, "before", "after"])
+def test_package_prerequisites_reach_installer_on_fresh_repeated_sdlc_calls(tmp_path, monkeypatch, interruption):
+    case = _package_mcp_case(tmp_path, monkeypatch)
+    original_wheel = case.wheel.read_bytes()
+    effects = []
+    calls = []
+    interrupted = False
+
+    def install(_root, _declaration, arguments):
+        nonlocal interrupted
+        options = dict(zip(arguments[::2], arguments[1::2], strict=True))
+        assert options == {"--repo-root": str(case.repo), "--mcp-server-name": case.name,
+                           "--source": str(case.source), "--package-wheel": str(case.wheel),
+                           "--package-lock": str(case.lock)}
+        calls.append(options)
+        first = not interrupted
+        if first and interruption:
+            interrupted = True
+        if first and interruption == "before":
+            raise KeyboardInterrupt
+        # Model direct service feedback: the installed selection, not an action log.
+        if not case.target.exists():
+            case.target.write_text("1.0.1", encoding="utf-8")
+            effects.append("install")
+        if first and interruption == "after":
+            raise KeyboardInterrupt
+        return {"status": "completed"}
+
+    monkeypatch.setattr(skill_actions, "_call_action", install)
+    monkeypatch.setattr(skill_actions, "run_progress_command", lambda *_a, **_k: pytest.fail("unexpected build or test"))
+    for attempt in range(3):
+        # Each call prepares current authoritative inputs without saved execution state.
+        prepared = runner.prepare_operations(case.repo, [runner.OperationRequest(case.operation)])[0]
+        assert prepared.steps[0].handoff["inputs"] == {"mcp-server": case.name}
+        if attempt == 0 and interruption:
+            with pytest.raises(KeyboardInterrupt):
+                runner.execute_prepared_operation(prepared)
+        else:
+            assert runner.execute_prepared_operation(prepared)["status"] == "completed"
+    assert effects == ["install"] and len(calls) == 3
+    assert case.wheel.read_bytes() == original_wheel
+    assert not (case.source / "pylock.toml").exists()
+
+
+@pytest.mark.parametrize("problem", ["missing-wheel", "stale-wheel", "multiple-wheels", "missing-lock",
+                                     "ambiguous-lock", "pin-mismatch", "wrong-project", "wrong-server",
+                                     "missing-project", "no-direct-pin", "unpinned-package", "multiple-direct",
+                                     "linked-wheel", "linked-project"])
+def test_bad_package_prerequisites_stop_before_installer(tmp_path, monkeypatch, problem):
+    case = _package_mcp_case(tmp_path, monkeypatch, problem)
+    monkeypatch.setattr(skill_actions, "_call_action", lambda *_a: pytest.fail("installer must not start"))
+    for _ in range(2):
+        prepared = runner.prepare_operations(case.repo, [runner.OperationRequest(case.operation)])[0]
+        result = runner.execute_prepared_operation(prepared)
+        assert result["status"] == "operation_failed", result
+        assert "Cannot prepare package-backed MCP installation" in result["message"]
+    assert not case.target.exists()
+
+
+def test_source_only_mcp_keeps_existing_install_arguments(tmp_path, monkeypatch):
+    case = _package_mcp_case(tmp_path, monkeypatch, "source-only")
+    calls = []
+
+    def install(_root, _declaration, arguments):
+        calls.append(arguments)
+        return {"status": "completed"}
+
+    monkeypatch.setattr(skill_actions, "_call_action", install)
+    for _ in range(2):
+        prepared = runner.prepare_operations(case.repo, [runner.OperationRequest(case.operation)])[0]
+        assert runner.execute_prepared_operation(prepared)["status"] == "completed"
+    assert calls == [["--repo-root", str(case.repo), "--mcp-server-name", case.name]] * 2
 
 
 @pytest.mark.parametrize("version", [4, 5])

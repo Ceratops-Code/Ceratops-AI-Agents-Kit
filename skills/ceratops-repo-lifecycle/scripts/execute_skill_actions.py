@@ -17,6 +17,7 @@ import sys
 from collections.abc import Callable, Mapping
 from typing import Any
 
+import tomllib
 from ceratops_repo_compatibility_engine.sdlc_contract_validation import MCP_NAME
 from github_pr_workflow.command import (
     release_lock_module,
@@ -57,11 +58,97 @@ def _call_action(root: pathlib.Path, declaration: Mapping[str, Any], arguments: 
         return getattr(module, declaration["function"])(request)
 
 
+def _mcp_package_arguments(
+    repo_root: pathlib.Path, server_name: str, context: Mapping[str, Any],
+) -> dict[str, str]:
+    """Select existing declared package outputs; never build or test them again.
+
+    The SDLC runner supplies authoritative source and prerequisite declarations.
+    File selection is confined to this checkout, follows the MCP's exact package
+    pin, and admits one wheel and one canonical package lock. The installer owns
+    wheel-content and deployment checks. No process or persistent output starts
+    until this complete selection succeeds.
+    """
+    root = repo_root.resolve()
+
+    def distribution_key(name: str) -> str:
+        # Selection compares distribution identities; the manager owns full
+        # requirement/wheel parsing. No new shared-runtime dependency is needed.
+        return re.sub(r"[-_.]+", "-", name).casefold()
+
+    def owned_path(relative: str) -> pathlib.Path:
+        raw = pathlib.Path(relative)
+        if raw.is_absolute() or ".." in raw.parts:
+            raise ValueError(f"MCP package path must stay inside the repository: {relative}")
+        path = root / raw
+        if any(part.is_symlink() or part.is_junction() for part in (path, *path.parents) if part != root):
+            raise ValueError(f"MCP package path rejects links: {relative}")
+        resolved = path.resolve(strict=True)
+        if not resolved.is_relative_to(root):
+            raise ValueError(f"MCP package path escapes the repository: {relative}")
+        return resolved
+
+    source = owned_path(context["source"])
+    source_project = owned_path(str((source / "pyproject.toml").relative_to(root)))
+    with source_project.open("rb") as stream:
+        mcp_project = tomllib.load(stream)["project"]
+    if mcp_project["name"] != server_name:
+        raise ValueError(f"MCP source does not declare the selected server {server_name}")
+    requirements = mcp_project.get("dependencies", [])
+    selections = []
+    for name, package in context["packages"].items():
+        artifact = package["artifact"]
+        distribution = distribution_key(artifact["distribution"])
+        pins = [item for item in requirements
+                if (match := re.match(r"[A-Za-z0-9][A-Za-z0-9._-]*", item))
+                and distribution_key(match[0]) == distribution]
+        if not pins:
+            continue  # A transitive prerequisite is not the MCP's package wheel.
+        project_path = owned_path(package["project"])
+        with project_path.open("rb") as stream:
+            project = tomllib.load(stream)["project"]
+        version = project["version"]
+        if (artifact["type"] != "python-wheel" or distribution_key(project["name"]) != distribution
+                or len(pins) != 1
+                or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*\s*==\s*" + re.escape(version), pins[0]) is None):
+            raise ValueError(f"MCP package {name} must match its declared distribution and exact version pin")
+        directory = owned_path(artifact["output-directory"])
+        pattern = artifact["filename-pattern"]
+        if "/" in pattern or "\\" in pattern or not pattern.endswith(".whl"):
+            raise ValueError(f"Package {name} needs a wheel filename pattern without directories")
+        wheels = []
+        for candidate in directory.glob(pattern):
+            selected = owned_path(str(candidate.relative_to(root)))
+            # A wheel's distribution and version are its first two filename
+            # components. Content acceptance remains with the existing installer.
+            parts = selected.name.removesuffix(".whl").split("-")
+            if len(parts) not in {5, 6}:
+                raise ValueError(f"Malformed package wheel filename: {selected}")
+            if selected.is_file() and distribution_key(parts[0]) == distribution and parts[1] == version:
+                wheels.append(selected)
+        if len(wheels) != 1:
+            build = package.get("action-locations", {}).get("build", "the declared package build action")
+            raise ValueError(f"Package {name} needs exactly one existing {version} wheel in {directory}; use {build}")
+        locks = [project_path.parent / filename for filename in ("uv.lock", "pylock.toml")
+                 if (project_path.parent / filename).exists()]
+        if len(locks) != 1:
+            raise ValueError(f"Package {name} needs exactly one canonical uv.lock or pylock.toml")
+        lock = owned_path(str(locks[0].relative_to(root)))
+        if not lock.is_file():
+            raise ValueError(f"Package lock must be a file: {lock}")
+        selections.append({"{mcp_source}": str(source), "{package_wheel}": str(wheels[0]),
+                           "{package_lock}": str(lock)})
+    if len(selections) != 1:
+        raise ValueError("Package-backed MCP installation requires exactly one directly pinned package prerequisite")
+    return selections[0]
+
+
 def execute_handoff(
     route: str,
     repo_root: pathlib.Path,
     *,
     inputs: Mapping[str, Any] | None = None,
+    mcp_package_context: Mapping[str, Any] | None = None,
     expected_commit: str | None = None,
     diagnostic_output: pathlib.Path | None = None,
     diagnostic_owner: tuple[pathlib.Path, str] | None = None,
@@ -142,7 +229,7 @@ def execute_handoff(
                 "handoff": route,
                 "message": "No deterministic binding for these lifecycle inputs.",
             }
-        if selected_mcp_server is not None and packages:
+        if selected_mcp_server is not None and packages and mcp_package_context is None:
             return {
                 "status": "handoff_required",
                 "handoff": route,
@@ -220,11 +307,21 @@ def execute_handoff(
                 "message": "This action requires skill judgment.",
             }
         if (not isinstance(entry, dict)
-                or set(entry) - {"selected-skill", "selected-mcp-server"}
+                or set(entry) - {"selected-skill", "selected-mcp-server", "package-backed-mcp-server"}
                 not in ({"run"}, {"steps"}, {"call"})):
             raise ValueError("Executor must declare run, ordered steps or a Python call")
         selector = ("selected-skill" if selected_skill is not None else
                     "selected-mcp-server" if selected_mcp_server is not None else None)
+        package_values = {}
+        if mcp_package_context is not None:
+            if selected_mcp_server is None or skill != "ceratops-mcp-server-lifecycle" or action != "install":
+                raise ValueError("MCP package context requires an explicitly selected MCP install")
+            try:
+                package_values = _mcp_package_arguments(repo_root, selected_mcp_server, mcp_package_context)
+            except (OSError, ValueError, TypeError, AttributeError, KeyError) as exc:
+                return {**evidence, "status": "operation_failed", "target": selected_mcp_server,
+                        "message": f"Cannot prepare package-backed MCP installation: {type(exc).__name__}: {exc}"}
+            selector = "package-backed-mcp-server"
         if selector is not None:
             selected_entry = entry.get(selector)
             if (not isinstance(selected_entry, dict)
@@ -263,6 +360,7 @@ def execute_handoff(
             values["{skill}"] = selected_skill
         if selected_mcp_server is not None:
             values["{mcp_server}"] = selected_mcp_server
+        values.update(package_values)
         commands: list[list[str]] = []
         uses_skill_input = False
         uses_mcp_input = False

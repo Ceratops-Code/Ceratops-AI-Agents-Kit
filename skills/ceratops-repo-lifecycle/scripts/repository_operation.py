@@ -125,6 +125,7 @@ class PreparedOperation:
     qualification_level: str = "alpha"
     check_plan: Any = None
     result_commit_field: str | None = None
+    mcp_source: str | None = None
 
 
 def _build_test_gate(receipt: Mapping[str, Any], required_tests: Sequence[str]) -> None:
@@ -516,6 +517,10 @@ def prepare_operations(
                 result_schema=selected.get("result-schema"),
                 check_results=selected.get("check-results"),
                 result_commit_field=selected.get("result-commit-field"),
+                mcp_source=(
+                    contract["deliverables"]["mcp-servers"][request.operation.split(".")[2]]["source"]
+                    if request.operation.startswith("deliverables.mcp-servers.") else None
+                ),
             )
         )
     if any(item.result_commit_field for item in prepared[:-1]):
@@ -687,10 +692,19 @@ def execute_prepared_operation(
                 }
             route = f"{step.handoff['lifecycle']}/{step.handoff['action']}"
             inputs = dict(step.handoff.get("inputs", {}))
+            # Declared package prerequisites are authoritative even when the
+            # handoff names only its server. Keep them out of user-authored argv.
+            mcp_package_context = None
+            if route == "ceratops-mcp-server-lifecycle/install" and prepared.prerequisites.get("packages"):
+                mcp_package_context = {
+                    "source": prepared.mcp_source,
+                    "packages": prepared.prerequisites["packages"],
+                }
             outcome = execute_skill_actions.execute_handoff(
                 route,
                 prepared.repo_root,
                 inputs=inputs,
+                mcp_package_context=mcp_package_context,
                 expected_commit=prepared.commit
                 if prepared.category in MUTATION_CATEGORIES
                 else None,
