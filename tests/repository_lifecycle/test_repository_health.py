@@ -683,7 +683,7 @@ class RepositoryHealthTests(unittest.TestCase):
                 for name in ("grandchild", "child", "parent"):
                     path = root / f"{name}.pid"
                     if path.exists() and running(pid := int(path.read_text())):
-                        if os.name == "nt":
+                        if sys.platform == "win32":
                             subprocess.run(
                                 ["taskkill.exe", "/PID", str(pid), "/T", "/F"],
                                 capture_output=True, check=False, timeout=5,
