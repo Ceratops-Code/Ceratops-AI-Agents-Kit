@@ -31,6 +31,12 @@
       ],
       "depends_on": []
     },
+    "code-consistency-audit": {
+      "pytest": [
+        "tests/test_repository_audit.py"
+      ],
+      "depends_on": []
+    },
     "skill-lifecycle": {
       "pytest": [
         "tests/skill_lifecycle"
@@ -151,6 +157,7 @@
     "scripts/.yamllint.yml",
     "scripts/package-lock.json",
     "scripts/package.json",
+    "scripts/result_records.py",
     "scripts/testing/run-tests.py",
     "scripts/testing/runner_requests.py",
     "scripts/testing/pytest-diagnostics.py",

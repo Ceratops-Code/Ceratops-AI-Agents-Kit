@@ -31,7 +31,12 @@ from dataclasses import dataclass
 from typing import Any
 
 from reuse_test_results import result_environment
-from runner_requests import TEST_CONTEXT_ENV, parse_request, validate_execution_context
+from runner_requests import (
+    TEST_CONTEXT_ENV,
+    parse_request,
+    run_recorded_request,
+    validate_execution_context,
+)
 
 pytest_diagnostics = importlib.import_module("pytest-diagnostics")
 pytest_environment = importlib.import_module("pytest-environment")
@@ -179,9 +184,10 @@ def run_text(
         )
         with context as environ:
             if environ is not None:
-                # A test subprocess must not pass this invocation's promotion
-                # identity to runner calls made by fixtures or nested repos.
+                # Fixture runners own their identities; neither promotion nor
+                # durable-check inputs from this invocation belong to them.
                 environ.pop(TEST_CONTEXT_ENV, None)
+                environ.pop("CERATOPS_REPOSITORY_CHECK_CONTEXT", None)
             if is_pytest and not any(
                 option in command for option in ("--collect-only", "--co")
             ):
@@ -1225,6 +1231,28 @@ def execute(
     repo_root: pathlib.Path | None = None,
     text_runner: TextRunner = run_text,
     bytes_runner: BytesRunner = run_bytes,
+) -> int:
+    """Record the actual custom runner outcome through the shared interface."""
+    args, request_error = parse_request(argv)
+    root = (repo_root or pathlib.Path(__file__).resolve().parents[2]).resolve()
+    observed: list[dict[str, object]] = []
+
+    def observe(command: Sequence[str], cwd: pathlib.Path) -> subprocess.CompletedProcess[str]:
+        result = text_runner(command, cwd)
+        observed.extend(getattr(result, "accepted_result_references", None) or [])
+        observed.extend(getattr(result, "nonreusable_checks", None) or [])
+        observed.extend(getattr(result, "skipped_checks", None) or [])
+        observed.extend(getattr(result, "passed_checks", None) or [])
+        return result
+
+    return run_recorded_request(args, lambda: execute_selected(
+        argv, repo_root=repo_root, text_runner=observe, bytes_runner=bytes_runner,
+    ), repo_root=root, request_error=request_error, checks=lambda: observed)
+
+
+def execute_selected(
+    argv: Sequence[str] | None = None, *, repo_root: pathlib.Path | None = None,
+    text_runner: TextRunner = run_text, bytes_runner: BytesRunner = run_bytes,
 ) -> int:
     """Execute one explicit mode and emit exactly one stable JSON result."""
 

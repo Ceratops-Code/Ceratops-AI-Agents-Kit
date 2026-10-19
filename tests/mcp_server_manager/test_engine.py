@@ -5,10 +5,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import importlib
+import importlib.util
 import io
 import json
 import os
+import subprocess
 import sys
+import venv
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -118,6 +121,9 @@ def deployment(tmp_path, monkeypatch):
 
     def fake_run(command, *, cwd, env, timeout=120):
         calls.append(command)
+        cache = Path(env["UV_CACHE_DIR"])
+        cache.mkdir(parents=True, exist_ok=True)
+        (cache / "dependency.bin").write_bytes(b"unpacked wheel")
         if "venv" in command:
             executable = Path(command[-1]) / "Scripts/python.exe"
             executable.parent.mkdir(parents=True)
@@ -155,7 +161,7 @@ def test_install_update_previous_and_versions(deployment, tmp_path):
     assert engine.update("fixture", "2.0.0")["installed_version"] == "2.0.0"
     assert engine.install("fixture", "1.0.0")["installed_version"] == "1.0.0"
     assert engine.selected("fixture")["instance"] != first["instance"]
-    assert (tmp_path / "fixture/versions/1.0.0" / first["instance"]).is_dir()
+    assert not (tmp_path / "fixture/versions/1.0.0" / first["instance"]).exists()
     assert engine.versions("fixture")["available_versions"] == ["1.0.0", "2.0.0"]
     assert engine.versions("fixture")["running_version"] is None
     assert any("check" in command for command in calls)
@@ -258,7 +264,7 @@ def test_schema_probe_child_main_emits_structured_result(
     }
 
 
-def test_deployment_retains_current_two_predecessors_and_prunes_release_bytes(deployment, tmp_path):
+def test_deployment_retains_current_previous_version_and_prunes_release_bytes(deployment, tmp_path):
     engine, _, _ = deployment
     selections = []
     for version in ("1.0.0", "2.0.0", "3.0.0", "4.0.0"):
@@ -267,10 +273,10 @@ def test_deployment_retains_current_two_predecessors_and_prunes_release_bytes(de
         selections.append(engine.selected("fixture"))
 
     assert not (tmp_path / "fixture/versions/1.0.0" / selections[0]["instance"]).exists()
-    for selection in selections[1:]:
+    for selection in selections[2:]:
         assert (tmp_path / "fixture/versions" / selection["version"] / selection["instance"]).is_dir()
     catalog = json.loads((tmp_path / "fixture/registry.json").read_text())
-    assert sorted(catalog["versions"]) == ["2.0.0", "3.0.0", "4.0.0"]
+    assert sorted(catalog["versions"]) == ["3.0.0", "4.0.0"]
     assert not (tmp_path / "fixture/artifacts/1.0.0").exists()
     launcher = tmp_path / "fixture/bin/fixture.py"
     assert launcher.read_bytes() == (REPOSITORY / "mcp-servers/ceratops_mcp_server_manager/launcher.py").read_bytes()
@@ -278,7 +284,7 @@ def test_deployment_retains_current_two_predecessors_and_prunes_release_bytes(de
 
 def test_deployment_expires_abandoned_candidates_but_defers_running_predecessor(deployment, tmp_path, monkeypatch):
     engine, _, _ = deployment
-    for version in ("1.0.0", "2.0.0", "3.0.0"):
+    for version in ("1.0.0", "2.0.0"):
         make_release(tmp_path, version)
         engine.install("fixture", version)
     first = next((tmp_path / "fixture/versions/1.0.0").iterdir())
@@ -295,6 +301,8 @@ def test_deployment_expires_abandoned_candidates_but_defers_running_predecessor(
         lambda: ({os.path.normcase(os.path.abspath(first / "environment/Scripts/python.exe"))}, False),
     )
 
+    make_release(tmp_path, "3.0.0")
+    engine.install("fixture", "3.0.0")
     make_release(tmp_path, "4.0.0")
     engine.install("fixture", "4.0.0")
 
@@ -323,6 +331,124 @@ def test_usage_leases_are_shared_and_block_retirement(tmp_path, monkeypatch):
             assert removable is False
     with layout._retirement_lease(installation) as removable:
         assert removable is True
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows console launch behavior")
+def test_launcher_hides_selected_child_and_allows_fresh_retries(tmp_path, monkeypatch):
+    monkeypatch.setattr(storage, "INSTALL_ROOT", tmp_path)
+    root = tmp_path / "fixture"
+    layout = storage.Layout("fixture")
+    layout.install_launcher()
+    script = root / "bin/fixture.py"
+    spec = importlib.util.spec_from_file_location("installed_fixture_launcher", script)
+    assert spec is not None and spec.loader is not None
+    launcher = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(launcher)
+    selected = {
+        "schema": 1,
+        "mcp_server_id": "fixture",
+        "version": "1.0.0",
+        "manifest_sha256": "a" * 64,
+        "instance": "b" * 32,
+        "module": "fixture_server",
+    }
+    (root / "current.json").write_text(json.dumps(selected), encoding="utf-8")
+    installation = root / "versions/1.0.0" / selected["instance"]
+    (installation / "environment/Scripts").mkdir(parents=True)
+    (installation / "receipt.json").write_text(json.dumps(selected), encoding="utf-8")
+    python = installation / "environment/Scripts/python.exe"
+    python.write_bytes(b"")
+
+    attempts = []
+
+    def run_child(arguments, **options):
+        attempts.append((arguments, options))
+        with layout._retirement_lease(installation) as removable:
+            assert removable is False
+        if len(attempts) == 1:
+            raise OSError("child could not start")
+        if len(attempts) == 2:
+            raise KeyboardInterrupt
+        return 9 if len(attempts) == 3 else 0
+
+    monkeypatch.setattr(launcher, "__file__", str(script))
+    monkeypatch.setattr(launcher.sys, "argv", [str(script), "--serve"])
+    monkeypatch.setattr(launcher.subprocess, "call", run_child)
+    monkeypatch.setenv("PYTHONPATH", "ignored")
+
+    # Fail before starting, interrupt the child call, then retry fresh.
+    for failure in (OSError, KeyboardInterrupt):
+        with pytest.raises(failure):
+            launcher.main()
+        with layout._retirement_lease(installation) as removable:
+            assert removable is True
+    for exit_code in (9, 0):
+        assert launcher.main() == exit_code
+        with layout._retirement_lease(installation) as removable:
+            assert removable is True
+    assert len(attempts) == 4
+    for arguments, options in attempts:
+        assert arguments == [str(python), "-I", "-B", "-m", "fixture_server", "--serve"]
+        assert options["creationflags"] == launcher.subprocess.CREATE_NO_WINDOW
+        assert "PYTHONPATH" not in options["env"]
+        assert options["stdin"] is launcher.sys.stdin
+        assert options["stdout"] is launcher.sys.stdout
+        assert options["stderr"] is launcher.sys.stderr
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows hidden stdio transport")
+def test_launcher_connects_hidden_child_standard_streams_and_releases_lease(tmp_path, monkeypatch):
+    """Exercise real pipes, argument and exit forwarding, and fresh launches."""
+    monkeypatch.setattr(storage, "INSTALL_ROOT", tmp_path)
+    layout = storage.Layout("fixture")
+    layout.install_launcher()
+    selected = {
+        "schema": 1,
+        "mcp_server_id": "fixture",
+        "version": "1.0.0",
+        "manifest_sha256": "a" * 64,
+        "instance": "b" * 32,
+        "module": "fixture_server",
+    }
+    installation = layout.directory("versions", "1.0.0", selected["instance"])
+    (installation / "receipt.json").write_text(json.dumps(selected), encoding="utf-8")
+    layout.path("current.json").write_text(json.dumps(selected), encoding="utf-8")
+    environment = installation / "environment"
+    venv.EnvBuilder(with_pip=False).create(environment)
+    site_packages = environment / "Lib/site-packages"
+    # A bounded reader lets the broken launcher fail without leaving a child
+    # waiting indefinitely on disconnected stdin after the test controller exits.
+    (site_packages / "fixture_server.py").write_text(
+        "import json, sys, threading\n"
+        "def reply():\n"
+        "    request = json.loads(sys.stdin.readline())\n"
+        "    print(json.dumps({'request': request, 'arguments': sys.argv[1:]}), flush=True)\n"
+        "    print('fixture diagnostic', file=sys.stderr, flush=True)\n"
+        "reader = threading.Thread(target=reply, daemon=True)\n"
+        "reader.start()\n"
+        "reader.join(5)\n"
+        "raise SystemExit(124 if reader.is_alive() else int(sys.argv[1]))\n",
+        encoding="utf-8",
+    )
+    command = [sys.executable, "-I", "-B", str(layout.path("bin", "fixture.py"))]
+    for exit_code in (9, 0, 0):
+        request = {"attempt": exit_code}
+        result = subprocess.run(
+            [*command, str(exit_code)],
+            input=json.dumps(request) + "\n",
+            capture_output=True,
+            text=True,
+            timeout=15,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            check=False,
+        )
+        assert result.returncode == exit_code, (result.stdout, result.stderr)
+        assert json.loads(result.stdout) == {
+            "request": request, "arguments": [str(exit_code)],
+        }
+        assert result.stderr.strip() == "fixture diagnostic"
+        with layout._retirement_lease(installation) as removable:
+            assert removable is True
 
 
 @pytest.mark.parametrize("metadata_name", ["example_mcp_server", "Example-MCP-Server", "example.mcp.server", "example__mcp__server"])
@@ -503,6 +629,78 @@ def test_cli_uses_shared_engine_and_rejects_extra_operation(deployment, tmp_path
         cli.main(["update", "fixture", "1.0.0", "--root", "C:/escape"])
 
 
+def test_refresh_launcher_changes_only_named_installed_server(deployment, tmp_path, capsys):
+    engine, calls, _ = deployment
+    make_release(tmp_path, "1.0.0")
+    make_release(tmp_path, "1.0.0", mcp_server="independent")
+    engine.install("fixture", "1.0.0")
+    engine.install("independent", "1.0.0")
+    selected = (tmp_path / "fixture/current.json").read_bytes()
+    independent = (tmp_path / "independent/bin/independent.py").read_bytes()
+    launcher = tmp_path / "fixture/bin/fixture.py"
+    command = tmp_path / "fixture/bin/fixture.cmd"
+    launcher.write_bytes(b"stale Python launcher")
+    command.write_bytes(b"stale command launcher")
+    prior_calls = len(calls)
+
+    assert cli.main(["refresh-launcher", "fixture"]) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "mcp_server_name": "fixture",
+        "installed_version": "1.0.0",
+        "launcher_updated": True,
+        "maintenance": {"removed": [], "deferred": [], "errors": []},
+    }
+    assert launcher.is_file() and launcher.stat().st_size > 0
+    assert command.read_bytes().startswith(b"@echo off\r\npython -I -B")
+    assert (tmp_path / "fixture/current.json").read_bytes() == selected
+    assert (tmp_path / "independent/bin/independent.py").read_bytes() == independent
+    assert len(calls) == prior_calls
+    assert engine.refresh_launcher("fixture")["launcher_updated"] is False
+
+
+@pytest.mark.parametrize("file_name", ["fixture.py", "fixture.cmd"])
+@pytest.mark.parametrize("interrupt", ["before", "after"])
+def test_refresh_launcher_resumes_each_file_effect(
+    deployment, tmp_path, monkeypatch, file_name, interrupt
+):
+    engine, _, _ = deployment
+    make_release(tmp_path, "1.0.0")
+    engine.install("fixture", "1.0.0")
+    selected = (tmp_path / "fixture/current.json").read_bytes()
+    launcher = tmp_path / "fixture/bin/fixture.py"
+    command = tmp_path / "fixture/bin/fixture.cmd"
+    launcher.write_bytes(b"stale Python launcher")
+    command.write_bytes(b"stale command launcher")
+    atomic_bytes = storage.Layout.atomic_bytes
+
+    def interrupted_write(layout, target, contents):
+        if target.name == file_name and interrupt == "before":
+            raise OSError("interrupted before launcher replacement")
+        atomic_bytes(layout, target, contents)
+        if target.name == file_name and interrupt == "after":
+            raise OSError("interrupted after launcher replacement")
+
+    with monkeypatch.context() as interrupted:
+        interrupted.setattr(storage.Layout, "atomic_bytes", interrupted_write)
+        with pytest.raises(OSError, match="interrupted"):
+            engine.refresh_launcher("fixture")
+
+    assert engine.refresh_launcher("fixture")["launcher_updated"] is (interrupt == "before" or file_name == "fixture.py")
+    assert launcher.is_file() and launcher.stat().st_size > 0
+    assert command.read_bytes().startswith(b"@echo off\r\npython -I -B")
+    assert (tmp_path / "fixture/current.json").read_bytes() == selected
+    assert not list((tmp_path / "fixture/bin").glob("*.tmp"))
+    with monkeypatch.context() as repeated:
+        repeated.setattr(storage.Layout, "atomic_bytes", lambda *_args: pytest.fail("unchanged launcher rewritten"))
+        assert engine.refresh_launcher("fixture")["launcher_updated"] is False
+
+
+def test_refresh_launcher_rejects_uninstalled_target_without_creating_root(deployment, tmp_path):
+    with pytest.raises(contracts.DeploymentError, match="installed MCP server"):
+        deployment[0].refresh_launcher("missing")
+    assert not (tmp_path / "missing").exists()
+
+
 def test_linked_root_is_rejected(tmp_path, monkeypatch):
     actual = tmp_path / "actual"
     actual.mkdir()
@@ -514,3 +712,160 @@ def test_linked_root_is_rejected(tmp_path, monkeypatch):
     monkeypatch.setattr(storage, "INSTALL_ROOT", alias)
     with pytest.raises(contracts.DeploymentError, match="links"):
         storage.Layout().directory("versions")
+
+
+def test_deployment_reuses_current_and_keeps_previous_distinct_version(deployment, tmp_path):
+    engine, calls, _ = deployment
+    for version in ("1.0.0", "2.0.0"):
+        make_release(tmp_path, version)
+        engine.install("fixture", version)
+    selected = engine.selected("fixture")
+    before_calls = len(calls)
+    for _ in range(2):
+        result = engine.install("fixture", "2.0.0")
+        assert result["maintenance"] == {"removed": [], "deferred": [], "errors": []}
+        assert engine.selected("fixture") == selected
+    assert len(calls) == before_calls
+    assert sorted(path.name for path in (tmp_path / "fixture/versions").iterdir()) == ["1.0.0", "2.0.0"]
+    assert not (tmp_path / "fixture/cache").exists()
+    assert not list((tmp_path / "fixture/versions").glob("*/*/tmp"))
+
+
+def test_retention_removes_duplicate_instances_without_losing_previous_version(deployment, tmp_path, monkeypatch):
+    import shutil
+
+    engine, _, _ = deployment
+    for version in ("1.0.0", "2.0.0"):
+        make_release(tmp_path, version)
+        engine.install("fixture", version)
+    selected = engine.selected("fixture")
+    current = tmp_path / "fixture/versions/2.0.0" / selected["instance"]
+    duplicate = current.with_name("d" * 32)
+    shutil.copytree(current, duplicate)
+    receipt = {**selected, "instance": duplicate.name}
+    (duplicate / "receipt.json").write_text(json.dumps(receipt))
+    monkeypatch.setattr(storage, "running_python_paths", lambda: (
+        {os.path.normcase(os.path.abspath(duplicate / "environment/Scripts/python.exe"))}, False
+    ))
+    first = engine.refresh_launcher("fixture")["maintenance"]
+    assert str(duplicate) in first["deferred"] and duplicate.exists()
+    monkeypatch.setattr(storage, "running_python_paths", lambda: (set(), False))
+    assert str(duplicate) in engine.refresh_launcher("fixture")["maintenance"]["removed"]
+    assert current.is_dir() and not duplicate.exists()
+    assert (tmp_path / "fixture/versions/1.0.0").is_dir()
+
+
+@pytest.mark.parametrize("effect", ["installation", "artifact", "registry"])
+@pytest.mark.parametrize("timing", ["before", "after"])
+def test_retirement_repeats_after_each_effect(deployment, tmp_path, monkeypatch, effect, timing):
+    engine, _, _ = deployment
+    first_artifact = make_release(tmp_path, "1.0.0")
+    old = storage.time.time() - storage.ABANDONED_SECONDS - 1
+    os.utime(first_artifact, (old, old))
+    engine.install("fixture", "1.0.0")
+    first = next((tmp_path / "fixture/versions/1.0.0").iterdir())
+    running = {os.path.normcase(os.path.abspath(first / "environment/Scripts/python.exe"))}
+    monkeypatch.setattr(storage, "running_python_paths", lambda: (running, False))
+    for version in ("2.0.0", "3.0.0"):
+        make_release(tmp_path, version)
+        engine.install("fixture", version)
+    selected = engine.selected("fixture")
+    running.clear()
+    remove = storage.Layout._remove_tree
+    write = storage.Layout.atomic_json
+    fired = False
+
+    def around(matches, operation):
+        nonlocal fired
+        interrupt = matches and not fired
+        if interrupt and timing == "before":
+            fired = True
+            raise OSError("retirement interrupted before effect")
+        result = operation()
+        if interrupt and timing == "after":
+            fired = True
+            raise OSError("retirement interrupted after effect")
+        return result
+
+    def remove_tree(layout, path):
+        matches = (effect == "installation" and path == first) or (effect == "artifact" and path == first_artifact)
+        return around(matches, lambda: remove(layout, path))
+
+    def write_json(layout, path, payload):
+        return around(effect == "registry" and path.name == "registry.json", lambda: write(layout, path, payload))
+
+    with monkeypatch.context() as interrupted:
+        interrupted.setattr(storage.Layout, "_remove_tree", remove_tree)
+        interrupted.setattr(storage.Layout, "atomic_json", write_json)
+        if effect == "registry":
+            with pytest.raises(OSError, match="retirement interrupted"):
+                engine.refresh_launcher("fixture")
+        else:
+            result = engine.refresh_launcher("fixture")["maintenance"]
+            assert any("retirement interrupted" in error for error in result["errors"])
+    assert fired
+    for _ in range(2):
+        result = engine.refresh_launcher("fixture")["maintenance"]
+        assert not result["deferred"] and not result["errors"]
+        assert engine.selected("fixture") == selected
+    assert not first.exists() and not first.parent.exists() and not first_artifact.exists()
+    catalog = json.loads((tmp_path / "fixture/registry.json").read_text())
+    assert sorted(catalog["versions"]) == ["2.0.0", "3.0.0"]
+
+
+@pytest.mark.parametrize("timing", ["before", "after"])
+def test_deployment_repeats_after_selection_interruption(deployment, tmp_path, monkeypatch, timing):
+    engine, _, _ = deployment
+    for version in ("1.0.0", "2.0.0"):
+        make_release(tmp_path, version)
+    engine.install("fixture", "1.0.0")
+    replace = storage.os.replace
+
+    def interrupted_replace(source, destination):
+        if Path(destination).name != "current.json":
+            return replace(source, destination)
+        if timing == "before":
+            raise OSError("selection interrupted before effect")
+        replace(source, destination)
+        raise OSError("selection interrupted after effect")
+
+    with monkeypatch.context() as interrupted:
+        interrupted.setattr(storage.os, "replace", interrupted_replace)
+        with pytest.raises(OSError, match="selection interrupted"):
+            engine.install("fixture", "2.0.0")
+    current = engine.selected("fixture")
+    assert current["version"] == ("1.0.0" if timing == "before" else "2.0.0")
+    engine.install("fixture", "2.0.0")
+    accepted = engine.selected("fixture")
+    engine.install("fixture", "2.0.0")
+    assert engine.selected("fixture") == accepted
+    assert sorted(path.name for path in (tmp_path / "fixture/versions").iterdir()) == ["1.0.0", "2.0.0"]
+    assert not list((tmp_path / "fixture/versions").glob("*/*/tmp"))
+
+
+@pytest.mark.parametrize("failure", ["exit", "timeout", "spawn"])
+def test_command_failure_keeps_invocation_and_both_streams(tmp_path, monkeypatch, failure):
+    import subprocess
+
+    secret = "private" + "-value"
+    command = ["C:/runtime/python.exe", "--token", secret]
+    stdout = "BEGIN-" + "output" * 1000 + "-END " + secret
+
+    def fail(*args, **kwargs):
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired(command, 120, output=stdout.encode(), stderr=b"child timed out")
+        if failure == "spawn":
+            raise OSError("runtime missing")
+        return subprocess.CompletedProcess(command, 7, stdout, "")
+
+    monkeypatch.setattr(engine_module.subprocess, "run", fail)
+    with pytest.raises(contracts.DeploymentError) as caught:
+        engine_module.run(command, cwd=tmp_path, env={"API_TOKEN": secret})
+    result = json.loads(str(caught.value))
+    assert result["runtime"] == command[0]
+    assert result["invocation"] == command[:2] + ["<redacted>"]
+    assert result["target"] == str(tmp_path) and secret not in str(caught.value)
+    assert result["exit_status"] == {"exit": 7, "timeout": "timeout", "spawn": "not_started"}[failure]
+    assert result["stdout"].startswith("BEGIN-") if failure != "spawn" else result["stdout"] == "<no stdout>"
+    assert "-END" in result["stdout"] if failure != "spawn" else result["stderr"] == "<no stderr>"
+    assert result["stderr"] == ("child timed out" if failure == "timeout" else "<no stderr>")

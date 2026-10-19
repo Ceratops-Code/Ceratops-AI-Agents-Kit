@@ -27,16 +27,21 @@ first.
   dependency-finalize --snapshot-helper PATH --sync-helper PATH
   --preflight PATH --snapshot PATH --sync-output PATH --output PATH
   [--approved-pr PR] [--admin]`
-- Queue preflight owns batched PR projection and registry, dependency-tree,
-  engine/API, and exact-CI evidence. Finalization owns preflight-approved head
-  binding, bounded readiness waits, live revalidation, blocker fingerprints,
-  one-successful-merge-per-repository waves, merge delegation, snapshot refresh,
-  checkout sync, and bounded results. After a repository merges, each later
-  approved PR still in the refreshed queue becomes `next_wave_required`; an
-  absent PR becomes `resolved_after_refresh`.
-  Finalization delegates `--admin` to `python -m github_pr_workflow merge` and
-  inherits its checkpointed admin-enforcement semantics; it does not toggle
-  protection independently.
+- (D) Automation preflight, from this skill's root:
+  `python scripts/github_pr_workflow/__main__.py dependency-preflight
+  --automation-dir PATH`.
+- (D) Automation finalization, from this skill's root:
+  `python scripts/github_pr_workflow/__main__.py dependency-finalize
+  --automation-dir PATH [--approved-pr PR] [--admin]`.
+- `PATH` is the caller's installed automation directory. The entrypoint
+  reads its repository-scope configuration and binds its independent adapters;
+  explicit options override defaults. It owns current-report retirement and
+  dated unavailable-state reports, preserving genuine blocked queue results.
+- Queue preflight owns dependency and exact-CI evidence. Finalization binds
+  each approval to its exact PR head, stages eligible updates through
+  `release/local`, and delegates publication to the repository's shipping
+  workflow. It preserves readiness and review gates, refreshes the queue,
+  synchronizes checkouts, and reports completed effects and blockers.
 
 ### Inputs To Capture
 
@@ -94,17 +99,15 @@ first.
 
 #### 3. Re-check dependency posture
 
-- Route ready dependency PR merge or auto-merge finalization through the
-  `merge-pr` action; it owns PR readiness, Codex review gate, merge, and
-  post-merge cleanup.
-- For a caller-scoped multi-PR queue, pass every model-approved PR to one
-  queue finalization call; it must reuse `merge-pr` semantics, allow at most one
-  successful merge per repository in that call, and reconcile later
-  same-repository PRs with the refreshed queue without duplicating or weakening
-  gates, admin-enforcement bypass, or recovery.
-- Treat `next_wave_required` as expected continuation, not a blocker. Refresh
-  preflight and model approval against current repository state before the next
-  finalization call. Treat `resolved_after_refresh` as terminal for that PR.
+- Publish dependency updates through `release/local` in every repository.
+  Preserve the source PR readiness and Codex review gates, then use the
+  repository shipping workflow for the assembled release.
+- Pass every model-approved PR to queue finalization. Process all eligible
+  updates without a per-repository merge limit; changed PR heads require fresh
+  preflight and approval.
+- Include unrelated unpublished work only with explicit authorization bound
+  to that repository's release commit. Repeat preflight, decisions, and
+  finalization while actionable work remains.
 - Include live repo dependency selection only when the queue changes or
   explicitly verifies GitHub dependency/security posture.
 - Include code dependency selection only when explicitly verifying Dependabot

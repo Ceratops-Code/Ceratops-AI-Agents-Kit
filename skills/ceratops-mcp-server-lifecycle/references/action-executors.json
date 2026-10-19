@@ -2,14 +2,28 @@
   "version": 1,
   "actions": {
     "install": {
-      "run": [
-        "{python}",
-        "-I",
-        "-B",
-        "{skill_root}/scripts/install-mcp-server.py",
-        "--repo-root",
-        "{repo_root}"
-      ]
+      "call": {
+        "path": "scripts/install-mcp-server.py",
+        "function": "install_mcp_server",
+        "request": "InstallOptions",
+        "args": ["--repo-root", "{repo_root}"]
+      },
+      "selected-mcp-server": {
+        "call": {
+          "path": "scripts/install-mcp-server.py",
+          "function": "install_mcp_server",
+          "request": "InstallOptions",
+          "args": ["--repo-root", "{repo_root}", "--mcp-server-name", "{mcp_server}"]
+        }
+      },
+      "package-backed-mcp-server": {
+        "call": {
+          "path": "scripts/install-mcp-server.py",
+          "function": "install_mcp_server",
+          "request": "InstallOptions",
+          "args": ["--repo-root", "{repo_root}", "--mcp-server-name", "{mcp_server}", "--source", "{mcp_source}", "--package-wheel", "{package_wheel}", "--package-lock", "{package_lock}"]
+        }
+      }
     }
   }
 }

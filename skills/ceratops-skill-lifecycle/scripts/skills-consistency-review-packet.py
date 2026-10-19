@@ -5,6 +5,8 @@ The caller names the installed skill and every non-repository automation root.
 This helper never discovers sibling installed skills. It resolves attributable
 source surfaces and runs the owning source validator with the current Python
 runtime so the subsequent semantic review can stay inside the packet.
+It also reads the two native command roots from the selected profile's
+config.toml; missing or malformed settings become packet blockers.
 """
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import tomllib
 from collections.abc import Iterable, Mapping
 from typing import Any
 
@@ -265,6 +268,37 @@ def run_validator(
     }
 
 
+def configured_root_settings(installed_skill: pathlib.Path, blockers: list[str]) -> dict[str, Any]:
+    """Read native command roots from the selected installation's Codex profile.
+
+    Environment inheritance is not evidence that the bootstrap saved settings.
+    Only the two owned keys are returned; unrelated configuration is never
+    included in a packet or modified by this read-only audit.
+    """
+    path = installed_skill.parent.parent / "config.toml"
+    evidence: dict[str, Any] = {"path": str(path), "status": "failed", "variables": {}}
+    try:
+        document = tomllib.loads(path.read_bytes().decode("utf-8-sig"))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as exc:
+        blockers.append(f"Codex root settings unavailable in {path}: {exc}")
+        return evidence
+    policy = document.get("shell_environment_policy", {})
+    settings = policy.get("set", {}) if isinstance(policy, Mapping) else {}
+    if not isinstance(settings, Mapping):
+        settings = {}
+    for name in ("CERATOPS_PROJECTS_ROOT", "CERATOPS_TASK_TEMP_ROOT"):
+        value = settings.get(name)
+        valid = isinstance(value, str) and bool(value.strip()) and pathlib.Path(value).is_absolute()
+        evidence["variables"][name] = {"defined": valid}
+        if valid:
+            evidence["variables"][name]["value"] = value
+        else:
+            blockers.append(f"Codex configuration {path} must define shell_environment_policy.set.{name} as an absolute directory.")
+    if all(item["defined"] for item in evidence["variables"].values()):
+        evidence["status"] = "passed"
+    return evidence
+
+
 def packet(args: argparse.Namespace) -> dict[str, Any]:
     """Resolve the selected installed skill and its attributable review surfaces."""
 
@@ -320,6 +354,7 @@ def packet(args: argparse.Namespace) -> dict[str, Any]:
     section_names = string_list(assignments[skill], f"skills.{skill}")
     sections = mapping(manifest.get("sections"), "section manifest sections")
     blockers: list[str] = []
+    codex_configuration = configured_root_settings(installed_skill, blockers)
     section_paths: list[str] = []
     for name in section_names:
         value = sections.get(name)
@@ -421,6 +456,7 @@ def packet(args: argparse.Namespace) -> dict[str, Any]:
             "automation_consumers": consumers,
         },
         "validator": validation,
+        "codex_configuration": codex_configuration,
         "blockers": sorted(set(blockers)),
     }
 

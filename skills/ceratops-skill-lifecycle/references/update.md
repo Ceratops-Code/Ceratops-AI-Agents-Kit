@@ -79,38 +79,45 @@ repo docs, then update the narrowest correct source that exists.
 
 #### 3. Apply updates at the real source
 
-- (D) Before editing helper-runtime code or a multi-file contract, run `python
-  scripts/skill-update-workflow.py init --repo-root WORKTREE --selected-skill
-  SKILL --group NAME PATH`.
+`SKILL_ROOT` is the installed directory containing this skill's `SKILL.md`.
+`PYTHON_RUNTIME` is `python_runtime` from
+`SKILL_ROOT/.runtime-manifest.json`.
+
+- (D) Before editing helper-runtime code or a multi-file contract, run `uv run
+  --no-project --python "PYTHON_RUNTIME"   python
+  "SKILL_ROOT/scripts/skill-update-workflow.py" init --repo-root WORKTREE
+  --selected-skill   SKILL --group NAME PATH`.
 - Repeat `--selected-skill` and `--group` as needed, and declare non-test checks
   with `--command-check-file FILE` or `--search-check EXPECTED PATTERN PATH`.
   `init` derives allowed paths from the groups, records the closed request in
   the worktree-owned checkpoint, and returns one next action. Command-check
   files are UTF-8 with one exact argument per nonempty line.
-- For a caller-owned complete `ceratops-skill-update-request.v3`, run `python
-  scripts/skill-update-workflow.py open_skill_change --repo-root WORKTREE
-  --change-request REQUEST`. `WORKTREE` is the selected task worktree;
-  `REQUEST` is the caller's JSON file. Run these commands with the skill's
-  managed Python runtime.
+- For a caller-owned complete `ceratops-skill-update-request.v3`, run `uv run
+  --no-project --python "PYTHON_RUNTIME"   python
+  "SKILL_ROOT/scripts/skill-update-workflow.py" open_skill_change --repo-root
+  WORKTREE   --change-request REQUEST`. `WORKTREE` is the selected task
+  worktree;   `REQUEST` is the caller's JSON file. Run these commands with the
+  skill's   managed Python runtime.
 - The calling task applies the requested source edits. This helper records
   approved scope and checks; it does not edit, commit, promote or deploy source.
-- (D) After editing, run `python scripts/skill-update-workflow.py run
-  --repo-root WORKTREE`.
+- (D) After editing, run `uv run --no-project --python "PYTHON_RUNTIME"   python
+  "SKILL_ROOT/scripts/skill-update-workflow.py" run   --repo-root WORKTREE`.
 - `run` performs only the needed verification, then returns the recorded status
   and one next action. Caller-owned request flows may use the lower-level
   `run_skill_checks --repo-root WORKTREE` command.
 - Preserve the original Git and dirty-file baselines, explicit approved scope,
   shared-source ownership and Git whitespace gates. Tests remain owned by the
   repository-declared SDLC test phase; requests contain only non-test checks.
-- (D) For approved additional scope, update the caller's request and run
-  `python scripts/skill-update-workflow.py expand_skill_scope
-  --repo-root WORKTREE --change-request REQUEST` before editing added paths.
+- (D) For approved additional scope, update the caller's request and run   `uv
+  run --no-project --python "PYTHON_RUNTIME"   python
+  "SKILL_ROOT/scripts/skill-update-workflow.py" expand_skill_scope   --repo-root
+  WORKTREE --change-request REQUEST` before editing added paths.
 - Scope expansion preserves existing approvals and the original baseline.
   Changed inputs create a pending generation before checks. Reuse saved passed
   commands for unchanged complete inputs and saved searches for unchanged
   declared inputs; an identical successful retry does no check work.
 - The helper discovers one unfinished update per worktree beneath the Git
-  common directory and holds its producer lock. Immutable states and check
+  common directory without a checkpoint or worktree lock. Immutable states and check
   results recover interrupted recording; caller request files remain owned by
   the caller. Do not supply state, evidence or operation-ID paths.
 - Do not use the workflow for skill-local text-only updates.
@@ -134,8 +141,9 @@ repo docs, then update the narrowest correct source that exists.
 - If runtime generation or validation flow no longer matches the section model,
   fix the scripts instead of working around them in skill text.
 
-- (D) For an explicitly revised request after failed checks, run
-  `python scripts/skill-update-workflow.py replace_failed_request
+- (D) For an explicitly revised request after failed checks, run   `uv run
+  --no-project --python "PYTHON_RUNTIME"   python
+  "SKILL_ROOT/scripts/skill-update-workflow.py" replace_failed_request
   --repo-root WORKTREE --change-request REQUEST` before editing added paths.
   Preserve the original baseline, existing scope and saved successful checks;
   the new request may revise failed checks without concealing unrelated work.
@@ -156,13 +164,17 @@ repo docs, then update the narrowest correct source that exists.
 - If runtime generation, installer, or transaction code changed, run the
   affected transaction tests and one all-managed temporary installation.
 - (D) After successful checks and the final requested commit, deployment or
-  other caller use, run `python scripts/skill-update-workflow.py run
-  --repo-root WORKTREE --caller-use-complete`.
+  other caller use, run `uv run --no-project --python "PYTHON_RUNTIME"   python
+  "SKILL_ROOT/scripts/skill-update-workflow.py" run   --repo-root WORKTREE
+  --caller-use-complete`.
 - Closing consumes saved success without rechecking the checkout, writes
   `completion_receipt.json`, and removes the operation's checkpoints.
   It preserves caller inputs and unrelated work. Interrupted cleanup resumes
-  from that receipt; successful close also sweeps removed-worktree checkpoints
-  for the same producer. Caller-owned request flows may use the lower-level
+  from that receipt. An absent or empty request is already closed; that no-op
+  writes no acceptance and does not bypass checks for remaining records.
+  Close touches no other worktree's saved request. Dedicated
+  worktree cleanup is connected separately in plan step 20C. Caller-owned
+  request flows may use the lower-level
   `close_skill_change --repo-root WORKTREE` command. Do not close failed or
   incomplete changes.
 - After committing, use `$ceratops-repo-lifecycle` `promote` when only local

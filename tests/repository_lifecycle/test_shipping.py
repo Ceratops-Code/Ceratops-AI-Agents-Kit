@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import pathlib
 import runpy
-import subprocess
 import sys
 from typing import Any
 
@@ -20,6 +20,12 @@ from tests.support.repositories import run_git, write_sdlc_contract
 
 LOCAL = "deliverables.apps.fixture.actions.install"
 PUBLIC = "deliverables.apps.fixture.actions.publish"
+
+
+def _load_ship() -> dict[str, Any]:
+    """Load the callable implementation; keep parser tests at the real CLI."""
+    module = importlib.reload(importlib.import_module("github_pr_workflow.ship_repository"))
+    return {**runpy.run_path(str(SHIP_REPOSITORY)), **vars(module)}
 
 
 def _commit(repo: pathlib.Path) -> str:
@@ -109,8 +115,8 @@ def _setup(
             },
         )
     _commit(repo)
-    loaded = runpy.run_path(str(SHIP_REPOSITORY))
-    original = loaded["_run_json"]
+    loaded = _load_ship()
+    original = loaded["run_command_for_json"]
     commands: list[list[str]] = []
     scope = tmp_path / "scope.json"
     state: dict[str, Any] = {
@@ -122,6 +128,32 @@ def _setup(
         "external_failure": external_failure,
         "target_commit_override": None,
     }
+
+    def call_github_ship(_args, repo_root, pending_scope, candidate_commit):
+        assert repo_root == repo
+        state["github_request"] = (_args, pending_scope, candidate_commit)
+        head = run_git(repo, "rev-parse", "HEAD").stdout.strip()
+        if state["remote_error"]:
+            raise loaded["RepositoryShipError"](
+                state["remote_error"]["message"], state["remote_error"],
+            )
+        assert not log.exists() or log.read_text().splitlines()[-1] == "check"
+        with log.open("a") as out:
+            out.write("remote\n")
+        state["calls"] += 1
+        if state["break_after_remote"]:
+            (repo / "code.txt").write_text("broken", encoding="utf-8")
+            if state["break_after_remote"] != "dirty":
+                head = _commit(repo)
+        return {
+            "status": "shipped" if state["calls"] == 1 else "already_shipped",
+            "repository": "example/repository",
+            "commit": head,
+            "synchronized_head": head,
+            "merge_commit": head,
+            "pr": 24,
+            "url": "https://example.invalid/pull/24",
+        }
 
     def run_json(command: list[str], **kwargs: Any) -> tuple[int, dict[str, Any]]:
         assert kwargs.get("cwd") == repo
@@ -135,26 +167,6 @@ def _setup(
             "pending_work_scope": str(scope) if state["scope"] else "",
             "target_commit": state["target_commit_override"] or head,
         }
-        if str(PR_WORKFLOW_ENTRYPOINT) in command:
-            if state["remote_error"]:
-                return 1, state["remote_error"]
-            assert not log.exists() or log.read_text().splitlines()[-1] == "check"
-            with log.open("a") as out:
-                out.write("remote\n")
-            state["calls"] += 1
-            if state["break_after_remote"]:
-                (repo / "code.txt").write_text("broken", encoding="utf-8")
-                if state["break_after_remote"] != "dirty":
-                    head = _commit(repo)
-            return 0, {
-                "status": "shipped" if state["calls"] == 1 else "already_shipped",
-                "repository": "example/repository",
-                "commit": head,
-                "synchronized_head": head,
-                "merge_commit": head,
-                "pr": 24,
-                "url": "https://example.invalid/pull/24",
-            }
         if "prepare" in command:
             return 0, prepared
         if "check" in command:
@@ -169,7 +181,8 @@ def _setup(
             return 0, {"status": "finalized"}
         raise AssertionError(command)
 
-    loaded["ship_repository"].__globals__["_run_json"] = run_json
+    loaded["ship_repository"].__globals__["run_command_for_json"] = run_json
+    loaded["ship_repository"].__globals__["_call_github_ship"] = call_github_ship
     loaded["ship_repository"].__globals__["_branch_worktree"] = lambda *args: None
     # Cleanup path eligibility itself has separate real-path coverage below.
     loaded["ship_repository"].__globals__["_require_cleanup_safe_caller"] = (
@@ -182,6 +195,7 @@ def _setup(
             "--head-branch",
             head_branch,
             "--reusable-head",
+            "--confirm-previous-commands-stopped",
             *(
                 ["--publish-operation", PUBLIC, "--deploy-operation", LOCAL]
                 if contract
@@ -207,28 +221,16 @@ def test_repository_ship_metadata_reaches_shared_pr_producer(
     monkeypatch: pytest.MonkeyPatch,
     metadata: list[str],
 ) -> None:
-    loaded = runpy.run_path(str(SHIP_REPOSITORY))
+    repo, loaded, _, _, _, _ = _setup(tmp_path, contract=False)
     ship = load_pr_workflow_module(monkeypatch, "ship")
     args = loaded["build_parser"]().parse_args(
-        ["--repo-root", str(tmp_path), "--head-branch", "release/local", *metadata]
+        ["--repo-root", str(repo), "--head-branch", "release/local", *metadata]
     )
-    command = loaded["_ship_command"](args, tmp_path, None, "a" * 40)
-    assert command[1] == str(PR_WORKFLOW_ENTRYPOINT)
-    parsed = ship.build_parser().parse_args(command[3:])
-    if not metadata:
-        smoke = subprocess.run(
-            [*command[:3], "--help"],
-            cwd=tmp_path,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        assert smoke.returncode == 0, smoke.stderr
     events: list[str] = []
     monkeypatch.setattr(ship.merge, "restore_unfinished_checkpoints", lambda root: None)
-    monkeypatch.setattr(ship, "_repository_name", lambda *args: "example/repository")
+    monkeypatch.setattr(ship.wait_pr_checks, "resolve_repository_name", lambda *args: "example/repository")
     monkeypatch.setattr(ship, "_resolve_commit", lambda *args: "a" * 40)
-    monkeypatch.setattr(ship, "_load_pending_work_scope", lambda *args: (None, None))
+    monkeypatch.setattr(ship, "load_pending_work_scope", lambda *args: (None, None))
     monkeypatch.setattr(
         ship,
         "_load_or_create_checkpoint",
@@ -255,16 +257,14 @@ def test_repository_ship_metadata_reaches_shared_pr_producer(
 
     monkeypatch.setattr(ship.ensure_pr, "ensure_pr", ensure)
     with pytest.raises(ProducerReached):
-        ship.ship(parsed)
+        loaded["_call_github_ship"](args, repo, None, "a" * 40)
     assert events == ["availability", "producer"]
-
-
 
 
 def test_repository_ship_rejects_release_namespace_conflict(
     tmp_path: pathlib.Path,
 ) -> None:
-    repo, loaded, args, log, state, _ = _setup(
+    _, loaded, args, log, state, _ = _setup(
         tmp_path,
         contract=False,
         head_branch="release",
@@ -283,7 +283,7 @@ def test_repository_ship_rejects_noncanonical_legacy_promotion_branch(
     tmp_path: pathlib.Path,
 ) -> None:
     repo, loaded, args, _, _, _ = _setup(tmp_path, contract=False)
-    legacy_branch = "/".join(("promote", "local"))
+    legacy_branch = "promote/local"
     assert run_git(repo, "branch", "-m", legacy_branch).returncode == 0
     args.head_branch = legacy_branch
 
@@ -302,10 +302,6 @@ def test_repository_ship_missing_custom_contract_blocks_before_remote_mutation(
     with pytest.raises(loaded["RepositoryShipError"], match="repository file"):
         loaded["ship_repository"](args)
     assert state["calls"] == 0 and not log.exists()
-
-
-
-
 
 
 def test_repository_ship_release_failure_blocks_deployment_and_cleanup(
@@ -327,8 +323,6 @@ def test_repository_ship_release_failure_blocks_deployment_and_cleanup(
     result = loaded["ship_repository"](args)
     assert result["status"] == "already_shipped"
     assert log.read_text().splitlines()[-2:] == ["deploy", "finalize"]
-
-
 
 
 def test_synchronized_dirty_state_preserves_remote_recovery(
@@ -400,7 +394,7 @@ def test_repository_ship_checkpoints_each_operation_before_the_next(
     original = loaded["execute_prepared_operation"]
     count = 0
 
-    def execute(prepared: Any) -> dict[str, Any]:
+    def execute(prepared: Any, **kwargs: Any) -> dict[str, Any]:
         nonlocal count
         if prepared.category == category:
             count += 1
@@ -416,7 +410,7 @@ def test_repository_ship_checkpoints_each_operation_before_the_next(
                 assert selected[0]["position"] == 1
                 assert selected[0]["result"].get("step_results", []) == expected_results
                 raise RuntimeError("interrupted between operations")
-        return original(prepared)
+        return original(prepared, **kwargs)
 
     loaded["_checkpointed_operation_batch"].__globals__[
         "execute_prepared_operation"
@@ -484,7 +478,7 @@ def test_repository_ship_finalization_runs_outside_selected_worktree(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    loaded = runpy.run_path(str(SHIP_REPOSITORY))
+    loaded = _load_ship()
     repo = tmp_path / "repo"
     repo.mkdir()
     command = ["python", "manage-pending-work.py", "finalize"]
@@ -501,7 +495,7 @@ def test_repository_ship_finalization_runs_outside_selected_worktree(
         return 0, {"status": "finalized"}
 
     monkeypatch.setattr(loaded["os"], "chdir", change_directory)
-    loaded["_run_finalization"].__globals__["_run_json"] = run_json
+    loaded["_run_finalization"].__globals__["run_command_for_json"] = run_json
 
     result = loaded["_run_finalization"](command, repo_root=repo)
 
@@ -517,7 +511,7 @@ def test_repository_ship_blocks_selected_worktree_caller_before_remote_process(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    loaded = runpy.run_path(str(SHIP_REPOSITORY))
+    loaded = _load_ship()
     repo = tmp_path / "repo"
     selected = tmp_path / "worktrees" / "repo" / "thread"
     selected.mkdir(parents=True)
@@ -560,9 +554,9 @@ def test_repository_ship_blocks_selected_worktree_caller_before_remote_process(
             "pending_work_scope": str(scope),
         }
 
-    ship_repository = loaded["ship_repository"]
+    ship_repository = loaded["_ship_repository"]
     ship_repository.__globals__["_branch_worktree"] = branch_worktree
-    ship_repository.__globals__["_run_json"] = run_json
+    ship_repository.__globals__["run_command_for_json"] = run_json
     ship_repository.__globals__["_local_branch_exists"] = lambda *_args: False
     ship_repository.__globals__["_prepare_operation_batch"] = lambda *args, **kwargs: (
         None
@@ -622,7 +616,7 @@ def test_repository_ship_rejects_runtime_directory_caller(
     monkeypatch: pytest.MonkeyPatch,
     caller_suffix: str,
 ) -> None:
-    loaded = runpy.run_path(str(SHIP_REPOSITORY))
+    loaded = _load_ship()
     repo = tmp_path / "repo"
     runtime = tmp_path / "installed-skill"
     caller = runtime / caller_suffix
@@ -634,7 +628,7 @@ def test_repository_ship_rejects_runtime_directory_caller(
     def unexpected_run(*_args: object, **_kwargs: object) -> None:
         pytest.fail("An unsafe caller must be rejected before any lifecycle child")
 
-    monkeypatch.setitem(ship_repository.__globals__, "_run_json", unexpected_run)
+    monkeypatch.setitem(ship_repository.__globals__, "run_command_for_json", unexpected_run)
     monkeypatch.chdir(caller)
     args = loaded["build_parser"]().parse_args(
         ["--repo-root", str(repo), "--head-branch", "release/local"]
@@ -645,60 +639,6 @@ def test_repository_ship_rejects_runtime_directory_caller(
         ship_repository(args)
     assert str(repo) in str(captured.value)
     assert list(repo.iterdir()) == []
-
-
-def test_repository_ship_child_runs_from_repository(
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    loaded = runpy.run_path(str(SHIP_REPOSITORY))
-    repo = tmp_path / "repo with spaces"
-    caller = tmp_path / "caller"
-    repo.mkdir()
-    caller.mkdir()
-    monkeypatch.chdir(caller)
-    code, payload = loaded["_run_json"](
-        [
-            sys.executable,
-            "-c",
-            "import json, pathlib; print(json.dumps({'cwd': str(pathlib.Path.cwd())}))",
-        ],
-        cwd=repo,
-    )
-    assert code == 0
-    assert payload == {"cwd": str(repo.resolve())}
-    assert pathlib.Path.cwd() == caller
-
-    with pytest.raises(loaded["RepositoryShipError"]) as failure:
-        loaded["_run_json"](
-            [
-                sys.executable,
-                "-c",
-                (
-                    "import sys; print('not json'); "
-                    "print('x' * 2500 + ' child import failed', file=sys.stderr); "
-                    "raise SystemExit(7)"
-                ),
-                "--body",
-                "private PR body",
-            ],
-            cwd=repo,
-        )
-    diagnostic = failure.value.payload["diagnostic"]
-    assert "invalid JSON (exit code 7)" in failure.value.payload["message"]
-    assert diagnostic["command"][-2:] == ["--body", "<redacted>"]
-    assert diagnostic["exit_code"] == 7
-    assert diagnostic["stderr_tail"][-1].endswith("child import failed")
-    assert sum(map(len, diagnostic["stderr_tail"])) <= 2048
-    assert diagnostic["stdout_tail"] == ["not json"]
-    assert "line 1, column 1" in diagnostic["output_error"]
-
-    with pytest.raises(loaded["RepositoryShipError"]) as non_object:
-        loaded["_run_json"]([sys.executable, "-c", "print('[1]')"], cwd=repo)
-    assert "non-object" in non_object.value.payload["message"]
-    assert non_object.value.payload["diagnostic"]["output_error"] == (
-        "expected an object, received list"
-    )
 
 
 def _publish_pr_setup(
@@ -1015,6 +955,7 @@ def test_publish_pr_failure_retains_work_and_retry_does_not_duplicate(
         )
     state["fail"] = None
     args.check_command = []
+    args.confirm_previous_commands_stopped = True
     assert module.ensure_pr(args)["status"] == "pr_ready"
     assert run_git(repo, "rev-list", "--count", "main..HEAD").stdout.strip() == "1"
     assert state["creates"] == 1
@@ -1256,12 +1197,11 @@ def test_repository_ship_checks_declared_test_selection_before_remote_work(
             ).returncode
             == 0
         )
-    original = loaded["ship_repository"].__globals__["_run_json"]
+    original = loaded["ship_repository"].__globals__["_call_github_ship"]
 
-    def checked_remote(command: list[str], **kwargs: Any) -> tuple[int, dict[str, Any]]:
-        if str(PR_WORKFLOW_ENTRYPOINT) in command:
-            assert json.loads(selection_log.read_text()) == [base, head]
-        code, payload = original(command, **kwargs)
+    def checked_remote(*values, **kwargs) -> dict[str, Any]:
+        assert json.loads(selection_log.read_text()) == [base, head]
+        payload = original(*values, **kwargs)
         if (
             case
             in {
@@ -1270,12 +1210,11 @@ def test_repository_ship_checks_declared_test_selection_before_remote_work(
                 "post-merge-resume-without-checkpoint",
             }
             and state["calls"] == 2
-            and str(PR_WORKFLOW_ENTRYPOINT) in command
         ):
             payload = {**payload, "commit": head}
-        return code, payload
+        return payload
 
-    loaded["ship_repository"].__globals__["_run_json"] = checked_remote
+    loaded["ship_repository"].__globals__["_call_github_ship"] = checked_remote
     if case in {
         "post-merge-resume",
         "post-merge-resume-unreused",
@@ -1289,7 +1228,9 @@ def test_repository_ship_checks_declared_test_selection_before_remote_work(
         first = loaded["ship_repository"](args)
         assert first["status"] == "pending_work"
         assert json.loads(selection_log.read_text()) == [base, head]
-        args = loaded["build_parser"]().parse_args(first["resume_action"]["argv"][2:])
+        args = loaded["build_parser"]().parse_args([
+            *first["resume_action"]["argv"][2:], "--confirm-previous-commands-stopped",
+        ])
         assert run_git(repo, "checkout", "-b", args.base_branch).returncode == 0
         (repo / "merged.txt").write_text("merged", encoding="utf-8")
         synchronized = _commit(repo)

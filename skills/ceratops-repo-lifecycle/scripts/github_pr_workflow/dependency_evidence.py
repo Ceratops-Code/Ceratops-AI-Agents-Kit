@@ -7,12 +7,14 @@ import json
 import pathlib
 import re
 import subprocess
+import time
+import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any
 
-import tomllib
+from github_contract_engine.format_report import sanitize_for_output
 
 from .dependency_common import (
     BUMP_RE,
@@ -43,6 +45,104 @@ INCLUSIVE_LOWER_BOUND_RE = re.compile(
     r"^>=\s*(?P<version>v?[0-9][0-9A-Za-z.!+_-]*)$",
     re.IGNORECASE,
 )
+
+
+def fetch_ci_annotations(repo: str, head: str) -> dict[str, Any]:
+    """Read exact-head CheckRun messages, including warnings in successful jobs.
+
+    GitHub CLI owns authentication and pagination. A bounded read never mutates
+    checks or repeats CI. Counts include every fetched message; the first fifty
+    warnings/failures retain their location and check link in the current queue
+    report. Notices are counted separately. Missing or partial pages remain an
+    unavailable evidence result rather than a claim that the PR has no warnings.
+    """
+
+    result: dict[str, Any] = {
+        "status": "ok", "head_oid": head, "check_runs": 0,
+        "counts": {"warning": 0, "failure": 0, "notice": 0},
+        "annotations": [], "omitted_annotations": 0,
+    }
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", head):
+        return {**result, "status": "unavailable", "error": "missing exact PR head"}
+    deadline = time.monotonic() + 120
+
+    def read_pages(endpoint: str) -> list[Any]:
+        command = ["gh", "api", endpoint, "--paginate", "--slurp"]
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise WorkflowError("CI annotation read exceeded its 120-second budget")
+        completed = _pr_query(command, min(30, remaining))
+        if completed.returncode:
+            # Keep both streams and the exact read invocation for the caller's
+            # existing current-report diagnostics, without a separate log file.
+            raise WorkflowError(json.dumps(sanitize_for_output({
+                "operation": "read_ci_annotations", "target": endpoint,
+                "invocation": command, "exit_status": completed.returncode,
+                "stdout": completed.stdout.strip() or "<absent>",
+                "stderr": completed.stderr.strip() or "<absent>",
+            })))
+        try:
+            pages = json.loads(completed.stdout)
+        except ValueError as exc:
+            raise WorkflowError(f"invalid CI annotation JSON for {endpoint}: {exc}") from exc
+        if not isinstance(pages, list) or not pages:
+            raise WorkflowError(f"missing CI annotation pages for {endpoint}")
+        return pages
+
+    try:
+        pages = read_pages(f"repos/{repo}/commits/{head}/check-runs?per_page=100&filter=latest")
+        checks = []
+        for page in pages:
+            if not isinstance(page, dict) or not isinstance(page.get("check_runs"), list):
+                raise WorkflowError("invalid CheckRun page")
+            checks.extend(page["check_runs"])
+        total = pages[0].get("total_count")
+        if type(total) is not int or total != len(checks):
+            raise WorkflowError("incomplete CheckRun pagination")
+        result["check_runs"] = len(checks)
+        for check in checks:
+            if not isinstance(check, dict) or check.get("head_sha") != head:
+                raise WorkflowError("CheckRun does not match the exact PR head")
+            check_id = check.get("id")
+            count = as_object(check.get("output")).get("annotations_count")
+            if type(check_id) is not int or type(count) is not int or count < 0:
+                raise WorkflowError("CheckRun lacks an annotation count or identity")
+            if not count:
+                continue
+            annotation_pages = read_pages(
+                f"repos/{repo}/check-runs/{check_id}/annotations?per_page=100"
+            )
+            seen = 0
+            for page in annotation_pages:
+                if not isinstance(page, list):
+                    raise WorkflowError(f"invalid annotation page for CheckRun {check_id}")
+                for annotation in page:
+                    level = annotation.get("annotation_level") if isinstance(annotation, dict) else None
+                    if not isinstance(level, str) or level not in result["counts"] or not isinstance(annotation.get("message"), str):
+                        raise WorkflowError(f"invalid annotation for CheckRun {check_id}")
+                    seen += 1
+                    result["counts"][level] += 1
+                    if level == "notice":
+                        continue
+                    if len(result["annotations"]) >= 50:
+                        result["omitted_annotations"] += 1
+                        continue
+                    message = sanitize_for_output(annotation["message"])
+                    result["annotations"].append({
+                        "check_run_id": check_id, "check_name": check.get("name"),
+                        "check_url": check.get("html_url") or check.get("details_url"),
+                        "check_conclusion": check.get("conclusion"), "level": level,
+                        "path": str(annotation.get("path") or "")[:500],
+                        "start_line": annotation.get("start_line"),
+                        "end_line": annotation.get("end_line"),
+                        "title": str(annotation.get("title") or "")[:240],
+                        "message": message[:2000], "message_truncated": len(message) > 2000,
+                    })
+            if seen < count:
+                raise WorkflowError(f"incomplete annotation pagination for CheckRun {check_id}")
+    except WorkflowError as exc:
+        result.update(status="unavailable", error=str(exc))
+    return result
 
 
 def project_check(check: dict[str, Any]) -> dict[str, Any]:

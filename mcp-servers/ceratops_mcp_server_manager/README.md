@@ -15,7 +15,7 @@ stays outside the wheel.
 
 Editable source belongs in the MCP server's owning repository. Each MCP server
 owns a separate directory under `%USERPROFILE%\.codex\mcp`, including its
-packages, environments, version selection, registry, cache, and locks. The
+packages, environments, version selection, registry, and locks. The
 manager's directory is
 `%USERPROFILE%\.codex\mcp\ceratops_mcp_server_manager`. The skill installer
 separately owns skill deployment.
@@ -58,15 +58,30 @@ uv run --locked scripts/deploy-mcp-server-manager.py
 %USERPROFILE%\.codex\mcp\ceratops_mcp_server_manager\bin\ceratops_mcp_server_manager.cmd versions
 ```
 
-The deployment script installs the source checkout's declared manager version,
-including when a manager is already installed. It validates global
+The deployment script selects the source checkout's declared manager version,
+reusing an exact selected release on retries. It validates global
 prerequisites, builds and registers the source release, prepares the launchers,
 and calls the same packaging and deployment code used after installation. It
 provisions hash-locked Python libraries in temporary storage and removes that
 storage on success or failure; no libraries need to be installed globally.
-It changes no Codex
-configuration. An incompatible or missing prerequisite fails before deployment
-writes installation files.
+It changes no Codex configuration. An incompatible or missing prerequisite fails
+before deployment writes installation files.
+
+The manager's launcher template is copied into each server's own `bin` folder.
+It starts the selected environment with explicit input, output, and error streams,
+so hidden Windows processes retain the host's stdio connection. The launcher
+holds its usage lease until that child exits and returns the child's exit status.
+Manager source installation finds complete, selected server installations in
+the manager-owned `%USERPROFILE%\.codex\mcp` root and brings only missing or
+stale launcher files to that template. It ignores unrelated entries, unselected
+directories, and links without following them. An invalid selected installation
+stops the operation before packaging. A repeat after interruption keeps the
+selected manager and server versions and changes only launcher files still
+missing or stale.
+
+To refresh one installed server later, run the selected manager's stable
+launcher with `refresh-launcher <mcp-server-name>`. This does not rebuild or
+reselect that server's environment; it also applies the two-version retention policy.
 
 For a one-time move from a previous manager root, name that exact source
 explicitly:
@@ -88,6 +103,7 @@ rollback state until it is deliberately removed.
 | `install --source <mcp-server-directory> --package-wheel <wheel> --package-lock <lockfile>` | Not exposed | Build the MCP server and install it with the declared package wheel |
 | Not exposed | `install` | `mcp_server_name`, `version` for an exact registered release |
 | `update <mcp-server-name> <version>` | `update` | `mcp_server_name`, `version` |
+| `refresh-launcher <mcp-server-name>` | Not exposed | One installed MCP server whose launcher should use the selected manager's template |
 | `versions [mcp-server-name]` | `versions` | optional `mcp_server_name` |
 
 Omitting a version-inspection name selects `ceratops_mcp_server_manager`.
@@ -255,8 +271,21 @@ to work because their leased environments are retained.
 Every successful activation installs or refreshes that MCP server's stable launcher.
 The launcher selects `current.json` and holds an instance lease for the child
 process lifetime. At deployment startup and after a completed package or
-activation, the manager retains the selected environment and two newest
-complete predecessors. Older live environments are deferred. Incomplete
+activation, the manager retains the selected environment and the newest
+complete different version. Older and duplicate live environments are deferred.
+Repeated installation of the selected immutable release reuses that accepted
+environment and repairs only launcher and retention state. Launcher refresh also
+applies retention, so manager deployment updates all selected servers without
+reinstalling them. Maintenance reports removed paths, deferred live paths, and
+operation/target/error details for cleanup failures.
+
+The package operation owns each `staging/package_*/uv-cache` and bootstrap owns
+`staging/bootstrap_*/uv-cache`; their enclosing temporary directories are removed
+on exit. Deployment owns `versions/<version>/<instance>/tmp/uv-cache`; it is
+removed before activation or with a failed candidate. uv copies files into an
+accepted environment, so those environments do not depend on cache lifetime.
+No persistent per-server `cache` directory is produced. Old caches can be cleared
+with uv's cache-clean operation after outstanding deployments stop. Incomplete
 environments and unselected or orphaned packages receive a 24-hour recovery
 window; after that they and any registry entries are removed. Reparse points and
 unclassified paths are never cleanup targets.

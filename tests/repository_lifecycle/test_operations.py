@@ -777,18 +777,19 @@ def test_prepared_results_cannot_authorize_a_new_commit(tmp_path: pathlib.Path) 
 def test_bootstrap_and_ci_handoffs_need_no_skill_runtime(
     tmp_path: pathlib.Path,
 ) -> None:
-    skill_handoff = lambda action: {
-        "requires": {"capabilities": []},
-        "steps": [
-            {
-                "handoff": {
-                    "lifecycle": "ceratops-skill-lifecycle",
-                    "action": action,
-                    "inputs": {"skill": "ceratops-managed"},
+    def skill_handoff(action):
+        return {
+            "requires": {"capabilities": []},
+            "steps": [
+                {
+                    "handoff": {
+                        "lifecycle": "ceratops-skill-lifecycle",
+                        "action": action,
+                        "inputs": {"skill": "ceratops-managed"},
+                    }
                 }
-            }
-        ],
-    }
+            ],
+        }
     write_sdlc_contract(
         tmp_path,
         repository={
@@ -1170,7 +1171,7 @@ def test_completed_validation_binding_is_not_returned_as_pending_handoff(
         },
     )
     monkeypatch.setattr(
-        runner,
+        runner.execute_skill_actions,
         "execute_handoff",
         lambda route, root, **_kwargs: {
             "status": "completed",

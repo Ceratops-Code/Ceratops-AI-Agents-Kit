@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Classify and transactionally install exact managed runtime skill batches.
+"""Check source inputs and transactionally deploy exact managed skill batches.
 
-The installer never validates source behavior. It resolves an explicit
-selection, a structured Git affected set, or one all-managed snapshot, then
-invokes the transactional builder once. Its inventory operation reads only
+One callable owns request preflight, the existing source-check command, the
+transactional builder, and promotion cleanup. It resolves explicit selections,
+a structured Git affected set, or one all-managed snapshot. Inventory reads only
 direct child runtime manifests and writes routing evidence to a caller-selected
 file without comparing installed files with source.
 """
@@ -13,14 +13,17 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import hashlib
+import importlib
 import json
 import os
 import pathlib
 import re
 import subprocess
 import sys
+import threading
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from contextlib import ExitStack, nullcontext
+from dataclasses import dataclass, replace
 from typing import Any, cast
 
 # Direct script execution and maintenance imports must use one package identity.
@@ -29,10 +32,18 @@ scripts_root = str(pathlib.Path(__file__).resolve().parents[1])
 sys.path.insert(0, scripts_root)
 try:
     from runtime import managed_runtime_builder as runtime_builder
+    from runtime import prepare_python_runtime as python_environments
 finally:
     sys.path.remove(scripts_root)
 
 BUNDLE_ROOT = pathlib.Path(__file__).resolve().parents[2]
+if not (BUNDLE_ROOT / ".runtime-manifest.json").is_file():
+    shared_scripts = str(BUNDLE_ROOT.parent / "sections" / "scripts")
+    if shared_scripts not in sys.path:
+        sys.path.insert(0, shared_scripts)
+else:
+    sys.path.insert(0, str(BUNDLE_ROOT / "scripts"))
+source_locks = importlib.import_module("hold_write_lock")
 MANIFEST_RELATIVE = pathlib.PurePosixPath("skills/skill-sections.json")
 MANIFEST_NAME = ".runtime-manifest.json"
 RUNTIME_MANIFEST_SCHEMA = "ceratops-runtime-skill.v3"
@@ -55,6 +66,10 @@ GLOBAL_RUNTIME_PATHS = {
 FULL_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 PayloadDeclaration = str | tuple[str, str]
 
+# The builder selects a repository through module globals and chdir is process
+# state. One callable owns both until its final cleanup and CWD restoration end.
+_DEPLOYMENT_LOCK = threading.Lock()
+
 
 class InstallerError(RuntimeError):
     """Compact installer failure before transactional builder ownership."""
@@ -66,11 +81,13 @@ class InstallerError(RuntimeError):
         phase: str = "classification",
         skill: str = "",
         status: str = "error",
+        details: Mapping[str, Any] | None = None,
     ) -> None:
         super().__init__(reason)
         self.phase = phase
         self.skill = skill
         self.status = status
+        self.details = dict(details or {})
 
     def result(self) -> dict[str, object]:
         return {
@@ -79,6 +96,7 @@ class InstallerError(RuntimeError):
             "skill": self.skill,
             "rollback": "not_started",
             "reason": str(self),
+            **self.details,
         }
 
 
@@ -98,6 +116,29 @@ class AffectedSet:
     all_managed: bool = False
 
 
+@dataclass(frozen=True)
+class DeployOptions:
+    """Inputs shared by the public deployment callable and its CLI adapter.
+
+    No selection means all managed skills; an explicitly empty selection is a
+    no-op. Promotion fields bind cleanup to an existing caller-owned record,
+    not to a saved execution checkpoint or permission to rerun repository work.
+    """
+
+    repo_root: pathlib.Path | None = None
+    install_root: pathlib.Path | None = None
+    skill: Sequence[str] | None = None
+    remove_skill: Sequence[str] | None = None
+    base_revision: str | None = None
+    previous_runtime_source_id: str | None = None
+    inventory_output: pathlib.Path | None = None
+    promotion_result: pathlib.Path | None = None
+    operation: Sequence[str] | None = None
+    task_temp_root: pathlib.Path | None = None
+    finalize_promotion_with: pathlib.Path | None = None
+    deployment_evidence: Sequence[pathlib.Path] | None = None
+
+
 def default_install_root() -> pathlib.Path:
     """Return the direct personal runtime skills root."""
 
@@ -112,7 +153,7 @@ def default_install_root() -> pathlib.Path:
 def _git(
     repo_root: pathlib.Path, *arguments: str, text: bool = True
 ) -> subprocess.CompletedProcess[Any]:
-    result = subprocess.run(
+    result = source_locks.run_protected_command(
         ["git", "-C", str(repo_root), *arguments],
         capture_output=True,
         text=text,
@@ -135,7 +176,7 @@ def _git_text(repo_root: pathlib.Path, *arguments: str) -> str:
 def _git_file(
     repo_root: pathlib.Path, revision: str, path: str
 ) -> str | None:
-    result = subprocess.run(
+    result = source_locks.run_protected_command(
         ["git", "-C", str(repo_root), "show", f"{revision}:{path}"],
         capture_output=True,
         text=True,
@@ -143,7 +184,7 @@ def _git_file(
     )
     if result.returncode == 0:
         return result.stdout
-    existence = subprocess.run(
+    existence = source_locks.run_protected_command(
         ["git", "-C", str(repo_root), "cat-file", "-e", f"{revision}:{path}"],
         capture_output=True,
         text=True,
@@ -559,7 +600,7 @@ def runtime_inventory(runtime_root: pathlib.Path) -> dict[str, object]:
     if runtime_root.is_dir():
         for skill_dir in sorted(runtime_root.iterdir()):
             if (
-                runtime_builder._unsafe_link(skill_dir)
+                python_environments.is_runtime_link(skill_dir)
                 or not skill_dir.is_dir()
                 or not (skill_dir / MANIFEST_NAME).is_file()
             ):
@@ -625,7 +666,7 @@ def _source_commit(repo_root: pathlib.Path) -> str | None:
     Ordinary uncommitted installations remain supported, but their receipts
     cannot finalize a promotion. No installed-content scan is needed.
     """
-    result = subprocess.run(["git", "-C", str(repo_root), "rev-parse", "--show-toplevel"],
+    result = source_locks.run_protected_command(["git", "-C", str(repo_root), "rev-parse", "--show-toplevel"],
                             capture_output=True, text=True, check=False)
     if result.returncode == 128:
         return None
@@ -656,7 +697,7 @@ def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 
 def _promotion_bindings(
-    args: argparse.Namespace,
+    args: DeployOptions,
     repo_root: pathlib.Path,
     commit: str | None,
 ) -> list[dict[str, Any]] | None:
@@ -675,7 +716,12 @@ def _promotion_bindings(
         if args.deployment_evidence:
             raise InstallerError("deployment evidence requires promotion cleanup inputs")
         return None
-    if not all(options):
+    if (
+        not args.promotion_result
+        or not args.operation
+        or not args.task_temp_root
+        or not args.finalize_promotion_with
+    ):
         raise InstallerError(
             "promotion cleanup requires promotion-result, operation, "
             "task-temp-root, and finalize-promotion-with"
@@ -702,10 +748,15 @@ def _promotion_bindings(
     if [getattr(path.stat(), field) for field in identity_fields] != identity:
         raise InstallerError("promotion record changed during preflight")
     record = json.loads(data, object_pairs_hook=_unique_object)
-    if not isinstance(record, dict) or record.get("status") != "ready" or record.get("head") != commit:
+    pending = isinstance(record, dict) and record.get("status") == "handoff_required" and record.get("phase") == "deployment"
+    promotion = record.get("promotion") if pending else record
+    if not isinstance(promotion, dict) or promotion.get("status") != "ready" or promotion.get("head") != commit:
         raise InstallerError("promotion record does not identify this ready source commit")
     operations = record.get("operations")
-    if not isinstance(operations, dict) or operations.get("status") != "completed" or operations.get("pending_operations") != []:
+    if (not isinstance(operations, dict)
+            or operations.get("status") != ("handoff_required" if pending else "completed")
+            or not isinstance(operations.get("pending_operations"), list)
+            or (not pending and operations["pending_operations"] != [])):
         raise InstallerError("promotion record has incomplete repository operations")
     if not isinstance(operations.get("results"), list):
         raise InstallerError("promotion operation results are missing")
@@ -720,12 +771,13 @@ def _promotion_bindings(
             len(matches) != 1
             or matches[0].get("handoff") != "ceratops-skill-lifecycle/deploy"
             or matches[0].get("handoff_completed")
+            or (pending and operation not in operations["pending_operations"])
         ):
             raise InstallerError(
                 "promotion record does not contain the selected pending skill deployment"
             )
         if (
-            matches[0].get("status") not in {"completed", "advisory"}
+            matches[0].get("status") not in ({"handoff_required"} if pending else {"completed", "advisory"})
             or matches[0].get("commit") != commit
             or (
                 matches[0].get("status") == "advisory"
@@ -747,7 +799,7 @@ def _promotion_bindings(
 
 
 def _additional_deployment_evidence(
-    args: argparse.Namespace, repo_root: pathlib.Path, commit: str | None,
+    args: DeployOptions, repo_root: pathlib.Path, commit: str | None,
     promotion: list[dict[str, Any]] | None,
 ) -> list[str]:
     """Reject unavailable or unrelated caller receipts before any installation.
@@ -839,124 +891,247 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _request_paths(args: DeployOptions) -> DeployOptions:
+    """Resolve caller-relative paths before leaving an installed working directory."""
+
+    paths: dict[str, Any] = {}
+    for name in ("repo_root", "install_root", "inventory_output", "promotion_result",
+                 "task_temp_root", "finalize_promotion_with"):
+        value = getattr(args, name)
+        if value is not None:
+            if not isinstance(value, (str, os.PathLike)):
+                raise InstallerError(f"{name} must be a filesystem path", phase="preflight")
+            # Promotion evidence retains its lexical path until _plain_path can
+            # reject redirection. Ordinary roots retain their existing resolution.
+            paths[name] = pathlib.Path(os.path.abspath(pathlib.Path(value).expanduser()))
+    for name in ("skill", "remove_skill", "operation"):
+        value = getattr(args, name)
+        if value is not None:
+            if (not isinstance(value, Sequence) or isinstance(value, str)
+                    or not all(isinstance(item, str) and item for item in value)):
+                raise InstallerError(f"{name} must be a sequence of nonempty names", phase="preflight")
+            paths[name] = tuple(value)
+    if args.deployment_evidence is not None:
+        if (not isinstance(args.deployment_evidence, Sequence)
+                or isinstance(args.deployment_evidence, (str, bytes))
+                or not all(isinstance(path, (str, os.PathLike)) for path in args.deployment_evidence)):
+            raise InstallerError("deployment_evidence must be a sequence of paths", phase="preflight")
+        paths["deployment_evidence"] = tuple(
+            pathlib.Path(os.path.abspath(pathlib.Path(path).expanduser()))
+            for path in args.deployment_evidence
+        )
+    return replace(args, **paths)
+
+
+def _deployment_scope(args: DeployOptions, repo_root: pathlib.Path) -> AffectedSet:
+    """Reject ambiguous selection and source ownership before any command effect.
+
+    These are request checks, not a second source acceptance pass. Source content
+    remains owned by the existing checker; runtime target ownership and rollback
+    remain owned by install_transaction under its writer lock.
+    """
+
+    if not repo_root.is_dir():
+        raise InstallerError("repo-root must name an existing source directory", phase="preflight")
+    if args.base_revision is not None and (args.skill is not None or args.remove_skill is not None):
+        raise InstallerError("--base-revision cannot be combined with explicit selections", phase="preflight")
+    manifest_path = repo_root / MANIFEST_RELATIVE
+    if not manifest_path.is_file():
+        raise InstallerError("repo-root must contain skills/skill-sections.json", phase="preflight")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict):
+        raise InstallerError("section manifest must be a JSON object", phase="preflight")
+    source_id = manifest.get("runtime_source_id")
+    profile = manifest.get("validation_profile")
+    if not isinstance(source_id, str) or not source_id.strip():
+        raise InstallerError("runtime_source_id must be nonempty", phase="preflight")
+    if not isinstance(profile, str) or profile not in VALIDATION_PROFILES:
+        raise InstallerError("unsupported source validation profile", phase="preflight")
+    previous = args.previous_runtime_source_id
+    if previous is not None and (not isinstance(previous, str) or not previous.strip() or previous == source_id):
+        raise InstallerError("previous runtime source identity must be nonempty and differ from current identity", phase="preflight")
+    if args.base_revision is not None:
+        if not isinstance(args.base_revision, str):
+            raise InstallerError("base revision must be one full Git SHA", phase="preflight")
+        affected = affected_from_base(repo_root, args.base_revision)
+    elif args.skill is not None or args.remove_skill is not None:
+        affected = AffectedSet(tuple(args.skill or ()), tuple(args.remove_skill or ()))
+    else:
+        affected = AffectedSet((), (), True)
+    source_names = {path.parent.name for path in (repo_root / "skills").glob("*/SKILL.md")}
+    selected = tuple(sorted(source_names)) if affected.all_managed else affected.deploy
+    for label, names in (("selected", selected), ("removed", affected.remove)):
+        if len(names) != len(set(names)):
+            raise InstallerError(f"{label} skill names must be unique", phase="preflight")
+        for name in names:
+            if not runtime_builder.valid_skill_name(name):
+                raise InstallerError(f"unsafe skill name: {name}", phase="preflight", skill=name)
+    if set(selected).intersection(affected.remove):
+        raise InstallerError("a skill cannot be both deployed and removed", phase="preflight")
+    assignments = _mapping(manifest.get("skills"), "current skills")
+    for name in selected:
+        if name not in source_names or name not in assignments:
+            raise InstallerError(f"unknown selected skill: {name}", phase="preflight", skill=name)
+    if set(affected.remove).intersection(source_names):
+        raise InstallerError("cannot remove a skill still present in the source snapshot", phase="preflight")
+    return AffectedSet(selected, affected.remove, affected.all_managed)
+
+
+def _check_deployment_sources(repo_root: pathlib.Path, affected: AffectedSet) -> None:
+    """Run this bundle's existing source checker once for the exact deploy scope."""
+
+    if not affected.all_managed and not affected.deploy:
+        return
+    checker = BUNDLE_ROOT / "scripts" / "skills-consistency-source-validator.py"
+    command = [sys.executable, str(checker), "--repo-root", str(repo_root),
+               "--mode", "full" if affected.all_managed else "skill"]
+    if not affected.all_managed:
+        command.extend(argument for name in affected.deploy for argument in ("--skill", name))
+    if not checker.is_file():
+        raise InstallerError("source checker is unavailable in the selected lifecycle bundle",
+                             phase="source_check", details={"command": command})
+    try:
+        result = source_locks.run_protected_command(command, cwd=repo_root, capture_output=True, text=True,
+                                encoding="utf-8", errors="replace", check=False,
+                                env={**os.environ, "PYTHONIOENCODING": "utf-8"})
+    except OSError as exc:
+        raise InstallerError(str(exc), phase="source_check",
+                             details=source_locks.command_failure_details(exc, target=repo_root, command=command)) from exc
+    if result.returncode:
+        raise InstallerError(f"source check failed with exit code {result.returncode}", phase="source_check",
+                             details=source_locks.command_failure_details(result, target=repo_root))
+
+
+def deploy_managed_skills(args: DeployOptions) -> dict[str, Any] | str:
+    """Perform one current-input deployment or inventory request without printing.
+
+    Source checks finish before the builder can acquire its runtime lock or
+    stage files. The builder owns activation, rollback, and retired-tree cleanup.
+    Promotion cleanup consumes its actual receipt; failure returns that receipt
+    and a cleanup-only call, never an automatic second deployment. Package
+    acceptance is a caller prerequisite: this interface has no package receipts.
+    Calls are serialized because the builder's repository selection and the
+    working directory are process state. The entry directory is restored unless
+    activation retired or replaced that directory; in that case the call stays
+    at source so Windows can release the old installed directory.
+    """
+
+    # Lock release before taking the in-process builder mutex or its destination
+    # lock. Inventory and task-worktree sources need no release protection.
+    source_context = (source_locks.hold_release_source(args.repo_root)
+                      if args.repo_root is not None else nullcontext())
+    with ExitStack() as locks:
+        try:
+            locks.enter_context(source_context)
+        except source_locks.WriteLockError as exc:
+            return InstallerError(str(exc), phase="source_lock").result()
+        locks.enter_context(_DEPLOYMENT_LOCK)
+        entry_directory = pathlib.Path.cwd()
+        entry_identity = entry_directory.stat()
+        try:
+            try:
+                args = _request_paths(args)
+                install_root = (args.install_root or default_install_root()).resolve()
+                if install_root.exists() and not install_root.is_dir():
+                    raise InstallerError("install-root must name a directory", phase="preflight")
+                if args.inventory_output is not None:
+                    if any(value is not None for value in (
+                        args.repo_root, args.skill, args.remove_skill, args.base_revision,
+                        args.previous_runtime_source_id, args.promotion_result, args.operation,
+                        args.task_temp_root, args.finalize_promotion_with, args.deployment_evidence,
+                    )):
+                        raise InstallerError("--inventory-output cannot be combined with installation inputs", phase="preflight")
+                    try:
+                        write_inventory(install_root, args.inventory_output)
+                    except OSError as exc:
+                        raise InstallerError(str(exc), phase="inventory") from exc
+                    return "OK"
+                if args.repo_root is None:
+                    raise InstallerError("--repo-root is required for installation", phase="preflight")
+                repo_root = args.repo_root.resolve()
+                affected = _deployment_scope(args, repo_root)
+                commit = _source_commit(repo_root)
+                promotion = _promotion_bindings(args, repo_root, commit)
+                deployment_evidence = _additional_deployment_evidence(args, repo_root, commit, promotion)
+                if not affected.all_managed and not affected.deploy and not affected.remove:
+                    receipt = _completion_receipt(runtime_builder.TransactionResult("ok", (), (), ""),
+                                                  repo_root, install_root, commit, promotion)
+                    receipt["status"] = "no_op"
+                    return receipt
+                _check_deployment_sources(repo_root, affected)
+                if _source_commit(repo_root) != commit:
+                    raise InstallerError("source changed during source checks", phase="source_check", status="source_changed")
+                # The source is outside the runtime skill directories being retired.
+                os.chdir(repo_root)
+                result = runtime_builder.install_transaction(
+                    repo_root,
+                    install_root,
+                    selected=() if affected.all_managed else affected.deploy,
+                    remove=affected.remove,
+                    all_managed=affected.all_managed,
+                    previous_runtime_source_id=args.previous_runtime_source_id,
+                )
+            except (InstallerError, runtime_builder.TransactionError, OSError, ValueError) as exc:
+                if getattr(exc, "local_commands_stopped", None) is False:
+                    raise  # Preserve uncertain command shutdown for the release owner.
+                if isinstance(exc, (runtime_builder.TransactionError, InstallerError)):
+                    return exc.result()
+                return InstallerError(str(exc)).result()
+            receipt = _completion_receipt(result, repo_root, install_root, commit, promotion)
+            try:
+                if _source_commit(repo_root) != commit:
+                    receipt["status"] = "source_changed"
+            except (InstallerError, OSError) as exc:
+                receipt["status"] = "source_changed"
+                receipt["message"] = str(exc)
+            if promotion is not None and receipt["status"] == "completed":
+                first_binding = promotion[0]
+                command = [sys.executable, str(args.finalize_promotion_with), "--repo-root", str(repo_root),
+                           "--finalize-result", "--result-file", first_binding["result_file"],
+                           "--task-temp-root", str(args.task_temp_root), "--expected-commit", str(commit),
+                           "--deployment-evidence", "-",
+                           *[argument for path in deployment_evidence
+                             for argument in ("--deployment-evidence", path)]]
+                receipt_input = json.dumps(receipt)
+                try:
+                    finalized = source_locks.run_protected_command(command, input=receipt_input, cwd=repo_root,
+                                               capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
+                                               env={**os.environ, "PYTHONIOENCODING": "utf-8"})
+                    cleanup: dict[str, Any] = {"status": "completed" if finalized.returncode == 0 else "failed",
+                                               "replay_required": False}
+                    if finalized.returncode:
+                        cleanup.update(returncode=finalized.returncode, stdout=finalized.stdout, stderr=finalized.stderr,
+                                       message=finalized.stderr.strip() or finalized.stdout.strip())
+                except OSError as exc:
+                    cleanup = {"status": "failed", "message": str(exc), "replay_required": False,
+                               "returncode": None, "stdout": "", "stderr": str(exc)}
+                if cleanup["status"] == "failed":
+                    cleanup["next_action"] = {"command": command, "stdin": receipt_input}
+                receipt["promotion_cleanup"] = cleanup
+            return receipt
+        finally:
+            try:
+                if os.path.samestat(entry_identity, entry_directory.stat()):
+                    os.chdir(entry_directory)
+            except FileNotFoundError:
+                # This call may have retired the installed directory that
+                # launched it; never recreate or re-enter that obsolete CWD.
+                pass
+
+
 def main(argv: list[str] | None = None) -> int:
-    """Classify one request, invoke one transaction, or write inventory."""
+    """Adapt the deployment callable's result to the existing public CLI."""
 
-    args = build_parser().parse_args(argv)
-    install_root = (args.install_root or default_install_root()).resolve()
-    if args.inventory_output is not None:
-        if any(
-            value is not None
-            for value in (
-                args.repo_root,
-                args.skill,
-                args.remove_skill,
-                args.base_revision, args.previous_runtime_source_id,
-                args.promotion_result, args.operation,
-                args.task_temp_root, args.finalize_promotion_with, args.deployment_evidence,
-            )
-        ):
-            raise SystemExit(
-                "--inventory-output cannot be combined with installation inputs"
-            )
-        try:
-            write_inventory(install_root, args.inventory_output)
-        except OSError as exc:
-            print(
-                json.dumps(
-                    InstallerError(
-                        str(exc), phase="inventory"
-                    ).result(),
-                    separators=(",", ":"),
-                ),
-                file=sys.stderr,
-            )
-            return 1
-        print("OK")
+    result = deploy_managed_skills(DeployOptions(**vars(build_parser().parse_args(argv))))
+    if isinstance(result, str):
+        print(result)
         return 0
-
-    if args.repo_root is None:
-        raise SystemExit("--repo-root is required for installation")
-    if args.base_revision is not None and (
-        args.skill is not None or args.remove_skill is not None
-    ):
-        raise SystemExit(
-            "--base-revision cannot be combined with explicit selections"
-        )
-    repo_root = args.repo_root.expanduser().resolve()
-    try:
-        # A Windows process cannot retire a directory held as its own CWD.
-        # The required source repository is outside every runtime target.
-        os.chdir(repo_root)
-        commit = _source_commit(repo_root)
-        promotion = _promotion_bindings(args, repo_root, commit)
-        deployment_evidence = _additional_deployment_evidence(args, repo_root, commit, promotion)
-        if args.base_revision is not None:
-            affected = affected_from_base(repo_root, args.base_revision)
-        elif args.skill is not None or args.remove_skill is not None:
-            affected = AffectedSet(
-                tuple(args.skill or ()), tuple(args.remove_skill or ())
-            )
-        else:
-            affected = AffectedSet((), (), True)
-        if not affected.all_managed and not affected.deploy and not affected.remove:
-            receipt = _completion_receipt(runtime_builder.TransactionResult("ok", (), (), ""),
-                                          repo_root, install_root, commit, promotion)
-            receipt["status"] = "no_op"
-            print(json.dumps(receipt, separators=(",", ":")))
-            return 0
-        result = runtime_builder.install_transaction(
-            repo_root,
-            install_root,
-            selected=() if affected.all_managed else affected.deploy,
-            remove=affected.remove,
-            all_managed=affected.all_managed,
-            previous_runtime_source_id=args.previous_runtime_source_id,
-        )
-    except (
-        DecisionRequired,
-        InstallerError,
-        runtime_builder.TransactionError,
-        OSError,
-        ValueError,
-        json.JSONDecodeError,
-    ) as exc:
-        if isinstance(exc, (runtime_builder.TransactionError, InstallerError)):
-            payload = exc.result()
-        else:
-            payload = InstallerError(str(exc)).result()
-        print(json.dumps(payload, separators=(",", ":")), file=sys.stderr)
-        return 2 if payload.get("status") == "decision_required" else 1
-    receipt = _completion_receipt(result, repo_root, install_root, commit, promotion)
-    try:
-        if _source_commit(repo_root) != commit:
-            receipt["status"] = "source_changed"
-    except (InstallerError, OSError) as exc:
-        receipt["status"] = "source_changed"
-        receipt["message"] = str(exc)
-    if promotion is not None and receipt["status"] == "completed":
-        # Pass the actual receipt directly. No additional temp file is needed.
-        # A failed cleanup returns the receipt for finalizer-only retries.
-        try:
-            first_binding = promotion[0]
-            finalized = subprocess.run(
-                [sys.executable, str(args.finalize_promotion_with), "--repo-root", str(repo_root),
-                 "--finalize-result", "--result-file", first_binding["result_file"],
-                 "--task-temp-root", str(args.task_temp_root), "--expected-commit", str(commit),
-                 "--deployment-evidence", "-",
-                 *[argument for path in deployment_evidence
-                   for argument in ("--deployment-evidence", path)]], input=json.dumps(receipt), cwd=repo_root,
-                capture_output=True, text=True, check=False,
-            )
-            receipt["promotion_cleanup"] = {"status": "completed" if finalized.returncode == 0 else "failed",
-                                            "replay_required": False}
-            if finalized.returncode:
-                receipt["promotion_cleanup"]["message"] = finalized.stderr.strip()[-4096:]
-        except OSError as exc:
-            receipt["promotion_cleanup"] = {"status": "failed", "message": str(exc), "replay_required": False}
-    failed = receipt["status"] != "completed" or receipt.get("promotion_cleanup", {}).get("status") == "failed"
-    print(json.dumps(receipt, separators=(",", ":")), file=sys.stderr if failed else sys.stdout)
-    return 2 if failed else 0
+    status = result.get("status")
+    failed_cleanup = result.get("promotion_cleanup", {}).get("status") == "failed"
+    code = (0 if status in {"completed", "no_op"} and not failed_cleanup else
+            2 if status in {"decision_required", "cleanup_blocked", "source_changed", "completed"} else 1)
+    print(json.dumps(result, separators=(",", ":")), file=sys.stderr if code else sys.stdout)
+    return code
 
 
 if __name__ == "__main__":

@@ -11,7 +11,7 @@ import shutil
 import subprocess
 import sys
 import threading
-from typing import Any
+from typing import Any, Self
 
 import pytest
 
@@ -128,7 +128,7 @@ def test_json_command_forwards_progress_before_exit_without_polluting_its_result
         sink = Observer(observations)
         with monkeypatch.context() as context:
             context.setattr(sys, "stderr", sink)
-            code, result = commands.run_json_command(
+            code, result = commands.run_command_for_json(
                 [sys.executable, str(child)], tmp_path,
             )
         assert code == (7 if result_stream == "stderr" else 0)
@@ -156,10 +156,10 @@ def test_command_transport_drains_both_large_streams_and_retains_failure_details
     observed = capsys.readouterr()
     assert observed.out == "" and observed.err == "[tests] 0/1 completed; running probe\n"
     with pytest.raises(commands.CommandError, match="invalid JSON") as captured:
-        commands.run_json_command([sys.executable, "-c", "print('bad-result')"], tmp_path)
+        commands.run_command_for_json([sys.executable, "-c", "print('bad-result')"], tmp_path)
     assert captured.value.completed.stdout == "bad-result\n"
     with pytest.raises(commands.CommandError, match="non-object"):
-        commands.run_json_command([sys.executable, "-c", "print('[]')"], tmp_path)
+        commands.run_command_for_json([sys.executable, "-c", "print('[]')"], tmp_path)
 
 
 @pytest.mark.parametrize("failure", [False, True])
@@ -177,6 +177,7 @@ def test_promotion_streams_real_pytest_progress_through_every_parent(
         ROOT / "scripts" / "testing", repo / "scripts" / "testing",
         ignore=shutil.ignore_patterns("__pycache__"),
     )
+    shutil.copy2(ROOT / "scripts/result_records.py", repo / "scripts/result_records.py")
     tests = repo / "tests"
     tests.mkdir()
     (tests / "test-impact.json").write_text(json.dumps({
@@ -243,7 +244,11 @@ def test_promotion_streams_real_pytest_progress_through_every_parent(
     assert result.returncode == int(failure), payload
     assert payload["status"] == ("tests_failed" if failure else "ready"), payload
     if failure:
-        assert "expected-failure-marker" in json.dumps(payload)
+        # Promotion returns the runner's complete report path instead of
+        # copying the pytest failure into every parent's bounded response.
+        report = pathlib.Path(payload["diagnostic_output"])
+        assert report.is_file()
+        assert "expected-failure-marker" in report.read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize("phase", ["before-status", "after-status"])
@@ -289,12 +294,12 @@ def test_interrupted_transport_stops_its_child_and_allows_a_fresh_call(
             self.stdout = InterruptedRead()
             self.stderr = self.child.stderr
 
-        def __enter__(self) -> ChildProxy:
+        def __enter__(self) -> Self:
             self.child.__enter__()
             return self
 
-        def __exit__(self, *args: Any) -> Any:
-            return self.child.__exit__(*args)
+        def __exit__(self, exc_type, exc_value, traceback) -> Any:
+            return self.child.__exit__(exc_type, exc_value, traceback)
 
         def kill(self) -> None:
             self.child.kill()

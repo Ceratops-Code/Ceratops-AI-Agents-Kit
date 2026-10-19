@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tomllib
 import zoneinfo
+from collections.abc import Sequence
 from importlib.metadata import version
 from typing import Any
 
@@ -143,6 +144,7 @@ def test_run_process_captures_output_without_a_shell(
         return completed(command)
 
     monkeypatch.setattr(VALIDATOR.subprocess, "run", fake_subprocess_run)
+    monkeypatch.setenv("CERATOPS_REPOSITORY_CHECK_CONTEXT", "outer-check-only")
 
     VALIDATOR.run_process(("tool", "argument with spaces"), tmp_path)
 
@@ -151,6 +153,7 @@ def test_run_process_captures_output_without_a_shell(
     assert observed["capture_output"] is True
     assert observed["text"] is True
     assert observed["check"] is False
+    assert "CERATOPS_REPOSITORY_CHECK_CONTEXT" not in observed["env"]
     assert "shell" not in observed
 
 
@@ -226,6 +229,97 @@ def test_failure_is_fail_fast_compact_and_writes_complete_evidence(
     assert "complete stderr diagnostics" in evidence
     assert "complete stdout diagnostics" not in captured.out
     assert "complete stderr diagnostics" not in captured.out
+
+
+def test_recorded_checks_preserve_actual_outcomes_and_original_acceptance(
+    tmp_path: pathlib.Path, monkeypatch: Any,
+) -> None:
+    monkeypatch.delenv("CERATOPS_REPOSITORY_CHECK_CONTEXT", raising=False)
+    result_file = tmp_path / "attempt.json"
+    arguments = [
+        "--evidence-file", str(tmp_path / "evidence.log"),
+        "--result-file", str(result_file), "--result-id", "attempt-1",
+        "--candidate-id", "candidate-1", "--check-id", "repository.validate",
+        "--check-version", "checks-1",
+    ]
+    calls: list[Sequence[str]] = []
+
+    def process(command: Sequence[str], cwd: pathlib.Path) -> subprocess.CompletedProcess[str]:
+        del cwd
+        calls.append(command)
+        return completed(command)
+
+    assert VALIDATOR.main(arguments, process_runner=process) == 0
+    saved = json.loads(result_file.read_text(encoding="utf-8"))
+    assert saved["result_id"] == "attempt-1"
+    assert saved["check_version"] == "checks-1"
+    assert saved["status"] == "passed" and saved["exit_code"] == 0
+    assert len(calls) == 6
+    assert len(saved["checks"]) == 7
+    assert all(check["status"] == "passed" for check in saved["checks"])
+    calls.clear()
+    assert VALIDATOR.main(arguments, process_runner=process) == 0
+    assert not calls
+    assert json.loads(result_file.read_text(encoding="utf-8")) == saved
+
+
+@pytest.mark.parametrize("interrupt", [False, True])
+def test_recorded_checks_keep_failure_and_interruption_evidence(
+    tmp_path: pathlib.Path, monkeypatch: Any, interrupt: bool,
+) -> None:
+    monkeypatch.delenv("CERATOPS_REPOSITORY_CHECK_CONTEXT", raising=False)
+    result_file = tmp_path / "first.json"
+    arguments = [
+        "--evidence-file", str(tmp_path / "evidence.log"),
+        "--result-file", str(result_file), "--result-id", "first",
+        "--candidate-id", "candidate-1", "--check-id", "repository.validate",
+        "--check-version", "checks-1",
+    ]
+    calls: list[Sequence[str]] = []
+
+    def fail(command: Sequence[str], cwd: pathlib.Path) -> subprocess.CompletedProcess[str]:
+        del cwd
+        calls.append(command)
+        if interrupt:
+            raise KeyboardInterrupt
+        return completed(command, 7)
+
+    assert VALIDATOR.main(arguments, process_runner=fail) == (130 if interrupt else 7)
+    saved = json.loads(result_file.read_text(encoding="utf-8"))
+    assert saved["status"] == ("interrupted" if interrupt else "failed")
+    assert saved["exit_code"] == (130 if interrupt else 7)
+    calls.clear()
+    assert VALIDATOR.main(arguments, process_runner=fail) != 0
+    assert not calls
+    assert json.loads(result_file.read_text(encoding="utf-8")) == saved
+    arguments[3], arguments[5] = str(tmp_path / "second.json"), "second"
+    assert VALIDATOR.main(arguments, process_runner=lambda command, cwd: completed(command)) == 0
+    assert json.loads((tmp_path / "second.json").read_text(encoding="utf-8"))["status"] == "passed"
+
+
+def test_recorded_validator_describes_and_runs_controlled_probe(
+    tmp_path: pathlib.Path, monkeypatch: Any, capsys: Any,
+) -> None:
+    monkeypatch.delenv("CERATOPS_REPOSITORY_CHECK_CONTEXT", raising=False)
+    assert VALIDATOR.main(["--describe-test-results"]) == 0
+    assert json.loads(capsys.readouterr().out)["result_schema"] == "ceratops-repository-check-result.v1"
+    command = [sys.executable, "-c", "raise SystemExit(0)"]
+    result_file = tmp_path / "probe.json"
+    arguments = [
+        "--result-file", str(result_file), "--result-id", "probe-1",
+        "--candidate-id", "candidate-1", "--check-id", "repository.validate",
+        "--check-version", "checks-1", "--probe-command", json.dumps(command),
+    ]
+    calls = []
+
+    def process(argv: Sequence[str], cwd: pathlib.Path) -> subprocess.CompletedProcess[str]:
+        del cwd
+        calls.append(list(argv))
+        return completed(argv)
+
+    assert VALIDATOR.main(arguments, process_runner=process) == 0
+    assert calls == [command]
+    assert json.loads(result_file.read_text(encoding="utf-8"))["invocation"]["probe_command"] == command
 
 
 def test_validation_has_no_test_mode_or_test_side_effects(tmp_path: pathlib.Path, capsys: Any) -> None:
@@ -389,7 +483,9 @@ def test_repository_entrypoints_run_through_uv(
         script.write_text(template.replace("__TEST_TARGETS__", "[]").replace("__CHECK_DEFINITIONS__", "[]"), encoding="utf-8")
         project_template = ROOT / "skills/ceratops-repo-lifecycle/references/templates/validation-pyproject.toml.tmpl"
         (scripts / "pyproject.toml").write_text(
-            project_template.read_text(encoding="utf-8").replace("__DEPENDENCIES__", "[]"), encoding="utf-8",
+            project_template.read_text(encoding="utf-8").replace(
+                "__DEPENDENCIES__", json.dumps(metadata["project"]["dependencies"]),
+            ), encoding="utf-8",
         )
         locked = subprocess.run(["uv", "lock", "--project", str(scripts)], capture_output=True, text=True)
         assert locked.returncode == 0, locked.stderr

@@ -22,16 +22,24 @@ import sys
 import tempfile
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
-from typing import Any
+from typing import Any, NamedTuple
 
+import git_branch_operations as git_branches
 from check_deployment_receipts import check_deployment_receipt
+from git_branch_operations import PromotionError, SourceState
+from github_pr_workflow import ship_repository as repository_ship
 from github_pr_workflow.command import (
     CommandError,
+    capture_failure_report,
+    describe_command_failure,
+    project_task_temp_root,
+    release_write_context,
+    remove_resolved_failures,
+    report_phase,
     require_output,
     require_success,
     run_command,
-    run_json_command,
+    run_command_for_json,
 )
 from repository_operation import (
     OperationError,
@@ -41,6 +49,7 @@ from repository_operation import (
     operation_category,
     parse_parameters,
     prepare_operations,
+    remove_operation_failures,
     require_clean_commit,
 )
 from sdlc_results import _unique_result_object
@@ -48,116 +57,17 @@ from sdlc_results import _unique_result_object
 SCRIPT_ROOT = pathlib.Path(__file__).resolve().parent
 PENDING_MANAGER = SCRIPT_ROOT / "manage-pending-work.py"
 OPERATION_RUNNER = SCRIPT_ROOT / "repository_operation.py"
-SHIP_REPOSITORY = SCRIPT_ROOT / "ship-repository.py"
 RELEASE_BRANCH = "release/local"
 DEFAULT_SDLC_CONTRACT = pathlib.Path("sdlc/sdlc.yml")
 
 
-class PromotionError(RuntimeError):
-    """Raised when a local promotion invariant is not satisfied."""
+class CompletedPromotion(NamedTuple):
+    """Accepted release and its frozen installation selection, not a new request."""
 
-    def __init__(
-        self,
-        message: str,
-        payload: dict[str, Any] | None = None,
-    ) -> None:
-        super().__init__(message)
-        self.payload = payload
-
-
-@dataclass(frozen=True)
-class SourceState:
-    """Immutable preflight identity for one selected source branch."""
-
-    head: str
-    worktree: pathlib.Path | None
-
-
-@dataclass(frozen=True)
-class ReleaseCheckoutState:
-    """Exact clean checkout state restored when release preparation fails."""
-
-    branch: str
-    head: str
-    main_head: str
-    release_head: str | None
-
-
-def _git(repo_root: pathlib.Path, *args: str) -> list[str]:
-    return ["git", "-C", str(repo_root), *args]
-
-
-def _clean(repo_root: pathlib.Path, phase: str) -> None:
-    if require_output(_git(repo_root, "status", "--porcelain"), cwd=repo_root).strip():
-        raise PromotionError(f"Repository is dirty {phase}.")
-
-
-def _ref_exists(repo_root: pathlib.Path, ref: str) -> bool:
-    result = run_command(
-        _git(repo_root, "show-ref", "--verify", "--quiet", ref),
-        cwd=repo_root,
-    )
-    if result.returncode not in {0, 1}:
-        raise PromotionError(f"Could not inspect Git ref: {ref}")
-    return result.returncode == 0
-
-
-def _branch_head(repo_root: pathlib.Path, branch: str) -> str:
-    return require_output(
-        _git(repo_root, "rev-parse", f"{branch}^{{commit}}"),
-        cwd=repo_root,
-    ).splitlines()[0]
-
-
-def _selected_worktree(repo_root: pathlib.Path, branch: str) -> pathlib.Path | None:
-    raw = require_output(
-        _git(
-            repo_root,
-            "for-each-ref",
-            "--format=%(worktreepath)",
-            f"refs/heads/{branch}",
-        ),
-        cwd=repo_root,
-    ).strip()
-    return pathlib.Path(raw).resolve() if raw else None
-
-
-def _primary_checkout(repo_root: pathlib.Path) -> pathlib.Path:
-    """Resolve a linked-worktree invocation to its primary checkout.
-
-    Promotion keeps the caller's task worktree as the source-branch owner. Git
-    permits ``main`` and ``release/local`` switching only in the checkout that
-    owns those branches, so the helper performs release preparation from the
-    primary checkout instead of asking the caller or model to rerun there.
-    """
-
-    common_dir = pathlib.Path(
-        require_output(
-            _git(
-                repo_root,
-                "rev-parse",
-                "--path-format=absolute",
-                "--git-common-dir",
-            ),
-            cwd=repo_root,
-        ).strip()
-    ).resolve()
-    if common_dir.name != ".git":
-        raise PromotionError(
-            "Promotion requires a non-bare repository with a primary checkout."
-        )
-    primary_root = common_dir.parent.resolve()
-    if not primary_root.is_dir():
-        raise PromotionError("The repository primary checkout is unavailable.")
-    primary_git_dir = pathlib.Path(
-        require_output(
-            _git(primary_root, "rev-parse", "--absolute-git-dir"),
-            cwd=primary_root,
-        ).strip()
-    ).resolve()
-    if primary_git_dir != common_dir:
-        raise PromotionError("Could not verify the repository primary checkout.")
-    return primary_root
+    result: dict[str, object]
+    repo_root: pathlib.Path
+    operations: list[PreparedOperation]
+    source_checks: dict[str, Any]
 
 
 def _remap_repo_owned_path(
@@ -187,295 +97,6 @@ def _remap_repo_owned_path(
     return effective_root / relative
 
 
-def _preflight_release_checkout(
-    repo_root: pathlib.Path,
-    main_branch: str,
-    release_branch: str,
-) -> ReleaseCheckoutState:
-    """Reject an ineligible primary checkout before any branch is switched."""
-
-    git_dir = pathlib.Path(
-        require_output(
-            _git(repo_root, "rev-parse", "--absolute-git-dir"),
-            cwd=repo_root,
-        ).strip()
-    ).resolve()
-    common_dir = pathlib.Path(
-        require_output(
-            _git(
-                repo_root,
-                "rev-parse",
-                "--path-format=absolute",
-                "--git-common-dir",
-            ),
-            cwd=repo_root,
-        ).strip()
-    ).resolve()
-    if git_dir != common_dir:
-        raise PromotionError("Promotion did not resolve to the primary checkout.")
-
-    current_branch = require_output(
-        _git(repo_root, "branch", "--show-current"),
-        cwd=repo_root,
-    ).strip()
-    if not current_branch:
-        raise PromotionError("Promotion --repo-root must be on a local branch.")
-
-    for branch in dict.fromkeys((main_branch, release_branch)):
-        owner = _selected_worktree(repo_root, branch)
-        if owner is not None and owner != repo_root:
-            raise PromotionError(
-                f"Promotion branch is checked out in another worktree: "
-                f"{branch} at {owner}"
-            )
-
-    return ReleaseCheckoutState(
-        branch=current_branch,
-        head=_branch_head(repo_root, current_branch),
-        main_head=_branch_head(repo_root, main_branch),
-        release_head=(
-            _branch_head(repo_root, release_branch)
-            if _ref_exists(repo_root, f"refs/heads/{release_branch}")
-            else None
-        ),
-    )
-
-
-def _restore_release_checkout(
-    repo_root: pathlib.Path,
-    main_branch: str,
-    release_branch: str,
-    state: ReleaseCheckoutState,
-) -> None:
-    """Restore every local ref changed while preparing the release checkout."""
-
-    current_branch = require_output(
-        _git(repo_root, "branch", "--show-current"),
-        cwd=repo_root,
-    ).strip()
-    if current_branch != state.branch:
-        require_success(
-            _git(repo_root, "switch", state.branch),
-            cwd=repo_root,
-        )
-    require_success(
-        _git(repo_root, "reset", "--hard", state.head),
-        cwd=repo_root,
-    )
-
-    if state.branch != main_branch:
-        require_success(
-            _git(repo_root, "branch", "--force", main_branch, state.main_head),
-            cwd=repo_root,
-        )
-    if state.release_head is None:
-        if _ref_exists(repo_root, f"refs/heads/{release_branch}"):
-            require_success(
-                _git(repo_root, "branch", "--delete", "--force", release_branch),
-                cwd=repo_root,
-            )
-    elif state.branch != release_branch:
-        require_success(
-            _git(
-                repo_root,
-                "branch",
-                "--force",
-                release_branch,
-                state.release_head,
-            ),
-            cwd=repo_root,
-        )
-
-    restored_branch = require_output(
-        _git(repo_root, "branch", "--show-current"),
-        cwd=repo_root,
-    ).strip()
-    if restored_branch != state.branch:
-        raise PromotionError("Could not restore the original checkout branch.")
-    if _branch_head(repo_root, state.branch) != state.head:
-        raise PromotionError("Could not restore the original checkout commit.")
-    if _branch_head(repo_root, main_branch) != state.main_head:
-        raise PromotionError("Could not restore the original main commit.")
-    release_exists = _ref_exists(repo_root, f"refs/heads/{release_branch}")
-    if state.release_head is None:
-        if release_exists:
-            raise PromotionError("Could not remove the newly created release branch.")
-    elif (
-        not release_exists
-        or _branch_head(repo_root, release_branch) != state.release_head
-    ):
-        raise PromotionError("Could not restore the original release commit.")
-    _clean(repo_root, "after restoring failed release preparation")
-
-
-def _prepare_release_checkout(
-    repo_root: pathlib.Path,
-    main_branch: str,
-    release_branch: str,
-    remote_main: str,
-    state: ReleaseCheckoutState,
-) -> None:
-    """Prepare the release checkout as one rollback-safe local transaction."""
-
-    try:
-        require_success(
-            _git(repo_root, "switch", main_branch),
-            cwd=repo_root,
-        )
-        require_success(
-            _git(repo_root, "merge", "--ff-only", remote_main),
-            cwd=repo_root,
-        )
-        if state.release_head is not None:
-            require_success(
-                _git(repo_root, "switch", release_branch),
-                cwd=repo_root,
-            )
-        else:
-            require_success(
-                _git(
-                    repo_root,
-                    "switch",
-                    "-c",
-                    release_branch,
-                    main_branch,
-                ),
-                cwd=repo_root,
-            )
-        _clean(repo_root, f"after preparing {release_branch}")
-    except Exception as exc:
-        try:
-            _restore_release_checkout(
-                repo_root,
-                main_branch,
-                release_branch,
-                state,
-            )
-        except Exception as restore_exc:  # Preserve rollback evidence.
-            raise PromotionError(
-                f"Release checkout preparation failed: {exc}; restoring the "
-                f"original checkout also failed: {restore_exc}"
-            ) from exc
-        raise
-
-
-def _preflight_sources(
-    repo_root: pathlib.Path, branches: list[str]
-) -> dict[str, SourceState]:
-    """Validate and snapshot selected branches before release preparation."""
-
-    states: dict[str, SourceState] = {}
-    for branch in branches:
-        require_success(
-            ["git", "check-ref-format", "--branch", branch],
-            cwd=repo_root,
-        )
-        if not _ref_exists(repo_root, f"refs/heads/{branch}"):
-            raise PromotionError(f"Source branch does not exist: {branch}")
-        worktree = _selected_worktree(repo_root, branch)
-        if worktree is None:
-            states[branch] = SourceState(
-                head=_branch_head(repo_root, branch),
-                worktree=None,
-            )
-            continue
-        if _worktree_status(worktree, repo_root):
-            raise PromotionError(f"Source worktree is dirty: {branch}")
-        states[branch] = SourceState(
-            head=_branch_head(repo_root, branch),
-            worktree=worktree,
-        )
-    return states
-
-
-def _worktree_status(worktree: pathlib.Path, repo_root: pathlib.Path) -> str:
-    """Return porcelain state for one known worktree."""
-
-    return require_output(
-        _git(worktree, "status", "--porcelain"),
-        cwd=repo_root,
-    ).strip()
-
-
-def _command_detail(result: subprocess.CompletedProcess[str]) -> str:
-    """Return one bounded single-line command diagnostic."""
-
-    raw = result.stderr.strip() or result.stdout.strip()
-    detail = " ".join(raw.split()) if raw else f"exit {result.returncode}"
-    return detail if len(detail) <= 500 else detail[:500] + " [truncated]"
-
-
-def _is_ancestor(repo_root: pathlib.Path, older: str, newer: str) -> bool:
-    """Distinguish a negative ancestry answer from a failed Git query."""
-    result = run_command(
-        _git(repo_root, "merge-base", "--is-ancestor", older, newer), cwd=repo_root
-    )
-    if result.returncode not in {0, 1}:
-        raise PromotionError("Could not inspect source ancestry.")
-    return result.returncode == 0
-
-
-def _unique_merge_base(repo_root: pathlib.Path, left: str, right: str) -> str:
-    result = run_command(
-        _git(repo_root, "merge-base", "--all", left, right), cwd=repo_root
-    )
-    bases = result.stdout.splitlines()
-    if result.returncode or len(bases) != 1:
-        raise PromotionError("Automatic rebase requires unambiguous shared ancestry.")
-    return bases[0]
-
-
-def _task_commits(
-    repo_root: pathlib.Path,
-    release_head: str,
-    main_head: str,
-    branch: str,
-    head: str,
-) -> tuple[str, list[str]]:
-    """Find the one contiguous task range, excluding shared main/release history.
-
-    Comparable unique bases are required; selecting an arbitrary merge base or
-    merely filtering merge commits could omit part of the source's changes.
-    Parent checks prove that the exact --onto range is linear and contiguous.
-    """
-    release_base = _unique_merge_base(repo_root, release_head, head)
-    main_base = _unique_merge_base(repo_root, main_head, head)
-    if _is_ancestor(repo_root, release_base, main_base):
-        base = main_base
-    elif _is_ancestor(repo_root, main_base, release_base):
-        base = release_base
-    else:
-        raise PromotionError("Automatic rebase cannot identify one task-only boundary.")
-    result = run_command(
-        _git(
-            repo_root,
-            "rev-list",
-            "--reverse",
-            "--topo-order",
-            "--parents",
-            f"{base}..{head}",
-        ),
-        cwd=repo_root,
-    )
-    if result.returncode:
-        raise PromotionError(f"Could not inspect source history: {branch}")
-    commits: list[str] = []
-    parent = base
-    for row in result.stdout.splitlines():
-        fields = row.split()
-        if len(fields) != 2 or fields[1] != parent:
-            raise PromotionError(
-                f"Automatic rebase requires linear source history: {branch}"
-            )
-        parent = fields[0]
-        commits.append(parent)
-    if not commits or commits[-1] != head:
-        raise PromotionError(
-            "Automatic rebase cannot identify a nonempty task-only range."
-        )
-    return base, commits
-
-
 def _branch_is_published(
     repo_root: pathlib.Path,
     branch: str,
@@ -488,10 +109,10 @@ def _branch_is_published(
     creating refs or FETCH_HEAD. In a proven linear range every published task
     commit contains its first commit, so one ancestry query per tip suffices.
     """
-    remotes = require_output(_git(repo_root, "remote"), cwd=repo_root).splitlines()
+    remotes = require_output(git_branches._git(repo_root, "remote"), cwd=repo_root).splitlines()
     for remote in remotes:
         advertised = run_command(
-            _git(repo_root, "ls-remote", "--heads", "--tags", remote), cwd=repo_root
+            git_branches._git(repo_root, "ls-remote", "--heads", "--tags", remote), cwd=repo_root
         )
         if advertised.returncode:
             raise PromotionError(f"Could not inspect remote publication for: {branch}")
@@ -509,7 +130,7 @@ def _branch_is_published(
         if not refs:
             continue
         objects = subprocess.run(
-            _git(repo_root, "cat-file", "--batch-check=%(objectname) %(objecttype)"),
+            git_branches._git(repo_root, "cat-file", "--batch-check=%(objectname) %(objecttype)"),
             input="\n".join(refs.values()) + "\n",
             cwd=repo_root,
             capture_output=True,
@@ -522,7 +143,7 @@ def _branch_is_published(
         for (ref, oid), row in zip(refs.items(), rows, strict=True):
             if row == f"{oid} missing":
                 require_success(
-                    _git(
+                    git_branches._git(
                         repo_root,
                         "fetch",
                         "--no-tags",
@@ -537,7 +158,7 @@ def _branch_is_published(
                     cwd=repo_root,
                 )
                 kind = require_output(
-                    _git(repo_root, "cat-file", "-t", oid), cwd=repo_root
+                    git_branches._git(repo_root, "cat-file", "-t", oid), cwd=repo_root
                 ).strip()
             else:
                 parts = row.split()
@@ -549,234 +170,9 @@ def _branch_is_published(
                 continue
             if kind != "commit":
                 raise PromotionError("Could not resolve a published commit.")
-            if _is_ancestor(repo_root, commits[0], oid):
+            if git_branches._is_ancestor(repo_root, commits[0], oid):
                 return True
     return False
-
-
-def _rebase_target(repo_root: pathlib.Path, release_head: str, task_base: str) -> str:
-    """Preserve both shared histories without rewriting either or touching a ref.
-
-    A release batch can predate main's dependency merges. Replaying only the
-    task range onto that release would drop inherited changes. Git builds their
-    conflict-free merge as the rebase target; the release ref moves only after
-    the source rebase succeeds. Unreferenced objects remain Git-GC-owned.
-    """
-    if _is_ancestor(repo_root, task_base, release_head):
-        return release_head
-    _unique_merge_base(repo_root, release_head, task_base)
-    merged = run_command(
-        _git(
-            repo_root,
-            "merge-tree",
-            "--write-tree",
-            "--name-only",
-            release_head,
-            task_base,
-        ),
-        cwd=repo_root,
-    )
-    if merged.returncode:
-        raise PromotionError(
-            "Could not merge shared task history; source and release preserved: "
-            + _command_detail(merged)
-        )
-    tree = merged.stdout.strip()
-    if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", tree):
-        raise PromotionError("Git returned an invalid shared-history merge tree.")
-    return require_output(
-        _git(
-            repo_root,
-            "commit-tree",
-            tree,
-            "-p",
-            release_head,
-            "-p",
-            task_base,
-            "-m",
-            "Merge shared task base with the existing release batch",
-        ),
-        cwd=repo_root,
-    ).strip()
-
-
-def _rebase_in_progress(
-    worktree: pathlib.Path,
-    repo_root: pathlib.Path,
-) -> bool:
-    """Return whether Git records an active rebase in the selected worktree."""
-
-    for state_name in ("rebase-merge", "rebase-apply"):
-        result = run_command(
-            _git(worktree, "rev-parse", "--git-path", state_name),
-            cwd=repo_root,
-        )
-        if result.returncode:
-            raise PromotionError("Could not inspect automatic rebase state.")
-        state_path = pathlib.Path(result.stdout.strip())
-        if not state_path.is_absolute():
-            state_path = worktree / state_path
-        if state_path.exists():
-            return True
-    return False
-
-
-def _restore_source_after_rebase(
-    repo_root: pathlib.Path,
-    branch: str,
-    state: SourceState,
-) -> str | None:
-    """Restore the exact clean source snapshot after an unsuccessful rebase."""
-
-    worktree = state.worktree
-    if worktree is None:
-        return "source worktree disappeared"
-    in_progress = _rebase_in_progress(worktree, repo_root)
-    current = run_command(
-        _git(worktree, "branch", "--show-current"),
-        cwd=repo_root,
-    )
-    if current.returncode:
-        return "could not read the source worktree branch"
-    if not in_progress and current.stdout.strip() != branch:
-        return "source worktree no longer has the selected branch checked out"
-    if in_progress:
-        aborted = run_command(
-            _git(worktree, "rebase", "--abort"),
-            cwd=repo_root,
-        )
-        if aborted.returncode:
-            return f"git rebase --abort failed: {_command_detail(aborted)}"
-
-    current = run_command(
-        _git(worktree, "branch", "--show-current"),
-        cwd=repo_root,
-    )
-    if current.returncode or current.stdout.strip() != branch:
-        return "source branch was not restored after abort"
-
-    head = _branch_head(repo_root, branch)
-    status = _worktree_status(worktree, repo_root)
-    if head != state.head or status:
-        reset = run_command(
-            _git(worktree, "reset", "--hard", state.head),
-            cwd=repo_root,
-        )
-        if reset.returncode:
-            return f"git reset --hard failed: {_command_detail(reset)}"
-
-    restored_head = _branch_head(repo_root, branch)
-    restored_status = _worktree_status(worktree, repo_root)
-    if _rebase_in_progress(worktree, repo_root):
-        return "rebase state remains after rollback"
-    if restored_head != state.head:
-        return f"restored head is {restored_head}, expected {state.head}"
-    if restored_status:
-        count = len(restored_status.splitlines())
-        return f"restored worktree has {count} status entries"
-    return None
-
-
-def _conflicting_paths(
-    worktree: pathlib.Path,
-    repo_root: pathlib.Path,
-) -> list[str]:
-    """Return sorted unmerged paths from an unsuccessful rebase."""
-
-    result = run_command(
-        _git(worktree, "diff", "--name-only", "--diff-filter=U"),
-        cwd=repo_root,
-    )
-    if result.returncode:
-        return []
-    return sorted({line for line in result.stdout.splitlines() if line})
-
-
-def _automatic_rebase(
-    repo_root: pathlib.Path,
-    release_head: str,
-    branch: str,
-    merge_base: str,
-    state: SourceState,
-) -> dict[str, str]:
-    """Rebase one eligible source and compensate every unsuccessful attempt."""
-
-    worktree = state.worktree
-    assert worktree is not None
-    result = run_command(
-        _git(
-            worktree,
-            "rebase",
-            "--no-autostash",
-            "--no-gpg-sign",
-            "--no-update-refs",
-            "--no-rebase-merges",
-            "--no-fork-point",
-            "--onto",
-            release_head,
-            merge_base,
-            branch,
-        ),
-        cwd=repo_root,
-    )
-    if result.returncode:
-        conflicts = _conflicting_paths(worktree, repo_root)
-        rollback_error = _restore_source_after_rebase(repo_root, branch, state)
-        if rollback_error is not None:
-            raise PromotionError(
-                f"Automatic rebase and rollback failed for {branch}: {rollback_error}"
-            )
-        if conflicts:
-            raise PromotionError(
-                f"Automatic rebase conflicted for {branch}; original head "
-                f"{state.head} restored; conflicting paths: {', '.join(conflicts)}"
-            )
-        raise PromotionError(
-            f"Automatic rebase failed for {branch}; original head {state.head} "
-            f"restored: {_command_detail(result)}"
-        )
-
-    new_head = state.head
-    validation_error: str | None = None
-    try:
-        new_head = _branch_head(repo_root, branch)
-        if _worktree_status(worktree, repo_root):
-            validation_error = "rebased worktree is dirty"
-        else:
-            ancestor = run_command(
-                _git(repo_root, "merge-base", "--is-ancestor", release_head, branch),
-                cwd=repo_root,
-            )
-            if ancestor.returncode:
-                validation_error = "release head is not an ancestor after rebase"
-        if validation_error is None:
-            checked = run_command(
-                _git(repo_root, "diff", "--check", release_head, branch),
-                cwd=repo_root,
-            )
-            if checked.returncode:
-                validation_error = (
-                    f"git diff --check failed: {_command_detail(checked)}"
-                )
-    except (CommandError, PromotionError, OSError) as exc:
-        validation_error = str(exc)
-    if validation_error is not None:
-        rollback_error = _restore_source_after_rebase(repo_root, branch, state)
-        if rollback_error is not None:
-            raise PromotionError(
-                f"Automatic rebase validation and rollback failed for {branch}: "
-                f"{validation_error}; {rollback_error}"
-            )
-        raise PromotionError(
-            f"Automatic rebase validation failed for {branch}; original head "
-            f"{state.head} restored: {validation_error}"
-        )
-    return {
-        "branch": branch,
-        "old_head": state.head,
-        "new_head": new_head,
-        "onto": release_head,
-    }
 
 
 def _prepare_source_for_fast_forward(
@@ -788,15 +184,15 @@ def _prepare_source_for_fast_forward(
 ) -> dict[str, str] | None:
     """Validate ancestry or perform the one eligible automatic rebase."""
 
-    if _branch_head(repo_root, branch) != state.head:
+    if git_branches._branch_head(repo_root, branch) != state.head:
         raise PromotionError(f"Source branch changed after preflight: {branch}")
     ancestor = run_command(
-        _git(repo_root, "merge-base", "--is-ancestor", release_head, branch),
+        git_branches._git(repo_root, "merge-base", "--is-ancestor", release_head, branch),
         cwd=repo_root,
     )
     if ancestor.returncode == 0:
         require_success(
-            _git(repo_root, "diff", "--check", release_head, branch),
+            git_branches._git(repo_root, "diff", "--check", release_head, branch),
             cwd=repo_root,
         )
         return None
@@ -804,7 +200,7 @@ def _prepare_source_for_fast_forward(
         raise PromotionError(f"Could not compare source branch: {branch}")
 
     contained = run_command(
-        _git(repo_root, "merge-base", "--is-ancestor", state.head, release_head),
+        git_branches._git(repo_root, "merge-base", "--is-ancestor", state.head, release_head),
         cwd=repo_root,
     )
     if contained.returncode == 0:
@@ -819,7 +215,7 @@ def _prepare_source_for_fast_forward(
             f"Automatic rebase requires an existing source worktree: {branch}"
         )
     current = require_output(
-        _git(worktree, "branch", "--show-current"),
+        git_branches._git(worktree, "branch", "--show-current"),
         cwd=repo_root,
     ).strip()
     if current != branch:
@@ -827,17 +223,17 @@ def _prepare_source_for_fast_forward(
             f"Automatic rebase requires the source branch checked out in its "
             f"worktree: {branch}"
         )
-    task_base, commits = _task_commits(
+    task_base, commits = git_branches._task_commits(
         repo_root, release_head, main_head, branch, state.head
     )
     if _branch_is_published(repo_root, branch, commits):
         raise PromotionError(f"Automatic rebase refuses published branch: {branch}")
-    target = _rebase_target(repo_root, release_head, task_base)
-    if _branch_head(repo_root, branch) != state.head or _worktree_status(
+    target = git_branches._rebase_target(repo_root, release_head, task_base)
+    if git_branches._branch_head(repo_root, branch) != state.head or git_branches._worktree_status(
         worktree, repo_root
     ):
         raise PromotionError(f"Source changed before automatic rebase: {branch}")
-    result = _automatic_rebase(repo_root, target, branch, task_base, state)
+    result = git_branches._automatic_rebase(repo_root, target, branch, task_base, state)
     if target != release_head:
         result.update(shared_base=task_base, release_head=release_head)
     return result
@@ -882,6 +278,12 @@ def _validation_command(
         command.extend(("--operation", operation))
     for parameter in args.parameter or []:
         command.extend(("--parameter", parameter))
+    if diagnostic_output := getattr(args, "diagnostic_output", None):
+        command.extend((
+            "--diagnostic-output", str(diagnostic_output),
+            "--diagnostic-repo-root", str(args.repo_root),
+            "--diagnostic-action", "promote",
+        ))
     return command
 
 
@@ -904,80 +306,44 @@ def _ship_after_promotion(
     scope = pathlib.Path(pending_work_scope)
     if not scope.is_absolute() or not scope.resolve(strict=True).is_file():
         raise PromotionError("Recorded pending-work scope is unavailable for shipping.")
-    command = [
-        sys.executable,
-        str(SHIP_REPOSITORY),
-        "--repo-root",
-        str(repo_root),
-        "--head-branch",
-        args.release_branch,
-        "--base-branch",
-        args.main_branch,
-        "--remote-name",
-        args.remote_name,
-        "--commit",
-        target_commit,
-        "--reusable-head",
-        "--sdlc-contract",
-        str(args.sdlc_contract),
-    ]
-    for field in ("title", "body"):
-        value = getattr(args, field, None)
-        if value is not None:
-            command.extend((f"--{field}", value))
-    for flag, operations in (
-        ("--validation-operation", args.validation_operation or []),
-        ("--publish-operation", _operation_ids(args.publish_operation, "publish")),
-        ("--deploy-operation", _operation_ids(args.deploy_operation, "deploy-local")),
+    request = repository_ship.ShipOptions(
+        repo_root=repo_root,
+        head_branch=args.release_branch,
+        base_branch=args.main_branch,
+        remote_name=args.remote_name,
+        commit=target_commit,
+        reusable_head=True,
+        sdlc_contract=args.sdlc_contract,
+        title=getattr(args, "title", None),
+        body=getattr(args, "body", None),
+        validation_operation=args.validation_operation,
+        publish_operation=_operation_ids(args.publish_operation, "publish"),
+        deploy_operation=_operation_ids(args.deploy_operation, "deploy-local"),
+        diagnostic_output=getattr(args, "diagnostic_output", None),
+        diagnostic_owner=(args.repo_root, "promote"),
+    )
+    try:
+        shipped = repository_ship.ship_repository(request)
+    except (repository_ship.RepositoryShipError, CommandError, OperationError, OSError, ValueError) as exc:
+        raise PromotionError(str(exc), describe_command_failure(exc)) from exc
+    if shipped.get("status") == "pending_work":
+        if not isinstance(shipped.get("findings"), list):
+            raise PromotionError("Shipping returned an incomplete pending-work blocker.")
+        return shipped
+    if (
+        shipped.get("status") not in {"shipped", "already_shipped"}
+        or shipped.get("commit") != target_commit
+        or not isinstance(shipped.get("synchronized_head"), str)
+        or not isinstance(shipped.get("release_publication"), dict)
+        or not isinstance(shipped.get("deployment"), dict)
+        or "finalization" not in shipped
     ):
-        for operation in operations:
-            command.extend((flag, operation))
-    ship_code, shipped = run_json_command(command, repo_root)
-    status = shipped.get("status")
-    if ship_code == 0:
-        if (
-            status not in {"shipped", "already_shipped"}
-            or shipped.get("commit") != target_commit
-            or not isinstance(shipped.get("synchronized_head"), str)
-            or not isinstance(shipped.get("release_publication"), dict)
-            or not isinstance(shipped.get("deployment"), dict)
-            or "finalization" not in shipped
-        ):
-            raise PromotionError("Shipping returned an incomplete terminal result.")
-        return shipped
-    if ship_code == 2:
-        if status != "pending_work" or not isinstance(shipped.get("findings"), list):
-            raise PromotionError(
-                "Shipping returned an incomplete pending-work blocker."
-            )
-        return shipped
-    if ship_code == 1:
-        message = shipped.get("message")
-        if status not in {
-            "blocked",
-            "error",
-            "operation_failed",
-            "validation_failed",
-            "tests_failed",
-            "handoff_required",
-            "state_changed",
-        } or not isinstance(message, str):
-            raise PromotionError("Shipping returned an incomplete blocker.")
-        raise PromotionError(message, shipped)
-    raise PromotionError(f"Shipping returned unsupported exit code: {ship_code}")
+        raise PromotionError("Shipping returned an incomplete terminal result.")
+    return shipped
 
 
-def _promote(
-    args: argparse.Namespace,
-    *,
-    timings: dict[str, float] | None = None,
-    rollback: dict[str, Any],
-) -> dict[str, object]:
-    """Prepare a release branch, record selected work, and optionally deploy."""
-
-    if timings is None:
-        timings = {}
-
+def _promotion_inputs(args: argparse.Namespace) -> tuple[pathlib.Path, list[str], bool, dict[str, str]]:
+    """Reject invalid argument combinations without starting a release operation."""
     requested_root = args.repo_root.expanduser().resolve(strict=True)
     if not requested_root.is_dir():
         raise PromotionError("Repository root is not a directory.")
@@ -1037,7 +403,23 @@ def _promote(
     if args.parameter and args.run_operation is None:
         raise PromotionError("--parameter requires --run-operation.")
     parameters = parse_parameters(args.parameter or [])
-    repo_root = _primary_checkout(requested_root)
+    return requested_root, branches, ship_after_promotion, parameters
+
+
+def _promote(
+    args: argparse.Namespace,
+    *,
+    timings: dict[str, float] | None = None,
+    rollback: dict[str, Any],
+    inputs: tuple[pathlib.Path, list[str], bool, dict[str, str]],
+) -> dict[str, object] | CompletedPromotion:
+    """Complete release integration and checks, leaving installation to the caller."""
+
+    if timings is None:
+        timings = {}
+
+    requested_root, branches, ship_after_promotion, parameters = inputs
+    repo_root = git_branches._primary_checkout(requested_root)
     args.sdlc_contract = _remap_repo_owned_path(
         args.sdlc_contract,
         requested_root=requested_root,
@@ -1045,7 +427,7 @@ def _promote(
     )
     if args.prepare_release_only:
         current_branch = require_output(
-            _git(repo_root, "branch", "--show-current"),
+            git_branches._git(repo_root, "branch", "--show-current"),
             cwd=repo_root,
         ).strip()
         if current_branch != args.main_branch:
@@ -1053,36 +435,36 @@ def _promote(
                 f"Prepare-only requires branch {args.main_branch}, "
                 f"got {current_branch or 'detached HEAD'}."
             )
-    if _ref_exists(repo_root, "refs/heads/release"):
+    if git_branches._ref_exists(repo_root, "refs/heads/release"):
         raise PromotionError(
             "refs/heads/release blocks the required release/local branch namespace."
         )
-    _clean(repo_root, "before promotion")
-    if not _ref_exists(repo_root, f"refs/heads/{args.main_branch}"):
+    git_branches._clean(repo_root, "before promotion")
+    if not git_branches._ref_exists(repo_root, f"refs/heads/{args.main_branch}"):
         raise PromotionError(f"Local main branch does not exist: {args.main_branch}")
-    checkout_state = _preflight_release_checkout(
+    checkout_state = git_branches._preflight_release_checkout(
         repo_root,
         args.main_branch,
         args.release_branch,
     )
     source_states: dict[str, SourceState] = {}
     if not args.prepare_release_only:
-        source_states = _preflight_sources(repo_root, branches)
+        source_states = git_branches._preflight_sources(repo_root, branches)
     require_success(
-        _git(repo_root, "remote", "get-url", args.remote_name),
+        git_branches._git(repo_root, "remote", "get-url", args.remote_name),
         cwd=repo_root,
     )
     require_success(
-        _git(repo_root, "fetch", "--prune", args.remote_name),
+        git_branches._git(repo_root, "fetch", "--prune", args.remote_name),
         cwd=repo_root,
     )
     remote_main = f"{args.remote_name}/{args.main_branch}"
-    if not _ref_exists(
+    if not git_branches._ref_exists(
         repo_root,
         f"refs/remotes/{args.remote_name}/{args.main_branch}",
     ):
         raise PromotionError(f"Remote main branch does not exist: {remote_main}")
-    _prepare_release_checkout(
+    git_branches._prepare_release_checkout(
         repo_root,
         args.main_branch,
         args.release_branch,
@@ -1095,7 +477,7 @@ def _promote(
         release_branch=args.release_branch,
         state=checkout_state,
     )
-    release_start = _branch_head(repo_root, args.release_branch)
+    release_start = git_branches._branch_head(repo_root, args.release_branch)
 
     if args.prepare_release_only:
         rollback.clear()
@@ -1108,24 +490,21 @@ def _promote(
     merged: list[str] = []
     rebased: list[dict[str, str]] = []
     for branch in branches:
-        release_head = _branch_head(repo_root, args.release_branch)
+        release_head = git_branches._branch_head(repo_root, args.release_branch)
         rebase_result = _prepare_source_for_fast_forward(
             repo_root,
             release_head,
             branch,
             source_states[branch],
-            _branch_head(repo_root, args.main_branch),
+            git_branches._branch_head(repo_root, args.main_branch),
         )
         if rebase_result is not None:
             rebased.append(rebase_result)
-        require_success(
-            _git(repo_root, "merge", "--ff-only", branch),
-            cwd=repo_root,
-        )
-        _clean(repo_root, f"after promoting {branch}")
+        git_branches.fast_forward_branch(repo_root, branch)
+        git_branches._clean(repo_root, f"after promoting {branch}")
         merged.append(branch)
 
-    target_commit = _branch_head(repo_root, args.release_branch)
+    target_commit = git_branches._branch_head(repo_root, args.release_branch)
     record_command = [
         sys.executable,
         str(PENDING_MANAGER),
@@ -1140,14 +519,14 @@ def _promote(
     ]
     for branch in merged:
         record_command.extend(("--source-branch", branch))
-    record_code, record = run_json_command(record_command, SCRIPT_ROOT)
+    record_code, record = run_command_for_json(record_command, SCRIPT_ROOT)
     if record_code == 2:
         return record
     if record_code:
         raise PromotionError(str(record.get("message", "Scope recording failed.")))
 
     prepared_operations: list[PreparedOperation] = []
-    with _timed_phase(timings, "validation"):
+    with _timed_phase(timings, "validation", diagnostic_output=getattr(args, "diagnostic_output", None)):
         try:
             if args.run_operation is not None:
                 require_clean_commit(repo_root, target_commit)
@@ -1161,15 +540,15 @@ def _promote(
                         for name in args.run_operation
                     ],
                     args.sdlc_contract,
-                    context="ci",
+                    context="skill",
                 )
-            validation_code, validation = run_json_command(
+            validation_code, validation = run_command_for_json(
                 _validation_command(args, repo_root, target_commit),
                 repo_root,
             )
         except (OperationError, OSError, ValueError) as exc:
             validation_code = 1
-            validation = {"status": "error", "message": str(exc)[:4096]}
+            validation = describe_command_failure(exc)
     if validation_code:
         raise PromotionError(
             str(validation.get("message", "Repository validation failed.")),
@@ -1182,69 +561,12 @@ def _promote(
                 "head": target_commit,
             },
         )
-    validation_handoffs = [
-        item
-        for item in validation["results"]
-        if item.get("handoff") and not item.get("handoff_completed")
-    ]
-    operations: dict[str, Any] | None = None
-    handoffs: list[dict[str, str]] = []
-    if args.run_operation is not None:
-        with _timed_phase(timings, "deployment"):
-            try:
-                require_clean_commit(repo_root, target_commit)
-                operations = execute_prepared_operations(prepared_operations)
-                if validation_handoffs:
-                    operations["validation_handoffs"] = validation_handoffs
-            except (OperationError, OSError, ValueError) as exc:
-                operations = {"status": "error", "message": str(exc)[:4096]}
-        if operations["status"] != "completed":
-            raise PromotionError(
-                str(operations.get("message", "Deployment failed.")),
-                {
-                    **operations,
-                    "phase": "deployment",
-                    "remote_mutation": False,
-                    "pending_work_scope": record["pending_work_scope"],
-                },
-            )
-        for operation_result in operations.get("results", []):
-            if operation_result.get("status") == "deferred_handoff":
-                declaration = operation_result.get("handoff")
-                if not isinstance(declaration, dict):
-                    raise PromotionError("Deferred deployment handoff is malformed.")
-                lifecycle = declaration.get("lifecycle")
-                action = declaration.get("action")
-                inputs = declaration.get("inputs", {})
-                if (
-                    not isinstance(lifecycle, str)
-                    or not lifecycle
-                    or not isinstance(action, str)
-                    or not action
-                    or not isinstance(inputs, dict)
-                ):
-                    raise PromotionError("Deferred deployment handoff is malformed.")
-                operation_result.update(
-                    status="completed",
-                    handoff=f"{lifecycle}/{action}",
-                    handoff_inputs=dict(inputs),
-                )
-            if operation_result.get("handoff") and not operation_result.get(
-                "handoff_completed"
-            ):
-                handoffs.append(
-                    {
-                        "operation": operation_result["operation"],
-                        "handoff": operation_result["handoff"],
-                    }
-                )
-        operations["completed_operations"] = [
-            operation_result["operation"]
-            for operation_result in operations.get("results", [])
-        ]
-        operations.pop("deferred_handoffs", None)
-
-    _clean(repo_root, "before reporting ready state")
+    remove_operation_failures(
+        validation, diagnostic_output=getattr(args, "diagnostic_output", None),
+        diagnostic_owner=(args.repo_root, "promote"),
+    )
+    if args.run_operation is None:
+        git_branches._clean(repo_root, "before reporting ready state")
     pending_work_scope = record["pending_work_scope"]
     if ship_after_promotion:
         # Shipping owns its resumable retained state and may already have made
@@ -1264,12 +586,10 @@ def _promote(
         "merged_branches": merged,
         "rebased_branches": rebased,
         "pending_work_scope": pending_work_scope,
-        "operations": operations,
+        "operations": None,
     }
     if record.get("preserved_sources"):
         result["preserved_sources"] = record["preserved_sources"]
-    if handoffs:
-        result["handoffs"] = handoffs
     validation_handoffs = [
         item
         for item in validation["results"]
@@ -1278,32 +598,160 @@ def _promote(
     if validation_handoffs:
         result["validation_handoffs"] = validation_handoffs
     rollback.clear()
+    if args.run_operation is not None:
+        return CompletedPromotion(result, repo_root, prepared_operations, validation)
     return result
 
 
 def promote(
     args: argparse.Namespace, *, timings: dict[str, float] | None = None
 ) -> dict[str, object]:
-    """Run promotion and restore the primary checkout after local failure.
+    """Own release exclusion before selecting any commit or preparing work."""
+    inputs = _promotion_inputs(args)
+    with release_write_context(
+        args.repo_root,
+        confirm_stopped=getattr(args, "confirm_previous_commands_stopped", False),
+    ), capture_failure_report(
+        getattr(args, "diagnostic_output", None), repo_root=args.repo_root, action="promote",
+    ):
+        report_phase("promotion", enabled=getattr(args, "diagnostic_output", None) is not None)
+        outcome = _promote_with_rollback(args, timings=timings, inputs=inputs)
+        result = outcome.result if isinstance(outcome, CompletedPromotion) else outcome
+        if result.get("status") in {"ready", "shipped", "already_shipped"}:
+            remove_resolved_failures(
+                result, diagnostic_output=getattr(args, "diagnostic_output", None),
+                repo_root=args.repo_root, action="promote", resolved_failures=("promote",),
+            )
+        if isinstance(outcome, CompletedPromotion):
+            # Integration is already accepted. Keep release protected while the
+            # current installer reads it, but never roll it back for install errors.
+            return _deploy_completed_promotion(args, outcome, timings=timings)
+        return result
+
+
+def _pending_installation_results(
+    operations: dict[str, Any], prepared: list[PreparedOperation],
+) -> dict[str, Any]:
+    """Retain the frozen handoff selection without claiming its effects ran.
+
+    A later operation can be handed to its installer only when it consists
+    entirely of one handoff. Unexecuted repository commands remain incomplete.
+    """
+    outcomes = {item["operation"]: item for item in operations.get("results", [])}
+    for selected in prepared:
+        if selected.operation not in operations.get("pending_operations", []):
+            continue
+        observed = outcomes.get(selected.operation)
+        if not selected.steps or not selected.steps[-1].handoff:
+            continue
+        if observed is None and len(selected.steps) != 1:
+            continue
+        observed = dict(observed or {})
+        handoff = observed.get("handoff")
+        if not isinstance(handoff, dict):
+            handoff = dict(selected.steps[-1].handoff)
+        outcomes[selected.operation] = {
+            **observed, "operation": selected.operation, "commit": selected.commit,
+            "status": "handoff_required", "steps": observed.get("steps", []),
+            "handoff": f"{handoff['lifecycle']}/{handoff['action']}",
+            "handoff_inputs": observed.get("handoff_inputs", handoff.get("inputs", {})),
+        }
+    return {**operations, "results": [
+        outcomes[selected.operation] for selected in prepared
+        if selected.operation in outcomes
+    ]}
+
+
+def _deploy_completed_promotion(
+    args: argparse.Namespace, accepted: CompletedPromotion,
+    *, timings: dict[str, float] | None = None,
+) -> dict[str, object]:
+    """Install the accepted commit once; failures retain completed promotion."""
+
+    repo_root = accepted.repo_root
+    target_commit = str(accepted.result["head"])
+    prepared_operations = accepted.operations
+    validation = accepted.source_checks
+    validation_handoffs = accepted.result.get("validation_handoffs", [])
+    timings = {} if timings is None else timings
+    with _timed_phase(timings, "deployment", diagnostic_output=getattr(args, "diagnostic_output", None)):
+        try:
+            require_clean_commit(repo_root, target_commit)
+            operations = execute_prepared_operations(
+                prepared_operations,
+                diagnostic_output=getattr(args, "diagnostic_output", None),
+                diagnostic_owner=(args.repo_root, "promote"),
+                successful_results=validation["results"],
+            )
+            if validation_handoffs:
+                operations["validation_handoffs"] = validation_handoffs
+        except (OperationError, OSError, ValueError) as exc:
+            operations = describe_command_failure(exc)
+    if operations["status"] != "completed":
+        if operations["status"] == "handoff_required":
+            operations = _pending_installation_results(operations, prepared_operations)
+        raise PromotionError(
+            str(operations.get("message", "Deployment failed.")),
+            {
+                **operations,
+                "phase": "deployment",
+                "remote_mutation": False,
+                "pending_work_scope": accepted.result["pending_work_scope"],
+                "promotion": dict(accepted.result),
+                "operations": operations,
+            },
+        )
+    for operation_result in operations.get("results", []):
+        if operation_result.get("status") not in {"completed", "no_op"} or (
+            operation_result.get("handoff") and not operation_result.get("handoff_completed")
+        ):
+            raise PromotionError("Deployment operation did not complete.", {
+                **operations, "phase": "deployment", "promotion": dict(accepted.result),
+                "remote_mutation": False,
+            })
+    operations["completed_operations"] = [
+        operation_result["operation"]
+        for operation_result in operations.get("results", [])
+    ]
+    operations.pop("deferred_handoffs", None)
+
+    try:
+        git_branches._clean(repo_root, "before reporting ready state")
+    except PromotionError as exc:
+        raise PromotionError(str(exc), {
+            **describe_command_failure(exc), "phase": "deployment",
+            "promotion": dict(accepted.result), "operations": operations,
+            "remote_mutation": False,
+        }) from exc
+    result = {**accepted.result, "operations": operations}
+    return result
+
+
+def _promote_with_rollback(
+    args: argparse.Namespace, *, timings: dict[str, float] | None = None,
+    inputs: tuple[pathlib.Path, list[str], bool, dict[str, str]],
+) -> dict[str, object] | CompletedPromotion:
+    """Run promotion and restore the primary checkout after integration failure.
 
     A linked task worktree is only the source-branch owner. The mutable release
     transaction runs in the primary checkout and rolls that checkout and its
-    local main/release refs back if any pre-shipping step fails.
+    local main/release refs back if integration or its required checks fail.
+    Installation runs only after this function returns a completed promotion.
     """
 
     rollback: dict[str, Any] = {}
     try:
-        return _promote(args, timings=timings, rollback=rollback)
+        return _promote(args, timings=timings, rollback=rollback, inputs=inputs)
     except Exception as exc:
         if rollback:
             try:
-                _restore_release_checkout(
+                git_branches._restore_release_checkout(
                     rollback["repo_root"],
                     rollback["main_branch"],
                     rollback["release_branch"],
                     rollback["state"],
                 )
-            except Exception as restore_exc:  # Retain both failures.
+            except Exception as restore_exc:  # Preserve both promotion and restoration failures.
                 raise PromotionError(
                     f"Promotion failed: {exc}; restoring the original checkout "
                     f"also failed: {restore_exc}"
@@ -1312,9 +760,10 @@ def promote(
 
 
 @contextmanager
-def _timed_phase(timings: dict[str, float], phase: str):
+def _timed_phase(timings: dict[str, float], phase: str, *, diagnostic_output=None):
     """Record actual elapsed work even when a phase fails; never repeat it."""
     started = time.monotonic()
+    report_phase(phase, enabled=diagnostic_output is not None)
     try:
         yield
     finally:
@@ -1402,47 +851,66 @@ def _completed_deployment(
     The runner records steps only after zero exits; structured output is optional
     and its receipts form an ordered subset of those completed steps.
     """
-    if not isinstance(result, dict) or result.get("status") != "ready":
+    if not isinstance(result, dict):
         raise PromotionError("Result is not a successful promote-and-deploy outcome.")
-    if result.get("head") != commit:
+    pending_handoffs = (
+        result.get("status") == "handoff_required"
+        and result.get("phase") == "deployment"
+    )
+    promotion = result.get("promotion") if pending_handoffs else result
+    if not isinstance(promotion, dict) or promotion.get("status") != "ready":
+        raise PromotionError("Result is not a successful promote-and-deploy outcome.")
+    if promotion.get("head") != commit:
         raise PromotionError("Result head does not match expected-commit.")
-    if release_branch is not None and result.get("release_branch") != release_branch:
+    if release_branch is not None and promotion.get("release_branch") != release_branch:
         raise PromotionError(
             "Result promotion branch does not match finalization inputs."
         )
     operations = result.get("operations")
     if (
         not isinstance(operations, dict)
-        or operations.get("status") != "completed"
-        or operations.get("pending_operations") != []
+        or operations.get("status") != ("handoff_required" if pending_handoffs else "completed")
+        or (not pending_handoffs and operations.get("pending_operations") != [])
     ):
         raise PromotionError("Deployment is missing or incomplete; retain the result.")
     completed = operations.get("completed_operations")
+    pending = operations.get("pending_operations")
     outcomes = operations.get("results")
+    if not isinstance(pending, list) or (pending_handoffs and not pending):
+        raise PromotionError("Pending deployment operations are missing or ambiguous.")
+    selected = completed + pending if isinstance(completed, list) else None
     if (
-        not isinstance(completed, list)
-        or not completed
-        or not all(isinstance(item, str) and item for item in completed)
-        or len(set(completed)) != len(completed)
+        not isinstance(selected, list)
+        or not selected
+        or not all(isinstance(item, str) and item for item in selected)
+        or len(set(selected)) != len(selected)
         or not isinstance(outcomes, list)
-        or len(outcomes) != len(completed)
+        or len(outcomes) != len(selected)
     ):
         raise PromotionError(
             "Completed deployment operations are missing or ambiguous."
         )
     external = dict(external or {})
-    for operation, outcome in zip(completed, outcomes, strict=True):
+    for operation, outcome in zip(selected, outcomes, strict=True):
         supplied = external.pop(operation, None)
+        if operation in pending and supplied is None:
+            raise PromotionError("Deployment handoff lacks bound completion evidence.")
         bound_advisory = (
             supplied is not None
             and isinstance(outcome, dict)
             and outcome.get("status") == "advisory"
             and outcome.get("steps") == []
         )
+        bound_pending = (
+            pending_handoffs and operation in pending and supplied is not None
+            and isinstance(outcome, dict) and outcome.get("status") == "handoff_required"
+            and bool(outcome.get("handoff")) and not outcome.get("handoff_completed")
+        )
         if (
             not isinstance(outcome, dict)
             or outcome.get("operation") != operation
-            or (outcome.get("status") != "completed" and not bound_advisory)
+            or (outcome.get("status") != "completed" and not bound_advisory and not bound_pending)
+            or (operation in pending and not bound_pending)
             or outcome.get("commit") != commit
         ):
             raise PromotionError(
@@ -1622,7 +1090,7 @@ def finalize_result(args: argparse.Namespace) -> None:
     repo_root = args.repo_root.expanduser().resolve(strict=True)
     common_dir = pathlib.Path(
         require_output(
-            _git(repo_root, "rev-parse", "--path-format=absolute", "--git-common-dir"),
+            git_branches._git(repo_root, "rev-parse", "--path-format=absolute", "--git-common-dir"),
             cwd=repo_root,
         ).strip()
     )
@@ -1632,13 +1100,13 @@ def finalize_result(args: argparse.Namespace) -> None:
         )
     primary_root = common_dir.parent
     task_root = _cleanup_path(args.task_temp_root)
-    expected_parent = primary_root.parent / "tmp" / primary_root.name
+    expected_parent = project_task_temp_root(primary_root)
     if not task_root.is_dir() or task_root.parent != expected_parent:
         raise PromotionError(
             f"task-temp-root must be one existing task directory under {expected_parent}."
         )
     inside_git = run_command(
-        _git(task_root, "rev-parse", "--is-inside-work-tree"), cwd=task_root
+        git_branches._git(task_root, "rev-parse", "--is-inside-work-tree"), cwd=task_root
     )
     if inside_git.returncode != 128:
         raise PromotionError(
@@ -1648,7 +1116,7 @@ def finalize_result(args: argparse.Namespace) -> None:
     if not path.is_relative_to(task_root) or path == task_root:
         raise PromotionError("result-file must be a file inside task-temp-root.")
     inside_git = run_command(
-        _git(path.parent, "rev-parse", "--is-inside-work-tree"), cwd=path.parent
+        git_branches._git(path.parent, "rev-parse", "--is-inside-work-tree"), cwd=path.parent
     )
     if inside_git.returncode != 128:
         raise PromotionError(
@@ -1751,6 +1219,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--repo-root", type=pathlib.Path, default=pathlib.Path.cwd())
     parser.add_argument("--source-branch", action="append")
+    parser.add_argument("--diagnostic-output", type=pathlib.Path,
+                        help="Stable task-owned file for complete failure details.")
     parser.add_argument(
         "--result-file",
         type=pathlib.Path,
@@ -1790,6 +1260,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="required local promotion branch: release/local",
     )
     parser.add_argument("--remote-name", default="origin")
+    parser.add_argument("--confirm-previous-commands-stopped", action="store_true",
+                        help="Recover an unfinished release run after confirming its commands stopped.")
     parser.add_argument("--title", help="PR title override for composed shipping.")
     parser.add_argument("--body", help="PR body override for composed shipping.")
     parser.add_argument(
@@ -1882,11 +1354,13 @@ def main(argv: list[str] | None = None) -> int:
     result_file = None
     failed = False
     try:
+        if (args.result_file is not None and args.diagnostic_output is not None
+                and args.result_file.expanduser().resolve() == args.diagnostic_output.expanduser().resolve()):
+            raise PromotionError("--result-file and --diagnostic-output must be different files.")
         if args.result_file is not None:
             requested = args.result_file.expanduser().resolve()
             if requested.is_relative_to(args.repo_root.resolve()):
                 raise PromotionError("result-file must stay outside the repository")
-            requested.parent.mkdir(parents=True, exist_ok=True)
             if requested.exists() and not requested.is_file():
                 raise PromotionError("result-file must name a file")
             result_file = requested
@@ -1900,10 +1374,12 @@ def main(argv: list[str] | None = None) -> int:
         subprocess.SubprocessError,
     ) as exc:
         failed = True
+        if getattr(exc, "release_not_started", False):
+            result_file = None  # A competing invocation creates no attempt record.
         result = (
             exc.payload
             if isinstance(exc, PromotionError) and exc.payload is not None
-            else {"status": "error", "message": str(exc)}
+            else describe_command_failure(exc)
         )
     timings["total"] = round(time.monotonic() - started, 6)
     result["timings_seconds"] = timings

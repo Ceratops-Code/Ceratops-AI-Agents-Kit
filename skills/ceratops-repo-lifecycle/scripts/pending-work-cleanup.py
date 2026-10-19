@@ -18,6 +18,7 @@ from typing import Any
 
 from github_pr_workflow.command import (
     CommandError,
+    project_task_temp_root,
     require_output,
     require_success,
     run_command,
@@ -175,13 +176,13 @@ def _remove_matching_task_temp_directories(
     checkpoints have their own owner beneath Git's common directory.
     """
 
-    canonical_root = (repo_root.parent / "tmp" / repo_root.name).resolve()
+    canonical_root = project_task_temp_root(repo_root)
     if task_temp_root != canonical_root:
         raise PendingWorkError("Residual-cleanup record has an unexpected task-temp root.")
     attributes = _lstat(task_temp_root)
     if attributes is None:
         return
-    _cleanup_boundary(task_temp_root, {"tmp", "temp"})
+    _cleanup_boundary(task_temp_root, {canonical_root.parent.name.casefold()})
     if not stat.S_ISDIR(attributes.st_mode) or _is_reparse(task_temp_root, attributes):
         raise PendingWorkError(f"Task-temp root is not a real directory: {task_temp_root}")
     exact_names = {worktree_name.casefold()}
@@ -221,7 +222,7 @@ def _remove_matching_task_temp_directories(
             raise PendingWorkError(
                 f"Matching task-temp directory still exists after cleanup: {candidate}"
             )
-    _remove_empty_parents(task_temp_root, boundary_names={"tmp", "temp"})
+    _remove_empty_parents(task_temp_root, boundary_names={canonical_root.parent.name.casefold()})
 
 
 RESIDUAL_CLEANUP_RECORD_VERSION = 2
@@ -457,7 +458,7 @@ def _read_residual_cleanup_record(
     task_temp_root = pathlib.Path(value["task_temp_root"])
     if _worktree_cleanup_root(worktree) != expected_root:
         raise PendingWorkError("Residual-cleanup record has an unexpected root.")
-    canonical_temp_root = (repo_root.parent / "tmp" / repo_root.name).resolve()
+    canonical_temp_root = project_task_temp_root(repo_root)
     if task_temp_root != canonical_temp_root:
         raise PendingWorkError("Residual-cleanup record has an unexpected task-temp root.")
     if worktree_name != worktree.name:
@@ -506,7 +507,7 @@ def _write_residual_cleanup_record(
     record_path = _residual_cleanup_record_path(scope, branch)
     worktree_name = worktree.name
     thread_id = _worktree_thread_id(worktree)
-    task_temp_root = (repo_root.parent / "tmp" / repo_root.name).resolve()
+    task_temp_root = project_task_temp_root(repo_root)
     record = {
         "version": RESIDUAL_CLEANUP_RECORD_VERSION,
         "scope": str(scope.resolve()),

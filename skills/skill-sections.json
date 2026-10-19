@@ -39,10 +39,6 @@
         "target": "references/templates/sections/multi-action-skill.md"
       },
       {
-        "source": "skills/sections/scripts/manage_checkpoints.py",
-        "target": "scripts/manage_checkpoints.py"
-      },
-      {
         "source": "skills/sections/scripts/hold_write_lock.py",
         "target": "scripts/hold_write_lock.py"
       }
@@ -57,9 +53,11 @@
         "target": "references/templates/sections/multi-action-skill.md"
       },
       {
-        "source": "skills/sections/scripts/manage_checkpoints.py",
-        "target": "scripts/manage_checkpoints.py"
-      },
+        "source": "skills/sections/scripts/hold_write_lock.py",
+        "target": "scripts/hold_write_lock.py"
+      }
+    ],
+    "ceratops-mcp-server-lifecycle": [
       {
         "source": "skills/sections/scripts/hold_write_lock.py",
         "target": "scripts/hold_write_lock.py"
@@ -68,6 +66,7 @@
     "*": []
   },
   "python_runtime_skills": [
+    "ceratops-code-consistency-audit",
     "ceratops-credit-savings-analysis",
     "ceratops-governance-lifecycle",
     "ceratops-misunderstanding-audit",

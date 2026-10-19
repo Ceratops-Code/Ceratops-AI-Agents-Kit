@@ -956,7 +956,7 @@ class GHContractStateEngineTests(unittest.TestCase):
             {"owner": "owner", "repo": "repo", "default_branch": "main"},
             repo_subset_ids(self.contracts, "all"),
         )
-        self.assertEqual(len(desired_state["rules"]), 81)
+        self.assertEqual(len(desired_state["rules"]), 83)
         self.assertTrue(all(rule["assertions"] for rule in desired_state["rules"]))
         self.assertTrue(
             any(

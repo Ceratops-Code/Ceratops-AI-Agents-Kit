@@ -15,11 +15,13 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 GH_SCRIPTS = ROOT / "skills" / "ceratops-repo-lifecycle" / "scripts"
 sys.path.insert(0, str(GH_SCRIPTS))
 
-from github_pr_workflow import (  # noqa: E402
+from github_pr_workflow import (
     dependency_finalization,
     ensure_pr,
     merge,
+    preserve_check_references,
     ship,
+    ship_pull_request,
     sync,
 )
 
@@ -45,11 +47,10 @@ class EnsurePrTests(unittest.TestCase):
     def test_stops_after_the_bounded_attempt_count(self) -> None:
         with mock.patch.object(
             ensure_pr, "_open_pr", return_value={"headRefOid": "old"}
-        ) as probe:
-            with self.assertRaisesRegex(ensure_pr.EnsurePrError, "after 3 attempts"):
-                ensure_pr.wait_for_pr_head(
-                    self.args(), "new", max_attempts=3, delay_seconds=0
-                )
+        ) as probe, self.assertRaisesRegex(ensure_pr.EnsurePrError, "after 3 attempts"):
+            ensure_pr.wait_for_pr_head(
+                self.args(), "new", max_attempts=3, delay_seconds=0
+            )
 
         self.assertEqual(probe.call_count, 3)
 
@@ -91,7 +92,7 @@ class SyncTests(unittest.TestCase):
 
             with (
                 mock.patch.object(
-                    sync,
+                    sync.git_branches,
                     "_branch_worktrees",
                     return_value={
                         branch: worktrees[owner]
@@ -106,7 +107,7 @@ class SyncTests(unittest.TestCase):
                 mock.patch.object(sync, "require_success") as run,
                 self.assertRaisesRegex(sync.SyncError, "worktree is dirty"),
             ):
-                sync.sync_main(
+                sync._sync_main(
                     argparse.Namespace(
                         repo_root=worktrees["caller"],
                         main_branch="main",
@@ -136,7 +137,7 @@ class SyncTests(unittest.TestCase):
 
             with (
                 mock.patch.object(
-                    sync,
+                    sync.git_branches,
                     "_branch_worktrees",
                     return_value={
                         branch: worktrees[owner]
@@ -147,7 +148,7 @@ class SyncTests(unittest.TestCase):
                 mock.patch.object(sync, "require_success") as run,
                 self.assertRaisesRegex(sync.SyncError, "is unavailable"),
             ):
-                sync.sync_main(
+                sync._sync_main(
                     argparse.Namespace(
                         repo_root=worktrees["caller"],
                         main_branch="main",
@@ -211,15 +212,16 @@ class SyncTests(unittest.TestCase):
             repo_root = pathlib.Path(temporary_directory)
             with (
                 mock.patch.object(
-                    sync,
+                    sync.git_branches,
                     "_branch_worktrees",
                     return_value={"ship": repo_root},
                 ),
                 mock.patch.object(sync, "_assert_clean"),
                 mock.patch.object(sync, "require_success") as run,
+                mock.patch.object(sync.git_branches, "require_success", new=run),
                 mock.patch.object(sync, "require_output", return_value="a" * 40),
             ):
-                sync.sync_main(
+                sync._sync_main(
                     argparse.Namespace(
                         repo_root=repo_root,
                         main_branch="main",
@@ -268,13 +270,13 @@ class SyncTests(unittest.TestCase):
                 f"worktree {second}\0branch refs/heads/main\0\0"
             )
             with (
-                mock.patch.object(sync, "require_output", return_value=porcelain),
+                mock.patch.object(sync.git_branches, "require_output", return_value=porcelain),
                 self.assertRaisesRegex(
                     sync.SyncError,
                     "checked out in multiple worktrees",
                 ),
             ):
-                sync._branch_worktrees(first)
+                sync.git_branches._branch_worktrees(first)
 
     def test_unrelated_stale_worktree_does_not_block_sync(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -301,9 +303,11 @@ class SyncTests(unittest.TestCase):
                     "require_output",
                     side_effect=command_output,
                 ),
+                mock.patch.object(sync.git_branches, "require_output", side_effect=command_output),
                 mock.patch.object(sync, "require_success") as run,
+                mock.patch.object(sync.git_branches, "require_success", new=run),
             ):
-                result = sync.sync_main(
+                result = sync._sync_main(
                     argparse.Namespace(
                         repo_root=main_worktree,
                         main_branch="main",
@@ -516,7 +520,7 @@ class ShipTests(unittest.TestCase):
 
     def pending_scope(self, target_commit: str) -> dict[str, object]:
         return {
-            "version": ship.PENDING_WORK_SCOPE_VERSION,
+            "version": preserve_check_references.PENDING_WORK_SCOPE_VERSION,
             "target_branch": "release/local",
             "target_commit": target_commit,
             "sources": [
@@ -627,12 +631,12 @@ class ShipTests(unittest.TestCase):
             checkpoint = repo_root / "checkpoint.json"
             with (
                 mock.patch.object(
-                    ship, "_repository_name", return_value="owner/repo"
+                    ship.wait_pr_checks, "resolve_repository_name", return_value="owner/repo"
                 ),
                 mock.patch.object(ship, "_resolve_commit", return_value=self.commit),
                 mock.patch.object(
                     ship,
-                    "_load_pending_work_scope",
+                    "load_pending_work_scope",
                     return_value=(
                         state["pending_work"],
                         self.pending_scope(self.commit),
@@ -654,7 +658,7 @@ class ShipTests(unittest.TestCase):
                 mock.patch.object(ship.merge, "merge_verified_pr") as merge_pr,
                 mock.patch.object(ship.sync, "sync_main") as sync_main,
             ):
-                result = ship.ship(args)
+                result = ship._ship(args)
 
         self.assertEqual(
             result,
@@ -674,7 +678,7 @@ class ShipTests(unittest.TestCase):
         sync_main.assert_not_called()
 
     def test_pending_work_flags_are_explicit_and_consistent(self) -> None:
-        parser = ship.build_parser()
+        parser = ship_pull_request.build_parser()
         with self.assertRaises(SystemExit):
             parser.parse_args(["--head-branch", "release/local"])
 
@@ -684,7 +688,7 @@ class ShipTests(unittest.TestCase):
             ship.ShipError,
             "requires --pending-work-scope",
         ):
-            ship._load_pending_work_scope(args, pathlib.Path.cwd(), self.commit)
+            ship.load_pending_work_scope(args, pathlib.Path.cwd(), self.commit, ship.ShipError)
 
         args.pending_work_check = False
         args.pending_work_scope = pathlib.Path("scope.json")
@@ -692,7 +696,7 @@ class ShipTests(unittest.TestCase):
             ship.ShipError,
             "cannot be used",
         ):
-            ship._load_pending_work_scope(args, pathlib.Path.cwd(), self.commit)
+            ship.load_pending_work_scope(args, pathlib.Path.cwd(), self.commit, ship.ShipError)
 
     def test_pending_work_scope_is_normalized_and_hashed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -701,7 +705,7 @@ class ShipTests(unittest.TestCase):
             scope_path.write_text(
                 json.dumps(
                     {
-                        "version": ship.PENDING_WORK_SCOPE_VERSION,
+                        "version": preserve_check_references.PENDING_WORK_SCOPE_VERSION,
                         "target_branch": "release/local",
                         "target_commit": self.commit,
                         "sources": [
@@ -724,10 +728,11 @@ class ShipTests(unittest.TestCase):
             args.pending_work_check = True
             args.pending_work_scope = scope_path
 
-            identity, scope = ship._load_pending_work_scope(
+            identity, scope = ship.load_pending_work_scope(
                 args,
                 repo_root,
                 self.commit,
+                ship.ShipError,
             )
 
         self.assertTrue(identity["enabled"])
@@ -793,7 +798,7 @@ class ShipTests(unittest.TestCase):
 
     def test_obsolete_prepared_checkpoint_is_removed_before_resume(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            repo_root, checkpoint, commit, _ = self.checkpoint_repository(
+            repo_root, checkpoint, _commit, _ = self.checkpoint_repository(
                 temporary_directory
             )
             api_result = mock.Mock(ok=True, data=[])
@@ -988,7 +993,7 @@ class ShipTests(unittest.TestCase):
             mock.patch.object(ship, "ship", return_value=pending),
             mock.patch("builtins.print"),
         ):
-            exit_code = ship.main(
+            exit_code = ship_pull_request.main(
                 [
                     "--head-branch",
                     "release/local",
@@ -1012,7 +1017,7 @@ class ShipTests(unittest.TestCase):
             "validate_readiness",
             return_value=({"head_oid": self.commit, "number": 17}, findings),
         ) as validate:
-            result = ship.wait_for_ci_gate(
+            result = ship.wait_pr_checks.wait_for_ci_gate(
                 "17",
                 pathlib.Path.cwd(),
                 self.commit,
@@ -1040,7 +1045,7 @@ class ShipTests(unittest.TestCase):
                 findings,
             ),
         ) as validate:
-            result = ship.wait_for_ci_gate(
+            result = ship.wait_pr_checks.wait_for_ci_gate(
                 "17",
                 pathlib.Path.cwd(),
                 self.commit,
@@ -1048,7 +1053,7 @@ class ShipTests(unittest.TestCase):
                 interval_seconds=0,
             )
 
-        self.assertFalse(ship._transient_readiness(findings[0]))
+        self.assertFalse(ship.wait_pr_checks._transient_readiness(findings[0]))
         self.assertEqual(result["pending"], 0)
         validate.assert_called_once()
 
@@ -1067,7 +1072,7 @@ class ShipTests(unittest.TestCase):
             findings,
         )
 
-        self.assertTrue(ship._transient_readiness(findings[0]))
+        self.assertTrue(ship.wait_pr_checks._transient_readiness(findings[0]))
 
         opaque = ship.readiness.Finding(
             level="ERROR",
@@ -1082,13 +1087,13 @@ class ShipTests(unittest.TestCase):
             actual=["CI"],
         )
         summary = {"head_oid": self.commit, "number": 17}
-        self.assertTrue(ship._transient_readiness(opaque))
+        self.assertTrue(ship.wait_pr_checks._transient_readiness(opaque))
         with mock.patch.object(
             ship.readiness,
             "validate_readiness",
             side_effect=[(summary, [opaque]), (summary, [passing])],
         ) as validate:
-            result = ship.wait_for_ci_gate(
+            result = ship.wait_pr_checks.wait_for_ci_gate(
                 "17",
                 pathlib.Path.cwd(),
                 self.commit,
@@ -1105,13 +1110,13 @@ class ShipTests(unittest.TestCase):
                 "validate_readiness",
                 side_effect=[(summary, [opaque]), (summary, [opaque])],
             ) as validate,
-            mock.patch.object(ship, "_check_uncertainty_detail", return_value={}),
+            mock.patch.object(ship.wait_pr_checks, "_check_uncertainty_detail", return_value={}),
             self.assertRaisesRegex(
-                ship.ShipBlocked,
+                ship.wait_pr_checks.ShipBlocked,
                 "status-check state remained unclassifiable after 0 seconds",
             ) as blocked,
         ):
-            ship.wait_for_ci_gate(
+            ship.wait_pr_checks.wait_for_ci_gate(
                 "17",
                 pathlib.Path.cwd(),
                 self.commit,
@@ -1130,7 +1135,7 @@ class ShipTests(unittest.TestCase):
             message="One or more status checks are failing.",
             actual=["CI"],
         )
-        surfaced = ship.ShipBlocked("surfaced check failure", {})
+        surfaced = ship.wait_pr_checks.ShipBlocked("surfaced check failure", {})
         with (
             mock.patch.object(
                 ship.readiness,
@@ -1141,10 +1146,10 @@ class ShipTests(unittest.TestCase):
                     (summary, [failed]),
                 ],
             ) as validate,
-            mock.patch.object(ship, "_ci_blocker", return_value=surfaced),
-            self.assertRaisesRegex(ship.ShipBlocked, "surfaced check failure"),
+            mock.patch.object(ship.wait_pr_checks, "_ci_blocker", return_value=surfaced),
+            self.assertRaisesRegex(ship.wait_pr_checks.ShipBlocked, "surfaced check failure"),
         ):
-            ship.wait_for_ci_gate(
+            ship.wait_pr_checks.wait_for_ci_gate(
                 "17",
                 pathlib.Path.cwd(),
                 self.commit,
@@ -1169,8 +1174,8 @@ class ShipTests(unittest.TestCase):
             actual="REVIEW_REQUIRED",
         )
 
-        self.assertFalse(ship._transient_readiness(bypassed))
-        self.assertTrue(ship._transient_readiness(blocking))
+        self.assertFalse(ship.wait_pr_checks._transient_readiness(bypassed))
+        self.assertTrue(ship.wait_pr_checks._transient_readiness(blocking))
         with mock.patch.object(
             ship.readiness,
             "validate_readiness",
@@ -1179,7 +1184,7 @@ class ShipTests(unittest.TestCase):
                 [bypassed],
             ),
         ):
-            result = ship.wait_for_ci_gate(
+            result = ship.wait_pr_checks.wait_for_ci_gate(
                 "17",
                 pathlib.Path.cwd(),
                 self.commit,
@@ -1235,7 +1240,7 @@ class ShipTests(unittest.TestCase):
 
         args = self.args(pathlib.Path.cwd())
         with (
-            mock.patch.object(ship, "wait_for_ci_gate", side_effect=ci_gate),
+            mock.patch.object(ship.wait_pr_checks, "wait_for_ci_gate", side_effect=ci_gate),
             mock.patch.object(
                 ship.codex_review,
                 "wait_for_codex_threads",
@@ -1259,7 +1264,7 @@ class ShipTests(unittest.TestCase):
         args = self.args(pathlib.Path.cwd())
         with (
             mock.patch.object(
-                ship,
+                ship.wait_pr_checks,
                 "wait_for_ci_gate",
                 return_value={
                     "base": "main",
@@ -1307,25 +1312,24 @@ class ShipTests(unittest.TestCase):
                 "wait_for_codex_threads",
                 return_value=preflight,
             ) as review_wait,
-            mock.patch.object(ship, "wait_for_ci_gate") as ci_wait,
+            mock.patch.object(ship.wait_pr_checks, "wait_for_ci_gate") as ci_wait,
             mock.patch.object(
                 ship.readiness,
                 "review_thread_resolution_required",
                 return_value=True,
-            ) as resolution_required,
+            ) as resolution_required,self.assertRaisesRegex(
+            ship.ShipError,
+            "PRRT_old_1, PRRT_old_2",
+        )
         ):
-            with self.assertRaisesRegex(
-                ship.ShipError,
-                "PRRT_old_1, PRRT_old_2",
-            ):
-                ship.run_parallel_gates(
-                    args,
-                    "17",
-                    "owner/repo",
-                    self.commit,
-                    ci_wait_seconds=30,
-                    review_wait_seconds=30,
-                )
+            ship.run_parallel_gates(
+                args,
+                "17",
+                "owner/repo",
+                self.commit,
+                ci_wait_seconds=30,
+                review_wait_seconds=30,
+            )
 
         review_wait.assert_called_once()
         self.assertEqual(review_wait.call_args.kwargs["wait_seconds"], 0)
@@ -1336,7 +1340,7 @@ class ShipTests(unittest.TestCase):
         args = self.args(pathlib.Path.cwd())
         with (
             mock.patch.object(
-                ship,
+                ship.wait_pr_checks,
                 "wait_for_ci_gate",
                 return_value={
                     "base": "main",
@@ -1357,20 +1361,19 @@ class ShipTests(unittest.TestCase):
                 ship.readiness,
                 "review_thread_resolution_required",
                 return_value=True,
-            ) as resolution_required,
+            ) as resolution_required,self.assertRaisesRegex(
+            ship.ShipError,
+            "require resolution of 2 unresolved review thread",
+        )
         ):
-            with self.assertRaisesRegex(
-                ship.ShipError,
-                "require resolution of 2 unresolved review thread",
-            ):
-                ship.run_parallel_gates(
-                    args,
-                    "17",
-                    "owner/repo",
-                    self.commit,
-                    ci_wait_seconds=0,
-                    review_wait_seconds=0,
-                )
+            ship.run_parallel_gates(
+                args,
+                "17",
+                "owner/repo",
+                self.commit,
+                ci_wait_seconds=0,
+                review_wait_seconds=0,
+            )
 
         resolution_required.assert_called_once_with("main", args.repo_root)
 
@@ -1422,7 +1425,7 @@ class ShipTests(unittest.TestCase):
             unidentifiable_checkpoint.write_text("invalid", encoding="utf-8")
             with (
                 mock.patch.object(
-                    ship, "_repository_name", return_value="owner/repo"
+                    ship.wait_pr_checks, "resolve_repository_name", return_value="owner/repo"
                 ),
                 mock.patch.object(ship, "_resolve_commit", return_value=self.commit),
                 mock.patch.object(
@@ -1484,7 +1487,7 @@ class ShipTests(unittest.TestCase):
                     },
                 ),
             ):
-                result = ship.ship(args)
+                result = ship._ship(args)
             checkpoint_removed = not checkpoint.exists()
             checkpoint_temporary_removed = not checkpoint_temporary.exists()
             same_pr_removed = not same_pr_checkpoint.exists()
@@ -1538,7 +1541,7 @@ class ShipTests(unittest.TestCase):
             checkpoint.write_text("checkpoint", encoding="utf-8")
             with (
                 mock.patch.object(
-                    ship, "_repository_name", return_value="owner/repo"
+                    ship.wait_pr_checks, "resolve_repository_name", return_value="owner/repo"
                 ),
                 mock.patch.object(ship, "_resolve_commit", return_value=self.commit),
                 mock.patch.object(
@@ -1592,7 +1595,7 @@ class ShipTests(unittest.TestCase):
                     },
                 ),
             ):
-                result = ship.ship(args)
+                result = ship._ship(args)
 
         self.assertEqual(result["status"], "shipped")
         self.assertEqual(result["phase"], "synchronized")
@@ -1625,7 +1628,7 @@ class ShipTests(unittest.TestCase):
             checkpoint.write_text("checkpoint", encoding="utf-8")
             with (
                 mock.patch.object(
-                    ship, "_repository_name", return_value="owner/repo"
+                    ship.wait_pr_checks, "resolve_repository_name", return_value="owner/repo"
                 ),
                 mock.patch.object(ship, "_resolve_commit", return_value=self.commit),
                 mock.patch.object(
@@ -1679,7 +1682,7 @@ class ShipTests(unittest.TestCase):
                     },
                 ),
             ):
-                result = ship.ship(args)
+                result = ship._ship(args)
 
         self.assertEqual(result["status"], "shipped")
         self.assertEqual(result["phase"], "synchronized")
@@ -1707,7 +1710,7 @@ class ShipTests(unittest.TestCase):
             checkpoint.write_text("checkpoint", encoding="utf-8")
             with (
                 mock.patch.object(
-                    ship, "_repository_name", return_value="owner/repo"
+                    ship.wait_pr_checks, "resolve_repository_name", return_value="owner/repo"
                 ),
                 mock.patch.object(ship, "_resolve_commit", return_value=self.commit),
                 mock.patch.object(
@@ -1727,10 +1730,9 @@ class ShipTests(unittest.TestCase):
                     ship,
                     "run_parallel_gates",
                     side_effect=ship.ShipError("gate failed"),
-                ),
+                ),self.assertRaisesRegex(ship.ShipError, "gate failed")
             ):
-                with self.assertRaisesRegex(ship.ShipError, "gate failed"):
-                    ship.ship(args)
+                ship._ship(args)
 
             self.assertTrue(checkpoint.exists())
 
@@ -1752,7 +1754,7 @@ class ShipTests(unittest.TestCase):
             checkpoint.write_text("checkpoint", encoding="utf-8")
             with (
                 mock.patch.object(
-                    ship, "_repository_name", return_value="owner/repo"
+                    ship.wait_pr_checks, "resolve_repository_name", return_value="owner/repo"
                 ),
                 mock.patch.object(ship, "_resolve_commit", return_value=self.commit),
                 mock.patch.object(
@@ -1780,11 +1782,9 @@ class ShipTests(unittest.TestCase):
                     ],
                 ) as gates,
                 mock.patch.object(ship.merge, "merge_verified_pr") as merge_pr,
+                self.assertRaisesRegex(ship.ShipError, "pending checks appeared"),
             ):
-                with self.assertRaisesRegex(
-                    ship.ShipError, "pending checks appeared"
-                ):
-                    ship.ship(args)
+                ship._ship(args)
 
             self.assertEqual(gates.call_count, 2)
             merge_pr.assert_not_called()
@@ -1860,7 +1860,7 @@ class ShipTests(unittest.TestCase):
             checkpoint = repo_root / "checkpoint.json"
             with (
                 mock.patch.object(
-                    ship, "_repository_name", return_value="owner/repo"
+                    ship.wait_pr_checks, "resolve_repository_name", return_value="owner/repo"
                 ),
                 mock.patch.object(ship, "_resolve_commit", return_value=self.commit),
                 mock.patch.object(
@@ -1896,7 +1896,7 @@ class ShipTests(unittest.TestCase):
                     },
                 ),
             ):
-                result = ship.ship(args)
+                result = ship._ship(args)
             checkpoint_removed = not checkpoint.exists()
 
         self.assertEqual(result["status"], "shipped")
@@ -1966,327 +1966,6 @@ class ShipTests(unittest.TestCase):
         self.assertNotIn("--admin", command)
         self.assertEqual(result["status"], "merged")
 
-
-class DependencyFinalizationTests(unittest.TestCase):
-    @staticmethod
-    def _live(head: str, *, failed: bool = False) -> dict[str, Any]:
-        checks = (
-            [{"name": "ci", "classification": "failed"}]
-            if failed
-            else []
-        )
-        return {
-            "url": "https://github.com/owner/repo/pull/1",
-            "head_oid": head,
-            "state": "OPEN",
-            "is_draft": False,
-            "checks": checks,
-            "mergeable": "MERGEABLE",
-            "review_decision": "APPROVED",
-            "merge_state": "CLEAN",
-        }
-
-    def _finalize_case(
-        self,
-        approved: list[tuple[str, int]],
-        live_states: dict[tuple[str, int], dict[str, Any]],
-        *,
-        snapshot_open: list[tuple[str, int]] | None = None,
-        include_snapshot_membership: bool = True,
-    ) -> tuple[dict[str, Any], list[tuple[str, int]], list[tuple[str, int]]]:
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            root = pathlib.Path(temporary_directory)
-            preflight_path = root / "preflight.json"
-            snapshot_path = root / "snapshot.json"
-            output_path = root / "finalize.json"
-            repositories = []
-            for repo in dict.fromkeys(repo for repo, _number in approved):
-                pull_requests = []
-                for item_repo, number in approved:
-                    if item_repo != repo:
-                        continue
-                    live = live_states[(repo.lower(), number)]
-                    pull_requests.append(
-                        {
-                            "number": number,
-                            "url": f"https://github.com/{repo}/pull/{number}",
-                            "live": {"head_oid": live["head_oid"]},
-                        }
-                    )
-                repositories.append(
-                    {
-                        "repo": repo,
-                        "archived": False,
-                        "requires_report_only": False,
-                        "checkout": {"status": "found", "path": str(root)},
-                        "pull_requests": pull_requests,
-                    }
-                )
-            preflight_path.write_text(
-                json.dumps(
-                    {
-                        "outcome": {"blocked": False},
-                        "summary": {"org": "owner"},
-                        "snapshot": {"summary": {"excluded_repositories": []}},
-                        "repositories": repositories,
-                    }
-                ),
-                encoding="utf-8",
-            )
-            remaining = approved if snapshot_open is None else snapshot_open
-            final_snapshot: dict[str, Any] = {
-                "outcome": {"blocked": False, "queue_present": bool(remaining)},
-                "summary": {
-                    "open_dependabot_alerts": 0,
-                    "open_dependabot_prs": len(remaining),
-                    "repositories_with_work": len({repo for repo, _ in remaining}),
-                },
-            }
-            if include_snapshot_membership:
-                final_snapshot["open_dependabot_prs"] = [
-                    {"repo": repo, "number": number, "state": "OPEN"}
-                    for repo, number in remaining
-                ]
-            snapshot_path.write_text(json.dumps(final_snapshot), encoding="utf-8")
-            args = argparse.Namespace(
-                approved_pr=[
-                    f"https://github.com/{repo}/pull/{number}"
-                    for repo, number in approved
-                ],
-                org=None,
-                admin=True,
-                merge_method="auto",
-                wait_seconds=600,
-                interval_seconds=15,
-                workspace_root=root,
-                snapshot_helper=root / "snapshot-helper.py",
-                sync_helper=root / "sync-helper.py",
-                preflight=preflight_path,
-                snapshot=snapshot_path,
-                sync_output=root / "sync.json",
-                output=output_path,
-            )
-            policy = {
-                "isArchived": False,
-                "mergeCommitAllowed": True,
-                "rebaseMergeAllowed": False,
-                "squashMergeAllowed": False,
-                "viewerPermission": "ADMIN",
-            }
-
-            def fresh(repo: str, number: int):
-                return live_states[(repo.lower(), number)], None
-
-            with (
-                mock.patch.object(
-                    dependency_finalization,
-                    "fetch_repo_policy",
-                    return_value=(policy, None),
-                ),
-                mock.patch.object(
-                    dependency_finalization,
-                    "fresh_live",
-                    side_effect=fresh,
-                ) as fresh_pr,
-                mock.patch.object(
-                    dependency_finalization,
-                    "merge_pr",
-                    return_value=({"status": "merged"}, None),
-                ) as merge_pr,
-                mock.patch.object(
-                    dependency_finalization,
-                    "refresh_snapshot",
-                    return_value=(
-                        final_snapshot,
-                        argparse.Namespace(returncode=0, stdout="", stderr=""),
-                    ),
-                ),
-                mock.patch.object(
-                    dependency_finalization,
-                    "run_sync",
-                    return_value=({"summary": {}, "repositories": []}, None),
-                ),
-                mock.patch.object(dependency_finalization, "emit_result"),
-            ):
-                self.assertEqual(dependency_finalization.finalize(args), 0)
-
-            payload = json.loads(output_path.read_text(encoding="utf-8"))
-            fresh_calls = [
-                (call.args[0].lower(), call.args[1])
-                for call in fresh_pr.call_args_list
-            ]
-            merge_calls = [
-                (call.args[0].lower(), call.args[1])
-                for call in merge_pr.call_args_list
-            ]
-            return payload, fresh_calls, merge_calls
-
-    def test_finalization_defers_only_after_a_repository_merge(self) -> None:
-        approved = [("owner/one", 1), ("owner/one", 2), ("owner/two", 3)]
-        live_states = {
-            (repo.lower(), number): self._live(str(number) * 40)
-            for repo, number in approved
-        }
-
-        payload, fresh_calls, merge_calls = self._finalize_case(
-            approved,
-            live_states,
-        )
-
-        self.assertEqual(
-            [item["status"] for item in payload["pull_requests"]],
-            ["merged", "next_wave_required", "merged"],
-        )
-        self.assertEqual(
-            fresh_calls,
-            [("owner/one", 1), ("owner/two", 3)],
-        )
-        self.assertEqual(merge_calls, fresh_calls)
-        self.assertEqual(payload["summary"]["next_wave_prs"], 1)
-        self.assertTrue(payload["outcome"]["next_wave_required"])
-        self.assertFalse(payload["outcome"]["blocked"])
-        self.assertEqual(payload["blockers"], [])
-
-    def test_finalization_accepts_resolution_from_the_refreshed_queue(self) -> None:
-        approved = [("owner/one", 1), ("owner/one", 2)]
-        live_states = {
-            (repo.lower(), number): self._live(str(number) * 40)
-            for repo, number in approved
-        }
-
-        payload, fresh_calls, merge_calls = self._finalize_case(
-            approved,
-            live_states,
-            snapshot_open=[],
-        )
-
-        self.assertEqual(
-            [item["status"] for item in payload["pull_requests"]],
-            ["merged", "resolved_after_refresh"],
-        )
-        self.assertEqual(fresh_calls, [("owner/one", 1)])
-        self.assertEqual(merge_calls, fresh_calls)
-        self.assertEqual(payload["summary"]["next_wave_prs"], 0)
-        self.assertEqual(payload["summary"]["resolved_after_refresh_prs"], 1)
-        self.assertFalse(payload["outcome"]["next_wave_required"])
-        self.assertFalse(payload["outcome"]["queue_present"])
-        self.assertEqual(payload["blockers"], [])
-
-    def test_missing_snapshot_membership_requires_a_fresh_wave(self) -> None:
-        approved = [("owner/one", 1), ("owner/one", 2)]
-        live_states = {
-            (repo.lower(), number): self._live(str(number) * 40)
-            for repo, number in approved
-        }
-
-        payload, fresh_calls, merge_calls = self._finalize_case(
-            approved,
-            live_states,
-            include_snapshot_membership=False,
-        )
-
-        self.assertEqual(
-            [item["status"] for item in payload["pull_requests"]],
-            ["merged", "next_wave_required"],
-        )
-        self.assertEqual(fresh_calls, [("owner/one", 1)])
-        self.assertEqual(merge_calls, fresh_calls)
-        self.assertEqual(payload["summary"]["next_wave_prs"], 1)
-        self.assertEqual(payload["summary"]["resolved_after_refresh_prs"], 0)
-
-    def test_blocked_pr_does_not_consume_the_repository_merge_wave(self) -> None:
-        approved = [("owner/one", 1), ("owner/one", 2)]
-        live_states = {
-            ("owner/one", 1): self._live("1" * 40, failed=True),
-            ("owner/one", 2): self._live("2" * 40),
-        }
-
-        payload, fresh_calls, merge_calls = self._finalize_case(
-            approved,
-            live_states,
-        )
-
-        self.assertEqual(
-            [item["status"] for item in payload["pull_requests"]],
-            ["blocked", "merged"],
-        )
-        self.assertEqual(
-            fresh_calls,
-            [("owner/one", 1), ("owner/one", 2)],
-        )
-        self.assertEqual(merge_calls, [("owner/one", 2)])
-        self.assertEqual(payload["summary"]["next_wave_prs"], 0)
-        self.assertFalse(payload["outcome"]["next_wave_required"])
-
-    def test_dependency_merge_passes_the_preflight_approved_head(self) -> None:
-        approved_head = "a" * 40
-        completed = argparse.Namespace(
-            returncode=0,
-            stdout='{"status":"merged"}',
-            stderr="",
-        )
-        with mock.patch.object(
-            dependency_finalization,
-            "run_command",
-            return_value=completed,
-        ) as run:
-            result, error = dependency_finalization.merge_pr(
-                "owner/repo",
-                17,
-                pathlib.Path.cwd(),
-                "merge",
-                expected_head=approved_head,
-                admin=False,
-                wait_seconds=0,
-                interval_seconds=1,
-            )
-
-        command = run.call_args.args[0]
-        self.assertEqual(
-            command[command.index("--expected-head") + 1],
-            approved_head,
-        )
-        self.assertEqual(result, {"status": "merged"})
-        self.assertIsNone(error)
-
-    def test_dependency_head_binding_requires_new_preflight(self) -> None:
-        approved_head = "a" * 40
-        live = {"head_oid": "b" * 40}
-
-        blocker = dependency_finalization.head_binding_blocker(
-            "owner/repo",
-            17,
-            approved_head,
-            live,
-        )
-
-        assert blocker is not None
-        self.assertEqual(blocker["check"], "preflight_head")
-        self.assertIn("run a new preflight and approval", blocker["message"])
-
-    def test_merge_rejects_a_head_other_than_the_external_approval(self) -> None:
-        args = argparse.Namespace(
-            repo_root=pathlib.Path.cwd(),
-            repo="owner/repo",
-            pr="17",
-            merge_method="merge",
-            expected_head="a" * 40,
-            admin=False,
-            auto=False,
-            delete_branch=False,
-            wait_seconds=0,
-            interval_seconds=1,
-        )
-        with mock.patch.object(
-            merge,
-            "_validate_readiness",
-            return_value={"head_oid": "b" * 40},
-        ):
-            with self.assertRaisesRegex(
-                merge.WorkflowError,
-                "externally approved commit",
-            ):
-                merge.merge_pr(args)
 
 
 if __name__ == "__main__":

@@ -21,8 +21,8 @@ import pathlib
 import re
 import subprocess
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Sequence
 
 ANNOTATE = "annotate-on-failure"
 BLOCK = "block"
@@ -132,13 +132,13 @@ NEW_ITEM_LITERALPATH_RE = re.compile(
     r"\bNew-Item\b[^\r\n;|]*\s-LiteralPath\b",
     re.IGNORECASE,
 )
-PS_PATH_TOKEN = (
+PS_PATH_PATTERN = (
     r"(?:'(?:''|[^'])*'|\"(?:`\"|[^\"])*\"|"
     r"\$[A-Za-z_][\w:]*|[^\s;|)]+)"
 )
 NEW_ITEM_LITERALPATH_VALUE_RE = re.compile(
     rf"\bNew-Item\b[^\r\n;|]*?\s(?P<parameter>-LiteralPath)\s+"
-    rf"(?P<path>{PS_PATH_TOKEN})",
+    rf"(?P<path>{PS_PATH_PATTERN})",
     re.IGNORECASE,
 )
 SELECT_INDEX_BARE_RANGE_RE = re.compile(
@@ -156,7 +156,7 @@ POWERSHELL_RANGE_LIST_RE = re.compile(
 )
 UNGUARDED_TEST_PATH_READ_RE = re.compile(
     rf"\bTest-Path\b[^\r\n;|]*\s-LiteralPath\s+"
-    rf"(?P<path>{PS_PATH_TOKEN})[^\r\n;|]*"
+    rf"(?P<path>{PS_PATH_PATTERN})[^\r\n;|]*"
     rf"(?:;|\r?\n)\s*\bGet-Content\b[^\r\n;|]*"
     rf"\s-LiteralPath\s+(?P=path)(?:\s|;|\||$)",
     re.IGNORECASE,

@@ -165,7 +165,7 @@ def test_pending_work_scope_is_selected_generic_and_finalized_late(
         encoding="utf-8",
         newline="\n",
     )
-    identity, normalized = ship_module._load_pending_work_scope(
+    identity, normalized = ship_module.load_pending_work_scope(
         argparse.Namespace(
             pending_work_check=True,
             pending_work_scope=identity_scope,
@@ -173,6 +173,7 @@ def test_pending_work_scope_is_selected_generic_and_finalized_late(
         ),
         repo,
         target_commit,
+        ship_module.ShipError,
     )
     expected_normalized = {
         "version": 2,

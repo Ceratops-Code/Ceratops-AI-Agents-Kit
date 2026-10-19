@@ -46,6 +46,82 @@ owns timing.
   untouched by scope-driven cleanup. Repository-wide discovery applies current
   eligibility independently. Other old or malformed formats block.
 
+### Callable implementation and lock lifetime
+
+`ship-repository.py` is the public parser and JSON/exit-code adapter. It and
+Promote call the same `github_pr_workflow/ship_repository.py::ship_repository()`
+implementation with shared `ShipOptions`; that implementation calls
+`github_pr_workflow.ship.ship()` directly with an explicit repository path.
+Neither internal call builds argv or captures printed JSON. External commands
+use `command.py::run_command_for_json()` and always start a separate program.
+The outer release lock stays held during the automatic attempt and its current
+CI/review waits. Confirmed local command shutdown allows a clean unlock on
+success, failure, exception or a decision return; unknown shutdown retains the
+unfinished flag. Model corrections happen after return, unlocked. The next
+normal call reads current inputs. Local exit does not cancel remote CI, and
+clearing the flag does not accept work or delete checkpoints. Complete diagnostic
+files are implemented; new CI receipt/publication behavior remains later work.
+
+The current installation call stays inside Ship's outer release protection,
+including when Promote called Ship. Its prepared selection and commit remain
+unchanged. The installer acquires its destination lock afterward and releases
+it before the release lock; it never calls Promote/Ship while holding that
+destination lock. Explicit Python action declarations share outer ownership
+with the same callable used by standalone skill/MCP installation. Those direct
+calls protect release sources, not task worktrees. Installation failure reports
+completed promotion/publication effects and the original cause without undoing
+them or automatically retrying. Today's installer still reads source; the
+artifact-only switch and earlier release unlock belong to 17–19/22/27B.
+
+Each task worktree belongs to one thread; ordinary editing, checks and builds
+take no worktree or checkpoint lock. Shared request completion removes only
+that request, without scanning other worktrees. 20C still connects exact
+removed/absent-worktree records to the dedicated cleanup script after its
+ownership and stopped-command checks; 4D removes the empty artifact wrapper
+and directory. Release, shared-store and installation locks remain separate.
+Old `skill-updates` and `artifact-versions` per-worktree lock files under
+`<git-common-dir>/ceratops/locks/` await one-time retirement at the next authorized
+deployment after old invocations stop. Files still in use are retained and
+reported; saved requests and unrelated locks are untouched.
+
+### Complete failure details
+
+Add `--diagnostic-output FILE` to `ship-repository.py`. The direct
+`ShipOptions` field is `diagnostic_output`. The lower-level
+`python -m github_pr_workflow ship` parser accepts the same flag; that CLI
+adapter now lives in `github_pr_workflow/ship_pull_request.py`.
+FILE is one stable caller-selected path under
+`<repo-parent>/tmp/<repo-name>/<calling-worktree-name>/`, such as
+`_ship_failure.json`, distinct from a separate top-level Promote report.
+Retries reuse FILE. Composed Ship retains its requesting workflow's path/owner.
+
+Direct workflow calls and both operation execution functions forward the path.
+`command.py` writes complete secret-redacted diagnostics directly to FILE
+before returning a short error and `diagnostic_output`, with references to
+existing successful test/build result files. It references a complete child
+report unchanged instead of copying it; the child helper retains deletion
+authority. No report path or a failed write means the full error stays in the
+response. Report-enabled commands flush observational phase JSON lines to stdout
+before the terminal result; those events are not completed outcomes.
+
+The requesting workflow decides when matching results resolve every reported
+failure, then asks the writing helper to remove that exact managed file after
+commands stop. Tests passing can resolve their report while Ship still has work
+left. Partial success and same-work replacement preserve unresolved failures.
+Restart, phase advance and unlock do not delete reports. Cleanup excludes
+successful/mixed results, receipts, required acceptance logs, other actions'
+files and unmanaged retained reports. 4B connects successful commands, exact
+reused checks and saved delivery results to this cleanup without repeating work.
+Ship also clears the matching repository/PR's CI failure after its existing
+checks pass and the concurrent waits stop, even if review needs attention.
+The check-waiting code lives in `github_pr_workflow/wait_pr_checks.py`; its polling
+and gate policy are unchanged. The helper compares command/check IDs, not error
+messages. Partial success rewrites the same report with remaining failures;
+cleanup trouble accompanies the success as `report_cleanup_error`.
+6D connects test-runner report cleanup, and 20C/21 connect explicit request
+abandonment/replacement and worktree removal. No scheduled cleanup or high-level
+failed receipt is added.
+
 ### Inputs To Capture
 
 - Repository checkout, staged promotion branch, base branch, remote, merge

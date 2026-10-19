@@ -48,6 +48,77 @@ publication, deployment and repository-wide shipped-task cleanup.
   --main-branch main --release-branch release/local --remote-name origin
   --prepare-release-only`.
 
+### Callable implementation and lock lifetime
+
+The current helper calls `github_pr_workflow.ship_repository.ship_repository()`
+directly for composed shipping, passing `ShipOptions` and the repository path.
+The standalone Ship CLI uses that same implementation. External pending-work
+and operation-runner commands use `command.py::run_command_for_json()`, which
+always launches a program; no filename selects a different calling mechanism.
+The outer release lock covers the automatic attempt, including composed Ship's
+CI wait. Once local commands are known to have stopped, it unlocks before a
+failure or decision reaches the model. Corrections therefore run unlocked; the
+next normal call reads current inputs. Unknown shutdown retains `unfinished_run`
+and the existing explicit recovery requirement. Clearing it neither accepts
+failed work nor deletes checkpoints. Complete report forwarding is implemented;
+new phase scheduling and receipt-driven remote work remain later steps.
+
+Installation runs after promotion has completed, outside the code that can
+restore the previous release commit. Plain Promote finishes local cleanup and
+unlocks. Promote-and-deploy retains the lock while today's installer reads the
+already selected commit; it does not select a newer one. Installation failure
+reports the completed promotion and original cause without undoing promotion
+or retrying installation. Composed Ship keeps the outer lock through its own
+installation and cleanup. Standalone skill/MCP installation protects a release
+source too, never a task worktree. Installers take their destination locks only
+after release protection, and never invoke Promote/Ship inside them. Explicit
+Python action declarations call the same installer used by its CLI, sharing
+outer ownership without filename-based dispatch. Artifact-only installation
+and earlier release unlock remain steps 17–19/22/27B.
+
+Each task worktree belongs to one thread; ordinary editing, checks and builds
+take no worktree or checkpoint lock. Shared request storage now removes only
+its own completed request, never another worktree's records. Release locks,
+short shared-store locks and installation locks keep their separate purposes.
+20C still connects dedicated worktree cleanup; 4D removes the empty artifact
+checkpoint wrapper/directory. Old `skill-updates` and `artifact-versions`
+per-worktree files under `<git-common-dir>/ceratops/locks/` await one-time
+retirement at the next authorized deployment after old invocations stop.
+Files still in use are retained and reported; other locks and requests remain.
+
+### Complete failure details
+
+Add `--diagnostic-output FILE` to the promotion command. FILE is one stable
+caller-selected path under
+`<repo-parent>/tmp/<repo-name>/<calling-worktree-name>/`, such as
+`_promote_failure.json`; reuse it on retries. A separate top-level Ship uses a
+different file. Composed Ship receives the original request's path and owner.
+Keep `--result-file` on its own path; its outcome/receipt contract is unchanged.
+
+The direct workflow and both operation execution functions forward this path.
+`command.py` writes complete secret-redacted failure details there before
+returning a short error and `diagnostic_output`. Successful test/build result
+files are referenced, never copied or deleted by report cleanup. Existing
+complete child reports are referenced unchanged; the child's helper owns their
+deletion. Without a selected path, or after a write error, diagnostics remain
+complete in the returned failure. Report-enabled commands flush phase JSON lines
+to stdout before the terminal result; phase events do not signal completion.
+
+The requesting workflow decides from matching successful results when every
+failure in a report is resolved; the writing helper removes its exact managed
+file after commands stop. Tests passing can resolve their report before the
+whole promotion finishes. Partial success retains the report; same-work
+replacement carries other unresolved failures forward. Restart, phase advance
+and unlock alone remove nothing. Successful/mixed results, receipts, acceptance
+logs, other actions' reports and unmanaged retained files are excluded.
+4B connects those calls after successful commands, exact reused checks and
+completed operations, before later promotion work. The helper matches
+command/check IDs, not individual error messages. Partial success rewrites only
+the same report, retaining the other failures and successful-result paths.
+Cleanup errors are reported without changing an accepted result into failure.
+6D handles child test-runner reports; 20C/21 connect explicit request
+abandonment/replacement and worktree removal rather than matching-work success.
+
 ### Inputs To Capture
 
 - Repository checkout, selected committed source branches, main branch, local

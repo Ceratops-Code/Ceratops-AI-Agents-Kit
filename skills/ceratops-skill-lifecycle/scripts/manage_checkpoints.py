@@ -1,11 +1,13 @@
-"""Lock and store essential, disposable records for one producer/worktree.
+"""Store essential, disposable records for the skill-update workflow.
 
 Records are immutable JSON objects, written directly to their final names. The
 producer decides what needs saving and when its durable result proves success;
 this module neither runs domain work nor stores acceptance on its behalf.
-Checkpoint trees live in Git's common directory. Their native lock files live
-outside those trees and remain reusable after cleanup. Only successful finish
-or confirmed worktree removal sweeps orphans, never opening or a failed run.
+Checkpoint trees live in Git's common directory. One thread owns each task
+worktree, so request storage takes no lock. Successful finish removes only that
+request's records; opening and failed runs remove nothing. The dedicated
+worktree cleanup caller may discard records for an exact removed worktree after
+establishing ownership and that its commands have stopped.
 """
 
 from __future__ import annotations
@@ -23,8 +25,6 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
-from filelock import FileLock, Timeout
-
 _COMPONENT = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?")
 _WORKTREE_ID = re.compile(r"main|linked-[a-f0-9]{64}")
 _MAX_RECORD_BYTES = 2 * 1024 * 1024
@@ -32,18 +32,17 @@ _ACTIVE = threading.local()
 
 
 class CheckpointError(RuntimeError):
-    """A checkpoint is unreadable, busy, conflicting, or outside its owner."""
+    """A checkpoint is unreadable, conflicting, or outside its owner."""
 
 
 @dataclass
 class CheckpointContext:
-    """Directory and held-lock information, valid only inside the context."""
+    """Request directory and nesting information, valid only inside the context."""
 
     common_dir: pathlib.Path
     owner: str
     worktree_id: str
     directory: pathlib.Path
-    lock: Any
     _depth: int = 1
 
     @property
@@ -127,21 +126,13 @@ def _contexts() -> dict[pathlib.Path, CheckpointContext]:
     return _ACTIVE.contexts
 
 
-def _lock(common: pathlib.Path, owner: str, worktree_id: str) -> Any:
-    directory = common / "ceratops" / "locks" / _component(owner)
-    _directory(directory)
-    path = directory / f"{worktree_id}.lock"
-    _plain(path)
-    return FileLock(path, timeout=0, fallback_to_soft=False, preserve_lock_file=True)
-
-
 @contextmanager
 def open_checkpoints(repo_root: pathlib.Path, owner: str) -> Iterator[CheckpointContext]:
-    """Discover and exclusively own this producer's records; never sweep on open.
+    """Discover this component's request records without locking or sweeping.
 
-    Same-thread nesting reuses the context. Other writers fail immediately while
-    its native OS lock is busy. This lock protects cooperating parent helpers,
-    not independently running artifact-writing children.
+    Same-thread nesting reuses the context; only its outermost caller may finish
+    the request. A context checks record ownership, not concurrent access to the
+    worktree or any shared artifact/installation destination.
     """
     common, worktree_id = _repository(repo_root)
     directory = common / "ceratops" / "operations" / _component(owner) / worktree_id
@@ -154,23 +145,17 @@ def open_checkpoints(repo_root: pathlib.Path, owner: str) -> Iterator[Checkpoint
         finally:
             context._depth -= 1
         return
-    lock = _lock(common, owner, worktree_id)
-    try:
-        lock.acquire()
-    except Timeout as exc:
-        raise CheckpointError(f"Checkpoint producer is busy: {owner}/{worktree_id}") from exc
     try:
         _directory(directory)
-        context = CheckpointContext(common, owner, worktree_id, directory, lock)
+        context = CheckpointContext(common, owner, worktree_id, directory)
         active[directory] = context
         yield context
     finally:
         active.pop(directory, None)
-        lock.release()
 
 
 def _owned(context: CheckpointContext) -> None:
-    if _contexts().get(context.directory) is not context or not context.lock.is_locked:
+    if _contexts().get(context.directory) is not context:
         raise CheckpointError("Checkpoint access requires its active producer context.")
 
 
@@ -305,42 +290,31 @@ def _discard(common: pathlib.Path, owner: str, worktree_id: str) -> None:
     directory = common / "ceratops" / "operations" / _component(owner) / worktree_id
     if _plain(directory) is None:
         return
-    lock = _lock(common, owner, worktree_id)
-    try:
-        lock.acquire()
-    except Timeout:
-        return
-    try:
-        # The registration may have reappeared between the sweep's inventory
-        # and acquiring this lock. Never discard the new worktree's request.
-        if worktree_id not in _live_worktrees(common):
-            _remove_records(directory)
-    finally:
-        lock.release()
+    # Recheck before deleting this component's records: the registration may
+    # have reappeared since discard_worktree_checkpoints inspected it.
+    if worktree_id not in _live_worktrees(common):
+        _remove_records(directory)
 
 
 def finish_checkpoints(context: CheckpointContext) -> None:
-    """After durable success, remove own records and sweep only this producer.
+    """After durable success, remove only this request's records.
 
-    On failure the producer may call this again as cleanup only. Live worktrees
-    and busy orphan writers are retained. The reusable lock file is not deleted.
+    Interrupted deletion may be repeated without rerunning accepted work.
+    No worktree inventory or sibling request is needed to finish this request.
     """
     _owned(context)
     if not context.outermost:
         raise CheckpointError("Only the outermost invocation may finish checkpoints.")
-    live = _live_worktrees(context.common_dir)
     _remove_records(context.directory)
-    for directory in context.directory.parent.iterdir():
-        if directory.name not in live:
-            _discard(context.common_dir, context.owner, directory.name)
 
 
 def discard_worktree_checkpoints(repo_root: pathlib.Path, worktree_id: str) -> None:
     """After confirmed removal, clear the worktree's checkpoints across owners.
 
     Reservations, receipts, artifacts and installations are never traversed.
-    Step 7's worktree-removal producer will call this boundary; it is not a
-    background cleaner or a command-startup sweep.
+    The dedicated worktree cleanup script must establish ownership and stopped
+    commands before calling this function; its connection is planned in 20C.
+    This is not a background cleaner or a command-startup sweep.
     """
     common, _current = _repository(repo_root)
     if _WORKTREE_ID.fullmatch(worktree_id) is None:

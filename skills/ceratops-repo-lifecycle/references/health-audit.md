@@ -37,6 +37,39 @@ credential-bound fixes precisely.
   `--params-file`, named flags, then `--param`. The parameter file defaults to
   `$CODEX_HOME/gh-contract-params.json`.
 
+### Batch Repository Scope
+
+For a list or all configured repositories, bind `SKILL_ROOT` to this installed
+skill and `PYTHON_RUNTIME` to its runtime manifest's `python_runtime`.
+`SCOPES` and `TARGETS` are the caller's shared scope and target JSON paths;
+`PROJECTS` is its projects root. Use the current `CODEX_THREAD_ID` as `TASK`
+unless the caller supplies its task id. `WORKERS` defaults to four and respects
+the caller's lower limit.
+
+- (D) Run `uv run --no-project --python "PYTHON_RUNTIME" python
+  "SKILL_ROOT/scripts/audit_repository_health.py" --run-health-contracts
+  --all-configured --scope-config SCOPES --config TARGETS
+  --projects-root PROJECTS --task-id TASK --max-workers WORKERS`.
+- For an explicit repository or list, replace `--all-configured` with one
+  `--repo OWNER/REPO` per selected repository. Keep the existing direct
+  single-repository contract command available.
+- Consume `results` and each exact `local_path`. Completed batch contracts
+  satisfy the normal health-check step and must not be replayed during
+  per-repository handling. Classify every finding and failure; preserve helper
+  blockers, including missing checkouts and origin mismatches.
+- When code consistency is requested, pass this same result queue to
+  `$ceratops-code-consistency-audit` through the model. Scripts remain within
+  their owning skill; keep evidence available until all consumers finish.
+- The lifecycle helper owns its current evidence under
+  `<projects-root>/tmp/Ceratops-AI-Agents-Kit/<task-id>`. Read full evidence
+  only when a compact result is insufficient.
+- (D) After all result handling, on every outcome, run
+  `uv run --no-project --python "PYTHON_RUNTIME" python
+  "SKILL_ROOT/scripts/audit_repository_health.py" --cleanup-task
+  --projects-root PROJECTS --task-id TASK`.
+- Cleanup must return `OK`; any other result blocks closure. Include each
+  repository's community-profile score and target even when no finding remains.
+
 ### Inputs To Capture
 
 - Target repo and any expected posture that differs from the GitHub repo, code

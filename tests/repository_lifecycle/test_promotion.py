@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import argparse
 import copy
 import hashlib
 import json
@@ -15,9 +14,7 @@ import pytest
 
 from tests.repository_lifecycle.support import (
     MANAGE_PENDING_WORK,
-    OPERATION_RUNNER,
     PROMOTE_REPOSITORY,
-    SHIP_REPOSITORY,
     prepare_divergent_promotion_repo,
     prepare_repository_lifecycle_repo,
 )
@@ -25,205 +22,6 @@ from tests.support.repositories import (
     run_git,
     write_sdlc_contract,
 )
-
-
-@pytest.mark.parametrize(
-    (
-        "operation_arguments",
-        "declares_base_revision",
-        "managed_skills",
-        "declared_handoff",
-        "expected_operation",
-        "expected_managed_skills",
-        "expected_handoff",
-        "expects_base_revision",
-    ),
-    [
-        (["--no-run-operation"], False, False, None, None, None, None, None),
-        (
-            ["--run-operation", "deliverables.apps.sample.actions.install"],
-            False,
-            False,
-            None,
-            {
-                "status": "completed",
-                "operation": "deliverables.apps.sample.actions.install",
-                "steps": [1],
-            },
-            False,
-            None,
-            False,
-        ),
-        (
-            ["--run-operation", "deliverables.apps.sample.actions.install"],
-            False,
-            True,
-            None,
-            {
-                "status": "completed",
-                "operation": "deliverables.apps.sample.actions.install",
-                "steps": [1],
-            },
-            True,
-            None,
-            False,
-        ),
-        (
-            ["--run-operation", "deliverables.apps.sample.actions.install"],
-            False,
-            True,
-            "ceratops-skill-lifecycle/deploy",
-            {
-                "status": "completed",
-                "operation": "deliverables.apps.sample.actions.install",
-                "steps": [1],
-                "handoff": "ceratops-skill-lifecycle/deploy",
-                "handoff_inputs": {},
-            },
-            True,
-            "ceratops-skill-lifecycle/deploy",
-            False,
-        ),
-    ],
-)
-def test_promote_repository_requires_an_explicit_deployment_choice(
-    tmp_path: pathlib.Path,
-    operation_arguments: list[str],
-    declares_base_revision: bool,
-    managed_skills: bool,
-    declared_handoff: str | None,
-    expected_operation: dict[str, object] | None,
-    expected_managed_skills: bool | None,
-    expected_handoff: str | None,
-    expects_base_revision: bool | None,
-) -> None:
-    repo, approved_head, log, environment = prepare_repository_lifecycle_repo(
-        tmp_path,
-        declares_base_revision=declares_base_revision,
-        managed_skills=managed_skills,
-        handoff=declared_handoff,
-    )
-    release_start = run_git(repo, "rev-parse", "main").stdout.strip()
-    task_temp = repo.parent / "tmp" / repo.name / "non-json-deployment"
-    task_temp.mkdir(parents=True)
-    result_file = task_temp / "result.json"
-
-    promoted = subprocess.run(
-        [
-            sys.executable,
-            str(PROMOTE_REPOSITORY),
-            "--result-file",
-            str(result_file),
-            "--repo-root",
-            str(repo),
-            "--source-branch",
-            "approved",
-            *operation_arguments,
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-        env=environment,
-    )
-
-    assert promoted.returncode == 0, promoted.stderr
-    result = json.loads(promoted.stdout)
-    assert result["status"] == "ready"
-    assert result["release_branch"] == "release/local"
-    assert result["merged_branches"] == ["approved"]
-    assert result["head"] == approved_head
-    assert result["release_start"] == release_start
-    if expected_operation is None:
-        assert result["operations"] is None
-    else:
-        assert result["operations"] == {
-            "status": "completed",
-            "completed_operations": [expected_operation["operation"]],
-            "pending_operations": [],
-            "results": [
-                {
-                    **expected_operation,
-                    "commit": approved_head,
-                }
-            ],
-        }
-    assert "managed_skills" not in result
-    expected_handoffs = []
-    if expected_handoff is not None:
-        assert expected_operation is not None
-        expected_handoffs = [
-            {"operation": expected_operation["operation"], "handoff": expected_handoff}
-        ]
-    assert result.get("handoffs", []) == expected_handoffs
-    scope_path = pathlib.Path(result["pending_work_scope"])
-    assert json.loads(scope_path.read_text(encoding="utf-8")) == {
-        "sources": [
-            {
-                "branch": "approved",
-                "commit": approved_head,
-                "state": "retained",
-            }
-        ],
-        "target_branch": "release/local",
-        "target_commit": approved_head,
-        "version": 2,
-    }
-    assert run_git(repo, "branch", "--show-current").stdout.strip() == "release/local"
-    assert run_git(repo, "status", "--porcelain").stdout == ""
-    if expects_base_revision is None:
-        assert not log.exists()
-    elif expects_base_revision:
-        assert log.read_text(encoding="utf-8") == f"{release_start}\n"
-    else:
-        assert log.read_text(encoding="utf-8") == "no-base\n"
-
-    # The caller validated command completion and the saved envelope above.
-    # Finalization must not require output the producer never emitted.
-    data = result_file.read_bytes()
-    assert json.loads(data) == result
-    scope_before = scope_path.read_bytes()
-    finalized = subprocess.run(
-        [
-            sys.executable,
-            str(PROMOTE_REPOSITORY),
-            "--repo-root",
-            str(repo),
-            "--finalize-result",
-            "--result-file",
-            str(result_file),
-            "--task-temp-root",
-            str(task_temp),
-            "--expected-commit",
-            approved_head,
-            "--verified-result-sha256",
-            hashlib.sha256(data).hexdigest(),
-            *(["--promotion-only"] if expected_operation is None else []),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-        env=environment,
-    )
-    if expected_operation is None:
-        assert finalized.returncode == 0, finalized.stderr
-        assert finalized.stdout == "OK\n"
-        assert not result_file.exists()
-        assert not log.exists()
-    elif expected_handoff is not None:
-        assert finalized.returncode == 1
-        assert (
-            "lacks bound completion evidence" in json.loads(finalized.stderr)["message"]
-        )
-        assert result_file.read_bytes() == data
-        assert log.read_text(encoding="utf-8") == "no-base\n"
-    else:
-        assert "step_results" not in result["operations"]["results"][0]
-        assert finalized.returncode == 0, finalized.stderr
-        assert finalized.stdout == "OK\n"
-        assert not result_file.exists()
-        assert log.read_text(encoding="utf-8") == "no-base\n"
-    assert scope_path.read_bytes() == scope_before
-    assert run_git(repo, "rev-parse", "HEAD").stdout.strip() == approved_head
 
 
 @pytest.mark.parametrize(
@@ -701,152 +499,6 @@ def test_promote_repository_runs_explicit_operation_ids_in_order(
     assert run_git(repo, "show-ref", "--verify", "refs/heads/approved").returncode == 0
     assert log.read_text(encoding="utf-8") == operation_log
 
-
-@pytest.mark.parametrize(
-    "metadata",
-    [
-        [],
-        ["--title", "Complete Dev Tools catalog"],
-        ["--body", "Use explicit exclusions.\n\nPreserve deployment.\n"],
-        ["--title", "Complete Dev Tools catalog", "--body", "Exact description"],
-        ["--body", ""],
-    ],
-    ids=["defaults", "title", "body", "both", "empty-body"],
-)
-def test_promote_repository_ship_after_promotion_composes_terminal_workflow(
-    tmp_path: pathlib.Path,
-    metadata: list[str],
-) -> None:
-    repo, approved_head, log, _ = prepare_repository_lifecycle_repo(tmp_path)
-    loaded = runpy.run_path(str(PROMOTE_REPOSITORY))
-    parser = loaded["build_parser"]()
-    arguments = [
-        "--repo-root",
-        str(repo),
-        "--source-branch",
-        "approved",
-        "--main-branch",
-        "main",
-        "--release-branch",
-        "release/local",
-        "--remote-name",
-        "origin",
-        "--ship-after-promotion",
-        *metadata,
-    ]
-    parsed = parser.parse_args(arguments)
-    assert parsed.ship_after_promotion is True
-    assert parsed.run_operation is None
-    assert parsed.no_run_operation is False
-    for conflicting in (
-        ["--run-operation", "deliverables.apps.sample.actions.install"],
-        ["--no-run-operation"],
-    ):
-        with pytest.raises(SystemExit):
-            parser.parse_args([*arguments, *conflicting])
-
-    shipped = {
-        "status": "shipped",
-        "repository": "example/repository",
-        "commit": approved_head,
-        "pr": 31,
-        "url": "https://example.invalid/pull/31",
-        "merge_commit": "c" * 40,
-        "synchronized_head": "b" * 40,
-        "release_publication": {
-            "status": "published",
-            "operation": "publish",
-            "steps": ["publish"],
-        },
-        "deployment": {
-            "status": "completed",
-            "operation": "deliverables.apps.sample.actions.install",
-            "steps": ["install"],
-        },
-        "finalization": {"status": "finalized"},
-    }
-    originalrun_json_command = loaded["run_json_command"]
-    original_ship_after_promotion = loaded["_ship_after_promotion"]
-    commands: list[list[str]] = []
-    recorded: dict[str, object] = {}
-    captured_handoff: dict[str, object] = {}
-
-    def run_json(command: list[str], cwd: pathlib.Path) -> tuple[int, dict[str, Any]]:
-        if pathlib.Path(command[1]) == OPERATION_RUNNER:
-            assert "--validate" in command
-            return originalrun_json_command(command, cwd)
-        commands.append(command)
-        if pathlib.Path(command[1]) == MANAGE_PENDING_WORK:
-            assert "--preserve-divergent-target" in command
-            code, result = originalrun_json_command(command, cwd)
-            recorded.update(result)
-            return code, result
-        assert pathlib.Path(command[1]) == SHIP_REPOSITORY
-        assert recorded["target_commit"] == approved_head
-        assert pathlib.Path(str(recorded["pending_work_scope"])).is_file()
-        assert run_git(repo, "rev-parse", "release/local").stdout.strip() == (
-            approved_head
-        )
-        return 0, shipped
-
-    def ship_after_promotion(
-        args: argparse.Namespace,
-        repo_root: pathlib.Path,
-        *,
-        target_commit: str,
-        pending_work_scope: object,
-    ) -> dict[str, object]:
-        captured_handoff.update(
-            {
-                "target_commit": target_commit,
-                "pending_work_scope": pending_work_scope,
-            }
-        )
-        return original_ship_after_promotion(
-            args,
-            repo_root,
-            target_commit=target_commit,
-            pending_work_scope=pending_work_scope,
-        )
-
-    promote = loaded["promote"]
-    promote.__globals__["run_json_command"] = run_json
-    promote.__globals__["_ship_after_promotion"] = ship_after_promotion
-    result = promote(parsed)
-
-    assert result == shipped
-    assert len(commands) == 2
-    assert pathlib.Path(commands[0][1]) == MANAGE_PENDING_WORK
-    ship_command = commands[1]
-    assert pathlib.Path(ship_command[1]) == SHIP_REPOSITORY
-    assert ship_command[ship_command.index("--repo-root") + 1] == str(repo.resolve())
-    assert ship_command[ship_command.index("--head-branch") + 1] == "release/local"
-    assert ship_command[ship_command.index("--base-branch") + 1] == "main"
-    assert ship_command[ship_command.index("--remote-name") + 1] == "origin"
-    assert ship_command[ship_command.index("--commit") + 1] == approved_head
-    assert pathlib.Path(
-        ship_command[ship_command.index("--sdlc-contract") + 1]
-    ) == pathlib.Path("sdlc/sdlc.yml")
-    assert "--publish-operation" not in ship_command
-    assert "--deploy-operation" not in ship_command
-    assert "--validation-operation" not in ship_command
-    assert "--reusable-head" in ship_command
-    for flag in ("--title", "--body"):
-        if flag in metadata:
-            assert (
-                ship_command[ship_command.index(flag) + 1]
-                == metadata[metadata.index(flag) + 1]
-            )
-        else:
-            assert flag not in ship_command
-    assert str(OPERATION_RUNNER) not in (command[1] for command in commands)
-    assert captured_handoff == {
-        "target_commit": approved_head,
-        "pending_work_scope": recorded["pending_work_scope"],
-    }
-    assert not log.exists()
-
-
 @pytest.mark.parametrize("mode", ["--prepare-release-only", "--no-run-operation"])
 @pytest.mark.parametrize("metadata", [["--title", "Custom title"], ["--body", ""]])
 def test_promote_repository_metadata_requires_composed_shipping_before_mutation(
@@ -863,128 +515,12 @@ def test_promote_repository_metadata_requires_composed_shipping_before_mutation(
         pytest.fail("metadata misuse must block before repository commands")
 
     promote = loaded["promote"]
-    for name in ("require_output", "require_success", "run_json_command"):
+    for name in ("require_output", "require_success", "run_command_for_json"):
         promote.__globals__[name] = unexpected
     with pytest.raises(
         loaded["PromotionError"], match="PR metadata requires --ship-after-promotion"
     ):
         promote(args)
-
-
-def test_promote_repository_ship_after_promotion_preserves_blocked_state(
-    tmp_path: pathlib.Path,
-) -> None:
-    (
-        repo,
-        source_worktree,
-        _,
-        _release_head,
-        _,
-    ) = prepare_divergent_promotion_repo(tmp_path / "shipping-blocker")
-    loaded = runpy.run_path(str(PROMOTE_REPOSITORY))
-    originalrun_json_command = loaded["run_json_command"]
-    commands: list[list[str]] = []
-    retained: dict[str, pathlib.Path] = {}
-    blocker = {
-        "status": "blocked",
-        "message": "Codex review gate found one active thread.",
-        "phase": "gates",
-        "blocker": {
-            "kind": "review_threads",
-            "head_oid": "a" * 40,
-            "threads": [{"thread_id": "PRRT_1", "body": "Fix this."}],
-        },
-    }
-
-    def run_json(command: list[str], cwd: pathlib.Path) -> tuple[int, dict[str, Any]]:
-        if pathlib.Path(command[1]) == OPERATION_RUNNER:
-            assert "--validate" in command
-            return originalrun_json_command(command, cwd)
-        commands.append(command)
-        if pathlib.Path(command[1]) == MANAGE_PENDING_WORK:
-            code, result = originalrun_json_command(command, cwd)
-            scope = pathlib.Path(str(result["pending_work_scope"]))
-            checkpoint = scope.with_suffix(".release-publication.json")
-            retained.update({"scope": scope, "checkpoint": checkpoint})
-            return code, result
-        assert pathlib.Path(command[1]) == SHIP_REPOSITORY
-        retained["checkpoint"].write_text(
-            "{}\n",
-            encoding="utf-8",
-            newline="\n",
-        )
-        return 1, blocker
-
-    promote = loaded["promote"]
-    promote.__globals__["run_json_command"] = run_json
-    args = loaded["build_parser"]().parse_args(
-        [
-            "--repo-root",
-            str(repo),
-            "--source-branch",
-            "approved",
-            "--ship-after-promotion",
-        ]
-    )
-    with pytest.raises(loaded["PromotionError"]) as captured:
-        promote(args)
-
-    assert captured.value.payload == blocker
-    assert len(commands) == 2
-    assert retained["scope"].is_file()
-    assert retained["checkpoint"].is_file()
-    assert source_worktree.is_dir()
-    assert run_git(source_worktree, "status", "--porcelain").stdout == ""
-    assert run_git(repo, "show-ref", "--verify", "refs/heads/approved").returncode == 0
-    assert run_git(repo, "status", "--porcelain").stdout == ""
-
-    original_ship_after_promotion = loaded["_ship_after_promotion"]
-    original_ship_after_promotion.__globals__["run_json_command"] = lambda command, cwd: (
-        0,
-        {"status": "ready"},
-    )
-    with pytest.raises(
-        loaded["PromotionError"],
-        match="incomplete terminal result",
-    ):
-        original_ship_after_promotion(
-            args,
-            repo.resolve(),
-            target_commit=run_git(repo, "rev-parse", "release/local").stdout.strip(),
-            pending_work_scope=str(retained["scope"]),
-        )
-
-    conflict_root = tmp_path / "promotion-blocker"
-    (
-        conflict_repo,
-        _,
-        _,
-        conflict_release_head,
-        _,
-    ) = prepare_divergent_promotion_repo(conflict_root, conflict=True)
-    conflict_loaded = runpy.run_path(str(PROMOTE_REPOSITORY))
-    conflict_promote = conflict_loaded["promote"]
-
-    def unexpectedrun_json_command(
-        command: list[str], cwd: pathlib.Path
-    ) -> tuple[int, dict[str, Any]]:
-        pytest.fail(f"promotion blocker invoked lifecycle child: {command}")
-
-    conflict_promote.__globals__["run_json_command"] = unexpectedrun_json_command
-    conflict_args = conflict_loaded["build_parser"]().parse_args(
-        [
-            "--repo-root",
-            str(conflict_repo),
-            "--source-branch",
-            "approved",
-            "--ship-after-promotion",
-        ]
-    )
-    with pytest.raises(conflict_loaded["PromotionError"]):
-        conflict_promote(conflict_args)
-    assert run_git(conflict_repo, "rev-parse", "release/local").stdout.strip() == (
-        conflict_release_head
-    )
 
 
 def test_promote_repository_routes_linked_repo_root_without_branch_drift(
@@ -1070,14 +606,14 @@ def test_release_preparation_failure_restores_original_checkout_and_refs(
     loaded = runpy.run_path(str(PROMOTE_REPOSITORY))
     promote = loaded["promote"]
     promotion_error = loaded["PromotionError"]
-    original_clean = promote.__globals__["_clean"]
+    original_clean = loaded["git_branches"]._clean
 
     def fail_after_preparation(repo_root: pathlib.Path, phase: str) -> None:
         if phase == "after preparing release/local":
             raise promotion_error("forced release preparation failure")
         original_clean(repo_root, phase)
 
-    promote.__globals__["_clean"] = fail_after_preparation
+    loaded["git_branches"]._clean = fail_after_preparation
     args = loaded["build_parser"]().parse_args(
         [
             "--repo-root",
@@ -1089,7 +625,10 @@ def test_release_preparation_failure_restores_original_checkout_and_refs(
     )
 
     with pytest.raises(promotion_error, match="forced release preparation failure"):
-        promote(args)
+        try:
+            promote(args)
+        finally:
+            loaded["git_branches"]._clean = original_clean
 
     assert run_git(repo, "branch", "--show-current").stdout.strip() == "approved"
     assert run_git(repo, "rev-parse", "HEAD").stdout.strip() == approved_head
@@ -1110,16 +649,16 @@ def test_validation_failure_restores_original_checkout_and_refs(
     original_main = run_git(repo, "rev-parse", "main").stdout.strip()
     loaded = runpy.run_path(str(PROMOTE_REPOSITORY))
     promote = loaded["promote"]
-    originalrun_json_command = promote.__globals__["run_json_command"]
+    original_run_command_for_json = promote.__globals__["run_command_for_json"]
 
     def fail_validation(
         command: list[str], cwd: pathlib.Path
     ) -> tuple[int, dict[str, Any]]:
         if pathlib.Path(command[1]) == MANAGE_PENDING_WORK:
-            return originalrun_json_command(command, cwd)
+            return original_run_command_for_json(command, cwd)
         return 1, {"status": "validation_failed", "message": "forced failure"}
 
-    promote.__globals__["run_json_command"] = fail_validation
+    promote.__globals__["run_command_for_json"] = fail_validation
     args = loaded["build_parser"]().parse_args(
         [
             "--repo-root",
@@ -1152,12 +691,12 @@ def test_promote_repository_prepare_only_mode_remains_unchanged(
     loaded = runpy.run_path(str(PROMOTE_REPOSITORY))
     promote = loaded["promote"]
 
-    def unexpectedrun_json_command(
+    def unexpected_run_command_for_json(
         command: list[str], cwd: pathlib.Path
     ) -> tuple[int, dict[str, Any]]:
         pytest.fail(f"prepare-only invoked lifecycle child: {command}")
 
-    promote.__globals__["run_json_command"] = unexpectedrun_json_command
+    promote.__globals__["run_command_for_json"] = unexpected_run_command_for_json
     result = promote(
         loaded["build_parser"]().parse_args(
             [
@@ -1176,166 +715,6 @@ def test_promote_repository_prepare_only_mode_remains_unchanged(
     assert run_git(repo, "branch", "--show-current").stdout.strip() == "release/local"
     assert run_git(repo, "status", "--porcelain").stdout == ""
     assert not log.exists()
-
-
-def test_promote_and_deploy_does_not_inject_base_revision(
-    tmp_path: pathlib.Path,
-) -> None:
-    repo, approved_head, log, environment = prepare_repository_lifecycle_repo(
-        tmp_path,
-        managed_skills=True,
-        handoff="ceratops-skill-lifecycle/deploy",
-    )
-    first = subprocess.run(
-        [
-            sys.executable,
-            str(PROMOTE_REPOSITORY),
-            "--repo-root",
-            str(repo),
-            "--source-branch",
-            "approved",
-            "--no-run-operation",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-        env=environment,
-    )
-    assert first.returncode == 0, first.stderr
-    assert not log.exists()
-
-    retained_worktree = tmp_path / "approved-retained"
-    assert (
-        run_git(repo, "worktree", "add", str(retained_worktree), "approved").returncode
-        == 0
-    )
-    retained_file = retained_worktree / "uncommitted.txt"
-    retained_file.write_text("preserve me\n", encoding="utf-8", newline="\n")
-
-    assert (
-        run_git(repo, "switch", "-c", "approved-second", "release/local").returncode
-        == 0
-    )
-    (repo / "README.md").write_text(
-        "base\napproved\napproved second\n",
-        encoding="utf-8",
-        newline="\n",
-    )
-    assert run_git(repo, "add", "README.md").returncode == 0
-    assert run_git(repo, "commit", "-m", "approved second change").returncode == 0
-    second = subprocess.run(
-        [
-            sys.executable,
-            str(PROMOTE_REPOSITORY),
-            "--repo-root",
-            str(repo),
-            "--source-branch",
-            "approved-second",
-            "--run-operation",
-            "deliverables.apps.sample.actions.install",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-        env=environment,
-    )
-
-    assert second.returncode == 0, second.stderr
-    second_result = json.loads(second.stdout)
-    assert second_result["release_start"] == approved_head
-    assert second_result["handoffs"] == [
-        {
-            "operation": "deliverables.apps.sample.actions.install",
-            "handoff": "ceratops-skill-lifecycle/deploy",
-        }
-    ]
-    assert second_result["preserved_sources"] == [
-        {
-            "branch": "approved",
-            "findings": [
-                {
-                    "kind": "dirty_worktree",
-                    "subject": "approved",
-                    "detail": "1 status entry",
-                }
-            ],
-        }
-    ]
-    second_head = run_git(repo, "rev-parse", "release/local").stdout.strip()
-    assert json.loads(
-        pathlib.Path(second_result["pending_work_scope"]).read_text(encoding="utf-8")
-    ) == {
-        "sources": [
-            {
-                "branch": "approved",
-                "commit": approved_head,
-                "state": "preserved",
-            },
-            {
-                "branch": "approved-second",
-                "commit": second_head,
-                "state": "retained",
-            },
-        ],
-        "target_branch": "release/local",
-        "target_commit": second_head,
-        "version": 2,
-    }
-    assert retained_file.read_text(encoding="utf-8") == "preserve me\n"
-    assert log.read_text(encoding="utf-8") == "no-base\n"
-
-    divergent = tmp_path / "automatic-rebase-success"
-    (
-        rebase_repo,
-        source_worktree,
-        source_head,
-        release_head,
-        rebase_environment,
-    ) = prepare_divergent_promotion_repo(divergent)
-    rebased = subprocess.run(
-        [
-            sys.executable,
-            str(PROMOTE_REPOSITORY),
-            "--repo-root",
-            str(rebase_repo),
-            "--source-branch",
-            "approved",
-            "--no-run-operation",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-        env=rebase_environment,
-    )
-
-    assert rebased.returncode == 0, rebased.stderr
-    rebase_result = json.loads(rebased.stdout)
-    new_source_head = run_git(source_worktree, "rev-parse", "HEAD").stdout.strip()
-    assert new_source_head != source_head
-    assert rebase_result["head"] == new_source_head
-    assert rebase_result["rebased_branches"] == [
-        {
-            "branch": "approved",
-            "old_head": source_head,
-            "new_head": new_source_head,
-            "onto": release_head,
-        }
-    ]
-    assert (
-        run_git(
-            rebase_repo,
-            "merge-base",
-            "--is-ancestor",
-            release_head,
-            "approved",
-        ).returncode
-        == 0
-    )
-    assert run_git(source_worktree, "status", "--porcelain").stdout == ""
-    assert (source_worktree / "release.txt").read_text(encoding="utf-8") == (
-        "release\n"
-    )
-    assert "approved" in (source_worktree / "README.md").read_text(encoding="utf-8")
 
 
 def test_promote_repository_rejects_noncanonical_release_branch_before_mutation(
@@ -1455,6 +834,7 @@ def test_promote_repository_rejects_noncanonical_release_branch_before_mutation(
                 "--source-branch",
                 "approved",
                 "--no-run-operation",
+                "--confirm-previous-commands-stopped",
             ],
             capture_output=True,
             text=True,
@@ -1626,46 +1006,6 @@ def test_promote_preserves_structured_operation_failure_evidence(
     assert json.loads(saved.read_text(encoding="utf-8")) == result
 
 
-def test_promote_and_deploy_rejects_operation_created_repository_work(
-    tmp_path: pathlib.Path,
-) -> None:
-    repo, _, _, environment = prepare_repository_lifecycle_repo(tmp_path)
-    probe = repo / "deploy-probe.py"
-    probe.write_text(
-        "import pathlib\n"
-        "pathlib.Path('generated-by-deploy.txt').write_text("
-        "'untracked\\n', encoding='utf-8')\n",
-        encoding="utf-8",
-        newline="\n",
-    )
-    assert run_git(repo, "add", "deploy-probe.py").returncode == 0
-    assert run_git(repo, "commit", "-m", "create deploy output").returncode == 0
-
-    promoted = subprocess.run(
-        [
-            sys.executable,
-            str(PROMOTE_REPOSITORY),
-            "--repo-root",
-            str(repo),
-            "--source-branch",
-            "approved",
-            "--run-operation",
-            "deliverables.apps.sample.actions.install",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-        env=environment,
-    )
-
-    assert promoted.returncode == 1
-    result = json.loads(promoted.stderr)
-    assert result["status"] == "error"
-    assert "dirty" in result["message"].lower()
-    assert "ready" in result["message"].lower()
-    assert (repo / "generated-by-deploy.txt").is_file()
-
-
 @pytest.mark.parametrize("gate", ["validate", "tests"])
 @pytest.mark.parametrize("mutation", ["none", "dirty", "head"])
 def test_promotion_repairs_and_revalidates_the_final_commit_before_deployment(
@@ -1738,6 +1078,7 @@ def test_promotion_repairs_and_revalidates_the_final_commit_before_deployment(
     assert evidence["commit"] == broken
     assert pathlib.Path(evidence["pending_work_scope"]).is_file()
     assert not deployment_log.exists()
+    command.append("--confirm-previous-commands-stopped")
 
     assert run_git(repo, "switch", "approved").returncode == 0
     (repo / "quality.txt").write_text("good", encoding="utf-8")
@@ -1746,13 +1087,13 @@ def test_promotion_repairs_and_revalidates_the_final_commit_before_deployment(
     repaired = run_git(repo, "rev-parse", "HEAD").stdout.strip()
     if mutation != "none":
         promotion = runpy.run_path(str(PROMOTE_REPOSITORY))
-        originalrun_json_command = promotion["run_json_command"]
+        original_run_command_for_json = promotion["run_command_for_json"]
 
         def change_after_validation(
             argv: list[str],
             cwd: pathlib.Path,
         ) -> tuple[int, dict[str, Any]]:
-            code, result = originalrun_json_command(argv, cwd)
+            code, result = original_run_command_for_json(argv, cwd)
             if "--validate" in argv and code == 0:
                 (repo / "quality.txt").write_text("changed", encoding="utf-8")
                 if mutation == "head":
@@ -1763,7 +1104,7 @@ def test_promotion_repairs_and_revalidates_the_final_commit_before_deployment(
                     )
             return code, result
 
-        promotion["promote"].__globals__["run_json_command"] = change_after_validation
+        promotion["promote"].__globals__["run_command_for_json"] = change_after_validation
         args = promotion["build_parser"]().parse_args(command[2:])
         with pytest.raises(promotion["PromotionError"]) as caught:
             promotion["promote"](args)
@@ -2025,7 +1366,7 @@ def test_automatic_rebase_refuses_uncertain_git_evidence(
             )
         return run(argv, **kwargs)
 
-    original_head = loaded["_branch_head"]
+    original_head = loaded["git_branches"]._branch_head
     failed_head_query = False
 
     def branch_head(*args: Any) -> str:
@@ -2036,12 +1377,12 @@ def test_automatic_rebase_refuses_uncertain_git_evidence(
         return original_head(*args)
 
     monkeypatch.setitem(
-        loaded["_prepare_source_for_fast_forward"].__globals__,
+        vars(loaded["git_branches"]),
         "_branch_head",
         branch_head,
     )
     monkeypatch.setitem(
-        loaded["_prepare_source_for_fast_forward"].__globals__, "run_command", probe
+        vars(loaded["git_branches"]), "run_command", probe
     )
     with pytest.raises(loaded["PromotionError"]):
         loaded["_prepare_source_for_fast_forward"](
@@ -2054,358 +1395,3 @@ def test_automatic_rebase_refuses_uncertain_git_evidence(
     assert rebased == (query in {"post-rebase-failure", "post-head-failure"})
     assert run_git(source, "rev-parse", "HEAD").stdout.strip() == head
     assert run_git(source, "status", "--porcelain").stdout == ""
-
-
-@pytest.mark.parametrize("cleanup_failure", [False, True])
-@pytest.mark.parametrize("deployment_case", ["plain", "json"])
-def test_managed_installer_finalizes_only_its_bound_promotion_record(
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    cleanup_failure: bool,
-    deployment_case: str,
-) -> None:
-    from tests.skill_lifecycle.support import load_runtime_installer
-    from tests.support.repositories import create_compatible_repo
-
-    repo, _, _, environment = prepare_repository_lifecycle_repo(tmp_path)
-    create_compatible_repo(repo, "example/completion", ["alpha-tool", "beta-tool"])
-    operation = "deliverables.apps.managed-deployment.actions.install"
-    structured = deployment_case == "json"
-    output = (
-        json.dumps({"schema": "test.install.v1", "status": "OK"})
-        if structured
-        else "Requirement already satisfied"
-    )
-    write_sdlc_contract(
-        repo,
-        deliverables={
-            "apps": {
-                "managed-deployment": {
-                    "source": ".",
-                    "manifest": "README.md",
-                    "prerequisites": [],
-                    "actions": {
-                        "validate": {
-                            "requires": {"capabilities": []},
-                            "no-op": "Repository validation covers this fixture.",
-                        },
-                        "install": {
-                            "requires": {"capabilities": []},
-                            "steps": [
-                                {"run": [sys.executable, "-c", f"print({output!r})"]},
-                                {
-                                    "handoff": {
-                                        "lifecycle": "ceratops-skill-lifecycle",
-                                        "action": "deploy",
-                                        "inputs": {},
-                                    }
-                                },
-                            ],
-                        },
-                    },
-                }
-            }
-        },
-    )
-    assert run_git(repo, "add", ".").returncode == 0
-    assert run_git(repo, "commit", "-m", "managed deployment").returncode == 0
-    task = repo.parent / "tmp" / repo.name / "promotion-completion"
-    task.mkdir(parents=True)
-    record = task / "promotion.json"
-    promoted = subprocess.run(
-        [
-            sys.executable,
-            str(PROMOTE_REPOSITORY),
-            "--repo-root",
-            str(repo),
-            "--source-branch",
-            "approved",
-            "--run-operation",
-            operation,
-            "--result-file",
-            str(record),
-        ],
-        env=environment,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert promoted.returncode == 0, promoted.stderr
-    original = record.read_bytes()
-    promotion = json.loads(original)
-    outcome = promotion["operations"]["results"][0]
-    assert outcome["status"] == "completed"
-    assert bool(outcome.get("step_results")) is structured
-    scope = pathlib.Path(promotion["pending_work_scope"])
-    scope_bytes = scope.read_bytes()
-    retained = task / "caller-owned.txt"
-    retained.write_text("preserve")
-    destination = tmp_path / "installed"
-    monkeypatch.chdir(tmp_path)
-    loaded = load_runtime_installer()
-    process = subprocess.run
-    finalizations = 0
-
-    def run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        nonlocal finalizations
-        if "--finalize-result" in argv:
-            finalizations += 1
-            if cleanup_failure:
-                return subprocess.CompletedProcess(argv, 1, "", "record is locked")
-        return process(argv, **kwargs)
-
-    with monkeypatch.context() as patch:
-        patch.setattr(subprocess, "run", run)
-        code = loaded["main"](
-            [
-                "--repo-root",
-                str(repo),
-                "--install-root",
-                str(destination),
-                "--promotion-result",
-                str(record),
-                "--operation",
-                operation,
-                "--task-temp-root",
-                str(task),
-                "--finalize-promotion-with",
-                str(PROMOTE_REPOSITORY),
-            ]
-        )
-    captured = capsys.readouterr()
-    cleanup_blocked = cleanup_failure or structured
-    assert code == (2 if cleanup_blocked else 0), (captured.out, captured.err)
-    receipt = json.loads(captured.err if cleanup_blocked else captured.out)
-    assert finalizations == 1
-    assert receipt["commit"] == promotion["head"]
-    assert receipt["install_root"] == str(destination)
-    assert receipt["deployed"] == ["alpha-tool", "beta-tool"]
-    assert receipt["removed"] == [] and receipt["cleanup_debt"] == []
-    assert receipt["promotion"]["sha256"] == hashlib.sha256(original).hexdigest()
-    assert (destination / "alpha-tool/SKILL.md").is_file()
-    if cleanup_blocked:
-        assert record.read_bytes() == original
-        assert receipt["promotion_cleanup"]["replay_required"] is False
-        command = [
-            sys.executable,
-            str(PROMOTE_REPOSITORY),
-            "--repo-root",
-            str(repo),
-            "--finalize-result",
-            "--result-file",
-            str(record),
-            "--task-temp-root",
-            str(task),
-            "--expected-commit",
-            promotion["head"],
-            "--deployment-evidence",
-            "-",
-        ]
-        if structured:
-            # Bound handoff evidence cannot validate an arbitrary producer's
-            # receipt. The caller checks that receipt before acknowledging it.
-            assert outcome["step_results"][0]["result"] == {
-                "schema": "test.install.v1",
-                "status": "OK",
-            }
-            unverified = process(
-                command, input=json.dumps(receipt), capture_output=True, text=True
-            )
-            assert unverified.returncode == 1 and record.read_bytes() == original
-            assert "require caller validation" in unverified.stderr
-            command.extend(
-                ["--verified-result-sha256", hashlib.sha256(original).hexdigest()]
-            )
-        invalid = [
-            ("status", "failed"),
-            ("cleanup_debt", ["retired-folder"]),
-            ("commit", "a" * 40),
-            ("repo_root", str(tmp_path)),
-            ("install_root", "relative"),
-            ("producer", "another-skill/deploy"),
-            ("deployed", ["alpha-tool", "alpha-tool"]),
-            ("removed", ["alpha-tool"]),
-            ("transaction_id", ""),
-            ("promotion", {**receipt["promotion"], "sha256": "0" * 64}),
-            (
-                "promotion",
-                {
-                    **receipt["promotion"],
-                    "operation": "deliverables.apps.other.actions.install",
-                },
-            ),
-        ]
-        for field, value in invalid:
-            wrong = {**receipt, field: value}
-            result = process(
-                command, input=json.dumps(wrong), capture_output=True, text=True
-            )
-            assert result.returncode == 1, (field, result.stdout, result.stderr)
-            assert json.loads(result.stderr)["replay_required"] is False
-            assert record.read_bytes() == original
-        wrong_identity = {
-            **receipt,
-            "promotion": {**receipt["promotion"], "identity": [0] * 6},
-        }
-        result = process(
-            command, input=json.dumps(wrong_identity), capture_output=True, text=True
-        )
-        assert result.returncode == 1 and record.read_bytes() == original
-        installed_before = (destination / "alpha-tool/SKILL.md").stat().st_mtime_ns
-        result = process(
-            command, input=json.dumps(receipt), capture_output=True, text=True
-        )
-        assert result.returncode == 0, result.stderr
-        assert (
-            destination / "alpha-tool/SKILL.md"
-        ).stat().st_mtime_ns == installed_before
-    assert not record.exists()
-    assert scope.read_bytes() == scope_bytes
-    assert retained.read_text() == "preserve"
-
-
-def test_completion_receipt_requires_unique_promotion_binding_batch() -> None:
-    loaded = runpy.run_path(str(PROMOTE_REPOSITORY))
-    parse = loaded["_receipt_promotion_bindings"]
-    error = loaded["PromotionError"]
-    bindings = [{"operation": "alpha"}, {"operation": "beta"}]
-    assert parse({"promotion": bindings}) == bindings
-    invalid_batches: tuple[list[dict[str, str]], ...] = (
-        [],
-        [{"operation": "alpha"}, {"operation": "alpha"}],
-        [{}],
-    )
-    for invalid in invalid_batches:
-        with pytest.raises(error, match="missing or duplicated"):
-            parse({"promotion": invalid})
-
-
-def test_managed_installer_finalizes_multiple_handoffs_once(
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    from tests.skill_lifecycle.support import load_runtime_installer
-    from tests.support.repositories import create_compatible_repo
-
-    repo, _, _, environment = prepare_repository_lifecycle_repo(tmp_path)
-    skills = ["alpha-tool", "beta-tool"]
-    create_compatible_repo(repo, "example/completion-batch", skills)
-    applications = {
-        f"{skill}-deployment": {
-            "source": ".",
-            "manifest": "README.md",
-            "prerequisites": [],
-            "actions": {
-                "validate": {
-                    "requires": {"capabilities": []},
-                    "no-op": "Repository validation covers this fixture.",
-                },
-                "install": {
-                    "requires": {"capabilities": []},
-                    "steps": [
-                        {
-                            "handoff": {
-                                "lifecycle": "ceratops-skill-lifecycle",
-                                "action": "deploy",
-                                "inputs": {"skill": skill},
-                            }
-                        }
-                    ],
-                },
-            },
-        }
-        for skill in skills
-    }
-    write_sdlc_contract(repo, deliverables={"apps": applications})
-    assert run_git(repo, "add", ".").returncode == 0
-    assert run_git(repo, "commit", "-m", "managed deployment batch").returncode == 0
-    operations = [
-        f"deliverables.apps.{skill}-deployment.actions.install" for skill in skills
-    ]
-    task = repo.parent / "tmp" / repo.name / "promotion-completion-batch"
-    task.mkdir(parents=True)
-    record = task / "promotion.json"
-    promotion_command = [
-        sys.executable,
-        str(PROMOTE_REPOSITORY),
-        "--repo-root",
-        str(repo),
-        "--source-branch",
-        "approved",
-        "--result-file",
-        str(record),
-    ]
-    for operation in operations:
-        promotion_command.extend(("--run-operation", operation))
-    promoted = subprocess.run(
-        promotion_command,
-        env=environment,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert promoted.returncode == 0, promoted.stderr
-    promotion = json.loads(record.read_text(encoding="utf-8"))
-    destination = tmp_path / "installed"
-    loaded = load_runtime_installer()
-
-    def installer_arguments(*selected_operations: str) -> list[str]:
-        arguments = [
-            "--repo-root",
-            str(repo),
-            "--install-root",
-            str(destination),
-            "--promotion-result",
-            str(record),
-            "--task-temp-root",
-            str(task),
-            "--finalize-promotion-with",
-            str(PROMOTE_REPOSITORY),
-        ]
-        for skill in skills:
-            arguments.extend(("--skill", skill))
-        for operation in selected_operations:
-            arguments.extend(("--operation", operation))
-        return arguments
-
-    assert loaded["main"](installer_arguments(operations[0], operations[0])) == 1
-    duplicate = json.loads(capsys.readouterr().err)
-    assert duplicate["reason"] == "promotion operations must be unique"
-    assert record.is_file() and not destination.exists()
-
-    missing_operation = "deliverables.apps.missing.actions.install"
-    assert loaded["main"](
-        installer_arguments(operations[0], missing_operation)
-    ) == 1
-    missing = json.loads(capsys.readouterr().err)
-    assert "selected pending skill deployment" in missing["reason"]
-    assert record.is_file() and not destination.exists()
-
-    process = subprocess.run
-    finalizations = 0
-
-    def run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        nonlocal finalizations
-        if "--finalize-result" in argv:
-            finalizations += 1
-        return process(argv, **kwargs)
-
-    monkeypatch.chdir(tmp_path)
-    with monkeypatch.context() as patch:
-        patch.setattr(subprocess, "run", run)
-        code = loaded["main"](installer_arguments(*operations))
-    captured = capsys.readouterr()
-    assert code == 0, (captured.out, captured.err)
-    receipt = json.loads(captured.out)
-    assert finalizations == 1
-    assert receipt["commit"] == promotion["head"]
-    assert receipt["deployed"] == skills
-    assert [item["operation"] for item in receipt["promotion"]] == operations
-    assert receipt["promotion_cleanup"] == {
-        "status": "completed",
-        "replay_required": False,
-    }
-    assert not record.exists()
-    assert all((destination / skill / "SKILL.md").is_file() for skill in skills)

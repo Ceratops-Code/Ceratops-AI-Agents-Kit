@@ -9,7 +9,7 @@ the existing skill-lifecycle validator.
 
 ### Inputs To Capture
 
-- Exact source repository and its manifest validation profile.
+- Exact source repository; its manifest supplies the profile.
 - Mode: `full` by default, `skill` for explicit selected skills, or `sections`
   for shared-section sources and assignments.
 - Exact skill names for `skill` mode; repeat `--skill` for multiple selections.
@@ -33,10 +33,10 @@ the existing skill-lifecycle validator.
 - Use `--skill` only with `skill` mode and require at least one selected name.
 - Keep this action read-only. Source validation does not establish installed
   runtime correctness or the semantic audit in `skills-consistency-review`.
-- SDLC callers route through `deliverables.skills.validate.ceratops-managed`
+- SDLC callers route through `deliverables.skills.NAME.actions.validate`
   with handoff `ceratops-skill-lifecycle/source-validate`; the action owns the
-  helper invocation. Its `references/action-executors.json` binding runs full
-  source validation for skill callers. CI defers this route. Keep helper paths
+  helper invocation. A named-skill handoff checks that exact skill; an untargeted
+  action checks the full source set. CI defers this route. Keep helper paths
   in the skill-owned binding and keep tests in separate SDLC test operations.
 - For SDLC v4, read the named skill's `prerequisites` and its returned package
   records before resolving `deliverables.skills.NAME.actions.validate`; verify
@@ -46,8 +46,9 @@ the existing skill-lifecycle validator.
 ## Workflow
 
 1. Resolve the source repository, bundle, and mode from the calling task.
-2. Invoke the existing validator once for that exact scope. Use `full` for an
-   SDLC source-validation handoff or deployment gate.
+2. Invoke the existing helper once for that exact scope. A named-skill SDLC
+   handoff uses `skill` mode and its supplied name. Deployment runs its own
+   source gate inside the installer; do not add a separate check before it.
 3. Treat exit zero and the helper's compact `ok:` result as source validation
    success. On nonzero exit, report its diagnostics and leave validation
    blocked. Return to the caller; reuse passing evidence only while the exact

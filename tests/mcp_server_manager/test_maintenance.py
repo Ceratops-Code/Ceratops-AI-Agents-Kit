@@ -20,7 +20,7 @@ from tests.mcp_server_manager.test_engine import (
     storage,
 )
 from tests.mcp_server_manager.test_engine import (
-    deployment as deployment,  # noqa: PLC0414 - explicit pytest fixture re-export
+    deployment as deployment,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -53,6 +53,9 @@ def test_child_environment_retains_profile_for_user_owned_install_root(tmp_path,
     assert probe.returncode == 0, probe.stderr
     assert Path(probe.stdout.strip()) == Path.home()
     assert "HOME" not in environment
+    assert Path(environment["UV_CACHE_DIR"]) == tmp_path / "temporary/uv-cache"
+    assert environment["UV_LINK_MODE"] == "copy"
+    assert not (tmp_path / "installed/fixture/cache").exists()
 
 
 def test_legacy_catalog_import_rehydrates_without_copying_environments(
@@ -202,6 +205,9 @@ def source_package(tmp_path, monkeypatch, request):
         if command[0] == "git":
             return RUN_COMMAND(command, **kwargs)
         calls.append((command, kwargs))
+        cache = Path(kwargs["env"]["UV_CACHE_DIR"])
+        cache.mkdir(parents=True, exist_ok=True)
+        (cache / "dependency.bin").write_bytes(b"unpacked wheel")
         if command[1] == "lock":
             return ""
         if "compile" in command:
@@ -261,7 +267,7 @@ def test_dependency_download_uses_five_minute_timeout_and_enforces_hash(
     def download(request_url, *, timeout):
         requests.append((request_url, timeout))
         response = io.BytesIO(b"corrupt archive" if corrupt else expected)
-        setattr(response, "url", url)
+        response.url = url  # type: ignore[attr-defined]
         return response
 
     monkeypatch.setattr(package_module.urllib.request, "urlopen", download)
@@ -866,6 +872,105 @@ def test_manager_source_installer_upgrades_existing_selection(deployment, source
     assert not list(runtime_root.glob("*/staging/*"))
 
 
+@pytest.mark.parametrize("source_package", ["ceratops_mcp_server_manager"], indirect=True)
+@pytest.mark.parametrize("interrupted_server", ["fixture", "independent"])
+@pytest.mark.parametrize("interrupt", ["before", "after"])
+def test_manager_install_discovers_launchers_and_resumes_after_each_server_effect(
+    deployment, source_package, monkeypatch, capsys, interrupted_server, interrupt
+):
+    engine, _, _ = deployment
+    project, runtime_root, _ = source_package
+    for name in ("fixture", "independent"):
+        make_release(runtime_root, "1.0.0", mcp_server=name)
+        engine.install(name, "1.0.0")
+    fixture_selection = (runtime_root / "fixture/current.json").read_bytes()
+    independent_selection = (runtime_root / "independent/current.json").read_bytes()
+    fixture_launcher = runtime_root / "fixture/bin/fixture.py"
+    independent_launcher = runtime_root / "independent/bin/independent.py"
+    fixture_launcher.write_bytes(b"old template")
+    independent_launcher.write_bytes(b"old template")
+    (runtime_root / "unselected").mkdir()
+    unrelated = runtime_root / "notes.txt"
+    unrelated.write_text("leave alone")
+    module = load("deploy-mcp-server-manager")
+    monkeypatch.setattr(module, "SOURCE", project)
+    monkeypatch.setattr(module, "run", lambda *args, **kwargs: "")
+    monkeypatch.setattr(module, "ensure_launchers", lambda layout: None)
+    original_refresh = engine_module.Engine.refresh_launcher
+    failed = False
+
+    def interrupt_target(selected_engine, name):
+        nonlocal failed
+        if name == interrupted_server and not failed:
+            failed = True
+            if interrupt == "before":
+                raise contracts.DeploymentError("target interrupted")
+            original_refresh(selected_engine, name)
+            raise contracts.DeploymentError("target interrupted")
+        return original_refresh(selected_engine, name)
+
+    with monkeypatch.context() as interrupted:
+        interrupted.setattr(engine_module.Engine, "refresh_launcher", interrupt_target)
+        assert module.main() == 2
+    completed = "fixture" if interrupted_server == "independent" else "none"
+    assert f"manager installed; launchers refreshed: {completed}" in capsys.readouterr().err
+    manager_selection = engine.selected("ceratops_mcp_server_manager")
+    assert (fixture_launcher.read_bytes() != b"old template") is (
+        interrupted_server == "independent" or interrupt == "after"
+    )
+    assert (independent_launcher.read_bytes() != b"old template") is (
+        interrupted_server == "independent" and interrupt == "after"
+    )
+
+    assert module.main() == 0
+    result = json.loads(capsys.readouterr().out)
+    assert [item["mcp_server_name"] for item in result["refreshed_launchers"]] == ["fixture", "independent"]
+    expected_updates = (
+        [interrupt == "before", True]
+        if interrupted_server == "fixture"
+        else [False, interrupt == "before"]
+    )
+    assert [item["launcher_updated"] for item in result["refreshed_launchers"]] == expected_updates
+    assert engine.selected("ceratops_mcp_server_manager") == manager_selection
+    assert (runtime_root / "fixture/current.json").read_bytes() == fixture_selection
+    assert (runtime_root / "independent/current.json").read_bytes() == independent_selection
+    assert independent_launcher.read_bytes() == fixture_launcher.read_bytes()
+    assert unrelated.read_text() == "leave alone"
+    assert not (runtime_root / "unselected/bin").exists()
+
+
+def test_manager_install_scans_only_real_selected_server_directories(
+    deployment, tmp_path, monkeypatch, capsys
+):
+    engine, _, _ = deployment
+    module = load("deploy-mcp-server-manager")
+    make_release(tmp_path, "1.0.0")
+    engine.install("fixture", "1.0.0")
+    (tmp_path / "unselected").mkdir()
+    (tmp_path / "notes.txt").write_text("unrelated")
+    (tmp_path / "INVALID").mkdir()
+    assert module.installed_server_names(engine) == ["fixture"]
+
+    linked = tmp_path / "linked"
+    try:
+        linked.symlink_to(tmp_path / "fixture", target_is_directory=True)
+    except OSError:
+        pass  # Windows may deny symlink creation outside developer mode.
+    else:
+        assert module.installed_server_names(engine) == ["fixture"]
+
+    broken = tmp_path / "broken"
+    broken.mkdir()
+    (broken / "current.json").write_text("{}")
+    with pytest.raises(contracts.DeploymentError):
+        module.installed_server_names(engine)
+    monkeypatch.setattr(module, "global_runtime", lambda: object())
+    monkeypatch.setattr(module, "package_manager", lambda *_args: pytest.fail("packaging must not start"))
+    assert module.main() == 2
+    assert capsys.readouterr().err
+    assert not (tmp_path / "ceratops_mcp_server_manager").exists()
+
+
 @pytest.mark.parametrize("arguments", [
     ["package"], ["package", "--source", ".", "--root", "elsewhere"],
     ["install", "fixture", "1.0.0"], ["install", "--version", "1.0.0"],
@@ -879,7 +984,7 @@ def test_cli_package_requires_explicit_source_and_rejects_extra_inputs(arguments
     assert "error:" in capsys.readouterr().err
 
 
-def test_cli_package_failure_keeps_bounded_diagnostics(monkeypatch, capsys):
+def test_cli_package_failure_keeps_complete_diagnostics(monkeypatch, capsys):
     def fail(*args, **kwargs):
         raise contracts.DeploymentError("x" * 5000 + " useful diagnostic")
 
@@ -887,7 +992,7 @@ def test_cli_package_failure_keeps_bounded_diagnostics(monkeypatch, capsys):
     assert cli.main(["package", "--source", "."]) == 2
     output = capsys.readouterr()
     diagnostic = json.loads(output.err)["error"]
-    assert output.out == "" and len(diagnostic) == 1800
+    assert output.out == "" and diagnostic == "x" * 5000 + " useful diagnostic"
     assert diagnostic.endswith("useful diagnostic")
 
 
@@ -965,6 +1070,7 @@ def test_source_install_stops_before_later_mutation_on_failure(monkeypatch, caps
     monkeypatch.setattr(module, "package_manager", package_manager)
     monkeypatch.setattr(module, "ensure_launchers", ensure_launchers)
     success = state in {"first-install", "already-installed"}
+    monkeypatch.setattr(module, "installed_server_names", lambda _engine: [])
     assert module.main() == (0 if success else 2)
     output = capsys.readouterr()
     if success:
@@ -1031,3 +1137,13 @@ raise SystemExit(main([sys.argv[5], '--source', sys.argv[3]]))
     assert json.loads(result.stdout)["mcp_server_name"] == "fixture"
     assert (store / "fixture/registry.json").is_file()
     assert not (store / "fixture/current.json").exists()
+
+
+def test_package_cache_is_removed_with_operation_scratch(source_package):
+    project, runtime_root, calls = source_package
+    package_module.package(project)
+    caches = {Path(kwargs["env"]["UV_CACHE_DIR"]) for _, kwargs in calls}
+    assert caches and all(path.name == "uv-cache" for path in caches)
+    assert all(path.is_relative_to(runtime_root / "fixture/staging") for path in caches)
+    assert all(not path.exists() for path in caches)
+    assert not (runtime_root / "fixture/cache").exists()

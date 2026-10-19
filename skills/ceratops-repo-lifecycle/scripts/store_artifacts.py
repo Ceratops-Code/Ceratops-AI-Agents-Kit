@@ -12,7 +12,6 @@ barrier. It keeps no helper-owned staging, pending, or temporary copy.
 from __future__ import annotations
 
 import hashlib
-import importlib
 import json
 import os
 import pathlib
@@ -20,12 +19,10 @@ import re
 import shutil
 import stat
 import subprocess
-import sys
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
-from functools import lru_cache
 from typing import Any
 
 import sdlc_results
@@ -46,8 +43,7 @@ FULL_VERSION_RE = re.compile(
     r"(?:(?P<class>a|b)(?:0|[1-9][0-9]*))?"
     r"(?:\+[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)*)?$"
 )
-ARTIFACT_RESERVATION_SCHEMA = "ceratops-artifact-reservation.v2"
-ARTIFACT_CHECKPOINT_OWNER = "artifact-versions"
+ARTIFACT_REQUEST_SCHEMA = "ceratops-artifact-build-request.v1"
 
 
 class OperationError(RuntimeError):
@@ -122,24 +118,30 @@ class BuildStorage:
 
 
 @dataclass(frozen=True)
-class ArtifactVersionTransaction:
-    """Durable ownership and final paths for one unit/version attempt."""
+class ArtifactVersionAllocation:
+    """Final directory selected before source versions and checkpoint B exist.
+
+    The request describes desired inputs, not execution progress. Occupied paths
+    without readable ownership remain untouched and are returned for cleanup.
+    """
 
     repo_root: pathlib.Path
     repository: str
+    worktree_registration: str
     branch: str
     release_unit: str
     version: str
     version_class: str
     attempt_id: str
-    pre_test_commit: str
+    allocation_commit: str
     required_targets: tuple[str, ...]
     declared_input_paths: tuple[str, ...]
     store: pathlib.Path
-    reservation_path: pathlib.Path
+    request_path: pathlib.Path
     version_root: pathlib.Path
     diagnostic_root: pathlib.Path
     lock_path: pathlib.Path
+    uncertain_directories: tuple[pathlib.Path, ...]
 
     def target_output(self, target: str) -> pathlib.Path:
         _require_transaction_target(self, target)
@@ -163,26 +165,10 @@ class ArtifactVersionTransaction:
 
 
 @dataclass(frozen=True)
-class PreparedBuildReceipt:
-    """Exact qualified receipt bytes handed to commit completion."""
+class ArtifactVersionTransaction(ArtifactVersionAllocation):
+    """Allocated version whose committed build inputs are bound before output."""
 
-    target: str
-    receipt_path: str
-    worktree_path: pathlib.Path
-    raw: bytes
-    sha256: str
-    store_files: tuple[Mapping[str, Any], ...]
-    git_files: tuple[Mapping[str, Any], ...]
-
-
-@dataclass(frozen=True)
-class CompletedArtifactVersion:
-    """The immutable commit, tag, and receipts of one completed version."""
-
-    final_commit: str
-    tag: str
-    build_receipts: tuple[pathlib.Path, ...]
-    artifact_receipts: tuple[pathlib.Path, ...]
+    pre_test_commit: str
 
 
 def canonical_json(value: object) -> bytes:
@@ -828,7 +814,7 @@ def _validated_targets(required_targets: object) -> tuple[str, ...]:
 
 
 def _require_transaction_target(
-    transaction: ArtifactVersionTransaction, target: str
+    transaction: ArtifactVersionAllocation, target: str
 ) -> None:
     if target not in transaction.required_targets:
         raise OperationError("Target is not owned by this artifact transaction.")
@@ -883,7 +869,7 @@ def _artifact_infrastructure(
     repo_root: pathlib.Path,
 ) -> tuple[pathlib.Path, pathlib.Path]:
     store = _build_directory(_artifact_store_path(repo_root))
-    for name in (".locks", ".reservations", ".diagnostics"):
+    for name in (".locks",):
         _build_directory(store / name)
     lock_path = store / ".locks" / "store.lock"
     if lock_path.exists() or lock_path.is_symlink():
@@ -892,14 +878,14 @@ def _artifact_infrastructure(
 
 
 @contextmanager
-def _locked_artifact_store(lock_path: pathlib.Path) -> Iterator[None]:
-    """Serialize only short versioned-store metadata mutations."""
+def _locked_artifact_store(lock_path: pathlib.Path, *, timeout: float = 30) -> Iterator[None]:
+    """Protect cross-version deletion only; allocation never waits on this lock."""
 
     from filelock import FileLock
 
     with FileLock(
         lock_path,
-        timeout=30,
+        timeout=timeout,
         fallback_to_soft=False,
         preserve_lock_file=True,
     ):
@@ -971,130 +957,195 @@ def _validated_relative_paths(values: object, *, label: str) -> tuple[str, ...]:
     return tuple(sorted(paths))
 
 
-def _new_reservation_record(
-    transaction: ArtifactVersionTransaction,
-) -> dict[str, Any]:
+def _build_request_record(allocation: ArtifactVersionAllocation) -> dict[str, Any]:
     return {
-        "schema": ARTIFACT_RESERVATION_SCHEMA,
-        "repository": transaction.repository,
-        "worktree": str(transaction.repo_root),
-        "branch": transaction.branch,
-        "releaseUnit": transaction.release_unit,
-        "version": transaction.version,
-        "attemptId": transaction.attempt_id,
-        "preTestCommit": transaction.pre_test_commit,
-        "requiredTargets": list(transaction.required_targets),
-        "declaredInputPaths": list(transaction.declared_input_paths),
+        "schema": ARTIFACT_REQUEST_SCHEMA,
+        "repository": allocation.repository,
+        "worktree": str(allocation.repo_root),
+        "worktreeRegistration": allocation.worktree_registration,
+        "branch": allocation.branch,
+        "releaseUnit": allocation.release_unit,
+        "version": allocation.version,
+        "attemptId": allocation.attempt_id,
+        "allocationCommit": allocation.allocation_commit,
+        "preTestCommit": (
+            allocation.pre_test_commit
+            if isinstance(allocation, ArtifactVersionTransaction) else None
+        ),
+        "requiredTargets": list(allocation.required_targets),
+        "declaredInputPaths": list(allocation.declared_input_paths),
     }
 
 
-def _validate_transaction(
-    transaction: ArtifactVersionTransaction,
-    reservation: Mapping[str, Any],
-) -> None:
-    if dict(reservation) != _new_reservation_record(transaction):
-        raise RecoveryRequired("Artifact reservation identity is inconsistent.")
+def _require_build_request(allocation: ArtifactVersionAllocation) -> None:
+    record = _read_transaction_record(allocation.request_path, "Artifact build request")
+    if record != _build_request_record(allocation):
+        raise RecoveryRequired("Artifact build request no longer matches its inputs.")
 
 
-def _validate_reservation_record(
-    record: Mapping[str, Any],
-) -> tuple[str, str, str, str, str, str, tuple[str, ...], tuple[str, ...]]:
-    expected = {
-        "schema",
-        "repository",
-        "worktree",
-        "branch",
-        "releaseUnit",
-        "version",
-        "attemptId",
-        "preTestCommit",
-        "requiredTargets",
-        "declaredInputPaths",
-    }
-    if set(record) != expected or record.get("schema") != ARTIFACT_RESERVATION_SCHEMA:
-        raise RecoveryRequired("Artifact reservation has an invalid shape.")
-    try:
-        repository = _validated_repository(record["repository"])
-        worktree_path = sdlc_results._plain_path(
-            pathlib.Path(record["worktree"]),
-            directory=True,
-            label="Recorded worktree",
-        )[0]
-        branch = record["branch"]
-        if (
-            not isinstance(branch, str)
-            or not branch
-            or len(branch) > 512
-            or any(character in branch for character in "\0\r\n")
-        ):
-            raise OperationError("Invalid recorded branch.")
-        _git_text(
-            worktree_path,
-            ["check-ref-format", "--branch", branch],
-            label="recorded branch",
-        )
-        unit = _require_identifier(
-            record["releaseUnit"], label="release unit", pattern=RELEASE_UNIT_RE
-        )
-        version, _classification = _version_classification(record["version"])
-        attempt = _require_identifier(
-            record["attemptId"], label="attempt ID", pattern=LOGICAL_ID_RE
-        )
-        commit = record["preTestCommit"]
-        if not isinstance(commit, str) or re.fullmatch(r"[a-f0-9]{40}", commit) is None:
-            raise OperationError("Invalid pre-test commit.")
-        targets = _validated_targets(record["requiredTargets"])
-        input_paths = _validated_relative_paths(
-            record["declaredInputPaths"], label="declared input path"
-        )
-    except (OSError, OperationError, StepResultError) as exc:
-        raise RecoveryRequired("Artifact reservation identity is invalid.") from exc
-    return (
-        repository,
-        str(worktree_path),
-        branch,
-        unit,
-        version,
-        attempt,
-        targets,
-        input_paths,
+def _input_paths(repo_root: pathlib.Path, declared: Sequence[str]) -> tuple[str, ...]:
+    if declared:
+        return _validated_relative_paths(declared, label="declared input path")
+    result = subprocess.run(
+        ["git", "-C", str(repo_root), "ls-files", "-z"],
+        capture_output=True, text=True, check=False,
     )
+    if result.returncode:
+        raise OperationError(f"Git could not list build inputs: {result.stderr.strip()}")
+    # Result receipts are not source inputs for the next build.
+    return tuple(sorted(path for path in result.stdout.split("\0")
+                        if path and not path.startswith(".build/")))
 
 
-def _scan_transaction_records_unchecked(
-    store: pathlib.Path,
-) -> dict[tuple[str, str], dict[str, Any]]:
-    """Read every reservation and reject partial or ambiguous ownership."""
-
-    reservations: dict[tuple[str, str], dict[str, Any]] = {}
-    reservation_root = store / ".reservations"
-    for unit_path in reservation_root.iterdir():
-        if not unit_path.is_dir() or unit_path.is_symlink():
-            raise RecoveryRequired("Artifact reservation storage is ambiguous.")
-        unit = _require_identifier(
-            unit_path.name, label="reservation unit", pattern=RELEASE_UNIT_RE
+def _inputs_match_commit(root: pathlib.Path, commit: str, paths: Sequence[str]) -> bool:
+    if not paths:
+        return True
+    specifications = [f":(literal){path}" for path in paths]
+    dirty = False
+    for flags in ([], ["--cached"]):
+        changed = subprocess.run(
+            ["git", "-C", str(root), "diff", *flags, "--quiet", commit, "--", *specifications],
+            capture_output=True, text=True, check=False,
         )
-        for path in unit_path.iterdir():
-            if not path.is_file() or path.is_symlink() or path.suffix != ".json":
-                raise RecoveryRequired("Artifact reservation storage is ambiguous.")
-            record = _read_transaction_record(path, "Artifact reservation")
-            identity = _validate_reservation_record(record)
-            key = (identity[3], identity[4])
-            if unit != identity[3] or path.stem != identity[4] or key in reservations:
-                raise RecoveryRequired("Artifact reservation location is inconsistent.")
-            reservations[key] = record
-    return reservations
+        if changed.returncode not in {0, 1}:
+            raise OperationError(f"Git could not compare build inputs: {changed.stderr.strip()}")
+        dirty = dirty or changed.returncode == 1
+    untracked = subprocess.run(
+        ["git", "-C", str(root), "ls-files", "--others", "--exclude-standard", "-z",
+         "--", *specifications], capture_output=True, text=True, check=False,
+    )
+    if untracked.returncode:
+        raise OperationError(f"Git could not inspect build inputs: {untracked.stderr.strip()}")
+    return not dirty and not untracked.stdout
 
 
-def _scan_transaction_records(
-    store: pathlib.Path,
-) -> dict[tuple[str, str], dict[str, Any]]:
-    try:
-        return _scan_transaction_records_unchecked(store)
-    except RecoveryRequired:
-        raise
-    except (OSError, OperationError, StepResultError) as exc:
-        raise RecoveryRequired("Artifact transaction storage requires recovery.") from exc
+def _next_prerelease(version: str) -> str:
+    match = re.fullmatch(r"(.+[ab])(\d+)(\+.*)?", version)
+    if match is None:
+        raise OperationError(
+            f"Final artifact version {version} is occupied; choose another final version."
+        )
+    return f"{match[1]}{int(match[2]) + 1}{match[3] or ''}"
+
+
+def _read_reusable_allocation(
+    allocation: ArtifactVersionAllocation, *, explicit_attempt: str | None,
+) -> ArtifactVersionAllocation | ArtifactVersionTransaction | None:
+    record = _read_transaction_record(allocation.request_path, "Artifact build request")
+    # Another worktree or another declared input set owns an independent build.
+    expected = _build_request_record(allocation)
+    for key in ("repository", "worktree", "worktreeRegistration", "branch",
+                "releaseUnit", "version", "requiredTargets", "declaredInputPaths"):
+        if record.get(key) != expected[key]:
+            return None
+    if explicit_attempt is not None and record.get("attemptId") != explicit_attempt:
+        return None
+    attempt = _require_identifier(record.get("attemptId"), label="attempt ID", pattern=LOGICAL_ID_RE)
+    allocated_at = _validated_commit(allocation.repo_root, record.get("allocationCommit"))
+    values = {**allocation.__dict__, "attempt_id": attempt, "allocation_commit": allocated_at}
+    checkpoint = record.get("preTestCommit")
+    if checkpoint is None:
+        if allocation.allocation_commit != allocated_at:
+            return None
+        reused: ArtifactVersionAllocation = ArtifactVersionAllocation(**values)
+    else:
+        checkpoint = _validated_commit(allocation.repo_root, checkpoint)
+        if not _inputs_match_commit(allocation.repo_root, checkpoint, allocation.declared_input_paths):
+            return None
+        reused = ArtifactVersionTransaction(**values, pre_test_commit=checkpoint)
+    _require_build_request(reused)
+    return reused
+
+
+def allocate_artifact_version(
+    repo_root: pathlib.Path, *, repository: str, release_unit: str, version: str,
+    required_targets: Sequence[str], attempt_id: str | None = None,
+    declared_input_paths: Sequence[str] = (),
+) -> ArtifactVersionAllocation:
+    """Choose one final directory for every target before preparing source versions.
+
+    Exclusive mkdir is the allocation primitive. Only a collision increments an
+    alpha/beta number. Permission/I/O errors propagate. A matching unfinished
+    request is reused from current inputs; no resume flag or allocation lock.
+    """
+    root = _validated_worktree(pathlib.Path(repo_root))
+    repository = _validated_repository(repository)
+    unit = _require_identifier(release_unit, label="release unit", pattern=RELEASE_UNIT_RE)
+    version, classification = _version_classification(version)
+    targets = _validated_targets(required_targets)
+    paths = _input_paths(root, declared_input_paths)
+    if attempt_id is not None:
+        _require_identifier(attempt_id, label="attempt ID", pattern=LOGICAL_ID_RE)
+    branch = _git_text(root, ["symbolic-ref", "--quiet", "--short", "HEAD"], label="branch")
+    registration = _git_text(root, ["rev-parse", "--absolute-git-dir"], label="Git registration")
+    head = _git_text(root, ["rev-parse", "HEAD"], label="allocation commit")
+    store, lock_path = _artifact_infrastructure(root)
+    _build_directory(store / unit)
+    uncertain: list[pathlib.Path] = []
+    while True:
+        directory = store / unit / version
+        allocation = ArtifactVersionAllocation(
+            repo_root=root, repository=repository, worktree_registration=registration,
+            branch=branch, release_unit=unit, version=version, version_class=classification,
+            attempt_id=attempt_id or "", allocation_commit=head, required_targets=targets,
+            declared_input_paths=paths, store=store, request_path=directory / "build_request.json",
+            version_root=directory, diagnostic_root=directory / ".diagnostics",
+            lock_path=lock_path, uncertain_directories=tuple(uncertain),
+        )
+        if _artifact_tag_exists(root, unit, version):
+            version = _next_prerelease(version)
+            continue
+        if attempt_id is None:
+            reused = _read_reusable_allocation(allocation, explicit_attempt=None)
+            if reused is None:
+                raise OperationError("A new artifact build requires its receipt attempt ID.")
+            _prune_completed_artifacts(root, store, lock_path, wait=False)
+            return reused
+        try:
+            directory.mkdir(exist_ok=False)
+        except FileExistsError:
+            try:
+                sdlc_results._plain_path(directory, directory=True, label="Artifact version")
+                reused = _read_reusable_allocation(allocation, explicit_attempt=attempt_id)
+            except (RecoveryRequired, StepResultError, OperationError, OSError):
+                uncertain.append(directory)
+                reused = None
+            if reused is not None:
+                _prune_completed_artifacts(root, store, lock_path, wait=False)
+                return reused
+            version = _next_prerelease(version)
+            continue
+        _write_transaction_record(
+            allocation.request_path, _build_request_record(allocation),
+            replace=False, label="artifact build request",
+        )
+        _prune_completed_artifacts(root, store, lock_path, wait=False)
+        return allocation
+
+
+def bind_artifact_inputs(
+    allocation: ArtifactVersionAllocation, *, pre_test_commit: str,
+) -> ArtifactVersionTransaction:
+    """Record committed checkpoint B before exposing any target output directory."""
+    checkpoint = _validated_commit(allocation.repo_root, pre_test_commit)
+    _require_build_request(allocation)
+    if isinstance(allocation, ArtifactVersionTransaction):
+        if checkpoint != allocation.pre_test_commit:
+            raise RecoveryRequired("Bound build inputs cannot be changed for this version.")
+        transaction = allocation
+    else:
+        if _git_text(allocation.repo_root, ["rev-parse", "HEAD"], label="checkpoint B") != checkpoint:
+            raise OperationError("Build inputs must be bound to the current committed HEAD.")
+        transaction = ArtifactVersionTransaction(**allocation.__dict__, pre_test_commit=checkpoint)
+        if not _inputs_match_commit(allocation.repo_root, checkpoint, allocation.declared_input_paths):
+            raise OperationError("Build inputs must be committed before writing artifacts.")
+        _write_transaction_record(
+            allocation.request_path, _build_request_record(transaction),
+            replace=True, label="artifact build request",
+        )
+    for target in transaction.required_targets:
+        _build_directory(transaction.target_output(target))
+    return transaction
 
 
 def _artifact_tag_exists(
@@ -1153,8 +1204,7 @@ def _completed_artifact_record(
 
 
 def _completed_artifact_outputs(
-    store: pathlib.Path,
-    protected: set[tuple[str, str]],
+    repo_root: pathlib.Path, store: pathlib.Path,
 ) -> list[_CompletedArtifactOutput]:
     outputs: list[_CompletedArtifactOutput] = []
     for unit_path in store.iterdir():
@@ -1169,7 +1219,9 @@ def _completed_artifact_outputs(
             if not version_path.is_dir() or version_path.is_symlink():
                 raise OperationError("Artifact store contains an invalid version.")
             version, _version_class = _version_classification(version_path.name)
-            if (unit, version) in protected:
+            # Requests and missing tags protect unfinished and uncertain bytes.
+            # A tag is permanent even when retention removes the package bytes.
+            if (version_path / "build_request.json").exists() or not _artifact_tag_exists(repo_root, unit, version):
                 continue
             direct_receipt = version_path / "artifact-receipt.json"
             if direct_receipt.exists() or direct_receipt.is_symlink():
@@ -1243,237 +1295,48 @@ def _remove_versioned_tree(
 
 
 def _prune_completed_artifacts(
-    store: pathlib.Path,
-    reservations: Mapping[tuple[str, str], Mapping[str, Any]],
+    repo_root: pathlib.Path, store: pathlib.Path, lock_path: pathlib.Path, *, wait: bool = True,
 ) -> None:
-    groups: dict[
-        tuple[str, str, str, str], list[_CompletedArtifactOutput]
-    ] = {}
-    protected = set(reservations)
-    for output in _completed_artifact_outputs(store, protected):
-        group = (
-            output.repository,
-            output.release_unit,
-            output.target,
-            output.version_class,
-        )
-        groups.setdefault(group, []).append(output)
-    for entries in groups.values():
-        entries.sort(
-            key=lambda item: (item.mtime_ns, item.version), reverse=True
-        )
-        retained = 0
-        for output in entries:
-            if (output.release_unit, output.version) in protected:
-                continue
-            retained += 1
-            if retained <= VERSIONED_ARTIFACT_RETENTION:
-                continue
-            if output.root == output.version_root:
-                _remove_versioned_tree(
-                    output.root, output.version_root.parent, label="artifact output"
-                )
-            else:
-                _remove_versioned_tree(
-                    output.root, output.version_root, label="artifact target"
-                )
-                if not any(output.version_root.iterdir()):
-                    output.version_root.rmdir()
+    """Rotate completed bytes under a short lock; allocation skips busy cleanup."""
+    from filelock import Timeout
 
-
-@lru_cache(maxsize=1)
-def _checkpoint_storage() -> Any:
-    """Use the mapped runtime sibling, or the shared source during development.
-
-    Installed skills never reach back into a source checkout. Keep this import
-    lazy so the still-independent v2 route does not acquire checkpoint behavior.
-    """
-    skill = pathlib.Path(__file__).resolve().parent.parent
-    if not (skill / ".runtime-manifest.json").is_file():
-        source = str(skill.parent / "sections" / "scripts")
-        if source not in sys.path:
-            sys.path.insert(0, source)
-    return importlib.import_module("manage_checkpoints")
-
-
-@contextmanager
-def versioned_artifact_checkpoints(repo_root: pathlib.Path) -> Iterator[Any]:
-    """Hold the cooperating parent writer's lock, independently of child work."""
-    checkpoints = _checkpoint_storage()
     try:
-        with checkpoints.open_checkpoints(repo_root, ARTIFACT_CHECKPOINT_OWNER) as context:
-            yield context
-    except checkpoints.CheckpointError as exc:
-        raise RecoveryRequired(str(exc)) from exc
-
-
-def finish_versioned_checkpoints(
-    transaction: ArtifactVersionTransaction, context: Any,
-) -> None:
-    """Finish only the outermost request after all its reservations are complete.
-
-    Reservations already carry the recovery essentials, so this producer writes
-    no duplicate checkpoint record. Other unit/version members of the same
-    request keep the directory until the last member succeeds.
-    """
-    if not context.outermost:
-        return
-    with _locked_artifact_store(transaction.lock_path):
-        remaining = _scan_transaction_records(transaction.store)
-        if any(
-            os.path.normcase(str(record["worktree"])) == os.path.normcase(str(transaction.repo_root))
-            for record in remaining.values()
-        ):
-            return
-    _checkpoint_storage().finish_checkpoints(context)
-
-
-def reserve_versioned_artifacts(
-    repo_root: pathlib.Path,
-    *,
-    repository: str,
-    release_unit: str,
-    version: str,
-    required_targets: Sequence[str],
-    attempt_id: str | None = None,
-    pre_test_commit: str,
-    declared_input_paths: Sequence[str] = (),
-    recovery_confirmed: bool = False,
-) -> ArtifactVersionTransaction:
-    """Reserve one internal full-version transaction under a short store lock.
-
-    ``pre_test_commit`` is checkpoint B and must already exist. New production
-    starts only after the caller has created B. Artifacts are written directly
-    below the final unit/version path; the version is not complete until its tag
-    exists. Explicit recovery resumes only the exact recorded owner, discovering
-    its existing attempt ID when omitted. A new attempt still needs its original
-    receipt attempt ID; no checkpoint operation ID is introduced.
-    """
-
-    root = _validated_worktree(pathlib.Path(repo_root))
-    repository = _validated_repository(repository)
-    release_unit = _require_identifier(
-        release_unit, label="release unit", pattern=RELEASE_UNIT_RE
-    )
-    version, version_class = _version_classification(version)
-    targets = _validated_targets(required_targets)
-    pre_test_commit = _validated_commit(root, pre_test_commit)
-    branch = _git_text(
-        root,
-        ["symbolic-ref", "--quiet", "--short", "HEAD"],
-        label="worktree branch",
-    )
-    _git_text(
-        root,
-        ["check-ref-format", "--branch", branch],
-        label="worktree branch",
-    )
-    input_paths = _validated_relative_paths(
-        declared_input_paths, label="declared input path"
-    )
-    store, lock_path = _artifact_infrastructure(root)
-    version_root = store / release_unit / version
-    resumed = False
-    with _locked_artifact_store(lock_path):
-        reservations = _scan_transaction_records(store)
-        key = (release_unit, version)
-        existing = reservations.get(key)
-        tagged = _artifact_tag_exists(root, release_unit, version)
-        if tagged and existing is None and not recovery_confirmed:
-            raise OperationError("Immutable artifact version tag already exists.")
-        completed_raw = None
-        if existing is not None and attempt_id is None:
-            attempt_id = str(existing["attemptId"])
-        elif existing is None and tagged:
-            # A crash during checkpoint cleanup can leave no reservation. The
-            # committed receipt, not a new recovery journal, identifies that run.
-            artifact_path = version_root
-            if len(targets) > 1:
-                artifact_path /= targets[0]
-            artifact = sdlc_results.read_artifact_receipt(
-                artifact_path / "artifact-receipt.json"
-            ).value
-            receipt_path = str(artifact["buildReceipt"]["path"])
-            completed_raw = _git_bytes(
-                root, ["show", f"refs/tags/{release_unit}/{version}:{receipt_path}"],
-                label="read completed attempt",
-            )
-            if hashlib.sha256(completed_raw).hexdigest() != artifact["buildReceipt"]["sha256"]:
-                raise OperationError("Completed build receipt changed from its recorded hash.")
-            completed_receipt = sdlc_results.parse_committed_build_receipt(completed_raw).value
-            if attempt_id is None:
-                attempt_id = str(completed_receipt["identity"]["attemptId"])
-        if attempt_id is None:
-            raise OperationError("A new artifact reservation requires its receipt attempt ID.")
-        attempt_id = _require_identifier(attempt_id, label="attempt ID", pattern=LOGICAL_ID_RE)
-        transaction = ArtifactVersionTransaction(
-            repo_root=root,
-            repository=repository,
-            branch=branch,
-            release_unit=release_unit,
-            version=version,
-            version_class=version_class,
-            attempt_id=attempt_id,
-            pre_test_commit=pre_test_commit,
-            required_targets=targets,
-            declared_input_paths=input_paths,
-            store=store,
-            reservation_path=store / ".reservations" / release_unit / f"{version}.json",
-            version_root=version_root,
-            diagnostic_root=store / ".diagnostics" / release_unit,
-            lock_path=lock_path,
-        )
-        for record in reservations.values():
-            if os.path.normcase(str(record["worktree"])) == os.path.normcase(str(root)) and any(
-                record[field] != expected
-                for field, expected in (
-                    ("repository", repository), ("branch", branch), ("preTestCommit", pre_test_commit),
+        with _locked_artifact_store(lock_path, timeout=30 if wait else 0):
+            groups: dict[
+                tuple[str, str, str, str], list[_CompletedArtifactOutput]
+            ] = {}
+            for output in _completed_artifact_outputs(repo_root, store):
+                group = (
+                    output.repository,
+                    output.release_unit,
+                    output.target,
+                    output.version_class,
                 )
-            ):
-                raise RecoveryRequired("Worktree already has a different unfinished artifact request.")
-        if completed_raw is not None:
-            _validate_prepared_receipt(transaction, targets[0], completed_raw)
-            return transaction
-        if existing is not None:
-            if existing["attemptId"] != attempt_id:
-                raise OperationError("Artifact version is reserved by another attempt.")
-            if not recovery_confirmed:
-                raise RecoveryRequired(
-                    "Existing artifact reservation requires explicit recovery."
+                groups.setdefault(group, []).append(output)
+            for entries in groups.values():
+                entries.sort(
+                    key=lambda item: (item.mtime_ns, item.version), reverse=True
                 )
-            _validate_transaction(transaction, existing)
-            resumed = True
-        else:
-            if version_root.exists() or version_root.is_symlink():
-                raise RecoveryRequired(
-                    "Unreserved artifact version directory requires recovery."
-                )
-            for reservation in reservations.values():
-                if reservation["attemptId"] == attempt_id:
-                    raise RecoveryRequired("Attempt ID already owns another reservation.")
-                if (
-                    os.path.normcase(str(reservation["worktree"]))
-                    == os.path.normcase(str(root))
-                    and reservation["releaseUnit"] == release_unit
-                ):
-                    raise RecoveryRequired(
-                        "Worktree already has an unfinished attempt for this unit."
-                    )
-            _prune_completed_artifacts(store, reservations)
-            _write_transaction_record(
-                transaction.reservation_path,
-                _new_reservation_record(transaction),
-                replace=False,
-                label="artifact reservation",
-            )
-    _build_directory(transaction.version_root)
-    for target in targets:
-        _build_directory(transaction.target_output(target))
-    if resumed:
-        with _locked_artifact_store(lock_path):
-            reservations = _scan_transaction_records(store)
-            _validate_transaction(transaction, reservations[(release_unit, version)])
-    return transaction
+                retained = 0
+                for output in entries:
+                    retained += 1
+                    if retained <= VERSIONED_ARTIFACT_RETENTION:
+                        continue
+                    if output.root == output.version_root:
+                        _remove_versioned_tree(
+                            output.root, output.version_root.parent, label="artifact output"
+                        )
+                    else:
+                        _remove_versioned_tree(
+                            output.root, output.version_root, label="artifact target"
+                        )
+                        if not any(output.version_root.iterdir()):
+                            output.version_root.rmdir()
+    except Timeout:
+        if wait:
+            raise
+
+
 
 
 def measure_versioned_artifact(
@@ -1484,841 +1347,9 @@ def measure_versioned_artifact(
     """Measure one owned artifact before tests consume its exact bytes."""
 
     _require_transaction_target(transaction, target)
+    _require_build_request(transaction)
     measured = measure_build_file(transaction.target_output(target), descriptor)
     if transaction.version not in pathlib.PurePosixPath(measured["path"]).name:
         raise OperationError("Artifact filename must contain the full version.")
     measured["root"] = "store"
     return measured
-
-
-def _receipt_store_records(receipt: Mapping[str, Any]) -> list[dict[str, Any]]:
-    records = [
-        *receipt["artifactInputs"],
-        *receipt["checkInputs"],
-        *(artifact for item in receipt["dependencies"] for artifact in item["artifacts"]),
-        *receipt["artifacts"],
-        *receipt["supportingFiles"],
-    ]
-    return [dict(item) for item in records if item["root"] == "store"]
-
-
-def _receipt_git_inputs(receipt: Mapping[str, Any]) -> list[dict[str, Any]]:
-    return [
-        dict(item)
-        for item in [*receipt["artifactInputs"], *receipt["checkInputs"]]
-        if item["root"] == "git"
-    ]
-
-
-def _receipt_git_results(receipt: Mapping[str, Any]) -> list[dict[str, Any]]:
-    return [
-        dict(item)
-        for item in receipt["supportingFiles"]
-        if item["root"] == "git"
-    ]
-
-
-def _verify_output_inventory(
-    root: pathlib.Path, records: Sequence[Mapping[str, Any]]
-) -> None:
-    expected = {str(item["path"]) for item in records}
-    actual: set[str] = set()
-    for parent, directories, files in os.walk(root, followlinks=False):
-        for name in directories:
-            sdlc_results._plain_path(
-                pathlib.Path(parent) / name,
-                directory=True,
-                label="Artifact directory",
-            )
-        for name in files:
-            path = pathlib.Path(parent) / name
-            sdlc_results._plain_path(path, label="Artifact file")
-            relative = path.relative_to(root).as_posix()
-            if relative != "artifact-receipt.json":
-                actual.add(relative)
-    if actual != expected:
-        raise OperationError("Artifact output contains missing or unlisted files.")
-    for record in records:
-        sdlc_results._verify_bundle_file(root, record)
-
-
-def _verify_worktree_record(
-    source_root: pathlib.Path, record: Mapping[str, Any]
-) -> pathlib.Path:
-    relative = sdlc_results._bundle_relative_path(
-        str(record["path"]), label="Git result"
-    )
-    source, _info = sdlc_results._plain_path(
-        source_root.joinpath(*relative.parts), label="Git result"
-    )
-    if not source.is_relative_to(source_root):
-        raise OperationError("Git result escapes its worktree.")
-    sdlc_results._verify_bundle_file(source_root, record)
-    return source
-
-
-def _persist_exact_bytes(
-    path: pathlib.Path,
-    raw: bytes,
-    *,
-    label: str,
-    parser: Callable[[bytes], Any],
-) -> None:
-    """Write final bytes directly; replace only an invalid interrupted write."""
-
-    _build_directory(path.parent)
-    if path.exists() or path.is_symlink():
-        checked, _info = sdlc_results._plain_path(path, label=label)
-        existing = checked.read_bytes()
-        if existing == raw:
-            return
-        try:
-            parser(existing)
-        except (OSError, StepResultError, UnicodeError, ValueError, RecursionError):
-            pass
-        else:
-            raise RecoveryRequired(f"Saved {label} conflicts with prepared bytes.")
-    with path.open("wb" if path.exists() else "xb") as stream:
-        stream.write(raw)
-        stream.flush()
-        os.fsync(stream.fileno())
-    if path.read_bytes() != raw:
-        raise RecoveryRequired(f"Written {label} bytes could not be verified.")
-
-
-def _validate_prepared_receipt(
-    transaction: ArtifactVersionTransaction,
-    target: str,
-    raw: bytes,
-) -> dict[str, Any]:
-    try:
-        receipt = sdlc_results.parse_committed_build_receipt(raw).value
-    except StepResultError as exc:
-        raise OperationError(str(exc)) from exc
-    expected_identity = {
-        "repository": transaction.repository,
-        "releaseUnit": transaction.release_unit,
-        "version": transaction.version,
-        "target": target,
-        "attemptId": transaction.attempt_id,
-    }
-    if receipt["identity"] != expected_identity:
-        raise OperationError("Prepared receipt identity does not match its reservation.")
-    if tuple(sorted(receipt["requiredTargets"])) != transaction.required_targets:
-        raise OperationError("Prepared receipt targets do not match its reservation.")
-    if receipt["preTestCommit"] != transaction.pre_test_commit:
-        raise OperationError("Prepared receipt does not identify checkpoint B.")
-    if receipt["receiptPath"] != transaction.receipt_path(target):
-        raise OperationError("Prepared receipt uses the wrong target layout.")
-    for artifact in receipt["artifacts"]:
-        if transaction.version not in pathlib.PurePosixPath(artifact["path"]).name:
-            raise OperationError("Artifact filename must contain the full version.")
-    return receipt
-
-
-def _prepared_result(
-    transaction: ArtifactVersionTransaction,
-    target: str,
-    raw: bytes,
-) -> PreparedBuildReceipt:
-    receipt = _validate_prepared_receipt(transaction, target, raw)
-    store_files = tuple(
-        {
-            "root": "store",
-            "path": item["path"],
-            "size": item["size"],
-            "sha256": item["sha256"],
-        }
-        for item in sorted(
-            _receipt_store_records(receipt), key=lambda value: value["path"]
-        )
-    )
-    git_files = tuple(
-        {
-            "root": "git",
-            "path": item["path"],
-            "size": item["size"],
-            "sha256": item["sha256"],
-        }
-        for item in sorted(
-            _receipt_git_results(receipt), key=lambda value: value["path"]
-        )
-    )
-    relative = sdlc_results._bundle_relative_path(
-        receipt["receiptPath"], label="Prepared build receipt"
-    )
-    return PreparedBuildReceipt(
-        target=target,
-        receipt_path=receipt["receiptPath"],
-        worktree_path=transaction.repo_root.joinpath(*relative.parts),
-        raw=raw,
-        sha256=hashlib.sha256(raw).hexdigest(),
-        store_files=store_files,
-        git_files=git_files,
-    )
-
-
-def prepare_versioned_build_receipt(
-    transaction: ArtifactVersionTransaction,
-    target: str,
-    receipt: Mapping[str, Any],
-) -> PreparedBuildReceipt:
-    """Verify qualified bytes and write their exact receipt to its Git path.
-
-    Artifacts already occupy their final version directory. Repeated calls
-    validate and reuse exact files; malformed interrupted receipt bytes are
-    rewritten directly without a helper-owned temporary copy.
-    """
-
-    _require_transaction_target(transaction, target)
-    try:
-        raw = sdlc_results.encode_new_receipt(receipt)
-    except StepResultError as exc:
-        raise OperationError(str(exc)) from exc
-    validated = _validate_prepared_receipt(transaction, target, raw)
-    if _git_text(
-        transaction.repo_root, ["rev-parse", "HEAD"], label="worktree HEAD"
-    ) != transaction.pre_test_commit:
-        raise OperationError("Worktree HEAD moved after checkpoint B.")
-
-    with _locked_artifact_store(transaction.lock_path):
-        reservations = _scan_transaction_records(transaction.store)
-        reservation = reservations.get(
-            (transaction.release_unit, transaction.version)
-        )
-        if reservation is None:
-            raise RecoveryRequired("Artifact transaction ownership disappeared.")
-        _validate_transaction(transaction, reservation)
-
-    for record in _receipt_git_inputs(validated):
-        sdlc_results._read_git_record(
-            transaction.repo_root, transaction.pre_test_commit, record
-        )
-        sdlc_results._verify_bundle_file(transaction.repo_root, record)
-    _verify_output_inventory(
-        transaction.target_output(target), _receipt_store_records(validated)
-    )
-    for record in _receipt_git_results(validated):
-        _verify_worktree_record(transaction.repo_root, record)
-
-    prepared = _prepared_result(transaction, target, raw)
-    _persist_exact_bytes(
-        prepared.worktree_path,
-        raw,
-        label="prepared build receipt",
-        parser=sdlc_results.parse_committed_build_receipt,
-    )
-    return prepared
-
-
-def write_versioned_failure_diagnostic(
-    transaction: ArtifactVersionTransaction,
-    target: str,
-    error: str,
-) -> pathlib.Path:
-    """Replace the one bounded diagnostic; it is never acceptance evidence."""
-
-    _require_transaction_target(transaction, target)
-    destination = (
-        transaction.diagnostic_root
-        / target
-        / f"{transaction.version_class}.json"
-    )
-    value = {
-        "schema": "ceratops-artifact-failure.v1",
-        "repository": transaction.repository,
-        "releaseUnit": transaction.release_unit,
-        "version": transaction.version,
-        "versionClass": transaction.version_class,
-        "target": target,
-        "attemptId": transaction.attempt_id,
-        "error": str(error)[:4096],
-    }
-    with _locked_artifact_store(transaction.lock_path):
-        _build_directory(destination.parent)
-        _write_transaction_record(
-            destination,
-            value,
-            replace=destination.exists() or destination.is_symlink(),
-            label="artifact failure diagnostic",
-        )
-    return destination
-
-
-def load_prepared_versioned_receipts(
-    transaction: ArtifactVersionTransaction,
-) -> tuple[PreparedBuildReceipt, ...]:
-    """Reconstruct prepared identities from direct final worktree paths."""
-
-    prepared: list[PreparedBuildReceipt] = []
-    for target in transaction.required_targets:
-        relative = sdlc_results._bundle_relative_path(
-            transaction.receipt_path(target), label="Prepared build receipt"
-        )
-        path, info = sdlc_results._plain_path(
-            transaction.repo_root.joinpath(*relative.parts),
-            label="Prepared build receipt",
-        )
-        if info.st_size > sdlc_results.NEW_RECEIPT_BYTES:
-            raise RecoveryRequired("Prepared build receipt is oversized.")
-        prepared.append(_prepared_result(transaction, target, path.read_bytes()))
-    return tuple(prepared)
-
-
-def _prepared_receipt_set(
-    transaction: ArtifactVersionTransaction,
-    prepared_receipts: Sequence[PreparedBuildReceipt] | None,
-) -> dict[str, tuple[PreparedBuildReceipt, dict[str, Any]]]:
-    values = (
-        load_prepared_versioned_receipts(transaction)
-        if prepared_receipts is None
-        else tuple(prepared_receipts)
-    )
-    by_target: dict[str, tuple[PreparedBuildReceipt, dict[str, Any]]] = {}
-    for prepared in values:
-        if not isinstance(prepared, PreparedBuildReceipt):
-            raise OperationError("Prepared receipts must use their recorded identities.")
-        if prepared.target in by_target:
-            raise OperationError("Prepared receipts repeat a target.")
-        expected = _prepared_result(transaction, prepared.target, prepared.raw)
-        if prepared != expected:
-            raise RecoveryRequired("Prepared receipt identity changed before completion.")
-        checked, _info = sdlc_results._plain_path(
-            prepared.worktree_path, label="Prepared build receipt"
-        )
-        if checked.read_bytes() != prepared.raw:
-            raise RecoveryRequired("Prepared build receipt changed before completion.")
-        receipt = _validate_prepared_receipt(
-            transaction, prepared.target, prepared.raw
-        )
-        try:
-            _verify_output_inventory(
-                transaction.target_output(prepared.target),
-                _receipt_store_records(receipt),
-            )
-            for record in _receipt_git_results(receipt):
-                _verify_worktree_record(transaction.repo_root, record)
-        except StepResultError as exc:
-            raise RecoveryRequired(
-                "Prepared result bytes changed before completion."
-            ) from exc
-        by_target[prepared.target] = (prepared, receipt)
-    if set(by_target) != set(transaction.required_targets):
-        raise OperationError("Every required target must have a prepared receipt.")
-    return by_target
-
-
-def _unique_records(
-    records: Sequence[Mapping[str, Any]], *, label: str
-) -> dict[str, dict[str, Any]]:
-    unique: dict[str, dict[str, Any]] = {}
-    for raw in records:
-        record = dict(raw)
-        path = str(record["path"])
-        existing = unique.get(path)
-        if existing is not None and existing != record:
-            raise OperationError(f"{label.capitalize()} has conflicting path records.")
-        unique[path] = record
-    return unique
-
-
-def _completion_records(
-    prepared: Mapping[str, tuple[PreparedBuildReceipt, Mapping[str, Any]]],
-) -> dict[str, dict[str, Any]]:
-    records: list[dict[str, Any]] = []
-    for target in sorted(prepared):
-        item, receipt = prepared[target]
-        records.append(
-            {
-                "root": "git",
-                "path": item.receipt_path,
-                "size": len(item.raw),
-                "sha256": item.sha256,
-            }
-        )
-        records.extend(_receipt_git_results(receipt))
-    result = _unique_records(records, label="committed result")
-    declared = {
-        path
-        for _item, receipt in prepared.values()
-        for path in receipt["committedResultPaths"]
-    }
-    if set(result) != declared:
-        raise OperationError("Prepared receipts disagree on committed result paths.")
-    return result
-
-
-def _git_bytes(
-    repo_root: pathlib.Path, arguments: Sequence[str], *, label: str
-) -> bytes:
-    completed = subprocess.run(
-        ["git", "-C", str(repo_root), *arguments],
-        capture_output=True,
-        check=False,
-    )
-    if completed.returncode:
-        detail = completed.stderr.decode("utf-8", errors="replace").strip()
-        suffix = f": {detail}" if detail else ""
-        raise OperationError(f"Git could not {label}{suffix}"[:1024])
-    return completed.stdout
-
-
-def _literal_pathspecs(paths: Sequence[str]) -> list[str]:
-    return [f":(literal){path}" for path in paths]
-
-
-def _require_unchanged_inputs(
-    transaction: ArtifactVersionTransaction,
-    prepared: Mapping[str, tuple[PreparedBuildReceipt, Mapping[str, Any]]],
-    result_paths: set[str],
-) -> None:
-    records = _unique_records(
-        [
-            record
-            for _item, receipt in prepared.values()
-            for record in _receipt_git_inputs(receipt)
-        ],
-        label="declared input",
-    )
-    input_paths = set(records) | set(transaction.declared_input_paths)
-    overlap = input_paths & result_paths
-    if overlap:
-        raise OperationError(f"Declared input is also a result path: {sorted(overlap)[0]}")
-    try:
-        for record in records.values():
-            sdlc_results._read_git_record(
-                transaction.repo_root, transaction.pre_test_commit, record
-            )
-            sdlc_results._verify_bundle_file(transaction.repo_root, record)
-    except StepResultError as exc:
-        raise RecoveryRequired("Declared inputs changed after checkpoint B.") from exc
-    if input_paths:
-        status = _git_bytes(
-            transaction.repo_root,
-            [
-                "status",
-                "--porcelain=v1",
-                "-z",
-                "--untracked-files=all",
-                "--",
-                *_literal_pathspecs(sorted(input_paths)),
-            ],
-            label="inspect declared inputs",
-        )
-        if status:
-            raise RecoveryRequired("Declared inputs changed after checkpoint B.")
-
-
-def _verify_result_worktree(
-    transaction: ArtifactVersionTransaction,
-    records: Mapping[str, Mapping[str, Any]],
-) -> None:
-    try:
-        for record in records.values():
-            _verify_worktree_record(transaction.repo_root, record)
-    except StepResultError as exc:
-        raise RecoveryRequired("Prepared result bytes changed before completion.") from exc
-
-
-def _git_diff_paths(
-    repo_root: pathlib.Path, parent: str, commit: str
-) -> set[str]:
-    raw = _git_bytes(
-        repo_root,
-        ["diff-tree", "--no-commit-id", "--name-only", "-r", "-z", parent, commit],
-        label="compare the result commit",
-    )
-    if raw and not raw.endswith(b"\0"):
-        raise OperationError("Git returned an invalid result path list.")
-    try:
-        return {
-            item.decode("utf-8")
-            for item in raw.rstrip(b"\0").split(b"\0")
-            if item
-        }
-    except UnicodeError as exc:
-        raise OperationError("Git returned a non-UTF-8 result path.") from exc
-
-
-def _commit_parents(repo_root: pathlib.Path, commit: str) -> tuple[str, ...]:
-    value = _git_text(
-        repo_root,
-        ["rev-list", "--parents", "-n", "1", commit],
-        label="result commit parents",
-    ).split()
-    if not value or value[0] != commit:
-        raise OperationError("Git returned an invalid result commit identity.")
-    return tuple(value[1:])
-
-
-def _commit_has_attempt(
-    transaction: ArtifactVersionTransaction, commit: str
-) -> bool:
-    message = _git_bytes(
-        transaction.repo_root,
-        ["show", "-s", "--format=%B", commit],
-        label="read the result commit message",
-    ).decode("utf-8", errors="strict")
-    return re.search(
-        rf"(?m)^Ceratops-Attempt: {re.escape(transaction.attempt_id)}$",
-        message,
-    ) is not None
-
-
-def _verify_result_commit(
-    transaction: ArtifactVersionTransaction,
-    commit: str,
-    records: Mapping[str, Mapping[str, Any]],
-) -> None:
-    if _commit_parents(transaction.repo_root, commit) != (
-        transaction.pre_test_commit,
-    ):
-        raise RecoveryRequired("Result commit does not have checkpoint B as parent.")
-    if not _commit_has_attempt(transaction, commit):
-        raise RecoveryRequired("Result commit lacks the recorded attempt trailer.")
-    if _git_diff_paths(
-        transaction.repo_root, transaction.pre_test_commit, commit
-    ) != set(records):
-        raise RecoveryRequired("B-to-C changes are not the exact result-only paths.")
-    for record in records.values():
-        try:
-            sdlc_results._read_git_record(transaction.repo_root, commit, record)
-        except StepResultError as exc:
-            raise RecoveryRequired("Committed result bytes do not match intent.") from exc
-
-
-def _matching_result_commits(
-    transaction: ArtifactVersionTransaction,
-    records: Mapping[str, Mapping[str, Any]],
-) -> tuple[str, ...]:
-    ref = f"refs/heads/{transaction.branch}"
-    branch_commit = _git_text(
-        transaction.repo_root,
-        ["rev-parse", "--verify", "--end-of-options", f"{ref}^{{commit}}"],
-        label="recorded branch",
-    )
-    if branch_commit == transaction.pre_test_commit:
-        descendants: tuple[str, ...] = ()
-    else:
-        raw = _git_bytes(
-            transaction.repo_root,
-            [
-                "rev-list",
-                "--ancestry-path",
-                f"{transaction.pre_test_commit}..{ref}",
-            ],
-            label="inspect result-commit recovery candidates",
-        )
-        descendants = tuple(
-            line.decode("ascii") for line in raw.splitlines() if line
-        )
-    matching: list[str] = []
-    conflicting_attempt = False
-    for commit in descendants:
-        if _commit_parents(transaction.repo_root, commit) != (
-            transaction.pre_test_commit,
-        ):
-            continue
-        if not _commit_has_attempt(transaction, commit):
-            continue
-        try:
-            _verify_result_commit(transaction, commit, records)
-        except RecoveryRequired:
-            conflicting_attempt = True
-        else:
-            matching.append(commit)
-    if conflicting_attempt:
-        raise RecoveryRequired("Attempt trailer identifies a conflicting result commit.")
-    if len(matching) > 1:
-        raise RecoveryRequired("More than one result commit matches this attempt.")
-    return tuple(matching)
-
-
-def _create_result_commit(
-    transaction: ArtifactVersionTransaction,
-    records: Mapping[str, Mapping[str, Any]],
-) -> str:
-    if _git_text(
-        transaction.repo_root, ["symbolic-ref", "--quiet", "--short", "HEAD"],
-        label="worktree branch",
-    ) != transaction.branch:
-        raise RecoveryRequired("Worktree is no longer on the recorded branch.")
-    if _git_text(
-        transaction.repo_root, ["rev-parse", "HEAD"], label="worktree HEAD"
-    ) != transaction.pre_test_commit:
-        raise RecoveryRequired("Recorded branch moved before result commit creation.")
-    message = (
-        f"Record {transaction.release_unit} {transaction.version} build receipts\n\n"
-        f"Ceratops-Attempt: {transaction.attempt_id}"
-    )
-    added = subprocess.run(
-        [
-            "git",
-            "-C",
-            str(transaction.repo_root),
-            "add",
-            "--",
-            *_literal_pathspecs(sorted(records)),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if added.returncode:
-        suffix = f": {added.stderr.strip()}" if added.stderr.strip() else ""
-        raise OperationError(f"Git could not stage exact result paths{suffix}"[:1024])
-    completed = subprocess.run(
-        [
-            "git",
-            "-C",
-            str(transaction.repo_root),
-            "commit",
-            "--only",
-            "--no-gpg-sign",
-            "-m",
-            message,
-            "--",
-            *_literal_pathspecs(sorted(records)),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if completed.returncode:
-        suffix = f": {completed.stderr.strip()}" if completed.stderr.strip() else ""
-        raise OperationError(f"Git could not create result commit{suffix}"[:1024])
-    commit = _git_text(
-        transaction.repo_root, ["rev-parse", "HEAD"], label="result commit"
-    )
-    _verify_result_commit(transaction, commit, records)
-    return commit
-
-
-def _resolve_result_commit(
-    transaction: ArtifactVersionTransaction,
-    prepared: Mapping[str, tuple[PreparedBuildReceipt, Mapping[str, Any]]],
-    records: Mapping[str, Mapping[str, Any]],
-) -> str:
-    _require_unchanged_inputs(transaction, prepared, set(records))
-    _verify_result_worktree(transaction, records)
-    matching = _matching_result_commits(transaction, records)
-    if matching:
-        return matching[0]
-    commit = _create_result_commit(transaction, records)
-    matching = _matching_result_commits(transaction, records)
-    if matching != (commit,):
-        raise RecoveryRequired("Created result commit could not be identified uniquely.")
-    return commit
-
-
-def _artifact_receipt_bytes(
-    prepared: PreparedBuildReceipt,
-    receipt: Mapping[str, Any],
-    final_commit: str,
-) -> bytes:
-    return sdlc_results.encode_new_receipt(
-        {
-            "schema": sdlc_results.ARTIFACT_RECEIPT_SCHEMA,
-            "status": "passed",
-            "identity": deepcopy(receipt["identity"]),
-            "finalCommit": final_commit,
-            "acceptance": deepcopy(receipt["acceptance"]),
-            "buildReceipt": {
-                "root": "git",
-                "path": prepared.receipt_path,
-                "size": len(prepared.raw),
-                "sha256": prepared.sha256,
-            },
-            "artifactPaths": [item["path"] for item in receipt["artifacts"]],
-        }
-    )
-
-
-def _write_version_artifact_receipts(
-    transaction: ArtifactVersionTransaction,
-    prepared: Mapping[str, tuple[PreparedBuildReceipt, Mapping[str, Any]]],
-    final_commit: str,
-) -> tuple[pathlib.Path, ...]:
-    paths: list[pathlib.Path] = []
-    for target in transaction.required_targets:
-        item, receipt = prepared[target]
-        raw = _artifact_receipt_bytes(item, receipt, final_commit)
-        path = transaction.artifact_receipt(target)
-        _persist_exact_bytes(
-            path,
-            raw,
-            label="artifact receipt",
-            parser=sdlc_results.parse_artifact_receipt,
-        )
-        loaded = sdlc_results.read_artifact_receipt(path).value
-        if loaded["finalCommit"] != final_commit:
-            raise RecoveryRequired("Artifact receipt binds another result commit.")
-        paths.append(path)
-    return tuple(paths)
-
-
-def _artifact_tag_commit(
-    transaction: ArtifactVersionTransaction,
-) -> str | None:
-    tag = f"{transaction.release_unit}/{transaction.version}"
-    result = subprocess.run(
-        [
-            "git",
-            "-C",
-            str(transaction.repo_root),
-            "rev-parse",
-            "--verify",
-            "--end-of-options",
-            f"refs/tags/{tag}^{{commit}}",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode:
-        return None
-    commit = result.stdout.strip()
-    if re.fullmatch(r"[a-f0-9]{40}", commit) is None:
-        raise RecoveryRequired("Immutable artifact tag is invalid.")
-    return commit
-
-
-def _create_artifact_tag(
-    transaction: ArtifactVersionTransaction, final_commit: str
-) -> str:
-    tag = f"{transaction.release_unit}/{transaction.version}"
-    existing = _artifact_tag_commit(transaction)
-    if existing is not None:
-        if existing != final_commit:
-            raise RecoveryRequired("Immutable artifact version tag points elsewhere.")
-        return tag
-    completed = subprocess.run(
-        [
-            "git",
-            "-C",
-            str(transaction.repo_root),
-            "tag",
-            "--no-sign",
-            tag,
-            final_commit,
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if completed.returncode:
-        existing = _artifact_tag_commit(transaction)
-        if existing != final_commit:
-            suffix = f": {completed.stderr.strip()}" if completed.stderr.strip() else ""
-            raise OperationError(f"Git could not create artifact tag{suffix}"[:1024])
-    return tag
-
-
-def _remove_versioned_reservation(
-    transaction: ArtifactVersionTransaction,
-) -> None:
-    if not transaction.reservation_path.exists():
-        return
-    reservation = _read_transaction_record(
-        transaction.reservation_path, "Artifact reservation"
-    )
-    _validate_transaction(transaction, reservation)
-    transaction.reservation_path.unlink()
-    unit_root = transaction.reservation_path.parent
-    if unit_root.is_dir() and not any(unit_root.iterdir()):
-        unit_root.rmdir()
-
-
-def _clear_versioned_diagnostics(transaction: ArtifactVersionTransaction) -> None:
-    for target in transaction.required_targets:
-        path = (
-            transaction.diagnostic_root
-            / target
-            / f"{transaction.version_class}.json"
-        )
-        if path.exists() or path.is_symlink():
-            sdlc_results._plain_path(path, label="Artifact diagnostic")
-            path.unlink()
-
-
-def complete_versioned_artifacts(
-    transaction: ArtifactVersionTransaction,
-    prepared_receipts: Sequence[PreparedBuildReceipt] | None = None,
-) -> CompletedArtifactVersion:
-    """Commit exact results, bind direct artifacts, tag, and clean ownership.
-
-    Every phase is recognized from its validated final effect. Recovery never
-    rebuilds, reruns tests, creates a duplicate commit, or moves a conflicting
-    tag. The tag is written only after every target artifact receipt exists.
-    """
-
-    completed = _completed_versioned_result(transaction)
-    if completed is not None:
-        # Durable success precedes cleanup. Do not recreate receipts, commits or
-        # tags, or even depend on mutable worktree result files on a cleanup retry.
-        with _locked_artifact_store(transaction.lock_path):
-            _remove_versioned_reservation(transaction)
-            _clear_versioned_diagnostics(transaction)
-            _prune_completed_artifacts(transaction.store, _scan_transaction_records(transaction.store))
-        return completed
-
-    prepared = _prepared_receipt_set(transaction, prepared_receipts)
-    records = _completion_records(prepared)
-    with _locked_artifact_store(transaction.lock_path):
-        reservations = _scan_transaction_records(transaction.store)
-        reservation = reservations.get(
-            (transaction.release_unit, transaction.version)
-        )
-        if reservation is None and _artifact_tag_commit(transaction) is None:
-            raise RecoveryRequired("Artifact transaction ownership disappeared.")
-        if reservation is not None:
-            _validate_transaction(transaction, reservation)
-
-    final_commit = _resolve_result_commit(transaction, prepared, records)
-    with _locked_artifact_store(transaction.lock_path):
-        reservations = _scan_transaction_records(transaction.store)
-        reservation = reservations.get(
-            (transaction.release_unit, transaction.version)
-        )
-        if reservation is not None:
-            _validate_transaction(transaction, reservation)
-        artifact_receipts = _write_version_artifact_receipts(
-            transaction, prepared, final_commit
-        )
-        tag = _create_artifact_tag(transaction, final_commit)
-        _remove_versioned_reservation(transaction)
-        _clear_versioned_diagnostics(transaction)
-        remaining = _scan_transaction_records(transaction.store)
-        _prune_completed_artifacts(transaction.store, remaining)
-
-    return CompletedArtifactVersion(
-        final_commit=final_commit,
-        tag=tag,
-        build_receipts=tuple(
-            prepared[target][0].worktree_path
-            for target in transaction.required_targets
-        ),
-        artifact_receipts=artifact_receipts,
-    )
-
-
-def _completed_versioned_result(
-    transaction: ArtifactVersionTransaction,
-) -> CompletedArtifactVersion | None:
-    """Recognize durable success by the existing tag/receipt chain, not a journal."""
-    final_commit = _artifact_tag_commit(transaction)
-    if final_commit is None:
-        return None
-    for target in transaction.required_targets:
-        selected = sdlc_results.read_artifact_receipt_chain(
-            transaction.repo_root, artifact_receipt_path=transaction.artifact_receipt(target),
-        )
-        _validate_prepared_receipt(transaction, target, selected.build_receipt.raw)
-        if selected.final_commit != final_commit:
-            raise RecoveryRequired("Completed artifact targets disagree on their final commit.")
-    return CompletedArtifactVersion(
-        final_commit=final_commit,
-        tag=f"{transaction.release_unit}/{transaction.version}",
-        build_receipts=tuple(transaction.repo_root / transaction.receipt_path(target) for target in transaction.required_targets),
-        artifact_receipts=tuple(transaction.artifact_receipt(target) for target in transaction.required_targets),
-    )

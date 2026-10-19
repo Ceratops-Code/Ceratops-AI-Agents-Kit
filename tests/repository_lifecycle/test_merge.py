@@ -8,6 +8,7 @@ import runpy
 import subprocess
 import sys
 from typing import Any, Self
+from unittest.mock import Mock
 
 import pytest
 
@@ -187,49 +188,30 @@ def test_dependency_rebase_wait_skips_sleep_for_current_or_failed_evidence(
         assert bool(blockers) == (status == "failed")
 
 
-@pytest.mark.parametrize("mode", ["timeout", "cleaned", "cleanup_blocked"])
-def test_dependency_finalization_preserves_gate_and_reports_cleanup(
+@pytest.mark.parametrize("mode", ["timeout", "published", "release_blocked"])
+def test_dependency_finalization_preserves_rebase_gate_and_release_failure(
     monkeypatch: pytest.MonkeyPatch, mode: str,
 ) -> None:
-    from tests.repository_lifecycle.test_github_workflow import (
+    from tests.repository_lifecycle.test_dependency_finalization import (
         DependencyFinalizationTests,
     )
 
-    finalization = load_pr_workflow_module(monkeypatch, "dependency_finalization")
-    original_index = finalization.preflight_pr_index
-
-    def index(payload: dict[str, Any]) -> dict[Any, Any]:
-        result = original_index(payload)
-        if mode == "timeout":
-            result[("owner/repo", 1)]["pr"]["live"]["rebase_wait"] = {"status": "timed_out"}
-        return result
-
-    cleanup_calls = []
-    monkeypatch.setattr(finalization, "preflight_pr_index", index)
-    monkeypatch.setattr(finalization, "selected_worktree_cleanup", lambda *_: ({"selected": "task"}, None))
-
-    def cleanup(plan: dict[str, str]):
-        assert finalization.run_sync.called
-        cleanup_calls.append(plan)
-        error = "folder retained" if mode == "cleanup_blocked" else None
-        return {"status": "blocked" if error else "cleaned"}, error
-
-    monkeypatch.setattr(finalization, "finalize_worktree_cleanup", cleanup)
+    load_pr_workflow_module(monkeypatch, "dependency_finalization")
     fixture = DependencyFinalizationTests()
-    payload, _, merges = fixture._finalize_case(
-        [("owner/repo", 1)], {("owner/repo", 1): fixture._live("a" * 40)}, snapshot_open=[]
+    payload, publications = fixture.finalize_case(
+        [("owner/repo", 1)],
+        rebase_timeout=mode == "timeout",
+        publication_failure="owner/repo" if mode == "release_blocked" else None,
     )
     if mode == "timeout":
-        assert not merges and not cleanup_calls
+        assert not publications
         assert payload["blockers"][0]["check"] == "dependabot_rebase"
     else:
-        assert merges == [("owner/repo", 1)]
-        assert cleanup_calls == [{"selected": "task"}]
-        assert payload["pull_requests"][0]["cleanup"]["status"] == (
-            "blocked" if mode == "cleanup_blocked" else "cleaned"
+        assert publications == [("owner/repo", [1])]
+        assert payload["release_batches"][0]["status"] == (
+            "blocked" if mode == "release_blocked" else "published"
         )
-    assert payload["outcome"]["blocked"] == (mode != "cleaned")
-
+    assert payload["outcome"]["blocked"] == (mode != "published")
 
 @pytest.mark.parametrize(
     "mode", ["clean", "residual", "dirty", "changed_head", "other_scope", "interrupted", "unmerged"]
@@ -320,8 +302,11 @@ def test_dependency_selected_cleanup_reuses_manager_and_preserves_unapproved_wor
 
 
 @pytest.mark.parametrize("wait_status", ["ready", "timed_out", "failed"])
+@pytest.mark.parametrize("annotation_state", ["clear", "warning", "unavailable"])
+@pytest.mark.parametrize("interruption", ["none", "before_write", "after_write"])
 def test_dependency_preflight_collects_evidence_after_rebase_wait(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, wait_status: str,
+    annotation_state: str, interruption: str,
 ) -> None:
     queue = load_pr_workflow_module(monkeypatch, "dependency_queue")
     common = load_pr_workflow_module(monkeypatch, "dependency_common")
@@ -369,6 +354,17 @@ def test_dependency_preflight_collects_evidence_after_rebase_wait(
 
     monkeypatch.setattr(queue, "exact_ci_evidence", ci)
     monkeypatch.setattr(queue, "registry_evidence", lambda _: {"status": "ok"})
+    annotations: dict[str, Any] = {
+        "status": "unavailable" if annotation_state == "unavailable" else "ok",
+        "counts": {"warning": int(annotation_state == "warning"), "failure": 0, "notice": 1},
+        "annotations": [], "error": "GitHub messages unavailable",
+    }
+
+    def messages(repo: str, head: str):
+        assert repo == "owner/repo" and head == new["head_oid"]
+        return annotations
+
+    monkeypatch.setattr(queue, "fetch_ci_annotations", messages)
 
     def tree(checkout: pathlib.Path, update: dict[str, Any], files: list[Any], alerts: list[Any]):
         assert files == new["files"]
@@ -386,6 +382,20 @@ def test_dependency_preflight_collects_evidence_after_rebase_wait(
         "--workspace-root", str(tmp_path),
         "--checkout", f"owner/repo={tmp_path}",
     ])
+    write = queue.write_json
+
+    def interrupted_write(path: pathlib.Path, payload: dict[str, Any]):
+        if interruption == "after_write":
+            write(path, payload)
+        raise RuntimeError("interrupted report write")
+
+    if interruption != "none":
+        monkeypatch.setattr(queue, "write_json", interrupted_write)
+        with pytest.raises(RuntimeError, match="interrupted report write"):
+            queue.preflight(args)
+        assert output.exists() == (interruption == "after_write")
+        monkeypatch.setattr(queue, "write_json", write)
+        order.clear()
     assert queue.preflight(args) == 0
     payload = json.loads(output.read_text(encoding="utf-8"))
     repository = payload["repositories"][0]
@@ -393,8 +403,96 @@ def test_dependency_preflight_collects_evidence_after_rebase_wait(
     result_pr = repository["pull_requests"][0]
     assert result_pr["live"]["head_oid"] == "b" * 40
     assert result_pr["decision_gates"]["rebase_repair_required"] == (wait_status == "timed_out")
-    assert payload["outcome"]["blocked"] == (wait_status == "failed")
+    assert result_pr["ci_annotations"] == annotations
+    assert result_pr["decision_gates"]["ci_warning_review_required"] == (annotation_state == "warning")
+    assert payload["summary"]["ci_warning_annotations"] == int(annotation_state == "warning")
+    assert payload["summary"]["ci_annotation_reads_unavailable"] == int(annotation_state == "unavailable")
+    assert payload["outcome"]["blocked"] == (wait_status == "failed" or annotation_state == "unavailable")
     assert order == ["wait", "ci", "tree"]
+    order.clear()
+    assert queue.preflight(args) == 0
+    repeated = json.loads(output.read_text(encoding="utf-8"))
+    assert repeated["repositories"] == payload["repositories"]
+    assert repeated["summary"] == payload["summary"]
+
+
+@pytest.mark.parametrize(
+    "mode", ["passed", "empty", "overflow", "denied", "timeout", "bad_json", "wrong_head",
+             "missing_page", "missing_annotations", "bad_annotation", "bad_count"],
+)
+def test_dependency_ci_annotations_keep_successful_job_warnings_and_read_failures(
+    monkeypatch: pytest.MonkeyPatch, mode: str,
+) -> None:
+    evidence = load_pr_workflow_module(monkeypatch, "dependency_evidence")
+    head = "a" * 40
+    warning = {"annotation_level": "warning", "message": "deprecated input", "path": "ci.yml",
+               "start_line": 7, "end_line": 8, "title": "Deprecation"}
+    annotations = [warning, {"annotation_level": "notice", "message": "runner update"},
+                   {"annotation_level": "failure", "message": "failed input"}]
+    if mode == "overflow":
+        annotations = [{**warning, "message": "x" * 2001}] * 101
+    check: dict[str, Any] = {"id": 42, "head_sha": "b" * 40 if mode == "wrong_head" else head,
+             "name": "ci", "conclusion": "success", "html_url": "https://github.com/owner/repo/runs/42",
+             "output": {"annotations_count": len(annotations)}}
+    calls: list[list[str]] = []
+
+    def query(command: list[str], **kwargs: Any):
+        calls.append(command)
+        assert command[-2:] == ["--paginate", "--slurp"]
+        assert 0 < kwargs["timeout"] <= 30
+        if "/commits/" in command[2]:
+            assert f"/commits/{head}/" in command[2]
+            payload: Any = [{"total_count": 0 if mode == "empty" else 1,
+                             "check_runs": [] if mode in {"empty", "missing_page"} else [check]}]
+            if mode == "bad_count":
+                check["output"]["annotations_count"] = -1
+        else:
+            assert command[2] == "repos/owner/repo/check-runs/42/annotations?per_page=100"
+            if mode == "timeout":
+                raise subprocess.TimeoutExpired(command, 30)
+            if mode == "denied":
+                return subprocess.CompletedProcess(command, 1, "", "HTTP 403")
+            if mode == "bad_json":
+                return subprocess.CompletedProcess(command, 0, "broken JSON", "")
+            payload = [annotations[:100], annotations[100:]] if mode == "overflow" else [annotations]
+            if mode == "missing_annotations":
+                payload = [[]]
+            elif mode == "bad_annotation":
+                payload = [[{"annotation_level": "surprise", "message": "bad"}]]
+        return subprocess.CompletedProcess(command, 0, json.dumps(payload), "")
+
+    monkeypatch.setattr(evidence, "run_command", query)
+    first = evidence.fetch_ci_annotations("owner/repo", head)
+    repeated = evidence.fetch_ci_annotations("owner/repo", head)
+    assert repeated == first
+    assert first["head_oid"] == head
+    if mode in {"passed", "overflow"}:
+        assert first["status"] == "ok"
+        assert first["counts"]["warning"] == (101 if mode == "overflow" else 1)
+        assert first["annotations"][0]["check_conclusion"] == "success"
+        assert first["annotations"][0]["path"] == "ci.yml"
+        assert first["annotations"][0]["start_line"] == 7
+        assert first["annotations"][0]["check_run_id"] == 42
+        if mode == "overflow":
+            assert len(first["annotations"]) == 50 and first["omitted_annotations"] == 51
+            assert first["annotations"][0]["message_truncated"]
+            assert len(first["annotations"][0]["message"]) == 2000
+        else:
+            assert first["counts"] == {"warning": 1, "failure": 1, "notice": 1}
+            assert len(first["annotations"]) == 2
+    elif mode == "empty":
+        assert first["status"] == "ok" and first["check_runs"] == 0
+        assert first["counts"] == {"warning": 0, "failure": 0, "notice": 0}
+        assert len(calls) == 2
+    else:
+        assert first["status"] == "unavailable" and first["error"]
+        if mode == "denied":
+            failure = json.loads(first["error"])
+            assert failure["exit_status"] == 1 and failure["stderr"] == "HTTP 403"
+            assert failure["stdout"] == "<absent>" and failure["invocation"][0] == "gh"
+    calls.clear()
+    assert evidence.fetch_ci_annotations("owner/repo", "")["status"] == "unavailable"
+    assert not calls
 
 
 @pytest.mark.parametrize(
@@ -579,27 +677,6 @@ def test_gradle_wrapper_context_requires_unambiguous_checkout_bound_files(
             assert result["sources"][0]["wrapper_sha256"] == hashlib.sha256(jar_bytes).hexdigest()
     unsupported = evidence.parse_update("Bump another-tool from 9.8.0 to 9.8.1", [{"path": relative}], [])
     assert unsupported["ecosystem"] == "unknown"
-
-
-def test_dependency_merge_runs_absolute_entrypoint_from_target_checkout(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    finalization = load_pr_workflow_module(monkeypatch, "dependency_finalization")
-    calls = []
-
-    def run(command: list[str], **kwargs: Any):
-        calls.append((command, kwargs))
-        return subprocess.CompletedProcess(command, 0, '{"status":"merged"}', "")
-
-    monkeypatch.setattr(finalization, "run_command", run)
-    result, error = finalization.merge_pr(
-        "owner/repo", 1, tmp_path, "merge",
-        expected_head="a" * 40, admin=False, wait_seconds=0, interval_seconds=1,
-    )
-    assert error is None and result["status"] == "merged"
-    assert pathlib.Path(calls[0][0][1]) == PR_WORKFLOW_ENTRYPOINT
-    assert calls[0][1]["cwd"] == tmp_path
-    assert "--expected-head" in calls[0][0]
 
 
 @pytest.mark.parametrize("enabled", [True, False])
@@ -1359,3 +1436,293 @@ def test_merge_cli_emits_compact_critical_json(
     )
     assert module.returncode == 0, module.stderr
     assert "GitHub PR workflows" in module.stdout
+
+
+@pytest.fixture
+def dependency_automation(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> Any:
+    queue = load_pr_workflow_module(monkeypatch, "dependency_queue")
+    cli = load_pr_workflow_module(monkeypatch, "cli")
+    root = tmp_path / "automation"
+    root.mkdir()
+    (root / "github-repository-scopes.json").write_text(json.dumps({"default_owner": "scope-owner"}))
+    record = {"generated_at": queue.utc_now(), "outcome": {"blocked": True}, "summary": {"open_alerts": 3}}
+    def report(phase: str) -> dict[str, Any]:
+        return {**record, "schema": f"ceratops-repo-lifecycle/dependency-{phase}.v1"}
+    def call(phase: str, *options: str) -> int:
+        return cli.main([f"dependency-{phase}", "--automation-dir", str(root), *options])
+    return queue, root, report, call
+
+
+@pytest.mark.parametrize("phase", ["preflight", "finalize"])
+@pytest.mark.parametrize("custom", [False, True])
+def test_dependency_automation_public_entrypoint_keeps_scope_options_and_reports(dependency_automation: Any, monkeypatch: pytest.MonkeyPatch, phase: str, custom: bool) -> None:
+    queue, root, report, call = dependency_automation
+    selected = root / ("chosen.json" if custom else f"dependabot-repository-{phase}.json")
+    final = root / "dependabot-repository-finalize.json"
+    options = ["--output", str(selected)] if custom else []
+    if phase == "finalize":
+        options += ["--approved-pr", "https://github.com/scope-owner/repo/pull/1", "--admin", "--wait-seconds", "7"]
+    def handler(args: argparse.Namespace) -> int:
+        assert args.org == "scope-owner" and args.output == selected
+        assert args.snapshot_helper == root / "dependabot-repository-queue-snapshot.py"
+        assert args.snapshot == root / "dependabot-repository-queue-snapshot.json"
+        assert not selected.exists() and not queue.failure_partial_path(selected).exists()
+        if phase == "finalize":
+            assert args.admin and args.wait_seconds == 7 and len(args.approved_pr) == 1
+            assert args.sync_helper == root / "sync-local-repo-checkouts.py"
+        else:
+            assert not final.exists()
+        selected.write_text(json.dumps(report(phase)))
+        return 0
+    monkeypatch.setattr(queue, phase, handler)
+    for _ in range(2):
+        selected.write_text("stale selected result")
+        queue.failure_partial_path(selected).write_text("stale partial")
+        if phase == "preflight":
+            final.write_text("stale final result")
+        assert call(phase, *options) == 0
+        assert json.loads(selected.read_text()) == report(phase)
+
+
+@pytest.mark.parametrize("phase", ["preflight", "finalize"])
+@pytest.mark.parametrize("failure", ["absent", "malformed", "error", "blocked", "before", "after", "scope", "arguments", "unwritable"])
+def test_dependency_automation_failure_boundaries_preserve_current_results(dependency_automation: Any, monkeypatch: pytest.MonkeyPatch, phase: str, failure: str, capsys: pytest.CaptureFixture[str]) -> None:
+    queue, root, report, call = dependency_automation
+    output = root / f"dependabot-repository-{phase}.json"
+    def handler(args: argparse.Namespace) -> int:
+        if failure == "before":
+            raise KeyboardInterrupt
+        if failure in {"blocked", "after"}:
+            output.write_text(json.dumps(report(phase)))
+        if failure == "after":
+            raise KeyboardInterrupt
+        if failure == "malformed":
+            output.write_text("{")
+        if failure == "error":
+            raise OSError("specific failure evidence")
+        return 1 if failure == "blocked" else 0
+    monkeypatch.setattr(queue, phase, handler)
+    if failure == "scope":
+        (root / "github-repository-scopes.json").write_text("{}")
+    if failure == "unwritable":
+        monkeypatch.setattr(queue, "write_automation_failure", Mock(side_effect=OSError("disk full")))
+    for _ in range(2):
+        output.write_text(json.dumps(report(phase)))
+        assert call(phase, *(["--unknown-option"] if failure == "arguments" else [])) == (130 if failure in {"before", "after"} else 2 if failure == "arguments" else 1)
+        if failure == "unwritable":
+            assert not output.exists() and "disk full" in capsys.readouterr().err
+            continue
+        result = json.loads(output.read_text())
+        if failure in {"blocked", "after"}:
+            assert result == report(phase)
+        else:
+            assert result["summary"]["queue_state"] == "unavailable"
+            assert result["failure"]["phase"] == phase and result["failure"]["target"] == str(output)
+        assert not queue.failure_partial_path(output).exists()
+
+
+@pytest.mark.parametrize("phase", ["preflight", "finalize"])
+@pytest.mark.parametrize("target_name", ["output", "partial", "final", "final_partial"])
+@pytest.mark.parametrize("after", [False, True])
+def test_dependency_automation_interrupted_retirement_converges(dependency_automation: Any, monkeypatch: pytest.MonkeyPatch, phase: str, target_name: str, after: bool) -> None:
+    queue, root, report, call = dependency_automation
+    output = root / f"dependabot-repository-{phase}.json"
+    final = root / "dependabot-repository-finalize.json"
+    target = {"output": output, "partial": queue.failure_partial_path(output), "final": final, "final_partial": queue.failure_partial_path(final)}[target_name]
+    original = pathlib.Path.unlink
+    output.write_text(json.dumps(report(phase)))
+    target.write_text("stale")
+    interrupted = False
+    def unlink(path: pathlib.Path, *args: Any, **kwargs: Any) -> None:
+        nonlocal interrupted
+        if path == target and not interrupted:
+            interrupted = True
+            if after:
+                original(path, *args, **kwargs)
+            raise KeyboardInterrupt
+        original(path, *args, **kwargs)
+    monkeypatch.setattr(queue, phase, lambda args: 0)
+    with monkeypatch.context() as scoped:
+        scoped.setattr(pathlib.Path, "unlink", unlink)
+        assert call(phase) == 130
+    assert json.loads(output.read_text())["summary"]["queue_state"] == "unavailable"
+    assert call(phase) == 1 and not queue.failure_partial_path(output).exists()
+
+
+@pytest.mark.parametrize("effect", ["mkdir", "write", "replace", "cleanup"])
+@pytest.mark.parametrize("after", [False, True])
+def test_dependency_automation_interrupted_failure_publication_converges(dependency_automation: Any, monkeypatch: pytest.MonkeyPatch, effect: str, after: bool) -> None:
+    queue, root, _report, call = dependency_automation
+    output = root / "report" / "final.json"
+    owner, name = (queue.os, "replace") if effect == "replace" else (pathlib.Path, {"mkdir": "mkdir", "write": "write_text", "cleanup": "unlink"}[effect])
+    original = getattr(owner, name)
+    interrupted = False
+    def operation(*args: Any, **kwargs: Any) -> Any:
+        nonlocal interrupted
+        if not interrupted:
+            interrupted = True
+            if after:
+                original(*args, **kwargs)
+            raise KeyboardInterrupt
+        return original(*args, **kwargs)
+    with monkeypatch.context() as scoped:
+        scoped.setattr(owner, name, operation)
+        with pytest.raises(KeyboardInterrupt):
+            queue.write_automation_failure(output, "finalize", queue.utc_now(), 1, "failed")
+    monkeypatch.setattr(queue, "finalize", lambda args: 0)
+    assert call("finalize", "--output", str(output)) == 1
+    assert json.loads(output.read_text())["failure"]["exit_code"] == 1
+    assert not queue.failure_partial_path(output).exists()
+
+
+@pytest.mark.parametrize("setting", ["allow_merge_commit", "allow_squash_merge", "allow_rebase_merge"])
+def test_contract_requires_merge_only_and_remediates_exact_flags(
+    monkeypatch: pytest.MonkeyPatch, setting: str,
+) -> None:
+    monkeypatch.syspath_prepend(str(PR_WORKFLOW_SCRIPTS))
+    from github_contract_engine.compare_states import compare_states
+    from github_contract_engine.compose_desired_state import compose_desired_state
+    from github_contract_engine.github_api import ApiResult
+    from github_contract_engine.remediations import HANDLERS
+
+    contract = PR_WORKFLOW_SCRIPTS.parent / "references/contracts/github-repo-deterministic-contract.json"
+    desired = compose_desired_state(
+        {"repo": str(contract)}, {"owner": "owner", "repo": "repo"},
+        {"repo": {"repo.merge_settings"}},
+    )
+    expected = {"allow_merge_commit": True, "allow_squash_merge": False, "allow_rebase_merge": False}
+    rule = desired["rules"][0]
+    for name, value in expected.items():
+        assertion = next(a for a in rule["assertions"] if a["path"].endswith("/" + name))
+        assert assertion["expected"] is value and "when" not in assertion
+    repo = {"fork": True, "archived": False, **expected}
+    observed = {"repo": repo, "repository": {"repo": repo}}
+    assert compare_states(observed, desired)["findings"][0]["level"] == "PASS"
+    repo[setting] = not expected[setting]
+    finding = compare_states(observed, desired)["findings"][0]
+    assert finding["path"] == "/repository/repo/" + setting
+    writes = []
+    def update(method: str, endpoint: str, payload: dict[str, Any]) -> ApiResult:
+        writes.append((method, endpoint, payload))
+        return ApiResult(True, method, endpoint, status=200)
+    monkeypatch.setattr("github_contract_engine.remediations.repository.run_gh_api", update)
+    assert HANDLERS["repository.update_settings"](
+        [{**rule, "_mismatch_paths": [finding["path"]]}], {"owner": "owner", "repo": "repo"},
+    )[0]["ok"]
+    assert writes == [("PATCH", "/repos/owner/repo", {setting: expected[setting]})]
+
+
+@pytest.mark.parametrize(("rules", "compatible"), [
+    ([], True),
+    ([{"type": "pull_request", "parameters": {"allowed_merge_methods": ["merge"]}}], True),
+    ([{"type": "pull_request", "parameters": {"allowed_merge_methods": ["squash"]}}], False),
+    ([{"type": "pull_request", "parameters": {"allowed_merge_methods": ["merge", "rebase"]}}], False),
+    ([{"type": "pull_request", "parameters": {}}], None),
+    ([{"type": "required_linear_history"}], False),
+    ([{"type": "merge_queue", "parameters": {"merge_method": "MERGE"}}], True),
+    ([{"type": "merge_queue", "parameters": {"merge_method": "SQUASH"}}], False),
+    ([{"type": "pull_request"}, {"type": "required_linear_history"}], False),
+    ([{}], None),
+    ({}, None),
+])
+def test_effective_merge_rules_keep_conflicts_and_unknowns(
+    monkeypatch: pytest.MonkeyPatch, rules: Any, compatible: bool | None,
+) -> None:
+    monkeypatch.syspath_prepend(str(PR_WORKFLOW_SCRIPTS))
+    from github_contract_engine.collectors.repository import _merge_policy_facts
+    from github_contract_engine.github_api import ApiResult
+
+    inputs = (ApiResult(True, "GET", "rules", data=rules),
+              ApiResult(False, "GET", "protection", status=404, message="Branch not protected"))
+    for _ in range(2):
+        facts = _merge_policy_facts(*inputs)
+        assert facts["compatible"] is compatible
+        assert facts["classic_protection_compatible"] is True
+
+
+@pytest.mark.parametrize(("payload", "status", "message", "compatible", "supported"), [
+    ({"required_linear_history": {"enabled": False}}, 200, None, True, True),
+    ({"required_linear_history": {"enabled": True}}, 200, None, False, True),
+    ({}, 200, None, None, True),
+    (None, 404, "Branch not protected", True, True),
+    (None, 404, "Not Found", None, None),
+    (None, 403, "Resource not accessible by integration", None, None),
+    (None, 403, "Upgrade to GitHub Pro or make this repository public to enable this feature.", None, False),
+    (None, 503, "Service unavailable", None, None),
+])
+def test_classic_merge_protection_requires_conclusive_evidence(
+    monkeypatch: pytest.MonkeyPatch, payload: Any, status: int, message: str | None,
+    compatible: bool | None, supported: bool | None,
+) -> None:
+    monkeypatch.syspath_prepend(str(PR_WORKFLOW_SCRIPTS))
+    from github_contract_engine.collectors.repository import _merge_policy_facts
+    from github_contract_engine.github_api import ApiResult
+
+    facts = _merge_policy_facts(
+        ApiResult(True, "GET", "rules", data=[]),
+        ApiResult(status == 200, "GET", "protection", data=payload, status=status, message=message),
+    )
+    assert facts["classic_protection_compatible"] is compatible
+    assert facts["classic_protection_supported"] is supported
+
+
+@pytest.mark.parametrize("mode", ["merge", "conflict", "unknown", "unsupported", "slurped_unsupported"])
+def test_merge_contract_collects_effective_rules_and_skips_only_plan_limits(
+    monkeypatch: pytest.MonkeyPatch, mode: str,
+) -> None:
+    monkeypatch.syspath_prepend(str(PR_WORKFLOW_SCRIPTS))
+    from github_contract_engine.collectors.repository import collect_repository
+    from github_contract_engine.compare_states import compare_states
+    from github_contract_engine.compose_desired_state import compose_desired_state
+    from github_contract_engine.github_api import ApiResult
+
+    contract = PR_WORKFLOW_SCRIPTS.parent / "references/contracts/github-repo-deterministic-contract.json"
+    ids = {"process.default_branch_merge_only_rulesets", "process.default_branch_merge_commit_classic_protection"}
+    desired = compose_desired_state({"repo": str(contract)}, {"owner": "owner", "repo": "repo"}, {"repo": ids})
+    endpoint = "/repos/owner/repo/rules/branches/main?per_page=100"
+    request = next(r for r in desired["requests"] if "/rules/branches/" in r["endpoint"])
+    assert request["paginate"] is True
+    message = "Upgrade to GitHub Pro or make this repository public to enable this feature."
+    methods = ["squash"] if mode == "conflict" else ["merge"]
+    data = [{"type": "pull_request", "parameters": {"allowed_merge_methods": methods}}]
+    response = ApiResult(mode in {"merge", "conflict"}, "GET", endpoint, data=data, status=200)
+    if mode == "unknown":
+        response.status, response.message = 503, "Service unavailable"
+    if "unsupported" in mode:
+        response.status, response.message = 403, message
+        if mode == "slurped_unsupported":
+            response.message, response.raw_stdout = "gh: rejected (HTTP 403)", json.dumps([{"message": message}])
+    protection = ApiResult(False, "GET", "protection", status=404, message="Branch not protected")
+    fetched = {
+        ("GET", "/repos/owner/repo"): ApiResult(True, "GET", "repo", data={"default_branch": "main"}),
+        ("GET", endpoint): response,
+        ("GET", "/repos/owner/repo/branches/main/protection"): protection,
+    }
+    repo = collect_repository(fetched, {"owner": "owner", "repo": "repo", "default_branch": "main"}, {"available": False, "root": None, "files": [], "texts": {}, "workflows": {}}, desired["rules"])
+    findings = compare_states({"repository": repo}, desired)["findings"]
+    levels = {f["check_id"]: f["level"] for f in findings}
+    assert levels["process.default_branch_merge_only_rulesets"] == ("SKIP" if "unsupported" in mode else "ERROR" if mode in {"conflict", "unknown"} else "PASS")
+    assert levels["process.default_branch_merge_commit_classic_protection"] == "PASS"
+    if mode == "unknown" or "unsupported" in mode:
+        assert repo["rulesets"]["merge_policy"]["errors"]
+
+
+@pytest.mark.parametrize(("repo", "applies"), [
+    ({"archived": False, "fork": False, "visibility": "public"}, True),
+    ({"archived": False, "fork": False, "visibility": "private"}, False),
+    ({"archived": False, "fork": True, "visibility": "public"}, False),
+    ({"archived": True, "fork": False, "visibility": "public"}, False),
+])
+def test_auto_merge_applicability_survives_merge_only_contract(
+    monkeypatch: pytest.MonkeyPatch, repo: dict[str, Any], applies: bool,
+) -> None:
+    monkeypatch.syspath_prepend(str(PR_WORKFLOW_SCRIPTS))
+    from github_contract_engine.compare_states import compare_states
+
+    contract = PR_WORKFLOW_SCRIPTS.parent / "references/contracts/github-repo-deterministic-contract.json"
+    rule = next(r for r in json.loads(contract.read_text())["checks"] if r["id"] == "repo.merge_settings")
+    auto = next(a for a in rule["assertions"] if a["path"].endswith("/allow_auto_merge"))
+    repo = {**repo, "allow_auto_merge": False}
+    observed = {"repo": repo, "repository": {"repo": repo}, "owner": {"plan": {"name": "free"}}}
+    desired = {"rules": [{**rule, "assertions": [auto]}], "contracts": []}
+    assert compare_states(observed, desired)["findings"][0]["level"] == ("WARN" if applies else "PASS")

@@ -13,7 +13,6 @@ all-managed install, is therefore the convergence boundary after a hard crash.
 """
 
 # Manifest validation uses ValueError so transaction callers can collect failures.
-# ruff: noqa: TRY004
 from __future__ import annotations
 
 import argparse
@@ -26,15 +25,21 @@ import os
 import pathlib
 import re
 import shutil
-import stat
 import subprocess
 import sys
-import tempfile
 import time
 import uuid
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, cast
+
+# Use the same package for direct CLI calls and source-maintenance imports.
+scripts_root = str(pathlib.Path(__file__).resolve().parents[1])
+sys.path.insert(0, scripts_root)
+try:
+    from runtime import prepare_python_runtime as python_environments
+finally:
+    sys.path.remove(scripts_root)
 
 ROOT = pathlib.Path(__file__).resolve().parents[4]
 SECTION_MANIFEST = ROOT / "skills" / "skill-sections.json"
@@ -63,8 +68,6 @@ REMNANT_RE = re.compile(
 )
 TRANSIENT_WINDOWS_ERRORS = {32, 33}
 RENAME_ATTEMPTS = 4
-RUNTIME_VERSION_RE = re.compile(r"^[0-9a-f]{24}(?:-[0-9a-f]{8})?$")
-RUNTIME_PREDECESSOR_LIMIT = 2
 
 
 class TransactionError(RuntimeError):
@@ -250,7 +253,7 @@ def validate_manifest(
                 continue
             if (
                 not _safe_repo_pattern(rel_path)
-                or _unsafe_link(section_path)
+                or python_environments.is_runtime_link(section_path)
                 or not section_path.is_file()
             ):
                 errors.append(f"{skill_name}: invalid section path {rel_path}")
@@ -322,7 +325,7 @@ def action_assignments(
         skill_dir = repo_root / "skills" / skill
         _assert_inside(skill_dir, repo_root)
         parent = skill_dir / "SKILL.md"
-        if not parent.is_file() or _unsafe_link(skill_dir) or _unsafe_link(parent):
+        if not parent.is_file() or python_environments.is_runtime_link(skill_dir) or python_environments.is_runtime_link(parent):
             raise ValueError(f"{skill}: unavailable action index")
         lines = parent.read_text(encoding="utf-8").splitlines()
         if lines.count("### Action References") != 1:
@@ -347,7 +350,7 @@ def action_assignments(
                 raise ValueError(f"{label}: action target must be routed exactly once")
             source = skill_dir / relative
             _assert_inside(source, skill_dir)
-            if not source.is_file() or _unsafe_link(source.parent) or _unsafe_link(source):
+            if not source.is_file() or python_environments.is_runtime_link(source.parent) or python_environments.is_runtime_link(source):
                 raise ValueError(f"{label}: unavailable action reference")
             # Rendering also checks the reserved H1 and source-only boundary.
             render_action(source.read_text(encoding="utf-8"), "", label)
@@ -360,7 +363,7 @@ def action_assignments(
                     raise ValueError(f"{label}: invalid or unknown section assignment {name!r}")
                 path = repo_root / section
                 _assert_inside(path, repo_root)
-                if not path.is_file() or _unsafe_link(path.parent) or _unsafe_link(path):
+                if not path.is_file() or python_environments.is_runtime_link(path.parent) or python_environments.is_runtime_link(path):
                     raise ValueError(f"{label}: unavailable section {section}")
                 if path.resolve() in seen:
                     raise ValueError(f"{label}: duplicate or inherited section {name}")
@@ -460,406 +463,15 @@ def _assert_inside(path: pathlib.Path, parent: pathlib.Path) -> None:
         raise ValueError(f"path escapes its declared root: {path}") from exc
 
 
-def _unsafe_link(path: pathlib.Path) -> bool:
-    if path.is_symlink():
-        return True
-    if os.name != "nt":
-        return False
-    try:
-        attributes = getattr(
-            path.stat(follow_symlinks=False), "st_file_attributes", 0
-        )
-    except (AttributeError, FileNotFoundError, OSError):
-        return False
-    return bool(
-        attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
-    )
-
-
-def _materialize_python_interpreters(interpreter: pathlib.Path) -> None:
-    """Keep POSIX venv entrypoints inside the immutable runtime version.
-
-    uv normally links each Python name to an interpreter outside the version.
-    Copy the executable once and replace its aliases with hard links so both
-    repository handoff and uv's subsequent health check use regular files.
-    The caller owns removal of the new version if any replacement fails.
-    """
-    if os.name == "nt":
-        return
-    source = interpreter.resolve(strict=True)
-    aliases = sorted(
-        path for path in interpreter.parent.iterdir()
-        if path != interpreter and re.fullmatch(r"python(?:3(?:\.\d+)?)?", path.name)
-    )
-    if not source.is_file() or any(
-        not alias.is_file() or alias.resolve(strict=True) != source
-        for alias in aliases
-    ):
-        raise ValueError("shared skill runtime Python aliases disagree")
-    if interpreter.is_symlink():
-        scratch = interpreter.with_name(f".{interpreter.name}-{uuid.uuid4().hex}.tmp")
-        try:
-            shutil.copy2(source, scratch)
-            os.replace(scratch, interpreter)
-        finally:
-            scratch.unlink(missing_ok=True)
-    for alias in aliases:
-        if alias.is_symlink():
-            scratch = alias.with_name(f".{alias.name}-{uuid.uuid4().hex}.tmp")
-            try:
-                os.link(interpreter, scratch)
-                os.replace(scratch, alias)
-            finally:
-                scratch.unlink(missing_ok=True)
-
-
-def _running_process_paths() -> str | None:
-    """Return normalized executable paths, or None when they cannot be read.
-
-    Retention is conservative: an unavailable process inventory prevents old
-    runtime deletion. Windows reads process metadata in one query, avoiding slow
-    per-process image lookups without changing processes or elevating access.
-    """
-
-    if os.name == "nt":
-        powershell = shutil.which("powershell") or shutil.which("powershell.exe")
-        if powershell is None:
-            return None
-        try:
-            result = subprocess.run(
-                [
-                    powershell,
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-Command",
-                    "$ErrorActionPreference='Stop'; Get-CimInstance Win32_Process | ForEach-Object { $_.ExecutablePath }",
-                ],
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=15,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return None
-        if result.returncode:
-            return None
-        return result.stdout.casefold() if result.stdout.strip() else None
-
-    proc = pathlib.Path("/proc")
-    if proc.is_dir():
-        paths: list[str] = []
-        try:
-            processes = list(proc.iterdir())
-        except OSError:
-            return None
-        for process in processes:
-            if not process.name.isdigit():
-                continue
-            try:
-                paths.append(os.readlink(process / "exe"))
-            except OSError:
-                continue
-        return "\n".join(paths) if paths else None
-
-    ps = shutil.which("ps")
-    if ps is None:
-        return None
-    try:
-        result = subprocess.run(
-            [ps, "-axo", "comm="], capture_output=True, text=True, check=False,
-            timeout=15,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return result.stdout if result.returncode == 0 and result.stdout.strip() else None
-
-
-def _referenced_runtime_versions(
-    install_root: pathlib.Path, versions: pathlib.Path,
-) -> set[str] | None:
-    """Collect runtime versions pinned by installed skill manifests.
-
-    A malformed installed manifest makes pruning unsafe because it may be the
-    only remaining pointer to an older interpreter.
-    """
-
-    referenced: set[str] = set()
-    try:
-        skills = list(install_root.iterdir())
-        versions_root = versions.resolve()
-    except (OSError, RuntimeError):
-        return None
-    for skill in skills:
-        if not skill.is_dir() or _unsafe_link(skill):
-            continue
-        manifest = skill / MANIFEST_NAME
-        if not manifest.exists():
-            continue
-        if not manifest.is_file() or _unsafe_link(manifest):
-            return None
-        try:
-            value = json.loads(manifest.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            return None
-        runtime = value.get("python_runtime") if isinstance(value, dict) else None
-        if not isinstance(runtime, str):
-            continue
-        try:
-            path = pathlib.Path(runtime).resolve(strict=False)
-        except (OSError, RuntimeError):
-            return None
-        try:
-            relative = path.relative_to(versions_root)
-        except ValueError:
-            continue
-        if relative.parts and RUNTIME_VERSION_RE.fullmatch(relative.parts[0]):
-            referenced.add(relative.parts[0])
-    return referenced
-
-
-def _runtime_interpreter_path(version: pathlib.Path) -> pathlib.Path:
-    """Return the expected interpreter beneath one runtime version."""
-
-    scripts = "Scripts" if os.name == "nt" else "bin"
-    executable = "python.exe" if os.name == "nt" else "python"
-    return version / ".venv" / scripts / executable
-
-
-def _valid_runtime_version(version: pathlib.Path) -> bool:
-    """Return whether a runtime directory is complete and safe to retain."""
-
-    try:
-        interpreter = _runtime_interpreter_path(version)
-        return (
-            version.is_dir()
-            and not _unsafe_link(version)
-            and interpreter.is_file()
-            and not _unsafe_link(interpreter)
-        )
-    except OSError:
-        return False
-
-
-def _runtime_predecessors(
-    current: Mapping[str, object], versions: pathlib.Path, selected: str,
-) -> list[str]:
-    """Build the finite predecessor list, seeding legacy indexes by recency."""
-
-    result: list[str] = []
-
-    def add(value: object) -> None:
-        if not isinstance(value, str):
-            return
-        if (
-            value != selected
-            and value not in result
-            and RUNTIME_VERSION_RE.fullmatch(value)
-            and _valid_runtime_version(versions / value)
-        ):
-            result.append(value)
-
-    add(current.get("version"))
-    recorded = current.get("predecessors", [])
-    if isinstance(recorded, list):
-        for value in recorded:
-            add(value)
-    legacy: list[tuple[int, str]] = []
-    for path in versions.iterdir():
-        if (
-            path.name == selected
-            or not RUNTIME_VERSION_RE.fullmatch(path.name)
-            or not _valid_runtime_version(path)
-        ):
-            continue
-        try:
-            legacy.append((path.stat().st_mtime_ns, path.name))
-        except OSError:
-            continue
-    for _, name in sorted(legacy, reverse=True):
-        add(name)
-    return result[:RUNTIME_PREDECESSOR_LIMIT]
-
-
-def prune_python_runtime_versions(
-    install_root: pathlib.Path, selected_interpreter: pathlib.Path,
-) -> None:
-    """Retain the selected runtime and two predecessors after activation.
-
-    Installed-manifest references and running interpreters remain protected.
-    Failed or damaged version directories do not consume predecessor slots.
-    Any uncertain process or manifest state keeps the candidate for a later
-    successful deployment instead of risking a live helper.
-    """
-
-    version = selected_interpreter.parents[2]
-    versions = version.parent
-    if (
-        versions.name != "versions"
-        or not RUNTIME_VERSION_RE.fullmatch(version.name)
-        or any(_unsafe_link(path) for path in (versions, version))
-    ):
-        return
-    referenced = _referenced_runtime_versions(install_root, versions)
-    process_paths = _running_process_paths()
-    if referenced is None or process_paths is None:
-        return
-    index = versions.parent / "current.json"
-    try:
-        current = json.loads(index.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return
-    if not isinstance(current, dict) or current.get("version") != version.name:
-        return
-    predecessors = current.get("predecessors", [])
-    if not isinstance(predecessors, list) or any(
-        not isinstance(name, str) or not RUNTIME_VERSION_RE.fullmatch(name)
-        for name in predecessors
-    ):
-        return
-
-    candidates: list[tuple[str, pathlib.Path]] = []
-    for path in versions.iterdir():
-        if (
-            not RUNTIME_VERSION_RE.fullmatch(path.name)
-            or not path.is_dir()
-            or _unsafe_link(path)
-        ):
-            continue
-        runtime_python = _runtime_interpreter_path(path)
-        if runtime_python.exists() and _unsafe_link(runtime_python):
-            continue
-        candidates.append((path.name, path))
-
-    protected = {version.name, *referenced, *predecessors}
-    normalized_processes = process_paths.casefold() if os.name == "nt" else process_paths
-    for name, path in candidates:
-        if name in protected:
-            continue
-        needle = str(path.resolve(strict=False))
-        if os.name == "nt":
-            needle = needle.casefold()
-        if needle in normalized_processes:
-            continue
-        try:
-            shutil.rmtree(path)
-        except OSError:
-            continue
-
-    root = versions.parent
-    for scratch in root.glob(".current-*.tmp"):
-        if scratch.is_file() and not _unsafe_link(scratch):
-            scratch.unlink(missing_ok=True)
-
-
-def prepare_python_runtime(install_root: pathlib.Path) -> pathlib.Path | None:
-    """Prepare one immutable dependency version from source-only declarations.
-
-    Existing versions receive a read-only uv check. A damaged version is
-    replaced at a fresh path, so an already running helper keeps its files.
-    Failed new versions and index scratch files are removed by this call.
-    """
-
-    project = ROOT / "skills/sections/python"
-    declaration = project / "pyproject.toml"
-    lock = project / "uv.lock"
-    if not declaration.exists() and not lock.exists():
-        return None
-    if not declaration.is_file() or not lock.is_file() or any(_unsafe_link(path) for path in (project, declaration, lock)):
-        raise ValueError("source skill runtime requires regular pyproject.toml and uv.lock")
-    uv = shutil.which("uv")
-    if uv is None:
-        raise ValueError("uv is required to prepare the shared skill Python runtime")
-    digest = hashlib.sha256(declaration.read_bytes() + b"\0" + lock.read_bytes()).hexdigest()
-    root = install_root.parent / "runtimes/ceratops"
-    versions = root / "versions"
-    if any(_unsafe_link(path) for path in (root, versions)):
-        raise ValueError("shared skill runtime path cannot be a link")
-    versions.mkdir(parents=True, exist_ok=True)
-    index = root / "current.json"
-    if index.is_symlink() or index.is_junction() or _unsafe_link(index):
-        raise ValueError("shared skill runtime index cannot be a link")
-    current: dict[str, object] = {}
-    if index.is_file():
-        current = json.loads(index.read_text(encoding="utf-8"))
-        if not isinstance(current, dict):
-            raise ValueError("shared skill runtime index is invalid")
-    # A 96-bit directory key keeps nested Windows test and task paths below
-    # CreateProcess path limits; current.json retains the full lock digest.
-    version = digest[:24]
-    if current.get("digest") == digest:
-        recorded = current.get("version")
-        if isinstance(recorded, str) and RUNTIME_VERSION_RE.fullmatch(recorded):
-            version = recorded
-    environment = os.environ.copy()
-    for key in ("PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV", "UV_PROJECT", "UV_PROJECT_ENVIRONMENT", "UV_WORKING_DIRECTORY", "UV_NO_SYNC", "UV_FROZEN", "UV_PYTHON"):
-        environment.pop(key, None)
-    environment["PYTHONNOUSERSITE"] = "1"
-    environment["PYTHONDONTWRITEBYTECODE"] = "1"
-    scripts = "Scripts" if os.name == "nt" else "bin"
-    executable = "python.exe" if os.name == "nt" else "python"
-
-    def interpreter(name: str) -> pathlib.Path:
-        return versions / name / ".venv" / scripts / executable
-
-    selected = versions / version
-    environment["UV_PROJECT_ENVIRONMENT"] = str(selected / ".venv")
-    if selected.is_symlink() or selected.is_junction():
-        raise ValueError("shared skill runtime version cannot be a link")
-    if selected.exists():
-        if _unsafe_link(selected):
-            raise ValueError("shared skill runtime version cannot be a link")
-        checked = subprocess.run(
-            [uv, "sync", "--quiet", "--project", str(project), "--locked", "--check", "--no-active"],
-            env=environment, capture_output=True, text=True, check=False,
-        )
-        if checked.returncode or not interpreter(version).is_file() or _unsafe_link(interpreter(version)):
-            version = digest[:24] + "-" + uuid.uuid4().hex[:8]
-            selected = versions / version
-            environment["UV_PROJECT_ENVIRONMENT"] = str(selected / ".venv")
-    if not selected.exists():
-        result = subprocess.run(
-            [uv, "sync", "--quiet", "--project", str(project), "--locked", "--no-active"],
-            env=environment, capture_output=True, text=True, check=False,
-        )
-        if result.returncode or not interpreter(version).is_file():
-            if selected.exists():
-                shutil.rmtree(selected)
-            raise ValueError("shared skill runtime setup failed: " + (result.stderr or result.stdout).strip()[-1000:])
-        if os.name != "nt":
-            try:
-                _materialize_python_interpreters(interpreter(version))
-                checked = subprocess.run(
-                    [uv, "sync", "--quiet", "--project", str(project), "--locked", "--check", "--no-active"],
-                    env=environment, capture_output=True, text=True, check=False,
-                )
-                if checked.returncode:
-                    raise ValueError("shared skill runtime health check failed: " + (checked.stderr or checked.stdout).strip()[-1000:])
-            except (OSError, ValueError):
-                shutil.rmtree(selected)
-                raise
-    temporary: pathlib.Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=root, prefix=".current-", suffix=".tmp", delete=False) as handle:
-            temporary = pathlib.Path(handle.name)
-            json.dump({
-                "digest": digest,
-                "predecessors": _runtime_predecessors(current, versions, version),
-                "version": version,
-            }, handle, sort_keys=True)
-        os.replace(temporary, index)
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
-    return interpreter(version)
 
 
 def validate_tree_links(root: pathlib.Path) -> None:
     """Reject links or reparse points anywhere in one generated tree."""
 
-    if _unsafe_link(root):
+    if python_environments.is_runtime_link(root):
         raise ValueError(f"unsafe runtime tree root: {root}")
     for path in root.rglob("*"):
-        if _unsafe_link(path):
+        if python_environments.is_runtime_link(path):
             raise ValueError(f"unsafe runtime tree entry: {path}")
 
 
@@ -867,13 +479,13 @@ def copy_path(source: pathlib.Path, target: pathlib.Path) -> None:
     """Copy one manifest-declared payload under its repository-relative path."""
 
     _assert_inside(source, ROOT)
-    if _unsafe_link(source):
+    if python_environments.is_runtime_link(source):
         raise ValueError(f"runtime payload cannot be a link: {source}")
     if source.is_dir():
         for child in source.rglob("*"):
             if any(part in IGNORE_NAMES for part in child.parts):
                 continue
-            if _unsafe_link(child):
+            if python_environments.is_runtime_link(child):
                 raise ValueError(f"runtime payload cannot contain links: {child}")
             rel = child.relative_to(source)
             destination = target / rel
@@ -973,7 +585,7 @@ def install_target_error(
 
     if not path.exists() and not path.is_symlink():
         return None
-    if _unsafe_link(path):
+    if python_environments.is_runtime_link(path):
         return f"refusing to replace unmanaged runtime skill link: {path}"
     if not path.is_dir() or not (path / MANIFEST_NAME).is_file():
         return f"refusing to replace unmanaged runtime skill folder: {path}"
@@ -1002,7 +614,7 @@ def enable_windows_acl_inheritance(path: pathlib.Path) -> None:
 
     if os.name != "nt":
         return
-    result = subprocess.run(
+    result = python_environments.write_locks.run_protected_command(
         ["icacls", str(path), "/inheritance:e", "/T", "/C"],
         capture_output=True,
         check=False,
@@ -1167,7 +779,7 @@ def rename_with_retry(source: pathlib.Path, target: pathlib.Path) -> None:
 def _remove_tree(path: pathlib.Path, install_root: pathlib.Path) -> None:
     _assert_inside(path, install_root)
     if path.exists() or path.is_symlink():
-        if _unsafe_link(path):
+        if python_environments.is_runtime_link(path):
             raise RuntimeError(f"refusing to remove unsafe runtime path: {path}")
         shutil.rmtree(path)
 
@@ -1190,7 +802,7 @@ def _remnants(
                     phase="recovery",
                 )
             continue
-        if _unsafe_link(path) or not path.is_dir():
+        if python_environments.is_runtime_link(path) or not path.is_dir():
             raise TransactionError(
                 f"unsafe transaction remnant: {path.name}",
                 phase="recovery",
@@ -1323,7 +935,7 @@ def same_source_stale(
     if not install_root.is_dir():
         return stale
     for path in install_root.iterdir():
-        if path.name.startswith(".") or _unsafe_link(path) or not path.is_dir():
+        if path.name.startswith(".") or python_environments.is_runtime_link(path) or not path.is_dir():
             continue
         if not (path / MANIFEST_NAME).is_file() or path.name in source_names:
             continue
@@ -1487,11 +1099,12 @@ def install_transaction(
 
         try:
             python_skills = selected_python_skills(manifest, deploy_names)
-            python_runtime = prepare_python_runtime(install_root) if python_skills else None
+            python_runtime = python_environments.prepare_python_runtime(ROOT, install_root) if python_skills else None
             if python_skills and python_runtime is None:
                 raise ValueError("declared Python skills require the source locked project")
         except (OSError, ValueError, json.JSONDecodeError) as exc:
-            raise TransactionError(str(exc), phase="runtime_prepare") from exc
+            detail = getattr(exc, "command_failure", None)
+            raise TransactionError(json.dumps(detail) if detail else str(exc), phase="runtime_prepare") from exc
 
         transaction_id = uuid.uuid4().hex
         deployed_paths: dict[str, pathlib.Path] = {}
@@ -1545,7 +1158,7 @@ def install_transaction(
                     retained.append(retired.name)
             if python_runtime is not None:
                 try:
-                    prune_python_runtime_versions(install_root, python_runtime)
+                    python_environments.prune_python_runtime_versions(install_root, python_runtime)
                 except (OSError, RuntimeError, subprocess.SubprocessError):
                     pass
             status = "cleanup_blocked" if retained else "ok"

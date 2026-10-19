@@ -13,9 +13,12 @@ import json
 import os
 import pathlib
 import re
+import runpy
 import subprocess
+import sys
 from collections.abc import Callable, Mapping, Sequence
 
+_result_writer = runpy.run_path(str(pathlib.Path(__file__).resolve().parents[1] / "result_records.py"))
 TEST_CONTEXT_ENV = "CERATOPS_SDLC_TEST_CONTEXT"
 
 
@@ -34,13 +37,14 @@ def parse_request(argv: Sequence[str] | None) -> tuple[argparse.Namespace, str |
     parser.add_argument("--validate-manifest", action="store_true")
     parser.add_argument("--worktree", action="store_true")
     parser.add_argument("--write-collection", type=pathlib.Path)
+    _result_writer["add_result_arguments"](parser)
     args = parser.parse_args(list(argv) if argv is not None else None)
     args.context = None
     modes = sum((bool(args.targets), args.all, args.auto, args.validate_manifest,
                  args.worktree, args.write_collection is not None,
                  args.reconcile_collection is not None,
                  args.base is not None or args.head is not None))
-    if (modes != 1 or ((args.base is None) != (args.head is None))
+    if ((modes != 1 and not (modes == 0 and (args.describe_test_results or args.probe_command))) or ((args.base is None) != (args.head is None))
             or (args.node_map is not None and args.reconcile_collection is None)
             or (args.select_only and not (args.worktree or args.base is not None))):
         return args, (
@@ -116,3 +120,31 @@ def validate_execution_context(
         if result.returncode or result.stdout.strip() != expected:
             return "promotion test context does not match the checked-out branch and commit"
     return None
+
+
+def run_recorded_request(
+    args: argparse.Namespace, callback: Callable[[], int], *,
+    repo_root: pathlib.Path, request_error: str | None = None,
+    checks: Callable[[], object] | None = None,
+) -> int:
+    """Keep custom selection/output while the declared runner writes outcomes."""
+    if args.describe_test_results:
+        _result_writer["describe_result_contract"]()
+        return 0
+    if args.probe_command is not None and request_error is None:
+        try:
+            command = json.loads(args.probe_command)
+            if (not isinstance(command, list) or not command
+                    or any(not isinstance(item, str) or "\0" in item for item in command)
+                    or not command[0]):
+                raise ValueError("probe-command must be a nonempty JSON argv")
+        except (TypeError, ValueError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        def callback() -> int:
+            return subprocess.run(command, check=False).returncode
+    return _result_writer["run_recorded_check"](callback, args, {
+        "targets": list(args.targets), "all": args.all, "auto": args.auto,
+        "base": args.base, "head": args.head, "worktree": args.worktree,
+        "select_only": args.select_only, "probe_command": args.probe_command,
+    }, repo_root=repo_root, checks=checks)

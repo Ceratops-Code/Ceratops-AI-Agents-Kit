@@ -90,6 +90,11 @@ def runtime_files(
     # Compatibility inspects native Ruff settings even when a custom runner
     # owns the repository checks; its locked environment must provide Ruff.
     dependencies: set[str] = {"ruff"}
+    # Skill repositories need the standalone bootstrap's TOML editor. Other
+    # repository runtimes retain their existing dependency requirements.
+    skills = root / "skills"
+    if skills.is_dir() and any((path / "SKILL.md").is_file() for path in skills.iterdir()):
+        dependencies.add("tomlkit")
     # Preserved runners own their framework dependencies. Only the runner this
     # transaction generates has a known pytest dependency.
     if generate_python_test_runner:

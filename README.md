@@ -20,7 +20,34 @@ or another governing contract.
 | `ceratops-mcp-server-lifecycle` | Create and package local Python MCP servers, bootstrap the deployment manager, install exact releases, update servers, and inspect versions. |
 | `ceratops-automation-run` | Run recurring automations with shared Ceratops alert, memory, and completion policy. |
 | `ceratops-task-lifecycle` | Route failed-fix-loop breaks, same-thread task resume, whole-task handoff, aggregate worktree status tables, and closure checks across action references. |
-| `ceratops-code-consistency-audit` | Audit merged refactors for contradictions, docs drift, comment sufficiency, stale follow-through, and merged-only edge cases. |
+| `ceratops-code-consistency-audit` | Audit merged refactors for contradictions, docs drift, comment sufficiency, stale follow-through, and merged-only edge cases, with skill-owned repository preflight and cleanup. |
+
+Repository health audits accept one repository, an explicit list, or all
+repositories in caller-supplied scope data. The repository-lifecycle skill owns
+scope collection and bounded batch execution through
+`scripts/audit_repository_health.py` in that skill. Its current evidence lives
+under `<projects-root>/tmp/Ceratops-AI-Agents-Kit/<task-id>` until the model
+finishes result handling and any requested code-consistency handoff; the health
+cleanup entrypoint then removes only its declared files and empty task root.
+
+The code-consistency skill owns `scripts/prepare_repository_audit.{cmd,py}` in
+its own bundle. Preflight discovers the Git root, runtime commands and declared
+checks without running them. It owns the returned
+`<repo-parent>/tmp/<repo-name>/<task-id>` directory and optional evidence until
+its cleanup entrypoint removes matching evidence and empty directories. Unknown
+contents or links block cleanup. Both operations support fresh calls after an
+interruption and preserve unrelated output. The two skills exchange repository
+results through the model; their scripts remain inside their own skill.
+
+Dependency queue finalization stages approved PR heads together in a thread
+worktree and publishes through `release/local` using the existing promotion
+and shipping workflow. It processes every eligible update in a repository;
+changed PR heads still need new preflight approval. The
+`--include-unpublished-release OWNER/REPO=COMMIT` option carries explicit
+authority for unrelated work at that exact release commit. Fresh calls inspect
+current Git and GitHub state after interruption, without replaying a completed
+publication. Automation scope, snapshot/sync adapters and report paths remain
+caller-owned through `--automation-dir`.
 
 ## Layout
 
@@ -29,8 +56,20 @@ keeps its editable source under `mcp-servers/`. Every deployed MCP server owns
 `%USERPROFILE%\.codex\mcp\<mcp-server-name>` with its packages, environments,
 and state; Python and uv are validated global prerequisites. Its CLI and local
 MCP adapters share
-one engine. The MCP server lifecycle skill contains instructions only; the existing
-skill installer continues to own `.codex` skill deployment.
+one engine. The MCP server lifecycle skill supplies its action instructions and
+`scripts/install-mcp-server.py`, which calls that manager and reports completion;
+the existing skill installer continues to own `.codex` skill deployment.
+
+The MCP installation callable returns failure JSON; its CLI writes the same JSON
+to stderr and exits 1. `diagnostics` names the selected server, command arguments,
+Python runtime, working directory, exit status, causes and separate stdout/stderr.
+Empty streams and unavailable information are explicit; secrets are redacted.
+Malformed completion output, even after exit 0, means the installation outcome
+is unknown, not that installation did nothing. The helper never retries it.
+If installation receipts already matched but writing the completion output fails,
+the error reports installation as completed. Successful receipt fields are unchanged.
+No new diagnostic files are created here; the repository operation owns any saved
+failure report.
 
 ```text
 skills/
@@ -108,10 +147,12 @@ contracts. `skills/ceratops-skill-lifecycle/references/` owns
 skill-design contracts and skill source-doc tracking. The
 `skills-contract-review` action refreshes those contracts against registered
 best-practice evidence; it does not audit skills or run the source validator.
-The `source-validate` action owns deterministic source validation through the
-existing validator in its skill bundle, with `full`, selected `skill`, and
-shared `sections` modes. Deployment requires its passing `full` result for
-unchanged source inputs. The separate `skills-consistency-review` action audits
+The `source-validate` action checks source through the existing helper in its
+skill bundle, with `full`, selected `skill`, and shared `sections` modes.
+The managed installer runs that source check itself before installation: `full`
+for all managed skills, or `skill` for the exact selected or base-derived set.
+Removal-only, empty affected-set and inventory requests do not install source
+and do not run that check. The separate `skills-consistency-review` action audits
 one direct manifest-backed
 installed skill, regardless of its name, against the contracts and checks its
 coupled metadata, action references, automation consumers, helpers, installer,
@@ -134,7 +175,7 @@ without repository deduplication.
 | `tools/source_search_mcp.py` | Read-only local STDIO `source_search` adapter using the pinned MCP SDK; exposes overview, complete paginated files, and selected-file inspect within an 8,000-byte tool-result ceiling. The MCP lifecycle skill packages and installs its declared release. See [installation and search semantics](hooks/README.md#bounded-source-search). |
 | `hooks/preserve-eol-for-apply-patch-tool.py` | Preserves each updated text file's existing encoding and uniform line-ending convention around `apply_patch`. |
 | `hooks/windows-shell-sanity.py` | Repository-owned source for the user-global Windows PowerShell preflight; rewrites exact command defects, annotates ordinary failures, and blocks unreliable or policy-prohibited forms. |
-| `scripts/deploy-skills.py` | Independent installation and updates; renders selected skills and overlays their files without validation, retirement, or lifecycle runtime calls. |
+| `scripts/deploy-skills.py` | Independent installation and updates; renders selected skills, overlays their files, and adds missing native command roots. See [native command roots](#native-command-roots). |
 | `scripts/deploy-hooks.py` | Independent hook installation and updates; copies the repository hook payloads and merges their registrations while preserving unrelated files and configuration. Does not grant trust or restart Codex. |
 | `scripts/deploy-mcp-server-manager.py` | Install the checkout's declared MCP server manager version, including over an existing installation, from the scripts environment; uses the manager's global Python and uv prerequisites, temporary locked libraries, and packaging and deployment code. Never changes Codex settings. |
 | `scripts/testing/run-tests.py` | Sole test-selection, collection-reconciliation, and pytest-execution owner; validates `tests/test-impact.json`, explains deterministic Git-diff selection, rejects mapping gaps before pytest collection or execution, supports explicit committed-diff, worktree, collection, and `--all` modes, adds `--select-only` to check diff/worktree mapping without pytest, and saves failed-pytest streams and structured pre-test failures with captured command output through `--diagnostic-output`; pytest output remains bounded in the console, with live test names and completed counts on stderr. |
@@ -150,8 +191,9 @@ without repository deduplication.
 | `skills/ceratops-repo-lifecycle/references/templates/validate-repository.py.tmpl`, `validate.yml.tmpl`, and `run-actionlint.py.tmpl` | Repository-neutral validation templates created only when their target files are absent; new validation setups receive a pinned, checksum-verified actionlint runner, and setups without JavaScript package-manager files also receive locked Markdown dependencies and default rules. Existing tooling, Markdown settings, and exclusive validators are preserved. |
 | `skills/ceratops-repo-lifecycle/scripts/ceratops_repo_compatibility_engine/` | Skill-owned package with the shared compatibility-contract loader, read-only compatibility checks, SDLC-contract validation, rollback-protected Ceratops compatibility application, and version-only bootstrap synchronization; it operates on explicit target repositories and is never copied into them. |
 | `skills/ceratops-repo-lifecycle/references/templates/skill-sections.json.tmpl` | Repository-neutral template for creating a target repository's live `skills/skill-sections.json`; never a live manifest. |
-| `skills/ceratops-skill-lifecycle/scripts/runtime/install-managed-skills.py` | Classifies exact affected sets, owns direct-manifest inventory and explicit prior-owner migration, and invokes one runtime transaction; emits commit-bound completion evidence and finalizes saved promotion handoffs with optional repeated `--deployment-evidence` sibling receipts, without replaying deployment. |
+| `skills/ceratops-skill-lifecycle/scripts/runtime/install-managed-skills.py` | Owns the managed deployment callable and its CLI: checks request inputs and the exact source selection before one runtime transaction; handles inventory and explicit prior-owner migration; emits commit-bound completion evidence and finalizes saved promotion handoffs with optional repeated `--deployment-evidence` sibling receipts. Cleanup failure preserves the installation receipt and cleanup-only call, without reinstalling. |
 | `skills/ceratops-skill-lifecycle/scripts/runtime/managed_runtime_builder.py` | Stages, activates, rolls back, recovers, and cleans one locked selected-skill runtime transaction. |
+| `skills/ceratops-skill-lifecycle/scripts/runtime/prepare_python_runtime.py` | Prepares the pinned Python environment and prunes unreferenced older environments; the builder calls it inside the existing installation transaction. |
 | `skills/ceratops-skill-lifecycle/scripts/skill-update-workflow.py` | Prints normal results and errors as UTF-8 under Windows legacy output encodings. Initializes ordinary updates from repeated skill/path groups and UTF-8 command files, or opens caller-owned requests. It discovers one unfinished skill change per worktree, records approved scope against the original baseline, saves immutable state/check generations, and drives verification to one next action. Scope expansion and failed-request replacement preserve the original baseline; exact passed checks are reused, and close consumes saved success without rechecking source. The caller edits, commits and requests promotion/deployment separately; this helper never runs repository tests. |
 | `skills/ceratops-skill-lifecycle/scripts/skill_update_checks.py` | Runs declared checks without a shell, records deterministic search applicability for safe reuse, and carries failure evidence to the update workflow. Failed pytest checks print test identities and reported errors from the same run, preserve complete structured failure details before scratch cleanup, mark bounded output, and use the captured terminal diagnostic when the native report is unavailable. |
 | `skills/ceratops-skill-lifecycle/scripts/skill_update_scratch.py` | Supplies subprocess-only temporary-directory settings under the verified task-temp root and removes its unique check folder after success or failure; cleanup errors block verification while preserving check evidence, and recorded residue is retried before new checks. Explicit paths in check arguments remain caller-owned. |
@@ -168,20 +210,25 @@ without repository deduplication.
 | `skills/ceratops-governance-lifecycle/scripts/apply_rules_update.py` | Prepares complete rule, history and TOML outputs, embeds acceptance in one application request, and applies its saved bytes using integrity comparisons and rollback. Completed-write retries perform no writes or content checks; successful application removes only the declared disposable request. |
 | `skills/ceratops-governance-lifecycle/scripts/validate_rule_candidate.py` | Checks new candidate text once; formatting stability, protected-token preservation and untouched source slices are producer invariants covered by behavior tests. `--accept` freezes complete outputs and original check results, including history-only repairs. |
 | `skills/ceratops-governance-lifecycle/scripts/rule_candidate_source.py` | Owns exact UTF-8 source loading, encoding and line-ending preservation, shared candidate data, and input-integrity checks used by governance validation and application. |
-| `skills/ceratops-governance-lifecycle/scripts/proposal-workflow.py` | Initializes exact proposals and records semantic decisions. At convergence, its driver generates one application request and invokes the updater when authorized. Proposal-only runs retain that file for approval; generation or application failures retain recovery inputs. Successful completion cleans owned iteration artifacts and preserves caller inputs. |
+| `skills/ceratops-governance-lifecycle/scripts/proposal-workflow.py` | Initializes exact proposals and records semantic decisions. Pending review output includes candidate edit fields, applicable history-entry examples, the assessment format, and a submission command. At convergence, its driver generates one application request and invokes the updater when authorized. Proposal-only runs retain that file for approval; generation or application failures retain recovery inputs. Successful completion cleans owned iteration artifacts and preserves caller inputs. |
+| `skills/ceratops-governance-lifecycle/scripts/read_proposal_requests.py` | Owns proposal request and construction-source input checks, exact source reading, and task-temp path boundaries. The command driver owns iteration effects, publication, acceptance, and cleanup. |
 | `skills/ceratops-governance-lifecycle/scripts/iteration_controller.py` | Opens structured candidates, invokes mechanical validation before recording, retains the exact validated champion, enforces stopping, and safely finalizes owned artifacts. |
 | `skills/ceratops-governance-lifecycle/scripts/rule_graph.py` | Parses canonical AGENTS rules and rejects structural syntax or rule-local explicit-user override escape clauses. |
 | `skills/ceratops-repo-lifecycle/scripts/github_contract_engine/` | Package CLI for compact local audit snapshots, contract evaluation, shared GitHub API access, sanitized evidence, and evidence-gated CodeQL disposition. |
-| `skills/ceratops-repo-lifecycle/scripts/github_pr_workflow/` | Package CLI for individual PR operations, opt-in scoped branch/stage/commit preparation and checked draft or fork PR publication in `ensure_pr.py`, bounded standalone review and CI inspectors with caller-owned evidence files, shared readiness-owned CI diagnostics, one-call retry-safe review replies and resolutions, decision-complete gate blockers, single-snapshot terminal Actions outage detection, exact-commit checkpointed shipping, four-proof obsolete-prepared-checkpoint cleanup before automatic resume, scoped pending-work checks, concurrent gates, integrated admin merge, reusable-branch restoration, and terminal cleanup. |
+| `skills/ceratops-repo-lifecycle/scripts/github_pr_workflow/` | Package CLI for individual PR operations, opt-in scoped branch/stage/commit preparation and checked draft or fork PR publication in `ensure_pr.py`, bounded standalone review and CI inspectors with caller-owned evidence files, shared readiness-owned CI diagnostics, one-call retry-safe review replies and resolutions, decision-complete gate blockers, single-snapshot terminal Actions outage detection, exact-commit checkpointed shipping, four-proof obsolete-prepared-checkpoint cleanup before automatic resume, scoped pending-work checks, concurrent gates, integrated admin merge, reusable-branch restoration, and terminal cleanup. Dependency preflight reads exact-head CheckRun annotations even for successful jobs, counts notices separately, retains up to fifty warning/failure messages per PR in its current report, reports omitted-message counts, and blocks the affected PR when annotation reads are unavailable. Dependency release batches require merge commits so every approved update remains an ancestor of the published branch. |
 | `skills/ceratops-repo-lifecycle/scripts/promote-repository.py` | Prepares the required local `release/local` promotion branch and rejects repositories where `refs/heads/release` occupies that namespace; promotes selected branches with no deployment or an explicit ordered operation selection; or composes promotion into exact-head shipping with ordered release and deploy selections, finalization, and cleanup; checks live publication before rebasing only task commits while preserving shared history; records outcomes, recreating the output directory at save time when needed, and finalizes verified promotion-only or bound deployment results within the task temp root without replay. |
+| `skills/ceratops-repo-lifecycle/scripts/git_branch_operations.py` | Imported local branch/worktree lookup, checkout restoration, rebase, fast-forward and alignment functions shared by promotion, sync and Ship; no CLI or lock acquisition. |
 | `skills/ceratops-repo-lifecycle/scripts/check_deployment_receipts.py` | Checks closed deployment receipts for promotion finalization, preserving MCP server underscores while keeping skill identities unchanged; rejects mismatched records, unfinished cleanup and duplicate identities without running installation or publication. |
 | `skills/ceratops-repo-lifecycle/scripts/manage-pending-work.py` | Records, checks, automatically resumes the retained target commit, and progressively finalizes the exact selected scope; preflight preserves and reports non-cleanup-eligible worktrees, while eligible residual-worktree and identity-matched task-temp cleanup delegates bounded removal to `pending-work-cleanup.py`. |
 | `skills/ceratops-repo-lifecycle/scripts/pending-work-cleanup.py` | Checks named directory boundaries, preserves active skill-update state, and removes selected residual and task-temp trees after clearing read-only Windows files and directories without traversing links. |
 | `skills/ceratops-repo-lifecycle/scripts/action.yml` | GitHub composite action that runs declared validation and, by default, tests using the skill-owned SDLC engine; `run-tests: false` permits validation-only CI when tests require an interactive desktop. CI defers skill handoffs and retains failure evidence. |
 | `skills/ceratops-repo-lifecycle/scripts/repository_operation.py` | Single capability runner: resolves complete YAML locations, prevalidates ordered argv/parameters/cwd, runs applicable validation and test gates before deployment or publication, and retains bounded structured step results separately from command completion; skill callers execute registered handoffs and CI defers them. |
-| `skills/ceratops-repo-lifecycle/scripts/ship-repository.py` | Prevalidates one SDLC contract and ordered phase selections, runs declared CI test selection against freshly fetched base and exact staged head commits before push, and orchestrates guarded GitHub shipping, main synchronization, per-operation publication and deployment checkpoints, and resumable selected-source cleanup. |
+| `skills/ceratops-repo-lifecycle/scripts/execute_skill_actions.py` | Runs a skill action's declared commands for the repository runner. Selects ordinary, named-skill or package-backed MCP arguments before any command starts. MCP package selection uses the SDLC prerequisites, exact project pin, one existing wheel and its canonical package lock; it never builds or tests an artifact. Preserves installed/source agreement and pinned Python execution, and returns step results and complete failure-report paths. It calls the owning skill's implementation; it does not install skills itself. |
+| `skills/ceratops-repo-lifecycle/scripts/ship-repository.py` | Public Ship argument parser and JSON/exit-code adapter; calls `github_pr_workflow/ship_repository.py`. |
+| `skills/ceratops-repo-lifecycle/scripts/github_pr_workflow/ship_repository.py` | Callable Ship orchestration and shared inputs/errors, used by both the CLI and Promote: SDLC checks, direct GitHub workflow calls, publication, installation and cleanup. |
 | `skills/ceratops-repo-lifecycle/scripts/rename-repository-path.py` | Plans or applies tracked file renames and exact filename references; accepts explicit or Git-detected rename pairs, updates relative Markdown links, blocks ambiguous references, preserves the index and text bytes outside replacements, and compensates caught file errors. |
 | `skills/ceratops-skill-lifecycle/scripts/skills-consistency-source-validator.py` | Source, metadata, runtime-input, contract, and portability validator invoked by source-validate and explicit skill workflows. It accepts optional skill-local `README.md` design documentation and a matching relative README Skills-table link. Full validation and selected skill-lifecycle validation check the deterministic contract against its closed schema, supported command arguments, and existing helper paths. The schema identifies descriptive fields as annotations; validation never executes contract-supplied commands. |
+| `skills/ceratops-skill-lifecycle/scripts/check_skill_runtime_inputs.py` | Checks runtime payload paths, shared Python declarations, and source files destined for installed skills. Imported by the source checker with an explicit repository and skill selection; writes no files and adds no separate command. |
 | `skills/ceratops-skill-lifecycle/scripts/skill_update_state.py` | Owns update state, filesystem boundaries and cleanup-record validation; successful successor finalization removes only unchanged inherited disposable records and preserves protected inputs. |
 | `skills/ceratops-skill-lifecycle/scripts/fast-change.py` | Classifies exact structured replacements, generates their diff, and owns the eligible direct-release change through declared Markdown lint, exact helper tests, targeted installation, commit, and failure compensation. |
 
@@ -229,10 +276,36 @@ are setup metadata; declaring them does not install dependencies. Bootstrap
 operations perform declared setup, and uv prepares the environment for commands
 invoked through it. SDLC v4/v5 handoffs name a skill/action. For skill callers,
 the engine resolves the installed skill's `references/action-executors.json` and
-runs its declared argv or ordered steps; unresolved routes block dependent work.
+runs its declared argv or ordered steps through `execute_skill_actions.py`.
+Each action declares `run`, ordered `steps`, or an explicit Python `call`.
+A `call` names its skill-relative `path`, public `function`, `request` type and
+CLI `args`; the existing parser supplies that request, and the same callable
+serves the standalone CLI. This form shares the caller's release lock instead
+of starting an installer process that would compete with its parent.
+Installed calls require the caller's interpreter to match the skill's pinned
+runtime. An optional `selected-skill` object declares a separate form for
+requests containing `inputs.skill`; `selected-mcp-server` supplies
+`{mcp_server}` for MCP installation.
+Only that explicit input supplies `{skill}`. Missing or malformed selected-skill
+commands return `handoff_required` before any command runs, never an all-skills
+fallback. The runner checks every selected command first and does not recognize
+skill script filenames or inject selection flags. Unresolved routes block
+dependent work. Deployment still performs its source check inside the installer;
+receipt-only installation is planned in refactor step 19, not implemented here.
 CI uses `--ci`, never dispatches skills, and reports deferred handoffs
 separately. SDLC versions 1 through 3 are rejected and must be upgraded before
 lifecycle execution.
+An SDLC v4/v5 `build` may declare `result-commit-field: resultCommit` when its
+final command commits native build records. Its complete JSON stdout must have
+a nonempty `schema`, status `OK` or `passed`, and that field naming the exact
+clean final Git HEAD descended from the prepared commit. The operation keeps
+`commit` as its input identity and reports `result_commit` separately; existing
+check acceptance keeps its original identities. Such a build must be the last
+selected operation, so later work needs a fresh call with current Git inputs.
+A missing supported starting Git HEAD stops the build before any command runs.
+Malformed output retains completed effects and blocks continuation; it never
+causes automatic replay. Other actions retain the frozen-HEAD guard. This narrow
+contract does not allocate versions or replace native package records.
 Ceratops skill handoffs are declared on each named skill. Skill source
 validation at `deliverables.skills.<name>.actions.validate` hands off to
 `ceratops-skill-lifecycle/source-validate`; its skill-owned binding invokes the
@@ -370,39 +443,50 @@ a recorded file rather than compared with today's working folder. Missing,
 unfinished, failed, malformed, wrong-identity or corrupt records and files fail
 closed. This reader is internal and does not yet switch public deployment.
 
-The separate internal versioned route starts only after the operation owner has
-created pre-test checkpoint B and completed build-independent checks. One short
-store-lock section reserves the complete unit/version/required-target set for a
-single attempt. Builds continue in the existing worktree and write directly to
-that version's final target directories; `measure_versioned_artifact` records
-the bytes artifact tests consume. After successful qualification,
-`prepare_versioned_receipt` rechecks every retained artifact, dependency and
-evidence file and writes each target's canonical v3 receipt directly to its
-final worktree path. `complete_versioned_build` validates declared inputs and
-all prepared bytes, creates or recovers exact result-only commit C, writes every
-artifact receipt and creates the immutable version tag. It derives recovery from
-the reservation and validated final effects; it has no pending journal or
-helper-owned output staging.
+The internal versioned route selects its final directory before preparing source
+versions or commit B. `allocate_versioned_build` exclusively creates
+`<git-common-dir>/ceratops/artifacts/<unit>/<version>/` for all required targets.
+An occupied directory or existing version tag advances an alpha/beta number;
+other filesystem errors retain their cause. An occupied final version requires
+a new explicit version choice. No allocation lock, hash suffix or separate
+reservation file is used.
 
-An existing reservation can be resumed only when recovery explicitly selects
-the same repository, worktree, unit, version, targets and B. The saved attempt ID
-is discovered when omitted; a supplied ID must match. New reservations still
-require their receipt attempt ID, not a separate checkpoint operation ID. Any
-partial, unreadable or mismatched ownership state reports `recovery_required`;
-an available lock, missing process or elapsed time never adopts or deletes it.
-One worktree has one unfinished artifact request, grouped by repository, branch
-and B. It may reserve multiple units, with one unfinished version per unit.
-Another worktree may own an independent version. The legacy v2 producer keeps
-its supported full-transaction lock and delete-recognizable-staging behavior;
-that cleanup is never applied to direct versioned output.
+The caller embeds the selected version in its sources, commits B, then calls
+`bind_versioned_build_inputs` before writing artifacts. The version directory's
+`build_request.json` records repository, registered worktree, branch, unit,
+version, targets, the existing receipt attempt identity, allocation commit,
+declared input paths and B. Before binding, B is null. A fresh allocation call
+reuses an unfinished same-worktree request only when its requested selection
+and current inputs match; changed inputs select another prerelease directory.
+Unreadable ownership remains untouched and is returned in
+`uncertain_directories`. These are observations, not saved execution progress.
 
-The versioned runner uses `manage_checkpoints.py` for its parent-writer lock and
-success cleanup. Reservations remain the recovery authority, so this route does
-not copy them into checkpoint records. After durable completion, cleanup removes
-only checkpoints, never artifacts or receipts. If cleanup fails, a fresh
-invocation discovers the attempt from its committed receipt and performs cleanup
-without recreating C, receipts or tags. This does not supervise artifact-writing
-child processes; full-promotion release protection remains step 2A.1b.
+`store_artifacts.py` owns allocation and storage.
+`complete_artifact_builds.py` owns prepared receipts and result-only commit C,
+artifact receipts and the immutable tag. Completion uses `read_versioned_build`
+to select existing requests/receipts without allocating or rebuilding.
+Successful tag completion removes `build_request.json` and resolved diagnostics;
+a cleanup-only call preserves the accepted files, commit and tag. One bounded
+failure report per version/target lives at
+`<version>/.diagnostics/<target>.json`; it is not acceptance evidence.
+
+Only cross-version retention uses the short store lock. Startup tries cleanup
+without waiting; completion performs remaining cleanup under that lock.
+Unfinished requests and untagged directories are excluded. The current bound
+remains three completed outputs per repository/unit/target/version class; the
+later 4F retention policy is not active yet. Immutable tags prevent reuse even
+after package bytes are pruned. Release and installation-destination locks are
+unchanged.
+
+This supersedes 1d/1e's reservation mechanism. The internal route has no artifact
+checkpoint directory or worktree lock; one thread owns each task worktree.
+Public Build/Promote adoption remains steps 16/22. The supported v2 route keeps
+its existing full-transaction lock and staging until its later retirement.
+During the authorized deployment, retire only old empty checkpoint directories
+and obsolete locks after old invocations stop. Transfer any still-needed old
+reservation into its matching version request, or remove a completed reservation
+only from its receipt/tag evidence; retain uncertain data. No recurring
+old-path scan or compatibility wrapper is added.
 
 ### Exact-artifact foundation and update methodology
 
@@ -423,23 +507,25 @@ The implemented foundation has six separate responsibilities:
   record through approved scope extensions and repeated edit/check/fix cycles.
   Its finalizer consumes recorded verification without rechecking the advanced
   checkout. It does not derive ownership from Git or select tests; release
-  writer integration arrives in 2A.1b and acceptance-record cleanup in step 7.
+  writer integration is connected in 2B; 3A releases stopped attempts before
+  corrections. 3B supplies reports; controlled cleanup remains in 4/20/21.
 - **1d — production and storage:** the internal `build_bundle` function in
   `skills/ceratops-repo-lifecycle/scripts/repository_operation.py` orchestrates
   adapters and required artifact tests. Its sibling `store_artifacts.py` owns
   the unchanged v2 store transaction, including the full-lifetime lock,
   measurement, receipt persistence, atomic publication, retention and cleanup.
-- **1e.1 — checkpoint storage:** the shared helper provides discoverable records,
-  native producer locks and scoped cleanup. Domain producers decide recovery;
-  artifact reservations and accepted receipts retain their existing ownership.
+- **1e.1/4A — checkpoint storage:** the shared helper provides discoverable records
+  without request locks; successful completion deletes only its own request.
+  Domain producers decide recovery;
+  version-local build requests and accepted receipts retain their ownership.
 
 The later public Build operation will supply the resolved selection, locked
 inputs, adapters, and required artifact tests. This foundation does not yet
 build real packages, alter existing deployment, or connect Promote/Ship.
 The storage module is packaged automatically with the owning skill's scripts.
-The manifest maps the shared checkpoint source from `skills/sections/scripts/`
-to `scripts/manage_checkpoints.py` in both repository and skill lifecycle.
-Repository lifecycle and skill lifecycle both use this storage. No
+Skill lifecycle includes its own `scripts/manage_checkpoints.py` directly;
+it no longer uses a shared payload mapping. Artifact storage has no
+checkpoint-helper dependency. No
 receipt schema, index or artifact-search command is introduced.
 Dependency locking remains separate from first-party artifact identity.
 
@@ -450,8 +536,9 @@ or checked inputs change. Finalize only at the real end of the requested work;
 do not finalize/reopen between corrections. Finalization consumes the saved
 successful verification, so later source advancement does not repeat its checks.
 The generated-runner result contract and compatibility probe are implemented in
-1e.3. Full-promotion release locking and affected-check reuse are planned in
-2A; new acceptance-record cleanup handoffs remain step 7, with general ownership
+1e.3. Release invocation locking is connected in 2B and clean unsuccessful exits
+in 3A; 3B supplies reports and 4B connects success cleanup. Affected-check reuse
+remains step 6, with general ownership
 derivation and an optional Nx trial later.
 
 The 1c preservation checkpoint reverified the unchanged `prepare`, `amend`,
@@ -460,6 +547,67 @@ tests. It adds no helper implementation, state-schema revision or test-selection
 path: the active record, original baseline, approved monotonic scope additions,
 repeated correction generations and recorded-success finalizer remain the
 implemented behavior.
+
+### Skill-update checkpoint storage (1e.1, corrected in 4D)
+
+The imported helper
+[`manage_checkpoints.py`](skills/ceratops-skill-lifecycle/scripts/manage_checkpoints.py)
+stores disposable records for the code that writes them, called their
+**producer**. Skill changes use the fixed owner name `skill-updates`.
+Artifact operations no longer open an empty checkpoint directory. It is not a separate
+command or a saved program counter.
+
+Every worktree in the repository shares the Git common directory. The helper
+derives this path without a caller-supplied operation ID:
+
+```text
+<git-common-dir>/ceratops/operations/<owner>/<worktree-id>/
+```
+
+The primary checkout uses `main` as its directory ID regardless of branch name.
+A linked worktree's ID comes from its Git registration name, so another process
+finds the same records even after the worktree moves. One directory holds one
+unfinished request; producers bind it before recording additional essentials.
+
+Each task worktree belongs to one thread. Ordinary edits, checks, builds and
+saved requests take no worktree or checkpoint lock. `open_checkpoints` resolves
+the request directory and keeps its context active until exit.
+`read_checkpoint` reads a record; `write_checkpoint` writes immutable JSON
+directly to its final path, reusing identical data and refusing conflicting or
+unreadable data. Same-thread nested calls share the context. Opening or leaving
+it does not delete records. `finish_checkpoints`, called by the outermost
+caller after durable success, removes only its own records. Completion does
+not list worktrees or inspect sibling requests, whether their worktrees still
+exist or have been removed. Interrupted own-request deletion can be repeated
+without rerunning accepted checks or builds.
+
+`close_skill_change` treats an absent or empty request as already closed. This
+covers interruption after deleting the last receipt and repeated close calls;
+it records no acceptance and leaves unfinished, nonempty requests subject to
+their existing successful-check requirements.
+
+`discard_worktree_checkpoints` provides the corresponding cleanup across
+owners after confirmed worktree removal. Step 20C connects it to the dedicated
+cleanup script after ownership and stopped-command checks; until then, absent
+worktrees' records stay. A still-present worktree or failed Git lookup prevents
+that explicit deletion. Neither cleanup follows redirected paths or deletes
+artifacts, build requests, installations or accepted results. There is no
+scheduled cleaner, startup sweep or successful-command orphan sweep. Artifact operations
+keep desired inputs and acceptance in build requests/receipts, not duplicate
+checkpoint JSON.
+
+The next authorized deployment must retire the exact obsolete
+`ceratops/locks/skill-updates/<worktree-id>.lock` and
+`ceratops/locks/artifact-versions/<worktree-id>.lock` files, relative to the Git
+common directory, after old helper invocations stop. Until then those files
+remain; the new helper neither creates, acquires nor removes them. Report any
+still used by old helpers and leave them in place. This is one-time retirement,
+not a recurring scan. Preserve saved requests and release/store/destination
+locks: those protect shared release updates, store metadata and installations,
+not ordinary work in a task worktree.
+
+See the design's [five-function interface table and caller responsibilities](docs/design-draft.md#skill-update-checkpoint-storage-implemented)
+for arguments, errors, storage limits and cleanup-only retries.
 
 ### Working-folder lifecycle refactor status
 
@@ -470,7 +618,7 @@ committed build and stored artifact receipts, and merge-back. Standalone Build
 produces alpha versions; Promote qualifies beta versions. Delivery consumes
 the selected version's recorded acceptance and bytes.
 
-The internal `hold_write_lock.py` helper is implemented in 2A.1a and mapped
+The `hold_write_lock.py` helper is implemented in 2A and mapped
 into repository and skill lifecycle runtimes. It finds one shared lock at
 `<git-common-dir>/ceratops/locks/release-local` from any repository worktree,
 without requiring a remote. The pinned library's `lock_descriptor` function uses
@@ -481,24 +629,131 @@ immediate busy result; the owning operation has no 30-second time limit.
 The retained lock file stores one Boolean, `unfinished_run`: its first byte
 is `1` during work and `0` after explicit clean completion. Before allowing
 protected work, the helper writes and flushes `1` in place. The outer owner
-calls `complete(commands_stopped=True)` after success or clean cancellation;
-normal context exit then writes and flushes `0`. A crash, exception or missing
-completion report leaves uncertainty. A later caller must acquire the native
+calls `complete(commands_stopped=True)` once its commands have stopped, whether
+the attempt succeeded, failed or needs a model decision. `finally` writes and
+flushes `0` before unlocking, including when propagating an exception. A crash
+or unknown command shutdown leaves uncertainty. A later caller must acquire
+the native
 lock and explicitly confirm that the previous commands stopped before retrying.
 Confirmation cannot bypass a busy lock or a caller-known running command.
 The helper neither launches nor discovers processes. It creates no temporary
 flag file, operation record, PID registry, background service or OS process group.
 Keep this one fixed-size lock file outside checkpoint cleanup.
 
-Public promotion and Ship do **not** use this helper yet. Step 2A.1b connects all
-local release writers. Promotion keeps the lock through tests, correction waits
-and release integration. Ship keeps it from before its first fetch through
-CI/review waits, receipt synchronization, PR merge, selected publication, local
-installation and completion cleanup. A second promotion or Ship fails immediately
-without starting candidate work. No general task-worktree lock is
-planned. Existing producer checkpoint locks remain unchanged; step 6 later
-adds a separate lock for each installation destination. Optional automatic
-child-process recovery is deferred to 2A.1c, not required for normal operation.
+2B connects promotion, Ship, release synchronization, release PR preparation and
+direct-release `fast-change` to this lock. Each current invocation holds it from
+before selecting release work until its synchronous commands finish. Promotion
+calls `github_pr_workflow.ship_repository.ship_repository(ShipOptions(...))`,
+and Ship calls `github_pr_workflow.ship.ship()` directly. Neither call builds
+CLI arguments or captures printed JSON; nested calls retain the same lock.
+The public Ship CLI calls that same implementation. Independent processes cannot
+borrow it. The lock
+also covers today's CI/review wait, publication and installation calls.
+Synchronization and PR preparation also take it when they can change the primary
+checkout, even while it is on `main`: promotion may switch that checkout to
+`release/local`. Commands confined to other non-release worktrees stay unlocked.
+
+A competing release command fails immediately without merging, testing or saving
+promotion checkpoints. An uncertain exit leaves the flag set. After establishing
+that the previous commands stopped, repeat the same command with
+`--confirm-previous-commands-stopped`; this cannot override a busy lock.
+Commands must remain foreground commands, including their workers: a command
+that detaches a writer is outside this guarantee. Manual Git does not participate.
+
+The shared imported module
+`skills/ceratops-repo-lifecycle/scripts/git_branch_operations.py` now owns local
+branch/worktree lookup, checkout restoration, existing rebase operations,
+fast-forwards and branch alignment. It takes no locks. Workflow callers still
+choose branches, fetch remotes, run checks and acquire the release lock.
+Existing Git behavior is unchanged, including today's remote prerequisite.
+
+3A ends an automatic attempt before handing corrections to the model. The shared
+`command.py::release_write_context()` clears the flag after existing synchronous
+command waits finish, then unlocks on return or exception. A failed check or
+expired remote CI wait does not itself mean local commands remain running.
+A launcher exception with unknown shutdown retains the flag even if caught.
+Cleanup errors accompany the original cause. Corrections take place unlocked;
+a fresh invocation takes the lock and reads current inputs. Clearing the flag
+neither accepts failed work nor deletes checkpoints.
+
+`command.py::run_command_for_json()` always starts the supplied external program,
+such as pending-work management or `repository_operation.py`, and reads its JSON.
+It does not dispatch by filename. Existing environment, working-directory and
+GitHub retry behavior remain unchanged; malformed output keeps its captured
+diagnostics. With `--diagnostic-output`, phase events are flushed as JSON lines
+before the terminal result; the JSON command reader forwards those events.
+
+#### Complete failure reports and successful-work cleanup (3B/4B)
+
+`promote-repository.py`, `ship-repository.py` and
+`python -m github_pr_workflow ship` accept `--diagnostic-output FILE`.
+The caller selects a stable file under
+`<shared-temp-base>/<repo-name>/<calling-worktree-name>/`, for example
+`_promote_failure.json` or `_ship_failure.json`. Separate top-level actions use
+separate files; retries reuse the same path. The path is independent of
+promotion's unchanged `--result-file`.
+
+`CERATOPS_TASK_TEMP_ROOT` supplies the shared temporary base. Without it,
+`command.py::project_task_temp_root()` uses `<projects-root>/tmp`, where
+`CERATOPS_PROJECTS_ROOT` overrides the primary checkout's parent directory.
+Reports add the primary repository name and one registered worktree name.
+The report's selected path preserves its owning worktree when execution moves
+to the primary checkout. Invalid, redirected, foreign, or ambiguous paths
+cannot authorize report writes or deletion. The environment does not carry
+worktree identity, and the command runner does not initialize these settings.
+
+`command.py` writes complete secret-redacted failures directly to that file
+before returning a short error with `diagnostic_output`. It references existing
+successful test/build result files without copying them. An existing complete
+child report is referenced unchanged and remains owned by that child's helper.
+Without a selected path, or when writing it fails, the complete diagnostics
+remain in the returned error instead of being silently shortened.
+
+Promote and Ship now pass actual successful operation results to
+`repository_operation.py::remove_operation_failures()`. The executor also does
+this after each successful command or exact reused check, before starting later
+work. `command.py::remove_resolved_failures()` removes only those command/check
+IDs from the report; it does not interpret individual error messages. Remaining
+failures and successful-result paths stay in the same file. Once none remain,
+`remove_failure_report()` deletes that exact managed file after commands stop.
+Thus corrected tests can clear their report while promotion is still unfinished.
+An unrelated pass, no-op, pending handoff, restart or phase change clears nothing.
+Successful or mixed test/build results, receipts, acceptance logs, other
+actions' files and user-retained files outside managed storage are not cleanup
+targets. A malformed existing file is retained; the current error stays complete
+in the response.
+
+The direct workflows and both operation execution functions forward the selected
+path. The unnecessary single-operation wrapper is removed. GitHub Ship's CLI
+adapter is now `github_pr_workflow/ship_pull_request.py`; its command is unchanged.
+GitHub check waiting now lives in `github_pr_workflow/wait_pr_checks.py`; its
+behavior is unchanged. Ship retires a matching PR's CI failure after its checks
+pass, even if review still needs attention. Saved successful delivery results
+also permit cleanup without executing publication or installation again.
+Cleanup errors accompany the successful result without changing it into failure.
+Step 6E handles test-runner-owned reports; 20C/21 connect explicit request
+abandonment/replacement and worktree removal, which are separate cleanup triggers.
+No scheduled cleaner or additional acceptance checks are introduced.
+
+4C places installation after completed promotion, outside the code that can
+restore the previous release commit. Plain Promote unlocks after its local
+cleanup. Promote-and-deploy retains release protection while the current
+installer reads that exact selected commit; installation failure reports the
+completed promotion and never reverses it or retries installation. Ship retains
+its outer lock through its current installation and cleanup. Standalone skill/MCP
+installation protects the release source too, but never locks a task worktree.
+Plain source directories without Git metadata skip Git lock discovery entirely.
+The existing installer takes its destination lock inside release protection;
+it cannot start Promote/Ship while holding that destination lock. Explicit
+in-process installer calls share ownership with Promote, Ship and fast-change.
+The 2B/3A–3C/4A–4E batch is implemented, locally promoted and deployed.
+Local Promote-and-deploy prepares operations in skill mode and executes their
+declared installers. CI mode still defers installation; a deferred handoff is
+never reported as an installed result. No-op declarations remain no-ops.
+Artifact-only installation remains steps 17–19/22/27B: only then can deployment
+stop reading the checkout and release protection end before installation.
+4A removes checkpoint locks and scans of other worktrees' requests; optional
+automatic child cleanup remains later work.
 See [Release locking and unfinished operations](docs/design-draft.md#release-locking-and-unfinished-operations).
 
 `uv run --locked` is unrelated: it requires the existing dependency versions
@@ -509,17 +764,20 @@ serialize commands.
 | --- | --- | --- |
 | 1a release declarations | Implemented | Keep current v4/v5 readers; connect exact-output producers later |
 | 1b receipt verification | Implemented v2 verifier plus internal v3/v1 receipt definitions and saved-chain reader | Connect public lifecycle callers in later steps |
-| 1c correction continuity | Implemented and preservation-verified; finalization consumes recorded success without rechecking the checkout | Connect release writers in 2A.1b and new acceptance-record cleanup in step 7 |
-| 1d build/test/store | Implemented current v2 transaction plus an internal direct-write versioned route: reservations, final artifact paths, committed v3 build receipts, B-to-C result binding, artifact receipts, immutable tag and effect-derived recovery | Connect promotion-wide release locking and orchestration in 2A; public Build and Promote remain pending |
-| 1e.1 shared checkpoints | Implemented storage, native producer locking, fresh-invocation discovery and success-triggered orphan cleanup; versioned artifacts and skill updates adopted | Step 7 connects controlled worktree removal; domain cleanup remains with its owners |
-| 1e.2 skill-change generations | Implemented immutable approvals, states and check results, five descriptive commands, interrupted-write recovery and completion cleanup; new committed receipts use `build_receipt.json` | Release-writer integration remains 2A.1b; historical committed receipts retain their recorded names |
-| 1e.3 test-result contract | Implemented generated-runner result contract and compatibility probe | 2A.2 connects repository-wide result ownership, retention and affected-check orchestration |
+| 1c correction continuity | Implemented and preservation-verified; finalization consumes recorded success without rechecking the checkout | Reports and matching-success cleanup connected in 3B/4B |
+| 1d/4D/4E build/test/store | Implemented v2 transaction and internal directory-first production with version-local requests, exact B-to-C receipts and immutable tags | Public Build and receipt-driven Promote remain in 16/22; 4F retention remains pending |
+| 1e.1/4A shared checkpoints | Implemented storage and fresh-invocation discovery without request locks; completion deletes only its own request; 4D removed the artifact checkpoint wrapper | 20C connects dedicated worktree cleanup; the one-time retirement removed 26 orphan lock files and retained five belonging to present worktrees |
+| 1e.2 skill-change generations | Implemented immutable approvals, states and check results, five descriptive commands, interrupted-write recovery and completion cleanup; new committed receipts use `build_receipt.json` | 2B protects direct-release changes; historical committed receipts retain their recorded names |
+| 1e.3/6A test-result contract | Implemented generated-runner contract, compatibility probe and standalone repository-runner adoption | 6B–6E connect result ownership, retention and affected-check orchestration |
 | Completed-build consumption | Implemented internal v2 reader; recorded acceptance and exact stored paths survive current test/input changes | Connect public receipt-based Deploy in later steps |
-| 2A.1a release-lock helper | Implemented internally in `fb6863c`: canonical release lock, immediate busy refusal, nested ownership and durable unfinished-run flag; Windows checks passed, Linux execution unverified | 2A.1b connects complete promotion/Ship and all local release writers; no general task-worktree lock |
-| Working-folder attempts and result reuse | Planned | 2A.2/2A.3 connect qualification-level baselines, successful-result reuse, success-only receipts and receipt commits; 2A.4 selects affected units |
-| Merge-back and beta qualification | Planned | 2B/8 remove the remote prerequisite for local promotion and activate merge-back, incremental qualification and guarded fast-forward |
+| 2A release-lock helper | Implemented internally in `fb6863c`: canonical release lock, immediate busy refusal, nested ownership and durable unfinished-run flag; Windows checks passed, Linux execution unverified | 3A/3B/4A–4E are implemented; optional automatic process cleanup remains 5B |
+| 2B Git separation and release writers | Shared `git_branch_operations.py`; promotion, Ship, release sync, PR preparation and fast-change use the native release lock | Implemented, locally promoted and deployed with 3A–3C/4A–4E |
+| 3A direct Ship calls and stopped-attempt release | One callable Ship implementation, external-command-only JSON helper and exception-safe clean lock exits; model corrections run unlocked | Standalone installers and fast-change share command-stop tracking; optional process supervision remains 5B |
+| 3B/4B failure reports and cleanup | Caller-selected paths, complete redacted diagnostics and successful-result references; actual command/check/delivery successes remove matching failures without repeating accepted work | 6E/20C/21 connect child-report and abandonment/removal cleanup |
+| Working-folder attempts and result reuse | Planned | 6/7 connect qualification-level baselines, successful-result reuse, success-only receipts and receipt commits; 8 selects affected units |
+| Merge-back and beta qualification | Planned | 9/22 remove the remote prerequisite for local promotion and activate merge-back, incremental qualification and guarded fast-forward |
 | Public Build and receipt Deploy | Planned | Connect producers/consumers before repository adoption; installation does not rebuild or repeat acceptance tests |
-| CI receipts and GitHub delivery | Planned | 9–12 connect CI-owned builds/receipts/checks/publication, protected PR merge, exact published-or-CI artifact installation and completion cleanup |
+| CI receipts and GitHub delivery | Planned | 24–27 connect CI-owned builds/receipts/checks/publication, protected PR merge, exact published-or-CI artifact installation and completion cleanup |
 
 The completed-build readers remain internal capabilities; they do not activate
 public Build or receipt-based Deploy. Each subsequent implementation step must
@@ -560,12 +818,13 @@ The approved changes below are **planned**, not new behavior of today's commands
 - Local installation failure stops for diagnosis, with no automatic retry.
   Report publication/CI success separately; a local fix permits explicit resume
   from the same files. An artifact fix requires a new version; ordinary compatible
-  bug fixes use a patch version. Successful completion removes its checkpoints
-  and the same producer's confirmed abandoned checkpoints, not other live work.
+  bug fixes use a patch version. Successful completion removes only its own
+  checkpoints. The dedicated worktree cleanup script removes abandoned records
+  after its ownership and stopped-command checks; 20C connects that path.
 
 See [test reuse and affected checks](docs/design-draft.md#acceptance-reuse-and-affected-checks),
 [the complete Ship sequence](docs/design-draft.md#ship-ci-receipts-and-local-installation)
-and [completion cleanup](docs/design-draft.md#planned-completion-and-abandoned-work-cleanup).
+and [completion cleanup](docs/design-draft.md#shipped-task-work-and-planned-abandoned-work-cleanup).
 The existing `skills/ceratops-repo-lifecycle/scripts/action.yml` remains a thin
 repository-check wrapper. Step 10 updates it, its workflow callers and the
 compatibility template together; PR management, publication and local installation
@@ -579,18 +838,19 @@ policy. These are the runtime paths used by the foundation and update workflow:
 
 | Runtime path | Class and owner | Rewrite, retention, or cleanup trigger |
 | --- | --- | --- |
+| `<automation-dir>/dependabot-repository-{preflight,finalize}.json` and the selected output's `.<name>.failed.tmp` | One current report per phase and its temporary failure write; the lifecycle skill's dependency queue entrypoint | `--automation-dir` reads the caller-owned repository scopes and binds the independent snapshot/sync adapters. Preflight retires the preceding final report; each phase retires its selected report and partial before execution. Missing results or operational failures produce dated unavailable-state reports. Atomic failure writing and the next ordinary call remove only that report's partial. Explicit output overrides retain unrelated reports. |
 | `<shared-git-directory>/ceratops/builds/<build-key>/`, including receipt, artifacts and supporting files | Persistent immutable output; `store_artifacts.py` publishes and reads on behalf of `repository_operation` | Grouped by repository, release unit, channel and target. At production startup and after publication, keep the newest completed bundle plus two predecessors by completion time and key; remove older directories without modifying retained bundles. Reading performs no retention or cleanup mutation. |
 | `builds/`, `.staging/`, `.locks/`, `.diagnostics/` and `.locks/store.lock` | Persistent bounded infrastructure for the current v2 route; `store_artifacts.py` and `filelock` | One repository lock serializes that route's complete build/test/store transaction and cleanup ownership. The file remains reusable; the OS releases the held lock on normal exit or process death. No per-build lock history accumulates. |
 | `.staging/<build-key>/work/` and `bundle/` | Temporary private work for the current v2 route; `store_artifacts.py` | Removed on success or failure. At every v2 transaction startup, while holding the repository lock, remove every recognizable staging directory left by an earlier instance. Preserve unrecognized entries and report cleanup failure. |
 | `.diagnostics/<release-group-key>.json` and its `.tmp` write file | Persistent latest-failure report and temporary write for the current v2 route; `store_artifacts.py` | Atomically overwrite the group's report on failure and remove it after successful new publication. At v2 production startup remove interrupted `.tmp` writes. The completed-build reader does not rewrite diagnostics. Reports contain bounded excerpts and are never artifact-test evidence. |
-| `<shared-git-directory>/ceratops/artifacts/.reservations/<unit>/<version>.json` | Persistent unfinished ownership; versioned `store_artifacts.py` route | Written directly and read back under the short store lock before output production. One attempt owns the complete required-target set, branch, B and declared inputs. A matching record is reusable only during explicit recovery; malformed or conflicting ownership blocks. Remove it only after every artifact receipt and the immutable tag exist. |
+| `<shared-git-directory>/ceratops/artifacts/<unit>/<version>/build_request.json` | Version-local desired inputs; `store_artifacts.py` | Written immediately after exclusive directory creation, then bound to B before output. Same-worktree current-input matches can reuse it. Remove only after receipt/tag completion; retain unfinished or uncertain requests for controlled abandonment/removal cleanup. |
 | `.build/<unit>/<version>/build_receipt.json` with an optional `<target>/` | Direct final worktree result; operation runner | Qualification validates the final artifact/evidence bytes and writes the canonical receipt directly. A byte-identical valid file is reused, an invalid interrupted write is replaced, and a different valid receipt blocks. C commits these exact result paths without including unrelated staged work. Historical versions are read at the exact saved path/hash, including `receipt.json`; no old tag or receipt is rewritten. |
-| `artifacts/.diagnostics/<unit>/<target>/<alpha\|beta\|stable>.json` | Persistent bounded latest-failure report; versioned `store_artifacts.py` route | Directly replace the one current report for the repository/unit/target/version-class group and verify its bytes. A later write can replace an interrupted invalid record; successful finalization clears the resolved group's report. No helper-owned temporary file is used. |
-| `artifacts/<unit>/<version>/` with optional `<target>/` | Direct final artifact output; artifact producer, finalizer and reader | Production writes into the final version directory after reservation. Valid existing files are measured and reused; changed or missing qualified bytes block completion. The version remains unreadable as completed until every target artifact receipt exists and immutable tag `<unit>/<version>` points to C. Startup and completion retain the current output plus two predecessors per repository/unit/target/class group while protecting reservations. |
-| `artifacts/.locks/store.lock` | Persistent reusable short-section lock; `store_artifacts.py` and `filelock` | Protects reservation, pruning, artifact-receipt and tag mutations only; build and artifact-test work runs outside it. The lock file is reusable and its availability is not recovery evidence. |
-| `<shared-git-directory>/ceratops/operations/<owner>/<worktree-id>/` | Disposable essential records; `manage_checkpoints.py` for `artifact-versions` and `skill-updates` | One unfinished request per producer/worktree. Open retains records; immutable JSON is written directly, identical writes are reused, and unreadable/conflicting records block unless the owner can reconstruct an unreferenced final write. Outermost success removes own records and sweeps only same-owner removed-worktree directories whose locks are free. Opening and failure never sweep. Durable repository acceptance and reservations are not stored here. |
-| `<shared-git-directory>/ceratops/locks/<owner>/<worktree-id>.lock` | Persistent reusable native lock; shared checkpoint helper | Held for the parent helper invocation and released on exit, including failure. Nested calls reuse the context. Lock files remain outside deleted checkpoint directories; busy orphan writers are skipped. No process tracking or scheduled cleanup is introduced. |
-| `operations/skill-updates/<worktree-id>/update_request.json`, `states/<generation>.json`, `check_results/<generation>.json`, `completion_receipt.json` under the shared Git directory's `ceratops/` | Disposable update continuity; `skill-update-workflow.py` | Keep the original request/baseline, current state plus two predecessors and their referenced check results. Write new generations directly; repair only malformed unreferenced tails, never valid conflicts or changed accepted results. Explicit `close_skill_change` consumes saved success, writes the completion receipt, then removes owned checkpoints and sweeps same-producer orphans. The receipt survives interrupted cleanup and is deleted last. Caller input requests remain caller-owned. |
+| `artifacts/<unit>/<version>/.diagnostics/<target>.json` | One bounded current failure report per version/target; `complete_artifact_builds.py` | Direct writes replace older or interrupted diagnostics. Receipt/tag completion removes resolved reports. No temporary copy or cross-version write lock. |
+| `artifacts/<unit>/<version>/` with optional `<target>/` | Final output; allocator, builder and completion owner | Exclusive directory creation selects the version before source version preparation and B. Existing tags stay occupied after byte pruning. Untagged directories and outstanding requests stay out of retention. Completion binds every target receipt and the tag to C; current retention keeps three per repository/unit/target/class until 4F. |
+| `artifacts/.locks/store.lock` | Persistent native cross-version cleanup lock; `store_artifacts.py` and `filelock` | Protects retention selection/deletion only. Allocation never waits on it; request, receipt and tag writes do not hold it. Not a worktree lock or allocation reservation. |
+| `<shared-git-directory>/ceratops/operations/skill-updates/<worktree-id>/` | Disposable skill-change records; `manage_checkpoints.py` | One unfinished request per worktree, without a request lock. Immutable direct records retain required scope and successful checks; outermost completion deletes only its own records. Dedicated removed-worktree cleanup is connected in 20C. Artifact operations do not use this directory. |
+| `<shared-git-directory>/ceratops/locks/{skill-updates,artifact-versions}/<worktree-id>.lock` | Obsolete files from the old checkpoint helper | No new creation or use. One-time retirement removed 26 files for absent worktrees after Git-registration and native-lock checks; five present-worktree files remain. Dedicated worktree cleanup owns their later removal, not another task's startup. Other locks and saved requests stay untouched. |
+| `operations/skill-updates/<worktree-id>/update_request.json`, `states/<generation>.json`, `check_results/<generation>.json`, `completion_receipt.json` under the shared Git directory's `ceratops/` | Disposable update continuity; `skill-update-workflow.py` | Keep the original request/baseline, current state plus two predecessors and their referenced check results. Write new generations directly; repair only malformed unreferenced tails, never valid conflicts or changed accepted results. Explicit `close_skill_change` consumes saved success, writes the completion receipt, then removes only that request's checkpoints. The receipt survives interrupted cleanup and is deleted last. Caller input requests remain caller-owned. |
 | Update check scratch directories and cleanup records | Temporary check work; `skill_update_scratch.py` | Removed when each check scope exits; recorded unfinished cleanup is retried before another check. Explicit check-output paths remain caller-owned. |
 | Existing test-runner scratch and `.build/test-diagnostics/pytest-failure.json` | Temporary execution scratch and persistent latest-failure report; repository test runner | Scratch is removed when the subprocess exits; failure evidence is rewritten on failure and removed by a successful run at that selected path. The existing runner remains its owner. |
 | Configured `.venv`/dependency environments, `__pycache__`, `.pytest_cache`, `.mypy_cache` and `.ruff_cache` | Persistent reusable development data; uv/Python and the owning check tool | Environments are synchronized to their project lock; cache entries are refreshed or invalidated by their owning tool. They are not bundle inputs or proof of passing artifact tests, and this flow does not purge them. |
@@ -603,9 +863,9 @@ in [the existing design draft](docs/design-draft.md#exact-artifact-bundle-transa
 Checkpoint IDs come from Git registration: `main` for the primary checkout and
 `linked-<SHA-256 of registration name>` for a linked worktree. They survive
 `git worktree move`; callers supply no operation UUID. Externally abandoned
-checkpoints may remain until that producer next succeeds. The shared
+checkpoints stay until the dedicated worktree cleanup script removes them. The shared
 `discard_worktree_checkpoints` interface can remove them across owners after
-confirmed worktree removal; its controlled-removal caller is planned in step 7.
+confirmed worktree removal; its controlled-removal caller is planned in step 20C.
 See [checkpoint interfaces and limits](docs/design-draft.md#shared-checkpoint-storage-implemented).
 
 The test runner writes collection snapshots and failure diagnostics directly to
@@ -665,7 +925,14 @@ root, UTF-8 failure and regression files, repeated `--context RULES HISTORY
 RULE_IDS`, and repeated `--replacement RULES HISTORY EXPECTED_FILE
 REPLACEMENT_FILE`. Use `-` for a source without history. The helper constructs
 and prepares the closed request and emits the candidate paths plus one
-`next_action`. Run `proposal-workflow.py run --state STATE` to inspect that
+`next_action`. Pending review responses also include the annotation-only
+`review_input_template` for the caller:
+editable candidate fields, append-entry examples for target companion histories,
+nonempty UTF-8 assessment text, and the next submission command with its allowed
+choices. This description comes from the saved target context, remains available
+while a candidate is unfinished, and omits frozen acceptance outputs. Reading it
+does not change proposal files. Completed and interrupted responses omit it.
+Run `proposal-workflow.py run --state STATE` to inspect that
 action, or add `--assessment-file FILE --outcome OUTCOME --regressions RESULT`
 to submit the semantic decision without writing workflow JSON by hand.
 
@@ -1123,9 +1390,9 @@ custom implementation never briefly created an internal file. Structural-only
 compatibility success is not proof that results are reusable.
 
 Result paths stay outside disposable operation checkpoints. 1e.3 defines this
-runner protocol; 2A.2 connects production selection, ownership and bounded
-retention under `<git-common-dir>/ceratops/results/repository-checks/`.
-Until then, callers own their selected result files and lifetime. Disposable
+runner protocol; implemented plan 6A connects production selection, ownership
+and bounded retention under
+`<git-common-dir>/ceratops/results/repository-checks/`. Disposable
 pytest caches and basetemp directories remain scratch, not acceptance. Cheap
 diagnostics/collection snapshots may be regenerated at their own final paths.
 
@@ -1560,3 +1827,62 @@ Releases use `vMAJOR.MINOR.PATCH` tags. See `CHANGELOG.md` for release notes.
 
 This repository publishes source files only. It does not publish Docker images,
 PyPI packages, npm packages, or other runtime artifacts.
+
+## Durable repository check results
+
+SDLC `check-results` declarations connect one repository runner command to
+durable unchanged-input reuse. The operation executor supplies the existing
+five result arguments; the declared runner writes its actual outcome before
+returning. Later promotion/build calls consume eligible original passes while
+new artifact checks still run. Corrupt evidence blocks the operation.
+
+Results live under `<git-common-dir>/ceratops/results/repository-checks/`.
+Existing pending-work scopes retain active candidate references; checkpoints
+and disposable reports are not acceptance authorities. Storage is bounded and
+protects required original passes and newer applicable failures. Checks marked
+`no_result_reuse`, distributed execution and unrepresented child scope also
+prevent aggregate reuse; ordinary child passes keep their original identities.
+
+`--qualification-level` selects required alpha/beta/rc/final eligibility;
+ordinary checks default to alpha and promotion tests to beta. The portable
+producer, custom runner and scope/retention ownership are described in
+`docs/design-draft.md`, section "Durable unchanged-input check reuse".
+This implements plan 6A and its limited Docs-and-Claims runner adoption;
+remaining affected-check and release/receipt adoption stays pending.
+
+## Native command roots
+
+The standalone bootstrap (`scripts/deploy-skills.py` and its authoritative
+template) owns two entries in the selected profile's
+`config.toml`, under `shell_environment_policy.set`:
+
+| Variable | Default on a local PC | GitHub CI value |
+| --- | --- | --- |
+| `CERATOPS_PROJECTS_ROOT` | Parent of the primary Git checkout | Parent of `GITHUB_WORKSPACE` |
+| `CERATOPS_TASK_TEMP_ROOT` | `<projects-root>/tmp` | `RUNNER_TEMP` |
+
+The installer identifies the primary checkout through Git when started in a
+linked worktree. An unpacked source uses its selected source directory.
+Existing absolute settings take precedence; otherwise inherited values take
+precedence over derived defaults. Only missing keys are written. Comments,
+line endings and unrelated settings are retained. Malformed configuration or
+relative roots stop installation before skill copies. Roots cannot place a
+project's temporary namespace inside its source checkout.
+
+The selected profile is the parent of the skill installation root, normally
+`$CODEX_HOME`. It retains one current configuration document and no backup
+history. Publication uses a temporary file in the installer's reserved staging
+directory and an atomic replacement. A configuration change detected before
+publication stops installation. Success and failure remove current
+staging; startup removes abandoned reserved staging under the bootstrap lock.
+
+Codex supplies the saved variables to shell commands. CI supplies them to its
+SDLC step directly; fixture test processes discard inherited host roots.
+Producers own `<shared-temp-base>/<project>/<worktree>` and their contents.
+The installer creates no project temp directories, and no hook initializes
+these variables. Worktree retirement uses the same configured base.
+
+The skills consistency review packet reads both values directly from the
+selected installed skill's profile `config.toml`. Missing, unreadable, empty,
+relative or non-string settings are blockers even when inherited environment
+variables happen to be present. The audit never edits the profile.

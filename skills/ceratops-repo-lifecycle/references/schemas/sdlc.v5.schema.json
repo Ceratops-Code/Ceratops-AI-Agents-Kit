@@ -211,6 +211,11 @@
             "$ref": "#/$defs/parameter"
           }
         },
+        "result-commit-field": {
+          "description": "Top-level field in the final build command's structured stdout naming its exact final Git commit. Successful status must be OK or passed; the runner requires clean descendant HEAD and preserves the prepared commit separately.",
+          "type": "string",
+          "pattern": "^[A-Za-z][A-Za-z0-9_]*$"
+        },
         "result-schema": {
           "description": "Required structured stdout from the final run step. The repository operation runner validates the complete object and requires a passed terminal status.",
           "enum": [
@@ -230,6 +235,62 @@
           "type": "string",
           "minLength": 1,
           "pattern": "\\S"
+        },
+        "check-results": {
+          "description": "Declared relevant inputs and execution scope for one durable check runner command.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "product-inputs",
+            "check-inputs"
+          ],
+          "properties": {
+            "product-inputs": {
+              "type": "array",
+              "uniqueItems": true,
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "check-inputs": {
+              "type": "array",
+              "uniqueItems": true,
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "dependencies": {
+              "type": "array",
+              "uniqueItems": true,
+              "minItems": 0,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "environment": {
+              "type": "array",
+              "uniqueItems": true,
+              "minItems": 0,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "tools": {
+              "type": "array",
+              "uniqueItems": true,
+              "minItems": 0,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
         }
       },
       "oneOf": [

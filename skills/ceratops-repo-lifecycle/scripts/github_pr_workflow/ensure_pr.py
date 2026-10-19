@@ -14,10 +14,18 @@ from typing import Any
 from urllib.parse import urlencode, urlsplit
 
 from github_contract_engine.github_api import (
-    RETRY_DELAY_SECONDS, run_gh_api, transient_github_error,
+    RETRY_DELAY_SECONDS,
+    run_gh_api,
+    transient_github_error,
 )
 
-from .command import CommandError, require_output, require_success, run_command
+from .command import (
+    CommandError,
+    release_write_context,
+    require_output,
+    require_success,
+    run_command,
+)
 
 
 class EnsurePrError(RuntimeError):
@@ -387,6 +395,19 @@ def _check_argv(value: str) -> list[str]:
 
 
 def ensure_pr(args: argparse.Namespace) -> dict[str, object]:
+    """Protect release publication and any requested local release edits."""
+    current = require_output(_git(args.repo_root, "branch", "--show-current"), cwd=args.repo_root)
+    with release_write_context(
+        args.repo_root, required="release/local" in {args.head_branch, current},
+        confirm_stopped=getattr(args, "confirm_previous_commands_stopped", False),
+    ) as owned:
+        result = _ensure_pr(args)
+        if owned is not None and owned.outermost:
+            owned.complete(commands_stopped=True)
+        return result
+
+
+def _ensure_pr(args: argparse.Namespace) -> dict[str, object]:
     """Verify, push, create or update, and observe one prepared branch PR."""
 
     repo_root = args.repo_root.expanduser().resolve(strict=True)
@@ -506,6 +527,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--head-branch", required=True)
     parser.add_argument("--base-branch", default="main")
     parser.add_argument("--remote-name", default="origin")
+    parser.add_argument("--confirm-previous-commands-stopped", action="store_true",
+                        help="Recover an unfinished release run after confirming its commands stopped.")
     parser.add_argument("--title")
     parser.add_argument("--body")
     parser.add_argument("--prepare", action="store_true", help="opt in to scoped branch/stage/commit preparation")

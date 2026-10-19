@@ -374,6 +374,152 @@ def _ruleset_protection_facts(
     }
 
 
+def _merge_policy_facts(
+    effective_rules: ApiResult, protection: ApiResult
+) -> dict[str, Any]:
+    """Describe merge-commit compatibility without treating unread evidence as safe.
+
+    The contract consumes each source's supported/compatible tri-state. Only the
+    exact GitHub plan restriction proves unsupported capability; other missing
+    evidence remains unknown. Explicit conflicts win over incomplete evidence,
+    and every unknown or unsupported source retains its causal API context.
+    """
+
+    facts: dict[str, Any] = {
+        "supported": None,
+        "compatible": None,
+        "classic_protection_supported": None,
+        "classic_protection_compatible": None,
+        "errors": [],
+    }
+    plan_message = (
+        "Upgrade to GitHub Pro or make this repository public to enable this feature."
+    )
+
+    def error_message(response: ApiResult) -> str:
+        # Paginated gh failures may slurp the server error into a singleton list.
+        candidates = [response.data]
+        for raw in (response.raw_stdout, response.message):
+            if raw:
+                try:
+                    candidates.append(json.loads(raw))
+                except (json.JSONDecodeError, TypeError):
+                    pass
+        for candidate in candidates:
+            while isinstance(candidate, list) and len(candidate) == 1:
+                candidate = candidate[0]
+            if isinstance(candidate, dict) and isinstance(candidate.get("message"), str):
+                return candidate["message"]
+        for raw in (response.message, response.raw_stderr):
+            for line in (raw or "").splitlines():
+                for known in (plan_message, "Branch not protected"):
+                    if line.strip() in (
+                        known, f"gh: {known} (HTTP {response.status})"
+                    ):
+                        return known
+        return (
+            response.message or response.raw_stderr or response.raw_stdout
+            or "API request did not return usable evidence."
+        )
+
+    def record_error(
+        source: str, response: ApiResult, message: str, **context: Any
+    ) -> None:
+        facts["errors"].append({
+            "source": source,
+            "endpoint": response.endpoint,
+            "status": response.status,
+            "message": message,
+            **context,
+        })
+
+    if effective_rules.ok and isinstance(effective_rules.data, list):
+        facts["supported"] = True
+        compatibility: list[bool | None] = []
+        for index, rule in enumerate(effective_rules.data):
+            if (
+                not isinstance(rule, dict)
+                or not isinstance(rule.get("type"), str)
+                or not rule["type"].strip()
+            ):
+                compatibility.append(None)
+                record_error(
+                    "rulesets", effective_rules,
+                    "Effective branch rule has no usable type.", rule_index=index,
+                )
+                continue
+            rule_type = rule["type"]
+            if rule_type == "required_linear_history":
+                compatibility.append(False)
+            elif rule_type in {"pull_request", "merge_queue"}:
+                parameters = rule.get("parameters")
+                value = (
+                    parameters.get(
+                        "allowed_merge_methods"
+                        if rule_type == "pull_request" else "merge_method"
+                    )
+                    if isinstance(parameters, dict) else None
+                )
+                if rule_type == "pull_request" and isinstance(value, list) and all(
+                    isinstance(method, str) for method in value
+                ):
+                    compatibility.append(value == ["merge"])
+                elif rule_type == "merge_queue" and isinstance(value, str):
+                    compatibility.append(value == "MERGE")
+                else:
+                    compatibility.append(None)
+                    record_error(
+                        "rulesets", effective_rules,
+                        "Effective branch rule has unusable merge parameters.",
+                        rule_index=index, rule_type=rule_type,
+                    )
+        facts["compatible"] = (
+            False if False in compatibility
+            else None if None in compatibility else True
+        )
+    elif effective_rules.ok:
+        record_error(
+            "rulesets", effective_rules,
+            "Effective branch rules response is not a list.",
+        )
+    else:
+        message = error_message(effective_rules)
+        if effective_rules.status == 403 and message == plan_message:
+            facts["supported"] = False
+        record_error("rulesets", effective_rules, message)
+
+    if protection.ok and isinstance(protection.data, dict):
+        facts["classic_protection_supported"] = True
+        linear_history = protection.data.get("required_linear_history")
+        enabled = (
+            linear_history.get("enabled") if isinstance(linear_history, dict) else None
+        )
+        if enabled is True or enabled is False:
+            facts["classic_protection_compatible"] = not enabled
+        else:
+            record_error(
+                "classic_protection", protection,
+                "Classic protection has no usable required_linear_history.enabled.",
+            )
+    elif protection.ok:
+        record_error(
+            "classic_protection", protection,
+            "Classic protection response is not an object.",
+        )
+    else:
+        message = error_message(protection)
+        if protection.status == 403 and message == plan_message:
+            facts["classic_protection_supported"] = False
+        elif protection.status == 404 and message == "Branch not protected":
+            facts["classic_protection_supported"] = True
+            facts["classic_protection_compatible"] = True
+        else:
+            record_error("classic_protection", protection, message)
+        if facts["classic_protection_supported"] is False:
+            record_error("classic_protection", protection, message)
+    return facts
+
+
 def _ruleset_facts(
     active: list[dict[str, Any]], expected_actors: list[Any], default_branch: str
 ) -> dict[str, Any]:
@@ -705,11 +851,21 @@ def collect_repository(
         },
         "protection": protection_data,
         "protection_facts": protection_facts,
-        "rulesets": _ruleset_facts(
-            active_rulesets,
-            parameters.get("expected_maintainer_bypass_actors", []),
-            default_branch,
-        ),
+        "rulesets": {
+            **_ruleset_facts(
+                active_rulesets,
+                parameters.get("expected_maintainer_bypass_actors", []),
+                default_branch,
+            ),
+            "merge_policy": _merge_policy_facts(
+                _result(
+                    fetched,
+                    "/repos/${owner}/${repo}/rules/branches/${default_branch}?per_page=100",
+                    parameters,
+                ),
+                protection,
+            ),
+        },
         "actions": {
             "permissions": (
                 _result(

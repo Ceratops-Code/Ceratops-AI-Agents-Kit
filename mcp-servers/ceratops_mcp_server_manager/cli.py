@@ -34,6 +34,8 @@ def main(argv: list[str] | None = None) -> int:
     update = commands.add_parser("update")
     update.add_argument("mcp_server_name")
     update.add_argument("version")
+    refresh = commands.add_parser("refresh-launcher", help="refresh one installed server's launcher without reinstalling it")
+    refresh.add_argument("mcp_server_name")
     versions = commands.add_parser("versions")
     versions.add_argument("mcp_server_name", nargs="?", default=MCP_SERVER_NAME)
     args = parser.parse_args(argv)
@@ -48,11 +50,13 @@ def main(argv: list[str] | None = None) -> int:
 
             result = install_from_source(args.source, args.mcp_server_name,
                                          package_wheel=args.package_wheel, package_lock=args.package_lock)
+        elif args.operation == "refresh-launcher":
+            result = Engine().refresh_launcher(args.mcp_server_name)
         else:
             engine = Engine()
             result = engine.update(args.mcp_server_name, args.version) if args.operation == "update" else engine.versions(args.mcp_server_name)
         print(json.dumps(result, sort_keys=True))
         return 0
     except (DeploymentError, OSError, ValueError, KeyError) as exc:
-        print(json.dumps({"error": str(exc)[-1800:]}), file=sys.stderr)
+        print(json.dumps({"error": str(exc)}), file=sys.stderr)
         return 2

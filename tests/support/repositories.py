@@ -33,7 +33,7 @@ def prepare_script_environment(repo: pathlib.Path) -> None:
     scripts = repo / "scripts"
     scripts.mkdir(exist_ok=True)
     (scripts / "pyproject.toml").write_text(
-        project_text(repo, templates / "validation-pyproject.toml.tmpl", ["jsonschema", "PyYAML", "ruff", "mypy"]),
+        project_text(repo, templates / "validation-pyproject.toml.tmpl", ["jsonschema", "PyYAML", "ruff", "mypy", "tomlkit"]),
         encoding="utf-8",
     )
     (scripts / ".gitignore").write_text(".venv/\n__pycache__/\n", encoding="utf-8")
@@ -87,6 +87,11 @@ def run_ci_action(
         project.mkdir(parents=True)
         for name in ("pyproject.toml", "uv.lock"):
             shutil.copy2(ROOT / "skills/sections/python" / name, project / name)
+        # Source actions import the same shared command helper as a real checkout.
+        shutil.copytree(
+            ROOT / "skills/sections/scripts", bundle / "skills/sections/scripts",
+            ignore=shutil.ignore_patterns("__pycache__"),
+        )
     action_root = action_root / "scripts"
     action = yaml.safe_load((action_root / "action.yml").read_text(encoding="utf-8"))
     assert action["runs"]["using"] == "composite"

@@ -30,6 +30,7 @@ from tests.support.processes import (
 from tests.support.repositories import (
     ROOT,
     create_compatible_repo,
+    run_git,
 )
 
 
@@ -540,6 +541,10 @@ def test_non_python_skill_needs_no_shared_skill_runtime(
     )
     assert compatibility.validate_ceratops_compatibility(repo)["valid"] is True
 
+    # The compatibility fixture's placeholder is not a real Git checkout.
+    # Bootstrap derives machine roots through Git, so give it a real checkout.
+    (repo / ".git").unlink()
+    run_git(repo, "init")
     install_root = tmp_path / "installed"
     installed = subprocess.run(
         [sys.executable, str(repo / "scripts/deploy-skills.py"),

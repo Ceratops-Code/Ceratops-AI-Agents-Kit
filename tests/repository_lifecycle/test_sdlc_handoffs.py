@@ -30,7 +30,9 @@ from tests.support.processes import run_compatibility_engine
 from tests.support.repositories import ROOT, run_ci_action, run_git
 
 runner = importlib.import_module("repository_operation")
+skill_actions = importlib.import_module("execute_skill_actions")
 storage = importlib.import_module("store_artifacts")
+completion = importlib.import_module("complete_artifact_builds")
 contracts = importlib.import_module(
     "ceratops_repo_compatibility_engine.sdlc_contract_validation"
 )
@@ -522,7 +524,7 @@ def test_v4_tests_gate_mutations_and_ci_never_dispatches_handoffs(
         calls.append(route)
         return {"status": "completed"}
 
-    monkeypatch.setattr(runner, "execute_handoff", record_handoff)
+    monkeypatch.setattr(skill_actions, "execute_handoff", record_handoff)
     handoff = runner.prepare_operations(
         tmp_path,
         [runner.OperationRequest("deliverables.apps.service.actions.validate")],
@@ -1243,371 +1245,219 @@ def _write_versioned_outputs(
 
 
 def _checkpoint_child(repository: pathlib.Path, body: str, *arguments: str):
-    """Exercise discovery and native locks in a genuinely fresh interpreter."""
+    """Exercise artifact recovery in a genuinely fresh interpreter."""
     return subprocess.run(
         [sys.executable, "-c",
          "import pathlib,sys,json; sys.path.insert(0,sys.argv[1]); "
-         "import store_artifacts,repository_operation; "
-         "cp=store_artifacts._checkpoint_storage(); repo=pathlib.Path(sys.argv[2]);\n" + body,
+         "import store_artifacts,repository_operation,complete_artifact_builds; "
+         "repo=pathlib.Path(sys.argv[2]);\n" + body,
          str(REPOSITORY_LIFECYCLE_SCRIPTS), str(repository), *arguments],
         capture_output=True, text=True, check=False,
     )
 
 
-def _checkpoint_worktree(repository: pathlib.Path, path: pathlib.Path) -> pathlib.Path:
-    added = run_git(repository, "worktree", "add", "-b", path.name, str(path), "HEAD")
-    assert added.returncode == 0, added.stderr
-    return path
+def _bound_test_build(repo_root, *, pre_test_commit, **selection):
+    """Existing receipt fixtures already have B; production uses the two calls."""
+    allocation = runner.allocate_versioned_build(repo_root, **selection)
+    return runner.bind_versioned_build_inputs(allocation, pre_test_commit=pre_test_commit)
 
 
-def test_checkpoints_discover_direct_records_nest_and_refuse_competing_writers(tmp_path, monkeypatch) -> None:
-    repository, _commit = _versioned_repository(tmp_path)
-    cp = storage._checkpoint_storage()
 
-    def no_replace(*args, **kwargs):
-        pytest.fail("Checkpoint writes must not publish a temporary copy.")
+@pytest.mark.parametrize("stage", ["mkdir", "request", "binding"])
+@pytest.mark.parametrize("timing", ["before", "after"])
+def test_versioned_allocation_repeats_after_directory_and_request_effects(tmp_path, monkeypatch, stage, timing):
+    repository, commit = _versioned_repository(tmp_path)
+    selection = dict(repository="example/project", release_unit="claims", version="1.2.3b1",
+                     required_targets=["linux", "windows"], attempt_id="attempt-interruption")
+    allocation = None
+    if stage == "binding":
+        allocation = runner.allocate_versioned_build(repository, **selection)
+    method = pathlib.Path.mkdir if stage == "mkdir" else storage._write_transaction_record
+    fired = False
 
-    monkeypatch.setattr(cp.os, "replace", no_replace)
-    with cp.open_checkpoints(repository, "artifact-versions") as context:
-        cp.write_checkpoint(context, "request.json", {"request": "first"})
-        cp.write_checkpoint(context, "states/1.json", {"essential": [1, 2]})
-        raw = (context.directory / "request.json").read_bytes()
-        mtime = (context.directory / "request.json").stat().st_mtime_ns
-        cp.write_checkpoint(context, "request.json", {"request": "first"})
-        assert (context.directory / "request.json").stat().st_mtime_ns == mtime
-        assert sorted(path.relative_to(context.directory).as_posix() for path in context.directory.rglob("*") if path.is_file()) == ["request.json", "states/1.json"]
-        with cp.open_checkpoints(repository, "artifact-versions") as nested:
-            assert nested is context
-            with pytest.raises(cp.CheckpointError, match="outermost"):
-                cp.finish_checkpoints(nested)
-        assert context.outermost
-        with pytest.raises(cp.CheckpointError, match="another unfinished request"):
-            cp.write_checkpoint(context, "request.json", {"request": "second"})
-        cp.write_checkpoint(context, "typed.json", {"value": True})
-        with pytest.raises(cp.CheckpointError, match="another unfinished request"):
-            cp.write_checkpoint(context, "typed.json", {"value": 1})
-        competing = _checkpoint_child(repository, "with cp.open_checkpoints(repo, 'artifact-versions'): pass")
-        assert competing.returncode != 0 and "producer is busy" in competing.stderr
-        assert (context.directory / "request.json").read_bytes() == raw
-    with pytest.raises(cp.CheckpointError, match="active producer context"):
-        cp.read_checkpoint(context, "request.json")
-    fresh = _checkpoint_child(repository,
-        "with cp.open_checkpoints(repo, 'artifact-versions') as c:\n"
-        " assert cp.read_checkpoint(c,'request.json') == {'request':'first'}\n"
-        " print(c.worktree_id)\n"
-        " cp.finish_checkpoints(c)\n")
-    assert fresh.returncode == 0, fresh.stderr
-    assert fresh.stdout.strip() == context.worktree_id
-    assert not context.directory.exists()
-    assert pathlib.Path(context.lock.lock_file).is_file()
+    def interrupted(*args, **kwargs):
+        nonlocal fired
+        path = args[0]
+        selected = (path.name == "1.2.3b1" if stage == "mkdir" else path.name == "build_request.json")
+        if selected and not fired:
+            fired = True
+            if timing == "after":
+                method(*args, **kwargs)
+            raise OSError("interrupted allocation")
+        return method(*args, **kwargs)
 
-
-@pytest.mark.parametrize("raw", [b"{", b"null", b'{"a":1,"a":2}', b'{"a":NaN}', b'{"a":1e999}', b"\xff"])
-def test_checkpoints_never_treat_unreadable_records_as_absent(tmp_path, raw) -> None:
-    repository, _commit = _versioned_repository(tmp_path)
-    cp = storage._checkpoint_storage()
-    with cp.open_checkpoints(repository, "artifact-versions") as context:
-        assert cp.read_checkpoint(context, "request.json") is None
-        path = context.directory / "request.json"
-        path.write_bytes(raw)
-        with pytest.raises(cp.CheckpointError, match="Unreadable"):
-            cp.read_checkpoint(context, "request.json")
-        with pytest.raises(cp.CheckpointError, match="Unreadable"):
-            cp.write_checkpoint(context, "request.json", {"request": "new"})
-        assert path.read_bytes() == raw
-
-
-def test_checkpoints_cleanup_is_success_only_same_owner_and_preserves_durable_data(tmp_path, monkeypatch) -> None:
-    repository, _commit = _versioned_repository(tmp_path)
-    cp = storage._checkpoint_storage()
-    removed = _checkpoint_worktree(repository, tmp_path / "removed")
-    live = _checkpoint_worktree(repository, tmp_path / "live")
-    contexts = {}
-    for owner, worktree in (("artifact-versions", removed), ("skill-updates", removed), ("artifact-versions", live)):
-        with cp.open_checkpoints(worktree, owner) as context:
-            cp.write_checkpoint(context, "request.json", {"selection": worktree.name})
-            contexts[owner, worktree] = context
-    assert run_git(repository, "worktree", "remove", str(removed)).returncode == 0
-    orphan = contexts["artifact-versions", removed].directory
-    foreign = contexts["skill-updates", removed].directory
-    live_directory = contexts["artifact-versions", live].directory
-    with pytest.raises(RuntimeError, match="failed work"):
-        with cp.open_checkpoints(repository, "artifact-versions") as context:
-            cp.write_checkpoint(context, "request.json", {"selection": "main"})
-            raise RuntimeError("failed work")
-    assert orphan.exists()
-    durable = {}
-    for relative in ("artifacts/unit/1.0.0/accepted.bin", "artifacts/.reservations/unit/1.0.1.json", "installed/current.json"):
-        path = context.common_dir / "ceratops" / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(b"owned by another producer")
-        durable[path] = path.read_bytes()
-    with cp.open_checkpoints(repository, "artifact-versions") as context:
-        assert orphan.exists()  # Opening does not sweep.
-        git = cp._git
-        with monkeypatch.context() as patch:
-            def lookup_fails(*args):
-                if "list" in args:
-                    raise cp.CheckpointError("lookup failed")
-                return git(*args)
-            patch.setattr(cp, "_git", lookup_fails)
-            with pytest.raises(cp.CheckpointError, match="lookup failed"):
-                cp.finish_checkpoints(context)
-        assert context.directory.exists() and orphan.exists()
-        cp.finish_checkpoints(context)
-        assert not context.directory.exists() and not orphan.exists()
-        assert foreign.exists() and live_directory.exists()
-        assert all(path.read_bytes() == raw for path, raw in durable.items())
-        cp.finish_checkpoints(context)  # Cleanup-only retry is harmless.
-    cp.discard_worktree_checkpoints(repository, contexts["skill-updates", removed].worktree_id)
-    assert not foreign.exists() and live_directory.exists()
-    with pytest.raises(cp.CheckpointError, match="still present"):
-        cp.discard_worktree_checkpoints(repository, contexts["artifact-versions", live].worktree_id)
-
-
-def test_checkpoints_removed_worktree_keeps_a_busy_parent_lock(tmp_path) -> None:
-    repository, _commit = _versioned_repository(tmp_path)
-    removed = _checkpoint_worktree(repository, tmp_path / "busy")
-    cp = storage._checkpoint_storage()
-    ready, release = threading.Event(), threading.Event()
-    owned = []
-
-    def parent_writer():
-        with cp.open_checkpoints(removed, "artifact-versions") as context:
-            cp.write_checkpoint(context, "request.json", {"still": "running"})
-            owned.append(context)
-            ready.set()
-            assert release.wait(30)
-
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        producer = executor.submit(parent_writer)
-        try:
-            assert ready.wait(10)
-            assert run_git(repository, "worktree", "remove", str(removed)).returncode == 0
-            with cp.open_checkpoints(repository, "artifact-versions") as context:
-                cp.finish_checkpoints(context)
-            cp.discard_worktree_checkpoints(repository, owned[0].worktree_id)
-            assert owned[0].directory.exists()
-        finally:
-            release.set()
-        producer.result(timeout=10)
-    cp.discard_worktree_checkpoints(repository, owned[0].worktree_id)
-    assert not owned[0].directory.exists()
-    assert pathlib.Path(owned[0].lock.lock_file).is_file()
-
-
-def test_checkpoints_follow_registration_across_worktree_move_and_external_removal(tmp_path) -> None:
-    repository, _commit = _versioned_repository(tmp_path)
-    original = _checkpoint_worktree(repository, tmp_path / "original")
-    cp = storage._checkpoint_storage()
-    with cp.open_checkpoints(original, "artifact-versions") as first:
-        cp.write_checkpoint(first, "request.json", {"intent": "unchanged"})
-    moved = tmp_path / "moved"
-    assert run_git(repository, "worktree", "move", str(original), str(moved)).returncode == 0
-    with cp.open_checkpoints(moved, "artifact-versions") as second:
-        assert second.worktree_id == first.worktree_id
-        assert second.directory == first.directory
-        assert cp.read_checkpoint(second, "request.json") == {"intent": "unchanged"}
-    shutil.rmtree(moved)  # Deliberately leave Git's stale registration.
-    with cp.open_checkpoints(repository, "artifact-versions") as context:
-        cp.finish_checkpoints(context)
-    assert not first.directory.exists()
-
-
-def test_checkpoints_preserve_a_registration_reappearing_before_cleanup_lock(tmp_path, monkeypatch) -> None:
-    repository, _commit = _versioned_repository(tmp_path)
-    worktree = _checkpoint_worktree(repository, tmp_path / "reappearing")
-    cp = storage._checkpoint_storage()
-    with cp.open_checkpoints(worktree, "artifact-versions") as orphan:
-        cp.write_checkpoint(orphan, "request.json", {"keep": True})
-    assert run_git(repository, "worktree", "remove", str(worktree)).returncode == 0
-    with cp.open_checkpoints(repository, "artifact-versions") as context:
-        native_lock = cp._lock
-        def reappearing(common, owner, worktree_id):
-            if worktree_id == orphan.worktree_id:
-                added = run_git(repository, "worktree", "add", str(worktree), worktree.name)
-                assert added.returncode == 0, added.stderr
-            return native_lock(common, owner, worktree_id)
-        monkeypatch.setattr(cp, "_lock", reappearing)
-        cp.finish_checkpoints(context)
-    assert (orphan.directory / "request.json").read_bytes() == b'{"keep":true}\n'
-
-
-@pytest.mark.parametrize("name", ["../outside.json", "/outside.json", "states/../outside.json", "states\\1.json", "a//b.json"])
-def test_checkpoints_reject_redirected_record_paths(tmp_path, name) -> None:
-    repository, _commit = _versioned_repository(tmp_path)
-    cp = storage._checkpoint_storage()
-    with cp.open_checkpoints(repository, "artifact-versions") as context:
-        with pytest.raises(cp.CheckpointError):
-            cp.write_checkpoint(context, name, {"intent": "unsafe"})
-        assert not list(context.directory.iterdir())
-
-
-def test_checkpoints_do_not_traverse_linked_files_during_reads_writes_or_cleanup(tmp_path) -> None:
-    repository, _commit = _versioned_repository(tmp_path)
-    cp = storage._checkpoint_storage()
-    outside = tmp_path / "outside.json"
-    outside.write_bytes(b'{"keep":true}')
-    with cp.open_checkpoints(repository, "artifact-versions") as context:
-        linked = context.directory / "request.json"
-        os.link(outside, linked)
-        for action in (
-            lambda: cp.read_checkpoint(context, "request.json"),
-            lambda: cp.write_checkpoint(context, "request.json", {"replace": True}),
-            lambda: cp.finish_checkpoints(context),
-        ):
-            with pytest.raises(cp.CheckpointError, match="hard-linked"):
-                action()
-        assert outside.read_bytes() == b'{"keep":true}'
-        assert linked.exists()
-
-
-def test_checkpoints_do_not_traverse_directory_links_during_cleanup(tmp_path) -> None:
-    repository, _commit = _versioned_repository(tmp_path)
-    cp = storage._checkpoint_storage()
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    sentinel = outside / "keep.json"
-    sentinel.write_bytes(b'{"keep":true}')
-    with cp.open_checkpoints(repository, "artifact-versions") as context:
-        link = context.directory / "linked"
-        try:
-            link.symlink_to(outside, target_is_directory=True)
-        except OSError:
-            if os.name != "nt":
-                raise
-            made = subprocess.run(
-                ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(outside)],
-                capture_output=True, text=True, check=False,
-            )
-            assert made.returncode == 0, made.stderr
-        try:
-            with pytest.raises(cp.CheckpointError, match="must not follow a link"):
-                cp.read_checkpoint(context, "linked/keep.json")
-            with pytest.raises(cp.CheckpointError, match="must not follow a link"):
-                cp.finish_checkpoints(context)
-            assert sentinel.read_bytes() == b'{"keep":true}'
-        finally:
-            if link.is_symlink():
-                link.unlink()
+    with monkeypatch.context() as patch:
+        if stage == "mkdir":
+            patch.setattr(pathlib.Path, "mkdir", interrupted)
+        else:
+            patch.setattr(storage, "_write_transaction_record", interrupted)
+        with pytest.raises(OSError, match="interrupted allocation"):
+            if allocation is None:
+                runner.allocate_versioned_build(repository, **selection)
             else:
-                link.rmdir()
+                runner.bind_versioned_build_inputs(allocation, pre_test_commit=commit)
+    assert fired
+    fresh = runner.allocate_versioned_build(repository, **selection)
+    uncertain = (stage == "mkdir" and timing == "after") or (stage == "request" and timing == "before")
+    assert fresh.version == ("1.2.3b2" if uncertain else "1.2.3b1")
+    bound = runner.bind_versioned_build_inputs(fresh, pre_test_commit=commit)
+    assert json.loads(bound.request_path.read_text())["preTestCommit"] == commit
+    assert all(bound.target_output(target).is_dir() for target in bound.required_targets)
+    repeated = runner.allocate_versioned_build(repository, **{**selection, "version": bound.version})
+    assert storage._build_request_record(repeated) == storage._build_request_record(bound)
+    assert repeated.request_path == bound.request_path
 
 
-def test_versioned_reservations_preserve_owners_and_coordinate_targets(
-    tmp_path,
-) -> None:
+def test_versioned_allocation_precedes_embedded_versions_and_commit_b(tmp_path):
+    repository, before = _versioned_repository(tmp_path)
+    selection = dict(repository="example/project", release_unit="claims", version="1.2.3b1",
+                     required_targets=["linux", "windows"], attempt_id="attempt-before-b",
+                     declared_input_paths=["src", "version.txt"])
+    allocation = runner.allocate_versioned_build(repository, **selection)
+    record = json.loads(allocation.request_path.read_text())
+    assert record["allocationCommit"] == before and record["preTestCommit"] is None
+    assert not allocation.target_output("linux").exists()
+    (repository / "version.txt").write_text(allocation.version)
+    assert run_git(repository, "add", "version.txt").returncode == 0
+    assert run_git(repository, "commit", "-m", "prepare selected version").returncode == 0
+    checkpoint = run_git(repository, "rev-parse", "HEAD").stdout.strip()
+    bound = runner.bind_versioned_build_inputs(allocation, pre_test_commit=checkpoint)
+    assert bound.pre_test_commit != before
+    assert (repository / "version.txt").read_text() == bound.version
+    assert runner.allocate_versioned_build(repository, **selection) == bound
+
+
+@pytest.mark.parametrize("change", ["worktree", "index", "new-file"])
+def test_versioned_changed_inputs_select_another_directory(tmp_path, change):
+    repository, commit = _versioned_repository(tmp_path)
+    selection = dict(repository="example/project", release_unit="claims", version="1.2.3a1",
+                     required_targets=["linux"], attempt_id="attempt-inputs",
+                     declared_input_paths=["src"])
+    original = _bound_test_build(repository, pre_test_commit=commit, **selection)
+    sentinel = original.version_root / "accepted.bin"
+    sentinel.write_bytes(b"keep successful work")
+    source = repository / "src/claims.py"
+    if change == "new-file":
+        (source.parent / "new.py").write_text("changed")
+    else:
+        source.write_text("changed")
+        if change == "index":
+            assert run_git(repository, "add", "src/claims.py").returncode == 0
+            source.write_bytes(b"print('claims')\n")
+    fresh = runner.allocate_versioned_build(repository, **selection)
+    assert fresh.version == "1.2.3a2"
+    assert sentinel.read_bytes() == b"keep successful work"
+    with pytest.raises(storage.OperationError, match="committed"):
+        runner.bind_versioned_build_inputs(fresh, pre_test_commit=commit)
+
+
+def test_versioned_allocation_propagates_permission_errors_and_requires_final_version_choice(tmp_path, monkeypatch):
+    repository, _commit = _versioned_repository(tmp_path)
+    selection = dict(repository="example/project", release_unit="claims", version="1.2.3b1",
+                     required_targets=["linux"], attempt_id="attempt-permissions")
+    mkdir = pathlib.Path.mkdir
+
+    def denied(path, *args, **kwargs):
+        if path.name == "1.2.3b1":
+            raise PermissionError("output denied")
+        return mkdir(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(pathlib.Path, "mkdir", denied)
+        with pytest.raises(PermissionError, match="output denied"):
+            runner.allocate_versioned_build(repository, **selection)
+    store = repository / ".git/ceratops/artifacts/claims"
+    assert not list(store.iterdir())
+    first = runner.allocate_versioned_build(repository, **{**selection, "version": "1.2.3"})
+    with pytest.raises(storage.OperationError, match="choose another final version"):
+        runner.allocate_versioned_build(repository, **{**selection, "version": "1.2.3", "attempt_id": "another"})
+    assert first.request_path.is_file()
+
+
+def test_versioned_competing_processes_allocate_while_retention_is_busy(tmp_path):
+    from filelock import FileLock
+
+    repository, commit = _versioned_repository(tmp_path)
+    worktrees = [tmp_path / "first-writer", tmp_path / "second-writer"]
+    for path in worktrees:
+        assert run_git(repository, "worktree", "add", "-b", path.name, str(path), commit).returncode == 0
+    store, lock_path = storage._artifact_infrastructure(repository)
+    program = (
+        "import json,pathlib,subprocess,sys; sys.path.insert(0,sys.argv[1]); import repository_operation as r\n"
+        "root=pathlib.Path(sys.argv[2]); print('ready',flush=True); input()\n"
+        "a=r.allocate_versioned_build(root,repository='example/project',release_unit='claims',version='1.2.3b1',"
+        "required_targets=['linux','windows'],attempt_id=root.name,declared_input_paths=['src','version.txt'])\n"
+        "(root/'version.txt').write_text(a.version)\n"
+        "subprocess.run(['git','-C',str(root),'add','version.txt'],check=True,capture_output=True)\n"
+        "subprocess.run(['git','-C',str(root),'commit','-m','embed version'],check=True,capture_output=True)\n"
+        "b=subprocess.check_output(['git','-C',str(root),'rev-parse','HEAD'],text=True).strip()\n"
+        "t=r.bind_versioned_build_inputs(a,pre_test_commit=b)\n"
+        "print(json.dumps({'version':t.version,'commit':b}),flush=True)\n"
+    )
+    workers = [subprocess.Popen([sys.executable, "-c", program, str(REPOSITORY_LIFECYCLE_SCRIPTS), str(path)],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+               for path in worktrees]
+    try:
+        for worker in workers:
+            assert worker.stdout is not None
+            assert worker.stdout.readline().strip() == "ready"
+        with FileLock(lock_path, timeout=0, preserve_lock_file=True):
+            for worker in workers:
+                assert worker.stdin is not None
+                worker.stdin.write("go\n")
+                worker.stdin.flush()
+            results_from_workers = [worker.communicate(timeout=30) for worker in workers]
+        versions = set()
+        for worker, path, (output, error) in zip(workers, worktrees, results_from_workers, strict=True):
+            assert worker.returncode == 0, error
+            record = json.loads(output)
+            versions.add(record["version"])
+            assert (path / "version.txt").read_text() == record["version"]
+            saved = json.loads((store / "claims" / record["version"] / "build_request.json").read_text())
+            assert saved["preTestCommit"] == record["commit"]
+            assert saved["requiredTargets"] == ["linux", "windows"]
+        assert versions == {"1.2.3b1", "1.2.3b2"}
+    finally:
+        for worker in workers:
+            if worker.poll() is None:
+                worker.kill()
+            worker.wait(timeout=10)
+
+
+def test_versioned_requests_preserve_owners_and_coordinate_targets(tmp_path) -> None:
     repository, commit = _versioned_repository(tmp_path)
     targets = ["python-3.14-windows", "python-3.14-linux"]
-    transaction = runner.reserve_versioned_build(
-        repository,
-        repository="example/project",
-        release_unit="claims",
-        version="1.2.3a1",
-        required_targets=targets,
-        attempt_id="attempt-alpha-001",
-        pre_test_commit=commit,
-    )
+    selection = dict(repository="example/project", release_unit="claims", version="1.2.3a1",
+                     required_targets=targets, attempt_id="attempt-alpha-001")
+    transaction = _bound_test_build(repository, pre_test_commit=commit, **selection)
     sentinel = transaction.target_output(targets[0]) / "owned.bin"
     sentinel.write_bytes(b"preserve this attempt")
     assert all(transaction.target_output(target).is_dir() for target in targets)
-
-    with pytest.raises(runner.OperationError, match="reserved by another attempt"):
-        runner.reserve_versioned_build(
-            repository,
-            repository="example/project",
-            release_unit="claims",
-            version="1.2.3a1",
-            required_targets=targets,
-            attempt_id="attempt-alpha-002",
-            pre_test_commit=commit,
-        )
-    with pytest.raises(storage.RecoveryRequired) as interrupted:
-        runner.reserve_versioned_build(
-            repository,
-            repository="example/project",
-            release_unit="claims",
-            version="1.2.3a1",
-            required_targets=targets,
-            attempt_id="attempt-alpha-001",
-            pre_test_commit=commit,
-        )
-    assert interrupted.value.status == "recovery_required"
-    resumed = runner.reserve_versioned_build(
-        repository,
-        repository="example/project",
-        release_unit="claims",
-        version="1.2.3a1",
-        required_targets=targets,
-        attempt_id="attempt-alpha-001",
-        pre_test_commit=commit,
-        recovery_confirmed=True,
+    repeated = runner.allocate_versioned_build(repository, **selection)
+    assert repeated.request_path == transaction.request_path
+    assert repeated.pre_test_commit == commit
+    independent = _bound_test_build(
+        repository, pre_test_commit=commit, **{**selection, "attempt_id": "another-build"},
     )
-    assert resumed.reservation_path == transaction.reservation_path
-    assert sentinel.read_bytes() == b"preserve this attempt"
-
-    with pytest.raises(storage.RecoveryRequired, match="unfinished attempt"):
-        runner.reserve_versioned_build(
-            repository,
-            repository="example/project",
-            release_unit="claims",
-            version="1.2.3a2",
-            required_targets=[targets[0]],
-            attempt_id="attempt-alpha-003",
-            pre_test_commit=commit,
-        )
-
+    assert independent.version == "1.2.3a2"
     second_worktree = tmp_path / "parallel-worktree"
-    added = run_git(
-        repository,
-        "worktree",
-        "add",
-        "-b",
-        "parallel-versioned-test",
-        str(second_worktree),
-        commit,
-    )
-    assert added.returncode == 0, added.stderr
-    independent = runner.reserve_versioned_build(
-        second_worktree,
-        repository="example/project",
-        release_unit="claims",
-        version="1.2.3a2",
-        required_targets=[targets[0]],
-        attempt_id="attempt-alpha-004",
-        pre_test_commit=commit,
-    )
-    assert independent.version_root != transaction.version_root
+    assert run_git(repository, "worktree", "add", "-b", "parallel-versioned-test",
+                   str(second_worktree), commit).returncode == 0
+    foreign = _bound_test_build(second_worktree, pre_test_commit=commit, **selection)
+    assert foreign.version == "1.2.3a3"
     assert sentinel.read_bytes() == b"preserve this attempt"
-
-    diagnostic = storage.write_versioned_failure_diagnostic(
-        transaction, targets[0], "first failure"
-    )
-    storage.write_versioned_failure_diagnostic(
-        transaction, targets[0], "replacement failure"
-    )
-    assert json.loads(diagnostic.read_text(encoding="utf-8"))["error"] == (
-        "replacement failure"
-    )
+    assert not (transaction.store / ".reservations").exists()
+    diagnostic = completion.write_versioned_failure_diagnostic(transaction, targets[0], "first failure")
+    assert diagnostic.parent == transaction.version_root / ".diagnostics"
+    completion.write_versioned_failure_diagnostic(transaction, targets[0], "replacement failure")
+    assert json.loads(diagnostic.read_text())["error"] == "replacement failure"
     diagnostic.write_bytes(b"interrupted diagnostic")
-    storage.write_versioned_failure_diagnostic(
-        transaction, targets[0], "recovered diagnostic"
-    )
-    assert json.loads(diagnostic.read_text(encoding="utf-8"))["error"] == (
-        "recovered diagnostic"
-    )
-    transaction.reservation_path.write_bytes(b"interrupted reservation")
-    with pytest.raises(storage.RecoveryRequired, match="reservation is unreadable"):
-        runner.reserve_versioned_build(
-            repository,
-            repository="example/project",
-            release_unit="claims",
-            version="1.2.3a1",
-            required_targets=targets,
-            attempt_id="attempt-alpha-001",
-            pre_test_commit=commit,
-            recovery_confirmed=True,
-        )
+    completion.write_versioned_failure_diagnostic(transaction, targets[0], "recovered diagnostic")
+    assert json.loads(diagnostic.read_text())["error"] == "recovered diagnostic"
+    transaction.request_path.write_bytes(b"interrupted request")
+    replacement = _bound_test_build(repository, pre_test_commit=commit, **selection)
+    assert replacement.version == "1.2.3a4"
+    assert transaction.version_root in replacement.uncertain_directories
     assert sentinel.read_bytes() == b"preserve this attempt"
 
 
@@ -1615,7 +1465,7 @@ def test_versioned_receipts_persist_exact_multi_target_direct_state(tmp_path) ->
     repository, commit = _versioned_repository(tmp_path)
     targets = ["python-3.14-windows", "python-3.14-linux"]
     attempt_id = "attempt-beta-001"
-    transaction = runner.reserve_versioned_build(
+    transaction = _bound_test_build(
         repository,
         repository="example/project",
         release_unit="claims",
@@ -1672,7 +1522,7 @@ def test_versioned_receipts_persist_exact_multi_target_direct_state(tmp_path) ->
 def test_versioned_receipt_rejects_changed_tested_artifact(tmp_path) -> None:
     repository, commit = _versioned_repository(tmp_path)
     target = "python-3.14-windows"
-    transaction = runner.reserve_versioned_build(
+    transaction = _bound_test_build(
         repository,
         repository="example/project",
         release_unit="claims",
@@ -1706,6 +1556,72 @@ def test_versioned_receipt_rejects_changed_tested_artifact(tmp_path) -> None:
     assert not (repository / transaction.receipt_path(target)).exists()
 
 
+
+@pytest.mark.parametrize("effect", ["_create_result_commit", "_write_version_artifact_receipts",
+                                  "_create_artifact_tag", "_remove_build_request"])
+@pytest.mark.parametrize("timing", ["before", "after"])
+def test_versioned_completion_repeats_before_and_after_each_effect(tmp_path, monkeypatch, effect, timing):
+    repository, checkpoint, transaction, prepared, _receipts = _prepared_versioned_completion(tmp_path)
+    original = getattr(completion, effect)
+
+    def interrupted(*args, **kwargs):
+        if timing == "after":
+            original(*args, **kwargs)
+        raise OSError("completion interrupted")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(completion, effect, interrupted)
+        with pytest.raises(OSError, match="completion interrupted"):
+            runner.complete_versioned_build(transaction, prepared)
+    fresh = runner.read_versioned_build(
+        repository, repository=transaction.repository, release_unit=transaction.release_unit,
+        version=transaction.version, required_targets=transaction.required_targets,
+    )
+    done = runner.complete_versioned_build(fresh)
+    assert runner.complete_versioned_build(fresh) == done
+    assert run_git(repository, "rev-list", "--count", f"{checkpoint}..HEAD").stdout.strip() == "1"
+    assert not fresh.request_path.exists()
+    assert all(path.is_file() for path in done.artifact_receipts)
+
+
+@pytest.mark.parametrize("timing", ["before", "after"])
+def test_versioned_retention_repeats_after_directory_deletion(tmp_path, monkeypatch, timing):
+    repository, commit = _versioned_repository(tmp_path)
+    store, lock_path = storage._artifact_infrastructure(repository)
+    for number in range(1, 5):
+        version = f"1.2.3a{number}"
+        fixture = tmp_path / f"retained-{number}"
+        fixture.mkdir()
+        _path, _build, _raw, _artifact_path, _artifact, raw = _new_receipt_fixtures(
+            fixture, version=version, target="linux", required_targets=["linux"],
+        )
+        output = store / "claims" / version
+        output.mkdir(parents=True)
+        (output / "artifact-receipt.json").write_bytes(raw)
+        os.utime(output, ns=(number, number))
+        assert run_git(repository, "tag", f"claims/{version}", commit).returncode == 0
+    unfinished = store / "claims/1.2.3a5"
+    unfinished.mkdir()
+    (unfinished / "build_request.json").write_bytes(b"unknown interrupted ownership")
+    original = storage._remove_versioned_tree
+
+    def interrupted(*args, **kwargs):
+        if timing == "after":
+            original(*args, **kwargs)
+        raise OSError("retention interrupted")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(storage, "_remove_versioned_tree", interrupted)
+        with pytest.raises(OSError, match="retention interrupted"):
+            storage._prune_completed_artifacts(repository, store, lock_path)
+    storage._prune_completed_artifacts(repository, store, lock_path)
+    storage._prune_completed_artifacts(repository, store, lock_path)
+    assert not (store / "claims/1.2.3a1").exists()
+    assert len(list((store / "claims").glob("*/artifact-receipt.json"))) == 3
+    assert (unfinished / "build_request.json").read_bytes() == b"unknown interrupted ownership"
+    assert run_git(repository, "show-ref", "--verify", "refs/tags/claims/1.2.3a1").returncode == 0
+
+
 def test_versioned_retention_keeps_three_and_tag_blocks_pruned_reuse(
     tmp_path,
 ) -> None:
@@ -1731,7 +1647,7 @@ def test_versioned_retention_keeps_three_and_tag_blocks_pruned_reuse(
         tagged = run_git(repository, "tag", f"claims/{version}", commit)
         assert tagged.returncode == 0, tagged.stderr
 
-    transaction = runner.reserve_versioned_build(
+    transaction = _bound_test_build(
         repository,
         repository="example/project",
         release_unit="claims",
@@ -1746,16 +1662,12 @@ def test_versioned_retention_keeps_three_and_tag_blocks_pruned_reuse(
     sentinel = transaction.target_output(target) / "pending.bin"
     sentinel.write_bytes(b"pending output stays protected")
 
-    with pytest.raises(runner.OperationError, match="version tag already exists"):
-        runner.reserve_versioned_build(
-            repository,
-            repository="example/project",
-            release_unit="claims",
-            version=versions[0],
-            required_targets=[target],
-            attempt_id="attempt-alpha-reuse",
-            pre_test_commit=commit,
-        )
+    next_build = _bound_test_build(
+        repository, repository="example/project", release_unit="claims",
+        version=versions[0], required_targets=[target],
+        attempt_id="attempt-alpha-reuse", pre_test_commit=commit,
+    )
+    assert next_build.version == "1.2.3a6"
     assert sentinel.read_bytes() == b"pending output stays protected"
 
 
@@ -1768,7 +1680,7 @@ def _prepared_versioned_completion(
 ):
     repository, commit = _versioned_repository(tmp_path)
     targets = ["python-3.14-linux", "python-3.14-windows"]
-    transaction = runner.reserve_versioned_build(
+    transaction = _bound_test_build(
         repository,
         repository="example/project",
         release_unit="claims",
@@ -1841,7 +1753,7 @@ def test_versioned_completion_commits_only_results_and_binds_every_target(
     assert run_git(repository, "diff", "--cached", "--name-only").stdout.strip() == (
         unrelated.relative_to(repository).as_posix()
     )
-    assert not transaction.reservation_path.exists()
+    assert not transaction.request_path.exists()
     assert not (transaction.store / ".pending").exists()
     assert not (transaction.store / ".staging").exists()
     assert all(path.is_file() for path in completed.artifact_receipts)
@@ -1861,66 +1773,63 @@ def test_versioned_completion_commits_only_results_and_binds_every_target(
 def test_versioned_fresh_instance_discovers_attempt_and_reuses_prepared_results(tmp_path) -> None:
     repository, checkpoint, transaction, prepared, _receipts = _prepared_versioned_completion(tmp_path)
     mtimes = {item.worktree_path: item.worktree_path.stat().st_mtime_ns for item in prepared}
-    reserved_bytes = transaction.reservation_path.read_bytes()
+    request_bytes = transaction.request_path.read_bytes()
     fresh = _checkpoint_child(repository,
-        "transaction=repository_operation.reserve_versioned_build(repo,repository='example/project',release_unit='claims',"
-        "version='1.2.5b1',required_targets=['python-3.14-linux','python-3.14-windows'],pre_test_commit=sys.argv[3],recovery_confirmed=True)\n"
+        "transaction=repository_operation.read_versioned_build(repo,repository='example/project',release_unit='claims',"
+        "version='1.2.5b1',required_targets=['python-3.14-linux','python-3.14-windows'])\n"
         "print(transaction.attempt_id)\n"
-        "prepared=store_artifacts.load_prepared_versioned_receipts(transaction)\n"
-        "assert len(prepared)==2\n", checkpoint)
+        "prepared=complete_artifact_builds.load_prepared_versioned_receipts(transaction)\n"
+        "assert len(prepared)==2\n")
     assert fresh.returncode == 0, fresh.stderr
     assert fresh.stdout.strip() == transaction.attempt_id
-    assert transaction.reservation_path.read_bytes() == reserved_bytes
+    assert transaction.request_path.read_bytes() == request_bytes
     assert all(path.stat().st_mtime_ns == mtime for path, mtime in mtimes.items())
-    cp = storage._checkpoint_storage()
-    with cp.open_checkpoints(repository, "artifact-versions") as context:
-        assert not list(context.directory.iterdir())  # No second reservation journal.
-    with pytest.raises(storage.RecoveryRequired, match="explicit recovery"):
-        runner.reserve_versioned_build(repository, repository=transaction.repository,
-            release_unit=transaction.release_unit, version=transaction.version,
-            required_targets=transaction.required_targets, pre_test_commit=checkpoint)
-    assert run_git(repository, "commit", "--allow-empty", "-m", "different request").returncode == 0
-    changed = run_git(repository, "rev-parse", "HEAD").stdout.strip()
-    with pytest.raises(storage.RecoveryRequired, match="different unfinished artifact request"):
-        runner.reserve_versioned_build(repository, repository=transaction.repository,
-            release_unit="other-unit", version="1.0.0", required_targets=["any"],
-            pre_test_commit=changed, attempt_id="different-request")
+    assert not (transaction.store.parent / "operations/artifact-versions").exists()
+    assert not (transaction.store.parent / "locks/artifact-versions").exists()
+    repeated = _bound_test_build(
+        repository, repository=transaction.repository, release_unit=transaction.release_unit,
+        version=transaction.version, required_targets=transaction.required_targets,
+        pre_test_commit=checkpoint,
+    )
+    assert repeated.attempt_id == transaction.attempt_id
+    # New unrelated commits do not invalidate the exact B inputs.
+    assert run_git(repository, "commit", "--allow-empty", "-m", "unrelated").returncode == 0
+    reused = runner.allocate_versioned_build(
+        repository, repository=transaction.repository, release_unit=transaction.release_unit,
+        version=transaction.version, required_targets=transaction.required_targets,
+    )
+    assert reused == repeated
 
 
-def test_versioned_nested_completion_leaves_cleanup_to_outermost_owner(tmp_path) -> None:
+def test_versioned_completion_needs_no_checkpoint_directory(tmp_path) -> None:
     repository, _checkpoint, transaction, prepared, _receipts = _prepared_versioned_completion(tmp_path)
-    with storage.versioned_artifact_checkpoints(repository) as context:
-        runner.complete_versioned_build(transaction, prepared)
-        assert context.directory.is_dir()
-        storage.finish_versioned_checkpoints(transaction, context)
-        assert not context.directory.exists()
+    first = runner.complete_versioned_build(transaction, prepared)
+    second = runner.complete_versioned_build(transaction, prepared)
+    assert first == second
+    assert not (transaction.store.parent / "operations/artifact-versions").exists()
+    assert not (transaction.store.parent / "locks/artifact-versions").exists()
 
 
 def test_versioned_request_may_own_multiple_units_without_premature_cleanup(tmp_path) -> None:
     repository, checkpoint, transaction, prepared, _receipts = _prepared_versioned_completion(tmp_path)
-    other = runner.reserve_versioned_build(repository, repository=transaction.repository,
+    other = _bound_test_build(repository, repository=transaction.repository,
         release_unit="other-unit", version="1.0.0", required_targets=["any"],
         pre_test_commit=checkpoint, attempt_id="other-unit-attempt")
-    with storage.versioned_artifact_checkpoints(repository) as context:
-        directory = context.directory
     runner.complete_versioned_build(transaction, prepared)
-    assert directory.is_dir() and other.reservation_path.is_file()
+    assert other.request_path.is_file()
+    assert not (transaction.store.parent / "operations/artifact-versions").exists()
 
 
 def test_versioned_cleanup_failure_retries_without_repeating_completed_effects(tmp_path, monkeypatch) -> None:
     repository, checkpoint, transaction, prepared, _receipts = _prepared_versioned_completion(tmp_path)
-    cp = storage._checkpoint_storage()
-    with cp.open_checkpoints(repository, "artifact-versions") as context:
-        directory = context.directory
     with monkeypatch.context() as patch:
-        def failed_cleanup(context):
-            raise cp.CheckpointError("cleanup interrupted")
-        patch.setattr(cp, "finish_checkpoints", failed_cleanup)
-        with pytest.raises(storage.RecoveryRequired, match="cleanup interrupted"):
+        def failed_cleanup(*args):
+            raise storage.OperationError("cleanup interrupted")
+        patch.setattr(completion, "_prune_completed_artifacts", failed_cleanup)
+        with pytest.raises(storage.OperationError, match="cleanup interrupted"):
             runner.complete_versioned_build(transaction, prepared)
     final = run_git(repository, "rev-parse", "HEAD").stdout.strip()
-    assert directory.exists()
-    assert not transaction.reservation_path.exists()
+    assert not transaction.request_path.exists()
     mtimes = {path: path.stat().st_mtime_ns for path in transaction.version_root.rglob("*") if path.is_file()}
     # Completed results are Git data; a cleanup retry must not need the mutable
     # worktree receipt, let alone rewrite it or repeat a build/test/finalization.
@@ -1928,9 +1837,9 @@ def test_versioned_cleanup_failure_retries_without_repeating_completed_effects(t
     fresh = _checkpoint_child(repository,
         "def forbid(*args,**kwargs): raise AssertionError('completed effect repeated')\n"
         "for name in ('_prepared_receipt_set','_resolve_result_commit','_write_version_artifact_receipts','_create_artifact_tag'):\n"
-        " setattr(store_artifacts,name,forbid)\n"
-        "transaction=repository_operation.reserve_versioned_build(repo,repository='example/project',release_unit='claims',"
-        "version='1.2.5b1',required_targets=['python-3.14-linux','python-3.14-windows'],pre_test_commit=sys.argv[3],recovery_confirmed=True)\n"
+        " setattr(complete_artifact_builds,name,forbid)\n"
+        "transaction=repository_operation.read_versioned_build(repo,repository='example/project',release_unit='claims',"
+        "version='1.2.5b1',required_targets=['python-3.14-linux','python-3.14-windows'])\n"
         "result=repository_operation.complete_versioned_build(transaction)\n"
         "print(result.final_commit)\n", checkpoint)
     assert fresh.returncode == 0, fresh.stderr
@@ -1938,7 +1847,7 @@ def test_versioned_cleanup_failure_retries_without_repeating_completed_effects(t
     assert run_git(repository, "rev-parse", "HEAD").stdout.strip() == final
     assert prepared[0].worktree_path.read_bytes() == b"unrelated subsequent work"
     assert all(path.stat().st_mtime_ns == mtime for path, mtime in mtimes.items())
-    assert not directory.exists()
+    assert not (transaction.store.parent / "operations/artifact-versions").exists()
 
 
 @pytest.mark.parametrize("interruption", ["after-commit", "after-receipts", "after-tag"])
@@ -1963,13 +1872,13 @@ def test_versioned_completion_resumes_effects_without_duplicate_commit(
     elif interruption == "after-receipts":
         name = "_create_artifact_tag"
     else:
-        name = "_remove_versioned_reservation"
-    original = getattr(storage, name)
+        name = "_remove_build_request"
+    original = getattr(completion, name)
 
     def interrupted(*args, **kwargs):
         raise RuntimeError(interruption)
 
-    monkeypatch.setattr(storage, name, interrupted)
+    monkeypatch.setattr(completion, name, interrupted)
     with pytest.raises(RuntimeError, match=interruption):
         runner.complete_versioned_build(transaction, prepared)
     created = run_git(repository, "rev-parse", "HEAD").stdout.strip()
@@ -1995,8 +1904,8 @@ def test_versioned_completion_resumes_effects_without_duplicate_commit(
         assert storage._artifact_tag_exists(
             repository, transaction.release_unit, transaction.version
         )
-        assert transaction.reservation_path.is_file()
-    monkeypatch.setattr(storage, name, original)
+        assert transaction.request_path.is_file()
+    monkeypatch.setattr(completion, name, original)
 
     completed = runner.complete_versioned_build(transaction)
 
@@ -2004,7 +1913,7 @@ def test_versioned_completion_resumes_effects_without_duplicate_commit(
     assert run_git(
         repository, "rev-list", "--count", f"{checkpoint}..{transaction.branch}"
     ).stdout.strip() == "1"
-    assert not transaction.reservation_path.exists()
+    assert not transaction.request_path.exists()
     assert run_git(
         repository, "rev-parse", f"refs/tags/{completed.tag}^{{commit}}"
     ).stdout.strip() == created
@@ -2039,7 +1948,7 @@ def test_versioned_completion_rejects_changed_declared_inputs(tmp_path, change) 
     assert not storage._artifact_tag_exists(
         repository, transaction.release_unit, transaction.version
     )
-    assert transaction.reservation_path.is_file()
+    assert transaction.request_path.is_file()
 
 
 def test_versioned_completion_rejects_changed_prepared_result(tmp_path) -> None:
@@ -3403,7 +3312,7 @@ def test_registered_skill_executor_is_portable_and_failure_is_not_completion(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    handoffs = runner
+    handoffs = skill_actions
     skill = tmp_path / "skills/example-skill"
     (skill / "references").mkdir(parents=True)
     (skill / "scripts").mkdir()
@@ -3493,7 +3402,7 @@ def test_registered_skill_executor_uses_installed_authorized_source_bundle(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    handoffs = runner
+    handoffs = skill_actions
     codex_home = tmp_path / "codex"
     installed = codex_home / "skills" / "example-skill"
     source_repo = tmp_path / "repository"
@@ -3546,13 +3455,13 @@ def test_registered_skill_executor_uses_installed_authorized_source_bundle(
 
 @pytest.mark.parametrize("failure", [None, "candidate", "missing_manager"])
 @pytest.mark.parametrize("selected_mcp_server", [None, "sample-mcp-server"])
-def test_tool_install_binding_uses_checkout_metadata_and_propagates_failures(
+def test_mcp_install_binding_passes_checkout_and_server_to_callable(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
     failure: str | None,
     selected_mcp_server: str | None,
 ) -> None:
-    handoffs = runner
+    handoffs = skill_actions
     skill = tmp_path / "skills/ceratops-mcp-server-lifecycle/references"
     skill.mkdir(parents=True)
     shutil.copyfile(
@@ -3562,19 +3471,19 @@ def test_tool_install_binding_uses_checkout_metadata_and_propagates_failures(
     source = tmp_path / "repo with spaces & punctuation/skills/ceratops-mcp-server-lifecycle"
     (source / "references").mkdir(parents=True)
     shutil.copyfile(skill / "action-executors.json", source / "references/action-executors.json")
+    (source / "scripts").mkdir()
+    (source / "scripts/install-mcp-server.py").write_text("# Callable replaced by the test.\n")
     monkeypatch.setenv("CODEX_HOME", str(tmp_path))
     repo = tmp_path / "repo with spaces & punctuation"
     calls = []
 
-    def run(argv, **kwargs):
-        calls.append((argv, kwargs))
+    def run(root, declaration, argv):
+        calls.append((root, declaration, argv))
         if failure == "missing_manager":
             raise FileNotFoundError("manager launcher missing")
-        return subprocess.CompletedProcess(
-            argv, 7 if failure else 0, "OK\n", "candidate failed" if failure else ""
-        )
+        return {"status": "failed" if failure else "completed", "message": "candidate failed"}
 
-    monkeypatch.setattr(handoffs, "run_progress_command", run)
+    monkeypatch.setattr(handoffs, "_call_action", run)
     inputs = (
         {
             "mcp-server": selected_mcp_server,
@@ -3589,25 +3498,19 @@ def test_tool_install_binding_uses_checkout_metadata_and_propagates_failures(
         inputs=inputs,
     )
     assert result["status"] == ("operation_failed" if failure else "completed")
-    expected = [
-        sys.executable,
-        "-I",
-        "-B",
-        str(source) + "/scripts/install-mcp-server.py",
-        "--repo-root",
-        str(repo),
-    ]
+    expected = ["--repo-root", str(repo)]
     if selected_mcp_server is not None:
         expected.extend(["--mcp-server-name", selected_mcp_server])
-    assert calls[0][0] == expected
-    assert calls[0][1]["cwd"] == repo
-    assert not calls[0][1].get("shell", False)
+    assert calls[0][0] == source
+    assert calls[0][1]["function"] == "install_mcp_server"
+    assert calls[0][1]["request"] == "InstallOptions"
+    assert calls[0][2] == expected
 
 
 def test_tool_install_binding_rejects_unknown_structured_inputs(
     tmp_path: pathlib.Path,
 ) -> None:
-    result = runner.execute_handoff(
+    result = skill_actions.execute_handoff(
         "ceratops-mcp-server-lifecycle/install",
         tmp_path,
         inputs={"mcp-server": "sample-mcp-server", "unexpected": "value"},
@@ -3623,7 +3526,7 @@ def test_tool_install_binding_rejects_unknown_structured_inputs(
 def test_tool_install_binding_defers_package_backed_selection(
     tmp_path: pathlib.Path,
 ) -> None:
-    result = runner.execute_handoff(
+    result = skill_actions.execute_handoff(
         "ceratops-mcp-server-lifecycle/install",
         tmp_path,
         inputs={
@@ -3780,7 +3683,7 @@ def test_tool_install_helper_runs_manager_once_and_attests_selection(
 
     def install(args, source_root):
         calls.append((args.mcp_server_name, source_root))
-        return payload
+        return subprocess.CompletedProcess([sys.executable, "manager", "install"], 0, json.dumps(payload), "")
 
     monkeypatch.setitem(helper["main"].__globals__, "INSTALL_ROOT", install_root)
     monkeypatch.setitem(helper["main"].__globals__, "_install", install)
@@ -3794,10 +3697,238 @@ def test_tool_install_helper_runs_manager_once_and_attests_selection(
     assert receipt["transaction_id"] == instance
 
 
+def _declared_skill_commands(tmp_path, monkeypatch, action, declaration):
+    """Install matching declarations with deliberately unfamiliar script names."""
+    repo = tmp_path / "repository"
+    source = repo / "skills/ceratops-skill-lifecycle"
+    installed = tmp_path / "codex/skills/ceratops-skill-lifecycle"
+    document = {"version": 1, "actions": {action: declaration}}
+    for root in (source, installed):
+        (root / "references").mkdir(parents=True)
+        (root / "references/action-executors.json").write_text(json.dumps(document))
+    (source / "scripts").mkdir()
+    probe = """import argparse, json, pathlib
+parser = argparse.ArgumentParser()
+parser.add_argument('--repo', type=pathlib.Path, required=True)
+parser.add_argument('--target')
+parser.add_argument('--phase', required=True)
+parser.add_argument('--fail', action='store_true')
+args = parser.parse_args()
+with (args.repo / 'calls.jsonl').open('a') as stream:
+    stream.write(json.dumps({'phase': args.phase, 'skill': args.target}) + chr(10))
+if args.fail:
+    raise SystemExit(9)
+print(json.dumps({'schema': 'fixture.skill-action.v1', 'status': 'passed',
+                  'skill': args.target, 'phase': args.phase}))
+"""
+    for name in ("check_named_sources.py", "copy_named_skills.py"):
+        (source / "scripts" / name).write_text(probe)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    return repo
+
+
+def _declared_skill_argv(action, phase, *, selected):
+    script = "check_named_sources.py" if action == "source-validate" else "copy_named_skills.py"
+    argv = ["{python}", "{skill_root}/scripts/" + script,
+            "--repo", "{repo_root}", "--phase", phase]
+    return [*argv, "--target", "{skill}"] if selected else argv
+
+
+@pytest.mark.parametrize("read_owner", ["source", "installed"])
+@pytest.mark.parametrize("selected", [False, True])
+def test_skill_action_binding_read_failure_stops_before_commands(
+    tmp_path, monkeypatch, read_owner, selected,
+):
+    declaration = {
+        "run": _declared_skill_argv("deploy", "all", selected=False),
+        "selected-skill": {"run": _declared_skill_argv("deploy", "one", selected=True)},
+    }
+    repo = _declared_skill_commands(tmp_path, monkeypatch, "deploy", declaration)
+    root = repo if read_owner == "source" else tmp_path / "codex"
+    broken = root / "skills/ceratops-skill-lifecycle/references/action-executors.json"
+    original_read = pathlib.Path.read_bytes
+    calls = []
+
+    def read_bytes(path):
+        if path == broken:
+            raise PermissionError(f"Cannot read {read_owner} declaration")
+        return original_read(path)
+
+    monkeypatch.setattr(pathlib.Path, "read_bytes", read_bytes)
+    monkeypatch.setattr(skill_actions, "run_progress_command", lambda *a, **k: calls.append(a))
+    result = skill_actions.execute_handoff(
+        "ceratops-skill-lifecycle/deploy", repo,
+        inputs={"skill": "example-skill"} if selected else None,
+    )
+    assert result == {
+        "status": "operation_failed",
+        "handoff": "ceratops-skill-lifecycle/deploy",
+        "message": f"Cannot read {read_owner} declaration",
+    }
+    assert calls == []
+    assert not (repo / "calls.jsonl").exists()
+
+
+@pytest.mark.parametrize("action", ["source-validate", "deploy"])
+@pytest.mark.parametrize("selected", [False, True])
+@pytest.mark.parametrize("form", ["run", "steps"])
+def test_declared_skill_forms_run_exact_arguments_in_order(
+    tmp_path, monkeypatch, action, selected, form,
+):
+    def commands(targeted):
+        first = {"run": _declared_skill_argv(action, "first", selected=targeted)}
+        return first if form == "run" else {"steps": [first, {
+            "run": _declared_skill_argv(action, "second", selected=targeted),
+        }]}
+
+    declaration = {**commands(False), "selected-skill": commands(True)}
+    original = deepcopy(declaration)
+    repo = _declared_skill_commands(tmp_path, monkeypatch, action, declaration)
+    inputs = {"skill": "example-skill", "prerequisite-packages": ["shared-package"]} if selected else None
+    phases = ["first"] if form == "run" else ["first", "second"]
+    for _ in range(2):
+        result = skill_actions.execute_handoff(
+            "ceratops-skill-lifecycle/" + action, repo, inputs=inputs,
+        )
+        assert result["status"] == "completed", result
+        assert result["steps"] == list(range(1, len(phases) + 1))
+        assert [item["result"]["phase"] for item in result["step_results"]] == phases
+    calls = [json.loads(line) for line in (repo / "calls.jsonl").read_text().splitlines()]
+    assert calls == [{"phase": phase, "skill": "example-skill" if selected else None}
+                     for phase in phases] * 2
+    assert declaration == original
+
+
+@pytest.mark.parametrize("action", ["source-validate", "deploy"])
+@pytest.mark.parametrize("problem", [
+    "missing", "null", "empty", "both-forms", "unknown-field", "empty-steps",
+    "bad-second-step", "bad-second-argument", "unknown-input", "unused-skill",
+])
+def test_declared_skill_selection_checks_entire_form_before_any_effect(
+    tmp_path, monkeypatch, action, problem,
+):
+    ordinary = {"run": _declared_skill_argv(action, "all", selected=False)}
+    targeted: dict[str, Any] = {"steps": [
+        {"run": _declared_skill_argv(action, "first", selected=True)},
+        {"run": _declared_skill_argv(action, "second", selected=True)},
+    ]}
+    declaration = {**ordinary, "selected-skill": targeted}
+    if problem == "missing":
+        del declaration["selected-skill"]
+    elif problem == "null":
+        declaration["selected-skill"] = None
+    elif problem == "empty":
+        declaration["selected-skill"] = {}
+    elif problem == "both-forms":
+        targeted["run"] = ordinary["run"]
+    elif problem == "unknown-field":
+        targeted["unexpected"] = "ignored"
+    elif problem == "empty-steps":
+        targeted["steps"] = []
+    elif problem == "bad-second-step":
+        targeted["steps"][1] = {"run": []}
+    elif problem == "bad-second-argument":
+        targeted["steps"][1]["run"].append(None)
+    elif problem == "unknown-input":
+        targeted["steps"][1]["run"].append("{unavailable}")
+    else:
+        declaration["selected-skill"] = ordinary
+    repo = _declared_skill_commands(tmp_path, monkeypatch, action, declaration)
+    for _ in range(2):
+        result = skill_actions.execute_handoff(
+            "ceratops-skill-lifecycle/" + action, repo, inputs={"skill": "example-skill"},
+        )
+        assert result["status"] == "handoff_required", result
+        assert result["steps"] == []
+        assert not (repo / "calls.jsonl").exists()
+
+
+@pytest.mark.parametrize("inputs", [
+    [], {}, {"skill": None}, {"skill": ""}, {"skill": "../outside"},
+    {"skill": "one", "extra": "value"}, {"skill": "one", "prerequisite-packages": "package"},
+    {"skill": "one", "prerequisite-packages": [None]},
+])
+@pytest.mark.parametrize("action", ["source-validate", "deploy"])
+def test_declared_skill_selection_rejects_malformed_inputs_without_commands(
+    tmp_path, monkeypatch, action, inputs,
+):
+    calls = []
+    monkeypatch.setattr(skill_actions, "run_progress_command", lambda *a, **k: calls.append(a))
+    result = skill_actions.execute_handoff(
+        "ceratops-skill-lifecycle/" + action, tmp_path, inputs=inputs,
+    )
+    assert result["status"] == "handoff_required"
+    assert calls == []
+
+
+@pytest.mark.parametrize("action", ["source-validate", "deploy"])
+def test_declared_skill_failure_keeps_success_and_stops_later_effects(tmp_path, monkeypatch, action):
+    declaration = {
+        "run": _declared_skill_argv(action, "all", selected=False),
+        "selected-skill": {"steps": [
+            {"run": _declared_skill_argv(action, "first", selected=True)},
+            {"run": [*_declared_skill_argv(action, "second", selected=True), "--fail"]},
+            {"run": _declared_skill_argv(action, "third", selected=True)},
+        ]},
+    }
+    repo = _declared_skill_commands(tmp_path, monkeypatch, action, declaration)
+    result = skill_actions.execute_handoff(
+        "ceratops-skill-lifecycle/" + action, repo, inputs={"skill": "example-skill"},
+    )
+    assert result["status"] == "operation_failed"
+    assert result["step"] == 2 and result["steps"] == [1]
+    assert result["step_results"][0]["result"]["phase"] == "first"
+    calls = [json.loads(line) for line in (repo / "calls.jsonl").read_text().splitlines()]
+    assert calls == [{"phase": phase, "skill": "example-skill"} for phase in ("first", "second")]
+
+
+@pytest.mark.parametrize("action", ["source-validate", "deploy"])
+@pytest.mark.parametrize("position", [1, 2])
+@pytest.mark.parametrize("interruption", ["before", "after"])
+def test_declared_skill_fresh_calls_keep_selection_after_interruption(
+    tmp_path, monkeypatch, action, position, interruption,
+):
+    declaration = {
+        "run": _declared_skill_argv(action, "all", selected=False),
+        "selected-skill": {"steps": [{
+            "run": _declared_skill_argv(action, phase, selected=True),
+        } for phase in ("first", "second")]},
+    }
+    repo = _declared_skill_commands(tmp_path, monkeypatch, action, declaration)
+    calls = []
+    attempts = 0
+    interrupted = False
+
+    def execute(argv, **_kwargs):
+        nonlocal attempts, interrupted
+        attempts += 1
+        stop = not interrupted and attempts == position
+        if stop and interruption == "before":
+            interrupted = True
+            raise KeyboardInterrupt
+        calls.append(argv)
+        if stop:
+            interrupted = True
+            raise KeyboardInterrupt
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(skill_actions, "run_progress_command", execute)
+    with pytest.raises(KeyboardInterrupt):
+        skill_actions.execute_handoff(
+            "ceratops-skill-lifecycle/" + action, repo, inputs={"skill": "example-skill"},
+        )
+    result = skill_actions.execute_handoff(
+        "ceratops-skill-lifecycle/" + action, repo, inputs={"skill": "example-skill"},
+    )
+    assert result["status"] == "completed"
+    assert len(calls) == position - (interruption == "before") + 2
+    assert all(argv[-2:] == ["--target", "example-skill"] for argv in calls)
+
+
 def _registered_skill_fixture(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> pathlib.Path:
-    """Use real subprocesses with fixture lifecycle CLIs that enforce selection."""
+    """Use the declared command/call forms with fixtures that enforce selection."""
     repo = tmp_path / "source"
     source = repo / "skills/ceratops-skill-lifecycle"
     installed = tmp_path / "codex/skills/ceratops-skill-lifecycle"
@@ -3809,23 +3940,28 @@ def _registered_skill_fixture(
         (skill / "references/action-executors.json").write_bytes(binding)
     (source / "scripts/runtime").mkdir(parents=True)
     probe = """import argparse, json, pathlib, subprocess
-parser = argparse.ArgumentParser()
-parser.add_argument('--repo-root', type=pathlib.Path, required=True)
-parser.add_argument('--mode')
-parser.add_argument('--skill', required=True)
-args = parser.parse_args()
-with (args.repo_root / 'calls.jsonl').open('a') as stream:
-    stream.write(json.dumps({'mode': args.mode, 'skill': args.skill}) + chr(10))
-if args.mode is not None:
-    assert args.mode == 'skill'
-else:
+from types import SimpleNamespace as DeployOptions
+def build_parser():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--repo-root', type=pathlib.Path, required=True)
+    parser.add_argument('--mode')
+    parser.add_argument('--skill', required=True)
+    return parser
+def deploy_managed_skills(args):
+    with (args.repo_root / 'calls.jsonl').open('a') as stream:
+        stream.write(json.dumps({'mode': args.mode, 'skill': args.skill}) + chr(10))
+    if args.mode is not None:
+        assert args.mode == 'skill'
+        return 'OK'
     commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=args.repo_root, text=True).strip()
-    print(json.dumps({'schema': 'ceratops-deployment-completion.v1',
+    return {'schema': 'ceratops-deployment-completion.v1',
         'producer': 'ceratops-skill-lifecycle/deploy', 'status': 'completed',
         'repo_root': str(args.repo_root), 'commit': commit,
         'install_root': str(args.repo_root.parent / 'installed'),
         'deployed': [args.skill], 'removed': [], 'transaction_id': 'a' * 32,
-        'cleanup_debt': [], 'promotion': None}))
+        'cleanup_debt': [], 'promotion': None}
+if __name__ == '__main__':
+    print(json.dumps(deploy_managed_skills(build_parser().parse_args())))
 """
     for script in (
         "scripts/skills-consistency-source-validator.py",
@@ -3870,10 +4006,9 @@ def test_v4_registered_skill_handoff_preserves_selection_prerequisites_and_recei
         json.loads(line) for line in (repo / "calls.jsonl").read_text().splitlines()
     ]
     expected: list[dict[str, str | None]] = [
-        {"mode": "skill", "skill": "claims-catalog-invoice"}
+        {"mode": "skill" if action == "validate" else None,
+         "skill": "claims-catalog-invoice"}
     ]
-    if action == "install":
-        expected.append({"mode": None, "skill": "claims-catalog-invoice"})
     assert calls == expected
     assert result["handoff_completed"] is True
     assert result["handoff_inputs"] == {
@@ -3881,8 +4016,10 @@ def test_v4_registered_skill_handoff_preserves_selection_prerequisites_and_recei
         "prerequisite-packages": ["claims"],
     }
     if action == "install":
-        assert result["steps"] == [1, 2]
-        assert result["step_results"][-1]["step"] == 2
+        # Source checking belongs inside the real installer, not a second
+        # executor step. This fixture observes only the public command call.
+        assert result["steps"] == [1]
+        assert result["step_results"][-1]["step"] == 1
         receipt = result["step_results"][-1]["result"]
         assert receipt["deployed"] == ["claims-catalog-invoice"]
         # The public finalizer must recognize the same completion protocol.
@@ -3944,23 +4081,17 @@ def test_v4_skill_handoff_rejects_unsafe_or_unhandled_work_before_deployment(
     elif problem == "dirty_source":
         (repo / "uncommitted.txt").write_text("must not deploy")
     else:
-        original = runner.run_progress_command
+        original = skill_actions._call_action
 
-        def changing(argv, **kwargs):
-            result = original(argv, **kwargs)
-            if any(
-                str(part).endswith("skills-consistency-source-validator.py")
-                for part in argv
-            ):
-                subprocess.run(
-                    ["git", "commit", "--allow-empty", "-m", "Concurrent change"],
-                    cwd=repo,
-                    capture_output=True,
-                    check=True,
-                )
+        def changing(root, declaration, argv):
+            result = original(root, declaration, argv)
+            subprocess.run(
+                ["git", "commit", "--allow-empty", "-m", "Concurrent change"],
+                cwd=repo, capture_output=True, check=True,
+            )
             return result
 
-        monkeypatch.setattr(runner, "run_progress_command", changing)
+        monkeypatch.setattr(skill_actions, "_call_action", changing)
     result = runner.execute_prepared_operation(prepared)
     assert result["status"] == (
         "state_changed"
@@ -3971,7 +4102,7 @@ def test_v4_skill_handoff_rejects_unsafe_or_unhandled_work_before_deployment(
     if calls.exists():
         assert [
             json.loads(line)["mode"] for line in calls.read_text().splitlines()
-        ] == ["skill"]
+        ] == [None]
 
 
 def test_completed_handoff_record_survives_removed_result_directory(
@@ -3987,6 +4118,9 @@ def test_completed_handoff_record_survives_removed_result_directory(
     module = runpy.run_path(str(PROMOTE_REPOSITORY))
     namespace = module["main"].__globals__
     result_file = tmp_path / "records/promotion.json"
+    # The caller owns this directory; promotion does not create records before
+    # acquiring its release lock. Simulate its removal during completed work.
+    result_file.parent.mkdir()
     result = {
         "status": "ready",
         "head": "a" * 40,

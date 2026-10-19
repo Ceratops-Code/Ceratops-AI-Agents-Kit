@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import errno
-import importlib
 import json
-import os
 import pathlib
 import runpy
 import shutil
@@ -33,14 +31,15 @@ from tests.support.repositories import (
 )
 
 
-@pytest.mark.parametrize("failure", [None, "before-finalize", "after-finalize", "missing", "wrong-commit", "duplicate"])
+@pytest.mark.parametrize("failure", [None, "before-finalize", "after-finalize", "failed-finalize", "missing", "wrong-commit", "duplicate"])
 def test_installer_forwards_completed_sibling_receipts_without_reinstalling(
     tmp_path, monkeypatch, capsys, failure,
 ):
     installer = load_runtime_installer()
     builder = installer["runtime_builder"]
     repo = tmp_path / "repo"
-    repo.mkdir()
+    create_compatible_repo(repo, "example/promotion", ["alpha-tool"])
+    monkeypatch.chdir(tmp_path)
     destination = tmp_path / "installed"
     record = tmp_path / "promotion.json"
     record.write_text("promotion")
@@ -62,14 +61,18 @@ def test_installer_forwards_completed_sibling_receipts_without_reinstalling(
     main_globals = installer["main"].__globals__
     monkeypatch.setitem(main_globals, "_source_commit", lambda root: "b" * 40)
     monkeypatch.setitem(main_globals, "_promotion_bindings", lambda *args: [binding])
+    monkeypatch.setitem(main_globals, "_check_deployment_sources", lambda *args: None)
     effects = []
     finalizations = []
+    run_command = subprocess.run
 
     def install(*args, **kwargs):
         effects.append("install")
         return builder.TransactionResult("ok", ("alpha-tool",), (), "transaction")
 
     def finalize(argv, **kwargs):
+        if argv[0] == "git":
+            return run_command(argv, **kwargs)
         finalizations.append((argv, kwargs["input"]))
         if failure == "before-finalize":
             raise OSError("finalizer unavailable")
@@ -78,6 +81,8 @@ def test_installer_forwards_completed_sibling_receipts_without_reinstalling(
         record.unlink(missing_ok=True)
         if failure == "after-finalize":
             raise OSError("finalizer acknowledgement interrupted")
+        if failure == "failed-finalize":
+            return subprocess.CompletedProcess(argv, 7, "full output\n" * 500, "full cause\n" * 500)
         return subprocess.CompletedProcess(argv, 0, "OK", "")
 
     monkeypatch.setattr(builder, "install_transaction", install)
@@ -99,6 +104,22 @@ def test_installer_forwards_completed_sibling_receipts_without_reinstalling(
         assert result["promotion_cleanup"]["status"] == ("completed" if failure is None else "failed")
         if failure:
             assert result["promotion_cleanup"]["replay_required"] is False
+            next_action = result["promotion_cleanup"]["next_action"]
+            completed = json.loads(next_action["stdin"])
+            assert completed["status"] == "completed"
+            assert completed["deployed"] == ["alpha-tool"]
+            assert completed["transaction_id"] == "transaction"
+            assert "promotion_cleanup" not in completed
+            if failure == "failed-finalize":
+                assert result["promotion_cleanup"]["stdout"] == "full output\n" * 500
+                assert result["promotion_cleanup"]["stderr"] == "full cause\n" * 500
+                assert result["promotion_cleanup"]["returncode"] == 7
+            # A cleanup-only repeat consumes the preserved receipt, not the
+            # installer entry point; an interrupted acknowledgement is harmless.
+            failure = None
+            for _ in range(2):
+                assert finalize(next_action["command"], input=next_action["stdin"]).returncode == 0
+            assert effects == ["install"]
     assert (evidence.read_bytes() if evidence.exists() else None) == before
     # The transport preflight is read-only and repeatable; interrupted cleanup
     # retains the actual receipt rather than requesting a second installation.
@@ -119,10 +140,12 @@ def test_runtime_installer_releases_installed_working_directory(
     installed_skill = install_root / skill
     installed_runtime = installed_skill / "scripts" / "runtime"
     shutil.copytree(
-        RUNTIME_INSTALLER.parent,
-        installed_runtime,
+        RUNTIME_INSTALLER.parent.parent,
+        installed_skill / "scripts",
         dirs_exist_ok=True,
     )
+    shutil.copy2(ROOT / "skills/sections/scripts/hold_write_lock.py",
+                 installed_skill / "scripts/hold_write_lock.py")
     source = repo / "skills" / skill / "SKILL.md"
     source.write_text(
         source.read_text(encoding="utf-8") + "\nRepository update.\n",
@@ -134,8 +157,11 @@ def test_runtime_installer_releases_installed_working_directory(
     # runs. Start it outside the target, then exercise the actual installer's
     # change away from an installed working directory in the Python process.
     invocation = (
-        "import os,runpy,sys; os.chdir(sys.argv.pop(1)); "
-        "sys.argv[0]=sys.argv.pop(1); runpy.run_path(sys.argv[0],run_name='__main__')"
+        "import os,pathlib,runpy,sys; os.chdir(sys.argv.pop(1)); "
+        "sys.argv[0]=sys.argv.pop(1); "
+        "source=pathlib.Path(sys.argv[sys.argv.index('--repo-root')+1]); "
+        "code=runpy.run_path(sys.argv[0])['main'](sys.argv[1:]); "
+        "assert pathlib.Path.cwd()==source; raise SystemExit(code)"
     )
     result = subprocess.run(
         [
@@ -161,6 +187,113 @@ def test_runtime_installer_releases_installed_working_directory(
     assert "Repository update." in runtime_skill_text(install_root, skill)
 
 
+@pytest.mark.parametrize("source_failure", [False, True])
+def test_managed_deploy_repeated_relative_options_restore_entry_directory(
+    tmp_path, monkeypatch, capsys, source_failure,
+):
+    """Repeat the same caller inputs without resolving them against a prior call."""
+    installer = load_runtime_installer()
+    owner = installer["deploy_managed_skills"].__globals__
+    repo = tmp_path / "source"
+    destination = tmp_path / "installed"
+    create_compatible_repo(repo, "example/relative", ["alpha-tool"])
+    monkeypatch.chdir(tmp_path)
+    checked = []
+
+    def check(source, affected):
+        checked.append(source)
+        assert source == repo and affected.deploy == ("alpha-tool",)
+        if source_failure:
+            raise installer["InstallerError"]("source rejected", phase="source_check")
+
+    monkeypatch.setitem(owner, "_check_deployment_sources", check)
+    options = installer["DeployOptions"](
+        repo_root=pathlib.Path("source"), install_root=pathlib.Path("installed"),
+        skill=("alpha-tool",),
+    )
+    for _ in range(2):
+        result = installer["deploy_managed_skills"](options)
+        assert pathlib.Path.cwd() == tmp_path
+        assert capsys.readouterr().out == ""
+        if source_failure:
+            assert result["status"] == "error" and result["reason"] == "source rejected"
+            assert not destination.exists()
+        else:
+            assert result["status"] == "completed"
+            assert result["repo_root"] == str(repo) and result["install_root"] == str(destination)
+            assert result["deployed"] == ["alpha-tool"]
+            assert runtime_owner(destination, "alpha-tool") == "example/relative"
+    assert checked == [repo, repo]
+
+
+def test_managed_deploy_concurrent_repositories_keep_source_and_receipt_ownership(
+    tmp_path, monkeypatch,
+):
+    """Pause one real staging effect while another caller competes for ownership."""
+    installer = load_runtime_installer()
+    owner = installer["deploy_managed_skills"].__globals__
+    builder = installer["runtime_builder"]
+    monkeypatch.chdir(tmp_path)
+    repos = [tmp_path / name for name in ("first-source", "second-source")]
+    destinations = [tmp_path / name for name in ("first-installed", "second-installed")]
+    names = ("alpha-tool", "beta-tool")
+    for index, repo in enumerate(repos):
+        create_compatible_repo(repo, f"example/source-{index}", [names[index]])
+    monkeypatch.setitem(owner, "_check_deployment_sources", lambda *args: None)
+    first_staging = threading.Event()
+    release_first = threading.Event()
+    second_attempt = threading.Event()
+    deployment_lock = owner["_DEPLOYMENT_LOCK"]
+    counter_lock = threading.Lock()
+    attempts = 0
+
+    class ObservedLock:
+        def __enter__(self):
+            nonlocal attempts
+            with counter_lock:
+                attempts += 1
+                if attempts == 2:
+                    second_attempt.set()
+            deployment_lock.acquire()
+
+        def __exit__(self, *_args):
+            deployment_lock.release()
+
+    monkeypatch.setitem(owner, "_DEPLOYMENT_LOCK", ObservedLock())
+    write_skill = builder.write_expected_skill
+
+    def stage(skill, *args, **kwargs):
+        if skill == "alpha-tool":
+            first_staging.set()
+            assert release_first.wait(10), "first staging was never released"
+        return write_skill(skill, *args, **kwargs)
+
+    monkeypatch.setattr(builder, "write_expected_skill", stage)
+    options = [installer["DeployOptions"](repo_root=repo, install_root=destinations[index],
+                                         skill=(names[index],)) for index, repo in enumerate(repos)]
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(installer["deploy_managed_skills"], options[0])
+        try:
+            assert first_staging.wait(10), "first call did not reach staging"
+            second = executor.submit(installer["deploy_managed_skills"], options[1])
+            assert second_attempt.wait(10), "second call did not contend for deployment ownership"
+            assert not second.done()
+        finally:
+            release_first.set()
+        results = [first.result(timeout=10), second.result(timeout=10)]
+    assert pathlib.Path.cwd() == tmp_path
+    for index, result in enumerate(results):
+        assert result["status"] == "completed"
+        assert result["repo_root"] == str(repos[index])
+        assert result["install_root"] == str(destinations[index])
+        assert result["deployed"] == [names[index]] and result["removed"] == []
+        assert runtime_owner(destinations[index], names[index]) == f"example/source-{index}"
+        installed = json.loads((destinations[index] / names[index] / RUNTIME_MANIFEST).read_text())
+        assert installed["source_repository_root"] == str(repos[index])
+        assert names[index].replace("-", " ").title() in runtime_skill_text(destinations[index], names[index])
+        assert not (destinations[index] / names[1 - index]).exists()
+
+
 @pytest.mark.skipif(shutil.which("uv") is None, reason="uv is required for the installed Python runtime")
 def test_installed_repo_lifecycle_helpers_use_regular_runtime(
     tmp_path: pathlib.Path,
@@ -172,12 +305,12 @@ def test_installed_repo_lifecycle_helpers_use_regular_runtime(
     skill = install_root / "ceratops-repo-lifecycle"
     assert (skill / "scripts" / "pending-work-cleanup.py").is_file()
     assert (skill / "scripts" / "store_artifacts.py").is_file()
-    assert (skill / "scripts" / "manage_checkpoints.py").is_file()
+    assert not (skill / "scripts" / "manage_checkpoints.py").exists()
     assert (skill / "scripts" / "hold_write_lock.py").is_file()
     runtime = json.loads((skill / RUNTIME_MANIFEST).read_text(encoding="utf-8"))
     interpreter = pathlib.Path(runtime["python_runtime"])
     assert interpreter.is_file() and not interpreter.is_symlink()
-    for script in ("manage-pending-work.py", "repository_operation.py"):
+    for script in ("manage-pending-work.py", "repository_operation.py", "ship-repository.py"):
         command = subprocess.run(
             [str(interpreter), str(skill / "scripts" / script), "--help"],
             capture_output=True,
@@ -191,13 +324,9 @@ def test_installed_repo_lifecycle_helpers_use_regular_runtime(
     assert run_git(repo, "init", "-b", "main").returncode == 0
     isolated = subprocess.run(
         [str(interpreter), "-I", "-c",
-         ("import pathlib,sys; sys.path.insert(0,sys.argv[1]); import store_artifacts,hold_write_lock; "
-         "cp=store_artifacts._checkpoint_storage(); "
-         "assert pathlib.Path(cp.__file__).parent==pathlib.Path(sys.argv[1]);\n"
-         "with cp.open_checkpoints(pathlib.Path(sys.argv[2]),'artifact-versions') as context:\n"
-         " cp.write_checkpoint(context,'request.json',{'request':'installed'})\n"
-         " assert cp.read_checkpoint(context,'request.json')=={'request':'installed'}\n"
-         " cp.finish_checkpoints(context)\n"
+         ("import pathlib,sys; sys.path.insert(0,sys.argv[1]); import store_artifacts,hold_write_lock,git_branch_operations; "
+         "from github_pr_workflow.ship_repository import ShipOptions,ship_repository; "
+         "assert ShipOptions(repo_root=pathlib.Path(sys.argv[2]),head_branch='release/local').base_branch=='main'\n"
          "with hold_write_lock.hold_write_lock(hold_write_lock.release_lock_path(pathlib.Path(sys.argv[2]))) as lock:\n"
          " lock.complete(commands_stopped=True)\n"),
          str(skill / "scripts"), str(repo)],
@@ -212,7 +341,13 @@ def test_installed_repo_lifecycle_helpers_use_regular_runtime(
     ).is_file()
     copied = subprocess.run(
         [str(interpreter), "-I", "-c",
-         ("import pathlib,sys; sys.path.insert(0,sys.argv[1]); import hold_write_lock as locks;\n"
+         ("import pathlib,sys; sys.path.insert(0,sys.argv[1]); import hold_write_lock as locks; "
+         "import skill_update_state; cp=skill_update_state.checkpoint_storage();\n"
+         "with cp.open_checkpoints(pathlib.Path(sys.argv[2]), 'skill-updates') as records:\n"
+         " cp.write_checkpoint(records, 'request.json', {'source':'installed'})\n"
+         " assert cp.read_checkpoint(records, 'request.json') == {'source':'installed'}\n"
+         " cp.finish_checkpoints(records)\n"
+         " assert not records.directory.exists()\n"
          "with locks.hold_write_lock(locks.release_lock_path(pathlib.Path(sys.argv[2]))) as lock:\n"
          " lock.complete(commands_stopped=True)\n"),
          str(install_root / "ceratops-skill-lifecycle" / "scripts"), str(repo)],
@@ -221,259 +356,6 @@ def test_installed_repo_lifecycle_helpers_use_regular_runtime(
     assert copied.returncode == 0, copied.stderr
 
 
-@pytest.fixture
-def write_locks(monkeypatch):
-    monkeypatch.syspath_prepend(str(ROOT / "skills" / "sections" / "scripts"))
-    return importlib.import_module("hold_write_lock")
-
-
-def _lock_child(path, body):
-    script = (
-        "import os,pathlib,sys; sys.path.insert(0,sys.argv[1]); "
-        "import hold_write_lock as locks; path=pathlib.Path(sys.argv[2]);\n"
-        + body
-    )
-    return subprocess.run(
-        [sys.executable, "-c", script, str(ROOT / "skills/sections/scripts"), str(path)],
-        capture_output=True, text=True, check=False, timeout=10,
-    )
-
-
-def test_write_lock_common_path_without_remote(tmp_path, write_locks):
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    for args in (
-        ("init", "-b", "main"), ("config", "user.name", "Tests"),
-        ("config", "user.email", "tests@example.test"),
-        ("commit", "--allow-empty", "-m", "initial"),
-        ("worktree", "add", "-b", "task", str(tmp_path / "task")),
-    ):
-        result = run_git(repo, *args)
-        assert result.returncode == 0, result.stderr
-    linked = tmp_path / "task"
-    first = write_locks.release_lock_path(repo)
-    assert first == write_locks.release_lock_path(linked)
-    assert first == (repo / ".git/ceratops/locks/release-local").resolve()
-    assert run_git(repo, "remote").stdout == ""
-    assert not first.exists()  # Discovery neither locks nor writes a flag.
-    with write_locks.hold_write_lock(first) as owned:
-        with write_locks.hold_write_lock(write_locks.release_lock_path(linked)) as nested:
-            assert nested is owned
-        owned.complete(commands_stopped=True)
-    with pytest.raises(write_locks.WriteLockError, match="Git common"):
-        write_locks.release_lock_path(tmp_path)
-
-
-def test_write_lock_excludes_processes_and_threads_without_waiting(tmp_path, write_locks):
-    path = tmp_path / "release-local"
-    with write_locks.hold_write_lock(path) as owned:
-        # The owner never releases in response to the competitor. Returning
-        # inside the subprocess deadline demonstrates refusal rather than queueing.
-        result = _lock_child(path,
-            "try:\n"
-            " with locks.hold_write_lock(path,confirm_previous_commands_stopped=True): pass\n"
-            "except locks.WriteLockBusy:\n print('busy')\n"
-        )
-        assert result.returncode == 0, result.stderr
-        assert result.stdout.strip() == "busy"
-
-        def compete():
-            with pytest.raises(write_locks.WriteLockBusy), write_locks.hold_write_lock(path):
-                pytest.fail("second thread entered")
-            with pytest.raises(write_locks.WriteLockError, match="active write lock"):
-                owned.complete(commands_stopped=True)
-
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            pool.submit(compete).result(timeout=10)
-        owned.complete(commands_stopped=True)
-    assert path.read_bytes() == b"0"
-
-
-def test_write_lock_nested_owner_and_stable_file(tmp_path, write_locks):
-    path = tmp_path / "release-local"
-    with write_locks.hold_write_lock(path) as owned:
-        identity = path.stat().st_ino
-        with write_locks.hold_write_lock(path.parent / "." / path.name) as nested:
-            assert nested is owned and not owned.outermost
-            with pytest.raises(write_locks.WriteLockError, match="outermost"):
-                nested.complete(commands_stopped=True)
-        assert owned.outermost
-        owned.complete(commands_stopped=True)
-    with write_locks.hold_write_lock(path) as fresh:
-        assert fresh is not owned
-        fresh.complete(commands_stopped=True)
-    assert path.stat().st_ino == identity
-    assert path.read_bytes() == b"0"
-    assert list(tmp_path.iterdir()) == [path]
-    with pytest.raises(write_locks.WriteLockError, match="active write lock"):
-        owned.complete(commands_stopped=True)
-
-
-@pytest.mark.parametrize("ending", ["return", "exception", "after-complete", "nested-after-complete", "crash"])
-def test_write_lock_uncertain_end_requires_explicit_recovery(tmp_path, write_locks, ending):
-    path = tmp_path / "release-local"
-    if ending == "crash":
-        result = _lock_child(path, "with locks.hold_write_lock(path):\n os._exit(73)\n")
-        assert result.returncode == 73, result.stderr
-    else:
-        try:
-            with write_locks.hold_write_lock(path) as owned:
-                if ending in ("after-complete", "nested-after-complete"):
-                    owned.complete(commands_stopped=True)
-                if ending == "nested-after-complete":
-                    with write_locks.hold_write_lock(path):
-                        pass
-                elif ending in ("exception", "after-complete"):
-                    raise ValueError("interrupted")
-        except ValueError:
-            pass
-    assert path.read_bytes() == b"1"
-    with pytest.raises(write_locks.WriteLockRecoveryRequired), write_locks.hold_write_lock(path):
-        pytest.fail("unfinished operation was ignored")
-    assert path.read_bytes() == b"1"
-    with write_locks.hold_write_lock(path, confirm_previous_commands_stopped=True) as recovered:
-        recovered.complete(commands_stopped=True)
-    assert path.read_bytes() == b"0"
-
-
-@pytest.mark.parametrize("value", [b"?", b"\x00", b"1"])
-def test_write_lock_bad_saved_flag_requires_confirmation(tmp_path, write_locks, value):
-    path = tmp_path / "release-local"
-    path.write_bytes(value)
-    with pytest.raises(write_locks.WriteLockRecoveryRequired), write_locks.hold_write_lock(path):
-        pytest.fail("uncertain state entered")
-    assert path.read_bytes() == value
-    with write_locks.hold_write_lock(path, confirm_previous_commands_stopped=True) as recovered:
-        recovered.complete(commands_stopped=True)
-    assert path.read_bytes() == b"0"
-
-
-def test_write_lock_known_commands_cannot_be_overridden(tmp_path, write_locks):
-    path = tmp_path / "release-local"
-    path.write_bytes(b"1")
-    with (
-        pytest.raises(write_locks.WriteLockRecoveryRequired, match="still running"),
-        write_locks.hold_write_lock(
-            path, confirm_previous_commands_stopped=True, commands_running=lambda: True,
-        ),
-    ):
-        pytest.fail("confirmation bypassed known running commands")
-    running = False
-    with write_locks.hold_write_lock(
-        path, confirm_previous_commands_stopped=True, commands_running=lambda: running,
-    ) as owned:
-        with pytest.raises(write_locks.WriteLockError, match="not stopped"):
-            owned.complete(commands_stopped=False)
-        running = True
-        with pytest.raises(write_locks.WriteLockError, match="not stopped"):
-            owned.complete(commands_stopped=True)
-        running = False
-        owned.complete(commands_stopped=True)  # Handled cancellation is also clean.
-    assert path.read_bytes() == b"0"
-    with write_locks.hold_write_lock(path) as owned:
-        owned.complete(commands_stopped=True)
-        with (
-            pytest.raises(write_locks.WriteLockError, match="still running"),
-            write_locks.hold_write_lock(path, commands_running=lambda: True),
-        ):
-            pytest.fail("nested work ignored a known running command")
-    assert path.read_bytes() == b"1"  # Rejected nested work invalidated the earlier clean report.
-    running = False
-    with (
-        pytest.raises(write_locks.WriteLockError, match="restarted"),
-        write_locks.hold_write_lock(
-            path, confirm_previous_commands_stopped=True, commands_running=lambda: running,
-        ) as owned,
-    ):
-        owned.complete(commands_stopped=True)
-        running = True
-    assert path.read_bytes() == b"1"
-
-
-@pytest.mark.parametrize("failure", ["short-write", "flush", "read"])
-def test_write_lock_flag_io_failure_blocks_work(tmp_path, write_locks, monkeypatch, failure):
-    path = tmp_path / "release-local"
-    path.write_bytes(b"1" if failure == "read" else b"0")
-
-    def fail(*_args):
-        if failure == "short-write":
-            return 0
-        raise OSError("injected flag IO failure")
-
-    function = {"short-write": "write", "flush": "fsync", "read": "read"}[failure]
-    with monkeypatch.context() as patch:
-        patch.setattr(write_locks.os, function, fail)
-        with pytest.raises(write_locks.WriteLockError), write_locks.hold_write_lock(path):
-            pytest.fail("protected work started before durable flag storage")
-    with write_locks.hold_write_lock(path, confirm_previous_commands_stopped=True) as recovered:
-        recovered.complete(commands_stopped=True)
-    assert path.read_bytes() == b"0"
-
-
-def test_write_lock_failed_clear_retains_uncertainty(tmp_path, write_locks, monkeypatch):
-    path = tmp_path / "release-local"
-    real_flush = write_locks.os.fsync
-    calls = 0
-
-    def flush(fd):
-        nonlocal calls
-        calls += 1
-        if calls == 2:
-            raise OSError("clear not durable")
-        real_flush(fd)
-
-    with monkeypatch.context() as patch:
-        patch.setattr(write_locks.os, "fsync", flush)
-        with (
-            pytest.raises(write_locks.WriteLockError, match="clean lock completion"),
-            write_locks.hold_write_lock(path) as owned,
-        ):
-            owned.complete(commands_stopped=True)
-    assert path.read_bytes() == b"1"
-    assert calls == 3
-
-
-def test_write_lock_requires_native_backend(tmp_path, write_locks, monkeypatch):
-    def unavailable_native_lock(_fd, *, blocking):
-        assert blocking is False
-        raise OSError(errno.ENOSYS, "native locking unavailable")
-
-    monkeypatch.setattr(write_locks, "lock_descriptor", unavailable_native_lock)
-    with (
-        pytest.raises(write_locks.WriteLockError, match="native locking unavailable"),
-        write_locks.hold_write_lock(tmp_path / "release-local"),
-    ):
-        pytest.fail("missing native locking fell back to existence locking")
-
-
-def test_write_lock_rejects_linked_file_without_changing_its_bytes(tmp_path, write_locks):
-    foreign = tmp_path / "foreign"
-    foreign.write_bytes(b"preserve")
-    linked = tmp_path / "release-local"
-    os.link(foreign, linked)
-    with pytest.raises(write_locks.WriteLockError, match="own regular file"), write_locks.hold_write_lock(linked):
-        pytest.fail("hard-linked lock was accepted")
-    assert foreign.read_bytes() == b"preserve"
-
-
-def test_write_lock_fork_cannot_reuse_parent_ownership(tmp_path, write_locks):
-    fork = getattr(os, "fork", None)
-    if fork is None:
-        pytest.skip("POSIX fork only")
-    path = tmp_path / "release-local"
-    with write_locks.hold_write_lock(path) as owned:
-        pid = fork()
-        if pid == 0:
-            try:
-                with write_locks.hold_write_lock(path):
-                    os._exit(1)
-            except write_locks.WriteLockBusy:
-                os._exit(0)
-            except BaseException:  # Terminate the fork child on any test failure.
-                os._exit(2)
-        _, status = os.waitpid(pid, 0)
-        assert os.waitstatus_to_exitcode(status) == 0
-        owned.complete(commands_stopped=True)
 
 
 @pytest.mark.parametrize("implementation", ["bootstrap", "managed"])
@@ -487,7 +369,7 @@ def test_runtime_pruning_preserves_every_live_version_class(
         interpreter_name = "runtime_interpreter_path"
         process_probe = "running_process_paths"
     else:
-        runtime = load_runtime_builder()
+        runtime = vars(load_runtime_builder()["python_environments"])
         interpreter_name = "_runtime_interpreter_path"
         process_probe = "_running_process_paths"
 
@@ -1323,6 +1205,7 @@ def test_installer_preserves_transaction_failures_and_cleanup_evidence(
     monkeypatch.chdir(tmp_path)
     installer = load_runtime_installer()
     builder = installer["runtime_builder"]
+    monkeypatch.setitem(installer["deploy_managed_skills"].__globals__, "_check_deployment_sources", lambda *args: None)
     remove = builder._remove_tree
     rename = builder.rename_with_retry
     install = builder.install_transaction

@@ -1,4 +1,4 @@
-"""Finalize approved dependency PRs through gates and repository-safe waves."""
+"""Publish approved dependency updates through guarded release/local batches."""
 
 from __future__ import annotations
 
@@ -216,17 +216,8 @@ def snapshot_open_pr_keys(
 
 
 def choose_merge_method(policy: dict[str, Any], requested: str) -> str | None:
-    allowed = {
-        "merge": bool(policy.get("mergeCommitAllowed")),
-        "squash": bool(policy.get("squashMergeAllowed")),
-        "rebase": bool(policy.get("rebaseMergeAllowed")),
-    }
-    if requested != "auto":
-        return requested if allowed.get(requested) else None
-    for method in ("merge", "squash", "rebase"):
-        if allowed[method]:
-            return method
-    return None
+    """Match Ship's merge commit and preserve every approved source ancestor."""
+    return "merge" if requested in {"auto", "merge"} and policy.get("mergeCommitAllowed") else None
 
 
 def merge_helper_directory() -> pathlib.Path:
@@ -236,49 +227,232 @@ def merge_helper_directory() -> pathlib.Path:
     return path
 
 
-def merge_pr(
-    repo: str,
-    number: int,
-    checkout: pathlib.Path,
-    method: str,
-    *,
-    expected_head: str,
-    admin: bool,
-    wait_seconds: int,
-    interval_seconds: int,
-) -> tuple[dict[str, Any] | None, str | None]:
-    command = [
-        sys.executable,
-        str(merge_helper_directory() / "github_pr_workflow" / "__main__.py"),
-        "merge",
-        "--pr",
-        f"https://github.com/{repo}/pull/{number}",
-        "--repo",
-        repo,
-        "--repo-root",
-        str(checkout),
-        "--expected-head",
-        expected_head,
-        "--merge-method",
-        method,
-        "--delete-branch",
-        "--wait-seconds",
-        str(wait_seconds),
-        "--interval-seconds",
-        str(interval_seconds),
-    ]
-    if admin:
-        command.append("--admin")
-    completed = run_command(command, cwd=checkout)
-    raw = completed.stdout if completed.returncode == 0 else completed.stderr
+def review_dependency_source(
+    repo: str, number: int, checkout: pathlib.Path, expected_head: str,
+    *, admin: bool, wait_seconds: int, interval_seconds: int,
+) -> dict[str, Any]:
+    """Apply the merge action's read-only gates without merging the bot branch."""
+    from . import codex_review, merge, readiness
+
+    url = f"https://github.com/{repo}/pull/{number}"
+    first = merge._validate_readiness(url, checkout, allow_admin_review_bypass=admin)
+    if first.get("head_oid") != expected_head:
+        raise WorkflowError("dependency PR changed before its review gate")
+    review = codex_review.wait_for_codex_threads(
+        url, repo, wait_seconds=wait_seconds, interval_seconds=interval_seconds,
+        authors=codex_review.DEFAULT_CODEX_AUTHORS, cwd=checkout,
+    )
+    final = merge._validate_readiness(url, checkout, allow_admin_review_bypass=admin)
+    if any(item.get("head_oid") != expected_head for item in (review, final)):
+        raise WorkflowError("dependency PR changed during its review gate")
+    if int(review.get("active_codex_thread_count") or 0):
+        raise WorkflowError("dependency PR has active Codex review threads")
+    if int(review.get("unresolved_review_thread_count") or 0):
+        base = final.get("base")
+        if not isinstance(base, str) or readiness.review_thread_resolution_required(base, checkout):
+            raise WorkflowError("dependency PR has unresolved required review threads")
+    return final
+
+
+def dependency_command(root: pathlib.Path, *command: str) -> str:
+    """Preserve child failures in the caller's bounded current JSON report."""
+    completed = run_command(list(command), cwd=root)
+    if completed.returncode:
+        raise WorkflowError(json.dumps({
+            "operation": "dependency_release", "target": str(root),
+            "command": list(command), "runtime": sys.executable,
+            "exit_status": completed.returncode,
+            "stdout": completed.stdout or "<absent>", "stderr": completed.stderr or "<absent>",
+        }))
+    return completed.stdout.strip()
+
+
+def dependency_ancestor(root: pathlib.Path, commit: str, target: str) -> bool:
+    completed = run_command(["git", "merge-base", "--is-ancestor", commit, target], cwd=root)
+    if completed.returncode not in (0, 1):
+        dependency_command(root, "git", "merge-base", "--is-ancestor", commit, target)
+    return completed.returncode == 0
+
+
+def check_dependency_batch_content(root: pathlib.Path, tip: str, allowed: list[str]) -> None:
+    """Admit approved ancestry and content-neutral automatic merge commits.
+
+    Every fresh call reads Git's graph. Unknown ordinary commits and merges
+    containing manual edits block; observational logs never authorize content.
+    """
+    extra = dependency_command(root, "git", "rev-list", tip, "--not", *allowed)
+    for commit in extra.splitlines():
+        parents = dependency_command(root, "git", "show", "-s", "--format=%P", commit).split()
+        if len(parents) != 2:
+            raise WorkflowError(f"unapproved unpublished commit {commit} in {tip}")
+        calculated = dependency_command(
+            root, "git", "merge-tree", "--write-tree", parents[0], parents[1],
+        ).splitlines()[0]
+        if dependency_command(root, "git", "show", "-s", "--format=%T", commit) != calculated:
+            raise WorkflowError(f"unapproved merge content in commit {commit}")
+
+
+def merge_dependency_head(root: pathlib.Path, head: str) -> None:
+    """Converge by ancestry; abort only a failed merge started by this call."""
+    if dependency_ancestor(root, head, "HEAD"):
+        return
+    command = ["git", "merge", "--no-ff", "--no-edit", head]
+    completed = run_command(command, cwd=root)
+    if not completed.returncode:
+        return
+    abort = run_command(["git", "merge", "--abort"], cwd=root)
+    raise WorkflowError(json.dumps({
+        "operation": "stage_dependency_head", "target": str(root), "head": head,
+        "command": command, "runtime": sys.executable, "exit_status": completed.returncode,
+        "stdout": completed.stdout or "<absent>", "stderr": completed.stderr or "<absent>",
+        "abort": {
+            "command": ["git", "merge", "--abort"], "exit_status": abort.returncode,
+            "stdout": abort.stdout or "<absent>", "stderr": abort.stderr or "<absent>",
+        },
+    }))
+
+
+def publish_dependency_batch(
+    repo: str, items: list[dict[str, Any]], checkout: pathlib.Path, args: argparse.Namespace,
+) -> tuple[dict[str, Any], str | None]:
+    """Stage approved heads in one thread worktree and delegate publication.
+
+    Promotion/Ship owns release locks, SDLC checks, reviews, remote merge and
+    cleanup. Current Git/GitHub state supports fresh calls after completed
+    effects. An unresolved Git operation blocks without discarding work.
+    Unrelated unpublished content needs exact caller-authorized release ancestry.
+
+    The publisher owns its single current failure report in the canonical task
+    temp root and removes resolved diagnostics on success. Snapshot/final/sync
+    outputs retain their existing adapter owners and bounded retention.
+    """
+    from .command import run_command_for_json
+
+    result: dict[str, Any] = {"repo": repo, "status": "blocked", "pull_requests": []}
     try:
-        value = json.loads(raw or "{}")
-    except json.JSONDecodeError:
-        value = None
-    if completed.returncode != 0:
-        message = value.get("message") if isinstance(value, dict) else compact_error(completed)
-        return None, str(message)[:500]
-    return value if isinstance(value, dict) else {}, None
+        common = pathlib.Path(dependency_command(
+            checkout, "git", "rev-parse", "--path-format=absolute", "--git-common-dir",
+        )).resolve()
+        primary = common.parent
+        if common.name != ".git":
+            raise WorkflowError("dependency publication requires a primary Git repository")
+        if dependency_command(primary, "git", "status", "--porcelain"):
+            raise WorkflowError(f"primary checkout contains uncommitted work: {primary}")
+        task = getattr(args, "task_name", "dependency-maintenance")
+        if not task or any(char not in "abcdefghijklmnopqrstuvwxyz0123456789-_" for char in task):
+            raise WorkflowError("invalid dependency task name")
+        worktree = primary.parent / "worktrees" / primary.name / task
+        result.update(worktree=str(worktree), release_branch="release/local")
+        dependency_command(primary, "git", "fetch", "origin")
+        base_ref = str(items[0]["live"].get("base_ref") or "main")
+        if any(str(item["live"].get("base_ref") or "main") != base_ref for item in items):
+            raise WorkflowError("approved updates use different release base branches")
+        base = dependency_command(primary, "git", "rev-parse", f"origin/{base_ref}")
+        probe = run_command(["git", "rev-parse", "--verify", "refs/heads/release/local"], cwd=primary)
+        if probe.returncode:
+            dependency_command(primary, "git", "branch", "release/local", base)
+        release = dependency_command(primary, "git", "rev-parse", "refs/heads/release/local")
+        allowed = [base]
+        for authority in getattr(args, "include_unpublished_release", []):
+            identity, separator, commit = authority.partition("=")
+            if not separator or len(commit) != 40 or any(
+                char not in "0123456789abcdefABCDEF" for char in commit
+            ):
+                raise WorkflowError("release authority must be OWNER/REPO=40-character-commit")
+            if identity.lower() == repo.lower():
+                if not dependency_ancestor(primary, commit, release):
+                    raise WorkflowError(f"authorized release commit is absent: {commit}")
+                allowed.append(commit)
+        for item in items:
+            number, head = item["pr"], item["approved_head"]
+            dependency_command(primary, "git", "fetch", "origin", f"refs/pull/{number}/head")
+            fetched = dependency_command(primary, "git", "rev-parse", "FETCH_HEAD")
+            if fetched != head:
+                raise WorkflowError(f"PR #{number} changed from approved head {head} to {fetched}")
+            allowed.append(head)
+        already_published = all(
+            dependency_ancestor(primary, item["approved_head"], base) for item in items
+        ) and dependency_ancestor(primary, release, base)
+        if already_published:
+            result["publication"] = {"status": "already_published"}
+        else:
+            check_dependency_batch_content(primary, release, allowed)
+            branch = f"codex/{task}"
+            if worktree.exists():
+                actual_root = pathlib.Path(dependency_command(
+                    worktree, "git", "rev-parse", "--show-toplevel",
+                )).resolve()
+                actual_common = pathlib.Path(dependency_command(
+                    worktree, "git", "rev-parse", "--path-format=absolute", "--git-common-dir",
+                )).resolve()
+                if actual_root != worktree or actual_common != common:
+                    raise WorkflowError(f"task path is not this repository's registered worktree: {worktree}")
+                branch = dependency_command(worktree, "git", "branch", "--show-current")
+                if not branch or branch in {base_ref, "release/local"}:
+                    raise WorkflowError("dependency staging requires an attached task branch")
+                if dependency_command(worktree, "git", "status", "--porcelain"):
+                    raise WorkflowError(f"task worktree contains uncommitted work: {worktree}")
+                check_dependency_batch_content(worktree, "HEAD", [release, *allowed])
+            else:
+                dependency_command(primary, "git", "worktree", "add", "-b", branch, str(worktree), release)
+            result["source_branch"] = branch
+            merge_dependency_head(worktree, release)
+            merge_dependency_head(worktree, base)
+            for item in items:
+                merge_dependency_head(worktree, item["approved_head"])
+            for item in items:
+                live, error = fresh_live(repo, item["pr"])
+                if error or live is None:
+                    raise WorkflowError(str(error or "source PR was not returned"))
+                if blocker := head_binding_blocker(repo, item["pr"], item["approved_head"], live):
+                    raise WorkflowError(blocker["message"])
+            diagnostics = primary.parent / "tmp" / primary.name / task / "_dependency_publication_failure.json"
+            diagnostics.parent.mkdir(parents=True, exist_ok=True)
+            body = "Publish approved dependency updates through release/local.\n\n" + "\n".join(
+                f"- https://github.com/{repo}/pull/{item['pr']} at {item['approved_head']}" for item in items
+            )
+            invocation = [
+                sys.executable, str(merge_helper_directory() / "promote-repository.py"),
+                "--repo-root", str(primary), "--source-branch", branch,
+                "--main-branch", base_ref, "--release-branch", "release/local",
+                "--remote-name", "origin", "--ship-after-promotion",
+                "--title", "Update approved dependencies", "--body", body,
+                "--diagnostic-output", str(diagnostics),
+            ]
+            code, publication = run_command_for_json(invocation, cwd=primary)
+            result.update(publication=publication, invocation=invocation)
+            if code or publication.get("status") not in {"ready", "shipped", "completed"}:
+                raise WorkflowError(f"release publication incomplete; see result (exit {code})")
+        dependency_command(primary, "git", "fetch", "origin")
+        for item in items:
+            number, head = item["pr"], item["approved_head"]
+            if not dependency_ancestor(primary, head, f"origin/{base_ref}"):
+                raise WorkflowError(f"published default branch lacks approved PR #{number} at {head}")
+            live, error = fresh_live(repo, number)
+            if error or live is None:
+                raise WorkflowError(str(error or "published source PR was not returned"))
+            if live.get("head_oid") != head:
+                raise WorkflowError(f"PR #{number} advanced after publication; newer work retained")
+            state = str(live.get("state") or "").upper()
+            if state == "OPEN":
+                dependency_command(
+                    primary, "gh", "api", "--method", "PATCH",
+                    f"repos/{repo}/pulls/{number}", "-f", "state=closed",
+                )
+                state = "CLOSED"
+            result["pull_requests"].append({
+                "repo": repo, "pr": number, "approved_head": head,
+                "status": "merged" if state == "MERGED" else "published",
+                "reason": "approved commit is contained in the published default branch",
+            })
+        result["status"] = "published"
+        return result, None
+    except (OSError, RuntimeError, ValueError) as exc:
+        result["message"] = str(exc)
+        failure = getattr(exc, "payload", None)
+        if isinstance(failure, dict):
+            result["failure"] = failure
+        return result, str(exc)
 
 
 def run_sync(
@@ -482,8 +656,8 @@ def finalize(args: argparse.Namespace) -> int:
     policies: dict[str, dict[str, Any]] = {}
     snapshot_fresh = False
     merged_count = 0
-    merged_repositories: set[str] = set()
-    latest_open_prs: set[tuple[str, int]] | None = None
+    ready_batches: dict[str, list[dict[str, Any]]] = {}
+    batch_results: list[dict[str, Any]] = []
 
     for repo, number in approved:
         key = (repo.lower(), number)
@@ -550,32 +724,6 @@ def finalize(args: argparse.Namespace) -> int:
             blockers.append(blocker)
             results.append({**blocker, "status": "blocked"})
             continue
-        if key[0] in merged_repositories:
-            approved_pr = as_object(approved_item.get("pr"))
-            if latest_open_prs is not None and key not in latest_open_prs:
-                status = "resolved_after_refresh"
-                message = (
-                    "PR is absent from the refreshed Dependabot queue after "
-                    "the repository merge; no new wave is required"
-                )
-            else:
-                status = "next_wave_required"
-                message = (
-                    "another approved PR for this repository merged during "
-                    "this finalization; run a new preflight and approval"
-                )
-            results.append(
-                {
-                    "repo": repo,
-                    "pr": number,
-                    "url": approved_pr.get("url"),
-                    "status": status,
-                    "check": "repository_merge_wave",
-                    "message": message,
-                    "approved_head": approved_head,
-                }
-            )
-            continue
         policy = policies.get(repo.lower())
         if policy is None:
             policy, policy_blocker = fetch_repo_policy(repo)
@@ -591,7 +739,7 @@ def finalize(args: argparse.Namespace) -> int:
                 "repo": repo,
                 "pr": number,
                 "check": "merge_method",
-                "message": f"requested merge method {args.merge_method!r} is not allowed",
+                "message": "release publication requires merge commits; squash and rebase discard approved source ancestry",
             }
             blockers.append(blocker)
             results.append({**blocker, "status": "blocked"})
@@ -692,80 +840,39 @@ def finalize(args: argparse.Namespace) -> int:
             blockers.append(blocker)
             results.append({**blocker, "status": "blocked", "fingerprint": current_fingerprint})
             continue
-        cleanup_plan, cleanup_error = selected_worktree_cleanup(
-            checkout_info, approved_head, str(live.get("base_ref") or "")
-        )
-        if cleanup_error:
-            blocker = {
-                "repo": repo, "pr": number, "check": "worktree_cleanup",
-                "message": cleanup_error,
-            }
+        try:
+            review_dependency_source(
+                repo, number, pathlib.Path(str(checkout_path)), approved_head,
+                admin=args.admin, wait_seconds=args.wait_seconds,
+                interval_seconds=args.interval_seconds,
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            blocker = {"repo": repo, "pr": number, "check": "source_review", "message": str(exc)}
             blockers.append(blocker)
             results.append({**blocker, "status": "blocked"})
             continue
-        merge_result, merge_error = merge_pr(
-            repo,
-            number,
-            pathlib.Path(str(checkout_path)),
-            method,
-            expected_head=approved_head,
-            admin=args.admin,
-            wait_seconds=args.wait_seconds,
-            interval_seconds=args.interval_seconds,
-        )
-        if merge_error:
-            live_after, _ = fresh_live(repo, number)
-            error_live = live_after or live
-            error_reasons = [f"merge_workflow:{merge_error}"]
-            error_fingerprint = fingerprint(repo, number, error_live, policy, args.admin, error_reasons)
-            status = "unchanged_blocker" if previous.get(key) == error_fingerprint else "blocked"
-            blocker = {
-                "repo": repo,
-                "pr": number,
-                "check": status,
-                "message": merge_error,
-            }
-            blockers.append(blocker)
-            results.append(
-                {
-                    **blocker,
-                    "status": status,
-                    "fingerprint": error_fingerprint,
-                    "live": error_live,
-                    "policy": policy,
+        ready_batches.setdefault(repo, []).append({
+            "repo": repo, "pr": number, "approved_head": approved_head,
+            "live": live, "checkout": str(checkout_path),
+        })
+
+    for repo, items in ready_batches.items():
+        batch, error = publish_dependency_batch(repo, items, pathlib.Path(items[0]["checkout"]), args)
+        batch_results.append(batch)
+        completed = {item["pr"]: item for item in batch.get("pull_requests", [])}
+        for item in items:
+            if item["pr"] in completed:
+                results.append(completed[item["pr"]])
+                if completed[item["pr"]]["status"] == "merged":
+                    merged_count += 1
+            else:
+                blocker = {
+                    "repo": repo, "pr": item["pr"], "check": "release_publication",
+                    "message": error or "release publication returned no PR outcome",
                 }
-            )
-            continue
-        merged_count += 1
-        merged_repositories.add(repo.lower())
-        results.append(
-            {
-                "repo": repo,
-                "pr": number,
-                "status": "merged",
-                "merge_method": method,
-                "admin": args.admin,
-                "result": merge_result,
-                **({"cleanup_plan": cleanup_plan} if cleanup_plan else {}),
-            }
-        )
-        refreshed, snapshot_process = refresh_snapshot(
-            args.snapshot_helper,
-            org,
-            exclusion_list,
-            args.snapshot,
-        )
-        snapshot_fresh = snapshot_process.returncode == 0 and not bool(refreshed.get("outcome", {}).get("blocked"))
-        if not snapshot_fresh:
-            blocker = {
-                "repo": repo,
-                "pr": number,
-                "check": "post_merge_snapshot",
-                "message": snapshot_failure_message(refreshed, snapshot_process),
-            }
-            blockers.append(blocker)
-            break
-        latest_open_prs = snapshot_open_pr_keys(refreshed)
+                blockers.append(blocker)
+                results.append({**blocker, "status": "blocked"})
+
 
     if not snapshot_fresh:
         final_snapshot, snapshot_process = refresh_snapshot(
@@ -807,26 +914,11 @@ def finalize(args: argparse.Namespace) -> int:
                     }
                 )
 
-    for item in results:
-        plan = item.get("cleanup_plan")
-        if item.get("status") != "merged" or not isinstance(plan, dict):
-            continue
-        if sync_error:
-            cleanup_error = f"checkout sync failed; selected worktree retained: {sync_error}"
-            item["cleanup"] = {"status": "blocked", "plan": plan}
-        else:
-            item["cleanup"], cleanup_error = finalize_worktree_cleanup(plan)
-        if cleanup_error:
-            blockers.append({
-                "repo": item["repo"], "pr": item["pr"],
-                "check": "worktree_cleanup", "message": cleanup_error,
-            })
-
     final_summary = as_object(final_snapshot.get("summary"))
     sync_summary = as_object(sync_result.get("summary")) if sync_result else {}
     unchanged_count = sum(1 for item in results if item.get("status") == "unchanged_blocker")
     blocked_count = sum(1 for item in results if item.get("status") == "blocked")
-    next_wave_count = sum(1 for item in results if item.get("status") == "next_wave_required")
+    published_count = sum(1 for item in results if item.get("status") == "published")
     resolved_count = sum(1 for item in results if item.get("status") == "resolved_after_refresh")
     queue_present = bool(as_object(final_snapshot.get("outcome")).get("queue_present"))
     summary = {
@@ -835,7 +927,7 @@ def finalize(args: argparse.Namespace) -> int:
         "blocked": len(blockers),
         "blocked_prs": blocked_count,
         "unchanged_blockers": unchanged_count,
-        "next_wave_prs": next_wave_count,
+        "published": published_count,
         "resolved_after_refresh_prs": resolved_count,
         "open_dependabot_alerts": final_summary.get("open_dependabot_alerts"),
         "open_dependabot_prs": final_summary.get("open_dependabot_prs"),
@@ -851,13 +943,12 @@ def finalize(args: argparse.Namespace) -> int:
         "schema": "ceratops-repo-lifecycle/dependency-finalize.v1",
         "generated_at": utc_now(),
         "outcome": {
-            "routine": not blocked and not queue_present and merged_count == 0,
-            "changed": merged_count > 0,
+            "routine": not blocked and not queue_present and merged_count + published_count == 0,
+            "changed": merged_count + published_count > 0,
             "blocked": blocked,
             "queue_present": queue_present,
-            "next_wave_required": next_wave_count > 0,
             "attention_required": (
-                blocked or queue_present or merged_count > 0 or next_wave_count > 0
+                blocked or queue_present or merged_count + published_count > 0
             ),
         },
         "summary": summary,
@@ -865,9 +956,10 @@ def finalize(args: argparse.Namespace) -> int:
         "snapshot": {"path": str(args.snapshot), "outcome": final_snapshot.get("outcome"), "summary": final_summary},
         "sync": {"path": str(args.sync_output), "result": sync_result},
         "pull_requests": results,
+        "release_batches": batch_results,
         "blockers": blockers,
     }
     write_json(args.output, payload)
-    status = "blocked" if blocked else ("changed" if merged_count else ("attention" if queue_present else "routine"))
+    status = "blocked" if blocked else ("changed" if merged_count + published_count else ("attention" if queue_present else "routine"))
     emit_result(status, args.output, summary, blockers)
     return 0

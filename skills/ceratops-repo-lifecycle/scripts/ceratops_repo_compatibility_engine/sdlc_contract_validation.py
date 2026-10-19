@@ -267,7 +267,23 @@ def _typed_semantic_errors(value: Mapping[str, Any]) -> list[str]:
                 errors.append(
                     f"handoff must be the single final step at {owner}.actions.{action_name}"
                 )
+            check_results = action.get("check-results")
+            if check_results is not None:
+                steps = action.get("steps", [])
+                if action_name not in {"validate", "test", "tests"} or len(steps) != 1 or "run" not in steps[0]:
+                    errors.append(f"check-results requires one check runner command at {owner}.actions.{action_name}")
+                for key in ("product-inputs", "check-inputs", "dependencies"):
+                    for input_path in check_results.get(key, []):
+                        if (input_path.startswith(("/", "\\")) or "\\" in input_path
+                                or ":" in input_path or ".." in input_path.split("/")):
+                            errors.append(f"check-results {key} must be repository-relative at {owner}.actions.{action_name}")
             declared_result = action.get("result-schema")
+            if action.get("result-commit-field") is not None:
+                steps = action.get("steps", [])
+                if action_name != "build" or not steps or "run" not in steps[-1] or handoff_positions:
+                    errors.append(
+                        f"result-commit-field requires a build ending in a run step at {owner}.actions.{action_name}"
+                    )
             if declared_result is not None:
                 expected_result = V4_RESULT_SCHEMAS.get(action_name)
                 if expected_result is None:

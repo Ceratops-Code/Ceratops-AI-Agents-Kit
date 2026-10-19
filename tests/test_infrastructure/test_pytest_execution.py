@@ -94,12 +94,16 @@ def test_non_windows_environment_keeps_git_and_explicit_pytest_options(
         "GIT_CONFIG_COUNT": "untouched",
         "GIT_TEMPLATE_DIR": "custom-template",
         "UNRELATED": "preserved",
+        "CERATOPS_PROJECTS_ROOT": str(tmp_path / "projects"),
+        "CERATOPS_TASK_TEMP_ROOT": str(tmp_path / "tmp"),
     }
     with test_runner_module.pytest_environment.isolated_environment(
         tmp_path,
         environ=caller,
         windows=False,
     ) as child:
+        assert "CERATOPS_PROJECTS_ROOT" not in child
+        assert "CERATOPS_TASK_TEMP_ROOT" not in child
         for key in (
             "GIT_CONFIG_COUNT",
             "GIT_TEMPLATE_DIR",
@@ -654,14 +658,14 @@ def _acceptance_run(runner, root):
     )
 
 
-def _pass_store(root):
+def _result_store(root):
     import importlib
 
     module = importlib.import_module("reuse_test_results")
     context = json.loads(module.result_environment(
         [sys.executable, "-m", "pytest", "-q", "tests"], root, {},
     )[module.RESULT_CONTEXT_ENV])
-    return module.PassStore(root, context)
+    return module.ResultStore(root, context)
 
 
 def test_acceptance_plugin_loads_without_assertion_rewrite_warning(
@@ -688,7 +692,7 @@ def test_repo_local_runtime_libraries_are_not_missing_repository_helpers(tmp_pat
     library.__file__ = str(library_root / "installed_library/__init__.py")
     source = types.ModuleType("repository_helper")
     source.__file__ = str(tmp_path / "helper.py")
-    setattr(source, "library", library)
+    vars(source)["library"] = library
     for _ in range(2):
         assert reuse._module_inputs(source, tmp_path) == {"helper.py"}
     # Ignored generated source outside installed library roots must still stop
@@ -716,7 +720,9 @@ def test_test_only_correction_reuses_passes_from_failed_suite(
     assert repeated.returncode == 0, repeated.stdout + repeated.stderr
     assert repeated.accepted_checks == {"collected": 2, "executed": 0, "reused": 2}
     assert counter.read_text().splitlines() == ["first", "second", "second"]
-    assert len(list(_pass_store(root).directory.glob("pytest-pass-*.json"))) == 2
+    outcomes = [json.loads(path.read_text())["outcome"]
+                for path in _result_store(root).directory.glob("pytest-attempt-*.json")]
+    assert outcomes.count("passed") == 2 and outcomes.count("failed") == 1
 
 
 @pytest.mark.parametrize("change", ["production", "fixture", "settings", "lock", "environment", "new-input"])
@@ -773,7 +779,9 @@ def test_failed_teardown_is_not_a_pass(test_runner_module, tmp_path):
         result = _acceptance_run(test_runner_module, root)
         assert result.returncode == 1, result.stdout + result.stderr
         assert result.accepted_checks["reused"] == 0
-    assert not list(_pass_store(root).directory.glob("pytest-pass-*.json"))
+    outcomes = [json.loads(path.read_text())["outcome"]
+                for path in _result_store(root).directory.glob("pytest-attempt-*.json")]
+    assert outcomes == ["failed", "failed"]
     assert counter.read_text().splitlines() == ["example", "example"]
 
 
@@ -787,20 +795,24 @@ def test_external_input_marker_and_empty_collection_do_not_borrow_passes(
         result = _acceptance_run(test_runner_module, root)
         assert result.returncode == 0, result.stdout + result.stderr
         assert result.accepted_checks["reused"] == 0
-    assert not list(_pass_store(root).directory.glob("pytest-pass-*.json"))
+        assert result.nonreusable_checks == [{
+            "id": "tests/test_example.py::test_example", "status": "scope-unrepresented",
+            "reusable": False, "reason": "The no_result_reuse marker requires fresh execution.",
+        }]
+    assert not list(_result_store(root).directory.glob("pytest-attempt-*.json"))
     (root / "tests/test_example.py").unlink()
     empty = _acceptance_run(test_runner_module, root)
     assert empty.returncode == 5, empty.stdout + empty.stderr
 
 
-@pytest.mark.parametrize("effect", ["_write_pass", "_prune"])
+@pytest.mark.parametrize("effect", ["_write_attempt", "_prune"])
 @pytest.mark.parametrize("after_effect", [False, True])
 def test_pass_record_interruption_uses_fresh_entry_without_execution_ids(
     test_runner_module, tmp_path, monkeypatch, effect, after_effect,
 ):
     root = _acceptance_repository(tmp_path)
     _acceptance_test(root, "example", tmp_path / "effects.log")
-    store = _pass_store(root)
+    store = _result_store(root)
     nodeid = "tests/test_example.py::test_example"
     inputs = store.inputs(nodeid)
     original = getattr(store, effect)
@@ -813,13 +825,13 @@ def test_pass_record_interruption_uses_fresh_entry_without_execution_ids(
     monkeypatch.setattr(store, effect, interrupted)
     with pytest.raises(KeyboardInterrupt, match="power lost"):
         store.save(nodeid, inputs)
-    fresh = _pass_store(root)
+    fresh = _result_store(root)
     assert bool(fresh.matching(nodeid, inputs)) == (after_effect or effect == "_prune")
     fresh.save(nodeid, inputs)
-    repeated = _pass_store(root)
+    repeated = _result_store(root)
     repeated.save(nodeid, inputs)
     assert repeated.matching(nodeid, inputs) is not None
-    assert len(list(repeated.directory.glob("pytest-pass-*.json"))) == 1
+    assert len(list(repeated.directory.glob("pytest-attempt-*.json"))) == 1
 
 
 def test_result_retention_prunes_at_startup_and_preserves_other_producers(
@@ -830,21 +842,21 @@ def test_result_retention_prunes_at_startup_and_preserves_other_producers(
     module = importlib.import_module("reuse_test_results")
     root = _acceptance_repository(tmp_path)
     _acceptance_test(root, "example", tmp_path / "effects.log")
-    store = _pass_store(root)
+    store = _result_store(root)
     unrelated = store.directory / "other-producer.json"
     unrelated.write_text("keep", encoding="utf-8")
     monkeypatch.setattr(module, "RETAINED_VERSIONS", 99)
     for version in range(5):
         (root / "tests/test_example.py").write_text(f"VERSION = {version}\n", encoding="utf-8")
-        current = _pass_store(root)
+        current = _result_store(root)
         current.save("tests/test_example.py::test_example", current.inputs("tests/test_example.py::test_example"))
-    assert len(list(store.directory.glob("pytest-pass-*.json"))) == 5
+    assert len(list(store.directory.glob("pytest-attempt-*.json"))) == 5
     monkeypatch.setattr(module, "RETAINED_VERSIONS", 3)
-    fresh = _pass_store(root)
-    assert len(list(fresh.directory.glob("pytest-pass-*.json"))) == 3
+    fresh = _result_store(root)
+    assert len(list(fresh.directory.glob("pytest-attempt-*.json"))) == 3
     (fresh.directory / "pytest-pass-partial.json").write_text('{"schema":', encoding="utf-8")
-    clean = _pass_store(root)
-    assert len(list(clean.directory.glob("pytest-pass-*.json"))) == 3
+    clean = _result_store(root)
+    assert len(list(clean.directory.glob("pytest-attempt-*.json"))) == 3
     assert unrelated.read_text() == "keep"
 
 
@@ -858,17 +870,17 @@ def test_changed_arguments_and_dependency_versions_do_not_reuse_results(
     root = _acceptance_repository(tmp_path)
     _acceptance_test(root, "example", tmp_path / "effects.log")
     nodeid = "tests/test_example.py::test_example"
-    store = _pass_store(root)
+    store = _result_store(root)
     store.save(nodeid, store.inputs(nodeid))
     monkeypatch.setattr(module.importlib.metadata, "distributions", lambda: [
         types.SimpleNamespace(metadata={"Name": "fixture-dependency"}, version="2"),
     ])
-    changed = _pass_store(root)
+    changed = _result_store(root)
     assert changed.matching(nodeid, changed.inputs(nodeid)) is None
     context = json.loads(module.result_environment(
         [sys.executable, "-m", "pytest", "-x", "tests"], root, {},
     )[module.RESULT_CONTEXT_ENV])
-    arguments = module.PassStore(root, context)
+    arguments = module.ResultStore(root, context)
     assert arguments.matching(nodeid, arguments.inputs(nodeid)) is None
 
 
@@ -911,21 +923,21 @@ def test_competing_writer_keeps_fresh_calls_live_and_retention_bounded(
     root = _acceptance_repository(tmp_path)
     _acceptance_test(root, "example", tmp_path / "effects.log")
     nodeid = "tests/test_example.py::test_example"
-    stale = _pass_store(root)
+    stale = _result_store(root)
     with stale.lock:
-        busy = _pass_store(root)
+        busy = _result_store(root)
         assert busy.records == []
         assert busy.save(nodeid, busy.inputs(nodeid)) is None
     for version in range(4):
         context = json.loads(module.result_environment(
             [sys.executable, "-m", "pytest", "-q", "tests"], root, {"VERSION": str(version)},
         )[module.RESULT_CONTEXT_ENV])
-        current = module.PassStore(root, context)
+        current = module.ResultStore(root, context)
         current.save(nodeid, current.inputs(nodeid))
     stale.save(nodeid, stale.inputs(nodeid))
-    fresh = _pass_store(root)
+    fresh = _result_store(root)
     assert fresh.matching(nodeid, fresh.inputs(nodeid)) is not None
-    assert len(list(fresh.directory.glob("pytest-pass-*.json"))) == 3
+    assert len(list(fresh.directory.glob("pytest-attempt-*.json"))) == 3
 
 
 def test_fixture_imports_from_other_checks_are_inputs(test_runner_module, tmp_path):
@@ -962,7 +974,7 @@ def test_ignored_generated_code_does_not_produce_reusable_passes(test_runner_mod
         result = _acceptance_run(test_runner_module, root)
         assert result.returncode == 0, result.stdout + result.stderr
         assert result.accepted_checks["reused"] == 0
-    assert not list(_pass_store(root).directory.glob("pytest-pass-*.json"))
+    assert not list(_result_store(root).directory.glob("pytest-attempt-*.json"))
 
 
 def test_configuration_outside_checkout_executes_checks_normally(test_runner_module, tmp_path):
@@ -1002,7 +1014,7 @@ def test_argument_and_tool_changes_are_independent_inputs(test_runner_module, tm
     root = _acceptance_repository(tmp_path)
     _acceptance_test(root, "example", tmp_path / "effects.log")
     nodeid = "tests/test_example.py::test_example"
-    original = _pass_store(root)
+    original = _result_store(root)
     original.save(nodeid, original.inputs(nodeid))
     command = [sys.executable, "-m", "pytest", "-q", "tests"]
     if change == "arguments":
@@ -1010,7 +1022,7 @@ def test_argument_and_tool_changes_are_independent_inputs(test_runner_module, tm
     else:
         monkeypatch.setattr(module, "_tool_versions", lambda root: {"git": "changed", "uv": "changed"})
     context = json.loads(module.result_environment(command, root, {})[module.RESULT_CONTEXT_ENV])
-    changed = module.PassStore(root, context)
+    changed = module.ResultStore(root, context)
     assert changed.matching(nodeid, changed.inputs(nodeid)) is None
 
 
@@ -1019,7 +1031,7 @@ def test_edits_after_input_snapshot_block_reuse_and_recording(test_runner_module
     root = _acceptance_repository(tmp_path)
     _acceptance_test(root, "example", tmp_path / "effects.log")
     nodeid = "tests/test_example.py::test_example"
-    store = _pass_store(root)
+    store = _result_store(root)
     inputs = store.inputs(nodeid)
     store.save(nodeid, inputs)
     assert store.matching(nodeid, inputs) is not None
@@ -1027,14 +1039,14 @@ def test_edits_after_input_snapshot_block_reuse_and_recording(test_runner_module
         stream.write("\nCHANGED = True\n")
     assert store.matching(nodeid, inputs) is None
     assert store.save(nodeid, inputs) is None
-    assert len(list(store.directory.glob("pytest-pass-*.json"))) == 1
+    assert len(list(store.directory.glob("pytest-attempt-*.json"))) == 1
 
 
 def test_unchanged_bytes_keep_acceptance_after_timestamp_change(test_runner_module, tmp_path):
     root = _acceptance_repository(tmp_path)
     _acceptance_test(root, "example", tmp_path / "effects.log")
     nodeid = "tests/test_example.py::test_example"
-    store = _pass_store(root)
+    store = _result_store(root)
     inputs = store.inputs(nodeid)
     store.save(nodeid, inputs)
     path = root / "production.py"
@@ -1042,7 +1054,7 @@ def test_unchanged_bytes_keep_acceptance_after_timestamp_change(test_runner_modu
     os.utime(path, ns=(value.st_atime_ns, value.st_mtime_ns + 1_000_000_000))
     assert store.matching(nodeid, inputs) is not None
     store.save(nodeid, inputs)
-    assert len(list(store.directory.glob("pytest-pass-*.json"))) == 1
+    assert len(list(store.directory.glob("pytest-attempt-*.json"))) == 1
 
 
 @pytest.mark.parametrize("wrapped", [False, True])
@@ -1115,3 +1127,193 @@ def test_startup_summary_requires_uncaptured_native_stderr(test_runner_module, s
     summary = test_runner_module.pytest_diagnostics.pytest_failure_summary(stdout, stderr)
     assert summary["failure_count"] == 0 and summary["failures"] == []
     assert summary["decisive_excerpt"] == ""
+
+
+def _qualified_acceptance_run(runner, root, monkeypatch, level):
+    if level is None:
+        monkeypatch.delenv("CERATOPS_REPOSITORY_CHECK_CONTEXT", raising=False)
+    else:
+        monkeypatch.setenv("CERATOPS_REPOSITORY_CHECK_CONTEXT", json.dumps({
+            "schema": "ceratops-repository-check-inputs.v1", "qualificationLevel": level,
+        }))
+    return _acceptance_run(runner, root)
+
+
+@pytest.mark.parametrize("original,requested,executed", [
+    (None, "beta", 1), ("alpha", "beta", 1), ("beta", "alpha", 0),
+    ("beta", "beta", 0), ("rc", "beta", 0), ("final", "rc", 0), ("beta", "final", 1),
+])
+def test_qualified_pytest_cache_preserves_original_level_and_identity(
+    test_runner_module, tmp_path, monkeypatch, original, requested, executed,
+):
+    root = _acceptance_repository(tmp_path)
+    counter = tmp_path / "effects.log"
+    _acceptance_test(root, "example", counter)
+    first = _qualified_acceptance_run(test_runner_module, root, monkeypatch, original)
+    assert first.returncode == 0, first.stdout + first.stderr
+    initial = first.accepted_result_references[0]
+    second = _qualified_acceptance_run(test_runner_module, root, monkeypatch, requested)
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert second.accepted_checks == {"collected": 1, "executed": executed, "reused": 1 - executed}
+    reference = second.accepted_result_references[0]
+    assert reference["qualificationLevel"] == (requested if executed else original)
+    assert (reference["result_id"] == initial["result_id"]) == (not executed)
+    assert reference["reused"] == (not executed)
+    assert len(counter.read_text().splitlines()) == 1 + executed
+
+
+@pytest.mark.parametrize("failure", ["failed", "interrupted"])
+def test_newer_qualified_failure_blocks_only_older_matching_check_passes(
+    test_runner_module, tmp_path, monkeypatch, failure,
+):
+    root = _acceptance_repository(tmp_path)
+    counter = tmp_path / "effects.log"
+    (root / ".failure-mode").write_text("passed")
+    (root / ".gitignore").write_text((root / ".gitignore").read_text() + "\n.failure-mode\n")
+    _acceptance_test(root, "example", counter, extra=(
+        "MODE = pathlib.Path('.failure-mode').read_text()\n"
+        "def fail_if_requested():\n"
+        "    if MODE == 'failed':\n        raise AssertionError('actual failed check')\n"
+        "    if MODE == 'interrupted':\n        raise KeyboardInterrupt('actual interrupted check')\n"
+    ))
+    test = root / "tests/test_example.py"
+    test.write_text(test.read_text() + "    fail_if_requested()\n")
+    _acceptance_test(root, "unrelated", counter)
+    passed = _qualified_acceptance_run(test_runner_module, root, monkeypatch, "beta")
+    assert passed.returncode == 0, passed.stdout + passed.stderr
+    previous = {item["id"]: item for item in passed.accepted_result_references}
+    (root / ".failure-mode").write_text(failure)
+    failed = _qualified_acceptance_run(test_runner_module, root, monkeypatch, "final")
+    assert failed.returncode != 0, failed.stdout + failed.stderr
+    assert any(item["status"] == failure for item in failed.accepted_result_references)
+    (root / ".failure-mode").write_text("passed")
+    recovered = _qualified_acceptance_run(test_runner_module, root, monkeypatch, "beta")
+    assert recovered.returncode == 0, recovered.stdout + recovered.stderr
+    assert recovered.accepted_checks == {"collected": 2, "executed": 1, "reused": 1}
+    current = {item["id"]: item for item in recovered.accepted_result_references}
+    assert current["tests/test_example.py::test_example"]["result_id"] != previous["tests/test_example.py::test_example"]["result_id"]
+    unrelated = current["tests/test_unrelated.py::test_unrelated"]
+    assert unrelated["reused"] is True
+    assert unrelated["qualificationLevel"] in {"beta", "final"}
+    repeated = _qualified_acceptance_run(test_runner_module, root, monkeypatch, "beta")
+    assert repeated.accepted_checks == {"collected": 2, "executed": 0, "reused": 2}
+
+
+def test_legacy_pass_records_keep_original_schema_and_only_legacy_eligibility(
+    test_runner_module, tmp_path,
+):
+    import importlib
+
+    module = importlib.import_module("reuse_test_results")
+    root = _acceptance_repository(tmp_path)
+    _acceptance_test(root, "example", tmp_path / "effects.log")
+    store = _result_store(root)
+    nodeid = "tests/test_example.py::test_example"
+    inputs = store.inputs(nodeid)
+    current = store.save(nodeid, inputs)
+    source = store._record_path(current)
+    legacy = {**current, "schema": "ceratops-pytest-pass.v1"}
+    legacy_path = store.directory / f'pytest-pass-{legacy["result_id"]}.json'
+    legacy_path.write_bytes(module._json(legacy) + b"\n")
+    source.unlink()
+    original = legacy_path.read_bytes()
+    fresh = _result_store(root)
+    assert fresh.matching(nodeid, inputs)["result_id"] == legacy["result_id"]
+    context = json.loads(module.result_environment(
+        [sys.executable, "-m", "pytest", "-q", "tests"], root, {},
+    )[module.RESULT_CONTEXT_ENV])
+    context["qualificationLevel"] = "beta"
+    qualified = module.ResultStore(root, context)
+    assert qualified.matching(nodeid, inputs) is None
+    assert legacy_path.read_bytes() == original
+
+
+def test_qualified_retention_protects_inherited_references_and_applicable_failures(
+    test_runner_module, tmp_path, monkeypatch,
+):
+    import importlib
+    import uuid
+
+    module = importlib.import_module("reuse_test_results")
+    root = _acceptance_repository(tmp_path)
+    _acceptance_test(root, "example", tmp_path / "effects.log")
+    context = json.loads(module.result_environment(
+        [sys.executable, "-m", "pytest", "-q", "tests"], root, {},
+    )[module.RESULT_CONTEXT_ENV])
+    context["qualificationLevel"] = "beta"
+    store = module.ResultStore(root, context)
+    nodeid = "tests/test_example.py::test_example"
+    original = store.save(nodeid, store.inputs(nodeid))
+    owner = store.directory / f"{uuid.uuid4()}.json"
+    owner.write_text(json.dumps({
+        "schema": "ceratops-repository-check-result.v1",
+        "checks": [{"result_id": original["result_id"]}],
+    }))
+    context["qualificationLevel"] = "final"
+    failed = module.ResultStore(root, context)
+    inputs = failed.inputs(nodeid)
+    failure = failed.save(nodeid, inputs, phases={"call": "failed"}, outcome="failed")
+    for version in range(5):
+        (root / "tests/test_example.py").write_text(f"VERSION={version}\n")
+        changed = module.ResultStore(root, context)
+        changed.save(nodeid, changed.inputs(nodeid))
+    fresh = module.ResultStore(root, context)
+    assert store._record_path(original).exists()
+    assert store._record_path(failure).exists()
+    assert len([item for item in fresh.records if item.get("qualificationLevel") == "final"]) == 4
+
+
+@pytest.mark.parametrize("boundary", ["after_durable_pass", "partial_pass", "incomplete_phases"])
+def test_pytest_interrupt_hook_preserves_completed_pass_and_incomplete_failure(
+    test_runner_module, tmp_path, monkeypatch, boundary,
+):
+    root = _acceptance_repository(tmp_path)
+    counter = tmp_path / "effects.log"
+    _acceptance_test(root, "example", counter)
+    if boundary == "incomplete_phases":
+        test = root / "tests/test_example.py"
+        test.write_text(test.read_text() + "    raise KeyboardInterrupt('incomplete call')\n")
+    else:
+        effect = (
+            "    original(self, record)\n"
+            if boundary == "after_durable_pass" else
+            "    self._record_path(record).write_bytes(reuse._json(record)[:30])\n"
+        )
+        (root / "tests/conftest.py").write_text(
+            "import reuse_test_results as reuse\n"
+            "original = reuse.ResultStore._write_attempt\n"
+            "def interrupted(self, record):\n"
+            "    if record['outcome'] != 'passed':\n"
+            "        return original(self, record)\n"
+            + effect
+            + "    raise KeyboardInterrupt('interrupted pass write')\n"
+            "reuse.ResultStore._write_attempt = interrupted\n"
+        )
+    first = _qualified_acceptance_run(test_runner_module, root, monkeypatch, "beta")
+    assert first.returncode != 0, first.stdout + first.stderr
+    directory = root / ".git/ceratops/results/repository-checks"
+    paths = list(directory.glob("pytest-attempt-*.json"))
+    assert paths
+    original = {path.name: path.read_bytes() for path in paths}
+    if boundary == "after_durable_pass":
+        assert [json.loads(raw)["outcome"] for raw in original.values()] == ["passed"]
+        reference = first.accepted_result_references[0]
+        assert reference["status"] == "passed" and reference["qualificationLevel"] == "beta"
+    elif boundary == "incomplete_phases":
+        assert [json.loads(raw)["outcome"] for raw in original.values()] == ["interrupted"]
+    second = _qualified_acceptance_run(test_runner_module, root, monkeypatch, "beta")
+    if boundary == "after_durable_pass":
+        assert second.returncode == 0, second.stdout + second.stderr
+        assert second.accepted_checks == {"collected": 1, "executed": 0, "reused": 1}
+        assert second.accepted_result_references[0]["result_id"] == reference["result_id"]
+        assert counter.read_text().splitlines() == ["example"]
+    elif boundary == "partial_pass":
+        assert second.returncode != 0
+        assert "blocks reuse of earlier passes" in second.stdout + second.stderr
+        assert counter.read_text().splitlines() == ["example"]
+    else:
+        assert second.returncode != 0
+        assert counter.read_text().splitlines() == ["example", "example"]
+        assert all(json.loads(path.read_bytes())["outcome"] == "interrupted"
+                   for path in directory.glob("pytest-attempt-*.json"))
+    assert all((directory / name).read_bytes() == raw for name, raw in original.items())
