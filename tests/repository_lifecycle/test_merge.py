@@ -188,49 +188,30 @@ def test_dependency_rebase_wait_skips_sleep_for_current_or_failed_evidence(
         assert bool(blockers) == (status == "failed")
 
 
-@pytest.mark.parametrize("mode", ["timeout", "cleaned", "cleanup_blocked"])
-def test_dependency_finalization_preserves_gate_and_reports_cleanup(
+@pytest.mark.parametrize("mode", ["timeout", "published", "release_blocked"])
+def test_dependency_finalization_preserves_rebase_gate_and_release_failure(
     monkeypatch: pytest.MonkeyPatch, mode: str,
 ) -> None:
-    from tests.repository_lifecycle.test_github_workflow import (
+    from tests.repository_lifecycle.test_dependency_finalization import (
         DependencyFinalizationTests,
     )
 
-    finalization = load_pr_workflow_module(monkeypatch, "dependency_finalization")
-    original_index = finalization.preflight_pr_index
-
-    def index(payload: dict[str, Any]) -> dict[Any, Any]:
-        result = original_index(payload)
-        if mode == "timeout":
-            result[("owner/repo", 1)]["pr"]["live"]["rebase_wait"] = {"status": "timed_out"}
-        return result
-
-    cleanup_calls = []
-    monkeypatch.setattr(finalization, "preflight_pr_index", index)
-    monkeypatch.setattr(finalization, "selected_worktree_cleanup", lambda *_: ({"selected": "task"}, None))
-
-    def cleanup(plan: dict[str, str]):
-        assert finalization.run_sync.called
-        cleanup_calls.append(plan)
-        error = "folder retained" if mode == "cleanup_blocked" else None
-        return {"status": "blocked" if error else "cleaned"}, error
-
-    monkeypatch.setattr(finalization, "finalize_worktree_cleanup", cleanup)
+    load_pr_workflow_module(monkeypatch, "dependency_finalization")
     fixture = DependencyFinalizationTests()
-    payload, _, merges = fixture._finalize_case(
-        [("owner/repo", 1)], {("owner/repo", 1): fixture._live("a" * 40)}, snapshot_open=[]
+    payload, publications = fixture.finalize_case(
+        [("owner/repo", 1)],
+        rebase_timeout=mode == "timeout",
+        publication_failure="owner/repo" if mode == "release_blocked" else None,
     )
     if mode == "timeout":
-        assert not merges and not cleanup_calls
+        assert not publications
         assert payload["blockers"][0]["check"] == "dependabot_rebase"
     else:
-        assert merges == [("owner/repo", 1)]
-        assert cleanup_calls == [{"selected": "task"}]
-        assert payload["pull_requests"][0]["cleanup"]["status"] == (
-            "blocked" if mode == "cleanup_blocked" else "cleaned"
+        assert publications == [("owner/repo", [1])]
+        assert payload["release_batches"][0]["status"] == (
+            "blocked" if mode == "release_blocked" else "published"
         )
-    assert payload["outcome"]["blocked"] == (mode != "cleaned")
-
+    assert payload["outcome"]["blocked"] == (mode != "published")
 
 @pytest.mark.parametrize(
     "mode", ["clean", "residual", "dirty", "changed_head", "other_scope", "interrupted", "unmerged"]

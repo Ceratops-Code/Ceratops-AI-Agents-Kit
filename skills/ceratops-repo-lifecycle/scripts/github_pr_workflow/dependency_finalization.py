@@ -458,8 +458,9 @@ def publish_dependency_batch(
         return result, None
     except (OSError, RuntimeError, ValueError) as exc:
         result["message"] = str(exc)
-        if isinstance(getattr(exc, "payload", None), dict):
-            result["failure"] = exc.payload
+        failure = getattr(exc, "payload", None)
+        if isinstance(failure, dict):
+            result["failure"] = failure
         return result, str(exc)
 
 

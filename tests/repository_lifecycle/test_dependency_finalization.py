@@ -32,7 +32,7 @@ class DependencyFinalizationTests(unittest.TestCase):
     def finalize_case(
         self, approved: list[tuple[str, int]], *, failed: set[int] | None = None,
         moved: set[int] | None = None, preflight_blockers: list[dict[str, Any]] | None = None,
-        publication_failure: str | None = None,
+        publication_failure: str | None = None, rebase_timeout: bool = False,
     ) -> tuple[dict[str, Any], list[tuple[str, list[int]]]]:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
@@ -44,7 +44,10 @@ class DependencyFinalizationTests(unittest.TestCase):
                     if candidate_repo != repo:
                         continue
                     head = str(number) * 40
-                    prs.append({"number": number, "live": {"head_oid": head}})
+                    approved_live: dict[str, Any] = {"head_oid": head}
+                    if rebase_timeout:
+                        approved_live["rebase_wait"] = {"status": "timed_out"}
+                    prs.append({"number": number, "live": approved_live})
                     states[(repo, number)] = self.live(
                         "f" * 40 if number in (moved or set()) else head,
                         failed=number in (failed or set()),
@@ -250,7 +253,7 @@ class DependencyPublicationTests(unittest.TestCase):
             states = {1: "OPEN", 2: "OPEN"}
             publications = []
             closures = []
-            effects = []
+            effects: list[str] = []
             armed = True
             original = flow.run_command
             options = argparse.Namespace(task_name="review", include_unpublished_release=(
@@ -316,7 +319,7 @@ class DependencyPublicationTests(unittest.TestCase):
                         flow.publish_dependency_batch("owner/repo", items, primary, options)
                 result, error = flow.publish_dependency_batch("owner/repo", items, primary, options)
                 if unpublished and not authorize:
-                    self.assertIn("unapproved unpublished commit", error)
+                    self.assertIn("unapproved unpublished commit", error or "")
                     self.assertEqual(publications, [])
                     self.assertEqual(states, {1: "OPEN", 2: "OPEN"})
                     return effects
