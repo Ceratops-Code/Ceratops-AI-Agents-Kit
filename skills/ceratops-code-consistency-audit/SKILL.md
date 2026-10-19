@@ -67,6 +67,53 @@ only partially cover.
   coherence concerns, narrow the work to documentation drift rather than running
   the full audit.
 
+### Repository Preflight and Cleanup
+
+Accept a repository, subtree, or supplied repository result queue. For a queue,
+preserve each exact `local_path` and upstream helper blocker. A result with
+`code_consistency_blocked` or any helper blocker remains blocked; run preflight
+only for the other repositories. Reuse completed health evidence.
+
+Bind `SKILL_ROOT` to this installed skill, `REPO` to the selected checkout,
+and `TASK` to the current `CODEX_THREAD_ID` or supplied task id.
+
+- (D) On Windows, run
+  `& "SKILL_ROOT/scripts/prepare_repository_audit.cmd" --repo REPO --task-id TASK`
+  once per eligible repository.
+- On other platforms, bind `PYTHON_RUNTIME` from this skill's runtime manifest.
+- (D) On other platforms, run `uv run --no-project --python "PYTHON_RUNTIME"
+  python "SKILL_ROOT/scripts/prepare_repository_audit.py"
+  --repo REPO --task-id TASK` once.
+- Use the returned repository root, task-temp path, runtime commands, missing
+  runtimes, loader requirement, and declared checks without rediscovery.
+  Invoke the bundled workspace dependency loader only when requested.
+- For `python_not_discoverable` or `unsupported_python`, bind
+  `BUNDLED_PYTHON` to the loader's Python interpreter.
+- (D) For those bootstrap errors only, run
+  `uv run --no-project --python "BUNDLED_PYTHON" python
+  "SKILL_ROOT/scripts/prepare_repository_audit.py" --repo REPO --task-id TASK`
+  once. Every other nonzero preflight result blocks that repository.
+- Continue the semantic audit from this evidence; the helper runs no repository
+  checks. Apply documented checks only where the audit's changed surfaces
+  require them.
+- The preflight owns its returned task directory and any requested evidence.
+  After each attempted audit, including a failed audit, clean that preflight's
+  output after its worker has stopped.
+- (D) On Windows, run
+  `& "SKILL_ROOT/scripts/prepare_repository_audit.cmd" --cleanup-task
+  --repo REPO --task-id TASK`.
+- (D) On other platforms, run `uv run --no-project --python "PYTHON_RUNTIME"
+  python "SKILL_ROOT/scripts/prepare_repository_audit.py" --cleanup-task
+  --repo REPO --task-id TASK`.
+- (D) When the loader supplied the successful preflight's interpreter, run
+  `uv run --no-project --python "BUNDLED_PYTHON" python
+  "SKILL_ROOT/scripts/prepare_repository_audit.py" --cleanup-task
+  --repo REPO --task-id TASK` for cleanup.
+- If evidence was explicitly requested, pass the same
+  `--evidence-file` value to cleanup. Skip cleanup when bootstrap or Git-root
+  resolution failed before creating task output. Cleanup must return `OK`;
+  retain and report any other result as a cleanup blocker.
+
 ### Workflow
 
 #### 1. Define intended behavior first

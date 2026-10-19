@@ -31,6 +31,12 @@
       ],
       "depends_on": []
     },
+    "code-consistency-audit": {
+      "pytest": [
+        "tests/test_repository_audit.py"
+      ],
+      "depends_on": []
+    },
     "skill-lifecycle": {
       "pytest": [
         "tests/skill_lifecycle"

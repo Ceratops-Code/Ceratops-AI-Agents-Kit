@@ -20,7 +20,24 @@ or another governing contract.
 | `ceratops-mcp-server-lifecycle` | Create and package local Python MCP servers, bootstrap the deployment manager, install exact releases, update servers, and inspect versions. |
 | `ceratops-automation-run` | Run recurring automations with shared Ceratops alert, memory, and completion policy. |
 | `ceratops-task-lifecycle` | Route failed-fix-loop breaks, same-thread task resume, whole-task handoff, aggregate worktree status tables, and closure checks across action references. |
-| `ceratops-code-consistency-audit` | Audit merged refactors for contradictions, docs drift, comment sufficiency, stale follow-through, and merged-only edge cases. |
+| `ceratops-code-consistency-audit` | Audit merged refactors for contradictions, docs drift, comment sufficiency, stale follow-through, and merged-only edge cases, with skill-owned repository preflight and cleanup. |
+
+Repository health audits accept one repository, an explicit list, or all
+repositories in caller-supplied scope data. The repository-lifecycle skill owns
+scope collection and bounded batch execution through
+`scripts/audit_repository_health.py` in that skill. Its current evidence lives
+under `<projects-root>/tmp/Ceratops-AI-Agents-Kit/<task-id>` until the model
+finishes result handling and any requested code-consistency handoff; the health
+cleanup entrypoint then removes only its declared files and empty task root.
+
+The code-consistency skill owns `scripts/prepare_repository_audit.{cmd,py}` in
+its own bundle. Preflight discovers the Git root, runtime commands and declared
+checks without running them. It owns the returned
+`<repo-parent>/tmp/<repo-name>/<task-id>` directory and optional evidence until
+its cleanup entrypoint removes matching evidence and empty directories. Unknown
+contents or links block cleanup. Both operations support fresh calls after an
+interruption and preserve unrelated output. The two skills exchange repository
+results through the model; their scripts remain inside their own skill.
 
 Dependency queue finalization stages approved PR heads together in a thread
 worktree and publishes through `release/local` using the existing promotion
