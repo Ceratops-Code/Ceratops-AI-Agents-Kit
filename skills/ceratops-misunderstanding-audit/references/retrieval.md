@@ -64,6 +64,15 @@ or the standard user Codex directory. `task_ids` narrows to exact task IDs or
 Codex task links. `project` matches an exact indexed project ID or working path.
 Host selection constrains inputs; it does not connect to or discover remote hosts.
 
+`assistant_scope: "final"` selects user messages and assistant answers with
+`final` or `final_answer` phase evidence. In rollouts, an exact match to the
+turn's completion answer supplies that evidence when its phase is absent.
+Unmarked assistant messages are omitted with a coverage gap. The default,
+`"visible"`, also retains assistant commentary. Both modes exclude reasoning;
+tool records are never conversation messages. Reader content-reference
+placeholders are reported as unavailable bodies. The packet and ledger record
+the selected scope.
+
 Each explicit source names `format`, `path` and `task` with `id`, `title`,
 `host`, `kind` (`codex` or `chatgpt`) and available `archived`, `project` or `url`.
 Formats are `app` for exported reader pages, `rollout` for a named JSONL session,
@@ -71,6 +80,7 @@ and `exchange` for a JSON array of pasted messages with `role`, `text`, optional
 `id`, `turn_id` and timezone-bearing `timestamp`. An app source also supplies
 `complete: true` only after its required pagination and context were verified.
 Set `disposable: true` only for a task-created export beneath the task-temp root.
+An exchange may supply `phase` or `channel` for final-answer selection.
 
 For `mode: case`, omit days, restrict sources to one task or pasted exchange,
 and supply `selector` with `item_id`, `timestamp` or `quote`. All supplied fields
@@ -109,6 +119,22 @@ reuse already exported pages and the frozen end time. Keep a superseded packet
 only while its evidence is needed, then remove its exact task-owned path.
 
 ## Review and finalize
+
+The installed helper can page every eligible user message without a keyword
+filter, then retrieve the selected task's conversation or source coverage:
+
+```text
+python scripts/audit.py inspect --packet PACKET --view users --offset 0 --limit 25
+python scripts/audit.py inspect --packet PACKET --view conversation --task-id TASK_ID --offset 0 --limit 25
+python scripts/audit.py inspect --packet PACKET --view coverage --offset 0 --limit 25
+```
+
+These commands use the installed skill directory and managed-runtime prefix
+defined in `SKILL.md`. `PACKET` is the collector output; `TASK_ID` comes from
+its message metadata. Each page returns `total`, `next_offset` and the packet
+hash. A null `next_offset` ends that view. Inspection writes nothing, preserves
+the selected assistant scope, and removes HTML annotation comments only from
+the display; the packet retains the exact evidence.
 
 Create a review JSON naming `packet_sha256`. `decisions` contains one object per
 literal/variant candidate and each additional semantic candidate. Each object

@@ -220,6 +220,93 @@ def test_misunderstanding_reconstructed_copies_and_current_reader_versions(tmp_p
     assert audit_sources.visible_text("<recommended_plugins>What?</recommended_plugins>")[2]
 
 
+def test_misunderstanding_final_answers_exclude_hidden_mirrors(tmp_path, monkeypatch):
+    """Final scope keeps every user and final, including completion-marked mirrors."""
+    audit = load_misunderstanding_audit(monkeypatch)
+    import audit_sources
+
+    task = {"id": "scope-task", "title": "Scope", "kind": "codex"}
+    rows = [{"type": "turn_context", "payload": {"turn_id": "turn"}}]
+    for role, text, phase in (("user", "?", None), ("assistant", "private thought", "analysis"),
+                              ("assistant", "progress", "commentary"), ("assistant", "Final answer", "final"),
+                              ("assistant", "Unknown legacy answer", None)):
+        payload = {"type": "message", "role": role, "content": [{"text": text}]}
+        if phase:
+            payload["channel"] = phase
+        rows.append({"timestamp": "2026-09-06T23:00:00Z", "type": "response_item", "payload": payload})
+        if role == "assistant":
+            rows.append({"timestamp": "2026-09-06T23:00:01Z", "type": "event_msg", "payload": {"type": "agent_message", "message": text}})
+    rows.append({"timestamp": "2026-09-06T23:01:00Z", "type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": "Final answer"}})
+    path = tmp_path / "session.jsonl"
+    path.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+    source = {"format": "rollout", "path": str(path), "task": task, "assistant_scope": "final"}
+    for _ in range(2):
+        records, gaps = audit_sources.read_source(source)
+        assert [record["text"] for record in records] == ["?", "Final answer"]
+        assert any("without phase evidence" in gap for gap in gaps)
+    visible, _ = audit_sources.read_source({**source, "assistant_scope": "visible"})
+    assert "progress" in [record["text"] for record in visible]
+    assert "private thought" not in [record["text"] for record in visible]
+    assert audit_sources.visible_text('<external_codex_apps_open_page>{}</external_codex_apps_open_page>')[2]
+    exchange = tmp_path / "exchange.json"
+    exchange.write_text(json.dumps([
+        {"role": "assistant", "text": "Private", "channel": "analysis"},
+        {"role": "assistant", "text": "Final", "phase": "final"},
+        {"role": "user", "text": "Which one?"},
+    ]), encoding="utf-8")
+    exchange_records, _ = audit_sources.read_source({**source, "format": "exchange", "path": str(exchange)})
+    assert [record["text"] for record in exchange_records] == ["Final", "Which one?"]
+
+
+def test_misunderstanding_reader_scope_titles_and_review_pages(tmp_path, monkeypatch):
+    """Null reader titles, missing bodies and signal-free questions stay explicit."""
+    import pytest
+
+    audit = load_misunderstanding_audit(monkeypatch)
+    root = tmp_path / "tmp" / "skills" / "scope"
+    root.mkdir(parents=True)
+    source = root / "pages.json"
+    page = {"thread": {"id": "reader", "title": None}, "turns": [{"id": "turn", "startedAt": "2026-09-06T23:00:00Z", "items": [
+        {"type": "agentMessage", "id": "hidden", "channel": "analysis", "text": "Private"},
+        {"type": "agentMessage", "id": "progress", "phase": "commentary", "text": "Progress"},
+        {"type": "agentMessage", "id": "final", "phase": "final_answer", "text": "Select the brush."},
+        {"type": "agentMessage", "id": "reference", "phase": "final_answer", "text": '::chatgpt-content-reference{index="1"}'},
+        {"type": "userMessage", "id": "u", "content": [{"type": "text", "text": "?"}]},
+        {"type": "userMessage", "id": "v", "content": [{"type": "text", "text": "Which one?"}]},
+    ]}]}
+    source.write_text(json.dumps(page), encoding="utf-8")
+    request = root / "request.json"
+    request.write_text(json.dumps({"version": 1, "mode": "history", "days": 1, "assistant_scope": "final",
+                                   "end": "2026-09-07T00:00:00Z", "task_temp_root": str(root),
+                                   "sources": [{"format": "app", "path": str(source), "complete": True,
+                                                "task": {"id": "reader", "title": "Archive title", "kind": "codex"}}]}), encoding="utf-8")
+    packet_path = root / "packet.json"
+    audit.collect(request, packet_path)
+    packet = audit.load(packet_path)
+    assert all(item["task"]["title"] == "Archive title" for item in packet["messages"])
+    assert not {"Private", "Progress"} & {item["text"] for item in packet["messages"]}
+    assert any("content reference only" in gap for gap in packet["coverage"][0]["gaps"])
+    before = packet_path.read_bytes()
+    first = audit.inspect_packet(packet_path, "users", None, 0, 1)
+    second = audit.inspect_packet(packet_path, "users", None, first["next_offset"], 1)
+    assert [first["records"][0]["text"], second["records"][0]["text"]] == ["?", "Which one?"]
+    assert second["next_offset"] is None
+    assert first == audit.inspect_packet(packet_path, "users", None, 0, 1)
+    with pytest.raises(ValueError, match="offset"):
+        audit.inspect_packet(packet_path, "users", None, -1, 1)
+    original_write = audit.write_new
+    monkeypatch.setattr(audit, "write_new", lambda *args: (_ for _ in ()).throw(InterruptedError("before save")))
+    with pytest.raises(InterruptedError):
+        audit.collect(request, root / "interrupted.json")
+    assert not (root / "interrupted.json").exists()
+    monkeypatch.setattr(audit, "write_new", original_write)
+    audit.collect(request, root / "interrupted.json")
+    with pytest.raises(FileExistsError):
+        audit.collect(request, root / "interrupted.json")
+    assert audit.load(root / "interrupted.json")["messages"] == packet["messages"]
+    assert packet_path.read_bytes() == before
+
+
 def test_credit_analysis_lineage_discovers_recursive_persistent_descendants(
     tmp_path: pathlib.Path,
     monkeypatch,

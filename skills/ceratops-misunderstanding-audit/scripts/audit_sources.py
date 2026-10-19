@@ -77,6 +77,7 @@ def visible_text(raw: str) -> tuple[str, list[str], bool]:
         "<environment_context>", "<permissions instructions>",
         "# AGENTS.md instructions", "<INSTRUCTIONS>", "<turn_aborted>",
         "<recommended_plugins>", "<skill>", "<codex_delegation>",
+        "<external_codex_apps_open_page>",
     ))
     return ("" if injected else visible.strip()), comments + selected + quotes + code, injected
 
@@ -118,7 +119,7 @@ def read_app(source: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str]]:
         task = value.get("thread", {})
         meta = {**source.get("task", {}), **{
             "id": task.get("id", task.get("threadId", source.get("task", {}).get("id"))),
-            "title": task.get("title", source.get("task", {}).get("title", "Unnamed task")),
+            "title": task.get("title") or source.get("task", {}).get("title") or "Unnamed task",
         }}
         if not meta.get("id"):
             raise ValueError("app source requires task.id when the page omits it")
@@ -132,12 +133,15 @@ def read_app(source: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str]]:
                 role = {"userMessage": "user", "agentMessage": "assistant"}.get(item.get("type"))
                 if not role:
                     continue
-                if item.get("phase") in ("analysis", "reasoning"):
+                if item.get("phase") in ("analysis", "reasoning") or item.get("channel") in ("analysis", "reasoning"):
                     continue
                 when = item.get("createdAt") or item.get("created_at_ms") or turn.get("startedAt") or turn.get("started_at")
                 record = message(meta, role, body(item), when, str(turn.get("id", "")),
                                  str(item.get("id", f"item-{item_no}")),
                                  f"{path}#page={page_no};turn={turn_no};item={item_no}", len(records))
+                record["assistant_phase"] = item.get("phase") or item.get("channel")
+                if role == "assistant" and "::chatgpt-content-reference{" in record["text"]:
+                    gaps.append(f"assistant body unavailable; content reference only: {meta['id']} {record['item_id']}")
                 records.append(record)
                 if item.get("truncated") or item.get("isTruncated"):
                     gaps.append(f"truncated item: {meta['id']} {record['item_id']}")
@@ -154,6 +158,8 @@ def read_rollout(source: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str
     records: list[dict[str, Any]] = []
     gaps: list[str] = []
     turn = ""
+    hidden_messages: set[tuple[str, str]] = set()
+    completed_answers: set[tuple[str, str]] = set()
     with path.open(encoding="utf-8-sig") as stream:
         for line_no, line in enumerate(stream, 1):
             try:
@@ -170,18 +176,24 @@ def read_rollout(source: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str
                 turn = str(payload.get("turn_id", turn))
             if kind == "compacted" or event == "context_compacted":
                 gaps.append(f"compacted/reconstructed history needs app verification: {path}:{line_no}")
+            if kind == "event_msg" and event == "task_complete" and payload.get("last_agent_message"):
+                completed_answers.add((str(payload.get("turn_id", turn)), digest(payload["last_agent_message"])))
             role = None
             if kind == "response_item" and payload.get("type") == "message":
                 role = payload.get("role")
-                if payload.get("phase") in ("analysis", "reasoning"):
-                    continue
             elif kind == "event_msg":
                 role = {"user_message": "user", "agent_message": "assistant"}.get(str(event))
             if role not in ("user", "assistant"):
                 continue
+            phase = payload.get("phase") or payload.get("channel")
+            if role == "assistant" and (payload.get("phase") in ("analysis", "reasoning")
+                                        or payload.get("channel") in ("analysis", "reasoning")):
+                hidden_messages.add((str(payload.get("turn_id", turn)), digest(body(payload))))
+                continue
             record = message(meta, role, body(payload), row.get("timestamp"),
                              str(payload.get("turn_id", turn)), str(payload.get("id", f"line-{line_no}")),
                              f"{path}:{line_no}", len(records))
+            record["assistant_phase"] = phase
             embedded = payload.get("internal_chat_message_metadata_passthrough") or {}
             reconstructed_turn = str(embedded.get("turn_id", "")) if isinstance(embedded, dict) else ""
             if reconstructed_turn.startswith("auto-compact-"):
@@ -191,6 +203,13 @@ def read_rollout(source: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str
                 record["turn_id"] = reconstructed_turn
             record["representation"] = kind
             records.append(record)
+    # Event mirrors can omit the channel. They must not reintroduce hidden text.
+    records = [record for record in records if record["role"] != "assistant"
+               or (record["turn_id"], digest(record["text"])) not in hidden_messages]
+    for record in records:
+        if record["role"] == "assistant" and not record.get("assistant_phase"):
+            if (record["turn_id"], digest(record["text"])) in completed_answers:
+                record["assistant_phase"] = "final_answer"
     # Explicit reconstructed windows may repeat earlier history with newly
     # generated IDs and capture times. Align ordered multi-message blocks;
     # one equal What alone is never enough to identify a copied message.
@@ -274,6 +293,18 @@ def inventory(home: Path, task_ids: list[str], project: str | None) -> list[dict
 
 
 def read_source(source: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str]]:
+    """Apply caller-selected final-answer scope without dropping user messages."""
+    records, gaps = read_source_records(source)
+    if source.get("assistant_scope", "visible") == "final":
+        unknown = sum(record["role"] == "assistant" and not record.get("assistant_phase") for record in records)
+        records = [record for record in records if record["role"] == "user"
+                   or record.get("assistant_phase") in ("final", "final_answer")]
+        if unknown:
+            gaps.append(f"final-answer scope omitted {unknown} assistant messages without phase evidence: {source['path']}")
+    return records, gaps
+
+
+def read_source_records(source: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str]]:
     if source["format"] == "app":
         return read_app(source)
     if source["format"] == "rollout":
@@ -281,10 +312,18 @@ def read_source(source: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str]
     if source["format"] == "exchange":
         data = json.loads(Path(source["path"]).read_text(encoding="utf-8-sig"))
         meta = source["task"]
-        records = [message(meta, item["role"], item["text"], item.get("timestamp"),
-                           str(item.get("turn_id", "")), str(item.get("id", index)),
-                           f"{source['path']}#message={index}", index)
-                   for index, item in enumerate(data) if item["role"] in ("user", "assistant")]
+        records = []
+        for index, item in enumerate(data):
+            if item["role"] not in ("user", "assistant"):
+                continue
+            if item["role"] == "assistant" and (item.get("phase") in ("analysis", "reasoning")
+                                                or item.get("channel") in ("analysis", "reasoning")):
+                continue
+            record = message(meta, item["role"], item["text"], item.get("timestamp"),
+                             str(item.get("turn_id", "")), str(item.get("id", index)),
+                             f"{source['path']}#message={index}", index)
+            record["assistant_phase"] = item.get("phase") or item.get("channel")
+            records.append(record)
         return records, ["pasted exchange only; original history not verified"]
     raise ValueError(f"unsupported source format: {source['format']}")
 
