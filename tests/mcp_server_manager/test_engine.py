@@ -978,16 +978,18 @@ def gateway_client(tmp_path, monkeypatch):
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding="utf-8", creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
-        messages = queue.Queue()
-        errors = []
+        assert process.stdin is not None and process.stdout is not None and process.stderr is not None
+        input_stream, output_stream, error_stream = process.stdin, process.stdout, process.stderr
+        messages: queue.Queue[dict | None] = queue.Queue()
+        errors: list[str] = []
 
         def read():
-            for line in process.stdout:
+            for line in output_stream:
                 messages.put(json.loads(line))
             messages.put(None)
 
         def read_errors():
-            errors.extend(process.stderr)
+            errors.extend(error_stream)
 
         threading.Thread(target=read, daemon=True).start()
         threading.Thread(target=read_errors, daemon=True).start()
@@ -996,10 +998,10 @@ def gateway_client(tmp_path, monkeypatch):
             arguments = message.get("params", {}).get("arguments", {})
             if "release" in arguments:
                 release_paths.add(Path(arguments["release"]))
-            process.stdin.write(json.dumps({"jsonrpc": "2.0", **message}) + "\n")
-            process.stdin.flush()
+            input_stream.write(json.dumps({"jsonrpc": "2.0", **message}) + "\n")
+            input_stream.flush()
 
-        deferred = []
+        deferred: list[dict] = []
 
         def receive(identifier=None):
             for index, message in enumerate(deferred):

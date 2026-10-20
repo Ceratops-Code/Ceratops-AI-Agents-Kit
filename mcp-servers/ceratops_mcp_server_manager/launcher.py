@@ -175,8 +175,8 @@ class Backend:
         self.ready = initialize is None
         self.bootstrap_id = None
         self.started = time.monotonic()
-        self.errors = deque(maxlen=16)
-        self.output = queue.Queue(maxsize=128)
+        self.errors: deque[bytes] = deque(maxlen=16)
+        self.output: queue.Queue[dict | None] = queue.Queue(maxsize=128)
         self.lease = contextlib.ExitStack()
         self.command = []
         try:
@@ -203,6 +203,7 @@ class Backend:
             self.send({**initialize, "id": self.bootstrap_id})
 
     def read_errors(self):
+        assert self.process.stderr is not None
         while chunk := self.process.stderr.read(4096):
             self.errors.append(chunk)
             stream = getattr(sys.stderr, "buffer", sys.stderr)
@@ -213,6 +214,7 @@ class Backend:
                 pass
 
     def write_messages(self):
+        assert self.process.stdin is not None
         try:
             while True:
                 try:
@@ -269,7 +271,7 @@ class McpGateway:
 
     def __init__(self, root, arguments):
         self.root, self.arguments = root, arguments
-        self.events = queue.Queue(maxsize=128)
+        self.events: queue.Queue = queue.Queue(maxsize=128)
         self.backends = set()
         self.pending = {}
         self.waiting = {}
@@ -285,10 +287,12 @@ class McpGateway:
         if self.output_closed:
             return
         try:
-            stream = getattr(sys.stdout, "buffer", sys.stdout)
             data = json.dumps(message, ensure_ascii=False) + "\n"
-            stream.write(data.encode("utf-8") if hasattr(sys.stdout, "buffer") else data)
-            stream.flush()
+            if hasattr(sys.stdout, "buffer"):
+                sys.stdout.buffer.write(data.encode("utf-8"))
+            else:
+                sys.stdout.write(data)
+            sys.stdout.flush()
         except (OSError, ValueError):
             self.closing = True
             self.output_closed = True
