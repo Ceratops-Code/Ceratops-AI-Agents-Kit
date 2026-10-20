@@ -335,19 +335,24 @@ def test_usage_leases_are_shared_and_block_retirement(tmp_path, monkeypatch):
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows console launch behavior")
-def test_launcher_hides_selected_child_and_allows_fresh_retries(tmp_path, monkeypatch):
+@pytest.mark.parametrize(("identity", "arguments"), [
+    ("fixture", ["--serve"]), ("ceratops_mcp_server_manager", []),
+    ("form-filling-mcp-server", []), ("source_search_mcp", []),
+    ("whatsapp-desktop-mcp-server", []),
+])
+def test_launcher_hides_selected_child_and_allows_fresh_retries(tmp_path, monkeypatch, identity, arguments):
     monkeypatch.setattr(storage, "INSTALL_ROOT", tmp_path)
-    root = tmp_path / "fixture"
-    layout = storage.Layout("fixture")
+    root = tmp_path / identity
+    layout = storage.Layout(identity)
     layout.install_launcher()
-    script = root / "bin/fixture.py"
+    script = root / "bin" / (identity + ".py")
     spec = importlib.util.spec_from_file_location("installed_fixture_launcher", script)
     assert spec is not None and spec.loader is not None
     launcher = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(launcher)
     selected = {
         "schema": 1,
-        "mcp_server_id": "fixture",
+        "mcp_server_id": identity,
         "version": "1.0.0",
         "manifest_sha256": "a" * 64,
         "instance": "b" * 32,
@@ -373,7 +378,7 @@ def test_launcher_hides_selected_child_and_allows_fresh_retries(tmp_path, monkey
         return 9 if len(attempts) == 3 else 0
 
     monkeypatch.setattr(launcher, "__file__", str(script))
-    monkeypatch.setattr(launcher.sys, "argv", [str(script), "--serve"])
+    monkeypatch.setattr(launcher.sys, "argv", [str(script), *arguments])
     monkeypatch.setattr(launcher.subprocess, "call", run_child)
     monkeypatch.setenv("PYTHONPATH", "ignored")
 
@@ -388,8 +393,8 @@ def test_launcher_hides_selected_child_and_allows_fresh_retries(tmp_path, monkey
         with layout._retirement_lease(installation) as removable:
             assert removable is True
     assert len(attempts) == 4
-    for arguments, options in attempts:
-        assert arguments == [str(python), "-I", "-B", "-m", "fixture_server", "--serve"]
+    for invocation, options in attempts:
+        assert invocation == [str(python), "-I", "-B", "-m", "fixture_server", *arguments]
         assert options["creationflags"] == launcher.subprocess.CREATE_NO_WINDOW
         assert "PYTHONPATH" not in options["env"]
         assert options["stdin"] is launcher.sys.stdin

@@ -536,7 +536,11 @@ class McpGateway:
 def main() -> int:
     root = Path(__file__).resolve().parent.parent
     arguments = sys.argv[1:]
-    is_mcp = ("--mcp" in arguments or (not arguments and root.name != "ceratops_mcp_server_manager")
+    # These frontends require an explicit service mode; bare invocation must
+    # retain their CLI usage/exit behavior instead of waiting for JSON input.
+    explicit_service_mode = {"ceratops_mcp_server_manager", "form-filling-mcp-server",
+                             "source_search_mcp", "whatsapp-desktop-mcp-server"}
+    is_mcp = ("--mcp" in arguments or (not arguments and root.name not in explicit_service_mode)
               or (arguments and arguments[0] == "serve"))
     if is_mcp:
         return McpGateway(root, arguments).run()
