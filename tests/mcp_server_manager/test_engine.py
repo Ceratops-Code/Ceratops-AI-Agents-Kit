@@ -1004,8 +1004,8 @@ def gateway_client(tmp_path, monkeypatch):
         deferred: list[dict] = []
 
         def receive(identifier=None):
-            for index, message in enumerate(deferred):
-                if identifier is None or message.get("id") == identifier:
+            for index, deferred_message in enumerate(deferred):
+                if identifier is None or deferred_message.get("id") == identifier:
                     return deferred.pop(index)
             deadline = time.monotonic() + 15
             while time.monotonic() < deadline:
