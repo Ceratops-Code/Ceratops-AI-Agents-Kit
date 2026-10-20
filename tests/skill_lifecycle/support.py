@@ -28,6 +28,21 @@ RUNTIME_MANIFEST_SCHEMA = "ceratops-runtime-skill.v3"
 INSTALLER_VERSION = 19
 
 
+def commit_runtime_release_source(repo: pathlib.Path) -> str:
+    """Prepare an isolated installer fixture as a committed release checkout."""
+    if not (repo / ".git").exists():
+        assert run_git(repo, "init", "-b", "release/local").returncode == 0
+    for arguments in (
+        ("config", "user.email", "test@example.invalid"),
+        ("config", "user.name", "Test Agent"),
+        ("add", "-A"),
+        ("commit", "--allow-empty", "-m", "Prepare release source"),
+    ):
+        result = run_git(repo, *arguments)
+        assert result.returncode == 0, result.stderr
+    return run_git(repo, "rev-parse", "HEAD").stdout.strip()
+
+
 def prepare_fast_change_repo(tmp_path: pathlib.Path) -> pathlib.Path:
     """Create one clean release checkout with a logging runtime installer."""
 

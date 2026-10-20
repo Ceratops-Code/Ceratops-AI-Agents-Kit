@@ -919,11 +919,20 @@ original diagnostics; there is no automatic retry. Plain Promote unlocks after
 local cleanup. Ship retains its outer ownership through installation and cleanup;
 nested Promote and installers do not release it. Standalone skill/MCP calls use
 `hold_release_source()` for the primary or release checkout, never a task worktree.
-Plain source directories without `.git` metadata need neither Git discovery nor
-a release lock; their ordinary request and source checks still run. A failed
-Git launch for a real checkout reports its original cause as a source-lock error.
-They acquire release before the existing destination lock and finish their local
-commands before unlocking. Destination code never starts a release writer.
+Managed skill deployment requires that source protection and a clean committed
+`release/local` checkout, or a clean primary checkout whose HEAD matches its
+upstream and that remote's published default branch. Both the callable and CLI
+reject task worktrees, detached HEADs, unpublished default-branch commits and
+non-Git sources before source checks or runtime effects. They inspect eligibility
+again immediately before the transaction, including a branch switch that leaves
+HEAD unchanged. Nested release ownership preserves fast-change's checked edits
+before its final commit; a standalone dirty release source is rejected.
+Report-only inventory and empty selections perform no installation and do not
+require promotion. MCP installation retains its existing non-Git source support.
+A failed Git launch for a real checkout reports its original cause as a
+source-lock error. Installers acquire release before the existing destination
+lock and finish their local commands before unlocking. Destination code never
+starts a release writer.
 Artifact-only installers remain steps 17–19; 22/27B switch callers and allow
 release unlock before installation without exposing a mutable checkout.
 

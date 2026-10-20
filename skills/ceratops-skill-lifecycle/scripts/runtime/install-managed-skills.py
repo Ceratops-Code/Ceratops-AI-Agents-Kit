@@ -663,8 +663,8 @@ def write_inventory(runtime_root: pathlib.Path, output: pathlib.Path) -> None:
 def _source_commit(repo_root: pathlib.Path) -> str | None:
     """Only a clean Git root can attest an exact deployed commit.
 
-    Ordinary uncommitted installations remain supported, but their receipts
-    cannot finalize a promotion. No installed-content scan is needed.
+    An already locked direct-release change may install before its final commit,
+    but that receipt cannot finalize a promotion. No installed-content scan is needed.
     """
     result = source_locks.run_protected_command(["git", "-C", str(repo_root), "rev-parse", "--show-toplevel"],
                             capture_output=True, text=True, check=False)
@@ -677,6 +677,64 @@ def _source_commit(repo_root: pathlib.Path) -> str | None:
     if _git_text(repo_root, "status", "--porcelain").strip():
         return None
     return _git_text(repo_root, "rev-parse", "HEAD").strip()
+
+
+def _promotion_source_git(repo_root: pathlib.Path, *arguments: str) -> str:
+    """Read release identity while retaining complete Git failure evidence."""
+    command = ["git", "-C", str(repo_root), *arguments]
+    try:
+        result = source_locks.run_protected_command(
+            command, capture_output=True, text=True, check=False,
+        )
+    except OSError as exc:
+        raise InstallerError(
+            "could not inspect the promoted deployment source", phase="promotion_gate",
+            details=source_locks.command_failure_details(exc, target=repo_root, command=command),
+        ) from exc
+    if result.returncode:
+        raise InstallerError(
+            "could not inspect the promoted deployment source", phase="promotion_gate",
+            details=source_locks.command_failure_details(result, target=repo_root),
+        )
+    return result.stdout.strip()
+
+
+def _require_promoted_source(repo_root: pathlib.Path, commit: str | None,
+                             release_owner: Any) -> None:
+    """Reject unpromoted sources before any source command or runtime mutation.
+
+    Normal installs use a clean release checkout or the exact published default
+    branch. The approved fast-change caller already owns the release lock and
+    installs its checked working tree before committing; only that nested release
+    operation may retain the existing uncommitted-source behavior. Inventory and
+    empty selections have no installation effect and do not enter this gate.
+    """
+    if release_owner is None:
+        raise InstallerError(
+            "managed deployment requires a protected release checkout; promote task changes before installation",
+            phase="promotion_gate", details={"repo_root": str(repo_root)},
+        )
+    branch = _promotion_source_git(repo_root, "branch", "--show-current")
+    if branch == "release/local":
+        if commit is not None or not release_owner.outermost:
+            return
+        reason = "standalone release installation requires a clean committed source"
+    else:
+        upstream, _, remote = _promotion_source_git(
+            repo_root, "for-each-ref", "--format=%(upstream)%00%(upstream:remotename)",
+            f"refs/heads/{branch}",
+        ).partition("\0") if branch else ("", "", "")
+        if commit is not None and remote and remote != ".":
+            published_default = _promotion_source_git(
+                repo_root, "for-each-ref", "--format=%(symref)", f"refs/remotes/{remote}/HEAD",
+            )
+            if published_default == upstream and commit == _promotion_source_git(
+                repo_root, "rev-parse", "--verify", f"{upstream}^{{commit}}",
+            ):
+                return
+        reason = "managed deployment requires release/local or its synced published default branch; promote task changes first"
+    raise InstallerError(reason, phase="promotion_gate",
+                         details={"repo_root": str(repo_root), "branch": branch})
 
 
 def _plain_path(path: pathlib.Path) -> pathlib.Path:
@@ -1016,13 +1074,13 @@ def deploy_managed_skills(args: DeployOptions) -> dict[str, Any] | str:
     at source so Windows can release the old installed directory.
     """
 
-    # Lock release before taking the in-process builder mutex or its destination
-    # lock. Inventory and task-worktree sources need no release protection.
+    # Acquire source protection before either installation lock. Task checkouts
+    # receive no ownership and are rejected before source checks or target writes.
     source_context = (source_locks.hold_release_source(args.repo_root)
                       if args.repo_root is not None else nullcontext())
     with ExitStack() as locks:
         try:
-            locks.enter_context(source_context)
+            release_owner = locks.enter_context(source_context)
         except source_locks.WriteLockError as exc:
             return InstallerError(str(exc), phase="source_lock").result()
         locks.enter_context(_DEPLOYMENT_LOCK)
@@ -1058,9 +1116,11 @@ def deploy_managed_skills(args: DeployOptions) -> dict[str, Any] | str:
                                                   repo_root, install_root, commit, promotion)
                     receipt["status"] = "no_op"
                     return receipt
+                _require_promoted_source(repo_root, commit, release_owner)
                 _check_deployment_sources(repo_root, affected)
                 if _source_commit(repo_root) != commit:
                     raise InstallerError("source changed during source checks", phase="source_check", status="source_changed")
+                _require_promoted_source(repo_root, commit, release_owner)
                 # The source is outside the runtime skill directories being retired.
                 os.chdir(repo_root)
                 result = runtime_builder.install_transaction(

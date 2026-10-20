@@ -16,6 +16,7 @@ from tests.skill_lifecycle.support import (
     RUNTIME_INSTALLER,
     RUNTIME_MANIFEST,
     add_action_sections,
+    commit_runtime_release_source,
     load_runtime_builder,
     load_runtime_installer,
     run_builder,
@@ -31,6 +32,100 @@ from tests.support.repositories import (
 )
 
 
+@pytest.mark.parametrize("state", [
+    "task", "linked-task", "detached", "unpublished-main", "dirty-release", "non-git",
+    "release", "linked-release", "published-default", "published-ahead", "published-dirty", "locked-fast-change",
+])
+def test_managed_deploy_requires_promoted_source_before_effects(tmp_path, monkeypatch, state):
+    """Both public entry paths inspect live Git state before source or install effects."""
+    installer = load_runtime_installer()
+    owner = installer["deploy_managed_skills"].__globals__
+    repo = tmp_path / "repo"
+    destination = tmp_path / "installed"
+    create_compatible_repo(repo, "example/promotion-gate", ["alpha-tool"])
+    if state != "non-git":
+        commit_runtime_release_source(repo)
+    if state == "linked-release":
+        assert run_git(repo, "switch", "-c", "primary").returncode == 0
+        linked = tmp_path / "release"
+        assert run_git(repo, "worktree", "add", str(linked), "release/local").returncode == 0
+        repo = linked
+    elif state == "linked-task":
+        linked = tmp_path / "task"
+        assert run_git(repo, "worktree", "add", "-b", "task", str(linked)).returncode == 0
+        repo = linked
+    elif state in {"task", "unpublished-main", "published-default", "published-ahead", "published-dirty"}:
+        branch = "task" if state == "task" else "main"
+        assert run_git(repo, "switch", "-c", branch).returncode == 0
+        if state.startswith("published-"):
+            for git_arguments in (
+                ("remote", "add", "origin", "https://example.invalid/source.git"),
+                ("update-ref", "refs/remotes/origin/main", "HEAD"),
+                ("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"),
+                ("branch", "--set-upstream-to=origin/main", "main"),
+            ):
+                result = run_git(repo, *git_arguments)
+                assert result.returncode == 0, result.stderr
+            if state == "published-ahead":
+                assert run_git(repo, "commit", "--allow-empty", "-m", "Unpublished change").returncode == 0
+            elif state == "published-dirty":
+                (repo / "uncommitted.txt").write_text("unpublished change")
+    elif state == "detached":
+        assert run_git(repo, "checkout", "--detach").returncode == 0
+    if state in {"dirty-release", "locked-fast-change"}:
+        (repo / "uncommitted.txt").write_text("direct release change")
+    accepted = state in {"release", "linked-release", "published-default", "locked-fast-change"}
+    checked = []
+    monkeypatch.setitem(owner, "_check_deployment_sources", lambda *args: checked.append(args))
+    arguments = ["--repo-root", str(repo), "--install-root", str(destination), "--skill", "alpha-tool"]
+    options = installer["DeployOptions"](**vars(installer["build_parser"]().parse_args(arguments)))
+    from contextlib import nullcontext
+    context = (installer["source_locks"].hold_release_source(repo)
+               if state == "locked-fast-change" else nullcontext())
+    with context:
+        for _ in range(2):
+            result = installer["deploy_managed_skills"](options)
+            if accepted:
+                assert result["status"] == "completed", result
+                assert runtime_owner(destination, "alpha-tool") == "example/promotion-gate"
+            else:
+                assert result["phase"] == "promotion_gate" and result["rollback"] == "not_started"
+                assert result["repo_root"] == str(repo)
+                assert not destination.exists()
+        if not accepted:
+            monkeypatch.setattr(installer["runtime_builder"], "install_transaction",
+                                lambda *args, **kwargs: pytest.fail("unpromoted CLI installed"))
+            assert installer["main"](arguments) == 1
+    assert len(checked) == (2 if accepted else 0)
+
+
+@pytest.mark.parametrize("interruption", ["before-check", "after-check"])
+def test_managed_deploy_stops_source_interruption_before_installation(
+    tmp_path, monkeypatch, interruption,
+):
+    installer = load_runtime_installer()
+    owner = installer["deploy_managed_skills"].__globals__
+    repo = tmp_path / "repo"
+    destination = tmp_path / "installed"
+    create_compatible_repo(repo, "example/promotion-gate", ["alpha-tool"])
+    commit_runtime_release_source(repo)
+
+    def interrupt(*args):
+        if interruption == "before-check":
+            raise installer["InstallerError"]("source check interrupted", phase="source_check")
+        # Keep HEAD identical: commit-only checking cannot catch this source switch.
+        assert run_git(repo, "switch", "-c", "task").returncode == 0
+
+    monkeypatch.setitem(owner, "_check_deployment_sources", interrupt)
+    monkeypatch.setattr(installer["runtime_builder"], "install_transaction",
+                        lambda *args, **kwargs: pytest.fail("source interruption installed"))
+    options = installer["DeployOptions"](repo_root=repo, install_root=destination, skill=("alpha-tool",))
+    for _ in range(2):
+        result = installer["deploy_managed_skills"](options)
+        assert result["phase"] == ("source_check" if interruption == "before-check" else "promotion_gate")
+        assert result["rollback"] == "not_started" and not destination.exists()
+
+
 @pytest.mark.parametrize("failure", [None, "before-finalize", "after-finalize", "failed-finalize", "missing", "wrong-commit", "duplicate"])
 def test_installer_forwards_completed_sibling_receipts_without_reinstalling(
     tmp_path, monkeypatch, capsys, failure,
@@ -39,6 +134,7 @@ def test_installer_forwards_completed_sibling_receipts_without_reinstalling(
     builder = installer["runtime_builder"]
     repo = tmp_path / "repo"
     create_compatible_repo(repo, "example/promotion", ["alpha-tool"])
+    commit_runtime_release_source(repo)
     monkeypatch.chdir(tmp_path)
     destination = tmp_path / "installed"
     record = tmp_path / "promotion.json"
@@ -152,6 +248,7 @@ def test_runtime_installer_releases_installed_working_directory(
         encoding="utf-8",
         newline="\n",
     )
+    commit_runtime_release_source(repo)
 
     # A Windows venv redirector remains in its launch directory while the child
     # runs. Start it outside the target, then exercise the actual installer's
@@ -197,6 +294,7 @@ def test_managed_deploy_repeated_relative_options_restore_entry_directory(
     repo = tmp_path / "source"
     destination = tmp_path / "installed"
     create_compatible_repo(repo, "example/relative", ["alpha-tool"])
+    commit_runtime_release_source(repo)
     monkeypatch.chdir(tmp_path)
     checked = []
 
@@ -239,6 +337,7 @@ def test_managed_deploy_concurrent_repositories_keep_source_and_receipt_ownershi
     names = ("alpha-tool", "beta-tool")
     for index, repo in enumerate(repos):
         create_compatible_repo(repo, f"example/source-{index}", [names[index]])
+        commit_runtime_release_source(repo)
     monkeypatch.setitem(owner, "_check_deployment_sources", lambda *args: None)
     first_staging = threading.Event()
     release_first = threading.Event()
@@ -1199,9 +1298,7 @@ def test_installer_preserves_transaction_failures_and_cleanup_evidence(
     assert run_builder(repo, destination, "--all-managed").returncode == 0
     original = (destination / "alpha-tool/SKILL.md").read_bytes()
     (repo / "skills/alpha-tool/notes.txt").write_text("new payload")
-    for args in (("init", "-b", "main"), ("config", "user.email", "test@example.invalid"),
-                 ("config", "user.name", "Test Agent"), ("add", "."), ("commit", "-m", "source")):
-        assert run_git(repo, *args).returncode == 0
+    commit_runtime_release_source(repo)
     monkeypatch.chdir(tmp_path)
     installer = load_runtime_installer()
     builder = installer["runtime_builder"]
