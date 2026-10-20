@@ -296,6 +296,12 @@ logs are persisted: active protocol queues and request counts are bounded at
 128, and each backend retains at most 64 KiB of stderr in memory. The existing
 manager continues to own version directories, release packages and retention;
 old pre-gateway connections need one client refresh to adopt this boundary.
+Protocol tasks keep connection-local IDs mapped to their original backend,
+including progress and task-related metadata. Queries, cancellation and serial
+listing reads use that owner. Results remain retrievable after terminal status;
+retrieval or the server's creation-time TTL releases the task's ownership.
+Unknown IDs never fall through to the current selection. Retention is bounded
+at 128 tasks and creates no persisted gateway state.
 Failed replacement handshakes can be terminated because they have accepted no
 application requests; client disconnects fail unanswered callbacks explicitly.
 

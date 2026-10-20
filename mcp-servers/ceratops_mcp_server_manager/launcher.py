@@ -22,6 +22,7 @@ import threading
 import time
 import uuid
 from collections import deque
+from datetime import datetime
 from pathlib import Path
 
 
@@ -277,6 +278,8 @@ class McpGateway:
         self.waiting = {}
         self.waiting_on = {}
         self.callbacks = {}
+        self.tasks = {}
+        self.task_lists = {}
         self.initialize = None
         self.protocol = None
         self.initialized = False
@@ -297,9 +300,94 @@ class McpGateway:
             self.closing = True
             self.output_closed = True
 
-    def error(self, message, detail):
+    def error(self, message, detail, code=-32603):
         self.emit({"jsonrpc": "2.0", "id": message["id"],
-                   "error": {"code": -32603, "message": "MCP gateway: " + detail}})
+                   "error": {"code": code, "message": "MCP gateway: " + detail}})
+
+    def forget_task(self, identifier):
+        task = self.tasks.pop(identifier, None)
+        if task:
+            owner = task["backend"]
+            owner.progress_tokens = {token: value for token, value in owner.progress_tokens.items()
+                                     if value[0] != "task:" + identifier}
+
+    def expire_tasks(self):
+        now = time.monotonic()
+        for identifier, task in list(self.tasks.items()):
+            in_flight = any(self.task_reference(message) == identifier for _, message in self.pending.values())
+            if task["expires"] is not None and task["expires"] <= now and not in_flight:
+                self.forget_task(identifier)
+
+    def remember_task(self, backend, value):
+        """Namespace backend IDs; a completed task still owns its unread result.
+
+        Task state belongs to this stdio connection, never a progress file.
+        Deadlines use the receiver's creation time and TTL, without extending
+        retention on polling. Null TTL remains live until result retrieval or
+        connection close. At most 128 task-augmented requests/tasks are accepted.
+        """
+        identifier = value.get("taskId")
+        if not isinstance(identifier, str) or not identifier:
+            raise ValueError("backend task response has no string taskId")
+        for public_id, task in self.tasks.items():
+            if task["backend"] is backend and task["backend_id"] == identifier:
+                public = public_id
+                break
+        else:
+            if len(self.tasks) >= 128:
+                raise ValueError("backend task response exceeds the 128-task bound")
+            public = "gateway-task-" + uuid.uuid4().hex
+            task = {"backend": backend, "backend_id": identifier, "expires": None}
+            self.tasks[public] = task
+        ttl = value.get("ttl")
+        if isinstance(ttl, (int, float)) and not isinstance(ttl, bool) and ttl >= 0:
+            created = datetime.fromisoformat(value["createdAt"]).timestamp()
+            deadline = time.monotonic() + max(0, created + ttl / 1000 - time.time())
+            task["expires"] = min(task["expires"], deadline) if task["expires"] is not None else deadline
+        task["value"] = {**value, "taskId": public}
+        return public
+
+    def task_reference(self, message):
+        params = message.get("params", {})
+        if not isinstance(params, dict):
+            return None
+        if message.get("method") in {"tasks/get", "tasks/result", "tasks/cancel"}:
+            return params.get("taskId")
+        meta = params.get("_meta", {})
+        related = meta.get("io.modelcontextprotocol/related-task", {}) if isinstance(meta, dict) else {}
+        return related.get("taskId") if isinstance(related, dict) else None
+
+    def task_metadata(self, backend, message, incoming):
+        """Translate only protocol metadata, never arbitrary tool content."""
+        result = dict(message)
+        for field in ("params", "result", "error"):
+            body = result.get(field)
+            if not isinstance(body, dict):
+                continue
+            meta = body.get("_meta", {})
+            related = meta.get("io.modelcontextprotocol/related-task") if isinstance(meta, dict) else None
+            if not isinstance(related, dict):
+                continue
+            identifier = related.get("taskId")
+            for public, task in self.tasks.items():
+                if task["backend"] is backend and identifier == (task["backend_id"] if incoming else public):
+                    translated = public if incoming else task["backend_id"]
+                    result[field] = {**body, "_meta": {**meta,
+                        "io.modelcontextprotocol/related-task": {**related, "taskId": translated}}}
+                    break
+        return result
+
+    def next_task_list_request(self, key):
+        listing = self.task_lists[key]
+        while listing["remaining"]:
+            identifier = listing["remaining"].popleft()
+            if identifier in self.tasks:
+                self.waiting[key] = {"jsonrpc": "2.0", "id": listing["message"]["id"],
+                                     "method": "tasks/get", "params": {"taskId": identifier}}
+                return
+        self.emit({"jsonrpc": "2.0", "id": listing["message"]["id"],
+                   "result": {"tasks": listing["tasks"]}})
+        self.task_lists.pop(key)
 
     def forward(self, backend, message):
         try:
@@ -320,22 +408,40 @@ class McpGateway:
         return backend
 
     def dispatch_waiting(self):
+        self.expire_tasks()
         for key, message in list(self.waiting.items()):
             if self.initialize is not None and self.protocol is None and message["method"] != "initialize":
                 continue
             backend = None
             try:
-                selected, directory = selected_environment(self.root)
-                backend = self.backend(selected, directory, message["method"] == "initialize")
+                task_id = self.task_reference(message)
+                if message["method"] in {"tasks/get", "tasks/result", "tasks/cancel"} or task_id is not None:
+                    task = self.tasks.get(task_id) if isinstance(task_id, str) else None
+                    if task is None:
+                        self.error(message, "unknown or expired task ID; request not dispatched", -32602)
+                        self.waiting.pop(key, None)
+                        self.task_lists.pop(key, None)
+                        continue
+                    backend = task["backend"]
+                    if backend.retiring or task.get("failure"):
+                        raise ValueError(task.get("failure", "task backend is unavailable; completion unknown"))
+                    selected = backend.selected
+                    payload = self.task_metadata(backend, message, False)
+                    if message["method"].startswith("tasks/"):
+                        payload = {**payload, "params": {**payload["params"], "taskId": task["backend_id"]}}
+                else:
+                    selected, directory = selected_environment(self.root)
+                    backend = self.backend(selected, directory, message["method"] == "initialize")
+                    payload = message
                 self.waiting_on[key] = backend
                 if not backend.ready:
                     continue
                 # Initialization may have taken time: do not dispatch against
                 # a selection superseded while that child was starting.
-                if selected_environment(self.root)[0] != selected:
+                if task_id is None and selected_environment(self.root)[0] != selected:
                     continue
                 wire_id = "gateway-request-" + uuid.uuid4().hex
-                payload = {**message, "id": wire_id}
+                payload = {**payload, "id": wire_id}
                 params = message.get("params", {})
                 meta = params.get("_meta", {}) if isinstance(params, dict) else {}
                 if isinstance(meta, dict) and "progressToken" in meta:
@@ -352,6 +458,7 @@ class McpGateway:
                     backend.forget_request(key)
                 self.error(message, f"dispatch {message['method']} for {self.root.name}: {exc}; "
                            "stdout=<request not dispatched>; stderr=<not started>")
+                self.task_lists.pop(key, None)
             self.waiting.pop(key, None)
             self.waiting_on.pop(key, None)
 
@@ -361,7 +468,7 @@ class McpGateway:
             callback = self.callbacks.pop(message_key(message.get("id")), None)
             if callback:
                 backend, original = callback
-                self.forward(backend, {**message, "id": original})
+                self.forward(backend, self.task_metadata(backend, {**message, "id": original}, False))
             return
         if "id" in message:
             key = message_key(message["id"])
@@ -376,6 +483,22 @@ class McpGateway:
                     self.error(message, "connection is already initialized")
                     return
                 self.initialize = dict(message)
+            self.expire_tasks()
+            if isinstance(message.get("params"), dict) and "task" in message["params"]:
+                creating = sum("task" in request.get("params", {}) for _, request in self.pending.values())
+                creating += sum("task" in request.get("params", {}) for request in self.waiting.values())
+                if len(self.tasks) + creating >= 128:
+                    self.error(message, "128 active tasks are already retained; request not dispatched")
+                    return
+            if method == "tasks/list":
+                if message.get("params", {}).get("cursor") is not None:
+                    self.error(message, "unknown task-list cursor", -32602)
+                    return
+                # The gateway exposes only its own connection's task namespace.
+                # Read each owner serially for current state, keeping queues bounded.
+                self.task_lists[key] = {"message": message, "remaining": deque(self.tasks), "tasks": []}
+                self.next_task_list_request(key)
+                return
             self.waiting[key] = message
             return
         if method == "notifications/initialized":
@@ -383,6 +506,7 @@ class McpGateway:
         if method == "notifications/cancelled":
             key = message_key(message.get("params", {}).get("requestId"))
             pending = self.pending.pop(key, None)
+            self.task_lists.pop(key, None)
             if pending:
                 owner, request = pending
                 wire_id = owner.forget_request(key)
@@ -392,6 +516,12 @@ class McpGateway:
             else:
                 self.waiting.pop(key, None)
                 self.waiting_on.pop(key, None)
+            return
+        identifier = self.task_reference(message)
+        if identifier is not None:
+            task = self.tasks.get(identifier) if isinstance(identifier, str) else None
+            if task and not task["backend"].retiring:
+                self.forward(task["backend"], self.task_metadata(task["backend"], message, False))
             return
         for backend in self.backends:
             if backend.ready and not backend.retiring:
@@ -410,6 +540,17 @@ class McpGateway:
                 self.emit({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
             return
         if "method" in message:
+            if message["method"] == "notifications/tasks/status":
+                try:
+                    raw_id = message.get("params", {}).get("taskId")
+                    if not any(task["backend"] is backend and task["backend_id"] == raw_id for task in self.tasks.values()):
+                        return
+                    identifier = self.remember_task(backend, message.get("params", {}))
+                    message = {**message, "params": self.tasks[identifier]["value"]}
+                except (KeyError, TypeError, ValueError) as exc:
+                    self.fail_backend(backend, "invalid task status: " + str(exc))
+                    return
+            message = self.task_metadata(backend, message, True)
             if message["method"] == "notifications/progress":
                 progress = backend.progress_tokens.get(message_key(message.get("params", {}).get("progressToken")))
                 if progress is None:
@@ -441,6 +582,23 @@ class McpGateway:
         pending = self.pending.get(key)
         if not pending or pending[0] is not backend:
             return
+        result = message.get("result", {})
+        params = pending[1].get("params", {})
+        try:
+            if isinstance(result, dict) and isinstance(result.get("task"), dict) and "task" in params:
+                identifier = self.remember_task(backend, result["task"])
+                backend.progress_tokens = {token: ("task:" + identifier, value[1]) if value[0] == key else value
+                                           for token, value in backend.progress_tokens.items()}
+                message = {**message, "result": {**result, "task": self.tasks[identifier]["value"]}}
+            elif pending[1]["method"] in {"tasks/get", "tasks/cancel"} and "result" in message:
+                if result.get("taskId") != self.tasks[params["taskId"]]["backend_id"]:
+                    raise ValueError("backend returned a different taskId")
+                identifier = self.remember_task(backend, result)
+                message = {**message, "result": self.tasks[identifier]["value"]}
+        except (KeyError, TypeError, ValueError) as exc:
+            self.fail_backend(backend, "invalid task response: " + str(exc))
+            return
+        message = self.task_metadata(backend, message, True)
         self.pending.pop(key)
         backend.forget_request(key)
         if pending[1]["method"] == "initialize" and "result" in message:
@@ -448,7 +606,17 @@ class McpGateway:
             tools = message["result"].get("capabilities", {}).get("tools")
             if isinstance(tools, dict):
                 tools["listChanged"] = True
-        self.emit({**message, "id": pending[1]["id"]})
+        if key in self.task_lists:
+            if "error" in message:
+                self.task_lists.pop(key)
+                self.emit({**message, "id": pending[1]["id"]})
+            else:
+                self.task_lists[key]["tasks"].append(message["result"])
+                self.next_task_list_request(key)
+        else:
+            self.emit({**message, "id": pending[1]["id"]})
+        if pending[1]["method"] == "tasks/result" and "result" in message:
+            self.forget_task(params.get("taskId"))
 
     def fail_backend(self, backend, cause):
         detail = backend.diagnostic(cause)
@@ -457,16 +625,23 @@ class McpGateway:
                 self.error(message, f"{message['method']} request {message['id']}: {detail}; completion unknown")
                 self.pending.pop(key)
                 backend.forget_request(key)
+                self.task_lists.pop(key, None)
         try:
             selected = selected_environment(self.root)[0]
         except (OSError, ValueError):
             selected = None
-        if selected == backend.selected:
-            for key, message in list(self.waiting.items()):
-                if self.waiting_on.get(key) is backend:
+        for key, message in list(self.waiting.items()):
+            identifier = self.task_reference(message)
+            task = self.tasks.get(identifier) if isinstance(identifier, str) else None
+            if selected == backend.selected or (task and task["backend"] is backend):
+                if self.waiting_on.get(key) is backend or task:
                     self.error(message, f"{message['method']} request {message['id']}: {detail}; request not dispatched")
                     self.waiting.pop(key)
                     self.waiting_on.pop(key, None)
+                    self.task_lists.pop(key, None)
+        for task in self.tasks.values():
+            if task["backend"] is backend:
+                task["failure"] = detail + "; task completion unknown"
         self.callbacks = {key: value for key, value in self.callbacks.items() if value[0] is not backend}
         backend.retire()
         if backend.bootstrap_id is not None and not backend.ready and backend.process.poll() is None:
@@ -478,6 +653,7 @@ class McpGateway:
                 print(backend.diagnostic(f"stop failed initialization: {exc}"), file=sys.stderr)
 
     def retire_idle(self):
+        self.expire_tasks()
         try:
             selected = selected_environment(self.root)[0]
         except (OSError, ValueError):
@@ -486,7 +662,9 @@ class McpGateway:
             if not backend.ready and not backend.retiring and time.monotonic() - backend.started > 60:
                 self.fail_backend(backend, "replacement initialization exceeded 60 seconds")
             busy = (backend.pending or backend in self.waiting_on.values()
-                    or any(value[0] is backend for value in self.callbacks.values()))
+                    or any(value[0] is backend for value in self.callbacks.values())
+                    or (not self.closing and any(task["backend"] is backend and not task.get("failure")
+                                                for task in self.tasks.values())))
             if not busy and (self.closing or (selected is not None and backend.selected != selected)):
                 backend.retire()
 
@@ -512,6 +690,7 @@ class McpGateway:
                     self.error(message, "client input closed before request dispatch")
                 self.waiting.clear()
                 self.waiting_on.clear()
+                self.task_lists.clear()
                 for owner, original in list(self.callbacks.values()):
                     self.forward(owner, {"jsonrpc": "2.0", "id": original, "error": {
                         "code": -32000, "message": "MCP client input closed before callback response"}})
@@ -520,7 +699,8 @@ class McpGateway:
                 self.fail_backend(backend, value)
             else:
                 if (backend.pending or not backend.ready
-                        or any(value[0] is backend for value in self.callbacks.values())):
+                        or any(value[0] is backend for value in self.callbacks.values())
+                        or any(task["backend"] is backend for task in self.tasks.values())):
                     self.fail_backend(backend, "selected backend exited before replying")
                 backend.retire()
                 self.backends.discard(backend)

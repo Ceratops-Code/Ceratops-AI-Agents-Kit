@@ -270,11 +270,18 @@ gateway reads the selection before dispatching every request, initializes a
 replacement backend when required by the negotiated protocol, and routes new
 requests to that selected environment. Requests already running finish in their
 original backend; progress, cancellation and client callbacks stay with their
-owning request. An incompatible replacement reports an error without silently
+owning request. MCP protocol tasks retain their original backend and progress
+tokens after the initial acknowledgement, until result retrieval or expiry.
+The gateway assigns connection-local task IDs, routes task queries and
+cancellation to their owner, and reads each owner for task listing. Terminal
+status alone does not discard an unread result. Unknown or expired IDs fail
+without dispatch to another version. An incompatible replacement reports an
+error without silently
 using an older version or replaying a request.
 Every successful activation installs or refreshes that MCP server's stable launcher.
 The gateway also notices selection changes while its chat is idle. Once a
-superseded backend has no pending requests or callbacks, it closes that child's
+superseded backend has no pending requests, callbacks or unread tasks, it closes
+that child's
 input and lets it exit naturally. This preserves background work that continues
 after returning a job ID. Each child's instance lease remains held until the
 process actually exits; the gateway itself runs in global Python and pins no
@@ -287,7 +294,10 @@ if necessary. When the client disconnects, unanswered callbacks receive an
 explicit connection-closed error so accepted calls can finish draining.
 
 The gateway creates no files, checkpoints or logs. Its bounded in-memory queues
-hold only active messages, and each child retains at most 64 KiB of stderr for
+hold only active messages and at most 128 retained tasks. Task expiry uses the
+server's creation time and TTL without extending it on polling; a null TTL lasts
+until result retrieval or connection closure. Each child retains at most 64 KiB
+of stderr for
 failure details. At deployment startup and after a completed package or
 activation, the manager retains the selected environment and the newest
 complete different version. Older and duplicate live environments are deferred.

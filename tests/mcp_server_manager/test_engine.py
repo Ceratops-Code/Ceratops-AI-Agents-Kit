@@ -879,10 +879,13 @@ def test_command_failure_keeps_invocation_and_both_streams(tmp_path, monkeypatch
 
 GATEWAY_FIXTURE_SERVER = r'''
 import json, os, sys, threading, time
+from datetime import datetime, timezone
 from pathlib import Path
 lock = threading.Lock()
 callbacks = {}
 cancellations = {}
+tasks = {}
+task_tokens = {}
 initialized = False
 version = Path(__file__).resolve().parents[4].name
 def emit(message):
@@ -943,8 +946,36 @@ for line in sys.stdin:
         elif name == "crash":
             print("fixture failure evidence",file=sys.stderr,flush=True)
             os._exit(17)
+        elif name == "task":
+            task_id = "task-" + str(len(tasks) + 1)
+            now = datetime.now(timezone.utc).isoformat()
+            tasks[task_id] = {"taskId": task_id, "status": "working", "createdAt": now,
+                              "lastUpdatedAt": now, "ttl": arguments.get("ttl")}
+            task_tokens[task_id] = arguments.get("progress_token")
+            result(identifier, task=dict(tasks[task_id]))
+        elif name == "task_status":
+            related = message["params"]["_meta"]["io.modelcontextprotocol/related-task"]
+            task_id = related["taskId"]
+            tasks[task_id]["status"] = "completed"
+            emit({"method":"notifications/tasks/status", "params":dict(tasks[task_id])})
+            if task_tokens[task_id] is not None:
+                emit({"method":"notifications/progress", "params":{
+                    "progressToken":task_tokens[task_id], "progress":1,
+                    "_meta":{"io.modelcontextprotocol/related-task":{"taskId":task_id}}}})
+            result(identifier)
         else:
             result(identifier, initialized=initialized)
+    elif method in {"tasks/get", "tasks/result", "tasks/cancel"}:
+        task_id = message["params"]["taskId"]
+        if task_id not in tasks:
+            emit({"id":identifier,"error":{"code":-32602,"message":"unknown backend task"}})
+        elif method == "tasks/result":
+            tasks[task_id]["status"] = "completed"
+            result(identifier, completed=True, _meta={"io.modelcontextprotocol/related-task":{"taskId":task_id}})
+        else:
+            if method == "tasks/cancel":
+                tasks[task_id]["status"] = "cancelled"
+            emit({"id":identifier,"result":dict(tasks[task_id])})
     elif "id" in message:
         result(identifier)
 '''
@@ -1143,8 +1174,9 @@ def test_gateway_keeps_overlapping_backchannel_ids_and_cancellation_with_owner(g
     fixture = gateway_client
     client = fixture.connect()
     fixture.initialize(client)
-    request = lambda identifier: {"id": identifier, "method": "tools/call",
-                                  "params": {"name": "callback", "arguments": {}}}
+    def request(identifier):
+        return {"id": identifier, "method": "tools/call",
+                "params": {"name": "callback", "arguments": {}}}
     client.send(request(1))
     first = client.receive()
     assert first["method"] == "roots/list"
@@ -1171,7 +1203,8 @@ def test_gateway_keeps_overlapping_backchannel_ids_and_cancellation_with_owner(g
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Installed Windows environment layout")
-@pytest.mark.parametrize("effect", ["before-lease", "before-start", "after-start", "after-dispatch"])
+@pytest.mark.parametrize("effect", ["before-lease", "before-start", "after-start", "after-dispatch",
+                                   "after-task-creation", "after-task-get", "after-task-result", "after-task-cancel"])
 def test_gateway_fresh_connections_converge_across_interrupted_effects(gateway_client, effect):
     fixture = gateway_client
     client = fixture.connect()
@@ -1197,6 +1230,14 @@ def test_gateway_fresh_connections_converge_across_interrupted_effects(gateway_c
         assert "initialization failed" in client.call(2, "identity")["error"]["message"]
         fixture.retired("2.0.0")
         marker.unlink()
+    elif effect.startswith("after-task-"):
+        client.send({"id": 2, "method": "tools/call", "params": {"name": "task", "task": {}, "arguments": {}}})
+        task_id = client.receive(2)["result"]["task"]["taskId"]
+        if effect != "after-task-creation":
+            client.send({"id": 3, "method": "tasks/" + effect.removeprefix("after-task-"), "params": {"taskId": task_id}})
+            assert "result" in client.receive(3)
+        client.process.stdin.close()
+        assert client.process.wait(timeout=10) == 0
     else:
         release, started = fixture.root / "release-disconnect", fixture.root / "started"
         client.send({"id": 2, "method": "tools/call", "params": {
@@ -1209,6 +1250,117 @@ def test_gateway_fresh_connections_converge_across_interrupted_effects(gateway_c
     fresh = fixture.connect()
     fixture.initialize(fresh)
     assert fresh.call(3, "identity")["result"]["version"] == "2.0.0"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Installed Windows environment layout")
+def test_gateway_retains_task_owners_ids_results_and_progress_across_selection(gateway_client):
+    fixture = gateway_client
+    client = fixture.connect()
+    fixture.initialize(client)
+    for cycle in range(2):
+        offset = cycle * 20
+        fixture.select("1.0.0")
+        client.send({"id": offset + 1, "method": "tools/call", "params": {
+            "name": "task", "task": {}, "_meta": {"progressToken": 7}, "arguments": {}}})
+        old = client.receive(offset + 1)["result"]["task"]["taskId"]
+        fixture.select("2.0.0")
+        assert client.call(offset + 2, "identity")["result"]["version"] == "2.0.0"
+        client.send({"id": offset + 3, "method": "tools/call", "params": {"name": "task", "task": {}, "arguments": {}}})
+        new = client.receive(offset + 3)["result"]["task"]["taskId"]
+        assert old != new and old.startswith("gateway-task-") and new.startswith("gateway-task-")
+        with fixture.layout._retirement_lease(fixture.directories["1.0.0"]) as removable:
+            assert not removable
+        client.send({"id": offset + 4, "method": "tasks/get", "params": {"taskId": old,
+            "_meta": {"io.modelcontextprotocol/related-task": {"taskId": new}}}})
+        assert client.receive(offset + 4)["result"]["taskId"] == old
+        client.send({"id": offset + 5, "method": "tasks/list", "params": {}})
+        assert {task["taskId"] for task in client.receive(offset + 5)["result"]["tasks"]} == {old, new}
+        client.send({"id": offset + 6, "method": "tools/call", "params": {
+            "name": "task_status", "arguments": {}, "_meta": {"io.modelcontextprotocol/related-task": {"taskId": old}}}})
+        assert client.receive(offset + 6)["result"]["version"] == "1.0.0"
+        messages: list[dict] = []
+        while len(messages) < 2:
+            message = client.receive()
+            if message.get("method") in {"notifications/tasks/status", "notifications/progress"}:
+                messages.append(message)
+        status = next(message for message in messages if message["method"] == "notifications/tasks/status")
+        progress = next(message for message in messages if message["method"] == "notifications/progress")
+        assert status["params"]["taskId"] == old and status["params"]["status"] == "completed"
+        assert progress["params"]["progressToken"] == 7
+        assert progress["params"]["_meta"]["io.modelcontextprotocol/related-task"]["taskId"] == old
+        with fixture.layout._retirement_lease(fixture.directories["1.0.0"]) as removable:
+            assert not removable  # The completed task's result has not been collected.
+        client.send({"id": offset + 7, "method": "tasks/result", "params": {"taskId": old}})
+        result = client.receive(offset + 7)["result"]
+        assert result["version"] == "1.0.0"
+        assert result["_meta"]["io.modelcontextprotocol/related-task"]["taskId"] == old
+        fixture.retired("1.0.0")
+        client.send({"id": offset + 8, "method": "tasks/cancel", "params": {"taskId": new}})
+        assert client.receive(offset + 8)["result"]["status"] == "cancelled"
+        client.send({"id": offset + 9, "method": "tasks/result", "params": {"taskId": new}})
+        assert client.receive(offset + 9)["result"]["version"] == "2.0.0"
+        client.send({"id": offset + 10, "method": "tasks/get", "params": {"taskId": old}})
+        error = client.receive(offset + 10)["error"]
+        assert error["code"] == -32602 and "gateway" in error["message"]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Installed Windows environment layout")
+def test_gateway_expires_tasks_without_extending_ttl_on_poll(gateway_client):
+    import time
+
+    fixture = gateway_client
+    client = fixture.connect()
+    fixture.initialize(client)
+    client.send({"id": 1, "method": "tools/call", "params": {"name": "task", "task": {}, "arguments": {"ttl": 1200}}})
+    task_id = client.receive(1)["result"]["task"]["taskId"]
+    fixture.select("2.0.0")
+    assert client.call(2, "identity")["result"]["version"] == "2.0.0"
+    deadline = time.monotonic() + 4
+    response = {}
+    while time.monotonic() < deadline:
+        client.send({"id": 3, "method": "tasks/get", "params": {"taskId": task_id}})
+        response = client.receive(3)
+        if "error" in response:
+            break
+        time.sleep(.02)
+    assert response["error"]["code"] == -32602
+    fixture.retired("1.0.0")
+
+
+def test_gateway_task_capacity_blocks_before_dispatch_and_late_status_does_not_resurrect(tmp_path):
+    launcher = importlib.import_module("ceratops_mcp_server_manager.launcher")
+    gateway = launcher.McpGateway(tmp_path, [])
+    backend = SimpleNamespace(progress_tokens={}, bootstrap_id=None)
+    messages: list[dict] = []
+    gateway.emit = messages.append
+    task = {"taskId": "expired", "status": "working", "createdAt": "2000-01-01T00:00:00Z", "ttl": 1}
+    gateway.remember_task(backend, task)
+    gateway.expire_tasks()
+    gateway.backend_message(backend, {"method": "notifications/tasks/status", "params": task})
+    assert not gateway.tasks and not messages
+    for index in range(128):
+        gateway.remember_task(backend, {**task, "taskId": f"task-{index}", "ttl": None})
+    for _ in range(2):
+        gateway.client_message({"id": 1, "method": "tools/call", "params": {"name": "task", "task": {}}})
+        assert "128 active tasks" in messages[-1]["error"]["message"]
+        assert not gateway.waiting and not gateway.pending
+    assert len(gateway.tasks) == 128
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Installed Windows environment layout")
+def test_gateway_task_backend_failure_keeps_cause_and_never_falls_through(gateway_client):
+    fixture = gateway_client
+    client = fixture.connect()
+    fixture.initialize(client)
+    client.send({"id": 1, "method": "tools/call", "params": {"name": "task", "task": {}, "arguments": {}}})
+    task_id = client.receive(1)["result"]["task"]["taskId"]
+    assert "fixture failure evidence" in client.call(2, "crash")["error"]["message"]
+    fixture.select("2.0.0")
+    for identifier in (3, 4):
+        client.send({"id": identifier, "method": "tasks/get", "params": {"taskId": task_id}})
+        error = client.receive(identifier)["error"]["message"]
+        assert "fixture failure evidence" in error and "completion unknown" in error
+    assert client.call(5, "identity")["result"]["version"] == "2.0.0"
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Installed Windows environment layout")
