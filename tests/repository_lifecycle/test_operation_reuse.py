@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import pathlib
 import shutil
 import subprocess
@@ -262,7 +263,7 @@ def test_an_earlier_callback_cannot_make_a_preflight_reuse_decision_stale(tmp_pa
 
 
 @pytest.mark.skipif(shutil.which("uv") is None, reason="uv is required by the declared runtime")
-def test_locked_child_path_tools_and_python_match_the_actual_producer(tmp_path):
+def test_locked_child_path_tools_and_python_match_the_actual_producer(tmp_path, monkeypatch):
     _fixture(tmp_path)
     project = tmp_path / "scripts"
     (project / "pyproject.toml").write_text('[project]\nname = "scope-probe"\nversion = "0.1.0"\nrequires-python = ">=3.12"\ndependencies = []\n')
@@ -277,7 +278,80 @@ def test_locked_child_path_tools_and_python_match_the_actual_producer(tmp_path):
     result = runner.execute_prepared_operation(operation)
     assert result["status"] == "completed", result
     assert result["check_decision"] == "executed"
-    assert runner.execute_prepared_operation(operation)["check_decision"] == "reused"
+    monkeypatch.setenv("PATH", str(tmp_path / ".git/empty-path-folder") + os.pathsep + os.environ["PATH"])
+    for _ in range(2):
+        again = runner.execute_prepared_operation(operation)
+        assert again["check_decision"] == "reused"
+        assert again["check_result"] == result["check_result"]
+    assert (tmp_path / "source-checks.txt").read_text() == "x"
+
+
+def _path_scoped_operation(root, *, tools=None):
+    _fixture(root)
+    operation = _check(root)
+    (root / ".git/tool.bin").write_bytes(b"declared tool")
+    (root / ".git/dependency.lock").write_text("locked dependency")
+    declaration = {
+        **operation.check_results, "environment": ["PATH", "CHECK_MODE"],
+        "tools": tools if tools is not None else [sys.executable, "git", ".git/tool.bin"],
+        "dependencies": [".git/dependency.lock"],
+    }
+    return runner.replace(operation, check_results=declaration)
+
+
+def test_path_folder_change_reuses_original_pass_without_rewriting_it(tmp_path, monkeypatch):
+    operation = _path_scoped_operation(tmp_path)
+    first = runner.execute_prepared_operation(operation)
+    assert first["status"] == "completed", first
+    reference = first["check_result"]
+    path = reuse.CheckResultStore(tmp_path).directory / (reference["result_id"] + ".json")
+    original = path.read_bytes()
+    empty = tmp_path / ".git/empty-path-folder"
+    empty.mkdir()
+    monkeypatch.setenv("PATH", str(empty) + os.pathsep + os.environ["PATH"])
+
+    for _ in range(2):
+        result = runner.execute_prepared_operation(operation)
+        assert result["status"] == "completed", result
+        assert result["check_decision"] == "reused"
+        assert result["check_result"] == reference
+        assert path.read_bytes() == original
+    assert (tmp_path / "source-checks.txt").read_text() == "x"
+
+
+@pytest.mark.parametrize("tools", [[], ["git"], [sys.executable, "git", "unavailable-test-command"]])
+def test_incomplete_tool_ownership_keeps_path_relevant(tmp_path, monkeypatch, tools):
+    operation = _path_scoped_operation(tmp_path, tools=tools)
+    first = runner.execute_prepared_operation(operation)
+    assert first["status"] == "completed", first
+    monkeypatch.setenv("PATH", str(tmp_path / ".git/other-folder") + os.pathsep + os.environ["PATH"])
+    plan = reuse.plan_operation(operation)
+    assert plan is not None and plan.decision["decision"] == "execute"
+    assert (tmp_path / "source-checks.txt").read_text() == "x"
+
+
+@pytest.mark.parametrize("change", ["product", "check", "dependency", "tool", "variable", "arguments"])
+def test_path_equivalence_does_not_hide_other_changed_inputs(tmp_path, monkeypatch, change):
+    operation = _path_scoped_operation(tmp_path)
+    first = runner.execute_prepared_operation(operation)
+    assert first["status"] == "completed", first
+    monkeypatch.setenv("PATH", str(tmp_path / ".git/other-folder") + os.pathsep + os.environ["PATH"])
+    if change == "product":
+        (tmp_path / "source.py").write_text("changed product")
+    elif change == "check":
+        with (tmp_path / "scripts/check.py").open("a") as stream:
+            stream.write("\n# changed check\n")
+    elif change == "dependency":
+        (tmp_path / ".git/dependency.lock").write_text("changed lock")
+    elif change == "tool":
+        (tmp_path / ".git/tool.bin").write_bytes(b"changed tool")
+    elif change == "variable":
+        monkeypatch.setenv("CHECK_MODE", "changed")
+    else:
+        step = operation.steps[0]
+        operation = runner.replace(operation, steps=(runner.replace(step, argv=(*step.argv, "--changed")),))
+    plan = reuse.plan_operation(operation)
+    assert plan is not None and plan.decision["decision"] == "execute"
     assert (tmp_path / "source-checks.txt").read_text() == "x"
 
 

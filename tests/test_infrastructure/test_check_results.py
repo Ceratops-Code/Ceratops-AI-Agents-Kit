@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import importlib.metadata
 import json
@@ -10,6 +11,7 @@ import platform
 import runpy
 import subprocess
 import sys
+import uuid
 from contextlib import nullcontext
 from typing import Any
 
@@ -60,6 +62,70 @@ def _context(root: pathlib.Path) -> dict[str, Any]:
                         "variables": {}, "tools": {}, "runtime": {}},
         "fingerprint": "3" * 64,
     }
+
+
+@pytest.mark.parametrize("boundary", ["before", "after"])
+def test_path_equivalent_failure_survives_interrupted_retention(
+    check_writer: dict[str, Any], tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    """PATH-only differences neither rewrite acceptance nor hide later failures."""
+    monkeypatch.chdir(tmp_path)
+    context = _context(tmp_path)
+    tool = tmp_path / ".git/tool.bin"
+    tool.write_bytes(b"original tool")
+    rules = context["scope"]["inputRules"]
+    rules.update({"environment": ["PATH"], "tools": ["uv", ".git/tool.bin"]})
+    read_environment = runpy.run_path(str(
+        ROOT / "skills/ceratops-repo-lifecycle/scripts/read_check_environment.py"
+    ))["read_environment"]
+    reader = runpy.run_path(str(
+        ROOT / "skills/ceratops-repo-lifecycle/scripts/retain_check_results.py"
+    ))
+    store = reader["CheckResultStore"](tmp_path)
+
+    def save_attempt(code: int) -> tuple[pathlib.Path, dict[str, Any]]:
+        inputs = copy.deepcopy(context)
+        inputs["environment"] = read_environment(tmp_path, rules, runtime=False)
+        inputs["fingerprint"] = reader["fingerprint"](inputs)
+        monkeypatch.setenv("CERATOPS_REPOSITORY_CHECK_CONTEXT", json.dumps(inputs))
+        result_id = str(uuid.uuid4())
+        path = store.directory / (result_id + ".json")
+        assert check_writer["run_recorded_check"](lambda: code, _request(path, result_id), {}) == code
+        return path, inputs
+
+    original_path, original_inputs = save_attempt(0)
+    original_bytes = original_path.read_bytes()
+    monkeypatch.setenv("PATH", str(tmp_path / ".git/empty-path") + os.pathsep + os.environ["PATH"])
+    failure_path, current_inputs = save_attempt(7)
+    for index in range(5):
+        tool.write_bytes(("different tool " + str(index)).encode())
+        save_attempt(0)
+    tool.write_bytes(b"original tool")
+    assert original_inputs["fingerprint"] != current_inputs["fingerprint"]
+
+    unlink = pathlib.Path.unlink
+
+    def interrupt(path: pathlib.Path, *args: Any, **kwargs: Any) -> None:
+        if path.parent == store.directory and boundary == "before":
+            raise OSError("interrupted before expired result deletion")
+        unlink(path, *args, **kwargs)
+        if path.parent == store.directory and boundary == "after":
+            raise OSError("interrupted after expired result deletion")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(pathlib.Path, "unlink", interrupt)
+        with pytest.raises(OSError, match="interrupted"):
+            store.prune(protected_ids=[original_path.stem], active_inputs=[current_inputs])
+
+    for _ in range(2):
+        fresh = reader["CheckResultStore"](tmp_path)
+        fresh.prune(protected_ids=[original_path.stem], active_inputs=[current_inputs])
+        result = fresh.select(current_inputs, check_id="repository.actions.test")
+        assert result["decision"] == "execute"
+        assert "newer applicable failed attempt" in result["reason"]
+        assert failure_path.exists()
+        assert original_path.read_bytes() == original_bytes
 
 
 @pytest.mark.parametrize("outcome", ["passed", "failed", "interrupted", "system_exit"])
