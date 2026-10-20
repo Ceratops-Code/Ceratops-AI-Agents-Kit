@@ -272,6 +272,25 @@ the MCP server before relying on the guard, then review changed hook trust as
 required by the client. An installed or registered server is not evidence that
 an already running chat has connected to it.
 
+Managed MCP stdio connections now remain on the manager's standalone gateway
+while each new request selects the current immutable backend. The gateway runs
+in global Python, so its own lifetime does not pin a manager environment. It
+replays legacy initialization for a replacement, forwards stateless protocol
+messages directly, and keeps cancellation and client callbacks bound to their
+owning request. A changed selection cannot redirect a request already running;
+an unavailable or incompatible selection returns an error without replaying it
+or falling back to an older release. CLI invocations retain direct dispatch.
+
+Selection polling also retires idle superseded backends. Retirement closes the
+child's input without terminating it, and holds its existing instance lease
+until actual process exit so background work can finish. No gateway state or
+logs are persisted: active protocol queues and request counts are bounded at
+128, and each backend retains at most 64 KiB of stderr in memory. The existing
+manager continues to own version directories, release packages and retention;
+old pre-gateway connections need one client refresh to adopt this boundary.
+Failed replacement handshakes can be terminated because they have accepted no
+application requests; client disconnects fail unanswered callbacks explicitly.
+
 Behavior tests exercise the actual server through an MCP STDIO client,
 including inventories beyond the direct-search cap, complete Unicode path
 pagination, all three modes, rejected paths and cursors, config isolation,
