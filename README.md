@@ -41,7 +41,12 @@ results through the model; their scripts remain inside their own skill.
 
 Dependency queue finalization stages approved PR heads together in a thread
 worktree and publishes through `release/local` using the existing promotion
-and shipping workflow. It processes every eligible update in a repository;
+and shipping workflow. Preflight keeps package/version identification from PR
+titles and reads dependency files from each exact PR commit, including when
+local unpublished work moved or deleted them. A missing commit is fetched
+without changing the checkout; read failures block review and retain their
+Git diagnostics. This source collection does not replace compatibility review
+or release checks. It processes every eligible update in a repository;
 changed PR heads still need new preflight approval. The
 `--include-unpublished-release OWNER/REPO=COMMIT` option carries explicit
 authority for unrelated work at that exact release commit. Fresh calls inspect
@@ -192,7 +197,7 @@ without repository deduplication.
 | `skills/ceratops-repo-lifecycle/scripts/ceratops_repo_compatibility_engine/` | Skill-owned package with the shared compatibility-contract loader, read-only compatibility checks, SDLC-contract validation, rollback-protected Ceratops compatibility application, and version-only bootstrap synchronization; it operates on explicit target repositories and is never copied into them. |
 | `skills/ceratops-repo-lifecycle/references/templates/skill-sections.json.tmpl` | Repository-neutral template for creating a target repository's live `skills/skill-sections.json`; never a live manifest. |
 | `skills/ceratops-skill-lifecycle/scripts/runtime/install-managed-skills.py` | Owns the managed deployment callable and its CLI: checks request inputs and the exact source selection before one runtime transaction; handles inventory and explicit prior-owner migration; emits commit-bound completion evidence and finalizes saved promotion handoffs with optional repeated `--deployment-evidence` sibling receipts. Cleanup failure preserves the installation receipt and cleanup-only call, without reinstalling. |
-| `skills/ceratops-skill-lifecycle/scripts/runtime/managed_runtime_builder.py` | Stages, activates, rolls back, recovers, and cleans one locked selected-skill runtime transaction. |
+| `skills/ceratops-skill-lifecycle/scripts/runtime/managed_runtime_builder.py` | Renders desired files before copying, leaves current skills in place, atomically applies manifest-only changes, and stages, activates, rolls back, recovers, and cleans changed skills in one locked transaction. |
 | `skills/ceratops-skill-lifecycle/scripts/runtime/prepare_python_runtime.py` | Prepares the pinned Python environment and prunes unreferenced older environments; the builder calls it inside the existing installation transaction. |
 | `skills/ceratops-skill-lifecycle/scripts/skill-update-workflow.py` | Prints normal results and errors as UTF-8 under Windows legacy output encodings. Initializes ordinary updates from repeated skill/path groups and UTF-8 command files, or opens caller-owned requests. It discovers one unfinished skill change per worktree, records approved scope against the original baseline, saves immutable state/check generations, and drives verification to one next action. Scope expansion and failed-request replacement preserve the original baseline; exact passed checks are reused, and close consumes saved success without rechecking source. The caller edits, commits and requests promotion/deployment separately; this helper never runs repository tests. |
 | `skills/ceratops-skill-lifecycle/scripts/skill_update_checks.py` | Runs declared checks without a shell, records deterministic search applicability for safe reuse, and carries failure evidence to the update workflow. Failed pytest checks print test identities and reported errors from the same run, preserve complete structured failure details before scratch cleanup, mark bounded output, and use the captured terminal diagnostic when the native report is unavailable. |
@@ -1475,6 +1480,17 @@ Input parsing and path-safety checks remain necessary for copying. Copy errors
 can leave partial updates; staging and locks created by this run are cleaned.
 For validated deployment with managed retirement and rollback, use
 `$ceratops-skill-lifecycle` `deploy`.
+
+The managed installer reads selected targets against the desired rendered files
+before creating staging folders. Identical skills produce no filesystem effects;
+runtime caches do not require replacement. A manifest-only change, such as the
+source checkout or pinned interpreter, atomically replaces
+`.runtime-manifest.json` while retaining the skill directory. This avoids Windows
+denying a redundant directory rename when Codex
+holds a child directory open. Missing, extra, or changed deployable content still
+uses complete-tree staging and rollback. Metadata-only staging folders use the
+same ownership and crash recovery as payload stages; their pending manifest file
+is removed with the stage after success or on the next matching fresh call.
 
 For another Ceratops-compatible repo, run its versioned repository installer:
 

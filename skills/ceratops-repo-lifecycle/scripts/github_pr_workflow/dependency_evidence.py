@@ -6,6 +6,7 @@ import hashlib
 import json
 import pathlib
 import re
+import shutil
 import subprocess
 import time
 import tomllib
@@ -663,8 +664,139 @@ def registry_evidence(update: dict[str, Any]) -> dict[str, Any]:
     return {"status": "unavailable", "reason": f"unsupported_ecosystem:{ecosystem or 'unknown'}"}
 
 
-def package_json_evidence(path: pathlib.Path, package: str) -> dict[str, Any]:
-    raw = json.loads(path.read_text(encoding="utf-8"))
+class _DependencySourceError(WorkflowError):
+    """Keep source-read failures distinct from dependency compatibility decisions."""
+
+    def __init__(self, message: str, details: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.details = details
+
+
+class _DependencyFileReader:
+    """Read one immutable PR tree, or local files for an alert without a PR.
+
+    A missing PR object is fetched by its exact ID without changing refs, HEAD,
+    index or working files. Git objects are the only persistent output, owned
+    and eventually pruned by Git. No failed commit read falls back to local data.
+    """
+
+    def __init__(self, checkout: pathlib.Path, paths: set[str], commit: str | None) -> None:
+        self.checkout = checkout.absolute() if commit is not None else checkout.resolve()
+        self.commit = commit
+        self.git = shutil.which("git") or "git"
+        self.entries: dict[str, tuple[str, str, int]] = {}
+        self.blobs: dict[str, bytes] = {}
+        if commit is None:
+            return
+        if not re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", commit):
+            raise _DependencySourceError("PR head must be an exact commit ID", {"commit": commit})
+        present = self._git(["rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}"], allowed=(0, 1))
+        if present.returncode == 1:
+            self._git(["fetch", "--no-tags", "--no-write-fetch-head", "origin", commit])
+            present = self._git(["rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}"])
+        if present.stdout.decode("ascii").strip().lower() != commit.lower():
+            raise _DependencySourceError("Git returned a different PR commit", {"commit": commit})
+        selected = {self._relative(self.path(relative)) for relative in paths}
+        selected.update(
+            str(pathlib.PurePosixPath(relative).with_name("gradle-wrapper.jar"))
+            for relative in tuple(selected)
+            if pathlib.PurePosixPath(relative).name == "gradle-wrapper.properties"
+        )
+        # Bound each command's arguments below Windows' process command limit.
+        batch: list[str] = []
+        for relative in sorted(selected):
+            if batch and sum(map(len, batch)) + len(relative) > 8000:
+                self._load_entries(batch)
+                batch = []
+            batch.append(relative)
+        if batch:
+            self._load_entries(batch)
+
+    def _git(self, arguments: list[str], *, allowed: tuple[int, ...] = (0,)) -> subprocess.CompletedProcess[bytes]:
+        command = [self.git, *arguments]
+        try:
+            result = subprocess.run(command, cwd=self.checkout, capture_output=True, check=False, timeout=30)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise self._command_error(command, None, getattr(exc, "stdout", None), getattr(exc, "stderr", None), str(exc)) from exc
+        if result.returncode not in allowed:
+            raise self._command_error(command, result.returncode, result.stdout, result.stderr, "Git source read failed")
+        return result
+
+    def _command_error(
+        self, command: list[str], exit_code: int | None,
+        stdout: bytes | str | None, stderr: bytes | str | None, message: str,
+    ) -> _DependencySourceError:
+        def output(value: bytes | str | None) -> str:
+            return (value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value) or "<absent>"
+
+        details = sanitize_for_output({
+            "operation": "read_pr_commit_files", "checkout": str(self.checkout), "commit": self.commit,
+            "command": command, "exit_code": exit_code,
+            "stdout": output(stdout), "stderr": output(stderr), "cause": message,
+        }, retain_diagnostics=True)
+        return _DependencySourceError(str(details["cause"]), details)
+
+    def _load_entries(self, paths: list[str]) -> None:
+        result = self._git(["--literal-pathspecs", "ls-tree", "-r", "-z", "-l", str(self.commit), "--", *paths])
+        selected = set(paths)
+        for record in result.stdout.split(b"\0"):
+            if not record:
+                continue
+            metadata, raw_path = record.split(b"\t", 1)
+            mode, kind, oid, size = metadata.decode("ascii").split()
+            relative = raw_path.decode("utf-8")
+            if relative in selected:
+                self.entries[relative] = (mode if kind == "blob" else kind, oid, int(size) if size != "-" else 0)
+
+    def path(self, relative: str) -> pathlib.Path:
+        portable = relative.replace("\\", "/")
+        pure = pathlib.PurePosixPath(portable)
+        if not portable or pure.is_absolute() or pathlib.PureWindowsPath(portable).drive or ".." in pure.parts or "\0" in portable:
+            raise _DependencySourceError("path_outside_checkout", {"file": relative})
+        path = self.checkout.joinpath(*pure.parts)
+        if self.commit is None:
+            path = path.resolve()
+            if not path.is_relative_to(self.checkout):
+                raise _DependencySourceError("path_outside_checkout", {"file": relative})
+        return path
+
+    def _relative(self, path: pathlib.Path) -> str:
+        return path.relative_to(self.checkout).as_posix()
+
+    def is_file(self, path: pathlib.Path) -> bool:
+        if self.commit is None:
+            return path.is_file()
+        entry = self.entries.get(self._relative(path))
+        if entry and entry[0] not in {"100644", "100755"}:
+            raise _DependencySourceError("PR dependency source is not a regular file", {"file": self._relative(path), "mode": entry[0]})
+        return entry is not None
+
+    def read_bytes(self, path: pathlib.Path, *, size_limit: int | None = None) -> bytes:
+        if self.commit is None:
+            size = path.stat().st_size
+            if size_limit is not None and size > size_limit:
+                raise WorkflowError("wrapper JAR exceeds the evidence size bound")
+            return path.read_bytes()
+        if not self.is_file(path):
+            raise _DependencySourceError("file_missing_from_pr_commit", {"file": self._relative(path)})
+        _, oid, size = self.entries[self._relative(path)]
+        if size_limit is not None and size > size_limit:
+            raise WorkflowError("wrapper JAR exceeds the evidence size bound")
+        if oid not in self.blobs:
+            self.blobs[oid] = self._git(["cat-file", "blob", oid]).stdout
+        return self.blobs[oid]
+
+    def read_text(self, path: pathlib.Path) -> str:
+        # Match Path.read_text's universal-newline behavior for committed blobs too.
+        return self.read_bytes(path).decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _dependency_read_error(path: str, exc: Exception) -> dict[str, Any]:
+    return {"file": path, "error": str(exc)[:300], **(exc.details if isinstance(exc, _DependencySourceError) else {})}
+
+
+def package_json_evidence(path: pathlib.Path, package: str, reader: _DependencyFileReader | None = None) -> dict[str, Any]:
+    raw = json.loads(reader.read_text(path) if reader else path.read_text(encoding="utf-8"))
     result: dict[str, Any] = {
         "file": str(path),
         "project_engines": raw.get("engines"),
@@ -678,8 +810,8 @@ def package_json_evidence(path: pathlib.Path, package: str) -> dict[str, Any]:
     return result
 
 
-def package_lock_evidence(path: pathlib.Path, package: str) -> dict[str, Any]:
-    raw = json.loads(path.read_text(encoding="utf-8"))
+def package_lock_evidence(path: pathlib.Path, package: str, reader: _DependencyFileReader | None = None) -> dict[str, Any]:
+    raw = json.loads(reader.read_text(path) if reader else path.read_text(encoding="utf-8"))
     matches: list[dict[str, Any]] = []
     packages = raw.get("packages")
     if isinstance(packages, dict):
@@ -703,8 +835,8 @@ def package_lock_evidence(path: pathlib.Path, package: str) -> dict[str, Any]:
     return {"file": str(path), "matches": matches[:25], "matches_truncated": max(0, len(matches) - 25)}
 
 
-def python_lock_evidence(path: pathlib.Path, package: str) -> dict[str, Any]:
-    raw = tomllib.loads(path.read_text(encoding="utf-8"))
+def python_lock_evidence(path: pathlib.Path, package: str, reader: _DependencyFileReader | None = None) -> dict[str, Any]:
+    raw = tomllib.loads(reader.read_text(path) if reader else path.read_text(encoding="utf-8"))
     packages = raw.get("package")
     matches = []
     if isinstance(packages, list):
@@ -725,10 +857,11 @@ def python_lock_evidence(path: pathlib.Path, package: str) -> dict[str, Any]:
     return {"file": str(path), "matches": matches[:25], "matches_truncated": max(0, len(matches) - 25)}
 
 
-def requirements_evidence(path: pathlib.Path, package: str) -> dict[str, Any]:
+def requirements_evidence(path: pathlib.Path, package: str, reader: _DependencyFileReader | None = None) -> dict[str, Any]:
     normalized = package.lower().replace("_", "-")
     matches = []
-    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+    text = reader.read_text(path) if reader else path.read_text(encoding="utf-8")
+    for number, line in enumerate(text.splitlines(), start=1):
         candidate = line.strip()
         name = re.split(r"[\s\[<>=!~;@]", candidate, maxsplit=1)[0].lower().replace("_", "-")
         if name == normalized:
@@ -736,8 +869,8 @@ def requirements_evidence(path: pathlib.Path, package: str) -> dict[str, Any]:
     return {"file": str(path), "matches": matches}
 
 
-def pyproject_evidence(path: pathlib.Path, package: str) -> dict[str, Any]:
-    raw = tomllib.loads(path.read_text(encoding="utf-8"))
+def pyproject_evidence(path: pathlib.Path, package: str, reader: _DependencyFileReader | None = None) -> dict[str, Any]:
+    raw = tomllib.loads(reader.read_text(path) if reader else path.read_text(encoding="utf-8"))
     normalized = package.lower().replace("_", "-")
     matches: list[dict[str, Any]] = []
 
@@ -780,19 +913,21 @@ def github_actions_tree_evidence(
     checkout: pathlib.Path,
     package: str,
     relative_paths: set[str],
+    reader: _DependencyFileReader | None = None,
 ) -> dict[str, Any]:
+    reader = reader or _DependencyFileReader(checkout, relative_paths, None)
     references: list[dict[str, Any]] = []
-    errors: list[dict[str, str]] = []
+    errors: list[dict[str, Any]] = []
     normalized = package.lower().rstrip("/")
     for relative in sorted(relative_paths):
-        portable = relative.lstrip("/\\").replace("\\", "/")
+        portable = relative.replace("\\", "/")
         if not portable.startswith(".github/workflows/"):
             continue
-        path = (checkout / portable).resolve()
-        if not path.is_file():
-            continue
         try:
-            for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+            path = reader.path(portable)
+            if not reader.is_file(path):
+                continue
+            for number, line in enumerate(reader.read_text(path).splitlines(), start=1):
                 match = re.match(r"^\s*(?:-\s*)?uses:\s*(?P<source>[^@\s]+)@(?P<ref>[^\s#]+)", line)
                 if match and match.group("source").lower().rstrip("/").startswith(normalized):
                     references.append(
@@ -803,8 +938,8 @@ def github_actions_tree_evidence(
                             "ref": match.group("ref"),
                         }
                     )
-        except OSError as exc:
-            errors.append({"file": str(path), "error": str(exc)[:300]})
+        except (OSError, ValueError, WorkflowError) as exc:
+            errors.append(_dependency_read_error(relative, exc))
     return {
         "status": "ok" if references and not errors else ("blocked" if errors else "unavailable"),
         "sources": references,
@@ -815,23 +950,24 @@ def github_actions_tree_evidence(
 def gradle_wrapper_tree_evidence(
     checkout: pathlib.Path,
     relative_paths: set[str],
+    reader: _DependencyFileReader | None = None,
 ) -> dict[str, Any]:
-    """Collect checkout wrapper context, not candidate-head acceptance.
+    """Collect wrapper context from the selected source, without accepting it.
 
     Wrapper updates have distribution and bootstrap references rather than a
     Maven dependency graph. Accept canonical Gradle-generated fields only;
     ambiguous properties, missing pins, and checkout escapes remain blocking.
     """
 
+    reader = reader or _DependencyFileReader(checkout, relative_paths, None)
     sources: list[dict[str, Any]] = []
-    errors: list[dict[str, str]] = []
+    errors: list[dict[str, Any]] = []
     for relative in sorted(relative_paths):
         if pathlib.PurePosixPath(relative).name != "gradle-wrapper.properties":
             continue
-        path = (checkout / relative).resolve()
         try:
-            path.relative_to(checkout.resolve())
-            text = path.read_text(encoding="utf-8")
+            path = reader.path(relative)
+            text = reader.read_text(path)
             for line in text.splitlines():
                 if not line.strip() or line.lstrip().startswith(("#", "!")):
                     continue
@@ -852,17 +988,14 @@ def gradle_wrapper_tree_evidence(
                 or parsed.query or parsed.fragment or not match
             ):
                 raise WorkflowError("wrapper distribution must name an exact official Gradle release")
-            jar = (path.parent / "gradle-wrapper.jar").resolve()
-            jar.relative_to(checkout.resolve())
-            if jar.stat().st_size > 5 * 1024 * 1024:
-                raise WorkflowError("wrapper JAR exceeds the evidence size bound")
+            jar = reader.path(str(pathlib.PurePosixPath(relative).with_name("gradle-wrapper.jar")))
             sources.append({
                 "file": relative, "distribution_url": url, "version": match.group("version"),
                 "distribution_sha256": pins[0],
-                "wrapper_sha256": hashlib.sha256(jar.read_bytes()).hexdigest(),
+                "wrapper_sha256": hashlib.sha256(reader.read_bytes(jar, size_limit=5 * 1024 * 1024)).hexdigest(),
             })
         except (OSError, ValueError, WorkflowError) as exc:
-            errors.append({"file": relative, "error": str(exc)[:300]})
+            errors.append(_dependency_read_error(relative, exc))
     return {
         "status": "ok" if sources and not errors else ("blocked" if errors else "unavailable"),
         "sources": sources, "errors": errors,
@@ -874,7 +1007,13 @@ def dependency_tree_evidence(
     update: dict[str, Any],
     changed_files: list[dict[str, Any]],
     alerts: list[dict[str, Any]],
+    commit: str | None = None,
 ) -> dict[str, Any]:
+    """Collect dependency facts at the PR head; alerts alone use local context.
+
+    This is source evidence for the existing review and release/local flow,
+    never permission to merge or a substitute for candidate checks.
+    """
     package = update.get("package")
     if not package:
         return {"status": "unavailable", "reason": "unparsed_dependency_update", "sources": []}
@@ -888,50 +1027,52 @@ def dependency_tree_evidence(
         for item in alerts
         if item.get("manifest_path")
     )
-    for name in (
+    relative_paths.update((
         "package.json",
         "package-lock.json",
         "pyproject.toml",
         "uv.lock",
         "poetry.lock",
         "requirements.txt",
-    ):
-        if (checkout / name).is_file():
-            relative_paths.add(name)
+    ))
+    try:
+        reader = _DependencyFileReader(checkout, relative_paths, commit)
+    except (OSError, ValueError, WorkflowError) as exc:
+        return {
+            "status": "unavailable", "reason": "dependency_source_unavailable", "commit": commit,
+            "sources": [], "errors": [_dependency_read_error(str(checkout), exc)],
+        }
     if str(update.get("ecosystem") or "").lower() == "github-actions":
-        return github_actions_tree_evidence(checkout, str(package), relative_paths)
+        result = github_actions_tree_evidence(checkout, str(package), relative_paths, reader)
+        return {**result, **({"commit": commit} if commit is not None else {})}
     if str(update.get("ecosystem") or "").lower() == "gradle" and package == "gradle-wrapper":
-        return gradle_wrapper_tree_evidence(checkout, relative_paths)
+        result = gradle_wrapper_tree_evidence(checkout, relative_paths, reader)
+        return {**result, **({"commit": commit} if commit is not None else {})}
     sources: list[dict[str, Any]] = []
-    errors: list[dict[str, str]] = []
+    errors: list[dict[str, Any]] = []
     for relative in sorted(relative_paths):
-        portable_relative = relative.lstrip("/\\")
-        path = (checkout / portable_relative).resolve()
         try:
-            path.relative_to(checkout.resolve())
-        except ValueError:
-            errors.append({"file": relative, "error": "path_outside_checkout"})
-            continue
-        if not path.is_file():
-            continue
-        try:
+            path = reader.path(relative)
+            if not reader.is_file(path):
+                continue
             lower = path.name.lower()
             if lower == "package.json":
-                sources.append(package_json_evidence(path, str(package)))
+                sources.append(package_json_evidence(path, str(package), reader))
             elif lower == "package-lock.json":
-                sources.append(package_lock_evidence(path, str(package)))
+                sources.append(package_lock_evidence(path, str(package), reader))
             elif lower == "pyproject.toml":
-                sources.append(pyproject_evidence(path, str(package)))
+                sources.append(pyproject_evidence(path, str(package), reader))
             elif lower in {"uv.lock", "poetry.lock"}:
-                sources.append(python_lock_evidence(path, str(package)))
+                sources.append(python_lock_evidence(path, str(package), reader))
             elif "requirements" in lower and path.suffix.lower() in {"", ".in", ".txt"}:
-                sources.append(requirements_evidence(path, str(package)))
-        except (OSError, ValueError, json.JSONDecodeError, tomllib.TOMLDecodeError) as exc:
-            errors.append({"file": str(path), "error": str(exc)[:300]})
+                sources.append(requirements_evidence(path, str(package), reader))
+        except (OSError, ValueError, WorkflowError) as exc:
+            errors.append(_dependency_read_error(relative, exc))
     return {
         "status": "ok" if sources and not errors else ("blocked" if errors else "unavailable"),
         "sources": sources,
         "errors": errors,
+        **({"commit": commit} if commit is not None else {}),
     }
 
 

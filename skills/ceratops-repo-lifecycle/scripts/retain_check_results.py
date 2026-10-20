@@ -55,6 +55,67 @@ def fingerprint(context: Mapping[str, Any]) -> str:
     return hashlib.sha256(canonical(inputs)).hexdigest()
 
 
+def _recorded_tools_cover_path_lookup(context: Mapping[str, Any]) -> bool:
+    """Use binary identities only for a complete declared tool inventory.
+
+    The launched command must itself be listed. Missing binaries, omitted tool
+    entries and declarations without tool ownership keep PATH significant.
+    This reads existing records without revising their fingerprints or bytes.
+    """
+    scope = context.get("scope", {})
+    rules = scope.get("inputRules", {}) if isinstance(scope, dict) else {}
+    if not isinstance(rules, dict):
+        return False
+    names = rules.get("tools")
+    environment = context.get("environment", {})
+    arguments = context.get("arguments", [])
+    if (not isinstance(names, list) or not names
+            or any(not isinstance(name, str) or not name for name in names)
+            or len(set(names)) != len(names)
+            or not arguments or arguments[0] not in names
+            or not isinstance(environment, dict)):
+        return False
+    variables = environment.get("variables", {})
+    tools = environment.get("tools", {})
+    declared_variables = rules.get("environment", [])
+    if (not isinstance(variables, dict)
+            or not isinstance(variables.get("PATH"), str)
+            or not _SHA.fullmatch(variables["PATH"])
+            or not isinstance(declared_variables, list) or "PATH" not in declared_variables
+            or not isinstance(tools, dict) or set(tools) != set(names)):
+        return False
+    return all(isinstance(tool, dict)
+               and isinstance(tool.get("sha256"), str)
+               and _SHA.fullmatch(tool["sha256"]) for tool in tools.values())
+
+
+def check_inputs_match_for_reuse(recorded: Mapping[str, Any], current: Mapping[str, Any]) -> bool:
+    """Compare applicability while preserving every original result identity.
+
+    PATH text can differ when all declared executables still have identical
+    bytes. Every other environment value, runtime, dependency, check and product
+    input must match. Incomplete tool evidence retains exact PATH matching.
+    The same comparison governs failures and retention, so a PATH-only change
+    cannot hide a newer applicable failure or discard the evidence blocking it.
+    """
+    if recorded["fingerprint"] == current["fingerprint"]:
+        return True
+    ignored = {"fingerprint", "workVersion", "qualificationLevel", "environment"}
+    if ({key: value for key, value in recorded.items() if key not in ignored}
+            != {key: value for key, value in current.items() if key not in ignored}
+            or not _recorded_tools_cover_path_lookup(recorded)
+            or not _recorded_tools_cover_path_lookup(current)):
+        return False
+
+    def effective_environment(context: Mapping[str, Any]) -> dict[str, Any]:
+        environment = dict(context["environment"])
+        environment["variables"] = {name: value for name, value in environment["variables"].items()
+                                    if name != "PATH"}
+        return environment
+
+    return effective_environment(recorded) == effective_environment(current)
+
+
 def _relative_path(value: Any) -> bool:
     return (isinstance(value, str) and bool(value) and "\\" not in value
             and not value.startswith("/") and not re.match(r"^[A-Za-z]:", value)
@@ -315,7 +376,7 @@ class CheckResultStore:
             return decision
         matching = [(path, record, raw) for path, record, raw in records
                     if record["check_id"] == check_id
-                    and record["inputs"]["fingerprint"] == request["fingerprint"]]
+                    and check_inputs_match_for_reuse(record["inputs"], request)]
         matching.sort(key=lambda item: _order(item[1]), reverse=True)
         if any(_nonreusable(record) for _, record, _ in matching):
             decision["reason"] = "Unrepresented child scope requires fresh execution."
@@ -449,7 +510,7 @@ class CheckResultStore:
                 for request, protect_pass in requests:
                     by_check: dict[str, list[dict[str, Any]]] = {}
                     for _, record, _ in records:
-                        if record["inputs"]["fingerprint"] == request["fingerprint"]:
+                        if check_inputs_match_for_reuse(record["inputs"], request):
                             by_check.setdefault(record["check_id"], []).append(record)
                     for relevant in by_check.values():
                         constraints = [record for record in relevant if _nonreusable(record)]

@@ -264,13 +264,41 @@ and are released when the owning process exits, including a crash.
 
 Self-update uses this same sequence. The current process completes its request
 from its existing directory; its files are never overwritten. The stable
-launcher reads its own `current.json` at the next launch, so a new CLI
-process or
-MCP reconnection uses the selected version. Already running versions continue
-to work because their leased environments are retained.
+launcher reads its own `current.json` for each new CLI process. MCP launches
+instead keep a dependency-free stdio gateway connected to the host. That
+gateway reads the selection before dispatching every request, initializes a
+replacement backend when required by the negotiated protocol, and routes new
+requests to that selected environment. Requests already running finish in their
+original backend; progress, cancellation and client callbacks stay with their
+owning request. MCP protocol tasks retain their original backend and progress
+tokens after the initial acknowledgement, until result retrieval or expiry.
+The gateway assigns connection-local task IDs, routes task queries and
+cancellation to their owner, and reads each owner for task listing. Terminal
+status alone does not discard an unread result. Unknown or expired IDs fail
+without dispatch to another version. An incompatible replacement reports an
+error without silently
+using an older version or replaying a request.
 Every successful activation installs or refreshes that MCP server's stable launcher.
-The launcher selects `current.json` and holds an instance lease for the child
-process lifetime. At deployment startup and after a completed package or
+The gateway also notices selection changes while its chat is idle. Once a
+superseded backend has no pending requests, callbacks or unread tasks, it closes
+that child's
+input and lets it exit naturally. This preserves background work that continues
+after returning a job ID. Each child's instance lease remains held until the
+process actually exits; the gateway itself runs in global Python and pins no
+versioned environment. Existing pre-gateway connections need one MCP refresh;
+subsequent selections require no connection refresh. CLI commands keep their
+existing argument, stream and exit-code behavior.
+
+Failed replacement handshakes accept no application requests and are stopped
+if necessary. When the client disconnects, unanswered callbacks receive an
+explicit connection-closed error so accepted calls can finish draining.
+
+The gateway creates no files, checkpoints or logs. Its bounded in-memory queues
+hold only active messages and at most 128 retained tasks. Task expiry uses the
+server's creation time and TTL without extending it on polling; a null TTL lasts
+until result retrieval or connection closure. Each child retains at most 64 KiB
+of stderr for
+failure details. At deployment startup and after a completed package or
 activation, the manager retains the selected environment and the newest
 complete different version. Older and duplicate live environments are deferred.
 Repeated installation of the selected immutable release reuses that accepted

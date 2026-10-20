@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Render and transactionally install managed runtime skill batches.
 
-The builder stages every selected present skill before touching canonical
-runtime folders. It then retires every selected canonical target, activates the
-complete staged batch, and deletes retired folders only after all activations
-complete. Pre-commit-point failures are compensated from in-memory state.
+The builder renders the desired files before writing and leaves current trees
+in place. Manifest-only changes replace the ownership manifest atomically;
+payload changes stage and swap the complete skill tree. All changed skills are
+staged before canonical mutation. Pre-commit-point failures are compensated from
+in-memory state, including ownership-manifest changes.
 
 No transaction journal or recovery database is written. Interrupted
 ``deployed`` and ``retired`` folders are resolved only when their names,
@@ -121,6 +122,15 @@ class TransactionResult:
             "transaction_id": self.transaction_id,
             "retained_retired": list(self.retained_retired),
         }
+
+
+@dataclass(frozen=True)
+class ExpectedSkillContent:
+    """One rendered file inventory shared by effect selection and staging."""
+
+    files: Mapping[pathlib.PurePosixPath, bytes]
+    directories: frozenset[pathlib.PurePosixPath]
+    copied_sources: Mapping[pathlib.PurePosixPath, pathlib.Path]
 
 
 def configure_repo(repo_root: pathlib.Path) -> None:
@@ -628,15 +638,14 @@ def enable_windows_acl_inheritance(path: pathlib.Path) -> None:
         )
 
 
-def write_expected_skill(
+def expected_skill_content(
     skill_name: str,
-    target_skill: pathlib.Path,
     manifest: Mapping[str, object],
     *,
     source_repository_root: pathlib.Path | None = None,
     python_runtime: pathlib.Path | None = None,
-) -> None:
-    """Write one canonical managed runtime tree into an empty target."""
+) -> ExpectedSkillContent:
+    """Render desired bytes in memory before deciding which target effects remain."""
 
     source_dir = SKILLS / skill_name
     source_skill = source_dir / "SKILL.md"
@@ -644,34 +653,51 @@ def write_expected_skill(
     validation_profile = cast(str, manifest["validation_profile"])
     if not source_skill.is_file():
         raise FileNotFoundError(f"missing source skill: {source_skill}")
-    if target_skill.exists() or target_skill.is_symlink():
-        raise FileExistsError(f"staging target already exists: {target_skill}")
-
     validate_tree_links(source_dir)
-    shutil.copytree(source_dir, target_skill, ignore=ignore_source_dir)
+    files: dict[pathlib.PurePosixPath, bytes] = {}
+    directories: set[pathlib.PurePosixPath] = set()
+    copied_sources: dict[pathlib.PurePosixPath, pathlib.Path] = {}
+
+    def collect(source: pathlib.Path, relative: pathlib.PurePosixPath) -> None:
+        if python_environments.is_runtime_link(source):
+            raise ValueError(f"runtime payload cannot be a link: {source}")
+        if source.is_dir():
+            directories.add(relative)
+            for child in sorted(source.iterdir()):
+                if child.name not in IGNORE_NAMES:
+                    collect(child, relative / child.name)
+        else:
+            files[relative] = source.read_bytes()
+            copied_sources[relative] = source
+        directories.update(parent for parent in relative.parents if parent.parts)
+
+    for child in sorted(source_dir.iterdir()):
+        if child.name not in IGNORE_NAMES:
+            collect(child, pathlib.PurePosixPath(child.name))
     shared_block = rendered_sections_block(skill_name, manifest)
     runtime_skill_text = compose_runtime_skill(
         source_skill.read_text(encoding="utf-8"), shared_block, skill_name
     )
-    (target_skill / "SKILL.md").write_text(
-        runtime_skill_text, encoding="utf-8", newline="\n"
-    )
+    files[pathlib.PurePosixPath("SKILL.md")] = runtime_skill_text.encode("utf-8")
+    copied_sources.pop(pathlib.PurePosixPath("SKILL.md"), None)
     for action_relative, names in action_assignments(ROOT, manifest, {skill_name}).get(skill_name, {}).items():
         action_text = (source_dir / action_relative).read_text(encoding="utf-8")
-        (target_skill / action_relative).write_text(
-            render_action(action_text, rendered_sections_block(skill_name, manifest, names), f"{skill_name}: {action_relative}"),
-            encoding="utf-8", newline="\n",
-        )
+        relative = pathlib.PurePosixPath(action_relative)
+        files[relative] = render_action(
+            action_text, rendered_sections_block(skill_name, manifest, names),
+            f"{skill_name}: {action_relative}",
+        ).encode("utf-8")
+        copied_sources.pop(relative, None)
     declarations = payload_declarations_for(skill_name, manifest)
     for payload, relative in expand_payload_declarations(declarations):
-        destination = target_skill.joinpath(*relative.parts)
-        _assert_inside(destination, target_skill)
-        if destination.exists() or destination.is_symlink():
+        if relative in files or relative in directories or any(
+            parent in files for parent in relative.parents
+        ):
             raise ValueError(
                 "runtime payload target collides with skill source: "
                 f"{relative.as_posix()}"
             )
-        copy_path(payload, destination)
+        collect(payload, relative)
 
     runtime_manifest = {
         "schema": RUNTIME_MANIFEST_SCHEMA,
@@ -685,11 +711,88 @@ def write_expected_skill(
     }
     if python_runtime is not None:
         runtime_manifest["python_runtime"] = str(python_runtime)
-    (target_skill / MANIFEST_NAME).write_text(
-        json.dumps(runtime_manifest, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8", newline="\n",
+    relative = pathlib.PurePosixPath(MANIFEST_NAME)
+    files[relative] = (json.dumps(runtime_manifest, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    copied_sources.pop(relative, None)
+    return ExpectedSkillContent(files, frozenset(directories), copied_sources)
+
+
+def write_expected_skill(
+    skill_name: str,
+    target_skill: pathlib.Path,
+    manifest: Mapping[str, object],
+    *,
+    source_repository_root: pathlib.Path | None = None,
+    python_runtime: pathlib.Path | None = None,
+    content: ExpectedSkillContent | None = None,
+) -> None:
+    """Write a complete rendered tree into an empty transaction-owned target."""
+
+    if target_skill.exists() or target_skill.is_symlink():
+        raise FileExistsError(f"staging target already exists: {target_skill}")
+    desired = content or expected_skill_content(
+        skill_name, manifest, source_repository_root=source_repository_root,
+        python_runtime=python_runtime,
     )
+    target_skill.mkdir(parents=True)
+    for relative in sorted(desired.directories):
+        target_skill.joinpath(*relative.parts).mkdir(parents=True, exist_ok=True)
+    for relative, data in desired.files.items():
+        destination = target_skill.joinpath(*relative.parts)
+        destination.write_bytes(data)
+        source = desired.copied_sources.get(relative)
+        if source is not None:
+            shutil.copystat(source, destination)
     validate_tree_links(target_skill)
+
+
+def required_skill_change(target: pathlib.Path, desired: ExpectedSkillContent) -> str:
+    """Choose no effect, a manifest update, or a complete tree replacement.
+
+    This is a current-target check before copying, not a second acceptance pass.
+    Cache directories are runtime-owned noise; other extra files and links must
+    still be removed by the existing replacement transaction.
+    """
+
+    if not target.is_dir():
+        return "replace"
+    files: dict[pathlib.PurePosixPath, pathlib.Path] = {}
+    directories: set[pathlib.PurePosixPath] = set()
+    for path in target.rglob("*"):
+        relative = pathlib.PurePosixPath(path.relative_to(target).as_posix())
+        if any(part in IGNORE_NAMES for part in relative.parts):
+            continue
+        if python_environments.is_runtime_link(path):
+            return "replace"
+        if path.is_dir():
+            directories.add(relative)
+        else:
+            files[relative] = path
+    if files.keys() != desired.files.keys() or directories != desired.directories:
+        return "replace"
+    manifest_path = pathlib.PurePosixPath(MANIFEST_NAME)
+    for relative, path in files.items():
+        if relative != manifest_path and path.read_bytes() != desired.files[relative]:
+            return "replace"
+    actual_manifest = files[manifest_path].read_bytes()
+    expected_manifest = desired.files[manifest_path]
+    if actual_manifest == expected_manifest:
+        return "current"
+    return "metadata"
+
+
+def replace_runtime_manifest(
+    staged: pathlib.Path, canonical: pathlib.Path, data: bytes,
+) -> None:
+    """Atomically change provenance without renaming a watched skill directory.
+
+    The stage retains its ownership manifest for ordinary rollback and hard-crash
+    recovery. Its pending file is transaction-owned and removed with that stage.
+    """
+
+    pending = staged / ".runtime-manifest-next.json"
+    pending.write_bytes(data)
+    rename_with_retry(pending, canonical / MANIFEST_NAME)
 
 
 def _runtime_identity(path: pathlib.Path) -> str:
@@ -963,8 +1066,14 @@ def _rollback(
     deployed_paths: Mapping[str, pathlib.Path],
     retired_paths: Mapping[str, pathlib.Path],
     activated: Sequence[str],
+    metadata_backups: Mapping[str, bytes],
 ) -> str:
     failures: list[str] = []
+    for skill, data in metadata_backups.items():
+        try:
+            replace_runtime_manifest(deployed_paths[skill], install_root / skill, data)
+        except (OSError, RuntimeError):
+            failures.append(f"restore-manifest:{skill}")
     for skill in reversed(activated):
         try:
             _remove_tree(install_root / skill, install_root)
@@ -1110,18 +1219,38 @@ def install_transaction(
         deployed_paths: dict[str, pathlib.Path] = {}
         retired_paths: dict[str, pathlib.Path] = {}
         activated: list[str] = []
-        phase = "staging"
+        metadata_backups: dict[str, bytes] = {}
+        phase = "effect_selection"
         current_skill = ""
         commit_point = False
         try:
+            desired: dict[str, ExpectedSkillContent] = {}
+            changes: dict[str, str] = {}
+            for skill in sorted(deploy_names):
+                current_skill = skill
+                desired[skill] = expected_skill_content(
+                    skill, manifest,
+                    python_runtime=python_runtime if skill in python_skills else None,
+                )
+                changes[skill] = required_skill_change(install_root / skill, desired[skill])
+            deploy_names = {skill for skill, change in changes.items() if change != "current"}
+            replace_names = {skill for skill, change in changes.items() if change == "replace"}
+            metadata_names = deploy_names - replace_names
+            remove_names = {skill for skill in remove_names if (install_root / skill).exists()}
+            if not deploy_names and not remove_names:
+                return TransactionResult("no_op", (), (), "")
+            phase = "staging"
             for skill in sorted(deploy_names):
                 current_skill = skill
                 staged = install_root / f".{skill}-deployed-{transaction_id}"
                 deployed_paths[skill] = staged
-                write_expected_skill(
-                    skill, staged, manifest,
-                    python_runtime=python_runtime if skill in python_skills else None,
-                )
+                if skill in metadata_names:
+                    staged.mkdir()
+                    (staged / MANIFEST_NAME).write_bytes(
+                        desired[skill].files[pathlib.PurePosixPath(MANIFEST_NAME)]
+                    )
+                else:
+                    write_expected_skill(skill, staged, manifest, content=desired[skill])
                 enable_windows_acl_inheritance(staged)
                 staged_manifest = read_runtime_manifest(staged)
                 if (
@@ -1132,7 +1261,7 @@ def install_transaction(
                     raise ValueError("staged runtime manifest identity mismatch")
 
             phase = "retirement"
-            for skill in sorted(deploy_names | remove_names):
+            for skill in sorted(replace_names | remove_names):
                 current_skill = skill
                 canonical = install_root / skill
                 if not canonical.exists() and not canonical.is_symlink():
@@ -1142,15 +1271,25 @@ def install_transaction(
                 retired_paths[skill] = retired
 
             phase = "activation"
-            for skill in sorted(deploy_names):
+            for skill in sorted(replace_names):
                 current_skill = skill
                 rename_with_retry(deployed_paths[skill], install_root / skill)
                 activated.append(skill)
+            for skill in sorted(metadata_names):
+                current_skill = skill
+                canonical = install_root / skill
+                metadata_backups[skill] = (canonical / MANIFEST_NAME).read_bytes()
+                replace_runtime_manifest(
+                    deployed_paths[skill], canonical,
+                    desired[skill].files[pathlib.PurePosixPath(MANIFEST_NAME)],
+                )
             commit_point = True
 
             phase = "cleanup"
             retained: list[str] = []
-            for skill, retired in retired_paths.items():
+            for skill, retired in {**retired_paths, **{
+                skill: deployed_paths[skill] for skill in metadata_names
+            }}.items():
                 current_skill = skill
                 try:
                     _remove_tree(retired, install_root)
@@ -1184,7 +1323,7 @@ def install_transaction(
                     rollback_state="not_available_after_commit",
                 ) from exc
             rollback = _rollback(
-                install_root, deployed_paths, retired_paths, activated
+                install_root, deployed_paths, retired_paths, activated, metadata_backups
             )
             raise TransactionError(
                 str(exc),

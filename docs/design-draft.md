@@ -105,6 +105,14 @@ remain with their existing owners.
 Dependabot must address the directories containing the dependency projects,
 including `/scripts` and the separate shared skill project.
 
+Dependabot preflight identifies updates from PR titles and collects dependency
+files from the exact PR head through Git's tree and blob readers. It fetches a
+missing commit by object ID without moving branches, the index or working
+files; local edits and symlinks cannot substitute other content. Read failures
+retain the command, target, exit status and both output streams. Alerts without
+a PR keep their local context. These facts feed the existing compatibility
+review and promotion through `release/local`; they do not grant merge approval.
+
 Repository examples use `uv run --locked scripts/<entrypoint>.py`; source
 helpers outside `scripts` use `uv run --project scripts --locked python ...`.
 The caller and uv prepare the environment. Individual scripts do not contain
@@ -271,6 +279,31 @@ definitions without granting trust or restarting Codex. Register and connect
 the MCP server before relying on the guard, then review changed hook trust as
 required by the client. An installed or registered server is not evidence that
 an already running chat has connected to it.
+
+Managed MCP stdio connections now remain on the manager's standalone gateway
+while each new request selects the current immutable backend. The gateway runs
+in global Python, so its own lifetime does not pin a manager environment. It
+replays legacy initialization for a replacement, forwards stateless protocol
+messages directly, and keeps cancellation and client callbacks bound to their
+owning request. A changed selection cannot redirect a request already running;
+an unavailable or incompatible selection returns an error without replaying it
+or falling back to an older release. CLI invocations retain direct dispatch.
+
+Selection polling also retires idle superseded backends. Retirement closes the
+child's input without terminating it, and holds its existing instance lease
+until actual process exit so background work can finish. No gateway state or
+logs are persisted: active protocol queues and request counts are bounded at
+128, and each backend retains at most 64 KiB of stderr in memory. The existing
+manager continues to own version directories, release packages and retention;
+old pre-gateway connections need one client refresh to adopt this boundary.
+Protocol tasks keep connection-local IDs mapped to their original backend,
+including progress and task-related metadata. Queries, cancellation and serial
+listing reads use that owner. Results remain retrievable after terminal status;
+retrieval or the server's creation-time TTL releases the task's ownership.
+Unknown IDs never fall through to the current selection. Retention is bounded
+at 128 tasks and creates no persisted gateway state.
+Failed replacement handshakes can be terminated because they have accepted no
+application requests; client disconnects fail unanswered callbacks explicitly.
 
 Behavior tests exercise the actual server through an MCP STDIO client,
 including inventories beyond the direct-search cap, complete Unicode path

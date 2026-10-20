@@ -1,19 +1,28 @@
-"""Stable bootstrap ABI: select a complete MCP server environment on launch.
+"""Dependency-free CLI bootstrap and a persistent MCP stdio gateway.
 
 The same standalone file is installed below every MCP server's ``bin``
-directory. It derives that server's identity from the parent directory, validates the
-selected receipt, and holds an instance lease until the child exits so producer
-retention never removes files used by a running process.
+directory. It derives that server's identity from the parent directory and checks
+the selected receipt before dispatch. MCP connections survive selection changes:
+new requests use the selected environment, and older children drain naturally.
+The standalone bootstrap cannot import a versioned SDK without pinning that
+environment itself. A small JSON-RPC relay negotiates child connections and
+gives each backend its own request, progress and callback IDs.
 """
 
 import contextlib
 import ctypes
 import json
 import os
+import queue
 import re
 import stat
 import subprocess
 import sys
+import threading
+import time
+import uuid
+from collections import deque
+from datetime import datetime
 from pathlib import Path
 
 
@@ -72,22 +81,23 @@ def shared_usage_lease(stream):
             fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
-def main() -> int:
-    root = Path(__file__).resolve().parent.parent
+def checked_path(root, path):
+    """Reject links and escapes before opening deployment-owned paths."""
+    if not path.is_relative_to(root):
+        raise ValueError("launcher path escaped installation root")
+    for item in (path, *path.parents):
+        info = item.lstat()
+        if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+            raise ValueError("launcher rejects links and reparse points")
+    return path
+
+
+def selected_environment(root):
+    """Read current authoritative selection; check only immutable identity."""
     identity = root.name
     if not re.fullmatch(r"[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*", identity):
         raise ValueError("invalid MCP server identity")
-
-    def checked(path: Path) -> Path:
-        if not path.is_relative_to(root):
-            raise ValueError("launcher path escaped installation root")
-        for item in (path, *path.parents):
-            info = item.lstat()
-            if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
-                raise ValueError("launcher rejects links and reparse points")
-        return path
-
-    selected = json.loads(checked(root / "current.json").read_text())
+    selected = json.loads(checked_path(root, root / "current.json").read_text())
     if set(selected) != {"schema", "mcp_server_id", "version", "manifest_sha256", "instance", "module"} or selected["schema"] != 1 or selected["mcp_server_id"] != identity:
         raise ValueError("invalid MCP server selection")
     if not isinstance(selected["instance"], str) or not re.fullmatch("[0-9a-f]{32}", selected["instance"]):
@@ -95,9 +105,15 @@ def main() -> int:
     if not isinstance(selected["version"], str) or not re.fullmatch(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", selected["version"]):
         raise ValueError("invalid selected version")
     directory = root / "versions" / selected["version"] / selected["instance"]
+    return selected, directory
+
+
+@contextlib.contextmanager
+def leased_command(root, selected, directory, arguments):
+    """Hold the environment's lease until its process actually exits."""
     locks = root / "locks"
     locks.mkdir(exist_ok=True)
-    checked(locks)
+    checked_path(root, locks)
     lease = locks / f"{selected['instance']}.usage.lock"
     with lease.open("a+b") as stream:
         stream.seek(0, os.SEEK_END)
@@ -106,16 +122,613 @@ def main() -> int:
             stream.flush()
         stream.seek(0)
         with shared_usage_lease(stream):
-            if json.loads(checked(directory / "receipt.json").read_text()) != selected:
+            if json.loads(checked_path(root, directory / "receipt.json").read_text()) != selected:
                 raise ValueError("MCP server receipt mismatch")
-            python = checked(directory / "environment" / "Scripts" / "python.exe")
-            env = {k: v for k, v in os.environ.items() if not k.upper().startswith(("PYTHON", "PIP_", "UV_"))}
-            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
-            # Hidden Windows children need explicit standard handles to keep
-            # the host's stdio transport connected; general inheritance is insufficient.
-            return subprocess.call([str(python), "-I", "-B", "-m", selected["module"], *sys.argv[1:]],
-                                   env=env, creationflags=creationflags,
-                                   stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr)
+            python = checked_path(root, directory / "environment" / "Scripts" / "python.exe")
+            yield [str(python), "-I", "-B", "-m", selected["module"], *arguments]
+
+
+def child_options():
+    return {"env": {k: v for k, v in os.environ.items()
+                    if not k.upper().startswith(("PYTHON", "PIP_", "UV_"))},
+            "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0}
+
+
+def message_key(identifier):
+    return json.dumps(identifier, ensure_ascii=True, sort_keys=True)
+
+
+def redacted_detail(detail):
+    for name, value in os.environ.items():
+        if len(value) > 3 and re.search(r"TOKEN|PASSWORD|SECRET|API_KEY", name, re.I):
+            detail = detail.replace(value, "<redacted>")
+    return re.sub(r"(?i)((?:token|password|secret|api[_-]?key)[=:]\s*)\S+", r"\1<redacted>", detail)
+
+
+def read_messages(stream, events, backend):
+    """One reader preserves each stream's order; queues bound pending traffic."""
+    try:
+        for line in stream:
+            message = json.loads(line)
+            if not isinstance(message, dict):
+                raise ValueError("JSON-RPC frame is not an object")
+            events.put(("message", backend, message))
+    except (OSError, ValueError) as exc:
+        events.put(("read_error", backend, str(exc)))
+    finally:
+        if backend is not None:
+            backend.process.wait()
+            backend.error_reader.join(timeout=1)
+        events.put(("eof", backend, None))
+
+
+class Backend:
+    """One leased child. Retirement closes input, never kills accepted work."""
+
+    def __init__(self, root, selected, directory, arguments, events, initialize):
+        self.selected = selected
+        self.events = events
+        self.pending = set()
+        self.request_ids = {}
+        self.wire_ids = {}
+        self.progress_tokens = {}
+        self.retiring = False
+        self.ready = initialize is None
+        self.bootstrap_id = None
+        self.started = time.monotonic()
+        self.errors: deque[bytes] = deque(maxlen=16)
+        self.output: queue.Queue[dict | None] = queue.Queue(maxsize=128)
+        self.lease = contextlib.ExitStack()
+        self.command = []
+        try:
+            self.command = self.lease.enter_context(leased_command(root, selected, directory, arguments))
+            self.process = subprocess.Popen(self.command, stdin=subprocess.PIPE,
+                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                            **child_options())
+        except OSError as exc:
+            self.lease.close()
+            raise OSError(redacted_detail(
+                f"start {selected['mcp_server_id']}@{selected['version']}; "
+                f"runtime={self.command[0] if self.command else '<not resolved>'}; "
+                f"invocation={subprocess.list2cmdline(self.command) if self.command else '<not started>'}; "
+                f"exit=not_started; stdout=<absent>; stderr=<absent>; cause={exc}")) from exc
+        except BaseException:
+            self.lease.close()
+            raise
+        self.error_reader = threading.Thread(target=self.read_errors, daemon=True)
+        self.error_reader.start()
+        threading.Thread(target=self.write_messages, daemon=True).start()
+        threading.Thread(target=read_messages, args=(self.process.stdout, events, self), daemon=True).start()
+        if initialize is not None:
+            self.bootstrap_id = "gateway-initialize-" + uuid.uuid4().hex
+            self.send({**initialize, "id": self.bootstrap_id})
+
+    def read_errors(self):
+        assert self.process.stderr is not None
+        while chunk := self.process.stderr.read(4096):
+            self.errors.append(chunk)
+            stream = getattr(sys.stderr, "buffer", sys.stderr)
+            try:
+                stream.write(chunk if hasattr(sys.stderr, "buffer") else chunk.decode("utf-8", "replace"))
+                stream.flush()
+            except (OSError, ValueError):
+                pass
+
+    def write_messages(self):
+        assert self.process.stdin is not None
+        try:
+            while True:
+                try:
+                    message = self.output.get(timeout=0.2)
+                except queue.Empty:
+                    if self.retiring:
+                        break
+                    continue
+                if message is None:
+                    break
+                self.process.stdin.write((json.dumps(message, ensure_ascii=False) + "\n").encode("utf-8"))
+                self.process.stdin.flush()
+        except (OSError, ValueError) as exc:
+            self.events.put(("read_error", self, str(exc)))
+        finally:
+            with contextlib.suppress(OSError, ValueError):
+                self.process.stdin.close()
+
+    def send(self, message):
+        if self.retiring:
+            raise ValueError("selected backend is retiring")
+        self.output.put_nowait(message)
+
+    def retire(self):
+        if not self.retiring:
+            self.retiring = True
+            with contextlib.suppress(queue.Full):
+                self.output.put_nowait(None)
+
+    def forget_request(self, key):
+        """Late replies and progress cannot attach to a reused client ID."""
+        wire_id = self.wire_ids.pop(key, None)
+        self.request_ids.pop(message_key(wire_id), None)
+        self.pending.discard(key)
+        self.progress_tokens = {token: value for token, value in self.progress_tokens.items()
+                                if value[0] != key}
+        return wire_id
+
+    def diagnostic(self, cause):
+        stderr = b"".join(self.errors).decode("utf-8", "replace") or "<absent>"
+        detail = (f"{cause}; target={self.selected['mcp_server_id']}@{self.selected['version']}; "
+                  f"invocation={subprocess.list2cmdline(self.command)}; exit={self.process.poll()}; "
+                  f"stdout=<JSON-RPC transport>; stderr={stderr}")
+        return redacted_detail(detail)
+
+
+class McpGateway:
+    """Route at dispatch, preserving cancellation, progress and back-channel IDs.
+
+    No progress files or history are written. Only active protocol messages and
+    64 KiB of child stderr are kept in memory. Idle selection polling releases
+    old environments even when a chat never makes another tool call.
+    """
+
+    def __init__(self, root, arguments):
+        self.root, self.arguments = root, arguments
+        self.events: queue.Queue = queue.Queue(maxsize=128)
+        self.backends = set()
+        self.pending = {}
+        self.waiting = {}
+        self.waiting_on = {}
+        self.callbacks = {}
+        self.tasks = {}
+        self.task_lists = {}
+        self.initialize = None
+        self.protocol = None
+        self.initialized = False
+        self.closing = False
+        self.output_closed = False
+
+    def emit(self, message):
+        if self.output_closed:
+            return
+        try:
+            data = json.dumps(message, ensure_ascii=False) + "\n"
+            if hasattr(sys.stdout, "buffer"):
+                sys.stdout.buffer.write(data.encode("utf-8"))
+            else:
+                sys.stdout.write(data)
+            sys.stdout.flush()
+        except (OSError, ValueError):
+            self.closing = True
+            self.output_closed = True
+
+    def error(self, message, detail, code=-32603):
+        self.emit({"jsonrpc": "2.0", "id": message["id"],
+                   "error": {"code": code, "message": "MCP gateway: " + detail}})
+
+    def forget_task(self, identifier):
+        task = self.tasks.pop(identifier, None)
+        if task:
+            owner = task["backend"]
+            owner.progress_tokens = {token: value for token, value in owner.progress_tokens.items()
+                                     if value[0] != "task:" + identifier}
+
+    def expire_tasks(self):
+        now = time.monotonic()
+        for identifier, task in list(self.tasks.items()):
+            in_flight = any(self.task_reference(message) == identifier for _, message in self.pending.values())
+            if task["expires"] is not None and task["expires"] <= now and not in_flight:
+                self.forget_task(identifier)
+
+    def remember_task(self, backend, value):
+        """Namespace backend IDs; a completed task still owns its unread result.
+
+        Task state belongs to this stdio connection, never a progress file.
+        Deadlines use the receiver's creation time and TTL, without extending
+        retention on polling. Null TTL remains live until result retrieval or
+        connection close. At most 128 task-augmented requests/tasks are accepted.
+        """
+        identifier = value.get("taskId")
+        if not isinstance(identifier, str) or not identifier:
+            raise ValueError("backend task response has no string taskId")
+        for public_id, task in self.tasks.items():
+            if task["backend"] is backend and task["backend_id"] == identifier:
+                public = public_id
+                break
+        else:
+            if len(self.tasks) >= 128:
+                raise ValueError("backend task response exceeds the 128-task bound")
+            public = "gateway-task-" + uuid.uuid4().hex
+            task = {"backend": backend, "backend_id": identifier, "expires": None}
+            self.tasks[public] = task
+        ttl = value.get("ttl")
+        if isinstance(ttl, (int, float)) and not isinstance(ttl, bool) and ttl >= 0:
+            created = datetime.fromisoformat(value["createdAt"]).timestamp()
+            deadline = time.monotonic() + max(0, created + ttl / 1000 - time.time())
+            task["expires"] = min(task["expires"], deadline) if task["expires"] is not None else deadline
+        task["value"] = {**value, "taskId": public}
+        return public
+
+    def task_reference(self, message):
+        params = message.get("params", {})
+        if not isinstance(params, dict):
+            return None
+        if message.get("method") in {"tasks/get", "tasks/result", "tasks/cancel"}:
+            return params.get("taskId")
+        meta = params.get("_meta", {})
+        related = meta.get("io.modelcontextprotocol/related-task", {}) if isinstance(meta, dict) else {}
+        return related.get("taskId") if isinstance(related, dict) else None
+
+    def task_metadata(self, backend, message, incoming):
+        """Translate only protocol metadata, never arbitrary tool content."""
+        result = dict(message)
+        for field in ("params", "result", "error"):
+            body = result.get(field)
+            if not isinstance(body, dict):
+                continue
+            meta = body.get("_meta", {})
+            related = meta.get("io.modelcontextprotocol/related-task") if isinstance(meta, dict) else None
+            if not isinstance(related, dict):
+                continue
+            identifier = related.get("taskId")
+            for public, task in self.tasks.items():
+                if task["backend"] is backend and identifier == (task["backend_id"] if incoming else public):
+                    translated = public if incoming else task["backend_id"]
+                    result[field] = {**body, "_meta": {**meta,
+                        "io.modelcontextprotocol/related-task": {**related, "taskId": translated}}}
+                    break
+        return result
+
+    def next_task_list_request(self, key):
+        listing = self.task_lists[key]
+        while listing["remaining"]:
+            identifier = listing["remaining"].popleft()
+            if identifier in self.tasks:
+                self.waiting[key] = {"jsonrpc": "2.0", "id": listing["message"]["id"],
+                                     "method": "tasks/get", "params": {"taskId": identifier}}
+                return
+        self.emit({"jsonrpc": "2.0", "id": listing["message"]["id"],
+                   "result": {"tasks": listing["tasks"]}})
+        self.task_lists.pop(key)
+
+    def forward(self, backend, message):
+        try:
+            backend.send(message)
+        except (OSError, ValueError, queue.Full) as exc:
+            self.fail_backend(backend, "forward protocol message: " + str(exc))
+
+    def backend(self, selected, directory, first_initialize=False):
+        for backend in self.backends:
+            if backend.selected == selected and not backend.retiring:
+                return backend
+        initialize = None
+        if not first_initialize and self.initialize is not None:
+            initialize = {**self.initialize, "params": {**self.initialize["params"],
+                                                       "protocolVersion": self.protocol}}
+        backend = Backend(self.root, selected, directory, self.arguments, self.events, initialize)
+        self.backends.add(backend)
+        return backend
+
+    def dispatch_waiting(self):
+        self.expire_tasks()
+        for key, message in list(self.waiting.items()):
+            if self.initialize is not None and self.protocol is None and message["method"] != "initialize":
+                continue
+            backend = None
+            try:
+                task_id = self.task_reference(message)
+                if message["method"] in {"tasks/get", "tasks/result", "tasks/cancel"} or task_id is not None:
+                    task = self.tasks.get(task_id) if isinstance(task_id, str) else None
+                    if task is None:
+                        self.error(message, "unknown or expired task ID; request not dispatched", -32602)
+                        self.waiting.pop(key, None)
+                        self.task_lists.pop(key, None)
+                        continue
+                    backend = task["backend"]
+                    if backend.retiring or task.get("failure"):
+                        raise ValueError(task.get("failure", "task backend is unavailable; completion unknown"))
+                    selected = backend.selected
+                    payload = self.task_metadata(backend, message, False)
+                    if message["method"].startswith("tasks/"):
+                        payload = {**payload, "params": {**payload["params"], "taskId": task["backend_id"]}}
+                else:
+                    selected, directory = selected_environment(self.root)
+                    backend = self.backend(selected, directory, message["method"] == "initialize")
+                    payload = message
+                self.waiting_on[key] = backend
+                if not backend.ready:
+                    continue
+                # Initialization may have taken time: do not dispatch against
+                # a selection superseded while that child was starting.
+                if task_id is None and selected_environment(self.root)[0] != selected:
+                    continue
+                wire_id = "gateway-request-" + uuid.uuid4().hex
+                payload = {**payload, "id": wire_id}
+                params = message.get("params", {})
+                meta = params.get("_meta", {}) if isinstance(params, dict) else {}
+                if isinstance(meta, dict) and "progressToken" in meta:
+                    token = "gateway-progress-" + uuid.uuid4().hex
+                    payload["params"] = {**params, "_meta": {**meta, "progressToken": token}}
+                    backend.progress_tokens[message_key(token)] = (key, meta["progressToken"])
+                backend.send(payload)
+                backend.request_ids[message_key(wire_id)] = key
+                backend.wire_ids[key] = wire_id
+                backend.pending.add(key)
+                self.pending[key] = (backend, message)
+            except (OSError, ValueError, queue.Full) as exc:
+                if backend is not None:
+                    backend.forget_request(key)
+                self.error(message, f"dispatch {message['method']} for {self.root.name}: {exc}; "
+                           "stdout=<request not dispatched>; stderr=<not started>")
+                self.task_lists.pop(key, None)
+            self.waiting.pop(key, None)
+            self.waiting_on.pop(key, None)
+
+    def client_message(self, message):
+        method = message.get("method")
+        if method is None:
+            callback = self.callbacks.pop(message_key(message.get("id")), None)
+            if callback:
+                backend, original = callback
+                self.forward(backend, self.task_metadata(backend, {**message, "id": original}, False))
+            return
+        if "id" in message:
+            key = message_key(message["id"])
+            if key in self.pending or key in self.waiting:
+                self.error(message, "duplicate active request ID")
+                return
+            if len(self.pending) + len(self.waiting) >= 128:
+                self.error(message, "128 active requests are already pending; request not dispatched")
+                return
+            if method == "initialize":
+                if self.initialize is not None:
+                    self.error(message, "connection is already initialized")
+                    return
+                self.initialize = dict(message)
+            self.expire_tasks()
+            if isinstance(message.get("params"), dict) and "task" in message["params"]:
+                creating = sum("task" in request.get("params", {}) for _, request in self.pending.values())
+                creating += sum("task" in request.get("params", {}) for request in self.waiting.values())
+                if len(self.tasks) + creating >= 128:
+                    self.error(message, "128 active tasks are already retained; request not dispatched")
+                    return
+            if method == "tasks/list":
+                if message.get("params", {}).get("cursor") is not None:
+                    self.error(message, "unknown task-list cursor", -32602)
+                    return
+                # The gateway exposes only its own connection's task namespace.
+                # Read each owner serially for current state, keeping queues bounded.
+                self.task_lists[key] = {"message": message, "remaining": deque(self.tasks), "tasks": []}
+                self.next_task_list_request(key)
+                return
+            self.waiting[key] = message
+            return
+        if method == "notifications/initialized":
+            self.initialized = True
+        if method == "notifications/cancelled":
+            key = message_key(message.get("params", {}).get("requestId"))
+            pending = self.pending.pop(key, None)
+            self.task_lists.pop(key, None)
+            if pending:
+                owner, request = pending
+                wire_id = owner.forget_request(key)
+                self.forward(owner, {**message, "params": {**message["params"], "requestId": wire_id}})
+                self.emit({"jsonrpc": "2.0", "id": request["id"], "error": {
+                    "code": -32800, "message": "client cancelled request; backend cancellation forwarded"}})
+            else:
+                self.waiting.pop(key, None)
+                self.waiting_on.pop(key, None)
+            return
+        identifier = self.task_reference(message)
+        if identifier is not None:
+            task = self.tasks.get(identifier) if isinstance(identifier, str) else None
+            if task and not task["backend"].retiring:
+                self.forward(task["backend"], self.task_metadata(task["backend"], message, False))
+            return
+        for backend in self.backends:
+            if backend.ready and not backend.retiring:
+                self.forward(backend, message)
+
+    def backend_message(self, backend, message):
+        if message.get("id") == backend.bootstrap_id and backend.bootstrap_id is not None:
+            result = message.get("result", {})
+            if "error" in message or result.get("protocolVersion") != self.protocol:
+                self.fail_backend(backend, "replacement initialization failed: " + json.dumps(message))
+                return
+            backend.ready = True
+            if self.initialized:
+                self.forward(backend, {"jsonrpc": "2.0", "method": "notifications/initialized"})
+            if self.initialized and result.get("capabilities", {}).get("tools") is not None:
+                self.emit({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
+            return
+        if "method" in message:
+            if message["method"] == "notifications/tasks/status":
+                try:
+                    raw_id = message.get("params", {}).get("taskId")
+                    if not any(task["backend"] is backend and task["backend_id"] == raw_id for task in self.tasks.values()):
+                        return
+                    identifier = self.remember_task(backend, message.get("params", {}))
+                    message = {**message, "params": self.tasks[identifier]["value"]}
+                except (KeyError, TypeError, ValueError) as exc:
+                    self.fail_backend(backend, "invalid task status: " + str(exc))
+                    return
+            message = self.task_metadata(backend, message, True)
+            if message["method"] == "notifications/progress":
+                progress = backend.progress_tokens.get(message_key(message.get("params", {}).get("progressToken")))
+                if progress is None:
+                    return
+                message = {**message, "params": {**message["params"], "progressToken": progress[1]}}
+            if message["method"] == "notifications/cancelled":
+                original = message.get("params", {}).get("requestId")
+                for identifier, (owner, request_id) in list(self.callbacks.items()):
+                    if owner is backend and request_id == original:
+                        message = {**message, "params": {**message["params"],
+                                   "requestId": json.loads(identifier)}}
+                        self.callbacks.pop(identifier)
+                        break
+            if "id" in message:
+                if self.closing:
+                    self.forward(backend, {"jsonrpc": "2.0", "id": message["id"], "error": {
+                        "code": -32000, "message": "MCP client input closed; callback not dispatched"}})
+                    return
+                if len(self.callbacks) >= 128:
+                    self.forward(backend, {"jsonrpc": "2.0", "id": message["id"],
+                                          "error": {"code": -32603, "message": "gateway back-channel capacity exceeded"}})
+                    return
+                identifier = "gateway-callback-" + uuid.uuid4().hex
+                self.callbacks[message_key(identifier)] = (backend, message["id"])
+                message = {**message, "id": identifier}
+            self.emit(message)
+            return
+        key = backend.request_ids.pop(message_key(message.get("id")), None)
+        pending = self.pending.get(key)
+        if not pending or pending[0] is not backend:
+            return
+        result = message.get("result", {})
+        params = pending[1].get("params", {})
+        try:
+            if isinstance(result, dict) and isinstance(result.get("task"), dict) and "task" in params:
+                identifier = self.remember_task(backend, result["task"])
+                backend.progress_tokens = {token: ("task:" + identifier, value[1]) if value[0] == key else value
+                                           for token, value in backend.progress_tokens.items()}
+                message = {**message, "result": {**result, "task": self.tasks[identifier]["value"]}}
+            elif pending[1]["method"] in {"tasks/get", "tasks/cancel"} and "result" in message:
+                if result.get("taskId") != self.tasks[params["taskId"]]["backend_id"]:
+                    raise ValueError("backend returned a different taskId")
+                identifier = self.remember_task(backend, result)
+                message = {**message, "result": self.tasks[identifier]["value"]}
+        except (KeyError, TypeError, ValueError) as exc:
+            self.fail_backend(backend, "invalid task response: " + str(exc))
+            return
+        message = self.task_metadata(backend, message, True)
+        self.pending.pop(key)
+        backend.forget_request(key)
+        if pending[1]["method"] == "initialize" and "result" in message:
+            self.protocol = message["result"].get("protocolVersion")
+            tools = message["result"].get("capabilities", {}).get("tools")
+            if isinstance(tools, dict):
+                tools["listChanged"] = True
+        if key in self.task_lists:
+            if "error" in message:
+                self.task_lists.pop(key)
+                self.emit({**message, "id": pending[1]["id"]})
+            else:
+                self.task_lists[key]["tasks"].append(message["result"])
+                self.next_task_list_request(key)
+        else:
+            self.emit({**message, "id": pending[1]["id"]})
+        if pending[1]["method"] == "tasks/result" and "result" in message:
+            self.forget_task(params.get("taskId"))
+
+    def fail_backend(self, backend, cause):
+        detail = backend.diagnostic(cause)
+        for key, (owner, message) in list(self.pending.items()):
+            if owner is backend:
+                self.error(message, f"{message['method']} request {message['id']}: {detail}; completion unknown")
+                self.pending.pop(key)
+                backend.forget_request(key)
+                self.task_lists.pop(key, None)
+        try:
+            selected = selected_environment(self.root)[0]
+        except (OSError, ValueError):
+            selected = None
+        for key, message in list(self.waiting.items()):
+            identifier = self.task_reference(message)
+            task = self.tasks.get(identifier) if isinstance(identifier, str) else None
+            if selected == backend.selected or (task and task["backend"] is backend):
+                if self.waiting_on.get(key) is backend or task:
+                    self.error(message, f"{message['method']} request {message['id']}: {detail}; request not dispatched")
+                    self.waiting.pop(key)
+                    self.waiting_on.pop(key, None)
+                    self.task_lists.pop(key, None)
+        for task in self.tasks.values():
+            if task["backend"] is backend:
+                task["failure"] = detail + "; task completion unknown"
+        self.callbacks = {key: value for key, value in self.callbacks.items() if value[0] is not backend}
+        backend.retire()
+        if backend.bootstrap_id is not None and not backend.ready and backend.process.poll() is None:
+            # A failed private handshake accepted no application request. It
+            # must not retain an environment indefinitely if stdin is ignored.
+            try:
+                backend.process.kill()
+            except OSError as exc:
+                print(backend.diagnostic(f"stop failed initialization: {exc}"), file=sys.stderr)
+
+    def retire_idle(self):
+        self.expire_tasks()
+        try:
+            selected = selected_environment(self.root)[0]
+        except (OSError, ValueError):
+            selected = None
+        for backend in list(self.backends):
+            if not backend.ready and not backend.retiring and time.monotonic() - backend.started > 60:
+                self.fail_backend(backend, "replacement initialization exceeded 60 seconds")
+            busy = (backend.pending or backend in self.waiting_on.values()
+                    or any(value[0] is backend for value in self.callbacks.values())
+                    or (not self.closing and any(task["backend"] is backend and not task.get("failure")
+                                                for task in self.tasks.values())))
+            if not busy and (self.closing or (selected is not None and backend.selected != selected)):
+                backend.retire()
+
+    def run(self):
+        stream = getattr(sys.stdin, "buffer", sys.stdin)
+        threading.Thread(target=read_messages, args=(stream, self.events, None), daemon=True).start()
+        while not self.closing or self.backends:
+            try:
+                kind, backend, value = self.events.get(timeout=1)
+            except queue.Empty:
+                if not self.closing:
+                    self.dispatch_waiting()
+                self.retire_idle()
+                continue
+            if kind == "message":
+                if backend is None:
+                    self.client_message(value)
+                else:
+                    self.backend_message(backend, value)
+            elif backend is None:
+                self.closing = True
+                for message in self.waiting.values():
+                    self.error(message, "client input closed before request dispatch")
+                self.waiting.clear()
+                self.waiting_on.clear()
+                self.task_lists.clear()
+                for owner, original in list(self.callbacks.values()):
+                    self.forward(owner, {"jsonrpc": "2.0", "id": original, "error": {
+                        "code": -32000, "message": "MCP client input closed before callback response"}})
+                self.callbacks.clear()
+            elif kind == "read_error":
+                self.fail_backend(backend, value)
+            else:
+                if (backend.pending or not backend.ready
+                        or any(value[0] is backend for value in self.callbacks.values())
+                        or any(task["backend"] is backend for task in self.tasks.values())):
+                    self.fail_backend(backend, "selected backend exited before replying")
+                backend.retire()
+                self.backends.discard(backend)
+                backend.lease.close()
+                backend.process.stdout.close()
+                backend.process.stderr.close()
+            if not self.closing:
+                self.dispatch_waiting()
+            self.retire_idle()
+        return 0
+
+
+def main() -> int:
+    root = Path(__file__).resolve().parent.parent
+    arguments = sys.argv[1:]
+    # These frontends require an explicit service mode; bare invocation must
+    # retain their CLI usage/exit behavior instead of waiting for JSON input.
+    explicit_service_mode = {"ceratops_mcp_server_manager", "form-filling-mcp-server",
+                             "source_search_mcp", "whatsapp-desktop-mcp-server"}
+    is_mcp = ("--mcp" in arguments or (not arguments and root.name not in explicit_service_mode)
+              or (arguments and arguments[0] == "serve"))
+    if is_mcp:
+        return McpGateway(root, arguments).run()
+    selected, directory = selected_environment(root)
+    with leased_command(root, selected, directory, arguments) as command:
+        # CLI commands retain inherited stdio and their exact child exit code.
+        return subprocess.call(command, **child_options(), stdin=sys.stdin,
+                               stdout=sys.stdout, stderr=sys.stderr)
 
 
 if __name__ == "__main__":
