@@ -41,7 +41,12 @@ results through the model; their scripts remain inside their own skill.
 
 Dependency queue finalization stages approved PR heads together in a thread
 worktree and publishes through `release/local` using the existing promotion
-and shipping workflow. It processes every eligible update in a repository;
+and shipping workflow. Preflight keeps package/version identification from PR
+titles and reads dependency files from each exact PR commit, including when
+local unpublished work moved or deleted them. A missing commit is fetched
+without changing the checkout; read failures block review and retain their
+Git diagnostics. This source collection does not replace compatibility review
+or release checks. It processes every eligible update in a repository;
 changed PR heads still need new preflight approval. The
 `--include-unpublished-release OWNER/REPO=COMMIT` option carries explicit
 authority for unrelated work at that exact release commit. Fresh calls inspect

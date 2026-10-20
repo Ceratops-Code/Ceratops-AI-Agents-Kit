@@ -105,6 +105,14 @@ remain with their existing owners.
 Dependabot must address the directories containing the dependency projects,
 including `/scripts` and the separate shared skill project.
 
+Dependabot preflight identifies updates from PR titles and collects dependency
+files from the exact PR head through Git's tree and blob readers. It fetches a
+missing commit by object ID without moving branches, the index or working
+files; local edits and symlinks cannot substitute other content. Read failures
+retain the command, target, exit status and both output streams. Alerts without
+a PR keep their local context. These facts feed the existing compatibility
+review and promotion through `release/local`; they do not grant merge approval.
+
 Repository examples use `uv run --locked scripts/<entrypoint>.py`; source
 helpers outside `scripts` use `uv run --project scripts --locked python ...`.
 The caller and uv prepare the environment. Individual scripts do not contain

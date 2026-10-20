@@ -397,6 +397,7 @@ def preflight(args: argparse.Namespace) -> int:
                         update,
                         changed_files,
                         repo_alerts,
+                        str(live.get("head_oid") or ""),
                     )
                     if checkout.get("status") == "found"
                     else {
