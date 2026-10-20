@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any, cast
 
 import pytest
 
@@ -71,7 +72,8 @@ def test_current_skill_keeps_watched_directory_and_only_needed_effects(
                         "rename_with_retry", guard_directory_rename)
     handle = None
     if os.name == "nt":
-        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        windows_ctypes = cast(Any, ctypes)
+        kernel = windows_ctypes.WinDLL("kernel32", use_last_error=True)
         kernel.CreateFileW.argtypes = (ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32,
                                       ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p)
         kernel.CreateFileW.restype = ctypes.c_void_p
@@ -82,7 +84,7 @@ def test_current_skill_keeps_watched_directory_and_only_needed_effects(
         if handle is not None:
             with pytest.raises(OSError) as blocked:
                 alpha.replace(destination / "would-fail")
-            assert blocked.value.winerror == 5
+            assert getattr(blocked.value, "winerror", None) == 5
         for attempt in range(2):
             result = builder["install_transaction"](repo, destination, all_managed=True)
             affected = ({"alpha-tool", "beta-tool"} if other_source_root else set()) | (
