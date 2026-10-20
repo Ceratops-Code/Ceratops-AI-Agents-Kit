@@ -14,6 +14,7 @@ import sys
 import venv
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -869,3 +870,403 @@ def test_command_failure_keeps_invocation_and_both_streams(tmp_path, monkeypatch
     assert result["stdout"].startswith("BEGIN-") if failure != "spawn" else result["stdout"] == "<no stdout>"
     assert "-END" in result["stdout"] if failure != "spawn" else result["stderr"] == "<no stderr>"
     assert result["stderr"] == ("child timed out" if failure == "timeout" else "<no stderr>")
+
+
+GATEWAY_FIXTURE_SERVER = r'''
+import json, os, sys, threading, time
+from pathlib import Path
+lock = threading.Lock()
+callbacks = {}
+cancellations = {}
+initialized = False
+version = Path(__file__).resolve().parents[4].name
+def emit(message):
+    with lock:
+        print(json.dumps({"jsonrpc":"2.0", **message}), flush=True)
+def result(identifier, **values):
+    emit({"id":identifier,"result":{"version":version,"pid":os.getpid(),**values}})
+def hold(identifier, arguments, background=False):
+    cancel = cancellations.setdefault(identifier, threading.Event())
+    Path(arguments["started"]).write_text("started")
+    token = arguments.get("progress_token")
+    if token is not None:
+        emit({"method":"notifications/progress", "params":{"progressToken":token,"progress":0}})
+    while not Path(arguments["release"]).exists():
+        if cancel.wait(.01) and not arguments.get("ignore_cancel"):
+            break
+    if token is not None:
+        emit({"method":"notifications/progress", "params":{"progressToken":token,"progress":1}})
+    if arguments.get("ignore_cancel"):
+        result(identifier, completed=True)
+        return
+        pass
+    if background:
+        Path(arguments["completed"]).write_text(version)
+    elif cancel.is_set():
+        emit({"id":identifier,"error":{"code":-32800,"message":"cancelled"}})
+    else:
+        result(identifier, completed=True)
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    identifier = message.get("id")
+    if method == "initialize":
+        protocol = "2025-11-25" if version == "1.0.0" else message["params"]["protocolVersion"]
+        if (Path(__file__).parent / "bad-protocol").exists():
+            protocol = "incompatible"
+            threading.Thread(target=time.sleep, args=(300,)).start()
+        emit({"id":identifier,"result":{"protocolVersion":protocol,"capabilities":{"tools":{}},
+                                     "serverInfo":{"name":"fixture","version":version}}})
+    elif method == "notifications/initialized":
+        initialized = True
+    elif method == "notifications/cancelled":
+        cancellations.setdefault(message["params"]["requestId"],threading.Event()).set()
+    elif method is None and "id" in message:
+        result(callbacks.pop(identifier), callback=message.get("result"), callback_error=message.get("error"))
+    elif method == "tools/call":
+        name = message["params"]["name"]
+        arguments = message["params"].get("arguments",{})
+        arguments["progress_token"] = message["params"].get("_meta",{}).get("progressToken")
+        if name == "hold":
+            threading.Thread(target=hold,args=(identifier,arguments)).start()
+        elif name == "background":
+            threading.Thread(target=hold,args=(identifier,arguments,True)).start()
+            result(identifier, queued=True)
+        elif name == "callback":
+            callbacks[1] = identifier
+            emit({"id":1,"method":"roots/list","params":{}})
+        elif name == "crash":
+            print("fixture failure evidence",file=sys.stderr,flush=True)
+            os._exit(17)
+        else:
+            result(identifier, initialized=initialized)
+    elif "id" in message:
+        result(identifier)
+'''
+
+
+@pytest.fixture
+def gateway_client(tmp_path, monkeypatch):
+    """Run the installed standalone gateway against real isolated stdio children."""
+    import queue
+    import threading
+    import time
+
+    monkeypatch.setattr(storage, "INSTALL_ROOT", tmp_path)
+    layout = storage.Layout("fixture")
+    layout.install_launcher()
+    selections, directories, clients = {}, {}, []
+    release_paths = set()
+    for version, instance in (("1.0.0", "a" * 32), ("2.0.0", "b" * 32)):
+        selected = {"schema": 1, "mcp_server_id": "fixture", "version": version,
+                    "manifest_sha256": instance * 2, "instance": instance, "module": "gateway_fixture"}
+        directory = layout.directory("versions", version, instance)
+        (directory / "receipt.json").write_text(json.dumps(selected), encoding="utf-8")
+        venv.EnvBuilder(with_pip=False).create(directory / "environment")
+        site = directory / "environment/Lib/site-packages"
+        (site / "gateway_fixture.py").write_text(GATEWAY_FIXTURE_SERVER, encoding="utf-8")
+        selections[version], directories[version] = selected, directory
+
+    def select(version):
+        staging = layout.path(".current.tmp")
+        staging.write_text(json.dumps(selections[version]), encoding="utf-8")
+        staging.replace(layout.path("current.json"))
+
+    def connect():
+        process = subprocess.Popen(
+            [sys.executable, "-I", "-B", str(layout.path("bin", "fixture.py")), "--mcp"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        messages = queue.Queue()
+        errors = []
+
+        def read():
+            for line in process.stdout:
+                messages.put(json.loads(line))
+            messages.put(None)
+
+        def read_errors():
+            errors.extend(process.stderr)
+
+        threading.Thread(target=read, daemon=True).start()
+        threading.Thread(target=read_errors, daemon=True).start()
+
+        def send(message):
+            arguments = message.get("params", {}).get("arguments", {})
+            if "release" in arguments:
+                release_paths.add(Path(arguments["release"]))
+            process.stdin.write(json.dumps({"jsonrpc": "2.0", **message}) + "\n")
+            process.stdin.flush()
+
+        deferred = []
+
+        def receive(identifier=None):
+            for index, message in enumerate(deferred):
+                if identifier is None or message.get("id") == identifier:
+                    return deferred.pop(index)
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                message = messages.get(timeout=max(.01, deadline - time.monotonic()))
+                assert message is not None, (process.poll(), "".join(errors))
+                if identifier is None or message.get("id") == identifier:
+                    return message
+                deferred.append(message)
+            raise AssertionError(("gateway response deadline", "".join(errors)))
+
+        def call(identifier, name, **arguments):
+            send({"id": identifier, "method": "tools/call",
+                  "params": {"name": name, "arguments": arguments}})
+            return receive(identifier)
+
+        client = SimpleNamespace(process=process, send=send, receive=receive, call=call,
+                                 errors=errors, messages=messages, deferred=deferred)
+        clients.append(client)
+        return client
+
+    def initialize(client, requested="2025-11-25"):
+        client.send({"id": 0, "method": "initialize", "params": {
+            "protocolVersion": requested, "capabilities": {"roots": {"listChanged": True}},
+            "clientInfo": {"name": "fixture-client", "version": "1"}}})
+        assert client.receive(0)["result"]["protocolVersion"] == "2025-11-25"
+        client.send({"method": "notifications/initialized"})
+
+    def wait_path(path):
+        deadline = time.monotonic() + 10
+        while not path.exists() and time.monotonic() < deadline:
+            time.sleep(.01)
+        assert path.exists(), path
+
+    def retired(version):
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            with layout._retirement_lease(directories[version]) as removable:
+                if removable:
+                    return
+            time.sleep(.02)
+        raise AssertionError("old environment lease did not drain")
+
+    select("1.0.0")
+    try:
+        yield SimpleNamespace(connect=connect, select=select, initialize=initialize,
+                              layout=layout, directories=directories, wait_path=wait_path,
+                              retired=retired, root=tmp_path)
+    finally:
+        # Only fixture-owned waits are released; no unrelated process is signaled.
+        for path in release_paths:
+            path.write_text("release")
+        for client in clients:
+            if client.process.stdin and not client.process.stdin.closed:
+                client.process.stdin.close()
+            try:
+                client.process.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                subprocess.run(["taskkill", "/PID", str(client.process.pid), "/T", "/F"],
+                               capture_output=True, check=False,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                client.process.wait(timeout=5)
+            client.process.stdout.close()
+            client.process.stderr.close()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Installed Windows environment layout")
+def test_gateway_routes_repeated_calls_and_replays_initialization_after_selection(gateway_client):
+    fixture = gateway_client
+    client = fixture.connect()
+    fixture.initialize(client, requested="2099-01-01")
+    first = client.call(1, "identity")["result"]
+    assert first["version"] == "1.0.0" and first["initialized"]
+    assert client.call(2, "identity")["result"]["pid"] == first["pid"]
+    fixture.select("2.0.0")
+    second = client.call(3, "identity")["result"]
+    assert second["version"] == "2.0.0" and second["initialized"]
+    assert second["pid"] != first["pid"]
+    fixture.retired("1.0.0")
+    fixture.select("1.0.0")
+    assert client.call(4, "identity")["result"]["version"] == "1.0.0"
+    fixture.retired("2.0.0")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Installed Windows environment layout")
+def test_gateway_switches_without_repeating_or_cancelling_an_inflight_call(gateway_client):
+    fixture = gateway_client
+    client = fixture.connect()
+    fixture.initialize(client)
+    release, started = fixture.root / "release-hold", fixture.root / "started"
+    release.touch()
+    release.unlink()
+    client.send({"id": 1, "method": "tools/call", "params": {
+        "name": "hold", "arguments": {"release": str(release), "started": str(started)}}})
+    fixture.wait_path(started)
+    fixture.select("2.0.0")
+    assert client.call(2, "identity")["result"]["version"] == "2.0.0"
+    with fixture.layout._retirement_lease(fixture.directories["1.0.0"]) as removable:
+        assert not removable
+    release.touch()
+    assert client.receive(1)["result"]["version"] == "1.0.0"
+    fixture.retired("1.0.0")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Installed Windows environment layout")
+def test_gateway_drains_background_work_and_releases_idle_old_backends(gateway_client):
+    fixture = gateway_client
+    client = fixture.connect()
+    fixture.initialize(client)
+    release, started = fixture.root / "release-background", fixture.root / "started"
+    completed = fixture.root / "completed"
+    result = client.call(1, "background", release=str(release),
+                         started=str(started), completed=str(completed))
+    assert result["result"]["queued"]
+    fixture.wait_path(started)
+    fixture.select("2.0.0")
+    assert client.call(2, "identity")["result"]["version"] == "2.0.0"
+    with fixture.layout._retirement_lease(fixture.directories["1.0.0"]) as removable:
+        assert not removable
+    assert not completed.exists()
+    release.touch()
+    fixture.wait_path(completed)
+    fixture.retired("1.0.0")
+    # No new client call is needed to release an obsolete idle environment.
+    fixture.select("1.0.0")
+    fixture.retired("2.0.0")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Installed Windows environment layout")
+def test_gateway_keeps_overlapping_backchannel_ids_and_cancellation_with_owner(gateway_client):
+    fixture = gateway_client
+    client = fixture.connect()
+    fixture.initialize(client)
+    request = lambda identifier: {"id": identifier, "method": "tools/call",
+                                  "params": {"name": "callback", "arguments": {}}}
+    client.send(request(1))
+    first = client.receive()
+    assert first["method"] == "roots/list"
+    fixture.select("2.0.0")
+    client.send(request(2))
+    second = client.receive()
+    while second.get("method") != "roots/list":
+        second = client.receive()
+    assert first["id"] != second["id"]
+    client.send({"id": second["id"], "result": {"roots": ["new"]}})
+    assert client.receive(2)["result"]["callback"] == {"roots": ["new"]}
+    client.send({"id": first["id"], "result": {"roots": ["old"]}})
+    assert client.receive(1)["result"]["callback"] == {"roots": ["old"]}
+    fixture.retired("1.0.0")
+    release, started = fixture.root / "release-cancel", fixture.root / "cancel-started"
+    client.send({"id": 3, "method": "tools/call", "params": {
+        "name": "hold", "arguments": {"release": str(release), "started": str(started)}}})
+    fixture.wait_path(started)
+    fixture.select("1.0.0")
+    assert client.call(4, "identity")["result"]["version"] == "1.0.0"
+    client.send({"method": "notifications/cancelled", "params": {"requestId": 3}})
+    assert client.receive(3)["error"]["code"] == -32800
+    fixture.retired("2.0.0")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Installed Windows environment layout")
+@pytest.mark.parametrize("effect", ["before-lease", "before-start", "after-start", "after-dispatch"])
+def test_gateway_fresh_connections_converge_across_interrupted_effects(gateway_client, effect):
+    fixture = gateway_client
+    client = fixture.connect()
+    fixture.initialize(client)
+    assert client.call(1, "identity")["result"]["version"] == "1.0.0"
+    fixture.select("2.0.0")
+    if effect == "before-lease":
+        receipt = fixture.directories["2.0.0"] / "receipt.json"
+        original = receipt.read_bytes()
+        receipt.unlink()
+        assert "receipt.json" in client.call(2, "identity")["error"]["message"]
+        receipt.write_bytes(original)
+    elif effect == "before-start":
+        python = fixture.directories["2.0.0"] / "environment/Scripts/python.exe"
+        original = python.read_bytes()
+        python.write_bytes(b"not an executable")
+        assert "error" in client.call(2, "identity")
+        python.write_bytes(original)
+    elif effect == "after-start":
+        site = fixture.directories["2.0.0"] / "environment/Lib/site-packages"
+        marker = site / "bad-protocol"
+        marker.touch()
+        assert "initialization failed" in client.call(2, "identity")["error"]["message"]
+        fixture.retired("2.0.0")
+        marker.unlink()
+    else:
+        release, started = fixture.root / "release-disconnect", fixture.root / "started"
+        client.send({"id": 2, "method": "tools/call", "params": {
+            "name": "hold", "arguments": {"release": str(release), "started": str(started)}}})
+        fixture.wait_path(started)
+        client.process.stdin.close()
+        release.touch()
+        assert client.receive(2)["result"]["version"] == "2.0.0"
+        assert client.process.wait(timeout=10) == 0
+    fresh = fixture.connect()
+    fixture.initialize(fresh)
+    assert fresh.call(3, "identity")["result"]["version"] == "2.0.0"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Installed Windows environment layout")
+def test_gateway_stateless_messages_and_failure_evidence_do_not_replay_calls(gateway_client):
+    fixture = gateway_client
+    client = fixture.connect()
+    # Current stateless MCP requests require no legacy initialize handshake.
+    assert client.call(1, "identity")["result"]["version"] == "1.0.0"
+    fixture.select("2.0.0")
+    assert client.call(2, "identity")["result"]["version"] == "2.0.0"
+    failure = client.call(3, "crash")["error"]["message"]
+    assert "exit=17" in failure and "fixture failure evidence" in failure
+    assert "invocation=" in failure and "stdout=" in failure and "stderr=" in failure
+    assert client.call(4, "identity")["result"]["version"] == "2.0.0"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Installed Windows environment layout")
+def test_gateway_drops_cancelled_replies_and_progress_before_reusing_client_ids(gateway_client):
+    import queue
+
+    fixture = gateway_client
+    client = fixture.connect()
+    fixture.initialize(client)
+    old_release, old_started = fixture.root / "old-release", fixture.root / "old-started"
+    new_release, new_started = fixture.root / "new-release", fixture.root / "new-started"
+
+    def hold(release, started, ignore_cancel=False):
+        client.send({"id": 1, "method": "tools/call", "params": {
+            "name": "hold", "_meta": {"progressToken": 3}, "arguments": {
+                "release": str(release), "started": str(started), "ignore_cancel": ignore_cancel}}})
+
+    hold(old_release, old_started, True)
+    progress = client.receive()
+    assert progress["method"] == "notifications/progress" and progress["params"]["progressToken"] == 3
+    fixture.select("2.0.0")
+    assert client.call(2, "identity")["result"]["version"] == "2.0.0"
+    client.send({"method": "notifications/cancelled", "params": {"requestId": 1}})
+    assert client.receive(1)["error"]["code"] == -32800
+    hold(new_release, new_started)
+    fixture.wait_path(new_started)
+    old_release.touch()
+    fixture.retired("1.0.0")
+    new_release.touch()
+    assert client.receive(1)["result"]["version"] == "2.0.0"
+    progress = [message for message in client.deferred if message.get("method") == "notifications/progress"]
+    while True:
+        try:
+            message = client.messages.get_nowait()
+        except queue.Empty:
+            break
+        if message and message.get("method") == "notifications/progress":
+            progress.append(message)
+    assert [message["params"]["progress"] for message in progress] == [0, 1]
+    assert all(message["params"]["progressToken"] == 3 for message in progress)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Installed Windows environment layout")
+def test_gateway_disconnect_finishes_callbacks_without_pinning_the_backend(gateway_client):
+    fixture = gateway_client
+    client = fixture.connect()
+    fixture.initialize(client)
+    client.send({"id": 1, "method": "tools/call", "params": {"name": "callback"}})
+    assert client.receive()["method"] == "roots/list"
+    client.process.stdin.close()
+    result = client.receive(1)["result"]
+    assert result["callback_error"]["code"] == -32000
+    assert client.process.wait(timeout=10) == 0
+    fixture.retired("1.0.0")

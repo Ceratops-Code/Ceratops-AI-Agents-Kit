@@ -69,6 +69,10 @@ deliverables:
           requires:
             capabilities: []
           no-op: Repository validation covers the MCP server manager source and manifest.
+        test:
+          requires:
+            capabilities: []
+          no-op: Repository tests cover managed launchers, selection changes, and version retirement.
         install:
           requires:
             capabilities: [uv]
