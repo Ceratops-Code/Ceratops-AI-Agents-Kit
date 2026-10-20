@@ -860,6 +860,125 @@ def test_result_retention_prunes_at_startup_and_preserves_other_producers(
     assert unrelated.read_text() == "keep"
 
 
+@pytest.mark.parametrize("other_checkout", [False, True])
+def test_result_save_touches_only_affected_check(
+    test_runner_module, tmp_path, monkeypatch, other_checkout,
+):
+    import importlib
+    import uuid
+
+    module = importlib.import_module("reuse_test_results")
+    root = _acceptance_repository(tmp_path)
+    for name in ("example", "other"):
+        _acceptance_test(root, name, tmp_path / "effects.log")
+    nodeid = "tests/test_example.py::test_example"
+    monkeypatch.setattr(module, "RETAINED_VERSIONS", 99)
+    for version in range(5):
+        (root / "tests/test_example.py").write_text(f"VERSION = {version}\n")
+        (root / "tests/test_other.py").write_text(f"VERSION = {version}\n")
+        current = _result_store(root)
+        saved = current.save(nodeid, current.inputs(nodeid))
+        if other_checkout:
+            inputs = {**saved["inputs"], "checkout": "another-checkout"}
+            group = module._digest([inputs["checkout"], nodeid])[:24]
+            current._write_attempt({
+                **saved, "inputs": inputs, "inputs_digest": module._digest(inputs),
+                "result_id": group + "-" + uuid.uuid4().hex,
+            })
+        else:
+            other = "tests/test_other.py::test_other"
+            current.save(other, current.inputs(other))
+
+    unaffected = {
+        path: path.read_bytes() for path in current.directory.glob("pytest-attempt-*.json")
+        if ((record := json.loads(path.read_bytes()))["nodeid"] != nodeid
+            or record["inputs"]["checkout"] != current.checkout)
+    }
+    inspected: list[str] = []
+
+    class ObservedRecord(dict):
+        def __getitem__(self, key):
+            inspected.append(key)
+            return super().__getitem__(key)
+
+        def get(self, key, default=None):
+            inspected.append(key)
+            return super().get(key, default)
+
+    original_reader = module.ResultStore._read_records
+
+    def observed_reader(store, group=None):
+        return [
+            ObservedRecord(record)
+            if (record["nodeid"] != nodeid or record["inputs"]["checkout"] != store.checkout)
+            else record
+            for record in original_reader(store, group)
+        ]
+
+    (root / "tests/test_example.py").write_text("VERSION = 5\n")
+    monkeypatch.setattr(module.ResultStore, "_read_records", observed_reader)
+    current = _result_store(root)  # Startup may inspect every group.
+    inspected.clear()
+    monkeypatch.setattr(module, "RETAINED_VERSIONS", 3)
+    inputs = current.inputs(nodeid)
+    saved = current.save(nodeid, inputs)
+    assert current.matching(nodeid, inputs)["result_id"] == saved["result_id"]
+    assert inspected == []  # Refresh, matching and pruning must all stay scoped.
+    assert len(unaffected) == 5
+    assert all(path.read_bytes() == original for path, original in unaffected.items())
+    assert len(list(current.directory.glob("pytest-attempt-*.json"))) == 8
+    repeated = current.save(nodeid, inputs)
+    assert repeated["result_id"] == saved["result_id"]
+    assert inspected == []
+    fresh = _result_store(root)
+    assert len(list(fresh.directory.glob("pytest-attempt-*.json"))) == 6
+
+
+@pytest.mark.parametrize("after_removal", [False, True])
+def test_result_save_retention_converges_after_interrupted_removal(
+    test_runner_module, tmp_path, monkeypatch, after_removal,
+):
+    import importlib
+
+    module = importlib.import_module("reuse_test_results")
+    root = _acceptance_repository(tmp_path)
+    _acceptance_test(root, "example", tmp_path / "effects.log")
+    nodeid = "tests/test_example.py::test_example"
+    monkeypatch.setattr(module, "RETAINED_VERSIONS", 99)
+    for version in range(5):
+        (root / "tests/test_example.py").write_text(f"VERSION = {version}\n")
+        current = _result_store(root)
+        current.save(nodeid, current.inputs(nodeid))
+    (root / "tests/test_example.py").write_text("VERSION = 5\n")
+    current = _result_store(root)
+    inputs = current.inputs(nodeid)
+    monkeypatch.setattr(module, "RETAINED_VERSIONS", 3)
+    original_unlink = pathlib.Path.unlink
+    removed = []
+
+    def interrupted(path, *args, **kwargs):
+        if path.parent == current.directory and path.name.startswith("pytest-attempt-"):
+            if after_removal:
+                original_unlink(path, *args, **kwargs)
+            removed.append(path)
+            raise KeyboardInterrupt("retention interrupted")
+        return original_unlink(path, *args, **kwargs)
+
+    with monkeypatch.context() as boundary:
+        boundary.setattr(pathlib.Path, "unlink", interrupted)
+        with pytest.raises(KeyboardInterrupt, match="retention interrupted"):
+            current.save(nodeid, inputs)
+    assert len(removed) == 1 and removed[0].exists() is not after_removal
+    fresh = _result_store(root)
+    saved = fresh.matching(nodeid, inputs)
+    original_bytes = fresh._record_path(saved).read_bytes()
+    assert fresh.save(nodeid, inputs)["result_id"] == saved["result_id"]
+    repeated = _result_store(root)
+    assert repeated.save(nodeid, inputs)["result_id"] == saved["result_id"]
+    assert fresh._record_path(saved).read_bytes() == original_bytes
+    assert len(list(fresh.directory.glob("pytest-attempt-*.json"))) == 3
+
+
 def test_changed_arguments_and_dependency_versions_do_not_reuse_results(
     test_runner_module, tmp_path, monkeypatch,
 ):
@@ -926,7 +1045,7 @@ def test_competing_writer_keeps_fresh_calls_live_and_retention_bounded(
     stale = _result_store(root)
     with stale.lock:
         busy = _result_store(root)
-        assert busy.records == []
+        assert busy.matching(nodeid, busy.inputs(nodeid)) is None
         assert busy.save(nodeid, busy.inputs(nodeid)) is None
     for version in range(4):
         context = json.loads(module.result_environment(
@@ -1260,7 +1379,8 @@ def test_qualified_retention_protects_inherited_references_and_applicable_failur
     fresh = module.ResultStore(root, context)
     assert store._record_path(original).exists()
     assert store._record_path(failure).exists()
-    assert len([item for item in fresh.records if item.get("qualificationLevel") == "final"]) == 4
+    assert sum(json.loads(path.read_bytes()).get("qualificationLevel") == "final"
+               for path in fresh.directory.glob("pytest-attempt-*.json")) == 4
 
 
 @pytest.mark.parametrize("boundary", ["after_durable_pass", "partial_pass", "incomplete_phases"])

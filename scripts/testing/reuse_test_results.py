@@ -9,8 +9,9 @@ passes, without execution IDs, saved steps or progress-log parsing.
 The owning store is <git-common-dir>/ceratops/results/repository-checks/. This
 producer owns pytest-attempt-*.json, retained pytest-pass-*.json and .pytest-pass.lock there. It writes
 immutable records directly to final paths under the existing filelock library.
-Startup and each completed write retain at most three versions per checkout
-and check/qualification level, preserving referenced facts and failure precedence.
+Startup prunes every checkout/check group; each completed write prunes only its
+affected group. Both retain at most three versions per qualification level,
+preserving referenced facts and failure precedence.
 Other producers' results and live writers are left alone.
 """
 
@@ -208,10 +209,12 @@ class ResultStore:
             "producer": hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest(),
             "shared_inputs": _digest(self.shared),
         }
-        self.records: list[dict[str, Any]] = []
+        self.records_by_check: dict[tuple[str, str], list[dict[str, Any]]] = {}
         try:
             with self.lock:
-                self.records = self._read_records()
+                for record in self._read_records():
+                    group = (record["inputs"]["checkout"], record["nodeid"])
+                    self.records_by_check.setdefault(group, []).append(record)
                 self._prune()
         except Timeout:
             pass  # A competing writer cannot delay a fresh test invocation.
@@ -234,8 +237,8 @@ class ResultStore:
         }
 
     def matching(self, nodeid: str, inputs: Mapping[str, Any]) -> dict[str, Any] | None:
-        candidates = [record for record in reversed(self.records)
-                      if record["nodeid"] == nodeid and record["inputs"] == inputs]
+        records = self.records_by_check.get((inputs["checkout"], nodeid), [])
+        candidates = [record for record in reversed(records) if record["inputs"] == inputs]
         failures = [record for record in candidates if record["outcome"] != "passed"]
         for record in candidates:
             if record["outcome"] != "passed" or not self._eligible(record.get("qualificationLevel")):
@@ -358,41 +361,51 @@ class ResultStore:
                     path.unlink(missing_ok=True)
         return sorted(records, key=lambda record: (record["completed_ns"], record["result_id"]))
 
-    def _prune(self) -> None:
-        groups: dict[tuple[str, str, str | None], list[dict[str, Any]]] = {}
-        identities: dict[tuple[str, str], list[dict[str, Any]]] = {}
-        for record in self.records:
-            groups.setdefault((record["inputs"]["checkout"], record["nodeid"],
-                               record.get("qualificationLevel")), []).append(record)
-            identities.setdefault((record["nodeid"], record["inputs_digest"]), []).append(record)
-        keep = set(self.protected_ids)
-        for group in groups.values():
-            keep.update(record["result_id"] for record in group[-RETAINED_VERSIONS:])
-        # A failure remains necessary while a retained earlier pass could otherwise
-        # be selected at a level no later pass covers. Unrelated checks stay reusable.
-        for attempts in identities.values():
-            failures = [record for record in attempts if record["outcome"] != "passed"]
-            if not failures:
-                continue
-            latest = failures[-1]
-            for earlier in attempts:
-                if (earlier["result_id"] not in keep or earlier["outcome"] != "passed"
-                        or earlier["completed_ns"] >= latest["completed_ns"]):
+    def _prune(self, check_group: tuple[str, str] | None = None) -> None:
+        """Prune all groups at startup or only the saved checkout/test group.
+
+        Every retention and failure-precedence relationship stays within one
+        checkout/test. Indexing that boundary also avoids traversing unrelated
+        records during refresh and matching. The caller holds the writer lock;
+        each successful removal updates memory only after its file is gone.
+        """
+        selected = (check_group,) if check_group is not None else self.records_by_check
+        for key in selected:
+            records = self.records_by_check[key]
+            levels: dict[str | None, list[dict[str, Any]]] = {}
+            identities: dict[str, list[dict[str, Any]]] = {}
+            for record in records:
+                levels.setdefault(record.get("qualificationLevel"), []).append(record)
+                identities.setdefault(record["inputs_digest"], []).append(record)
+            keep: set[str] = set()
+            for group in levels.values():
+                keep.update(record["result_id"] for record in group[-RETAINED_VERSIONS:])
+            # A failure remains necessary while a retained earlier pass could
+            # otherwise be selected at a level no later pass covers.
+            for attempts in identities.values():
+                failures = [record for record in attempts if record["outcome"] != "passed"]
+                if not failures:
                     continue
-                original = earlier.get("qualificationLevel")
-                resolved = any(
-                    later["outcome"] == "passed" and later["completed_ns"] > latest["completed_ns"]
-                    and ((original is None and later.get("qualificationLevel") is None)
-                         or (original in LEVELS and later.get("qualificationLevel") in LEVELS
-                             and LEVELS.index(later["qualificationLevel"]) >= LEVELS.index(original)))
-                    for later in attempts
-                )
-                if not resolved:
-                    keep.add(latest["result_id"])
-        for record in list(self.records):
-            if record["result_id"] not in keep:
-                self._record_path(record).unlink(missing_ok=True)
-                self.records.remove(record)
+                latest = failures[-1]
+                for earlier in attempts:
+                    if ((earlier["result_id"] not in keep and earlier["result_id"] not in self.protected_ids)
+                            or earlier["outcome"] != "passed"
+                            or earlier["completed_ns"] >= latest["completed_ns"]):
+                        continue
+                    original = earlier.get("qualificationLevel")
+                    resolved = any(
+                        later["outcome"] == "passed" and later["completed_ns"] > latest["completed_ns"]
+                        and ((original is None and later.get("qualificationLevel") is None)
+                             or (original in LEVELS and later.get("qualificationLevel") in LEVELS
+                                 and LEVELS.index(later["qualificationLevel"]) >= LEVELS.index(original)))
+                        for later in attempts
+                    )
+                    if not resolved:
+                        keep.add(latest["result_id"])
+            for record in list(records):
+                if record["result_id"] not in keep and record["result_id"] not in self.protected_ids:
+                    self._record_path(record).unlink(missing_ok=True)
+                    records.remove(record)
 
     def _write_attempt(self, record: Mapping[str, Any]) -> None:
         """Write directly to a non-reused final path; partial files are unaccepted."""
@@ -417,9 +430,8 @@ class ResultStore:
         try:
             with self.lock:
                 group = _digest([self.checkout, nodeid])[:24]
-                self.records = [record for record in self.records if not (
-                    record["nodeid"] == nodeid and record["inputs"]["checkout"] == self.checkout
-                )] + self._read_records(group)
+                check_group = (self.checkout, nodeid)
+                self.records_by_check[check_group] = self._read_records(group)
                 record = self.matching(nodeid, inputs) if outcome == "passed" else None
                 if record is None:
                     record = {
@@ -431,9 +443,9 @@ class ResultStore:
                     if self.qualification_level is not None:
                         record["qualificationLevel"] = self.qualification_level
                     self._write_attempt(record)
-                    self.records.append(record)
+                    self.records_by_check[check_group].append(record)
                 self.protected_ids.add(record["result_id"])
-                self._prune()
+                self._prune(check_group)
                 return record
         except Timeout:
             self.unsaved_reasons[nodeid] = "store-busy"

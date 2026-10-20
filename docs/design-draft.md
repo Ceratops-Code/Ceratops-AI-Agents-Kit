@@ -382,7 +382,11 @@ leaves another invocation free to execute its checks normally. Startup and each
 completed write retain current plus two predecessors per checkout, test and
 qualification level, protecting original results referenced by retained aggregate
 records and failures that can still block a retained pass. Other producers'
-files are untouched. Results survive task-temp and worktree deletion. The
+files are untouched. Startup inspects every checkout/test group; each save
+refreshes, matches and prunes only its affected group through an in-memory index.
+No persistent index or additional storage is introduced. Failure precedence and
+retained references stay within that group, so unrelated histories need no
+per-save traversal. Results survive task-temp and worktree deletion. The
 caller-owned `pytest-results.json` lives inside pytest's isolated temp directory,
 carries returned counts and original result references, and is removed by that
 directory's existing owner. Aggregate records retain those child identities,
