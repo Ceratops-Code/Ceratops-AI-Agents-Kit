@@ -191,7 +191,7 @@ without repository deduplication.
 | `skills/ceratops-repo-lifecycle/references/templates/validate-repository.py.tmpl`, `validate.yml.tmpl`, and `run-actionlint.py.tmpl` | Repository-neutral validation templates created only when their target files are absent; new validation setups receive a pinned, checksum-verified actionlint runner, and setups without JavaScript package-manager files also receive locked Markdown dependencies and default rules. Existing tooling, Markdown settings, and exclusive validators are preserved. |
 | `skills/ceratops-repo-lifecycle/scripts/ceratops_repo_compatibility_engine/` | Skill-owned package with the shared compatibility-contract loader, read-only compatibility checks, SDLC-contract validation, rollback-protected Ceratops compatibility application, and version-only bootstrap synchronization; it operates on explicit target repositories and is never copied into them. |
 | `skills/ceratops-repo-lifecycle/references/templates/skill-sections.json.tmpl` | Repository-neutral template for creating a target repository's live `skills/skill-sections.json`; never a live manifest. |
-| `skills/ceratops-skill-lifecycle/scripts/runtime/install-managed-skills.py` | Owns the managed deployment callable and its CLI: requires a protected release or published-default source, checks request inputs and the exact source selection before one runtime transaction; handles inventory and explicit prior-owner migration; emits commit-bound completion evidence and finalizes saved promotion handoffs with optional repeated `--deployment-evidence` sibling receipts. Cleanup failure preserves the installation receipt and cleanup-only call, without reinstalling. |
+| `skills/ceratops-skill-lifecycle/scripts/runtime/install-managed-skills.py` | Owns the managed deployment callable and its CLI: checks request inputs and the exact source selection before one runtime transaction; handles inventory and explicit prior-owner migration; emits commit-bound completion evidence and finalizes saved promotion handoffs with optional repeated `--deployment-evidence` sibling receipts. Cleanup failure preserves the installation receipt and cleanup-only call, without reinstalling. |
 | `skills/ceratops-skill-lifecycle/scripts/runtime/managed_runtime_builder.py` | Stages, activates, rolls back, recovers, and cleans one locked selected-skill runtime transaction. |
 | `skills/ceratops-skill-lifecycle/scripts/runtime/prepare_python_runtime.py` | Prepares the pinned Python environment and prunes unreferenced older environments; the builder calls it inside the existing installation transaction. |
 | `skills/ceratops-skill-lifecycle/scripts/skill-update-workflow.py` | Prints normal results and errors as UTF-8 under Windows legacy output encodings. Initializes ordinary updates from repeated skill/path groups and UTF-8 command files, or opens caller-owned requests. It discovers one unfinished skill change per worktree, records approved scope against the original baseline, saves immutable state/check generations, and drives verification to one next action. Scope expansion and failed-request replacement preserve the original baseline; exact passed checks are reused, and close consumes saved success without rechecking source. The caller edits, commits and requests promotion/deployment separately; this helper never runs repository tests. |
@@ -1499,12 +1499,8 @@ uv run --project scripts --locked python skills/ceratops-skill-lifecycle/scripts
 
 Installed Ceratops skills should be generated from the skills repo checkout: the
 local skills repo checkout used as the input path for the runtime installer.
-The managed installer accepts a clean `release/local` checkout or a clean
-primary checkout whose HEAD matches its upstream and the remote's published
-default branch. It rejects task worktrees, detached HEADs, unpublished default
-branch commits and non-Git sources before installation. The existing locked
-fast-change flow can install checked `release/local` edits before committing.
-Report-only inventory and empty selections remain available without promotion.
+The active branch only selects which repo snapshot is installed: synced `main`
+for normal use, or `release/local` for an active unpublished preview.
 After changing the installed source snapshot, use the installed lifecycle
 skill's `deploy` action for managed updates or the independent installer for
 an explicit overlay without validation or retirement.
