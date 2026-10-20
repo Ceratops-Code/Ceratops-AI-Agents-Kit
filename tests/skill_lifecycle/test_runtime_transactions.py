@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import ctypes
 import errno
 import json
+import os
 import pathlib
 import runpy
 import shutil
@@ -29,6 +31,168 @@ from tests.support.repositories import (
     run_git,
     write_manifest,
 )
+
+
+@pytest.mark.parametrize("other_source_root", [False, True])
+@pytest.mark.parametrize("changed_sibling", [False, True])
+def test_current_skill_keeps_watched_directory_and_only_needed_effects(
+    tmp_path, monkeypatch, other_source_root, changed_sibling,
+):
+    """A Windows descendant watcher must not force replacement of current bytes."""
+    repo, destination = tmp_path / "repo", tmp_path / "installed"
+    create_compatible_repo(repo, "example/watched", ["alpha-tool", "beta-tool"])
+    reference = repo / "skills/alpha-tool/references/source.md"
+    reference.parent.mkdir()
+    reference.write_bytes(b"Stable reference.\n")
+    builder = load_runtime_builder()
+    builder["install_transaction"](repo, destination, all_managed=True)
+    alpha = destination / "alpha-tool"
+    before = {path.relative_to(alpha): (path.read_bytes(), path.stat().st_mtime_ns)
+              for path in alpha.rglob("*") if path.is_file()}
+    directory_identity = (alpha.stat().st_ino, (alpha / "references").stat().st_ino)
+    if other_source_root:
+        other = tmp_path / "other-worktree"
+        shutil.copytree(repo, other)
+        repo = other
+    if changed_sibling:
+        source = repo / "skills/beta-tool/SKILL.md"
+        source.write_bytes(source.read_bytes() + b"\nUpdated sibling.\n")
+    # Runtime caches are not deployable source and must not trigger a swap.
+    cache = alpha / "__pycache__"
+    cache.mkdir()
+    (cache / "helper.pyc").write_bytes(b"runtime cache")
+    original_rename = builder["rename_with_retry"]
+
+    def guard_directory_rename(source, target):
+        assert source != alpha and target != alpha
+        return original_rename(source, target)
+
+    monkeypatch.setitem(builder["install_transaction"].__globals__,
+                        "rename_with_retry", guard_directory_rename)
+    handle = None
+    if os.name == "nt":
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.CreateFileW.argtypes = (ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32,
+                                      ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p)
+        kernel.CreateFileW.restype = ctypes.c_void_p
+        kernel.CloseHandle.argtypes = (ctypes.c_void_p,)
+        handle = kernel.CreateFileW(str(alpha / "references"), 1, 7, None, 3, 0x02000000, None)
+        assert handle != ctypes.c_void_p(-1).value
+    try:
+        if handle is not None:
+            with pytest.raises(OSError) as blocked:
+                alpha.replace(destination / "would-fail")
+            assert blocked.value.winerror == 5
+        for attempt in range(2):
+            result = builder["install_transaction"](repo, destination, all_managed=True)
+            affected = ({"alpha-tool", "beta-tool"} if other_source_root else set()) | (
+                {"beta-tool"} if changed_sibling else set())
+            assert set(result.deployed) == (affected if attempt == 0 else set())
+            assert result.status == ("ok" if affected and attempt == 0 else "no_op")
+        assert directory_identity == (alpha.stat().st_ino, (alpha / "references").stat().st_ino)
+        for relative, (data, mtime) in before.items():
+            current = alpha / relative
+            if other_source_root and relative.as_posix() == RUNTIME_MANIFEST:
+                assert json.loads(current.read_bytes())["source_repository_root"] == str(repo)
+            else:
+                assert (current.read_bytes(), current.stat().st_mtime_ns) == (data, mtime)
+        assert (cache / "helper.pyc").read_bytes() == b"runtime cache"
+        assert ("Updated sibling." in runtime_skill_text(destination, "beta-tool")) == changed_sibling
+        assert not list(destination.glob(".*-deployed-*"))
+        assert not list(destination.glob(".*-retired-*"))
+    finally:
+        if handle is not None:
+            kernel.CloseHandle(handle)
+
+
+@pytest.mark.parametrize("failure_kind", ["error", "worker-loss"])
+@pytest.mark.parametrize("boundary", ["manifest", "cleanup"])
+@pytest.mark.parametrize("after_effect", [False, True])
+def test_source_location_update_repeats_after_interruption(
+    tmp_path, monkeypatch, failure_kind, boundary, after_effect,
+):
+    """Metadata and payload changes retain rollback and fresh-call convergence."""
+    repo, destination = tmp_path / "repo", tmp_path / "installed"
+    create_compatible_repo(repo, "example/provenance", ["alpha-tool", "beta-tool"])
+    builder = load_runtime_builder()
+    builder["install_transaction"](repo, destination, all_managed=True)
+    original = (destination / "alpha-tool" / RUNTIME_MANIFEST).read_bytes()
+    other = tmp_path / "other-worktree"
+    shutil.copytree(repo, other)
+    source = other / "skills/beta-tool/SKILL.md"
+    source.write_bytes(source.read_bytes() + b"\nNew payload.\n")
+
+    class LostWorker(BaseException):
+        pass
+
+    injected = False
+    operation = "rename_with_retry" if boundary == "manifest" else "_remove_tree"
+    original_effect = builder[operation]
+
+    def interrupted_effect(path, target):
+        nonlocal injected
+        matches = (path.name == ".runtime-manifest-next.json" if boundary == "manifest"
+                   else path.name.startswith(".alpha-tool-deployed-"))
+        if not matches or injected:
+            return original_effect(path, target)
+        injected = True
+        if after_effect:
+            original_effect(path, target)
+        if failure_kind == "worker-loss":
+            raise LostWorker()
+        raise OSError("effect acknowledgement interrupted")
+
+    with monkeypatch.context() as patch:
+        patch.setitem(builder["install_transaction"].__globals__, operation, interrupted_effect)
+        if failure_kind == "worker-loss":
+            with pytest.raises(LostWorker):
+                builder["install_transaction"](other, destination, all_managed=True)
+        elif boundary == "manifest":
+            with pytest.raises(builder["TransactionError"]) as failure:
+                builder["install_transaction"](other, destination, all_managed=True)
+            assert failure.value.rollback_state == "complete"
+            assert (destination / "alpha-tool" / RUNTIME_MANIFEST).read_bytes() == original
+            assert "New payload." not in runtime_skill_text(destination, "beta-tool")
+        else:
+            assert builder["install_transaction"](other, destination, all_managed=True).status == "cleanup_blocked"
+    assert injected
+    for _ in range(2):
+        fresh = load_runtime_builder()
+        assert fresh["install_transaction"](other, destination, all_managed=True).status in {"ok", "no_op"}
+        assert json.loads((destination / "alpha-tool" / RUNTIME_MANIFEST).read_bytes())["source_repository_root"] == str(other)
+        assert "New payload." in runtime_skill_text(destination, "beta-tool")
+        assert not list(destination.glob(".*-deployed-*"))
+        assert not list(destination.glob(".*-retired-*"))
+
+
+@pytest.mark.parametrize("drift", ["bytes", "missing", "extra", "extra-directory", "manifest"])
+def test_current_source_still_repairs_target_drift(tmp_path, drift):
+    repo, destination = tmp_path / "repo", tmp_path / "installed"
+    create_compatible_repo(repo, "example/drift", ["alpha-tool"])
+    builder = load_runtime_builder()
+    builder["install_transaction"](repo, destination, all_managed=True)
+    alpha = destination / "alpha-tool"
+    original_directory = alpha.stat().st_ino
+    original = (alpha / "SKILL.md").read_bytes()
+    if drift == "bytes":
+        (alpha / "SKILL.md").write_bytes(b"damaged")
+    elif drift == "missing":
+        (alpha / "SKILL.md").unlink()
+    elif drift == "extra":
+        (alpha / "extra.md").write_bytes(b"stale")
+    elif drift == "extra-directory":
+        (alpha / "extra").mkdir()
+    else:
+        manifest = json.loads((alpha / RUNTIME_MANIFEST).read_bytes())
+        manifest["python_runtime"] = "unexpected-runtime"
+        (alpha / RUNTIME_MANIFEST).write_text(json.dumps(manifest))
+    assert builder["install_transaction"](repo, destination, all_managed=True).deployed == ("alpha-tool",)
+    assert (alpha / "SKILL.md").read_bytes() == original
+    assert not (alpha / "extra.md").exists() and not (alpha / "extra").exists()
+    assert "python_runtime" not in json.loads((alpha / RUNTIME_MANIFEST).read_bytes())
+    if drift == "manifest":
+        assert alpha.stat().st_ino == original_directory
+    assert builder["install_transaction"](repo, destination, all_managed=True).status == "no_op"
 
 
 @pytest.mark.parametrize("failure", [None, "before-finalize", "after-finalize", "failed-finalize", "missing", "wrong-commit", "duplicate"])
@@ -221,7 +385,7 @@ def test_managed_deploy_repeated_relative_options_restore_entry_directory(
         repo_root=pathlib.Path("source"), install_root=pathlib.Path("installed"),
         skill=("alpha-tool",),
     )
-    for _ in range(2):
+    for attempt in range(2):
         result = installer["deploy_managed_skills"](options)
         assert pathlib.Path.cwd() == tmp_path
         assert capsys.readouterr().out == ""
@@ -229,9 +393,9 @@ def test_managed_deploy_repeated_relative_options_restore_entry_directory(
             assert result["status"] == "error" and result["reason"] == "source rejected"
             assert not destination.exists()
         else:
-            assert result["status"] == "completed"
+            assert result["status"] == ("completed" if attempt == 0 else "no_op")
             assert result["repo_root"] == str(repo) and result["install_root"] == str(destination)
-            assert result["deployed"] == ["alpha-tool"]
+            assert result["deployed"] == (["alpha-tool"] if attempt == 0 else [])
             assert runtime_owner(destination, "alpha-tool") == "example/relative"
     assert checked == [repo, repo]
 
@@ -1145,7 +1309,7 @@ def test_transaction_cleanup_blocker_keeps_new_batch_and_serializes_writers(
         install_root,
         selected=("alpha-tool",),
     )
-    assert recovered.status == "ok"
+    assert recovered.status == "no_op"
     assert not list(install_root.glob(".*-retired-*"))
 
     lock_builder = load_runtime_builder()
