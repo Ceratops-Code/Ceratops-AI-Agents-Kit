@@ -290,9 +290,10 @@ def contract_checks(
             )
             tool = check["id"]
             if tool == "shellcheck":
-                selected[-1]["command"].extend(
-                    path for path in owned_paths if path.endswith(".sh")
-                )
+                selected[-1]["command"] = [
+                    *check["command"],
+                    *(path for path in owned_paths if path.endswith(".sh")),
+                ]
             if (
                 check["command"][0] in {"{npm}", "{pnpm}"}
                 and _package_root(repo_root) != repo_root
