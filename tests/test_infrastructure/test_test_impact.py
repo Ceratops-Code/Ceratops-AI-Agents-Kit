@@ -451,3 +451,25 @@ def test_ambiguous_production_mapping_records_gap_without_selecting_tests(
             ),
         },
     )
+
+@pytest.mark.parametrize("target_kind", ["file", "node", "two-files"])
+def test_collection_never_imports_unrequested_suites(
+    test_runner_module: Any, tmp_path: pathlib.Path, target_kind: str
+) -> None:
+    """An unrelated broken suite must not block a focused request."""
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    for name in ("alpha", "beta"):
+        (tests / f"test_{name}.py").write_text(
+            "def test_requested():\n    assert True\n", encoding="utf-8"
+        )
+    (tests / "test_unrequested.py").write_text(
+        "raise RuntimeError('unrequested suite was imported')\n", encoding="utf-8"
+    )
+    targets = ["tests/test_alpha.py"]
+    if target_kind == "node":
+        targets[0] += "::test_requested"
+    elif target_kind == "two-files":
+        targets.append("tests/test_beta.py")
+    for _ in range(2):
+        assert test_runner_module.collect_errors(tmp_path, targets) == []
