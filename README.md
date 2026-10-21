@@ -138,6 +138,15 @@ of each deliverable. Lifecycle actions decide when those capabilities run.
 The repository-compatibility templates under
 `skills/ceratops-repo-lifecycle/references/templates/` are reusable skeletons
 to copy into other repositories, not live configuration.
+`generate_repository_checks.py` plans check commands and CI setup; the
+compatibility application module owns file changes and rollback. Managed
+project files select .NET checks; native C++ solution containers do not.
+Shell repositories receive an executable ShellCheck check and matching SDLC
+capability requirements together. Git's `linguist-vendored` and
+`linguist-generated` attributes identify captured dependencies and generated
+outputs consistently for check selection and language coverage.
+The repository text collector honors declared HTML encodings in legacy
+documentation while retaining strict UTF-8 reads for executable/configuration files.
 `agents/openai.yaml` is Codex UI metadata and may be ignored by other agents.
 Each Ceratops skill declares the runtime-local icon path
 `./assets/ceratops-logo-500.png`; every source copy matches the canonical

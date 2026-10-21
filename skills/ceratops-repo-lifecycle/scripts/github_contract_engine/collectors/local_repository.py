@@ -554,8 +554,22 @@ def scan_local(path: str | None) -> dict[str, Any]:
         files.append(name)
         if _readable_text(candidate) and candidate.stat().st_size <= 1_000_000:
             try:
-                texts[name] = candidate.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError) as exc:
+                payload = candidate.read_bytes()
+                encoding = "utf-8"
+                if candidate.suffix.lower() in {".html", ".htm"}:
+                    # Legacy dependency documentation may declare a real HTML
+                    # encoding. Honor it without silently repairing source or
+                    # applying permissive decoding to scripts/configuration.
+                    declared = re.search(
+                        br"<meta\b[^>]*\bcharset\s*=\s*['\"]?\s*([-\w.]+)",
+                        payload[:4096], re.IGNORECASE,
+                    )
+                    if payload.startswith(b"\xef\xbb\xbf"):
+                        encoding = "utf-8-sig"
+                    elif declared:
+                        encoding = declared[1].decode("ascii")
+                texts[name] = payload.decode(encoding)
+            except (OSError, UnicodeError, LookupError) as exc:
                 errors.append(f"{name}: {exc}")
     return {
         "available": True,
