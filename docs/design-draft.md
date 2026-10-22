@@ -1647,8 +1647,9 @@ selected repository before remote effects; the terminal cleanup and returned
 rerun command carry the same protection. Unfinished removal records for these
 paths remain untouched until a later invocation releases the paths. This
 retention does not bypass source, pending-work, review or CI checks. After selected
-operations succeed, the helper finalizes the optional promotion scope and discovers task
-worktrees and unchecked-out local `codex/` task branches throughout the repository.
+operations succeed, the helper finalizes the optional promotion scope and
+discovers task worktrees and unchecked-out local `codex/` task branches throughout
+the repository.
 An absent scope does not suppress discovery. Removal requires clean Git state
 including untracked files, exact head ancestry in the synchronized shipped commit,
 and archived or absent associated Codex threads. The existing thread catalog is
