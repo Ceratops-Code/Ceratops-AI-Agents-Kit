@@ -9,6 +9,7 @@ from their final paths without repeating accepted work.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import pathlib
 import re
@@ -87,7 +88,7 @@ def _receipt_git_results(receipt: Mapping[str, Any]) -> list[dict[str, Any]]:
         dict(item)
         for item in receipt["supportingFiles"]
         if item["root"] == "git"
-    ]
+    ] + ([dict(receipt["checkSummary"])] if "checkSummary" in receipt else [])
 
 
 def _verify_output_inventory(
@@ -234,6 +235,8 @@ def prepare_versioned_build_receipt(
     transaction: ArtifactVersionTransaction,
     target: str,
     receipt: Mapping[str, Any],
+    *,
+    check_summaries: Sequence[Mapping[str, Any]] = (),
 ) -> PreparedBuildReceipt:
     """Verify qualified bytes and write their exact receipt to its Git path.
 
@@ -243,8 +246,19 @@ def prepare_versioned_build_receipt(
     """
 
     _require_transaction_target(transaction, target)
+    value = deepcopy(dict(receipt))
+    summary = compose_build_check_summary(value, check_summaries, source_root=transaction.repo_root)
+    summary_raw = (json.dumps(summary, sort_keys=True, separators=(",", ":"),
+                              ensure_ascii=True, allow_nan=False) + "\n").encode()
+    summary_path = str(pathlib.PurePosixPath(transaction.receipt_path(target)).with_name("check_summary.json"))
+    value["tag"] = f"{transaction.release_unit}/{transaction.version}"
+    value["checkSummary"] = {
+        "root": "git", "path": summary_path, "size": len(summary_raw),
+        "sha256": hashlib.sha256(summary_raw).hexdigest(),
+    }
+    value["committedResultPaths"] = sorted(set(value["committedResultPaths"]) | {summary_path})
     try:
-        raw = sdlc_results.encode_new_receipt(receipt)
+        raw = sdlc_results.encode_new_receipt(value)
     except StepResultError as exc:
         raise OperationError(str(exc)) from exc
     validated = _validate_prepared_receipt(transaction, target, raw)
@@ -263,6 +277,10 @@ def prepare_versioned_build_receipt(
     _verify_output_inventory(
         transaction.target_output(target), _receipt_store_records(validated)
     )
+    _persist_exact_bytes(
+        transaction.repo_root / summary_path, summary_raw,
+        label="check summary", parser=sdlc_results.parse_check_summary,
+    )
     for record in _receipt_git_results(validated):
         _verify_worktree_record(transaction.repo_root, record)
 
@@ -274,6 +292,64 @@ def prepare_versioned_build_receipt(
         parser=sdlc_results.parse_committed_build_receipt,
     )
     return prepared
+
+
+def compose_build_check_summary(
+    receipt: Mapping[str, Any], summaries: Sequence[Mapping[str, Any]],
+    *, source_root: pathlib.Path | None = None,
+) -> dict[str, Any]:
+    """Inline actual outcomes without upgrading their level or inventing facts.
+
+    Older build producers supply receipt-level checks only. Those remain
+    successful receipt facts, but cannot stand in for missing per-check reuse
+    inputs or execution identities. New runners supply their self-contained
+    summaries, including original passes reused from a preceding build.
+    """
+    result: dict[str, Any] = {"schema": "ceratops-check-summary.v1",
+                              "inputGroups": {}, "checkGroups": {}, "checks": []}
+    outcomes: dict[tuple[str | None, str], dict[str, Any]] = {}
+    for supplied in summaries:
+        parsed = sdlc_results.parse_check_summary(json.dumps(supplied).encode())
+        if source_root is not None:
+            # The runner supplied execution facts; binding them to this build
+            # checks only source-byte applicability, not acceptance again.
+            inventories = list(parsed["checkGroups"].values())
+            for group in parsed["inputGroups"].values():
+                inventories.extend(group[field] for field in ("product_inputs", "check_inputs", "productInputs", "checkInputs")
+                                   if field in group)
+                if "productInputs" in group:
+                    inventories.append(group.get("dependencies", {}))
+            for inventory in inventories:
+                for name, expected in inventory.items():
+                    relative = sdlc_results._bundle_relative_path(name, label="Summary input")
+                    path = source_root / relative
+                    if path.exists():
+                        sdlc_results._plain_path(path, label="Summary input")
+                        actual = hashlib.sha256(path.read_bytes()).hexdigest()
+                    else:
+                        actual = None
+                    if actual != expected:
+                        raise OperationError(f"Check summary names different source bytes: {name}")
+        for table in ("inputGroups", "checkGroups"):
+            result[table].update(parsed[table])
+        for check in parsed["checks"]:
+            if check.get("required", True) and check["status"] != "passed":
+                raise OperationError(f'Required check has not passed: {check["id"]}')
+            key = (check.get("kind"), check["id"])
+            if key in outcomes and outcomes[key] != check:
+                raise OperationError(f'Conflicting outcomes for check: {check["id"]}')
+            outcomes[key] = dict(check)
+    for kind, field in (("source-check", "sourceChecks"), ("artifact-test", "artifactTests")):
+        for check in receipt[field]:
+            if check["status"] != "passed":
+                raise OperationError(f'Required build check has not passed: {check["id"]}')
+            outcomes[(kind, check["id"])] = {
+                "kind": kind, "id": check["id"], "status": check["status"],
+                "check_version": check["version"], "required": True,
+                "acceptance": dict(receipt["acceptance"]),
+            }
+    result["checks"] = [outcomes[key] for key in sorted(outcomes, key=lambda item: (item[0] or "", item[1]))]
+    return result
 
 
 def write_versioned_failure_diagnostic(

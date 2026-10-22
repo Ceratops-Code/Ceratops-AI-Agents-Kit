@@ -11,6 +11,116 @@ from typing import Any
 import pytest
 
 
+def _allow_build_records(root):
+    path = root / "tests/test-impact.json"
+    manifest = json.loads(path.read_text())
+    manifest["ignored_paths"].append({"id": "build-records", "paths": [".build/**"], "reason": "Produced check summaries."})
+    path.write_text(json.dumps(manifest))
+
+
+def _level_store(root, level):
+    from reuse_test_results import ResultStore
+
+    return ResultStore(root, {"arguments": [], "environment": {}, "qualificationLevel": level})
+
+
+@pytest.mark.parametrize("original_level", ["alpha", "beta", "rc", "final"])
+@pytest.mark.parametrize("requested_level", ["alpha", "beta", "rc", "final"])
+def test_tagged_pass_keeps_its_original_level(tmp_path, original_level, requested_level):
+    from reuse_test_results import LEVELS, compact_results
+
+    from tests.repository_lifecycle.test_completed_builds import _tag_summary
+
+    root = _mapped_repository(tmp_path)
+    _allow_build_records(root)
+    node = "tests/a/test_value.py::test_value"
+    store = _level_store(root, original_level)
+    record = store.save(node, store.inputs(node))
+    _tag_summary(root, "1.0.0", compact_results([store.reference(record, reused=False)]))
+    store._record_path(record).unlink()
+    fresh = _level_store(root, requested_level)
+    selected = fresh.matching(node, fresh.inputs(node))
+    assert (selected is not None) == (LEVELS.index(original_level) >= LEVELS.index(requested_level))
+    if selected:
+        assert selected["result_id"] == record["result_id"]
+        assert fresh.reference(selected, reused=True)["qualificationLevel"] == original_level
+
+
+@pytest.mark.parametrize("lower_level_pass", [False, True])
+def test_newer_worktree_failure_blocks_tagged_pass_after_result_rotation(tmp_path, lower_level_pass):
+    from reuse_test_results import compact_results
+
+    from tests.repository_lifecycle.test_completed_builds import _tag_summary
+
+    root = _mapped_repository(tmp_path)
+    _allow_build_records(root)
+    node = "tests/a/test_value.py::test_value"
+    store = _level_store(root, "beta")
+    record = store.save(node, store.inputs(node))
+    _tag_summary(root, "1.0.0b1", compact_results([store.reference(record, reused=False)]))
+    store._record_path(record).unlink()
+    current = _level_store(root, "beta")
+    failed = current.save(node, current.inputs(node), phases={"setup": "passed", "call": "failed", "teardown": "passed"}, outcome="failed")
+    if lower_level_pass:
+        lower = _level_store(root, "alpha")
+        passed = lower.save(node, lower.inputs(node))
+        _tag_summary(root, "1.1.0a1", compact_results([lower.reference(passed, reused=False)]))
+    for index in range(5):
+        (root / "a.py").write_text(f"VALUE = {index + 2}\n")
+        changed = _level_store(root, "beta")
+        changed.save(node, changed.inputs(node))
+    (root / "a.py").write_text("VALUE = 1\n")
+    current = _level_store(root, "beta")
+    assert current.matching(node, current.inputs(node)) is None
+    assert current._record_path(failed).exists()
+    assert "newer applicable failure" in current.reuse_reasons[node]["reason"]
+    recovered = current.save(node, current.inputs(node))
+    assert recovered["result_id"] != record["result_id"]
+    fresh = _level_store(root, "beta")
+    assert fresh.matching(node, fresh.inputs(node))["result_id"] == recovered["result_id"]
+
+
+def test_auto_uses_successive_unpromoted_builds_without_package_or_log_reads(test_runner_module, tmp_path, capsys, monkeypatch):
+    from tests.repository_lifecycle.test_completed_builds import _tag_summary
+
+    for name in ("GITHUB_ACTIONS", "CERATOPS_SDLC_TEST_CONTEXT", "CERATOPS_REPOSITORY_CHECK_CONTEXT"):
+        monkeypatch.delenv(name, raising=False)
+    root = _mapped_repository(tmp_path)
+    manifest_path = root / "tests/test-impact.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["full_suite_paths"] = ["scripts/**", ".github/**", "tests/__init__.py", "tests/support/**", "tests/test-impact.json", ".gitignore"]
+    manifest_path.write_text(json.dumps(manifest))
+    (root / "production.py").unlink()
+    _allow_build_records(root)
+    for name in "abcd":
+        (root / f"tests/{name}/test_value.py").rename(root / f"tests/{name}/test_{name}.py")
+    summaries = []
+    def execute(command, cwd):
+        result = test_runner_module.run_text(command, cwd)
+        if getattr(result, "check_summary", None):
+            summaries.append(result.check_summary)
+        return result
+    assert test_runner_module.execute(["--auto"], repo_root=root, text_runner=execute) == 0
+    first = json.loads(capsys.readouterr().out)
+    assert first["mode"] == "build-history" and first["pytest"]["checks"]["executed"] == 4
+    assert not (root / ".build").exists()
+    tag, _ = _tag_summary(root, "1.0.0a1", summaries[-1])
+    for path in (root / ".git/ceratops/results/repository-checks").glob("pytest-*.json"):
+        path.unlink()
+    (root / "d.py").write_text("VALUE = 2\n")
+    assert test_runner_module.execute(["--auto"], repo_root=root, text_runner=execute) == 0
+    second = json.loads(capsys.readouterr().out)
+    assert second["pytest"]["checks"] == {"collected": 4, "executed": 1, "reused": 3}
+    assert sum(item.get("build", {}).get("tag") == tag for item in second["pytest"]["decisions"].values()) == 3
+    _tag_summary(root, "1.0.0a2", summaries[-1])
+    for path in (root / ".git/ceratops/results/repository-checks").glob("pytest-*.json"):
+        path.unlink()
+    assert test_runner_module.execute(["--auto"], repo_root=root, text_runner=execute) == 0
+    third = json.loads(capsys.readouterr().out)
+    assert third["pytest"]["checks"] == {"collected": 4, "executed": 0, "reused": 4}
+    assert not (root / ".git/ceratops/artifacts").exists()
+
+
 def _mapped_repository(tmp_path):
     root = _acceptance_repository(tmp_path)
     manifest: dict[str, Any] = {

@@ -814,9 +814,9 @@ serialize commands.
 | 1e.2 skill-change generations | Implemented immutable approvals, states and check results, five descriptive commands, interrupted-write recovery and completion cleanup; new committed receipts use `build_receipt.json` | 2B protects direct-release changes; historical committed receipts retain their recorded names |
 | 1e.3/6A test-result contract | Implemented generated-runner contract, compatibility probe and standalone repository-runner adoption | 6B–6E connect result ownership, retention and affected-check orchestration |
 | Completed-build consumption | Implemented internal v2 reader; recorded acceptance and exact stored paths survive current test/input changes | Connect public receipt-based Deploy in later steps |
-| 2A release-lock helper | Implemented internally in `fb6863c`: canonical release lock, immediate busy refusal, nested ownership and durable unfinished-run flag; Windows checks passed, Linux execution unverified | 3A/3B/4A–4E are implemented; optional automatic process cleanup remains 5B |
+| 2A release-lock helper | Implemented internally in `fb6863c`: canonical release lock, immediate busy refusal, nested ownership and durable unfinished-run flag; Windows checks passed, Linux execution unverified | 3A/3B/4A–4E are implemented; optional automatic process cleanup remains deferred |
 | 2B Git separation and release writers | Shared `git_branch_operations.py`; promotion, Ship, release sync, PR preparation and fast-change use the native release lock | Implemented, locally promoted and deployed with 3A–3C/4A–4E |
-| 3A direct Ship calls and stopped-attempt release | One callable Ship implementation, external-command-only JSON helper and exception-safe clean lock exits; model corrections run unlocked | Standalone installers and fast-change share command-stop tracking; optional process supervision remains 5B |
+| 3A direct Ship calls and stopped-attempt release | One callable Ship implementation, external-command-only JSON helper and exception-safe clean lock exits; model corrections run unlocked | Standalone installers and fast-change share command-stop tracking; optional process supervision remains deferred |
 | 3B/4B failure reports and cleanup | Caller-selected paths, complete redacted diagnostics and successful-result references; actual command/check/delivery successes remove matching failures without repeating accepted work | 6E/20C/21 connect child-report and abandonment/removal cleanup |
 | Working-folder attempts and result reuse | Planned | 6/7 connect qualification-level baselines, successful-result reuse, success-only receipts and receipt commits; 8 selects affected units |
 | Merge-back and beta qualification | Planned | 9/22 remove the remote prerequisite for local promotion and activate merge-back, incremental qualification and guarded fast-forward |
@@ -889,6 +889,7 @@ policy. These are the runtime paths used by the foundation and update workflow:
 | `.diagnostics/<release-group-key>.json` and its `.tmp` write file | Persistent latest-failure report and temporary write for the current v2 route; `store_artifacts.py` | Atomically overwrite the group's report on failure and remove it after successful new publication. At v2 production startup remove interrupted `.tmp` writes. The completed-build reader does not rewrite diagnostics. Reports contain bounded excerpts and are never artifact-test evidence. |
 | `<shared-git-directory>/ceratops/artifacts/<unit>/<version>/build_request.json` | Version-local desired inputs; `store_artifacts.py` | Written immediately after exclusive directory creation, then bound to B before output. Same-worktree current-input matches can reuse it. Remove only after receipt/tag completion; retain unfinished or uncertain requests for controlled abandonment/removal cleanup. |
 | `.build/<unit>/<version>/build_receipt.json` with an optional `<target>/` | Direct final worktree result; operation runner | Qualification validates the final artifact/evidence bytes and writes the canonical receipt directly. A byte-identical valid file is reused, an invalid interrupted write is replaced, and a different valid receipt blocks. C commits these exact result paths without including unrelated staged work. Historical versions are read at the exact saved path/hash, including `receipt.json`; no old tag or receipt is rewritten. |
+| Sibling `check_summary.json` | Compact original check outcomes and input facts; build completion | Written directly after required checks pass and committed with the receipt that names its hash. An interrupted partial is repaired from the same accepted outcomes; exact bytes are reused. Git retains completed historical versions. Check reuse reads the tagged blob without needing packages or full logs. |
 | `artifacts/<unit>/<version>/.diagnostics/<target>.json` | One bounded current failure report per version/target; `complete_artifact_builds.py` | Direct writes replace older or interrupted diagnostics. Receipt/tag completion removes resolved reports. No temporary copy or cross-version write lock. |
 | `artifacts/<unit>/<version>/` with optional `<target>/` | Final output; allocator, builder and completion owner | Exclusive directory creation selects the version before source version preparation and B. Existing tags stay occupied after byte pruning. Untagged directories and outstanding requests stay out of retention. Unconnected callers keep three per repository/unit/target/class; 4F-managed originals keep the named worktree's latest approved build. |
 | `artifacts/beta-stable/<unit>/<version>/<target>/` and `<destination>/deployed/<unit>/<existing-generation>/<target>/` | Complete retained copies; `retain_artifact_versions.py`, called by the store or installer owner | At scoped retention calls, keep the finite slots above plus files still used or whose ownership is uncertain. Copy first, record the complete choice, then remove obsolete owned copies. No scan of unrelated groups and no deletion of historical Git acceptance. |
@@ -1704,12 +1705,14 @@ directory when it is empty.
 The validator runs Markdown and YAML lint, Ruff, and mypy for Linux and Win32;
 it never runs tests.
 SDLC separately runs `scripts/testing/run-tests.py --auto`: exact PR base/head
-impact selection in GitHub, all tests locally and on push. Every deliverable
+impact selection in GitHub, build-summary reuse locally, and all-group scope on
+push. Every deliverable
 declares its tests, using a no-op when the repository test phase covers them.
 Promotion supplies `--test-trigger promotion` and the assembled commit to the
 SDLC runner. SDLC binds the current release branch and passes
 `CERATOPS_SDLC_TEST_CONTEXT` only to test commands. The test runner verifies
-that branch and commit before collection and preserves full-suite selection.
+that branch and commit before collection, accounts for every required group,
+and executes only checks without applicable passing results.
 PR results record source and destination branches from the GitHub event;
 the CI checkout may be a detached merge commit. Promotion context is removed
 from pytest's environment so nested runner calls cannot inherit it.
@@ -1910,8 +1913,43 @@ check versions, qualification levels, required/optional scope and phase facts;
 reused passes remain distinct from execution. Skips keep their reason, not a
 fabricated pass. Repository checks export the same envelope from the canonical
 `docs/result_records.py.tmpl` contract. Full reports are unnecessary to interpret
-these facts. At 5B, summaries travel with existing bounded result records;
-5C connects them to tagged build receipts. No build tag is created by tests alone.
+these facts. Summaries travel with existing bounded result records and are also
+committed beside completed v3 build receipts. No build tag is created by tests alone.
+
+Local `--auto` and promotion checks read the current worktree's
+`.build/<unit>/<version>/build_receipt.json` records, with `<target>/` below the
+version where required. For each unit/target they choose the newest completed
+eligible version, then read that version's receipt and `check_summary.json`
+directly from its `<unit>/<version>` Git tag. They do not walk commit ancestry,
+search another worktree or select by deployment. Alpha may reuse alpha/beta/rc/final,
+beta may reuse beta/rc/final, rc may reuse rc/final, and final uses final only.
+Each result keeps the level it actually earned: the tag cannot upgrade it.
+
+The build receipt now names `tag` and `checkSummary` (Git path, size and SHA-256).
+The existing completion code commits both files together, binds the artifact
+receipts, and creates the tag last. These compact facts live in Git; packages and
+full reports stay in Git-common storage and are unnecessary for reuse. Historical
+receipts are not rewritten. An absent or partial summary supplies no coverage for
+the missing checks, so those checks run; a broken committed hash/link stops reuse.
+
+One collection discovers all current required tests, including new cases. Before
+test bodies run, stderr names each reuse/execution reason and the original result
+ID for a reused pass. The final JSON includes the first 32 decisions and an omitted
+count. Only affected or uncovered tests execute. Current-worktree results support
+corrections between builds; a newer matching failure takes precedence over an
+older tagged pass. `.build/**` is a declared result-only input exclusion, allowed
+to be absent before the first build. Explicit targets, `--all`, push and PR
+base/head selection keep their existing scope.
+
+Before discarding a failed result, retention also considers the selected build at
+each qualification level (at most four per unit/target). A later alpha pass cannot
+erase a failure that still blocks beta reuse. This reads compact Git summaries,
+not packages, full logs, other worktrees or all historical builds.
+
+The current declared SDLC check and promotion callers consume these summaries.
+The v3 completion API accepts the runners' `check_summaries`; native Build and
+receipt-driven promotion adoption remain in steps 16/22. This does not convert
+historical v2 build producers or manufacture a build tag after a tests-only run.
 
 Normal execution uses one pytest collection, including empty-target checks before
 test bodies run. Returned counts distinguish collected, executed and reused cases;
@@ -1943,7 +1981,8 @@ ordinary checks default to alpha and promotion tests to beta. The portable
 producer, custom runner and scope/retention ownership are described in
 `docs/design-draft.md`, section "Durable unchanged-input check reuse".
 This implements plan 6A and its limited Docs-and-Claims runner adoption;
-remaining affected-check and release/receipt adoption stays pending.
+5B/5C add affected-check and Git-summary reuse; the later release/build routing
+adoption stays pending.
 
 ## Native command roots
 

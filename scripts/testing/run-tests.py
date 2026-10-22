@@ -26,7 +26,7 @@ import sys
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import nullcontext
 
-from reuse_test_results import result_environment
+from reuse_test_results import BUILD_REUSE_LEVEL, result_environment
 from runner_requests import (
     TEST_CONTEXT_ENV,
     parse_request,
@@ -599,7 +599,9 @@ def validate_manifest(
     for ignored_group in manifest.ignored_paths:
         for pattern in ignored_group.paths:
             matching = [path for path in tracked if path_matches(pattern, path)]
-            if not matching:
+            # The contract-owned result tree does not exist before the first
+            # build. Its absence is expected, not an abandoned source mapping.
+            if not matching and pattern != ".build/**":
                 errors.append(
                     f"stale ignored glob {ignored_group.ignore_id}: {pattern}"
                 )
@@ -787,6 +789,8 @@ def execute_selected(
         if args.targets
         else "validate-manifest"
         if args.validate_manifest
+        else "build-history"
+        if args.build_history
         else "all"
         if args.all
         else "worktree"
@@ -870,7 +874,9 @@ def execute_selected(
     changes: tuple[ChangedFile, ...] = ()
     if args.targets:
         selection = Selection((), tuple(dict.fromkeys(args.targets)), (), (), (), False, False)
-    elif args.all:
+    elif args.all or args.build_history:
+        # Discover every required current case once, then compare its exact
+        # inputs with the selected Git summary before running any test body.
         selection = all_selection(manifest)
     elif args.worktree:
         try:
@@ -934,7 +940,11 @@ def execute_selected(
         "-q",
         *selection.pytest_targets,
     ]
-    result = text_runner(pytest_command, root)
+    token = BUILD_REUSE_LEVEL.set("alpha" if args.build_history else None)
+    try:
+        result = text_runner(pytest_command, root)
+    finally:
+        BUILD_REUSE_LEVEL.reset(token)
     pytest_payload: dict[str, object] = {
         "exit_code": result.returncode,
         "outcome": outcome_name(result.returncode),
@@ -943,6 +953,9 @@ def execute_selected(
         pytest_payload["checks"] = accepted_checks
     if timings := getattr(result, "check_timings", None):
         pytest_payload["timings"] = timings
+    if decisions := getattr(result, "check_decisions", None):
+        pytest_payload["decisions"] = dict(list(decisions.items())[:32])
+        pytest_payload["omitted_decisions"] = max(0, len(decisions) - 32)
     if result.returncode != 0:
         pytest_payload.update(
             pytest_diagnostics.pytest_failure_summary(result.stdout, result.stderr)

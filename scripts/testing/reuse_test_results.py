@@ -24,6 +24,7 @@ import json
 import os
 import pathlib
 import platform
+import runpy
 import shutil
 import subprocess
 import sys
@@ -32,6 +33,7 @@ import time
 import types
 import uuid
 from collections.abc import Mapping, Sequence
+from contextvars import ContextVar
 from typing import Any
 
 import pytest
@@ -55,6 +57,7 @@ MAX_GROUP_RECORD_BYTES = 8 * 1024 * 1024
 CONTEXT_SCHEMA = "ceratops-pytest-inputs.v1"
 RETAINED_VERSIONS = 3
 SUMMARY_SCHEMA = "ceratops-check-summary.v1"
+BUILD_REUSE_LEVEL: ContextVar[str | None] = ContextVar("build_reuse_level", default=None)
 
 
 def _digest(value: object) -> str:
@@ -127,6 +130,8 @@ def result_environment(
                 or owner.get("qualificationLevel") not in LEVELS):
             raise ValueError("pytest owner lacks an explicit supported qualification level")
         context["qualificationLevel"] = owner["qualificationLevel"]
+    elif level := BUILD_REUSE_LEVEL.get():
+        context["qualificationLevel"] = level
     return {RESULT_CONTEXT_ENV: _json(context).decode()}
 
 
@@ -241,6 +246,39 @@ class ResultStore:
                                  for name in ("reuse_test_results.py", "select_test_groups.py")}),
         }
         self.records_by_check: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        self.tagged_by_check: dict[str, list[dict[str, Any]]] = {}
+        self.retention_passes: list[dict[str, Any]] | None = None
+        self.reuse_reasons: dict[str, dict[str, Any]] = {}
+        if self.qualification_level is not None:
+            # This repository-owned reader is also the generated runner's
+            # public result contract. No installed skill or artifact store is
+            # imported or searched to discover the previous built version.
+            reader = runpy.run_path(str(pathlib.Path(__file__).resolve().parents[1] / "result_records.py"))
+            for build in reader["select_build_check_summaries"](
+                self.root, qualification_level=self.qualification_level,
+            ):
+                summary = build["summary"]
+                for check in summary["checks"]:
+                    if (check.get("kind") != "pytest" or check.get("status") != "passed"
+                            or check.get("reusable") is False
+                            or not {"inputGroup", "checkGroup", "result_id", "completed_ns", "inputs_digest", "phases"} <= check.keys()):
+                        continue  # Historical/partial facts supply no invented coverage.
+                    inputs = {**summary["inputGroups"][check["inputGroup"]],
+                              "check_inputs": summary["checkGroups"][check["checkGroup"]]}
+                    if (check["inputs_digest"] != _digest(inputs)
+                            or type(check["completed_ns"]) is not int
+                            or check["phases"] != {"setup": "passed", "call": "passed", "teardown": "passed"}
+                            or check.get("check_version") != _digest({
+                                "producer": inputs.get("producer"), "check_inputs": inputs["check_inputs"],
+                            })):
+                        raise ValueError("Tagged pytest outcome conflicts with its recorded execution facts.")
+                    self.tagged_by_check.setdefault(check["id"], []).append({
+                        "nodeid": check["id"], "outcome": "passed", "inputs": inputs,
+                        **{key: check.get(key) for key in ("result_id", "completed_ns", "inputs_digest", "phases", "qualificationLevel")},
+                        "tagged_reference": {key: value for key, value in check.items()
+                                             if key not in {"inputGroup", "checkGroup"}},
+                        "build": {key: build[key] for key in ("tag", "commit", "receiptPath")},
+                    })
         self.inputs_by_group: dict[str, dict[str, Any]] = {}
         # Inventory names once, then open only this invocation's collected
         # checks. Reading every past check in every worktree dominated startup.
@@ -311,18 +349,43 @@ class ResultStore:
 
     def matching(self, nodeid: str, inputs: Mapping[str, Any]) -> dict[str, Any] | None:
         self._load_check(nodeid)
-        records = self.records_by_check.get((inputs["checkout"], nodeid), [])
-        candidates = [record for record in reversed(records) if record["inputs"] == inputs]
+        records = [*self.records_by_check.get((inputs["checkout"], nodeid), []),
+                   *self.tagged_by_check.get(nodeid, [])]
+        candidates = sorted((record for record in records if self._same_inputs(record, inputs)),
+                            key=lambda record: (record["completed_ns"], record["result_id"]), reverse=True)
+        self.reuse_reasons[nodeid] = {"decision": "execute", "reason": (
+            "Changed input or dependency." if records else "Missing coverage for this check."
+        )}
         failures = [record for record in candidates if record["outcome"] != "passed"]
         for record in candidates:
             if record["outcome"] != "passed" or not self._eligible(record.get("qualificationLevel")):
                 continue
             if any(failure["completed_ns"] >= record["completed_ns"] for failure in failures):
+                self.reuse_reasons[nodeid]["reason"] = "A newer applicable failure requires execution."
                 return None
             if self._current(inputs):
                 self.protected_ids.add(record["result_id"])
+                self.reuse_reasons[nodeid] = {
+                    "decision": "reuse", "reason": "Git build summary." if "build" in record else "Current worktree result.",
+                    "result_id": record["result_id"], **({"build": record["build"]} if "build" in record else {}),
+                }
                 return record
+        if candidates:
+            self.reuse_reasons[nodeid]["reason"] = (
+                "A newer applicable failure requires execution." if failures
+                else "Recorded results do not cover the requested qualification level."
+            )
         return None
+
+    @staticmethod
+    def _same_inputs(record: Mapping[str, Any], inputs: Mapping[str, Any]) -> bool:
+        if "build" not in record:
+            return bool(record["inputs"] == inputs)
+        # Checkout identity selects live attempt files; it is not a product
+        # input. A committed build is discovered ONLY through this checkout's
+        # .build inventory, even when that history arrived through a merge.
+        return ({key: value for key, value in record["inputs"].items() if key != "checkout"}
+                == {key: value for key, value in inputs.items() if key != "checkout"})
 
     def _eligible(self, original: str | None) -> bool:
         if self.qualification_level is None:
@@ -331,6 +394,9 @@ class ResultStore:
 
     def reference(self, record: Mapping[str, Any], *, reused: bool) -> dict[str, Any]:
         """Return original qualification and execution, never a promoted copy."""
+        if "tagged_reference" in record:
+            return {**record["tagged_reference"], "reused": reused,
+                    "inputs": record["inputs"], "build": record["build"]}
         path = self._record_path(record)
         return {
             "id": record["nodeid"], "status": record["outcome"], "result_id": record["result_id"],
@@ -479,9 +545,49 @@ class ResultStore:
                     if not resolved:
                         keep.add(latest["result_id"])
             for record in list(records):
+                if (record["result_id"] not in keep and record["outcome"] != "passed"
+                        and self._failure_blocks_build(record, records)):
+                    keep.add(record["result_id"])
                 if record["result_id"] not in keep and record["result_id"] not in self.protected_ids:
                     self._record_path(record).unlink(missing_ok=True)
                     records.remove(record)
+
+    def _failure_blocks_build(self, failure: Mapping[str, Any], records: Sequence[Mapping[str, Any]]) -> bool:
+        """Keep an expiring failure if deleting it could revive a tagged pass.
+
+        This rare retention check considers the selected build at each of four
+        levels, not every historical build. A newer alpha build or alpha pass
+        cannot remove a failure that still blocks the previous beta build.
+        """
+        if self.retention_passes is None:
+            reader = runpy.run_path(str(pathlib.Path(__file__).resolve().parents[1] / "result_records.py"))
+            builds = {}
+            for level in LEVELS:
+                for build in reader["select_build_check_summaries"](self.root, qualification_level=level):
+                    builds[(build["tag"], build["receiptPath"])] = build
+            self.retention_passes = []
+            for build in builds.values():
+                summary = build["summary"]
+                for check in summary["checks"]:
+                    if (check.get("kind") == "pytest" and check.get("status") == "passed"
+                            and check.get("qualificationLevel") in LEVELS
+                            and {"inputGroup", "checkGroup", "completed_ns"} <= check.keys()):
+                        self.retention_passes.append({**check, "build": True, "inputs": {
+                            **summary["inputGroups"][check["inputGroup"]],
+                            "check_inputs": summary["checkGroups"][check["checkGroup"]],
+                        }})
+        newer = [later for later in records if later["inputs"] == failure["inputs"]
+                 and later["completed_ns"] > failure["completed_ns"]]
+        if any(later["outcome"] != "passed" for later in newer):
+            return False  # The newer failure carries the same constraint.
+        return any(
+            baseline["id"] == failure["nodeid"] and self._same_inputs(baseline, failure["inputs"])
+            and baseline["completed_ns"] <= failure["completed_ns"]
+            and not any(later.get("qualificationLevel") in LEVELS
+                        and LEVELS.index(later["qualificationLevel"]) >= LEVELS.index(baseline["qualificationLevel"])
+                        for later in newer)
+            for baseline in self.retention_passes
+        )
 
     def _write_attempt(self, record: Mapping[str, Any]) -> None:
         """Write directly to a non-reused final path; partial files are unaccepted."""
@@ -557,6 +663,7 @@ class ReusePasses:
 
     def _unrepresented(self, nodeid: str, reason: str) -> None:
         """Keep external or incomplete scope separate from original pass facts."""
+        self.store.reuse_reasons.setdefault(nodeid, {"decision": "execute", "reason": reason})
         self.nonreusable_checks[nodeid] = {
             "id": nodeid, "status": "scope-unrepresented", "reusable": False, "reason": reason,
         }
@@ -752,6 +859,7 @@ class ReusePasses:
                     for check in summary["checks"]
                 ],
                 "check_summary": summary,
+                "check_decisions": self.store.reuse_reasons,
                 "nonreusable_checks": [self.nonreusable_checks[key] for key in sorted(self.nonreusable_checks)],
                 "skipped_checks": [self.skipped_checks[key] for key in sorted(self.skipped_checks)],
                 "passed_checks": [self.passed_checks[key] for key in sorted(self.passed_checks)],

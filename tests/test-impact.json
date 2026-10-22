@@ -359,6 +359,11 @@
   ],
   "ignored_paths": [
     {
+      "id": "completed-build-records",
+      "paths": [".build/**"],
+      "reason": "Build receipts and compact outcomes select reuse; they are not executable inputs to the checks they record."
+    },
+    {
       "id": "documentation-only",
       "paths": [
         ".github/CODEOWNERS",

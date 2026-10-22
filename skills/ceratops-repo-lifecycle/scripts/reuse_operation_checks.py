@@ -29,6 +29,7 @@ from retain_check_results import (
     read_check_result,
     result_reference,
 )
+from sdlc_results import select_build_check_summaries
 
 
 def _digest(path: pathlib.Path) -> str | None:
@@ -123,6 +124,7 @@ def check_inputs(prepared: Any, declaration: dict[str, Any]) -> dict[str, Any]:
     context = {
         "schema": CONTEXT_SCHEMA, "group": prepared.operation,
         "scope": {"operation": prepared.operation, "stage": prepared.category,
+                  "worktree": hashlib.sha256(str(root).encode()).hexdigest(),
                   "cwd": prepared.steps[0].cwd.relative_to(root).as_posix(),
                   "inputRules": declaration},
         "qualificationLevel": qualification,
@@ -144,6 +146,7 @@ class CheckPlan:
     store: CheckResultStore
     result_id: str | None = None
     path: pathlib.Path | None = None
+    summary: dict[str, Any] | None = None
 
     def arguments(self) -> list[str]:
         if self.path is None:
@@ -154,6 +157,18 @@ class CheckPlan:
                 "--check-version", self.context["checkVersion"]]
 
     def reused_result(self, prepared: Any) -> dict[str, Any]:
+        if build := self.decision.get("build"):
+            original = self.decision["record"]
+            included = {(original["kind"], original["id"]),
+                        *((item["kind"], item["id"]) for item in original.get("children", []))}
+            summary = build["summary"]
+            checks = [dict(item) for item in summary["checks"]
+                      if (item.get("kind"), item["id"]) in included]
+            return {"operation": prepared.operation, "commit": prepared.commit,
+                    "status": "completed", "steps": [], "check_decision": "reused",
+                    "check_reason": self.decision["reason"],
+                    "check_baseline": {key: build[key] for key in ("tag", "commit", "receiptPath")},
+                    "check_summary": {**summary, "checks": checks}}
         original_path = self.store.directory / (self.decision["reference"]["result_id"] + ".json")
         if result_reference(original_path) != self.decision["reference"]:
             raise ValueError("Original check evidence changed after selection.")
@@ -161,6 +176,8 @@ class CheckPlan:
         return {"operation": prepared.operation, "commit": prepared.commit,
                 "status": "completed", "steps": [], "check_decision": "reused",
                 "check_reason": self.decision["reason"],
+                **({"check_summary": self.decision["record"]["check_summary"]}
+                   if self.decision["record"].get("check_summary") else {}),
                 "check_result": self.decision["reference"]}
 
     def completed(self, prepared: Any, *, passed: bool) -> dict[str, Any]:
@@ -177,6 +194,7 @@ class CheckPlan:
                 or (not passed and record["status"] not in {"failed", "interrupted"})):
             raise ValueError("Declared runner outcome conflicts with its requested inputs or exit status.")
         reference = result_reference(self.path)
+        self.summary = record.get("check_summary")
         bind_references(prepared.repo_root, [reference])
         self.store.prune(protected_ids=[str(self.result_id)], active_inputs=[self.context])
         return reference
@@ -189,7 +207,8 @@ def plan_operation(prepared: Any) -> CheckPlan | None:
         return None
     context = check_inputs(prepared, declaration)
     store = CheckResultStore(prepared.repo_root)
-    decision = store.select(context, check_id=prepared.operation)
+    builds = select_build_check_summaries(prepared.repo_root, qualification_level=prepared.qualification_level)
+    decision = store.select(context, check_id=prepared.operation, builds=builds)
     if decision["decision"] == "blocked":
         raise ValueError("Recorded check evidence blocks reuse: " + decision["reason"])
     return CheckPlan(context, decision, store)
@@ -218,4 +237,5 @@ def activate_plans(prepared: list[Any]) -> None:
         identities = [reference["result_id"] for reference in references]
         contexts = [plan.context for plan in plans]
         for plan in plans:
-            plan.store.prune(protected_ids=identities, active_inputs=contexts)
+            if not plan.decision.get("build"):
+                plan.store.prune(protected_ids=identities, active_inputs=contexts)

@@ -354,6 +354,7 @@ class CheckResultStore:
     """Read/prune the canonical store shared by every worktree of a repository."""
 
     def __init__(self, repo_root: pathlib.Path) -> None:
+        self.repo_root = repo_root.resolve()
         completed = subprocess.run(
             ["git", "-C", str(repo_root), "rev-parse", "--path-format=absolute", "--git-common-dir"],
             capture_output=True, text=True, encoding="utf-8", check=True,
@@ -383,7 +384,8 @@ class CheckResultStore:
                 invalid.append(path)
         return records, invalid
 
-    def select(self, context: Mapping[str, Any], *, check_id: str) -> dict[str, Any]:
+    def select(self, context: Mapping[str, Any], *, check_id: str,
+               builds: Iterable[Mapping[str, Any]] = ()) -> dict[str, Any]:
         """Choose original eligible evidence, refusing newer applicable failures."""
         request = check_context(context)
         self.active_inputs.append(request)
@@ -405,15 +407,48 @@ class CheckResultStore:
             return decision
         failures = [record for _, record, _ in matching
                     if record["status"] in {"failed", "interrupted"}]
+        candidates: list[tuple[int, str, dict[str, Any], pathlib.Path | None, Mapping[str, Any] | None]] = []
         for path, record, _raw in matching:
+            candidates.append((int(_order(record)[0].timestamp() * 1_000_000_000),
+                               record["result_id"], record, path, None))
+        for build in builds:
+            summary = build["summary"]
+            for check in summary["checks"]:
+                if (check.get("kind") != "repository-check" or check.get("id") != check_id
+                        or check.get("status") != "passed" or check.get("reusable") is False
+                        or not {"inputGroup", "result_id", "check_version", "completed_ns"} <= check.keys()):
+                    continue
+                original = check_context(summary["inputGroups"][check["inputGroup"]])
+                if (check.get("inputs_digest") != original["fingerprint"]
+                        or check["check_version"] != original["checkVersion"]
+                        or check.get("qualificationLevel") != original["qualificationLevel"]
+                        or type(check["completed_ns"]) is not int):
+                    raise ValueError("Tagged repository check conflicts with its original inputs.")
+                compared = dict(original)
+                compared["scope"] = dict(original["scope"])
+                if "worktree" in request["scope"]:
+                    compared["scope"]["worktree"] = request["scope"]["worktree"]
+                compared["fingerprint"] = fingerprint(compared)
+                if check_inputs_match_for_reuse(compared, request):
+                    candidates.append((check["completed_ns"], check["result_id"],
+                                       {**check, "inputs": original}, None, build))
+                    # Keep any newer failure while this recorded pass can still
+                    # be selected. This is an applicability scope, not a cursor.
+                    self.active_inputs.append(compared)
+        candidates.sort(key=lambda item: item[:2], reverse=True)
+        for completed_ns, _identity, record, candidate_path, source_build in candidates:
             if record["status"] != "passed":
                 continue
             if LEVELS.index(record["inputs"]["qualificationLevel"]) < LEVELS.index(request["qualificationLevel"]):
                 continue
-            if any(_order(failure) >= _order(record) for failure in failures):
+            if any(int(_order(failure)[0].timestamp() * 1_000_000_000) >= completed_ns for failure in failures):
                 decision["reason"] = "A newer applicable failed attempt blocks the earlier pass."
                 return decision
-            reference = result_reference(path)
+            if source_build is not None:
+                return {"decision": "reuse", "reason": "Matching original result from Git build summary.",
+                        "record": record, "reference": None, "build": source_build}
+            assert candidate_path is not None
+            reference = result_reference(candidate_path)
             return {"decision": "reuse", "reason": "Matching original executed pass.",
                     "record": record, "reference": reference}
         if failures:
@@ -512,6 +547,27 @@ class CheckResultStore:
                 protected = set(protected_ids) | self._references()
                 requests = [(check_context(item), True)
                             for item in (*self.active_inputs, *active_inputs)]
+                if any(record["status"] in {"failed", "interrupted"} for _, record, _ in records):
+                    # Failure retention must cover the selected build at every
+                    # level, including a beta build older than the newest alpha.
+                    # This reads only this checkout's bounded selected summaries.
+                    from sdlc_results import select_build_check_summaries
+
+                    builds = {}
+                    for level in LEVELS:
+                        for build in select_build_check_summaries(self.repo_root, qualification_level=level):
+                            builds[(build["tag"], build["receiptPath"])] = build
+                    for build in builds.values():
+                        summary = build["summary"]
+                        for check in summary["checks"]:
+                            if (check.get("kind") != "repository-check" or check.get("status") != "passed"
+                                    or "inputGroup" not in check):
+                                continue
+                            inputs = check_context(summary["inputGroups"][check["inputGroup"]])
+                            if "worktree" in inputs["scope"]:
+                                inputs["scope"] = {**inputs["scope"], "worktree": hashlib.sha256(str(self.repo_root).encode()).hexdigest()}
+                                inputs["fingerprint"] = fingerprint(inputs)
+                            requests.append((inputs, False))
                 # Historical references retain their exact acceptance and any
                 # applicable failure; they do not create a current candidate
                 # that would pin an additional unreferenced passing version.

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import argparse
 import importlib
 import json
 import os
 import pathlib
+import runpy
 import shutil
 import subprocess
 import sys
@@ -70,6 +72,78 @@ def _fixture(root: pathlib.Path):
 def _check(root: pathlib.Path, level="beta"):
     operation = runner.prepare_operations(root, [runner.OperationRequest("repository.actions.test")])[0]
     return runner.replace(operation, qualification_level=level)
+
+
+def test_git_build_summary_supplies_public_cli_check_without_original_log(tmp_path):
+    from tests.repository_lifecycle.test_completed_builds import _tag_summary
+
+    _fixture(tmp_path)
+    original = runner.execute_prepared_operation(_check(tmp_path))
+    assert original["status"] == "completed" and original["check_decision"] == "executed"
+    reference = original["check_result"]
+    tag, _ = _tag_summary(tmp_path, "1.0.0b1", original["check_summary"])
+    (tmp_path / ".git" / reference["path"]).unlink()
+    argv = [sys.executable, str(ROOT / "skills/ceratops-repo-lifecycle/scripts/repository_operation.py"),
+            "--repo-root", str(tmp_path), "--tests", "--qualification-level", "beta"]
+    for _ in range(2):
+        process = subprocess.run(argv, cwd=tmp_path, text=True, capture_output=True, check=False)
+        assert process.returncode == 0, process.stdout + process.stderr
+        result = next(item for item in json.loads(process.stdout)["results"] if item["operation"] == "repository.actions.test")
+        assert result["check_decision"] == "reused" and result["check_baseline"]["tag"] == tag
+        own = next(item for item in result["check_summary"]["checks"] if item.get("kind") == "repository-check")
+        assert own["result_id"] == reference["result_id"] and own["qualificationLevel"] == "beta"
+    assert (tmp_path / "source-checks.txt").read_text() == "x"
+
+
+def test_git_baseline_never_hides_newer_repository_check_failure(tmp_path, monkeypatch):
+    from tests.repository_lifecycle.test_completed_builds import _tag_summary
+
+    _fixture(tmp_path)
+    original = runner.execute_prepared_operation(_check(tmp_path))
+    _tag_summary(tmp_path, "1.0.0b1", original["check_summary"])
+    plan = reuse.plan_operation(_check(tmp_path))
+    inputs = plan.context
+    writer = runpy.run_path(str(tmp_path / "scripts/check.py"))
+
+    identity, path = plan.store.new_result_path()
+    args = argparse.Namespace(result_file=path, result_id=identity, candidate_id=inputs["workVersion"],
+                              check_id=inputs["group"], check_version=inputs["checkVersion"], repair_unaccepted_result=False)
+    monkeypatch.setenv(reuse.CONTEXT_ENV, json.dumps(inputs))
+    monkeypatch.chdir(tmp_path)
+    assert writer["run_recorded_check"](lambda: 7, args, {}) == 7
+    monkeypatch.delenv(reuse.CONTEXT_ENV)
+    fresh = runner.execute_prepared_operation(_check(tmp_path))
+    assert fresh["check_decision"] == "executed" and fresh["status"] == "completed"
+    assert (tmp_path / "source-checks.txt").read_text() == "xx"
+
+
+def test_failure_retention_covers_older_beta_build_after_newer_alpha(tmp_path, monkeypatch):
+    from tests.repository_lifecycle.test_completed_builds import _tag_summary
+
+    _fixture(tmp_path)
+    original = runner.execute_prepared_operation(_check(tmp_path))
+    _tag_summary(tmp_path, "1.0.0b1", original["check_summary"])
+    (tmp_path / ".git" / original["check_result"]["path"]).unlink()
+    plan = reuse.plan_operation(_check(tmp_path))
+    inputs = plan.context
+    writer = runpy.run_path(str(tmp_path / "scripts/check.py"))
+    identity, path = plan.store.new_result_path()
+    args = argparse.Namespace(result_file=path, result_id=identity, candidate_id=inputs["workVersion"],
+                              check_id=inputs["group"], check_version=inputs["checkVersion"], repair_unaccepted_result=False)
+    monkeypatch.setenv(reuse.CONTEXT_ENV, json.dumps(inputs))
+    monkeypatch.chdir(tmp_path)
+    assert writer["run_recorded_check"](lambda: 7, args, {}) == 7
+    monkeypatch.delenv(reuse.CONTEXT_ENV)
+    lower = runner.execute_prepared_operation(_check(tmp_path, "alpha"))
+    _tag_summary(tmp_path, "1.1.0a1", lower["check_summary"])
+    for index in range(5):
+        (tmp_path / "source.py").write_text(f"value = {index + 2}\n")
+        assert runner.execute_prepared_operation(_check(tmp_path))["status"] == "completed"
+    (tmp_path / "source.py").write_text("value = 1\n")
+    fresh = reuse.plan_operation(_check(tmp_path))
+    assert path.exists()
+    assert fresh.decision["decision"] == "execute"
+    assert "failed" in fresh.decision["reason"]
 
 
 def test_promotion_pass_is_consumed_by_a_later_package_build(tmp_path, capsys):

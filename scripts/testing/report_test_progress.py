@@ -36,6 +36,7 @@ class PytestProcess(subprocess.CompletedProcess[str]):
     passed_checks: list[dict[str, object]] | None = None
     check_timings: dict[str, float] | None = None
     check_summary: dict[str, object] | None = None
+    check_decisions: dict[str, object] | None = None
 
 
 class TestProgress:
@@ -181,6 +182,11 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
 
 
 def pytest_collection_finish(session: pytest.Session) -> None:
+    reuse = session.config.pluginmanager.get_plugin("executed-pass-reuse")
+    if _stream is not None and reuse is not None:
+        for check, decision in reuse.store.reuse_reasons.items():
+            _stream.write(PREFIX + "selection " + json.dumps({"check": check, **decision}, sort_keys=True) + "\n")
+        _stream.flush()
     if _progress is not None:
         _progress.collected(len(session.items))
 
@@ -287,4 +293,5 @@ def run_pytest(
             result.passed_checks = summary.get("passed_checks", [])
             result.check_timings = summary.get("timings")
             result.check_summary = summary.get("check_summary")
+            result.check_decisions = summary.get("check_decisions")
     return result

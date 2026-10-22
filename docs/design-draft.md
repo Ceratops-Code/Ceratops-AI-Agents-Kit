@@ -359,7 +359,7 @@ An empty collection and actual pytest failures retain their failure exit codes.
 The returned JSON includes collected, executed and reused counts; no model call
 is needed to select or transfer individual results.
 
-Matching inputs include checkout identity, behavior-changing arguments,
+Current attempt files are selected by checkout identity. Matching inputs include behavior-changing arguments,
 runtime/platform and producer versions, plus the packages, tools, environment
 variables and production/data paths assigned to each check group. The existing
 `tests/test-impact.json` is read by `select_test_groups.py`; no second dependency
@@ -384,6 +384,10 @@ records remain unchanged; a missing historical level is eligible only for the
 legacy unqualified runner. Qualified calls use the shared level matrix, and a
 newer applicable failed or interrupted attempt blocks older passes for that
 individual test. A later matching pass resolves only its covered failure.
+When a failure would expire, retention also considers the selected build at each
+qualification level, at most four per unit/target. Newer alpha work cannot erase a
+failure still blocking an older beta build. These are compact tagged summaries;
+retention does not open packages or another worktree's build history.
 
 `.pytest-pass.lock` serializes reads, final writes and pruning; a busy writer
 leaves another invocation free to execute its checks normally. Startup and each
@@ -399,7 +403,8 @@ per-save traversal. Results survive task-temp and worktree deletion. The
 caller-owned `pytest-results.json` lives inside pytest's isolated temp directory,
 carries returned counts and original result references, and is removed by that
 directory's existing owner. Aggregate records retain those child identities,
-check versions and levels without changing the normal counts-only stdout.
+check versions and levels. Stdout adds at most 32 per-check decisions and an
+omitted count; stderr streams each decision before test bodies execute.
 The private `nonreusable_checks` transport carries explicit `reusable: false`
 facts for always-run tests, distributed execution and unrepresented child scope.
 Aggregate records preserve these constraints alongside original child references;
@@ -423,8 +428,46 @@ their complete canonical contents. `docs/result_records.py.tmpl` owns repository
 check exports and its generated consumers; the reader rejects a summary that
 contradicts its executed parent. Skips retain a reason and never become passes.
 The envelope contains the facts needed for reuse without following old reports.
-It adds no store: existing aggregate records own its lifecycle. 5C connects this
-contract to build receipts and tags; tests alone do not create build versions.
+Existing aggregate records own their bounded copy. The completed v3 build owns
+its tracked `check_summary.json` beside `build_receipt.json`; tests alone do not
+create build versions. The receipt's `tag` and `checkSummary` path/size/SHA-256
+bind the summary to the intended `<unit>/<version>` tag. Receipt and summary enter
+the same result-only commit; artifact binding follows, and tag creation is last.
+
+`sdlc_results.select_build_check_summaries()` discovers only the current worktree's
+`.build/<unit>/<version>/[<target>/]build_receipt.json` records. It chooses the
+highest completed eligible version for each requested unit/target and reads exact
+receipt and summary blobs at that tag. It neither walks commit ancestry nor reads
+other worktrees, deployments, packages or full logs. The portable reader is part
+of `docs/result_records.py.tmpl`, with generated repository/template consumers;
+repository maintenance does not import the installed skill implementation.
+
+Alpha accepts alpha/beta/rc/final results, beta accepts beta/rc/final, rc accepts
+rc/final, and final accepts final only. Both the selected version and each
+original result must qualify. Missing historical summary facts supply no
+coverage; malformed committed links or content hashes stop selection. The latest
+eligible historical record with no summary does not silently select an older one.
+Checkout copies supply selection identities only, never acceptance bytes.
+
+`--auto` local/promotion execution collects the current required inventory once
+and compares each case's product/check inputs, arguments, runtime, relevant
+dependencies and settings. Only uncovered or affected cases execute. A Git
+summary's original checkout location is not an executable input; its discovery
+still comes exclusively from this checkout's build records. Current attempt
+files remain worktree-scoped and can supersede tagged results after corrections.
+Newer applicable failures block old passes, including after retention. Tests
+without represented inputs execute instead of receiving fabricated coverage.
+
+`reuse_operation_checks` supplies the same selection to declared SDLC checks,
+including checks requested by current Build and promotion callers. Git-backed
+results return their original summary and tag/commit/receipt path without
+depending on a canonical log file or allocating a replacement result ID.
+`prepare_versioned_receipt(..., check_summaries=...)` composes the next build's
+summary from the supplied actual outcomes, retaining original IDs, versions and
+levels and checking that recorded source bytes still match. A failed required
+check cannot produce the new receipt. Existing historical receipts remain
+unchanged. Native v3 Build and receipt-driven promotion routing are still assigned
+to steps 16/22; they consume this foundation rather than adding another history.
 
 Pytest's maintained collection hook checks all requested targets and passes the
 same items to execution/reuse. Collection probes remain only for explicit
