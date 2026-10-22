@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import pathlib
 import runpy
@@ -276,7 +277,8 @@ def _make_mcp_receipt_case(tmp_path, name):
     record.write_text(json.dumps(promotion), encoding="utf-8")
     payload = {"installed_version": "1.0.1", "manifest_sha256": "a" * 64,
                "reconnection_required": False, "running_version": None,
-               "mcp_server_name": name}
+               "mcp_server_name": name,
+               "maintenance": {"removed": ["retired-version"], "deferred": ["busy-version"], "errors": []}}
     manager = task / "manager.json"
     manager.write_text(json.dumps(payload), encoding="utf-8")
     home = tmp_path / "home"
@@ -344,36 +346,36 @@ runpy.run_path(str(script), run_name='__main__')
 
 def _receipt_writer_arguments(case):
     return ["--repo-root", str(case.repo), "--manager-result", str(case.manager),
-            "--promotion-result", str(case.record), "--operation", case.operation,
             "--evidence-output", str(case.output)]
 
 
 def _receipt_finalizer_arguments(case):
+    if case.record.exists():
+        case.report_digest = hashlib.sha256(case.record.read_bytes()).hexdigest()
     return ["--repo-root", str(case.repo), "--finalize-result",
             "--release-branch", "release/local", "--result-file", str(case.record),
             "--task-temp-root", str(case.task), "--expected-commit", case.commit,
-            "--deployment-evidence", str(case.output)]
+            "--verified-result-sha256", case.report_digest]
+
+
+def _record_actual_installation(case, receipt):
+    """Model the repo caller saving the result of its own installation call."""
+    report = json.loads(case.record.read_text(encoding="utf-8"))
+    outcome = report["operations"]["results"][0]
+    outcome.update(handoff_completed=True, steps=[1],
+                   step_results=[{"step": 1, "result": receipt}])
+    case.record.write_text(json.dumps(report), encoding="utf-8")
 
 
 @pytest.mark.parametrize("name", ["source_search_mcp", "sample-mcp-server"])
-@pytest.mark.parametrize("pending", [False, True])
 @pytest.mark.parametrize("interruption", [None, "replace-before", "replace-after",
                                           "unlink-before", "unlink-after"])
-def test_mcp_receipt_cli_survives_repeat_and_effect_interruptions(tmp_path, name, interruption, pending):
+def test_mcp_receipt_cli_survives_repeat_and_effect_interruptions(tmp_path, name, interruption):
     case = _make_mcp_receipt_case(tmp_path, name)
-    if pending:
-        promotion = json.loads(case.record.read_text(encoding="utf-8"))
-        operations = promotion.pop("operations")
-        operations.update(status="handoff_required", completed_operations=[],
-                          pending_operations=[case.operation])
-        operations["results"][0]["status"] = "handoff_required"
-        case.record.write_text(json.dumps({
-            "status": "handoff_required", "phase": "deployment",
-            "promotion": promotion, "operations": operations,
-        }), encoding="utf-8")
     writer = ROOT / "skills/ceratops-mcp-server-lifecycle/scripts/install-mcp-server.py"
     finalizer = ROOT / "skills/ceratops-repo-lifecycle/scripts/promote-repository.py"
     accepted = (case.current.read_bytes(), case.accepted.read_bytes())
+    original_report = case.record.read_bytes()
     if interruption and interruption.startswith("replace"):
         phase = interruption.split("-")[1]
         failed = _receipt_cli(case, writer, _receipt_writer_arguments(case), "replace", phase)
@@ -386,79 +388,55 @@ def test_mcp_receipt_cli_survives_repeat_and_effect_interruptions(tmp_path, name
         assert result.returncode == 0, result.stderr
         receipt = json.loads(result.stdout)
         assert receipt["deployed"] == [name] and receipt["transaction_id"] == "b" * 32
+        assert "promotion" not in receipt and "promotion_cleanup" not in receipt
+        assert receipt["maintenance"] == json.loads(case.manager.read_text())["maintenance"]
         assert json.loads(case.output.read_text(encoding="utf-8")) == receipt
+        assert case.record.read_bytes() == original_report
+    _record_actual_installation(case, receipt)
+    arguments = _receipt_finalizer_arguments(case)
     if interruption and interruption.startswith("unlink"):
         phase = interruption.split("-")[1]
-        failed = _receipt_cli(case, finalizer, _receipt_finalizer_arguments(case), "unlink", phase)
+        failed = _receipt_cli(case, finalizer, arguments, "unlink", phase)
         assert failed.returncode == 1
         assert json.loads(failed.stderr)["replay_required"] is False
         assert case.record.exists() == (phase == "before")
-    if case.record.exists():
-        result = _receipt_cli(case, finalizer, _receipt_finalizer_arguments(case))
+    for _ in range(2):
+        result = _receipt_cli(case, finalizer, arguments)
         assert result.returncode == 0 and result.stdout.strip() == "OK", result.stderr
-    # A consumed record is not evidence for another deletion or installation.
-    repeated = _receipt_cli(case, finalizer, _receipt_finalizer_arguments(case))
-    assert repeated.returncode == 1 and not case.record.exists()
-    assert json.loads(repeated.stderr)["replay_required"] is False
+    assert not case.record.exists()
     assert (case.current.read_bytes(), case.accepted.read_bytes()) == accepted
     assert case.manager.exists() and case.output.exists()
 
 
-@pytest.mark.parametrize("fault", ["failure", "commit", "route", "duplicate", "selection", "unfinished"])
-def test_mcp_pending_handoff_rejects_unrelated_or_failed_work(tmp_path, fault):
+@pytest.mark.parametrize("status", ["handoff_required", "operation_failed"])
+def test_mcp_installer_ignores_repository_reports_and_repo_keeps_pending_work(tmp_path, status):
     case = _make_mcp_receipt_case(tmp_path, "source_search_mcp")
     promotion = json.loads(case.record.read_text(encoding="utf-8"))
     operations = promotion.pop("operations")
-    operations.update(status="handoff_required", completed_operations=[],
-                      pending_operations=[case.operation])
-    outcome = operations["results"][0]
-    outcome["status"] = "handoff_required"
-    record = {"status": "handoff_required", "phase": "deployment",
+    operations.update(status=status, completed_operations=[], pending_operations=[case.operation])
+    operations["results"][0]["status"] = status
+    record = {"status": status, "phase": "deployment",
               "promotion": promotion, "operations": operations}
-    if fault == "failure":
-        record["status"] = "operation_failed"
-    elif fault == "commit":
-        promotion["head"] = "0" * 40
-    elif fault == "route":
-        outcome["handoff"] = "ceratops-skill-lifecycle/deploy"
-    elif fault == "duplicate":
-        operations["results"].append(dict(outcome))
-    elif fault == "selection":
-        operations["pending_operations"] = ["another-operation"]
-    else:
-        outcome["status"] = "operation_failed"
     case.record.write_text(json.dumps(record), encoding="utf-8")
     original = case.record.read_bytes()
     writer = ROOT / "skills/ceratops-mcp-server-lifecycle/scripts/install-mcp-server.py"
     finalizer = ROOT / "skills/ceratops-repo-lifecycle/scripts/promote-repository.py"
     for _ in range(2):
-        failed = _receipt_cli(case, writer, _receipt_writer_arguments(case))
-        assert failed.returncode == 1 and not case.output.exists()
+        installed = _receipt_cli(case, writer, _receipt_writer_arguments(case))
+        assert installed.returncode == 0, installed.stderr
+        assert case.record.read_bytes() == original
         failed = _receipt_cli(case, finalizer, _receipt_finalizer_arguments(case))
         assert failed.returncode == 1 and case.record.read_bytes() == original
 
 
-@pytest.mark.parametrize("fault", ["malformed-mcp-name", "skill-underscore", "commit", "debt"])
-@pytest.mark.parametrize("pending", [False, True])
-def test_mcp_receipt_cli_keeps_invalid_or_unfinished_records(tmp_path, fault, pending):
-    import hashlib
-
+@pytest.mark.parametrize("fault", ["malformed-mcp-name", "skill-underscore", "commit", "debt", "maintenance"])
+def test_mcp_receipt_cli_keeps_incomplete_installation_results(tmp_path, fault):
     case = _make_mcp_receipt_case(tmp_path, "source_search_mcp")
-    if pending:
-        promotion = json.loads(case.record.read_text(encoding="utf-8"))
-        operations = promotion.pop("operations")
-        operations.update(status="handoff_required", completed_operations=[],
-                          pending_operations=[case.operation])
-        operations["results"][0]["status"] = "handoff_required"
-        case.record.write_text(json.dumps({
-            "status": "handoff_required", "phase": "deployment",
-            "promotion": promotion, "operations": operations,
-        }), encoding="utf-8")
     writer = ROOT / "skills/ceratops-mcp-server-lifecycle/scripts/install-mcp-server.py"
     finalizer = ROOT / "skills/ceratops-repo-lifecycle/scripts/promote-repository.py"
     result = _receipt_cli(case, writer, _receipt_writer_arguments(case))
     assert result.returncode == 0, result.stderr
-    receipt = json.loads(case.output.read_text(encoding="utf-8"))
+    receipt = json.loads(result.stdout)
     if fault == "malformed-mcp-name":
         receipt["deployed"] = ["source__search"]
     elif fault == "skill-underscore":
@@ -466,14 +444,13 @@ def test_mcp_receipt_cli_keeps_invalid_or_unfinished_records(tmp_path, fault, pe
         promotion["operations"]["results"][0]["handoff"] = "ceratops-skill-lifecycle/deploy"
         case.record.write_text(json.dumps(promotion), encoding="utf-8")
         receipt["producer"] = "ceratops-skill-lifecycle/deploy"
-        receipt["promotion"]["sha256"] = hashlib.sha256(case.record.read_bytes()).hexdigest()
-        receipt["promotion"]["identity"] = [getattr(case.record.stat(), key) for key in (
-            "st_dev", "st_ino", "st_mtime_ns", "st_size", "st_mode", "st_nlink")]
     elif fault == "commit":
         receipt["commit"] = "0" * 40
+    elif fault == "maintenance":
+        receipt["maintenance"]["errors"] = ["hidden error"]
     else:
         receipt["cleanup_debt"] = ["unfinished"]
-    case.output.write_text(json.dumps(receipt), encoding="utf-8")
+    _record_actual_installation(case, receipt)
     original = case.record.read_bytes()
     for _ in range(2):
         failed = _receipt_cli(case, finalizer, _receipt_finalizer_arguments(case))
@@ -484,22 +461,21 @@ def test_mcp_receipt_cli_keeps_invalid_or_unfinished_records(tmp_path, fault, pe
             assert "invalid deployment identities" in message["message"]
 
 
-@pytest.mark.parametrize("bound", [False, True])
-def test_receipt_destination_stops_before_manager_resolution(tmp_path, bound):
+@pytest.mark.parametrize("fault", ["missing-parent", "directory", "input"])
+def test_receipt_destination_stops_before_manager_resolution(tmp_path, fault):
     case = _make_mcp_receipt_case(tmp_path, "source_search_mcp")
     writer = ROOT / "skills/ceratops-mcp-server-lifecycle/scripts/install-mcp-server.py"
-    arguments = ["--repo-root", str(case.repo), "--evidence-output",
-                 str(case.task / "wrong/completion.json")]
-    if bound:
-        arguments.extend(["--promotion-result", str(case.record), "--operation", case.operation])
+    destination = {"missing-parent": case.task / "wrong/completion.json",
+                   "directory": case.task, "input": case.manager}[fault]
+    before = case.manager.read_bytes()
+    arguments = ["--repo-root", str(case.repo), "--manager-result", str(case.manager),
+                 "--evidence-output", str(destination)]
     for _ in range(2):
         result = _receipt_cli(case, writer, arguments)
         assert result.returncode == 1 and case.record.exists()
         message = json.loads(result.stderr)["message"]
-        expected = ("must share the promotion task directory" if bound
-                    else "requires a bound promotion result")
-        assert expected in message
-        assert not case.output.exists()
+        assert "evidence output" in message
+        assert not case.output.exists() and case.manager.read_bytes() == before
 
 
 def _manager_command_case(tmp_path, mode):
@@ -551,7 +527,6 @@ def test_mcp_install_preserves_command_facts_without_retry(tmp_path, monkeypatch
     monkeypatch.setenv("MCP_INSTALL_TEST_TOKEN", secret)
     script = ROOT / "skills/ceratops-mcp-server-lifecycle/scripts/install-mcp-server.py"
     arguments = ["--repo-root", str(case.repo), "--mcp-server-name", "source_search_mcp",
-                 "--promotion-result", str(case.record), "--operation", case.operation,
                  "--evidence-output", str(case.output)]
     runtime = str(tmp_path / f"{secret}-missing-python.exe") if mode == "launch" else sys.executable
     reported_runtime = runtime.replace(secret, "[REDACTED]")
@@ -582,7 +557,7 @@ def test_mcp_install_preserves_command_facts_without_retry(tmp_path, monkeypatch
                 "repo_root": str(case.repo), "commit": case.commit,
                 "install_root": str(case.home / ".codex/mcp"), "deployed": ["source_search_mcp"],
                 "removed": [], "transaction_id": "b" * 32, "cleanup_debt": [],
-                "promotion": result["promotion"],
+                "maintenance": {"removed": ["retired-version"], "deferred": ["busy-version"], "errors": []},
             }
             assert json.loads(case.output.read_text()) == result
             continue

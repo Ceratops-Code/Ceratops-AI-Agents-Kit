@@ -244,16 +244,14 @@ branches, and pending-work scope before finalization. The helper requires a
 ready result for the expected commit with no deployment operations or evidence.
 Without `--promotion-only`, deployment completion checks still apply.
 
-For completed handoffs, add `--deployment-evidence FILE` or pass JSON on
-stdin with `--deployment-evidence -`. One receipt may bind one operation or a
-nonempty ordered list of operations from the same unchanged promotion record.
-Bound evidence permits omission of the caller digest when every outcome uses
-this protocol. The receipt must bind the original record digest and operations
-to its producer, repository, clean commit, installation destination, exact
-deployed and removed skills, transaction, and cleanup debt. Finalization maps
-the receipt to every bound operation, rejects duplicate or unselected
-operations, and requires completed status with no debt; a handoff or `OK` alone
-cannot establish completion.
+The operation runner records the result returned by each requested installation.
+Installers receive installation inputs only; they do not read this report, bind
+its path/hash/file identity, or invoke the repo finalizer. Completion consumes
+those recorded actual outcomes without another promotion-matching stage. A
+pending or failed installation keeps the needed report; no external receipt can
+turn a pending handoff into completion. Use the repo cleanup command above after
+all requested work completes, without reinstalling or replaying promotion.
+Repeating cleanup after the owned report is already absent succeeds without effects.
 
 Finalization deletes only the named promotion record. It preserves failed,
 incomplete, mismatched, changed, linked, and out-of-scope records, other task

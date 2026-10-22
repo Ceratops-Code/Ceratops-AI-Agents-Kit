@@ -488,6 +488,7 @@ def remove_resolved_failures(
         selected, owner = _report_scope(diagnostic_output, repo_root, action)
         previous = _read_failure_report(selected, owner)
         if not previous or not set(previous["failures"]).intersection(resolved_failures):
+            result.pop("report_cleanup_error", None)
             return
         remaining = {key: value for key, value in previous["failures"].items()
                      if key not in resolved_failures}
@@ -502,6 +503,7 @@ def remove_resolved_failures(
                 selected, repo_root=repo_root, action=action,
                 resolved_failures=resolved_failures, commands_stopped=True,
             )
+        result.pop("report_cleanup_error", None)
     except (OSError, ValueError, CommandError) as exc:
         result["report_cleanup_error"] = sanitize_for_output(str(exc))
 

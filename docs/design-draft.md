@@ -13,7 +13,7 @@ output lifetimes; the refactor plan records delivery order. The working-folder
 methodology below distinguishes implemented versioned storage, receipt preparation,
 final-commit binding, completion tags, effect-derived recovery and shared
 checkpoint storage and connected release-lock protection from planned
-receipt-driven public lifecycle routing. Steps through 4F and standalone 6A are
+receipt-driven public lifecycle routing. Steps through 4G and standalone 6A are
 implemented; 4F provides internal retention functions, not the later public
 connections. Later phase scheduling and artifact-only installation remain planned.
 
@@ -894,6 +894,14 @@ complete resolution calls the writing helper's `remove_failure_report()`.
 It retains uncertain writers and files with different ownership or format.
 An I/O error is returned as `report_cleanup_error` on the successful result;
 it does not revoke that success or schedule another check/build/delivery.
+On the next normal call, an applicable saved success takes this same cleanup
+path without repeating its effect. An interruption before deletion leaves the
+report for that call; after deletion, absence is already success. Successful
+cleanup clears an earlier cleanup error. A newer failure that prevents result
+reuse, or an unresolved different check, keeps its diagnostics.
+No file is created unless the caller selected an output path and there is no
+existing complete child report to reference; without a selected path the complete
+error stays in the returned result.
 
 `ship.py::run_parallel_gates()` retires the selected repository/PR's CI failure
 after its existing exact-head check succeeds and the concurrent waits finish,
@@ -1782,7 +1790,7 @@ builder keeps its source repository in module variables. Calls restore the
 caller's working directory unless installation retired that directory; this
 uses an in-memory lock, not another lock file or saved operation record.
 Before installation it resolves the source and destination, exact deployment
-mode, selected skill names, and any supplied promotion bindings. It runs the
+mode and selected skill names. It runs the
 existing source-check script with the current interpreter: `full` for an
 all-managed request, or `skill` with the exact explicit or base-derived names.
 Source-check failure prevents the runtime transaction from starting. Inventory,
@@ -1795,15 +1803,29 @@ installed skills. Each call receives its repository and selection explicitly;
 the helper stores no repository selection, writes no files and adds no CLI.
 Clean Git sources are checked for commit movement before installation and
 before reporting commit-bound completion. Dirty and non-Git source installs
-remain supported, but they carry no commit attestation and cannot complete a
-saved promotion. This flow does not freeze files against simultaneous edits.
+remain supported, but carry no commit attestation. This flow does not freeze
+files against simultaneous edits.
 
 The existing runtime transaction remains responsible for destination ownership,
 activation, rollback and retired-output cleanup. The installer adds no storage
-layer, source-check history, implicit package build or deployment retry. A
-successful installation followed by failed promotion cleanup keeps the actual
-completion receipt, complete cleanup error output and cleanup-only command.
-The caller may pass that receipt to the existing finalizer without reinstalling.
+layer, source-check history, implicit package build or deployment retry. It takes
+no promotion-report path, operation binding, report hash or repository-helper
+path. Its result contains only the actual installation outcome, installed and
+removed names, destination, source commit, transaction ID and runtime-cleanup debt.
+The MCP installer follows the same separation and also returns the manager's
+complete `maintenance` object (`removed`, `deferred`, `errors`).
+
+Repo lifecycle records the result of its own requested installation, then removes
+only its completed caller-selected promotion report through the existing
+`--finalize-result` command. The report's digest selects the exact file to remove;
+it is not passed to installers or attached to installation results. Pending,
+failed or cleanup-blocked installations keep the report. No external receipt can
+turn a saved pending handoff into completion. Cleanup never runs installation or
+replays promotion; repeating it after the exact report is absent succeeds.
+Build receipts, successful results and unrelated files are excluded. An optional
+MCP `--evidence-output` is a caller-owned installation result, not a promotion
+record; its parent must exist and it cannot overwrite an installation input.
+It keeps one current file; its caller removes it after use.
 Repository package build/test acceptance remains with the SDLC caller: current
 installer inputs do not independently identify those accepted package results.
 

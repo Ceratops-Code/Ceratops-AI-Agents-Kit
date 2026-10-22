@@ -3545,104 +3545,6 @@ def test_tool_install_binding_defers_package_backed_selection(
     }
 
 
-def test_tool_install_helper_attests_existing_manager_result_without_reinstall(
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    projects = tmp_path / "projects"
-    repo = projects / "claims"
-    repo.mkdir(parents=True)
-    (repo / "source.txt").write_text("source\n", encoding="utf-8")
-    commit = _repository(repo)
-    task = projects / "tmp/claims/task"
-    task.mkdir(parents=True)
-    operation = "deliverables.mcp-servers.insurance-claims-mcp-server.actions.install"
-    promotion = {
-        "status": "ready",
-        "head": commit,
-        "operations": {
-            "status": "completed",
-            "pending_operations": [],
-            "completed_operations": [operation],
-            "results": [
-                {
-                    "operation": operation,
-                    "commit": commit,
-                    "status": "completed",
-                    "steps": [],
-                    "handoff": "ceratops-mcp-server-lifecycle/install",
-                }
-            ],
-        },
-    }
-    promotion_path = task / "promotion.json"
-    promotion_path.write_text(json.dumps(promotion), encoding="utf-8")
-    manager_result = {
-        "installed_version": "1.2.3",
-        "manifest_sha256": "a" * 64,
-        "reconnection_required": False,
-        "running_version": None,
-        "mcp_server_name": "insurance-claims-mcp-server",
-    }
-    manager_path = task / "manager.json"
-    manager_path.write_text(json.dumps(manager_result), encoding="utf-8")
-    install_root = tmp_path / "installed"
-    instance = "b" * 32
-    selected = {
-        "schema": 1,
-        "mcp_server_id": "insurance-claims-mcp-server",
-        "version": "1.2.3",
-        "manifest_sha256": "a" * 64,
-        "instance": instance,
-        "module": "insurance_claims_tool",
-    }
-    mcp_server_root = install_root / "insurance-claims-mcp-server"
-    immutable = mcp_server_root / "versions/1.2.3" / instance
-    immutable.mkdir(parents=True)
-    (mcp_server_root / "current.json").write_text(json.dumps(selected), encoding="utf-8")
-    (immutable / "receipt.json").write_text(json.dumps(selected), encoding="utf-8")
-    helper = runpy.run_path(
-        str(ROOT / "skills/ceratops-mcp-server-lifecycle/scripts/install-mcp-server.py")
-    )
-    monkeypatch.setitem(helper["main"].__globals__, "INSTALL_ROOT", install_root)
-    output = task / "mcp-server-completion.json"
-    code = helper["main"](
-        [
-            "--repo-root",
-            str(repo),
-            "--mcp-server-name",
-            "insurance-claims-mcp-server",
-            "--manager-result",
-            str(manager_path),
-            "--promotion-result",
-            str(promotion_path),
-            "--operation",
-            operation,
-            "--evidence-output",
-            str(output),
-        ]
-    )
-    assert code == 0
-    receipt = json.loads(capsys.readouterr().out)
-    assert json.loads(output.read_text(encoding="utf-8")) == receipt
-    assert receipt["producer"] == "ceratops-mcp-server-lifecycle/install"
-    assert receipt["commit"] == commit
-    assert receipt["deployed"] == ["insurance-claims-mcp-server"]
-    assert receipt["transaction_id"] == instance
-    assert receipt["promotion"]["operation"] == operation
-    promote = runpy.run_path(
-        str(ROOT / "skills/ceratops-repo-lifecycle/scripts/promote-repository.py")
-    )
-    binding = dict(receipt["promotion"])
-    binding.pop("operation")
-    promote["_completed_deployment"](
-        promotion,
-        commit,
-        repo_root=repo,
-        external={operation: receipt},
-        record_binding=binding,
-    )
 
 
 def test_tool_install_helper_runs_manager_once_and_attests_selection(
@@ -3693,7 +3595,6 @@ def test_tool_install_helper_runs_manager_once_and_attests_selection(
     receipt = json.loads(capsys.readouterr().out)
     assert calls == [("sample-mcp-server", repo)]
     assert receipt["commit"] == commit
-    assert receipt["promotion"] is None
     assert receipt["transaction_id"] == instance
 
 
@@ -3959,7 +3860,7 @@ def deploy_managed_skills(args):
         'repo_root': str(args.repo_root), 'commit': commit,
         'install_root': str(args.repo_root.parent / 'installed'),
         'deployed': [args.skill], 'removed': [], 'transaction_id': 'a' * 32,
-        'cleanup_debt': [], 'promotion': None}
+        'cleanup_debt': []}
 if __name__ == '__main__':
     print(json.dumps(deploy_managed_skills(build_parser().parse_args())))
 """

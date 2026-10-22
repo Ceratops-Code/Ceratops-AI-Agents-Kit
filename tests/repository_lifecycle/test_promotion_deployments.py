@@ -6,7 +6,6 @@ import pathlib
 import runpy
 import subprocess
 import sys
-from typing import Any
 
 import pytest
 
@@ -15,10 +14,7 @@ from tests.repository_lifecycle.support import (
     prepare_divergent_promotion_repo,
     prepare_repository_lifecycle_repo,
 )
-from tests.support.repositories import (
-    run_git,
-    write_sdlc_contract,
-)
+from tests.support.repositories import run_git
 
 
 @pytest.mark.parametrize(
@@ -219,7 +215,7 @@ def test_promote_repository_requires_an_explicit_deployment_choice(
         assert not log.exists()
     elif expected_handoff is not None:
         assert finalized.returncode == 1
-        assert "lacks bound completion evidence" in json.loads(finalized.stderr)["message"]
+        assert "Deployment is missing or incomplete" in json.loads(finalized.stderr)["message"]
         assert result_file.read_bytes() == data
         assert log.read_text(encoding="utf-8") == "no-base\n"
     else:
@@ -426,430 +422,128 @@ def test_promote_and_deploy_rejects_operation_created_repository_work(
     assert (repo / "generated-by-deploy.txt").is_file()
 
 
-def _write_saved_handoff_record(
-    record: pathlib.Path, outcomes: list[dict[str, Any]],
-) -> dict[str, Any]:
-    """Supply the existing saved-record contract to its receipt consumers.
-
-    Current promotion runs bound installations or reports them as pending; it
-    no longer emits ready records for unexecuted handoffs. These fixtures cover
-    records already retained by callers, not today's promotion output.
-    """
-    promotion = json.loads(record.read_text(encoding="utf-8"))
-    assert promotion["status"] == "ready" and promotion["operations"] is None
-    promotion["operations"] = {
-        "status": "completed",
-        "completed_operations": [item["operation"] for item in outcomes],
-        "pending_operations": [],
-        "results": [{**item, "commit": promotion["head"]} for item in outcomes],
-    }
-    record.write_text(json.dumps(promotion) + "\n", encoding="utf-8", newline="\n")
-    return promotion
-
-
-@pytest.mark.parametrize("cleanup_failure", [False, True])
-@pytest.mark.parametrize("deployment_case", ["plain", "json"])
-def test_managed_installer_finalizes_only_its_bound_promotion_record(
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    cleanup_failure: bool,
-    deployment_case: str,
-) -> None:
-    from tests.skill_lifecycle.support import load_runtime_installer
-    from tests.support.repositories import create_compatible_repo
-
-    repo, _, _, environment = prepare_repository_lifecycle_repo(tmp_path)
-    create_compatible_repo(repo, "example/completion", ["alpha-tool", "beta-tool"])
-    operation = "deliverables.apps.managed-deployment.actions.install"
-    structured = deployment_case == "json"
-    output = (
-        json.dumps({"schema": "test.install.v1", "status": "OK"})
-        if structured
-        else "Requirement already satisfied"
+@pytest.mark.parametrize("entrypoint", ["callable", "cli"])
+@pytest.mark.parametrize("effect", ["record", "delete"])
+@pytest.mark.parametrize("after", [False, True])
+def test_repo_owns_installation_result_recording_and_cleanup(
+    tmp_path, monkeypatch, capsys, entrypoint, effect, after,
+):
+    from tests.repository_lifecycle.test_sdlc_handoffs import (
+        _registered_skill_fixture,
+        runner,
     )
-    write_sdlc_contract(
-        repo,
-        deliverables={
-            "apps": {
-                "managed-deployment": {
-                    "source": ".",
-                    "manifest": "README.md",
-                    "prerequisites": [],
-                    "actions": {
-                        "validate": {
-                            "requires": {"capabilities": []},
-                            "no-op": "Repository validation covers this fixture.",
-                        },
-                        "install": {
-                            "requires": {"capabilities": []},
-                            "steps": [
-                                {"run": [sys.executable, "-c", f"print({output!r})"]},
-                                {
-                                    "handoff": {
-                                        "lifecycle": "ceratops-skill-lifecycle",
-                                        "action": "deploy",
-                                        "inputs": {},
-                                    }
-                                },
-                            ],
-                        },
-                    },
-                }
-            }
-        },
-    )
-    assert run_git(repo, "add", ".").returncode == 0
-    assert run_git(repo, "commit", "-m", "managed deployment").returncode == 0
-    task = repo.parent / "tmp" / repo.name / "promotion-completion"
+
+    repo = _registered_skill_fixture(tmp_path, monkeypatch)
+    operation = "deliverables.skills.claims-catalog-invoice.actions.install"
+    prepared = runner.prepare_operations(repo, [runner.OperationRequest(operation)], context="skill")[0]
+    outcome = runner.execute_prepared_operation(prepared)
+    assert outcome["status"] == "completed" and outcome["handoff_completed"]
+    receipt = outcome["step_results"][-1]["result"]
+    assert "promotion" not in receipt
+    assert receipt["deployed"] == ["claims-catalog-invoice"]
+    installed_calls = (repo / "calls.jsonl").read_bytes()
+    assert len(installed_calls.splitlines()) == 1
+
+    module = runpy.run_path(str(PROMOTE_REPOSITORY))
+    task = repo.parent / "tmp" / repo.name / "completion"
     task.mkdir(parents=True)
-    record = task / "promotion.json"
-    promoted = subprocess.run(
-        [
-            sys.executable,
-            str(PROMOTE_REPOSITORY),
-            "--repo-root",
-            str(repo),
-            "--source-branch",
-            "approved",
-            "--no-run-operation",
-            "--result-file",
-            str(record),
-        ],
-        env=environment,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert promoted.returncode == 0, promoted.stderr
-    promotion = _write_saved_handoff_record(record, [{
-        "status": "completed", "operation": operation, "steps": [1],
-        "handoff": "ceratops-skill-lifecycle/deploy", "handoff_inputs": {},
-        **({"step_results": [{"step": 1, "result": json.loads(output)}]}
-           if structured else {}),
-    }])
-    original = record.read_bytes()
-    outcome = promotion["operations"]["results"][0]
-    assert outcome["status"] == "completed"
-    assert bool(outcome.get("step_results")) is structured
-    scope = pathlib.Path(promotion["pending_work_scope"])
-    scope_bytes = scope.read_bytes()
-    retained = task / "caller-owned.txt"
-    retained.write_text("preserve")
-    destination = tmp_path / "installed"
-    monkeypatch.chdir(tmp_path)
-    loaded = load_runtime_installer()
-    process = subprocess.run
-    finalizations = 0
-
-    def run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        nonlocal finalizations
-        if "--finalize-result" in argv:
-            finalizations += 1
-            if cleanup_failure:
-                return subprocess.CompletedProcess(argv, 1, "", "record is locked")
-        return process(argv, **kwargs)
-
-    with monkeypatch.context() as patch:
-        patch.setattr(subprocess, "run", run)
-        code = loaded["main"](
-            [
-                "--repo-root",
-                str(repo),
-                "--install-root",
-                str(destination),
-                "--promotion-result",
-                str(record),
-                "--operation",
-                operation,
-                "--task-temp-root",
-                str(task),
-                "--finalize-promotion-with",
-                str(PROMOTE_REPOSITORY),
-            ]
-        )
-    captured = capsys.readouterr()
-    cleanup_blocked = cleanup_failure or structured
-    assert code == (2 if cleanup_blocked else 0), (captured.out, captured.err)
-    receipt = json.loads(captured.err if cleanup_blocked else captured.out)
-    assert finalizations == 1
-    assert receipt["commit"] == promotion["head"]
-    assert receipt["install_root"] == str(destination)
-    assert receipt["deployed"] == ["alpha-tool", "beta-tool"]
-    assert receipt["removed"] == [] and receipt["cleanup_debt"] == []
-    assert receipt["promotion"]["sha256"] == hashlib.sha256(original).hexdigest()
-    assert (destination / "alpha-tool/SKILL.md").is_file()
-    if cleanup_blocked:
-        assert record.read_bytes() == original
-        assert receipt["promotion_cleanup"]["replay_required"] is False
-        command = [
-            sys.executable,
-            str(PROMOTE_REPOSITORY),
-            "--repo-root",
-            str(repo),
-            "--finalize-result",
-            "--result-file",
-            str(record),
-            "--task-temp-root",
-            str(task),
-            "--expected-commit",
-            promotion["head"],
-            "--deployment-evidence",
-            "-",
-        ]
-        if structured:
-            # Bound handoff evidence cannot validate an arbitrary producer's
-            # receipt. The caller checks that receipt before acknowledging it.
-            assert outcome["step_results"][0]["result"] == {
-                "schema": "test.install.v1",
-                "status": "OK",
-            }
-            unverified = process(
-                command, input=json.dumps(receipt), capture_output=True, text=True
-            )
-            assert unverified.returncode == 1 and record.read_bytes() == original
-            assert "require caller validation" in unverified.stderr
-            command.extend(
-                ["--verified-result-sha256", hashlib.sha256(original).hexdigest()]
-            )
-        invalid = [
-            ("status", "failed"),
-            ("cleanup_debt", ["retired-folder"]),
-            ("commit", "a" * 40),
-            ("repo_root", str(tmp_path)),
-            ("install_root", "relative"),
-            ("producer", "another-skill/deploy"),
-            ("deployed", ["alpha-tool", "alpha-tool"]),
-            ("removed", ["alpha-tool"]),
-            ("transaction_id", ""),
-            ("promotion", {**receipt["promotion"], "sha256": "0" * 64}),
-            (
-                "promotion",
-                {
-                    **receipt["promotion"],
-                    "operation": "deliverables.apps.other.actions.install",
-                },
-            ),
-        ]
-        for field, value in invalid:
-            wrong = {**receipt, field: value}
-            result = process(
-                command, input=json.dumps(wrong), capture_output=True, text=True
-            )
-            assert result.returncode == 1, (field, result.stdout, result.stderr)
-            assert json.loads(result.stderr)["replay_required"] is False
-            assert record.read_bytes() == original
-        wrong_identity = {
-            **receipt,
-            "promotion": {**receipt["promotion"], "identity": [0] * 6},
-        }
-        result = process(
-            command, input=json.dumps(wrong_identity), capture_output=True, text=True
-        )
-        assert result.returncode == 1 and record.read_bytes() == original
-        installed_before = (destination / "alpha-tool/SKILL.md").stat().st_mtime_ns
-        result = process(
-            command, input=json.dumps(receipt), capture_output=True, text=True
-        )
-        assert result.returncode == 0, result.stderr
-        assert (
-            destination / "alpha-tool/SKILL.md"
-        ).stat().st_mtime_ns == installed_before
-    assert not record.exists()
-    assert scope.read_bytes() == scope_bytes
-    assert retained.read_text() == "preserve"
-
-
-def test_completion_receipt_requires_unique_promotion_binding_batch() -> None:
-    loaded = runpy.run_path(str(PROMOTE_REPOSITORY))
-    parse = loaded["_receipt_promotion_bindings"]
-    error = loaded["PromotionError"]
-    bindings = [{"operation": "alpha"}, {"operation": "beta"}]
-    assert parse({"promotion": bindings}) == bindings
-    invalid_batches: tuple[list[dict[str, str]], ...] = (
-        [],
-        [{"operation": "alpha"}, {"operation": "alpha"}],
-        [{}],
-    )
-    for invalid in invalid_batches:
-        with pytest.raises(error, match="missing or duplicated"):
-            parse({"promotion": invalid})
-
-
-@pytest.mark.parametrize("record_kind", ["ready", "pending", "pending-command"])
-def test_managed_installer_finalizes_multiple_handoffs_once(
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    record_kind: str,
-) -> None:
-    from tests.skill_lifecycle.support import load_runtime_installer
-    from tests.support.repositories import create_compatible_repo
-
-    repo, _, _, environment = prepare_repository_lifecycle_repo(tmp_path)
-    skills = ["alpha-tool", "beta-tool"]
-    create_compatible_repo(repo, "example/completion-batch", skills)
-    applications: dict[str, Any] = {
-        f"{skill}-deployment": {
-            "source": ".",
-            "manifest": "README.md",
-            "prerequisites": [],
-            "actions": {
-                "validate": {
-                    "requires": {"capabilities": []},
-                    "no-op": "Repository validation covers this fixture.",
-                },
-                "install": {
-                    "requires": {"capabilities": []},
-                    "steps": [
-                        {
-                            "handoff": {
-                                "lifecycle": "ceratops-skill-lifecycle",
-                                "action": "deploy",
-                                "inputs": {"skill": skill},
-                            }
-                        }
-                    ],
-                },
-            },
-        }
-        for skill in skills
+    report, unrelated = task / "promotion.json", task / "keep.json"
+    unrelated.write_text("unrelated")
+    result = {
+        "status": "ready", "head": prepared.commit, "release_branch": "release/local",
+        "operations": {"status": "completed", "pending_operations": [],
+                       "completed_operations": [operation], "results": [outcome]},
     }
-    pending = record_kind != "ready"
-    if record_kind == "pending-command":
-        applications["beta-tool-deployment"]["actions"]["install"]["steps"].insert(0, {
-            "run": [sys.executable, "-c", "raise SystemExit('unexecuted repository command')"],
-        })
-    write_sdlc_contract(repo, deliverables={"apps": applications})
-    assert run_git(repo, "add", ".").returncode == 0
-    assert run_git(repo, "commit", "-m", "managed deployment batch").returncode == 0
-    operations = [
-        f"deliverables.apps.{skill}-deployment.actions.install" for skill in skills
-    ]
-    task = repo.parent / "tmp" / repo.name / "promotion-completion-batch"
-    task.mkdir(parents=True)
-    record = task / "promotion.json"
-    promotion_command = [
-        sys.executable,
-        str(PROMOTE_REPOSITORY),
-        "--repo-root",
-        str(repo),
-        "--source-branch",
-        "approved",
-        "--result-file",
-        str(record),
-    ]
-    if pending:
-        for operation in operations:
-            promotion_command.extend(("--run-operation", operation))
-    else:
-        promotion_command.append("--no-run-operation")
-    promoted = subprocess.run(
-        promotion_command,
-        env=environment,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if pending:
-        assert promoted.returncode == 1, promoted.stdout
-        saved = json.loads(record.read_text(encoding="utf-8"))
-        assert saved["status"] == "handoff_required"
-        assert saved["operations"]["completed_operations"] == []
-        assert saved["operations"]["pending_operations"] == operations
-        assert [item["status"] for item in saved["operations"]["results"]] == ["handoff_required"] * (1 if record_kind == "pending-command" else 2)
-        promotion = saved["promotion"]
-    else:
-        assert promoted.returncode == 0, promoted.stderr
-        promotion = _write_saved_handoff_record(record, [
-            {"status": "advisory", "operation": operation, "steps": [],
-             "handoff": "ceratops-skill-lifecycle/deploy", "handoff_inputs": {"skill": skill}}
-            for operation, skill in zip(operations, skills, strict=True)
-        ])
-    destination = tmp_path / "installed"
-    loaded = load_runtime_installer()
+    original_replace, original_unlink = pathlib.Path.replace, pathlib.Path.unlink
 
-    def installer_arguments(*selected_operations: str) -> list[str]:
-        arguments = [
-            "--repo-root",
-            str(repo),
-            "--install-root",
-            str(destination),
-            "--promotion-result",
-            str(record),
-            "--task-temp-root",
-            str(task),
-            "--finalize-promotion-with",
-            str(PROMOTE_REPOSITORY),
-        ]
-        for skill in skills:
-            arguments.extend(("--skill", skill))
-        for operation in selected_operations:
-            arguments.extend(("--operation", operation))
-        return arguments
+    def interrupted_replace(source, target):
+        if pathlib.Path(target) != report:
+            return original_replace(source, target)
+        if after:
+            original_replace(source, target)
+        raise OSError("interrupted installation-result recording")
 
-    if record_kind == "pending-command":
-        original = record.read_bytes()
-        assert loaded["main"](installer_arguments(*operations)) == 1
-        assert "selected pending skill deployment" in json.loads(capsys.readouterr().err)["reason"]
-        finalizer = runpy.run_path(str(PROMOTE_REPOSITORY))
-        with pytest.raises(finalizer["PromotionError"], match="missing or ambiguous"):
-            finalizer["_completed_deployment"](saved, promotion["head"])
-        assert record.read_bytes() == original and not destination.exists()
-        return
+    def interrupted_unlink(path, *args, **kwargs):
+        if path != report:
+            return original_unlink(path, *args, **kwargs)
+        if after:
+            original_unlink(path, *args, **kwargs)
+        raise OSError("interrupted repository-report deletion")
 
-    if pending:
-        original = record.read_bytes()
-        for fault in ("failure", "commit", "unfinished"):
-            altered = json.loads(original)
-            if fault == "failure":
-                altered["status"] = "operation_failed"
-            elif fault == "commit":
-                altered["promotion"]["head"] = "0" * 40
+    if effect == "record":
+        with monkeypatch.context() as patch:
+            patch.setattr(pathlib.Path, "replace", interrupted_replace)
+            with pytest.raises(OSError, match="recording"):
+                module["_save_result"](report, result)
+        assert report.exists() == after
+    # The actual result is still in the caller, not reconstructed by reinstalling.
+    module["_save_result"](report, result)
+    digest = hashlib.sha256(report.read_bytes()).hexdigest()
+    arguments = ["--repo-root", str(repo), "--finalize-result", "--result-file", str(report),
+                 "--task-temp-root", str(task), "--expected-commit", prepared.commit,
+                 "--verified-result-sha256", digest]
+
+    def cleanup():
+        if entrypoint == "callable":
+            module["finalize_result"](module["build_parser"]().parse_args(arguments))
+            return 0
+        return module["main"](arguments)
+
+    if effect == "delete":
+        with monkeypatch.context() as patch:
+            patch.setattr(pathlib.Path, "unlink", interrupted_unlink)
+            if entrypoint == "callable":
+                with pytest.raises(OSError, match="deletion"):
+                    cleanup()
             else:
-                altered["operations"]["results"][0]["status"] = "operation_failed"
-            record.write_text(json.dumps(altered), encoding="utf-8")
-            assert loaded["main"](installer_arguments(*operations)) == 1
-            assert json.loads(capsys.readouterr().err)["status"] == "error"
-            assert not destination.exists()
-        record.write_bytes(original)
+                assert cleanup() == 1
+                failure = json.loads(capsys.readouterr().err)
+                assert failure["replay_required"] is False
+        assert report.exists() != after
+    for _ in range(2):
+        assert cleanup() == 0
+    assert not report.exists()
+    assert unrelated.read_text() == "unrelated"
+    assert (repo / "calls.jsonl").read_bytes() == installed_calls
+    assert not list(task.glob("*.tmp"))
 
-    assert loaded["main"](installer_arguments(operations[0], operations[0])) == 1
-    duplicate = json.loads(capsys.readouterr().err)
-    assert duplicate["reason"] == "promotion operations must be unique"
-    assert record.is_file() and not destination.exists()
 
-    missing_operation = "deliverables.apps.missing.actions.install"
-    assert loaded["main"](
-        installer_arguments(operations[0], missing_operation)
-    ) == 1
-    missing = json.loads(capsys.readouterr().err)
-    assert "selected pending skill deployment" in missing["reason"]
-    assert record.is_file() and not destination.exists()
+@pytest.mark.parametrize("fault", ["pending", "failed", "cleanup-debt", "missing-result"])
+def test_repo_cleanup_keeps_unfinished_installation_report(tmp_path, monkeypatch, fault):
+    from tests.repository_lifecycle.test_sdlc_handoffs import (
+        _registered_skill_fixture,
+        runner,
+    )
 
-    process = subprocess.run
-    finalizations = 0
-
-    def run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        nonlocal finalizations
-        if "--finalize-result" in argv:
-            finalizations += 1
-        return process(argv, **kwargs)
-
-    monkeypatch.chdir(tmp_path)
-    with monkeypatch.context() as patch:
-        patch.setattr(subprocess, "run", run)
-        code = loaded["main"](installer_arguments(*operations))
-    captured = capsys.readouterr()
-    assert code == 0, (captured.out, captured.err)
-    receipt = json.loads(captured.out)
-    assert finalizations == 1
-    assert receipt["commit"] == promotion["head"]
-    assert receipt["deployed"] == skills
-    assert [item["operation"] for item in receipt["promotion"]] == operations
-    assert receipt["promotion_cleanup"] == {
-        "status": "completed",
-        "replay_required": False,
-    }
-    assert not record.exists()
-    assert all((destination / skill / "SKILL.md").is_file() for skill in skills)
+    repo = _registered_skill_fixture(tmp_path, monkeypatch)
+    operation = "deliverables.skills.claims-catalog-invoice.actions.install"
+    prepared = runner.prepare_operations(repo, [runner.OperationRequest(operation)], context="skill")[0]
+    outcome = runner.execute_prepared_operation(prepared)
+    module = runpy.run_path(str(PROMOTE_REPOSITORY))
+    if fault == "pending":
+        outcome.update(status="handoff_required", handoff_completed=False)
+    elif fault == "failed":
+        outcome["status"] = "operation_failed"
+    elif fault == "cleanup-debt":
+        outcome["step_results"][-1]["result"]["cleanup_debt"] = ["busy retired directory"]
+    else:
+        outcome["step_results"] = []
+        outcome["steps"] = []
+    result = {"status": "ready", "head": prepared.commit, "release_branch": "release/local",
+              "operations": {"status": "completed", "pending_operations": [],
+                             "completed_operations": [operation], "results": [outcome]}}
+    task = repo.parent / "tmp" / repo.name / "pending"
+    task.mkdir(parents=True)
+    report = task / "promotion.json"
+    module["_save_result"](report, result)
+    before = report.read_bytes()
+    args = module["build_parser"]().parse_args([
+        "--repo-root", str(repo), "--finalize-result", "--result-file", str(report),
+        "--task-temp-root", str(task), "--expected-commit", prepared.commit,
+        "--verified-result-sha256", hashlib.sha256(before).hexdigest(),
+    ])
+    for _ in range(2):
+        with pytest.raises(module["PromotionError"]):
+            module["finalize_result"](args)
+        assert report.read_bytes() == before
+    assert len((repo / "calls.jsonl").read_text().splitlines()) == 1

@@ -406,6 +406,21 @@ def test_child_report_referenced_unchanged_without_copy(report_repo, tmp_path):
     assert child.read_bytes() == original
 
 
+def test_complete_error_without_selected_output_needs_no_report(report_repo, monkeypatch):
+    repo, path = report_repo
+    monkeypatch.setattr(command, "write_failure_report",
+                        lambda *_args, **_kwargs: pytest.fail("no report was requested"))
+    result = command.report_failure(
+        {"status": "operation_failed", "message": "command failed"},
+        diagnostic_output=None, repo_root=repo, action="promote",
+        stdout="full stdout\n" * 10000, stderr="full stderr\n" * 10000,
+    )
+    assert result["command_output"] == {
+        "stdout": "full stdout\n" * 10000, "stderr": "full stderr\n" * 10000,
+    }
+    assert "diagnostic_output" not in result and not path.exists()
+
+
 def test_success_evidence_is_not_mistaken_for_a_child_failure_report(report_repo):
     repo, path = report_repo
     accepted = repo / "accepted.json"
@@ -767,7 +782,8 @@ def test_nonpassing_outcomes_do_not_retire_failure(report_repo, status):
     assert path.read_bytes() == original
 
 
-def test_reused_check_retires_report_without_executing_command(report_repo, monkeypatch):
+@pytest.mark.parametrize("interruption", [None, "before", "after"])
+def test_reused_check_retires_report_without_executing_command(report_repo, monkeypatch, interruption):
     repo, path = report_repo
     accepted = repo / "accepted.json"
     accepted.write_text("original passing result", encoding="utf-8")
@@ -782,9 +798,28 @@ def test_reused_check_retires_report_without_executing_command(report_repo, monk
     )
     monkeypatch.setattr(runner.reuse_operation_checks, "check_inputs", lambda *_args: {"fingerprint": "same"})
     operation = replace(operation, check_results={}, check_plan=plan)
-    assert runner.execute_prepared_operation(
-        operation, diagnostic_output=path, diagnostic_owner=(repo, "promote"),
-    ) is result
+    original_unlink = pathlib.Path.unlink
+
+    def interrupted(selected, *args, **kwargs):
+        if selected != path:
+            return original_unlink(selected, *args, **kwargs)
+        if interruption == "after":
+            original_unlink(selected, *args, **kwargs)
+        raise OSError("lost cleanup acknowledgement")
+
+    if interruption:
+        with monkeypatch.context() as patch:
+            patch.setattr(pathlib.Path, "unlink", interrupted)
+            assert runner.execute_prepared_operation(
+                operation, diagnostic_output=path, diagnostic_owner=(repo, "promote"),
+            ) is result
+        assert result["status"] == "completed"
+        assert "lost cleanup" in result["report_cleanup_error"]
+    for _ in range(2):
+        assert runner.execute_prepared_operation(
+            operation, diagnostic_output=path, diagnostic_owner=(repo, "promote"),
+        ) is result
+        assert "report_cleanup_error" not in result
     assert not path.exists()
     assert accepted.read_text() == "original passing result"
 
@@ -973,6 +1008,8 @@ def test_cleanup_io_error_does_not_turn_success_into_failure(report_repo, monkey
     assert "open elsewhere" in result["report_cleanup_error"]
     runner.remove_operation_failures(result, diagnostic_output=path, diagnostic_owner=(repo, "promote"))
     assert not path.exists()
+    assert "report_cleanup_error" not in result
+    assert "report_cleanup_error" not in result
 
 
 @pytest.mark.parametrize("active,uncertain", [(1, False), (0, True)])
