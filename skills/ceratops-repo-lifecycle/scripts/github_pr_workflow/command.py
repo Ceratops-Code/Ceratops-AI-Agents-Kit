@@ -133,10 +133,10 @@ def _detail_value(value: Any, depth: int = 0) -> Any:
     return value
 
 
-def _json_error_lines(value: str) -> list[str]:
+def _json_error_lines(value: str, depth: int = 0) -> list[str]:
     """Extract error fields before a large JSON line can hide them by truncation."""
 
-    if not value.startswith("{") or len(value.encode("utf-8")) > 2_000_000:
+    if depth >= 4 or not value.startswith("{") or len(value.encode("utf-8")) > 2_000_000:
         return []
     try:
         data = json.loads(value)
@@ -144,25 +144,42 @@ def _json_error_lines(value: str) -> list[str]:
         return []
     if not isinstance(data, dict):
         return []
-    status = str(data.get("status") or "").casefold()
+    status = str(data.get("status") or data.get("result") or "").casefold()
     failed = (
         bool(status and status not in _SUCCESS_STATES)
-        or data.get("exit_code") not in (None, 0, "0")
+        or any(data.get(key) not in (None, 0, "0") for key in ("exit_code", "exit_status", "returncode"))
         or any(data.get(key) for key in
                ("error", "errors", "failures", "mapping_gaps", "manifest_errors"))
     )
     if not failed:
         return []
-    return [
+    # Child runners often encode their complete command failure as an error
+    # string inside another JSON result. Read that cause before clipping a
+    # field: its beginning is usually argv, while the useful test/exception is
+    # much later in stdout. Bound recursion and bytes; never open report paths.
+    causes: list[str] = []
+    for key in ("error", "message", "details", "diagnostic"):
+        child = data.get(key)
+        if isinstance(child, str):
+            causes.extend(_json_error_lines(child.strip(), depth + 1))
+        elif isinstance(child, dict):
+            causes.extend(_json_error_lines(json.dumps(child), depth + 1))
+    for key in ("stdout", "stderr"):
+        output = data.get(key)
+        if isinstance(output, str) and output:
+            lines, decisive = _failure_lines(output, depth + 1)
+            selected = sorted(set([*decisive[:6], *decisive[-6:], *range(max(0, len(lines) - 4), len(lines))]))
+            causes.extend(lines[index] for index in selected)
+    return [*causes, *[
         f"{key}: {json.dumps(_detail_value(data[key]), ensure_ascii=False)}"
         for key in _DETAIL_FIELDS
         if key in data and data[key] not in (None, "", [], {})
-    ]
+    ]]
 
 
-def _failure_lines(value: str) -> tuple[list[str], list[int]]:
+def _failure_lines(value: str, depth: int = 0) -> tuple[list[str], list[int]]:
     cleaned = clean_log(value)
-    whole = _json_error_lines(cleaned.strip())
+    whole = _json_error_lines(cleaned.strip(), depth)
     if whole:
         return whole, list(range(len(whole)))
     lines: list[str] = []
@@ -172,7 +189,7 @@ def _failure_lines(value: str) -> tuple[list[str], list[int]]:
         if not line:
             continue
         brace = line.find("{")
-        structured = _json_error_lines(line[brace:]) if brace >= 0 else []
+        structured = _json_error_lines(line[brace:], depth) if brace >= 0 else []
         if structured:
             decisive.extend(range(len(lines), len(lines) + len(structured)))
             lines.extend(structured)
@@ -586,7 +603,12 @@ def report_failure(
         key: value for key, value in full.items()
         if key not in {"command_output", "diagnostic", "stdout_tail", "stderr_tail", "causes"}
     }
-    response["message"] = _clip(str(full.get("message", "Required command failed.")), 2000)
+    message = str(full.get("message", "Required command failed."))
+    diagnostic = full.get("diagnostic")
+    cause = diagnostic.get("message") if isinstance(diagnostic, dict) else None
+    if isinstance(cause, str) and cause.strip() and cause not in message:
+        message += "\n" + cause
+    response["message"] = _clip(message, 2000)
     if "diagnostic" in full:
         response["diagnostic"] = {
             "message": response["message"],

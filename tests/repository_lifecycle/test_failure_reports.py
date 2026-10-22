@@ -74,6 +74,42 @@ def report_primary_checkout(repo):
     return pathlib.Path(result.stdout.strip()).parent
 
 
+@pytest.mark.parametrize("stream", ["stdout", "stderr"])
+def test_nested_command_failure_keeps_native_case_and_exception_in_compact_result(report_repo, stream):
+    repo, path = report_repo
+    output = ("setup output\n" * 1000
+              + "1/2 Test #1: fork-video-transport ....***Failed 10.0 sec\n"
+              + "Traceback (most recent call last):\n"
+              + "RuntimeError: the selected test display is missing\n"
+              + "2/2 Test #2: fork-video-visibility ... Passed\n"
+              + "routine footer\n" * 1000)
+    child = {"command": ["ctest", "--output-on-failure"], "exit_status": 8,
+             "stdout": "", "stderr": "", stream: output}
+    encoded = json.dumps({"result": "failed", "error": json.dumps(child)})
+    excerpt = command.failure_excerpt(encoded)
+    assert excerpt and "fork-video-transport" in excerpt and "RuntimeError:" in excerpt
+    payload = {"status": "tests_failed", "message": "SDLC step failed: repository.actions.test step 1",
+               "diagnostic": {"message": excerpt, "exit_code": 8}}
+    for _ in range(2):
+        result = command.report_failure(payload, diagnostic_output=path, repo_root=repo,
+                                        action="promote", stderr=encoded)
+        assert "fork-video-transport" in result["message"]
+        assert "RuntimeError: the selected test display is missing" in result["message"]
+        assert len(result["message"].encode("utf-8")) <= 2000
+        assert result["diagnostic_output"] == str(path.resolve())
+        retained = json.loads(path.read_text(encoding="utf-8"))
+        assert retained["failures"]["promote"]["command_output"]["stderr"] == encoded
+
+
+def test_nested_failure_summary_has_bounded_recursion_and_preserves_plain_errors():
+    value = {"result": "failed", "error": "plain child error"}
+    for _ in range(12):
+        value = {"result": "failed", "error": json.dumps(value)}
+    for text in (json.dumps(value), '{"error": malformed', "RuntimeError: plain child error"):
+        result = command.failure_excerpt(text)
+        assert result and len(result.encode("utf-8")) <= 2000
+
+
 @pytest.mark.parametrize("configured", ["temp", "projects"])
 def test_shared_temp_base_is_portable_and_preserves_report_owner(report_repo, tmp_path, monkeypatch, configured):
     repo, old_path = report_repo

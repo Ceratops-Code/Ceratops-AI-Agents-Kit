@@ -831,6 +831,9 @@ def execute_prepared_operation(
                     captured["result_omitted"] = "output_limit"
                 if captured:
                     child_results[stream] = captured
+            cause = failure_excerpt(f"{stderr}\n{stdout}") or (
+                f"Command exited with code {code}." if code is not None else "Command could not start."
+            )
             failure = {
                 **base,
                 "status": "validation_failed"
@@ -838,17 +841,12 @@ def execute_prepared_operation(
                 else "tests_failed"
                 if prepared.category == "tests"
                 else "operation_failed",
-                "message": f"SDLC step failed: {prepared.operation} step {step.position}",
+                "message": f"SDLC step failed: {prepared.operation} step {step.position}\n{cause}",
                 "steps": completed,
                 "failed_step": step.position,
                 "diagnostic": {
                     "exit_code": code,
-                    "message": failure_excerpt(f"{stderr}\n{stdout}")
-                    or (
-                        f"Command exited with code {code}."
-                        if code is not None
-                        else "Command could not start."
-                    ),
+                    "message": cause,
                     "stdout_tail": _bounded_tail(stdout),
                     "stderr_tail": _bounded_tail(stderr),
                     **({"child_results": child_results} if child_results else {}),
