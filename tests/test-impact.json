@@ -5,55 +5,228 @@
       "pytest": [
         "tests/design_document_lifecycle"
       ],
-      "depends_on": []
+      "depends_on": [],
+      "packages": [
+        "pyyaml"
+      ],
+      "tools": [
+        "git",
+        "uv"
+      ],
+      "environment": [
+        "PATH",
+        "CI",
+        "PYTEST_ADDOPTS",
+        "GITHUB_ACTIONS",
+        "GITHUB_EVENT_NAME",
+        "GITHUB_EVENT_PATH",
+        "UV_OFFLINE"
+      ]
     },
     "mcp_server_manager": {
       "pytest": [
         "tests/mcp_server_manager"
       ],
-      "depends_on": []
+      "depends_on": [],
+      "packages": [
+        "mcp",
+        "packaging",
+        "pyyaml",
+        "jsonschema"
+      ],
+      "tools": [
+        "git",
+        "uv"
+      ],
+      "environment": [
+        "PATH",
+        "CI",
+        "PYTEST_ADDOPTS",
+        "GITHUB_ACTIONS",
+        "GITHUB_EVENT_NAME",
+        "GITHUB_EVENT_PATH",
+        "UV_OFFLINE"
+      ]
     },
     "credit-analysis": {
       "pytest": [
         "tests/credit_analysis"
       ],
-      "depends_on": []
+      "depends_on": [],
+      "packages": [],
+      "tools": [
+        "git",
+        "uv"
+      ],
+      "environment": [
+        "PATH",
+        "CI",
+        "PYTEST_ADDOPTS",
+        "GITHUB_ACTIONS",
+        "GITHUB_EVENT_NAME",
+        "GITHUB_EVENT_PATH",
+        "UV_OFFLINE"
+      ]
     },
     "governance-lifecycle": {
       "pytest": [
         "tests/governance_lifecycle"
       ],
-      "depends_on": []
+      "depends_on": [],
+      "packages": [
+        "pyyaml",
+        "jsonschema",
+        "markdown-it-py"
+      ],
+      "tools": [
+        "git",
+        "uv"
+      ],
+      "environment": [
+        "PATH",
+        "CI",
+        "PYTEST_ADDOPTS",
+        "GITHUB_ACTIONS",
+        "GITHUB_EVENT_NAME",
+        "GITHUB_EVENT_PATH",
+        "UV_OFFLINE"
+      ]
     },
     "repository-lifecycle": {
       "pytest": [
         "tests/repository_lifecycle"
       ],
-      "depends_on": []
+      "depends_on": [],
+      "packages": [
+        "mcp",
+        "packaging",
+        "pyyaml",
+        "jsonschema",
+        "tomlkit"
+      ],
+      "tools": [
+        "git",
+        "uv",
+        "node",
+        "npm",
+        "powershell"
+      ],
+      "environment": [
+        "PATH",
+        "CI",
+        "PYTEST_ADDOPTS",
+        "GITHUB_ACTIONS",
+        "GITHUB_EVENT_NAME",
+        "GITHUB_EVENT_PATH",
+        "UV_OFFLINE"
+      ]
     },
     "code-consistency-audit": {
       "pytest": [
         "tests/test_repository_audit.py"
       ],
-      "depends_on": []
+      "depends_on": [],
+      "packages": [
+        "pyyaml",
+        "jsonschema"
+      ],
+      "tools": [
+        "git",
+        "uv"
+      ],
+      "environment": [
+        "PATH",
+        "CI",
+        "PYTEST_ADDOPTS",
+        "GITHUB_ACTIONS",
+        "GITHUB_EVENT_NAME",
+        "GITHUB_EVENT_PATH",
+        "UV_OFFLINE"
+      ]
     },
     "skill-lifecycle": {
       "pytest": [
         "tests/skill_lifecycle"
       ],
-      "depends_on": []
+      "depends_on": [],
+      "packages": [
+        "mcp",
+        "packaging",
+        "pyyaml",
+        "jsonschema",
+        "tomlkit"
+      ],
+      "tools": [
+        "git",
+        "uv",
+        "node",
+        "npm",
+        "powershell"
+      ],
+      "environment": [
+        "PATH",
+        "CI",
+        "PYTEST_ADDOPTS",
+        "GITHUB_ACTIONS",
+        "GITHUB_EVENT_NAME",
+        "GITHUB_EVENT_PATH",
+        "UV_OFFLINE"
+      ]
     },
     "task-lifecycle": {
       "pytest": [
         "tests/task_lifecycle"
       ],
-      "depends_on": []
+      "depends_on": [],
+      "packages": [
+        "pyyaml"
+      ],
+      "tools": [
+        "git",
+        "uv"
+      ],
+      "environment": [
+        "PATH",
+        "CI",
+        "PYTEST_ADDOPTS",
+        "GITHUB_ACTIONS",
+        "GITHUB_EVENT_NAME",
+        "GITHUB_EVENT_PATH",
+        "UV_OFFLINE"
+      ]
     },
     "test-infrastructure": {
       "pytest": [
         "tests/test_infrastructure"
       ],
-      "depends_on": []
+      "depends_on": [],
+      "packages": [
+        "mcp",
+        "packaging",
+        "pyyaml",
+        "jsonschema",
+        "tomlkit",
+        "ruff",
+        "mypy",
+        "yamllint",
+        "tzdata"
+      ],
+      "tools": [
+        "git",
+        "uv",
+        "node",
+        "npm",
+        "powershell"
+      ],
+      "environment": [
+        "PATH",
+        "CI",
+        "PYTEST_ADDOPTS",
+        "GITHUB_ACTIONS",
+        "GITHUB_EVENT_NAME",
+        "GITHUB_EVENT_PATH",
+        "UV_OFFLINE"
+      ]
     }
   },
   "rules": [
@@ -79,8 +252,13 @@
     },
     {
       "id": "mcp-server-lifecycle-source",
-      "paths": ["skills/ceratops-mcp-server-lifecycle/**"],
-      "suites": ["mcp_server_manager", "repository-lifecycle"]
+      "paths": [
+        "skills/ceratops-mcp-server-lifecycle/**"
+      ],
+      "suites": [
+        "mcp_server_manager",
+        "repository-lifecycle"
+      ]
     },
     {
       "id": "credit-analysis-source",
@@ -160,6 +338,7 @@
     "scripts/result_records.py",
     "scripts/testing/run-tests.py",
     "scripts/testing/runner_requests.py",
+    "scripts/testing/select_test_groups.py",
     "scripts/testing/pytest-diagnostics.py",
     "scripts/testing/pytest-environment.py",
     "scripts/testing/report_test_progress.py",

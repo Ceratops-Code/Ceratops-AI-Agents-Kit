@@ -177,7 +177,7 @@ def _plain(path: pathlib.Path) -> None:
 def _time(value: Any) -> datetime:
     if not isinstance(value, str) or not value:
         raise ValueError("Check execution time is missing.")
-    result = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    result = datetime.fromisoformat(value)
     if result.tzinfo is None:
         raise ValueError("Check execution time requires a timezone.")
     return result
@@ -202,7 +202,7 @@ def _load(path: pathlib.Path) -> tuple[dict[str, Any], bytes]:
         raise ValueError("Check result is not canonical complete JSON.")
     required = {"schema", "result_id", "candidate_id", "check_id", "check_version",
                 "invocation", "status", "exit_code", "inputs", "execution"}
-    if not required.issubset(value) or set(value) - required - {"checks"}:
+    if not required.issubset(value) or set(value) - required - {"checks", "check_summary"}:
         raise ValueError("Check result fields differ from the runner contract.")
     if (value.get("schema") != RESULT_SCHEMA or value.get("result_id") != path.stem
             or not all(isinstance(value.get(key), str) and value[key].strip()
@@ -210,6 +210,28 @@ def _load(path: pathlib.Path) -> tuple[dict[str, Any], bytes]:
             or not isinstance(value.get("invocation"), dict)):
         raise ValueError("Check result identity does not match its final path.")
     inputs = check_context(value.get("inputs", {}))
+    if "check_summary" in value:
+        summary = value["check_summary"]
+        if (not isinstance(summary, dict) or set(summary) != {"schema", "inputGroups", "checkGroups", "checks"}
+                or summary["schema"] != "ceratops-check-summary.v1"
+                or not isinstance(summary["inputGroups"], dict)
+                or not isinstance(summary["checkGroups"], dict)
+                or not isinstance(summary["checks"], list)):
+            raise ValueError("Compact check summary has incomplete input tables.")
+        for table in (summary["inputGroups"], summary["checkGroups"]):
+            if any(hashlib.sha256(canonical(item).rstrip(b"\n")).hexdigest() != identity
+                   for identity, item in table.items()):
+                raise ValueError("Compact input-group identity does not match its facts.")
+        for check in summary["checks"]:
+            if (not isinstance(check, dict)
+                    or ("inputGroup" in check and check["inputGroup"] not in summary["inputGroups"])
+                    or ("checkGroup" in check and check["checkGroup"] not in summary["checkGroups"])):
+                raise ValueError("Compact check outcome names an absent input group.")
+            if (check.get("kind") == "repository-check" and check.get("id") == value["check_id"]
+                    and (check.get("status") != value["status"] or check.get("result_id") != value["result_id"]
+                        or check.get("check_version") != value["check_version"]
+                        or summary["inputGroups"].get(check.get("inputGroup")) != inputs)):
+                raise ValueError("Compact outcome conflicts with its executed repository check.")
     if (inputs["checkVersion"] != value["check_version"]
             or inputs["workVersion"] != value["candidate_id"]
             or ("operation" in inputs["scope"] and inputs["scope"]["operation"] != value["check_id"])):

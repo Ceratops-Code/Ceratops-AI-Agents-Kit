@@ -3,9 +3,14 @@ from __future__ import annotations
 import json
 import pathlib
 import subprocess
+import sys
 from typing import Any
 
 import pytest
+
+from tests.test_infrastructure.test_run_tests import assert_pretest_diagnostic, payload
+
+ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 
 def sample_manifest(
@@ -13,20 +18,22 @@ def sample_manifest(
     *,
     dependencies: dict[str, tuple[str, ...]] | None = None,
 ) -> Any:
+    from select_test_groups import Ignore, Manifest, Rule, Suite
+
     dependencies = dependencies or {}
     suites = {
-        suite_id: runner.Suite(
+        suite_id: Suite(
             suite_id,
             (f"tests/{suite_id}",),
             dependencies.get(suite_id, ()),
         )
         for suite_id in ("alpha", "beta", "gamma")
     }
-    return runner.Manifest(
+    return Manifest(
         suites=suites,
         rules=(
-            runner.Rule("alpha-source", ("skills/alpha/**",), ("alpha",)),
-            runner.Rule("beta-source", ("skills/beta/**",), ("beta",)),
+            Rule("alpha-source", ("skills/alpha/**",), ("alpha",)),
+            Rule("beta-source", ("skills/beta/**",), ("beta",)),
         ),
         full_suite_paths=(
             "scripts/pyproject.toml",
@@ -37,7 +44,7 @@ def sample_manifest(
             "tests/test-impact.json",
         ),
         ignored_paths=(
-            runner.Ignore("documentation-only", ("docs/**",), "Documentation only."),
+            Ignore("documentation-only", ("docs/**",), "Documentation only."),
         ),
         unmapped_production="error",
     )
@@ -216,13 +223,13 @@ def test_name_status_parser_handles_added_deleted_copied_and_renamed_paths(
     }
 
 
-@pytest.mark.parametrize(("status", "destination", "expected_gap"), [
-    ("R095", "skills/alpha/new.py", None),
-    ("R100", "src/new.py", "src/new.py"),
-    ("C100", "skills/alpha/new.py", "src/old.py"),
+@pytest.mark.parametrize(("status", "destination", "expected_gaps"), [
+    ("R095", "skills/alpha/new.py", ["src/old.py"]),
+    ("R100", "src/new.py", ["src/new.py", "src/old.py"]),
+    ("C100", "skills/alpha/new.py", ["src/old.py"]),
 ])
-def test_renamed_source_can_retire_mapping_but_live_paths_still_require_ownership(
-    test_runner_module: Any, status: str, destination: str, expected_gap: str | None,
+def test_unknown_rename_inputs_report_missing_mapping_without_running_everything(
+    test_runner_module: Any, status: str, destination: str, expected_gaps: list[str],
 ) -> None:
     runner = test_runner_module
     selection = runner.selection_from_changes(
@@ -230,21 +237,16 @@ def test_renamed_source_can_retire_mapping_but_live_paths_still_require_ownershi
         (runner.ChangedFile(status, ("src/old.py", destination)),),
     )
 
-    assert selection.full_suite == status.startswith("R")
-    assert selection.suites == (
-        ("alpha", "beta", "gamma") if status.startswith("R") else ("alpha",)
-    )
-    assert selection.mapping_gaps == (
-        ({"path": expected_gap, "reason": "unmapped repository path"},)
-        if expected_gap else ()
-    )
+    assert not selection.full_suite
+    assert selection.suites == (("alpha",) if destination.startswith("skills/alpha/") else ())
+    assert [gap["path"] for gap in selection.mapping_gaps] == expected_gaps
 
 
 def test_suite_dependencies_expand_transitively(test_runner_module: Any) -> None:
     runner = test_runner_module
     manifest = sample_manifest(
         runner,
-        dependencies={"alpha": ("beta",), "beta": ("gamma",)},
+        dependencies={"beta": ("alpha",), "gamma": ("beta",)},
     )
     selection = runner.selection_from_changes(
         manifest,
@@ -262,15 +264,17 @@ def test_suite_dependencies_expand_transitively(test_runner_module: Any) -> None
 def test_cycles_and_stale_suite_references_are_rejected(
     test_runner_module: Any, tmp_path: pathlib.Path
 ) -> None:
+    from select_test_groups import Manifest, Rule
+
     runner = test_runner_module
     cyclic = sample_manifest(
         runner,
         dependencies={"alpha": ("beta",), "beta": ("alpha",)},
     )
     stale = sample_manifest(runner, dependencies={"alpha": ("missing",)})
-    stale_rule = runner.Manifest(
+    stale_rule = Manifest(
         suites=stale.suites,
-        rules=(runner.Rule("stale-suite", ("skills/alpha/**",), ("missing",)),),
+        rules=(Rule("stale-suite", ("skills/alpha/**",), ("missing",)),),
         full_suite_paths=stale.full_suite_paths,
         ignored_paths=stale.ignored_paths,
         unmapped_production=stale.unmapped_production,
@@ -330,12 +334,14 @@ def test_duplicate_suite_ids_and_empty_rule_globs_are_rejected(
 
 
 def test_stale_rule_globs_are_rejected(test_runner_module: Any, tmp_path: pathlib.Path) -> None:
+    from select_test_groups import Manifest, Rule, Suite
+
     runner = test_runner_module
-    manifest = runner.Manifest(
+    manifest = Manifest(
         suites={
-            "alpha": runner.Suite("alpha", ("tests/alpha",), ()),
+            "alpha": Suite("alpha", ("tests/alpha",), ()),
         },
-        rules=(runner.Rule("stale-source", ("skills/missing/**",), ("alpha",)),),
+        rules=(Rule("stale-source", ("skills/missing/**",), ("alpha",)),),
         full_suite_paths=(
             ".github/workflows/**",
             "scripts/pyproject.toml",
@@ -367,10 +373,12 @@ def test_stale_rule_globs_are_rejected(test_runner_module: Any, tmp_path: pathli
 def test_worktree_manifest_validation_includes_untracked_paths(
     test_runner_module: Any, tmp_path: pathlib.Path
 ) -> None:
+    from select_test_groups import Manifest, Rule, Suite
+
     runner = test_runner_module
-    manifest = runner.Manifest(
-        suites={"alpha": runner.Suite("alpha", ("tests/alpha",), ())},
-        rules=(runner.Rule("new-source", ("skills/new/**",), ("alpha",)),),
+    manifest = Manifest(
+        suites={"alpha": Suite("alpha", ("tests/alpha",), ())},
+        rules=(Rule("new-source", ("skills/new/**",), ("alpha",)),),
         full_suite_paths=(
             ".github/workflows/**",
             "scripts/pyproject.toml",
@@ -425,12 +433,14 @@ def test_unmapped_path_records_gap_without_selecting_tests(
 def test_ambiguous_production_mapping_records_gap_without_selecting_tests(
     test_runner_module: Any,
 ) -> None:
+    from select_test_groups import Manifest, Rule
+
     runner = test_runner_module
     base = sample_manifest(runner)
-    manifest = runner.Manifest(
+    manifest = Manifest(
         suites=base.suites,
         rules=base.rules
-        + (runner.Rule("overlapping-alpha", ("skills/alpha/**",), ("beta",)),),
+        + (Rule("overlapping-alpha", ("skills/alpha/**",), ("beta",)),),
         full_suite_paths=base.full_suite_paths,
         ignored_paths=base.ignored_paths,
         unmapped_production=base.unmapped_production,
@@ -473,3 +483,206 @@ def test_collection_never_imports_unrequested_suites(
         targets.append("tests/test_beta.py")
     for _ in range(2):
         assert test_runner_module.collect_errors(tmp_path, targets) == []
+
+
+def test_missing_node_is_reported_by_the_execution_collection(
+    test_runner_module: Any, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Missing node diagnostics come from pytest's one execution collection."""
+    report = tmp_path / "missing-node.json"
+    code = test_runner_module.execute(
+        ["tests/test_infrastructure/test_repository_validator.py::missing_node",
+         "--diagnostic-output", str(report)],
+        repo_root=ROOT,
+    )
+    result = payload(capsys)
+    assert code == 4
+    assert result["status"] == "pytest-failed"
+    complete = json.loads(report.read_text(encoding="utf-8"))
+    assert "missing_node" in complete["stderr"]
+    assert "not found" in complete["stderr"]
+
+
+class CollectionExecution:
+    """Return one declared pytest collection without running any test."""
+
+    def __init__(self, runner: Any, nodes: tuple[str, ...]) -> None:
+        self.runner = runner
+        self.nodes = nodes
+        self.commands: list[tuple[str, ...]] = []
+
+    def text(self, command: Any, cwd: pathlib.Path) -> subprocess.CompletedProcess[str]:
+        argv = tuple(command)
+        self.commands.append(argv)
+        assert argv[:5] == (
+            sys.executable,
+            "-m",
+            "pytest",
+            "--collect-only",
+            "-q",
+        )
+        return subprocess.CompletedProcess(command, 0, "\n".join(self.nodes) + "\n", "")
+
+    def bytes(
+        self, command: Any, cwd: pathlib.Path
+    ) -> subprocess.CompletedProcess[bytes]:
+        argv = tuple(command)
+        self.commands.append(argv)
+        assert argv in {
+            ("git", "ls-files", "-z"),
+            ("git", "ls-files", "--others", "--exclude-standard", "-z"),
+        }
+        return self.runner.run_bytes(command, cwd)
+
+
+def test_collection_snapshot_reconciles_moved_parameterized_nodes(
+    test_runner_module: Any,
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runner = test_runner_module
+    baseline_path = tmp_path / "collection.json"
+    old_nodes = (
+        "tests/legacy/test_flow.py::test_case[first]",
+        "tests/legacy/test_flow.py::test_case[second]",
+    )
+    writer = CollectionExecution(runner, old_nodes)
+
+    write_exit = runner.execute(
+        ["--write-collection", str(baseline_path)],
+        repo_root=ROOT,
+        text_runner=writer.text,
+        bytes_runner=writer.bytes,
+    )
+    written = payload(capsys)
+
+    assert write_exit == 0
+    assert written["status"] == "collection-snapshot-written"
+    assert written["collection"]["count"] == 2
+    baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    assert baseline["schema"] == runner.COLLECTION_SCHEMA
+    assert baseline["nodes"] == list(old_nodes)
+
+    current_nodes = (
+        "tests/domain/test_flow.py::test_case[first]",
+        "tests/domain/test_flow.py::test_case[second]",
+        "tests/domain/test_flow.py::test_new_case",
+    )
+    reconciler = CollectionExecution(runner, current_nodes)
+    reconcile_exit = runner.execute(
+        ["--reconcile-collection", str(baseline_path)],
+        repo_root=ROOT,
+        text_runner=reconciler.text,
+        bytes_runner=reconciler.bytes,
+    )
+    reconciled = payload(capsys)
+
+    assert reconcile_exit == 0
+    assert reconciled["status"] == "collection-reconciled"
+    assert reconciled["collection"]["preserved_count"] == 2
+    assert reconciled["collection"]["moved_count"] == 2
+    assert reconciled["collection"]["added"] == [
+        "tests/domain/test_flow.py::test_new_case"
+    ]
+    assert {
+        (item["old"], item["new"], item["method"])
+        for item in reconciled["collection"]["moved"]
+    } == {
+        (old_nodes[0], current_nodes[0], "identity"),
+        (old_nodes[1], current_nodes[1], "identity"),
+    }
+
+
+def test_collection_node_map_resolves_ambiguous_identity(
+    test_runner_module: Any,
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runner = test_runner_module
+    baseline_path = tmp_path / "collection.json"
+    old = "tests/legacy/test_flow.py::test_case[value]"
+    writer = CollectionExecution(runner, (old,))
+    assert (
+        runner.execute(
+            ["--write-collection", str(baseline_path)],
+            repo_root=ROOT,
+            text_runner=writer.text,
+            bytes_runner=writer.bytes,
+        )
+        == 0
+    )
+    payload(capsys)
+
+    candidates = (
+        "tests/alpha/test_flow.py::test_case[value]",
+        "tests/beta/test_flow.py::test_case[value]",
+    )
+    ambiguous = CollectionExecution(runner, candidates)
+    diagnostic = tmp_path / "collection failure.json"
+    mismatch_exit = runner.execute(
+        [
+            "--reconcile-collection",
+            str(baseline_path),
+            "--diagnostic-output",
+            str(diagnostic),
+        ],
+        repo_root=ROOT,
+        text_runner=ambiguous.text,
+        bytes_runner=ambiguous.bytes,
+    )
+    mismatch = payload(capsys)
+
+    assert mismatch_exit == runner.COLLECTION_MISMATCH_EXIT_CODE
+    assert mismatch["status"] == "collection-mismatch"
+    assert mismatch["collection"]["ambiguous"] == [
+        {"old": old, "candidates": list(candidates)}
+    ]
+    assert_pretest_diagnostic(diagnostic, mismatch, mismatch_exit)
+    missing = runner.reconcile_collections((old,), (), {})
+    assert missing["ok"] is False
+    assert missing["missing"] == [old]
+
+    node_map = tmp_path / "node-map.json"
+    node_map.write_text(
+        json.dumps(
+            {
+                "schema": runner.NODE_MAP_SCHEMA,
+                "mappings": {old: candidates[1]},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    resolved = CollectionExecution(runner, candidates)
+    resolved_exit = runner.execute(
+        [
+            "--reconcile-collection",
+            str(baseline_path),
+            "--node-map",
+            str(node_map),
+        ],
+        repo_root=ROOT,
+        text_runner=resolved.text,
+        bytes_runner=resolved.bytes,
+    )
+    result = payload(capsys)
+
+    assert resolved_exit == 0
+    assert result["status"] == "collection-reconciled"
+    assert result["collection"]["moved"] == [
+        {"method": "explicit", "new": candidates[1], "old": old}
+    ]
+    assert result["collection"]["added"] == [candidates[0]]
+    changed_identity = runner.reconcile_collections(
+        (old,),
+        ("tests/beta/test_flow.py::test_case[changed]",),
+        {old: "tests/beta/test_flow.py::test_case[changed]"},
+    )
+    assert changed_identity["ok"] is False
+    assert changed_identity["mapping_errors"] == [
+        (
+            "node map changes pytest identity: "
+            f"{old} -> tests/beta/test_flow.py::test_case[changed]"
+        )
+    ]

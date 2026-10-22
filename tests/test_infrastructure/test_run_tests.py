@@ -49,7 +49,6 @@ def test_explicit_targets_collect_and_run_only_requested_cases(
     [
         ["tests/missing.py"],
         ["../outside.py"],
-        ["tests/test_infrastructure/test_repository_validator.py::missing_node"],
         ["tests/test_infrastructure", "--all"],
         ["--auto", "--worktree"],
         ["--", "-q"],
@@ -396,33 +395,6 @@ class DeterministicExecution:
         return subprocess.CompletedProcess(command, 0, self.diff, b"")
 
 
-class CollectionExecution:
-    """Return one declared pytest collection without running any test."""
-
-    def __init__(self, runner: Any, nodes: tuple[str, ...]) -> None:
-        self.runner = runner
-        self.nodes = nodes
-        self.commands: list[tuple[str, ...]] = []
-
-    def text(self, command: Any, cwd: pathlib.Path) -> subprocess.CompletedProcess[str]:
-        argv = tuple(command)
-        self.commands.append(argv)
-        assert argv[:5] == (
-            sys.executable,
-            "-m",
-            "pytest",
-            "--collect-only",
-            "-q",
-        )
-        return subprocess.CompletedProcess(command, 0, "\n".join(self.nodes) + "\n", "")
-
-    def bytes(
-        self, command: Any, cwd: pathlib.Path
-    ) -> subprocess.CompletedProcess[bytes]:
-        argv = tuple(command)
-        self.commands.append(argv)
-        assert argv == ("git", "ls-files", "-z")
-        return self.runner.run_bytes(command, cwd)
 
 
 def payload(capsys: pytest.CaptureFixture[str]) -> dict[str, Any]:
@@ -1008,7 +980,7 @@ def test_committed_diff_maps_test_rename_source_through_destination(
     }
 
 
-def test_committed_diff_treats_deleted_test_as_intentional_full_suite(
+def test_committed_diff_reports_unmapped_deleted_test(
     test_runner_module: Any, capsys: pytest.CaptureFixture[str]
 ) -> None:
     runner = test_runner_module
@@ -1025,14 +997,12 @@ def test_committed_diff_treats_deleted_test_as_intentional_full_suite(
     )
     result = payload(capsys)
 
-    assert exit_code == 0
-    assert result["status"] == "passed"
-    assert result["full_suite"] is True
+    assert exit_code == runner.MAPPING_GAP_EXIT_CODE
+    assert result["status"] == "mapping-gap"
+    assert result["full_suite"] is False
     assert result["full_suite_fallback"] is False
-    assert result["mapping_gaps"] == []
-    assert result["selected_suites"] == sorted(
-        runner.load_manifest(ROOT / "tests" / "test-impact.json").suites
-    )
+    assert result["mapping_gaps"][0]["path"] == "tests/legacy_credit_deleted.py"
+    assert not execution.final_pytest
 
 
 @pytest.mark.parametrize("mode", ["diff", "worktree"])
@@ -1246,6 +1216,8 @@ def test_pretest_failures_preserve_report_and_full_command_output(
         command: Any, cwd: pathlib.Path
     ) -> subprocess.CompletedProcess[str]:
         if "--collect-only" in command or (
+            failure == "selected-collection" and "pytest" in command
+        ) or (
             failure in {"revision-resolution", "worktree-resolution"}
             and command[0] == "git"
         ):
@@ -1259,6 +1231,15 @@ def test_pretest_failures_preserve_report_and_full_command_output(
         bytes_runner=execution.bytes,
     )
     result = payload(capsys)
+    if failure == "selected-collection":
+        assert exit_code == 2
+        assert result["status"] == "pytest-failed"
+        assert result["pytest"]["exit_code"] == 2
+        complete = json.loads(diagnostic.read_text(encoding="utf-8"))
+        assert complete["stdout"] == stdout
+        assert complete["stderr"] == stderr
+        assert not execution.final_pytest
+        return
     assert exit_code == runner.CONFIGURATION_EXIT_CODE
     assert result["status"] == (
         "manifest-invalid"
@@ -1304,163 +1285,12 @@ def test_manifest_validation_mode_collects_every_declared_target(
     assert result["pytest"]["outcome"] == "not-run"
 
 
-def test_collection_snapshot_reconciles_moved_parameterized_nodes(
-    test_runner_module: Any,
-    tmp_path: pathlib.Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    runner = test_runner_module
-    baseline_path = tmp_path / "collection.json"
-    old_nodes = (
-        "tests/legacy/test_flow.py::test_case[first]",
-        "tests/legacy/test_flow.py::test_case[second]",
-    )
-    writer = CollectionExecution(runner, old_nodes)
-
-    write_exit = runner.execute(
-        ["--write-collection", str(baseline_path)],
-        repo_root=ROOT,
-        text_runner=writer.text,
-        bytes_runner=writer.bytes,
-    )
-    written = payload(capsys)
-
-    assert write_exit == 0
-    assert written["status"] == "collection-snapshot-written"
-    assert written["collection"]["count"] == 2
-    baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
-    assert baseline["schema"] == runner.COLLECTION_SCHEMA
-    assert baseline["nodes"] == list(old_nodes)
-
-    current_nodes = (
-        "tests/domain/test_flow.py::test_case[first]",
-        "tests/domain/test_flow.py::test_case[second]",
-        "tests/domain/test_flow.py::test_new_case",
-    )
-    reconciler = CollectionExecution(runner, current_nodes)
-    reconcile_exit = runner.execute(
-        ["--reconcile-collection", str(baseline_path)],
-        repo_root=ROOT,
-        text_runner=reconciler.text,
-        bytes_runner=reconciler.bytes,
-    )
-    reconciled = payload(capsys)
-
-    assert reconcile_exit == 0
-    assert reconciled["status"] == "collection-reconciled"
-    assert reconciled["collection"]["preserved_count"] == 2
-    assert reconciled["collection"]["moved_count"] == 2
-    assert reconciled["collection"]["added"] == [
-        "tests/domain/test_flow.py::test_new_case"
-    ]
-    assert {
-        (item["old"], item["new"], item["method"])
-        for item in reconciled["collection"]["moved"]
-    } == {
-        (old_nodes[0], current_nodes[0], "identity"),
-        (old_nodes[1], current_nodes[1], "identity"),
-    }
 
 
-def test_collection_node_map_resolves_ambiguous_identity(
-    test_runner_module: Any,
-    tmp_path: pathlib.Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    runner = test_runner_module
-    baseline_path = tmp_path / "collection.json"
-    old = "tests/legacy/test_flow.py::test_case[value]"
-    writer = CollectionExecution(runner, (old,))
-    assert (
-        runner.execute(
-            ["--write-collection", str(baseline_path)],
-            repo_root=ROOT,
-            text_runner=writer.text,
-            bytes_runner=writer.bytes,
-        )
-        == 0
-    )
-    payload(capsys)
-
-    candidates = (
-        "tests/alpha/test_flow.py::test_case[value]",
-        "tests/beta/test_flow.py::test_case[value]",
-    )
-    ambiguous = CollectionExecution(runner, candidates)
-    diagnostic = tmp_path / "collection failure.json"
-    mismatch_exit = runner.execute(
-        [
-            "--reconcile-collection",
-            str(baseline_path),
-            "--diagnostic-output",
-            str(diagnostic),
-        ],
-        repo_root=ROOT,
-        text_runner=ambiguous.text,
-        bytes_runner=ambiguous.bytes,
-    )
-    mismatch = payload(capsys)
-
-    assert mismatch_exit == runner.COLLECTION_MISMATCH_EXIT_CODE
-    assert mismatch["status"] == "collection-mismatch"
-    assert mismatch["collection"]["ambiguous"] == [
-        {"old": old, "candidates": list(candidates)}
-    ]
-    assert_pretest_diagnostic(diagnostic, mismatch, mismatch_exit)
-    missing = runner.reconcile_collections((old,), (), {})
-    assert missing["ok"] is False
-    assert missing["missing"] == [old]
-
-    node_map = tmp_path / "node-map.json"
-    node_map.write_text(
-        json.dumps(
-            {
-                "schema": runner.NODE_MAP_SCHEMA,
-                "mappings": {old: candidates[1]},
-            }
-        )
-        + "\n",
-        encoding="utf-8",
-        newline="\n",
-    )
-    resolved = CollectionExecution(runner, candidates)
-    resolved_exit = runner.execute(
-        [
-            "--reconcile-collection",
-            str(baseline_path),
-            "--node-map",
-            str(node_map),
-        ],
-        repo_root=ROOT,
-        text_runner=resolved.text,
-        bytes_runner=resolved.bytes,
-    )
-    result = payload(capsys)
-
-    assert resolved_exit == 0
-    assert result["status"] == "collection-reconciled"
-    assert result["collection"]["moved"] == [
-        {"method": "explicit", "new": candidates[1], "old": old}
-    ]
-    assert result["collection"]["added"] == [candidates[0]]
-    changed_identity = runner.reconcile_collections(
-        (old,),
-        ("tests/beta/test_flow.py::test_case[changed]",),
-        {old: "tests/beta/test_flow.py::test_case[changed]"},
-    )
-    assert changed_identity["ok"] is False
-    assert changed_identity["mapping_errors"] == [
-        (
-            "node map changes pytest identity: "
-            f"{old} -> tests/beta/test_flow.py::test_case[changed]"
-        )
-    ]
-
-
-def test_committed_diff_maps_retired_and_current_lifecycle_configuration(
+def test_committed_diff_reports_unmapped_retired_configuration(
     test_runner_module: Any, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Deleting a retired configuration runs all suites without a stale mapping."""
+    """A mapped addition does not conceal an unknown deleted input."""
     runner = test_runner_module
     execution = DeterministicExecution(
         runner, b"D\0deploy/deploy.yml\0A\0sdlc/sdlc.yml\0"
@@ -1473,17 +1303,13 @@ def test_committed_diff_maps_retired_and_current_lifecycle_configuration(
     )
     result = payload(capsys)
 
-    assert exit_code == 0
-    assert result["mapping_gaps"] == []
-    assert result["full_suite"] is True
+    assert exit_code == runner.MAPPING_GAP_EXIT_CODE
+    assert result["mapping_gaps"][0]["path"] == "deploy/deploy.yml"
+    assert result["full_suite"] is False
     assert result["full_suite_fallback"] is False
-    assert result["selected_suites"] == sorted(
-        runner.load_manifest(ROOT / "tests" / "test-impact.json").suites
-    )
-    assert {item["path"] for item in result["selections"]} == {
-        "deploy/deploy.yml",
-        "sdlc/sdlc.yml",
-    }
+    assert result["selected_suites"] == ["repository-lifecycle"]
+    assert {item["path"] for item in result["selections"]} == {"sdlc/sdlc.yml"}
+    assert not execution.final_pytest
 
 
 def test_release_documentation_changes_need_no_executable_suite(
@@ -1524,8 +1350,8 @@ def test_release_documentation_changes_need_no_executable_suite(
         (
             ["--base", BASE, "--head", HEAD],
             b"R100\0retired/old.py\0skills/ceratops-repo-lifecycle/SKILL.md\0",
-            "selection-valid",
-            0,
+            "mapping-gap",
+            3,
         ),
         (["--base", BASE, "--head", HEAD], b"A\0unknown/new.py\0", "mapping-gap", 3),
         (["--all"], b"", "configuration-error", 2),

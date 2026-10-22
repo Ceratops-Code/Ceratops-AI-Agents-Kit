@@ -359,11 +359,18 @@ An empty collection and actual pytest failures retain their failure exit codes.
 The returned JSON includes collected, executed and reused counts; no model call
 is needed to select or transfer individual results.
 
-Matching inputs include checkout identity, exact arguments, caller environment
-digest (excluding worker-monitoring IDs), runtime/platform, Git/uv versions,
-installed distribution versions, the producer version,
-test bytes, imported repository helpers and the conservative non-test input
-inventory. All fixture/helper/data files and new unignored inputs participate.
+Matching inputs include checkout identity, behavior-changing arguments,
+runtime/platform and producer versions, plus the packages, tools, environment
+variables and production/data paths assigned to each check group. The existing
+`tests/test-impact.json` is read by `select_test_groups.py`; no second dependency
+graph is maintained. A consumer includes its prerequisites' inputs and settings,
+recursively. Changes flow toward consumers, never from a consumer back to its
+unchanged prerequisites. Test bytes, imported repository helpers and ancestor
+fixtures are separate check inputs. New unignored inputs participate through the
+current Git inventory; missing executable ownership stops before tests start.
+Unknown group package/tool/environment declarations conservatively retain the
+complete corresponding inventory. Known selectors/reporting options are omitted
+from acceptance inputs; unknown options and behavior options remain significant.
 Documentation-only patterns come from `tests/test-impact.json`. Hashes identify
 versions; successful pytest reports prove that execution passed. Checks with
 unrepresented dynamic or external-service inputs use `no_result_reuse` and
@@ -383,7 +390,8 @@ leaves another invocation free to execute its checks normally. Startup and each
 completed write retain current plus two predecessors per checkout, test and
 qualification level, protecting original results referenced by retained aggregate
 records and failures that can still block a retained pass. Other producers'
-files are untouched. Startup inspects every checkout/test group; each save
+files are untouched. Startup inventories filenames once and opens only collected
+checkout/test groups; each save
 refreshes, matches and prunes only its affected group through an in-memory index.
 No persistent index or additional storage is introduced. Failure precedence and
 retained references stay within that group, so unrelated histories need no
@@ -407,10 +415,29 @@ They preserve actual execution facts without inventing individual result IDs.
 Changed input bytes remain a reuse constraint; a busy optimization is distinct
 from incomplete execution evidence.
 
-This is runner-level reuse with qualified provenance. Release-unit qualification,
-historical baseline selection and broader lifecycle receipt composition remain
-later refactor-plan work; they must consume this owner rather than create another
-result store.
+The compact `ceratops-check-summary.v1` export contains `inputGroups` and
+`checkGroups` tables plus `checks`. Each outcome references its inlined facts and
+keeps the original result ID, check version, qualification level, required scope,
+phase outcomes and whether it was executed or reused. The input table keys hash
+their complete canonical contents. `docs/result_records.py.tmpl` owns repository
+check exports and its generated consumers; the reader rejects a summary that
+contradicts its executed parent. Skips retain a reason and never become passes.
+The envelope contains the facts needed for reuse without following old reports.
+It adds no store: existing aggregate records own its lifecycle. 5C connects this
+contract to build receipts and tags; tests alone do not create build versions.
+
+Pytest's maintained collection hook checks all requested targets and passes the
+same items to execution/reuse. Collection probes remain only for explicit
+collection/manifest modes, not a prelude repeated for each execution target.
+Shared input calculations run once per group, module and fixture; summary tables
+also deduplicate those facts. Counts and collection/execution durations report
+actual work. A focused startup against roughly 37,000 existing result files
+fell from over 300 seconds before collection to the first progress interval
+after scoped loading. This measures startup overhead, not faster test bodies.
+A 33-case impact-suite sample then measured 0.43 seconds collection and 12.44
+seconds execution. After an unrelated check-file edit it reused all 33 original
+results, with 0.17 seconds collection and 0.002 seconds execution. The result
+demonstrates preserved acceptance after that edit, not a whole-suite benchmark.
 
 ## Pytest failure diagnostics
 

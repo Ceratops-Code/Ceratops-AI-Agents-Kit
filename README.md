@@ -192,9 +192,10 @@ without repository deduplication.
 | `scripts/deploy-skills.py` | Independent installation and updates; renders selected skills, overlays their files, and adds missing native command roots. See [native command roots](#native-command-roots). |
 | `scripts/deploy-hooks.py` | Independent hook installation and updates; copies the repository hook payloads and merges their registrations while preserving unrelated files and configuration. Does not grant trust or restart Codex. |
 | `scripts/deploy-mcp-server-manager.py` | Install the checkout's declared MCP server manager version, including over an existing installation, from the scripts environment; uses the manager's global Python and uv prerequisites, temporary locked libraries, and packaging and deployment code. Never changes Codex settings. |
-| `scripts/testing/run-tests.py` | Sole test-selection, collection-reconciliation, and pytest-execution owner; validates `tests/test-impact.json`, explains deterministic Git-diff selection, rejects mapping gaps before pytest collection or execution, supports explicit committed-diff, worktree, collection, and `--all` modes, adds `--select-only` to check diff/worktree mapping without pytest, and saves failed-pytest streams and structured pre-test failures with captured command output through `--diagnostic-output`; pytest output remains bounded in the console, with live test names and completed counts on stderr. |
+| `scripts/testing/run-tests.py` | Public test entry point. Uses the input map to select tests, runs one pytest collection/execution for the selected targets, preserves collection-snapshot/node-mapping modes and reports missing ownership before execution. Failed streams go to `--diagnostic-output`; console output stays bounded with current test names and counts on stderr. |
+| `scripts/testing/select_test_groups.py` | Reads `tests/test-impact.json`, maps changed inputs to check groups, follows dependencies toward consumers and separates selection/reporting options from options affecting test behavior. The map selects checks, not editable files. |
 | `scripts/testing/report_test_progress.py` | Pytest hook plugin and execution transport; reports collection, rate-limited current-test/count updates, sixty-second liveness, the actual pytest exit code, and bounded executed/reused check counts without mixing progress into the final stdout JSON or saving execution state. |
-| `scripts/testing/reuse_test_results.py` | Saves immutable pytest outcomes under Git's shared result directory and reuses exact passing input matches on fresh calls. Owns corrupt-file cleanup, writer exclusion and current-plus-two retention per checkout/check/qualification level. Startup prunes every group; each save refreshes, matches and prunes only its affected checkout/check while preserving referenced outcomes and applicable failures. |
+| `scripts/testing/reuse_test_results.py` | Saves immutable pytest outcomes and compact summaries under Git's shared result directory. Reuses passes on matching group inputs, imported check/fixture files and relevant tools/packages/settings. Opens and prunes only collected checkout/check groups; each save stays in that group. Incomplete evidence blocks reuse; original identities, applicable failures and current-plus-two retention remain intact. |
 | `scripts/testing/pytest-diagnostics.py` | Extracts bounded failure summaries using exact pytest and unittest-subtest identities and source-file evidence, including parameter names containing summary separators; reports terminal import errors, nested exception-group messages and assertion differences over source context, excluding captured output. Native stderr failures before collection use the explicit `<pytest startup>` identity. Ambiguous or missing test tracebacks use only that test's summary reason. Full diagnostic files remain owned by the runner. |
 | `scripts/run-actionlint.py` | Provisions the pinned, checksum-verified actionlint release inside the scripts environment and validates every GitHub Actions workflow. |
 | `scripts/validate-repository.py` | Local validation coordinator; checks the running Python against `scripts/pyproject.toml`, runs workflow, repository lint and type checks, and captures first-failure evidence. Tests run separately through `scripts/testing/run-tests.py`. |
@@ -1892,6 +1893,37 @@ This repository publishes source files only. It does not publish Docker images,
 PyPI packages, npm packages, or other runtime artifacts.
 
 ## Durable repository check results
+
+The 5B input map groups production/data files, transitive prerequisites, packages,
+tools and environment variables independently. If A uses B, changing B affects
+B and A; changing only A does not select B. Python test bodies and their imported
+helpers/ancestor fixtures are tracked separately. New, removed and renamed inputs
+participate; an unknown executable input reports its missing mapping rather than
+silently selecting everything. Explicitly shared inputs still affect all groups.
+Undeclared package/tool/environment lists conservatively include the complete
+corresponding inventory. Pytest selectors and progress options do not erase a
+pass; behavior options do.
+
+`ceratops-check-summary.v1` carries `inputGroups`, `checkGroups` and `checks`.
+Tables store repeated input facts once. Outcomes retain original result IDs,
+check versions, qualification levels, required/optional scope and phase facts;
+reused passes remain distinct from execution. Skips keep their reason, not a
+fabricated pass. Repository checks export the same envelope from the canonical
+`docs/result_records.py.tmpl` contract. Full reports are unnecessary to interpret
+these facts. At 5B, summaries travel with existing bounded result records;
+5C connects them to tagged build receipts. No build tag is created by tests alone.
+
+Normal execution uses one pytest collection, including empty-target checks before
+test bodies run. Returned counts distinguish collected, executed and reused cases;
+`pytest.timings` reports collection and execution seconds. The startup change also
+avoids opening unrelated histories: on the current 37,000-file result directory,
+the initial focused run waited over 300 seconds before collection; scoped reads
+reached collection within the first progress interval. This is a startup
+measurement, not a claim that test bodies themselves became faster.
+In a 33-case impact-suite sample, the fresh run collected in 0.43 seconds and
+executed in 12.44 seconds. After an unrelated test-file edit, all 33 original
+passes were reused: 0.17 seconds collection, 0.002 seconds execution. These are
+local observations, not a whole-suite speed guarantee.
 
 SDLC `check-results` declarations connect one repository runner command to
 durable unchanged-input reuse. The operation executor supplies the existing

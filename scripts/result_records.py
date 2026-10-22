@@ -123,6 +123,8 @@ def prepare_result(
             allowed.add("execution")
         if isinstance(saved, dict) and "checks" in saved:
             allowed.add("checks")
+        if isinstance(saved, dict) and "check_summary" in saved:
+            allowed.add("check_summary")
         if (isinstance(saved, dict) and set(saved) == allowed
                 and all(saved.get(key) == value for key, value in expected.items())
                 and saved.get("status") == "passed"
@@ -309,9 +311,44 @@ def check_current_inputs(context: Mapping[str, Any], root: pathlib.Path) -> None
             raise ValueError("repository check locked runtime differs from the selected runtime")
 
 
+
+def summarize_check_result(record: Mapping[str, Any], children: Any = None) -> dict[str, Any]:
+    """Export compact original outcomes with all applicability facts inlined.
+
+    Tables deduplicate group and test-file inputs. No receipt, log or package
+    must survive elsewhere for these facts to remain usable. Absent historical
+    inputs stay absent; this exporter never invents an executed check.
+    """
+    result = {"schema": "ceratops-check-summary.v1", "inputGroups": {},
+              "checkGroups": {}, "checks": []}
+    if children:
+        if not isinstance(children, dict) or children.get("schema") != result["schema"]:
+            raise ValueError("unsupported compact check summary")
+        result["inputGroups"].update(children["inputGroups"])
+        result["checkGroups"].update(children["checkGroups"])
+        result["checks"].extend(dict(item) for item in children["checks"])
+    represented = {item["id"] for item in result["checks"]}
+    result["checks"].extend(dict(item) for item in record.get("checks", [])
+                            if item.get("id") not in represented)
+    if isinstance(record.get("inputs"), dict) and record.get("execution", {}).get("finishedAt"):
+        context = record["inputs"]
+        group = hashlib.sha256(canonical(context).rstrip(b"\n")).hexdigest()
+        result["inputGroups"][group] = context
+        finished = datetime.datetime.fromisoformat(record["execution"]["finishedAt"])
+        result["checks"].append({
+            "kind": "repository-check", "id": record["check_id"], "status": record["status"], "required": True,
+            "result_id": record["result_id"], "check_version": record["check_version"],
+            "candidate_id": record["candidate_id"], "qualificationLevel": context["qualificationLevel"],
+            "completed_ns": int(finished.timestamp() * 1_000_000_000),
+            "inputGroup": group, "inputs_digest": context["fingerprint"],
+        })
+    return result
+
+
 def run_recorded_check(
     callback: Callable[[], int], args: argparse.Namespace, invocation: Mapping[str, Any],
     *, checks: Callable[[], Any] | None = None, repo_root: pathlib.Path | None = None,
+    summary: Callable[[], Any] | None = None,
 ) -> int:
     """Write actual runner outcomes before success and preserve original attempts.
 
@@ -386,6 +423,8 @@ def run_recorded_check(
             }
         if checks is not None:
             completed["checks"] = checks()
+        if context is not None or summary is not None:
+            completed["check_summary"] = summarize_check_result(completed, summary() if summary else None)
         if read_result(path)[1] != running:
             raise ValueError("running result changed; refusing to overwrite it")
         write_result(path, completed, exclusive=False)

@@ -16,11 +16,9 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
-from typing import TYPE_CHECKING, TextIO
+from typing import TextIO
 
-if TYPE_CHECKING:
-    import pytest
-
+import pytest
 from reuse_test_results import RESULT_CONTEXT_ENV, RESULT_SUMMARY_ENV
 
 PREFIX = "[tests] "
@@ -36,6 +34,8 @@ class PytestProcess(subprocess.CompletedProcess[str]):
     nonreusable_checks: list[dict[str, object]] | None = None
     skipped_checks: list[dict[str, object]] | None = None
     passed_checks: list[dict[str, object]] | None = None
+    check_timings: dict[str, float] | None = None
+    check_summary: dict[str, object] | None = None
 
 
 class TestProgress:
@@ -157,6 +157,29 @@ def pytest_configure(config: pytest.Config) -> None:
         _progress.start()
 
 
+@pytest.hookimpl(tryfirst=True)
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """Fail before tests if any explicitly selected target collected no cases.
+
+    Use the same collected items that will execute. This runs before reuse
+    deselection, so a target satisfied entirely by recorded passes still counts.
+    No per-target subprocess or second collection is needed.
+    """
+    if config.getoption("collectonly"):
+        return
+    for argument in config.args:
+        name, separator, node = argument.partition("::")
+        path = pathlib.Path(name).resolve()
+        covered = any(
+            (item.path.resolve() == path or item.path.resolve().is_relative_to(path))
+            and (not separator or item.nodeid.partition("::")[2] == node
+                 or item.nodeid.partition("::")[2].startswith((node + "::", node + "[")))
+            for item in items
+        )
+        if not covered and items:
+            raise pytest.UsageError(f"pytest target does not collect: {argument}")
+
+
 def pytest_collection_finish(session: pytest.Session) -> None:
     if _progress is not None:
         _progress.collected(len(session.items))
@@ -262,4 +285,6 @@ def run_pytest(
             result.nonreusable_checks = summary.get("nonreusable_checks", [])
             result.skipped_checks = summary.get("skipped_checks", [])
             result.passed_checks = summary.get("passed_checks", [])
+            result.check_timings = summary.get("timings")
+            result.check_summary = summary.get("check_summary")
     return result

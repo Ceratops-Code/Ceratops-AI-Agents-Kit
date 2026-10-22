@@ -126,6 +126,7 @@ def run_recorded_request(
     args: argparse.Namespace, callback: Callable[[], int], *,
     repo_root: pathlib.Path, request_error: str | None = None,
     checks: Callable[[], object] | None = None,
+    summary: Callable[[], object] | None = None,
 ) -> int:
     """Keep custom selection/output while the declared runner writes outcomes."""
     if args.describe_test_results:
@@ -147,4 +148,4 @@ def run_recorded_request(
         "targets": list(args.targets), "all": args.all, "auto": args.auto,
         "base": args.base, "head": args.head, "worktree": args.worktree,
         "select_only": args.select_only, "probe_command": args.probe_command,
-    }, repo_root=repo_root, checks=checks)
+    }, repo_root=repo_root, checks=checks, summary=summary)

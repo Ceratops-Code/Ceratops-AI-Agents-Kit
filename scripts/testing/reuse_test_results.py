@@ -9,8 +9,8 @@ passes, without execution IDs, saved steps or progress-log parsing.
 The owning store is <git-common-dir>/ceratops/results/repository-checks/. This
 producer owns pytest-attempt-*.json, retained pytest-pass-*.json and .pytest-pass.lock there. It writes
 immutable records directly to final paths under the existing filelock library.
-Startup prunes every checkout/check group; each completed write prunes only its
-affected group. Both retain at most three versions per qualification level,
+Startup opens and prunes only the collected checkout/check groups; each completed
+write prunes its affected group. Both retain at most three versions per qualification level,
 preserving referenced facts and failure precedence.
 Other producers' results and live writers are left alone.
 """
@@ -36,6 +36,15 @@ from typing import Any
 
 import pytest
 from filelock import FileLock, Timeout
+from packaging.requirements import Requirement
+from select_test_groups import (
+    ImpactError,
+    check_arguments,
+    group_inputs,
+    load_manifest,
+    owning_suites,
+    path_matches,
+)
 
 RESULT_CONTEXT_ENV = "CERATOPS_PYTEST_RESULT_CONTEXT"
 RESULT_SUMMARY_ENV = "CERATOPS_PYTEST_RESULT_SUMMARY"
@@ -45,6 +54,7 @@ LEVELS = ("alpha", "beta", "rc", "final")
 MAX_GROUP_RECORD_BYTES = 8 * 1024 * 1024
 CONTEXT_SCHEMA = "ceratops-pytest-inputs.v1"
 RETAINED_VERSIONS = 3
+SUMMARY_SCHEMA = "ceratops-check-summary.v1"
 
 
 def _digest(value: object) -> str:
@@ -53,6 +63,31 @@ def _digest(value: object) -> str:
 
 def _json(value: object) -> bytes:
     return json.dumps(value, sort_keys=True, ensure_ascii=True, separators=(",", ":")).encode()
+
+
+def compact_results(references: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Inline reusable facts once per input group, without linking to old logs.
+
+    Production/runtime inputs and check-file inputs have separate tables because
+    thousands of cases commonly share one product group and a few test modules.
+    IDs and original levels stay those of the actual executed result.
+    """
+    groups: dict[str, Any] = {}
+    checks: dict[str, Any] = {}
+    outcomes = []
+    for reference in references:
+        record = dict(reference)
+        inputs = record.pop("inputs", None)
+        if isinstance(inputs, dict):
+            group = {key: value for key, value in inputs.items() if key != "check_inputs"}
+            group_id = _digest(group)
+            check_id = _digest(inputs["check_inputs"])
+            groups[group_id] = group
+            checks[check_id] = inputs["check_inputs"]
+            record.update({"kind": "pytest", "inputGroup": group_id, "checkGroup": check_id})
+        outcomes.append(record)
+    return {"schema": SUMMARY_SCHEMA, "inputGroups": groups, "checkGroups": checks,
+            "checks": outcomes}
 
 
 def _git(root: pathlib.Path, *arguments: str) -> bytes:
@@ -83,8 +118,8 @@ def result_environment(
     context = {
         "schema": CONTEXT_SCHEMA,
         "root": str(root.resolve()),
-        "arguments": list(command[3:]),
-        "environment": _digest({k: v for k, v in environ.items() if k not in ignored}),
+        "arguments": check_arguments(command[3:], root),
+        "environment": {k: _digest(v) for k, v in environ.items() if k not in ignored},
     }
     if raw := environ.get("CERATOPS_REPOSITORY_CHECK_CONTEXT"):
         owner = json.loads(raw)
@@ -101,17 +136,14 @@ def _tool_versions(root: pathlib.Path) -> dict[str, str | None]:
     result = subprocess.run(
         [uv, "--version"], capture_output=True, text=True, encoding="utf-8", check=False,
     ) if uv else None
-    return {
+    versions = {
         "git": _git(root, "--version").decode("utf-8").strip(),
         "uv": result.stdout.strip() if result is not None and result.returncode == 0 else None,
     }
-
-
-def _is_test_file(path: str) -> bool:
-    name = pathlib.PurePosixPath(path).name
-    return path.startswith("tests/") and name.endswith(".py") and (
-        name.startswith("test_") or name.endswith("_test.py")
-    )
+    for name in ("node", "npm", "powershell"):
+        found = shutil.which(name)
+        versions[name] = hashlib.sha256(pathlib.Path(found).read_bytes()).hexdigest() if found else None
+    return versions
 
 
 def _module_inputs(module: types.ModuleType, root: pathlib.Path) -> set[str]:
@@ -158,11 +190,9 @@ def _module_inputs(module: types.ModuleType, root: pathlib.Path) -> set[str]:
 class ResultStore:
     """Own bounded, immutable terminal pytest outcomes for one input snapshot.
 
-    Non-test repository inputs are deliberately conservative: every tracked or
-    unignored new input participates, except explicitly documentation-only paths
-    in test-impact.json. Test bodies are separate check definitions; all fixture,
-    helper and data files remain shared inputs. Changing a test file executes its
-    cases again without discarding passes for other unchanged test files.
+    The impact map assigns production and data inputs to each group. A group's
+    consumers include its inputs; unrelated groups do not. Test bodies, actual
+    imported helpers and ancestor fixtures are separate check definitions.
     """
 
     def __init__(self, root: pathlib.Path, context: Mapping[str, Any]) -> None:
@@ -178,44 +208,56 @@ class ResultStore:
         if self.qualification_level is not None and self.qualification_level not in LEVELS:
             raise ValueError("unsupported pytest qualification level")
         self.protected_ids = self._group_references()
-        manifest = json.loads((self.root / "tests/test-impact.json").read_text(encoding="utf-8"))
-        ignored = [pattern for item in manifest.get("ignored_paths", []) for pattern in item["paths"]]
-        # Use the runner's existing manifest glob semantics, including ** matching
-        # zero path segments. Importing the runner does not execute its CLI.
-        import runpy
-
-        match = runpy.run_path(str(pathlib.Path(__file__).with_name("run-tests.py")))["path_matches"]
+        self.manifest = load_manifest(self.root / "tests/test-impact.json")
+        ignored = [pattern for item in self.manifest.ignored_paths for pattern in item.paths]
         names = _git(root, "ls-files", "--cached", "--others", "--exclude-standard", "-z").decode("utf-8").split("\0")
         self.files: dict[str, str | None] = {}
         self.stats: dict[str, tuple[int, int] | None] = {}
         for name in sorted(set(filter(None, names))):
-            if any(match(pattern, name) for pattern in ignored):
+            if any(path_matches(pattern, name) for pattern in ignored):
                 continue
             path = self.root / name
             if not path.resolve().is_relative_to(self.root):
                 raise ValueError("pytest result input escapes checkout: " + name)
             self.files[name] = hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else None
             self.stats[name] = self._stat(path)
-        self.shared = {name: value for name, value in self.files.items() if not _is_test_file(name)}
+        distributions = list(importlib.metadata.distributions())
+        self.package_requirements = {
+            dist.metadata.get("Name", "").lower().replace("_", "-"):
+            [Requirement(value).name.lower().replace("_", "-") for value in (getattr(dist, "requires", None) or [])]
+            for dist in distributions
+        }
         self.context = {
             "arguments": context["arguments"], "environment": context["environment"],
             "checkout": self.checkout,
-            "runtime": [sys.executable, sys.version, platform.platform()],
+            "runtime": {"python": hashlib.sha256(pathlib.Path(sys.executable).read_bytes()).hexdigest(),
+                        "version": sys.version, "platform": platform.platform()},
             "tools": _tool_versions(root),
             "dependencies": sorted(
                 [dist.metadata.get("Name", ""), dist.version]
-                for dist in importlib.metadata.distributions()
+                for dist in distributions
             ),
-            "producer": hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest(),
-            "shared_inputs": _digest(self.shared),
+            "producer": _digest({name: hashlib.sha256(pathlib.Path(__file__).with_name(name).read_bytes()).hexdigest()
+                                 for name in ("reuse_test_results.py", "select_test_groups.py")}),
         }
         self.records_by_check: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        self.inputs_by_group: dict[str, dict[str, Any]] = {}
+        # Inventory names once, then open only this invocation's collected
+        # checks. Reading every past check in every worktree dominated startup.
+        self.paths_by_group: dict[str, list[pathlib.Path]] = {}
+        for path in self.directory.iterdir():
+            if path.name.startswith(("pytest-pass-", "pytest-attempt-")):
+                group = path.name.removeprefix("pytest-pass-").removeprefix("pytest-attempt-").split("-", 1)[0]
+                self.paths_by_group.setdefault(group, []).append(path)
+
+    def _load_check(self, nodeid: str) -> None:
+        key = (self.checkout, nodeid)
+        if key in self.records_by_check:
+            return
         try:
             with self.lock:
-                for record in self._read_records():
-                    group = (record["inputs"]["checkout"], record["nodeid"])
-                    self.records_by_check.setdefault(group, []).append(record)
-                self._prune()
+                self.records_by_check[key] = self._read_records(_digest([self.checkout, nodeid])[:24])
+                self._prune(key)
         except Timeout:
             pass  # A competing writer cannot delay a fresh test invocation.
 
@@ -231,12 +273,44 @@ class ResultStore:
         names = {nodeid.split("::", 1)[0], *(helpers or set())}
         if any(name not in self.files or self.files[name] is None for name in names):
             raise ValueError("Check uses inputs outside the recorded inventory")
+        owners = owning_suites(self.manifest, nodeid.split("::", 1)[0])
+        if len(owners) != 1:
+            raise ValueError(f"Check must have one input group: {nodeid}: {owners}")
+        if owners[0] not in self.inputs_by_group:
+            self.inputs_by_group[owners[0]] = self._group_context(nodeid)
+        self._load_check(nodeid)
         return {
-            **self.context,
+            **self.inputs_by_group[owners[0]],
             "check_inputs": {name: self.files.get(name) for name in sorted(names)},
         }
 
+    def _group_context(self, nodeid: str) -> dict[str, Any]:
+        suite, products = group_inputs(self.manifest, nodeid, self.files)
+        environment = self.context["environment"]
+        if suite.environment is not None:
+            environment = {name: environment.get(name) for name in suite.environment}
+        packages = self.context["dependencies"]
+        if suite.packages is not None:
+            installed = {name.lower().replace("_", "-"): version for name, version in packages}
+            required = set(suite.packages) | {"pytest", "filelock", "packaging"}
+            pending = list(required)
+            while pending:
+                for dependency in self.package_requirements.get(pending.pop(), []):
+                    if dependency not in required:
+                        required.add(dependency)
+                        pending.append(dependency)
+            packages = [[name, installed.get(name)] for name in sorted(required)]
+        tools = self.context["tools"]
+        if suite.tools is not None:
+            tools = {name: tools.get(name) for name in suite.tools}
+        return {
+            **self.context, "group": suite.suite_id,
+            "environment": environment, "dependencies": packages, "tools": tools,
+            "product_inputs": {name: self.files[name] for name in products},
+        }
+
     def matching(self, nodeid: str, inputs: Mapping[str, Any]) -> dict[str, Any] | None:
+        self._load_check(nodeid)
         records = self.records_by_check.get((inputs["checkout"], nodeid), [])
         candidates = [record for record in reversed(records) if record["inputs"] == inputs]
         failures = [record for record in candidates if record["outcome"] != "passed"]
@@ -261,11 +335,13 @@ class ResultStore:
         return {
             "id": record["nodeid"], "status": record["outcome"], "result_id": record["result_id"],
             "qualificationLevel": record.get("qualificationLevel"), "reused": reused,
+            "required": True,
             "check_version": _digest({
                 "producer": record["inputs"]["producer"],
                 "check_inputs": record["inputs"]["check_inputs"],
             }),
             "inputs_digest": record["inputs_digest"], "completed_ns": record["completed_ns"],
+            "inputs": record["inputs"], "phases": record["phases"],
             "path": path.relative_to(self.common).as_posix(),
             "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
         }
@@ -298,7 +374,7 @@ class ResultStore:
 
     def _current(self, inputs: Mapping[str, Any]) -> bool:
         """Reject edits made after collection's snapshot without rejecting touches."""
-        for name, digest in self.shared.items():
+        for name, digest in inputs["product_inputs"].items():
             path = self.root / name
             current_stat = self._stat(path)
             if current_stat != self.stats[name]:
@@ -315,9 +391,9 @@ class ResultStore:
 
     def _read_records(self, group: str | None = None) -> list[dict[str, Any]]:
         records = []
-        for prefix in ("pytest-pass", "pytest-attempt"):
-            pattern = f"{prefix}-{group}-*.json" if group else f"{prefix}-*.json"
-            for path in self.directory.glob(pattern):
+        for paths in ([self.paths_by_group.get(group, [])] if group else self.paths_by_group.values()):
+            for path in paths:
+                prefix = "pytest-attempt" if path.name.startswith("pytest-attempt-") else "pytest-pass"
                 try:
                     raw = path.read_bytes()
                     record = json.loads(raw)
@@ -431,6 +507,10 @@ class ResultStore:
             with self.lock:
                 group = _digest([self.checkout, nodeid])[:24]
                 check_group = (self.checkout, nodeid)
+                # A save refreshes just this check, including another invocation's
+                # completed file; unrelated records are neither read nor pruned.
+                self.paths_by_group[group] = [*self.directory.glob(f"pytest-attempt-{group}-*.json"),
+                                              *self.directory.glob(f"pytest-pass-{group}-*.json")]
                 self.records_by_check[check_group] = self._read_records(group)
                 record = self.matching(nodeid, inputs) if outcome == "passed" else None
                 if record is None:
@@ -443,6 +523,7 @@ class ResultStore:
                     if self.qualification_level is not None:
                         record["qualificationLevel"] = self.qualification_level
                     self._write_attempt(record)
+                    self.paths_by_group[group].append(self._record_path(record))
                     self.records_by_check[check_group].append(record)
                 self.protected_ids.add(record["result_id"])
                 self._prune(check_group)
@@ -471,6 +552,8 @@ class ReusePasses:
         self.skipped_phases: dict[str, set[str]] = {}
         self.skip_reasons: dict[str, str] = {}
         self.current_node: str | None = None
+        self.collection_started = time.monotonic()
+        self.collection_finished: float | None = None
 
     def _unrepresented(self, nodeid: str, reason: str) -> None:
         """Keep external or incomplete scope separate from original pass facts."""
@@ -498,7 +581,13 @@ class ReusePasses:
         remaining = []
         deselected = []
         outside_configuration = config.inipath is not None and not config.inipath.resolve().is_relative_to(self.store.root)
-        fixture_helpers: set[str] = set()
+        fixture_modules: list[tuple[pathlib.Path, types.ModuleType]] = []
+        module_inputs: dict[types.ModuleType, set[str]] = {}
+
+        def inputs_for(module: types.ModuleType) -> set[str]:
+            if module not in module_inputs:
+                module_inputs[module] = _module_inputs(module, self.store.root)
+            return module_inputs[module]
         for plugin in config.pluginmanager.get_plugins():
             if isinstance(plugin, types.ModuleType) and (source := getattr(plugin, "__file__", None)):
                 path = pathlib.Path(source).resolve()
@@ -506,7 +595,7 @@ class ReusePasses:
                     if not path.is_relative_to(self.store.root):
                         outside_configuration = True
                     else:
-                        fixture_helpers.update(_module_inputs(plugin, self.store.root))
+                        fixture_modules.append((path.parent, plugin))
         for item in items:
             # pytest's distributed workers have different effect/teardown
             # ownership; until represented explicitly they execute normally.
@@ -524,9 +613,19 @@ class ReusePasses:
                 self._unrepresented(item.nodeid, "The collected check has no represented Python module.")
                 remaining.append(item)
                 continue
+            # Corrupt actual outcomes must block, not turn into permission to
+            # ignore a possibly newer failure and execute as if no record exists.
             try:
-                inputs = self.store.inputs(item.nodeid, fixture_helpers | _module_inputs(module, self.store.root))
+                self.store._load_check(item.nodeid)
             except ValueError as exc:
+                raise pytest.UsageError(str(exc)) from exc
+            try:
+                fixture_helpers = set().union(*(
+                    inputs_for(plugin) for parent, plugin in fixture_modules
+                    if item.path.resolve().is_relative_to(parent)
+                ))
+                inputs = self.store.inputs(item.nodeid, fixture_helpers | inputs_for(module))
+            except (ValueError, ImpactError) as exc:
                 self._unrepresented(item.nodeid, f"Check input scope is not represented: {exc}")
                 remaining.append(item)
                 continue
@@ -540,6 +639,9 @@ class ReusePasses:
         if deselected:
             config.hook.pytest_deselected(items=deselected)
         items[:] = remaining
+
+    def pytest_collection_finish(self) -> None:
+        self.collection_finished = time.monotonic()
 
     def pytest_runtest_logstart(self, nodeid: str) -> None:
         self.current_node = nodeid
@@ -632,12 +734,24 @@ class ReusePasses:
             # This caller-selected output belongs to pytest's isolated temp
             # directory. It is ordinary returned check data, removed with that
             # directory; it never selects work in a subsequent invocation.
+            summary = compact_results([self.references[key] for key in sorted(self.references)])
             pathlib.Path(destination).write_bytes(_json({
                 "collected": self.original_count,
                 "executed": self.original_count - len(self.reused),
                 "reused": len(self.reused),
+                "timings": {
+                    "collection_seconds": (self.collection_finished or time.monotonic()) - self.collection_started,
+                    "execution_seconds": max(0.0, time.monotonic() - (self.collection_finished or time.monotonic())),
+                },
                 "executed_passes": self.executed_passes, "reused_passes": self.reused,
-                "result_references": [self.references[key] for key in sorted(self.references)],
+                # Callers may forward references without the summary tables.
+                # Keep those original references independent of table offsets.
+                "result_references": [
+                    {key: value for key, value in check.items()
+                     if key not in {"inputGroup", "checkGroup"}}
+                    for check in summary["checks"]
+                ],
+                "check_summary": summary,
                 "nonreusable_checks": [self.nonreusable_checks[key] for key in sorted(self.nonreusable_checks)],
                 "skipped_checks": [self.skipped_checks[key] for key in sorted(self.skipped_checks)],
                 "passed_checks": [self.passed_checks[key] for key in sorted(self.passed_checks)],
