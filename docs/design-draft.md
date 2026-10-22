@@ -359,8 +359,9 @@ An empty collection and actual pytest failures retain their failure exit codes.
 The returned JSON includes collected, executed and reused counts; no model call
 is needed to select or transfer individual results.
 
-Current attempt files are selected by checkout identity. Matching inputs include behavior-changing arguments,
-runtime/platform and producer versions, plus the packages, tools, environment
+Current attempt files are selected by checkout identity. Matching inputs include
+behavior-changing arguments, runtime/platform and producer versions, plus the
+packages, tools, environment
 variables and production/data paths assigned to each check group. The existing
 `tests/test-impact.json` is read by `select_test_groups.py`; no second dependency
 graph is maintained. A consumer includes its prerequisites' inputs and settings,
@@ -384,10 +385,10 @@ records remain unchanged; a missing historical level is eligible only for the
 legacy unqualified runner. Qualified calls use the shared level matrix, and a
 newer applicable failed or interrupted attempt blocks older passes for that
 individual test. A later matching pass resolves only its covered failure.
-When a failure would expire, retention also considers the selected build at each
-qualification level, at most four per unit/target. Newer alpha work cannot erase a
-failure still blocking an older beta build. These are compact tagged summaries;
-retention does not open packages or another worktree's build history.
+When a failure would expire, retention also considers the selected build at
+each qualification level, at most four per unit/target. Newer alpha work cannot
+erase a failure still blocking an older beta build. These are compact tagged
+summaries; retention does not open packages or another worktree's build history.
 
 `.pytest-pass.lock` serializes reads, final writes and pruning; a busy writer
 leaves another invocation free to execute its checks normally. Startup and each
