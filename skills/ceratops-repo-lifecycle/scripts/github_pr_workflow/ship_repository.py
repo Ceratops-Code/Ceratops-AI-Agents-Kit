@@ -820,7 +820,7 @@ def _resume_ship_command(
         command.append("--delete-branch")
     if args.reusable_head:
         command.append("--reusable-head")
-    for path in args.preserve_worktree or []:
+    for path in getattr(args, "preserve_worktree", None) or []:
         command.extend(("--preserve-worktree", str(path)))
     if diagnostic_output := getattr(args, "diagnostic_output", None):
         command.extend(("--diagnostic-output", str(diagnostic_output)))
@@ -1109,7 +1109,7 @@ def _ship_repository(args: ShipOptions) -> dict[str, object]:
     repo_root = args.repo_root.expanduser().resolve(strict=True)
     try:
         explicit_preserved = select_preserved_worktrees(
-            repo_root, tuple(args.preserve_worktree or []),
+            repo_root, tuple(getattr(args, "preserve_worktree", None) or []),
         )
     except CleanupError as exc:
         raise RepositoryShipError(str(exc)) from exc
@@ -1313,7 +1313,7 @@ def _ship_repository(args: ShipOptions) -> dict[str, object]:
             target_commit=target_commit,
             current_branch=args.base_branch,
             current_commit=synchronized_head,
-            preserve_worktrees=args.preserve_worktree,
+            preserve_worktrees=getattr(args, "preserve_worktree", None),
         ),
         repo_root=repo_root,
     )
