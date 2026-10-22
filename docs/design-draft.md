@@ -1864,56 +1864,64 @@ were written; release-lock cases cover interruption before and after command eff
 `<git-common-dir>/ceratops/operations/skill-updates/<worktree-id>/` without a
 checkpoint or worktree lock. No operation UUID or caller-supplied
 state/evidence paths are required. The caller's request has schema
-`ceratops-skill-update-request.v3` and fields `selected_skills`,
-`allowed_paths`, `change_groups` and non-test `checks`.
+`ceratops-skill-update-request.v4` and fields `selected_skills` and non-test
+`checks`, alongside `schema`. There is no file allowlist or change-group field.
 
-Declared files may be existing, untracked or not yet created, including files
-whose parent directories do not yet exist. The selected checkout's resolved
-root bounds their location; the request's exact paths bound the change scope.
-Opening a request and loading its recorded scope use the same file-target
-checks: Git internals, symlinks, junctions, directories and paths outside the
-checkout are rejected. Git tracking is not an eligibility condition. Selected
-skills still require an owned source path in the declared scope.
+The first call records the task branch, original commit and pre-existing
+uncommitted edits. Each check run asks Git for the net changed files since that
+commit, including staged, committed, deleted, renamed and new untracked files.
+Ignored generated output is excluded. Adding a changed file needs no request
+amendment, and a selected skill need not have a skill-local source edit when the
+requested work changes its tests, dependencies or shared files instead.
+The helper does not grant editing permission; the user's request governs the
+calling task's edits.
 
-The ordinary driver boundary is deterministic: `init` derives that closed
-request from repeated skill/path groups plus UTF-8 command files, and `run`
-performs only the needed verification or emits the recorded result and one
-next action. Governance proposals use the same boundary: `init` converts UTF-8
-context and replacement declarations into the existing proposal state machine,
-while `run` transports one explicit semantic assessment and decision. Neither
-driver chooses scope, edits governed sources, makes semantic judgments,
-commits, deploys, or weakens the lower-level recovery commands.
+Pre-existing edits must remain unchanged. The branch must retain the original
+commit as an ancestor. Changed files and declared search inputs must be regular
+file paths inside the checkout, without Git-internal paths or linked components.
+Deleted files and not-yet-created search inputs may be absent. Git whitespace
+checks apply to the current changes. Saved passes bind to the actual inputs;
+changes while checks run cannot be recorded as a pass.
+
+The ordinary driver is `init` followed by `run`: the former records selected
+skills and check declarations; the latter runs only needed checks or returns the
+saved result and one next action. Governance proposals have their own driver:
+`init` accepts UTF-8 context and replacement declarations, while `run` submits
+one explicit semantic assessment and decision. Neither driver makes semantic
+judgments, edits governed sources, commits or deploys.
 
 From the source repository, using its managed Python runtime:
 
 ```text
-python skills/ceratops-skill-lifecycle/scripts/skill-update-workflow.py init --repo-root WORKTREE --selected-skill SKILL --group NAME PATH
+python skills/ceratops-skill-lifecycle/scripts/skill-update-workflow.py init --repo-root WORKTREE --selected-skill SKILL
 python skills/ceratops-skill-lifecycle/scripts/skill-update-workflow.py run --repo-root WORKTREE
 python skills/ceratops-skill-lifecycle/scripts/skill-update-workflow.py run --repo-root WORKTREE --caller-use-complete
 python skills/ceratops-skill-lifecycle/scripts/skill-update-workflow.py open_skill_change --repo-root WORKTREE --change-request REQUEST
-python skills/ceratops-skill-lifecycle/scripts/skill-update-workflow.py expand_skill_scope --repo-root WORKTREE --change-request REQUEST
 python skills/ceratops-skill-lifecycle/scripts/skill-update-workflow.py run_skill_checks --repo-root WORKTREE
 python skills/ceratops-skill-lifecycle/scripts/skill-update-workflow.py replace_failed_request --repo-root WORKTREE --change-request REQUEST
 python skills/ceratops-skill-lifecycle/scripts/skill-update-workflow.py close_skill_change --repo-root WORKTREE
 ```
 
-`WORKTREE` is the selected task checkout; `REQUEST` is the caller's JSON file
-for the lower-level request interface. `init` records the same approval and
-original Git/dirty baseline without caller-authored JSON; the caller, not this
-helper, edits source. Expansion adds approved scope before or after checks,
-using the original baseline even for newly added paths. Failed-request
-replacement may revise checks but cannot shrink scope or hide unrelated work.
-Source ownership, descendant-commit and whitespace gates remain. Tests still
-belong to the SDLC runner. Commit and explicitly requested promotion/deployment
-remain separate caller actions; `run --caller-use-complete` or the lower-level
-close command follows their completed use.
+`WORKTREE` is the selected task checkout; `REQUEST` is a caller-owned JSON file.
+Repeat `--selected-skill` for multiple skills. `--command-check-file FILE`
+reads one exact command argument per nonempty UTF-8 line;
+`--search-check EXPECTED PATTERN PATH` declares a search.
+Repeat `init` or `open_skill_change` with the complete declarations to append
+skills or checks. Identical calls do nothing; additions preserve the original
+Git/dirty baseline and applicable passing results. Existing declarations cannot
+be removed by this append path. `replace_failed_request` may revise failed
+checks without replacing that baseline. No command exists to expand file scope.
+
+Tests belong to the SDLC runner. Commit and explicitly requested
+promotion/deployment remain separate caller actions; `run --caller-use-complete`
+or the lower-level close command follows their completed use.
 
 The helper owns these direct-written records:
 
 | Record | Purpose and lifetime |
 | --- | --- |
 | `update_request.json` | Original request, initial baseline and worktree identity; immutable until successful cleanup. The caller's input file is separate and never deleted. |
-| `states/N.json` | Approved scope, baseline, status and predecessor hash; retain current plus two predecessors. |
+| `states/N.json` | Selected skills, check declarations, original baseline, status and predecessor hash; retain current plus two predecessors. |
 | `check_results/N.json` | Checked commit/input hash, changed paths, individual results, overall status and failures for checking state N. State N+1 records its hash; retain results referenced by kept states. |
 | `completion_receipt.json` | Saved successful state/result identity used to finish cleanup without rechecking source; delete last. |
 
