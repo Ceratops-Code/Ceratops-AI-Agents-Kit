@@ -86,6 +86,17 @@ per-worktree files under `<git-common-dir>/ceratops/locks/` await one-time
 retirement at the next authorized deployment after old invocations stop.
 Files still in use are retained and reported; other locks and requests remain.
 
+4F supplies internal scoped retention functions in `retain_artifact_versions.py`,
+with store protection supplied by `store_artifacts.retain_completed_artifacts()`.
+They retain complete unchanged packages for one unit/target and named worktree
+or destination. Shared beta/stable storage keeps two successfully deployed
+versions and the latest approved build; a destination keeps current/previous
+installations and its latest deployed beta/stable version. A worktree keeps its
+own latest approved build. Existing receipts and successful-result identities
+remain unchanged. Readers report the actual retained paths. Build, Promote and
+Deploy connect these functions in their later adoption steps; their availability
+does not change this action's current installation route.
+
 ### Complete failure details
 
 Add `--diagnostic-output FILE` to the promotion command. FILE is one stable

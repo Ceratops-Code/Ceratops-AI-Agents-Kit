@@ -803,8 +803,7 @@ def _git_output(
         completed = subprocess.run(
             ["git", "-C", str(repository), *arguments],
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             check=False,
         )
     except OSError as exc:
@@ -965,7 +964,7 @@ def _read_git_record(
 def _artifact_receipt_locations(
     store_root: pathlib.Path,
     identity: Mapping[str, Any],
-) -> tuple[pathlib.Path, pathlib.Path]:
+) -> tuple[pathlib.Path, ...]:
     base = f"{identity['releaseUnit']}/{identity['version']}"
     direct = _bundle_relative_path(
         f"{base}/artifact-receipt.json", label="artifact selection"
@@ -977,6 +976,8 @@ def _artifact_receipt_locations(
     return (
         store_root.joinpath(*direct.parts),
         store_root.joinpath(*targeted.parts),
+        store_root.joinpath("beta-stable", *direct.parts),
+        store_root.joinpath("beta-stable", *targeted.parts),
     )
 
 
@@ -989,7 +990,15 @@ def _selected_artifact_receipt_path(
     if not existing:
         raise StepResultError("Selected artifact receipt does not exist.")
     if len(existing) != 1:
-        raise StepResultError("Selected artifact receipt location is ambiguous.")
+        # Retention may keep the same immutable receipt in the original and
+        # beta/stable pools. Different receipt bytes are never interchangeable.
+        receipts = [read_artifact_receipt(path) for path in existing]
+        if len({receipt.sha256 for receipt in receipts}) != 1:
+            raise StepResultError("Selected artifact receipt location is ambiguous.")
+        retained = [path for path in existing if path.is_relative_to(store_root / "beta-stable")]
+        if len(retained) != 1:
+            raise StepResultError("Selected artifact receipt location is ambiguous.")
+        return retained[0]
     return existing[0]
 
 

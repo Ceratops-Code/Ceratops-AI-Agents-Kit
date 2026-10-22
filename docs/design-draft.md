@@ -13,8 +13,9 @@ output lifetimes; the refactor plan records delivery order. The working-folder
 methodology below distinguishes implemented versioned storage, receipt preparation,
 final-commit binding, completion tags, effect-derived recovery and shared
 checkpoint storage and connected release-lock protection from planned
-receipt-driven public lifecycle routing. Steps through 4E and standalone 6A are
-implemented; later phase scheduling and artifact-only installation remain planned.
+receipt-driven public lifecycle routing. Steps through 4F and standalone 6A are
+implemented; 4F provides internal retention functions, not the later public
+connections. Later phase scheduling and artifact-only installation remain planned.
 
 The intended users are agents and CI working on Ceratops-compatible
 repositories, including repositories other than Ceratops-AI-Agents-Kit and
@@ -1413,8 +1414,9 @@ explicit, separate target-specific purpose; it must not repeat the artifact's
 acceptance tests under another name.
 
 The operation runner owns qualification. The internal artifact route now has
-two imported owners: `store_artifacts.py` allocates final directories and owns
-retention; `complete_artifact_builds.py` prepares accepted receipts and completes
+three imported owners: `store_artifacts.py` allocates final directories and provides
+store protection, `retain_artifact_versions.py` selects and retains scoped copies,
+and `complete_artifact_builds.py` prepares accepted receipts and completes
 result-only commit C, artifact receipts and the immutable tag. The v2 producer
 keeps its existing transaction until its later retirement. Public adoption of
 the directory-first route remains steps 16/22.
@@ -1467,9 +1469,10 @@ not another worktree's normal build.
 Only cross-version deletion takes the existing short store lock. Allocation
 tries startup retention without waiting if that lock is busy; completed calls
 finish retention under the lock. Requests and untagged directories protect
-unfinished or uncertain output. The current bound is three completed outputs
-per repository/unit/target/alpha-beta-stable class; 4F's later shared policy is
-not active here. Pruning bytes does not remove tags or historical acceptance.
+unfinished or uncertain output. Unconnected callers keep three completed outputs
+per repository/unit/target/alpha-beta-stable class. That older rotation excludes
+4F-managed originals and the shared beta/stable pool. Pruning bytes does not
+remove tags or historical acceptance.
 
 This replaces 1d/1e's separate reservations. At authorized deployment after old
 writers stop, transfer still-needed old reservation data to its matching version
@@ -1477,6 +1480,64 @@ request and remove only the replaced file. Receipt/tag evidence permits removal
 of completed obsolete reservations; uncertain records stay. No recurring
 migration detector is installed. The source/helper split changes no receipt
 format or release/destination lock.
+
+### Scoped retained artifact copies (4F)
+
+`retain_artifact_versions.py` accepts one `RetentionScope`: an absolute managed
+root, release unit, target, pool and (for original builds) existing worktree ID.
+A bundle occupies its release-unit directory. Separate member versions remain
+step 8C; this library does not add receipt fields for them.
+
+`select_retained_versions()` uses the caller's existing accepted build and
+successful installation records, oldest deployment first. Shared beta/stable
+storage keeps the two most recently successfully deployed distinct beta/stable
+versions and the latest approved beta/stable version. A destination keeps its
+current and previous successful generations and latest deployed beta/stable
+generation. Alpha-only destinations have no invented beta/stable slot. A named
+worktree keeps its latest approved build, including alpha. Overlapping slots
+deduplicate; failed installations cannot advance a successful slot.
+
+`retain_artifact_versions()` copies each complete selected package, dependencies,
+supporting files and original receipt bytes directly to
+`<git-common-dir>/ceratops/artifacts/beta-stable/<unit>/<version>/<target>/`, or
+`<destination>/deployed/<unit>/<existing-generation>/<target>/`. Destination
+copies also include the installer's recorded runnable files and successful
+installation result. Original worktree output stays at the 4E allocated path.
+The caller holds its existing release/destination ownership and supplies current
+facts and file-use information; this is not a new worktree lock or process manager.
+
+Each copy's `.retained-files.json` records its exact files and ownership.
+`.build_receipt.json` contains the unchanged committed receipt, and destination
+copies also contain `.installation_receipt.json`. The original artifact receipt
+is copied last. The group's `.retention/<target>/<pool-or-worktree>.json` records
+only selected copies and unresolved deletion candidates, not worker progress.
+There are no temporary copies, timestamp-based choices or growing history.
+`store_artifacts.retain_completed_artifacts()` uses the existing short cleanup
+lock for selection-record changes and deletion, not copying or builds.
+
+Only the named group and its supplied record paths are read. File-use information
+is required before changing incomplete bytes or deleting a candidate. Running or
+pending installations protect their generations even when the recorded current
+selection differs. Unknown ownership, changed files, missing use information or
+unrecorded files leave the affected copy intact and return its path and cause.
+An incomplete replacement never displaces the previous successful selection.
+Repeated ordinary calls finish missing copy/delete effects; an unreadable ownership
+record remains explicit unresolved data, not guessed permission to remove files.
+
+The current receipt reader accepts identical original/shared copies and reports
+the selected shared paths. `read_versioned_build()` likewise finds retained-only
+completed output. Neither changes acceptance, result IDs, check versions, commit,
+receipt bytes or tags, nor executes checks. Successful test/build result retention
+remains with their result owner. Removing a worktree original after promotion
+requires the release branch to select the accepted replacement commit and the
+complete beta/stable copy to exist; any separately deployed copy stays independent.
+
+Build approval (7/16), installation (17–19), promotion replacement (22), and Codex
+(31) connect these functions later. Dedicated worktree/abandonment cleanup remains
+21. Tests in `test_artifact_retention.py` cover scoped selection, original receipt
+identity, complete copies, failed activation, live users and interruptions around
+copying, recording selection and deletion. No public Build/Deploy policy changes
+are implied by the library's availability.
 
 ### Skill-update checkpoint storage (implemented)
 
@@ -1656,7 +1717,7 @@ they do not rename old files, alter tags or rerun accepted builds/tests.
 | `ceratops/locks/release-local` | Implemented internal write-lock helper; one persistent native lock per Git common directory, with an in-place one-byte unfinished-run flag. Clear only after explicit clean completion, never during checkpoint cleanup or worktree removal. Current release writers use it in 2B; steps 3 and 4 complete the batch. |
 | `<destination>/locks/install` | Planned in steps 17–19; use the same helper and unfinished-run flag across source worktrees, through generation production, activation and cleanup. Retain the file; no mandatory OS process groups. |
 | Committed build receipt/evidence | Producer; current record plus at most two predecessors per unit/check group in the checkout; Git commit history supplies historical retrieval without an extra record database |
-| `ceratops/artifacts/<unit>/<version>/` with optional target subdirectory | Artifact store; immutable artifacts, supporting files and artifact receipt; current plus two predecessors per repository/unit/target and alpha/beta/stable retention group; later consumers supply explicitly bounded active/current/rollback protection |
+| `ceratops/artifacts/<unit>/<version>/` with optional target subdirectory | Artifact store; immutable artifacts, supporting files and artifact receipt. The 4F retention functions keep each unpromoted worktree's latest approved build and the separate shared/destination selections described above. Unconnected callers retain the existing current-plus-two policy per repository/unit/target and version class until their planned adoption. |
 | `ceratops/artifacts/<unit>/<version>/build_request.json` | Artifact allocation and input binding; immediately records the registered worktree and whole target set, then exact B/inputs before artifacts. No allocation lock. Remove after receipt/tag completion; preserve unfinished and uncertain requests. |
 | `.build/<unit>/<version>/build_receipt.json` with optional target directory | Operation runner; directly written final result, validated and reused by exact bytes, committed at C with other declared Git evidence and retained historically by Git |
 | `artifacts/<unit>/<version>/` with optional target directory | Direct final output; protected while a build request exists or the immutable tag is absent. Complete target receipts and the tag bind it to C. Directory creation, not a reservation file, allocates the version. |

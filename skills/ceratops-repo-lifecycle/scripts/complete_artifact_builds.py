@@ -442,7 +442,7 @@ def _require_unchanged_inputs(
     input_paths = set(records) | set(transaction.declared_input_paths)
     overlap = input_paths & result_paths
     if overlap:
-        raise OperationError(f"Declared input is also a result path: {sorted(overlap)[0]}")
+        raise OperationError(f"Declared input is also a result path: {min(overlap)}")
     try:
         for record in records.values():
             sdlc_results._read_git_record(
@@ -855,10 +855,16 @@ def read_artifact_build(
         attempt = _require_identifier(record.get("attemptId"), label="attempt ID", pattern=LOGICAL_ID_RE)
         paths = _validated_relative_paths(record.get("declaredInputPaths"), label="declared input path")
     else:
-        output = directory if len(targets) == 1 else directory / targets[0]
         selected = sdlc_results.read_artifact_receipt_chain(
-            root, artifact_receipt_path=output / "artifact-receipt.json",
+            root, tag=f"{unit}/{version}", expected={
+                "repository": repository, "releaseUnit": unit,
+                "version": version, "target": targets[0],
+            },
         )
+        # A completed original may have been retired after an identical copy
+        # reached the shared pool. Report that actual location to consumers.
+        output = selected.receipt_path.parent
+        directory = output if len(targets) == 1 else output.parent
         receipt = selected.build_receipt.value
         commit = receipt["preTestCommit"]
         allocation_commit = commit
@@ -886,16 +892,21 @@ def _completed_versioned_result(
     final_commit = _artifact_tag_commit(transaction)
     if final_commit is None:
         return None
+    artifact_receipts: list[pathlib.Path] = []
     for target in transaction.required_targets:
         selected = sdlc_results.read_artifact_receipt_chain(
-            transaction.repo_root, artifact_receipt_path=transaction.artifact_receipt(target),
+            transaction.repo_root,
+            tag=f"{transaction.release_unit}/{transaction.version}",
+            expected={"repository": transaction.repository, "releaseUnit": transaction.release_unit,
+                      "version": transaction.version, "target": target, "attemptId": transaction.attempt_id},
         )
         _validate_prepared_receipt(transaction, target, selected.build_receipt.raw)
         if selected.final_commit != final_commit:
             raise RecoveryRequired("Completed artifact targets disagree on their final commit.")
+        artifact_receipts.append(selected.receipt_path)
     return CompletedArtifactVersion(
         final_commit=final_commit,
         tag=f"{transaction.release_unit}/{transaction.version}",
         build_receipts=tuple(transaction.repo_root / transaction.receipt_path(target) for target in transaction.required_targets),
-        artifact_receipts=tuple(transaction.artifact_receipt(target) for target in transaction.required_targets),
+        artifact_receipts=tuple(artifact_receipts),
     )
