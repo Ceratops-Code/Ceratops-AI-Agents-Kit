@@ -1639,8 +1639,15 @@ or whole-system recovery.
 
 ### Shipped task work and planned abandoned-work cleanup
 
-Implemented Ship cleanup is owned by `retire_shipped_work.py`. After selected
-operations succeed, it finalizes the optional promotion scope and discovers task
+Implemented Ship cleanup is owned by `retire_shipped_work.py`. Explicit
+`--preserve-worktree` paths protect active manual
+worktrees, their branches and task files even without a catalog ownership record.
+Ship checks that requested paths are canonical registered task worktrees in the
+selected repository before remote effects; the terminal cleanup and returned
+rerun command carry the same protection. Unfinished removal records for these
+paths remain untouched until a later invocation releases the paths. This
+retention does not bypass source, pending-work, review or CI checks. After selected
+operations succeed, the helper finalizes the optional promotion scope and discovers task
 worktrees and unchecked-out local `codex/` task branches throughout the repository.
 An absent scope does not suppress discovery. Removal requires clean Git state
 including untracked files, exact head ancestry in the synchronized shipped commit,

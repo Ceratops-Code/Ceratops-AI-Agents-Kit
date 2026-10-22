@@ -943,6 +943,13 @@ the repository, including older batches absent from the pending-work scope.
 Removal requires clean Git state including untracked files, the exact head
 included in the synchronized shipped commit, and associated Codex threads that
 are archived or absent. Active or uncertain owners and protected checkouts stay.
+Direct Ship and `--ship-after-promotion` accept repeatable
+`--preserve-worktree <absolute-task-worktree>` arguments for active manual
+worktrees missing from Codex's ownership catalog. Each path must be a registered
+worktree in the selected repository's task root. This retains its branch and
+matching task files without changing thread records or weakening release checks.
+The same arguments are included in the returned rerun command; omit them when
+the task is finished and its shipped work can be retired.
 The repository lifecycle helper `retire_shipped_work.py` reads the existing Codex
 thread catalog without writing it, rechecks current removal conditions, and
 retains only unfinished removal records under
