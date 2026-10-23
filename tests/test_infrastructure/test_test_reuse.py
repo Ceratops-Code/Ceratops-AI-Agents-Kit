@@ -562,6 +562,84 @@ def _result_store(root):
     return module.ResultStore(root, context)
 
 
+@pytest.mark.parametrize("change", ["none", "first", "new-input"])
+def test_split_dependency_groups_reuse_original_passes_and_rerun_only_changed_work(
+    test_runner_module, tmp_path, change,
+):
+    root = _acceptance_repository(tmp_path)
+    counter = tmp_path / "effects.log"
+    for name in ("first", "second"):
+        _acceptance_test(root, name, counter)
+        (root / f"{name}.py").write_text("VALUE = 1\n")
+    initial = _acceptance_run(test_runner_module, root)
+    assert initial.returncode == 0, initial.stdout + initial.stderr
+    assert initial.accepted_checks == {"collected": 2, "executed": 2, "reused": 0}
+    originals = {item["id"]: item for item in initial.accepted_result_references}
+    store = _result_store(root)
+    original_bytes = {path: path.read_bytes() for path in store.directory.glob("pytest-attempt-*.json")}
+    path = root / "tests/test-impact.json"
+    manifest = json.loads(path.read_text())
+    manifest["full_suite_paths"] = []
+    manifest["suites"] = {
+        name: {"pytest": [f"tests/test_{name}.py"], "depends_on": []}
+        for name in ("first", "second")
+    }
+    manifest["rules"] = [
+        {"id": name, "paths": [f"{name}.*"], "suites": [name]}
+        for name in ("first", "second")
+    ]
+    path.write_text(json.dumps(manifest))
+    if change == "first":
+        (root / "first.py").write_text("VALUE = 2\n")
+    elif change == "new-input":
+        (root / "first.json").write_text("{}")
+    affected = int(change != "none")
+    changed = _acceptance_run(test_runner_module, root)
+    assert changed.returncode == 0, changed.stdout + changed.stderr
+    assert changed.accepted_checks == {"collected": 2, "executed": affected, "reused": 2 - affected}
+    for reference in changed.accepted_result_references:
+        if reference["reused"]:
+            original = originals[reference["id"]]
+            assert reference["result_id"] == original["result_id"]
+            assert reference["check_version"] == original["check_version"]
+            assert reference["inputs_digest"] == original["inputs_digest"]
+    assert all(path.read_bytes() == content for path, content in original_bytes.items())
+    repeated = _acceptance_run(test_runner_module, root)
+    assert repeated.returncode == 0, repeated.stdout + repeated.stderr
+    assert repeated.accepted_checks == {"collected": 2, "executed": 0, "reused": 2}
+    assert counter.read_text().splitlines() == ["first", "second"] + (["first"] if affected else [])
+
+
+@pytest.mark.parametrize("rotate", [False, True])
+def test_renamed_dependency_group_keeps_newer_failure_ahead_of_old_pass(tmp_path, rotate):
+    root = _mapped_repository(tmp_path)
+    node = "tests/b/test_value.py::test_value"
+    original = _level_store(root, "beta")
+    original.save(node, original.inputs(node))
+    path = root / "tests/test-impact.json"
+    manifest = json.loads(path.read_text())
+    manifest["suites"]["consumer"] = manifest["suites"].pop("b")
+    for suite in manifest["suites"].values():
+        suite["depends_on"] = ["consumer" if name == "b" else name for name in suite["depends_on"]]
+    for rule in manifest["rules"]:
+        rule["suites"] = ["consumer" if name == "b" else name for name in rule["suites"]]
+    path.write_text(json.dumps(manifest))
+    changed = _level_store(root, "alpha")
+    assert changed.matching(node, changed.inputs(node)) is not None
+    failure = changed.save(node, changed.inputs(node), outcome="failed", phases={"call": "failed"})
+    if rotate:
+        for value in range(2, 6):
+            (root / "b.py").write_text(f"VALUE = {value}\n")
+            current = _level_store(root, "alpha")
+            current.save(node, current.inputs(node))
+        (root / "b.py").write_text("VALUE = 1\n")
+    for _ in range(2):
+        fresh = _level_store(root, "beta")
+        assert fresh.matching(node, fresh.inputs(node)) is None
+        assert fresh._record_path(failure).exists()
+        assert "newer applicable failure" in fresh.reuse_reasons[node]["reason"]
+
+
 def test_acceptance_plugin_loads_without_assertion_rewrite_warning(
     test_runner_module, tmp_path, monkeypatch,
 ):

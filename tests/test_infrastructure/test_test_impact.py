@@ -71,6 +71,55 @@ def test_domain_source_change_selects_only_mapped_suite(test_runner_module: Any)
     assert not selection.mapping_gaps
 
 
+@pytest.mark.parametrize("source,affected,unaffected", [
+    ("skills/ceratops-repo-lifecycle/scripts/sdlc_results.py",
+     {"artifact-storage", "check-result-reuse", "repository-operations", "repository-promotion"},
+     {"github-contracts", "repository-compatibility", "repository-health", "skill-checkpoints", "test-runner"}),
+    ("skills/ceratops-repo-lifecycle/scripts/github_contract_engine/github_api.py",
+     {"github-contracts", "github-workflows", "repository-health"},
+     {"artifact-storage", "check-result-reuse", "skill-checkpoints", "test-runner"}),
+    ("skills/ceratops-skill-lifecycle/scripts/manage_checkpoints.py",
+     {"skill-checkpoints", "skill-lifecycle"},
+     {"github-contracts", "repository-compatibility", "repository-promotion", "test-runner"}),
+    ("scripts/testing/reuse_test_results.py", {"test-runner", "command-reporting"},
+     {"github-contracts", "repository-compatibility", "repository-promotion", "source-search", "shell-hook"}),
+    ("hooks/windows-shell-sanity.py", {"shell-hook"},
+     {"test-runner", "source-search", "repository-promotion"}),
+])
+def test_repository_sources_select_their_consumers_not_entire_test_directories(
+    test_runner_module, source, affected, unaffected,
+):
+    """The real input map must keep unrelated responsibilities out of a change."""
+    runner = test_runner_module
+    manifest = runner.load_manifest(ROOT / "tests/test-impact.json")
+    selection = runner.selection_from_changes(manifest, (runner.ChangedFile("M", (source,)),))
+    assert not selection.mapping_gaps
+    assert affected <= set(selection.suites)
+    assert not unaffected.intersection(selection.suites)
+    assert not selection.full_suite
+
+
+def test_repository_group_input_scopes_keep_unrelated_receipt_changes_out(test_runner_module):
+    from select_test_groups import group_inputs
+
+    manifest = test_runner_module.load_manifest(ROOT / "tests/test-impact.json")
+    receipt = "skills/ceratops-repo-lifecycle/scripts/sdlc_results.py"
+    contract = "skills/ceratops-repo-lifecycle/scripts/github_contract_engine/github_api.py"
+    artifact_case = "tests/repository_lifecycle/test_artifact_retention.py::test_retention"
+    contract_case = "tests/repository_lifecycle/test_contract_engine.py::test_contract"
+    assert group_inputs(manifest, artifact_case, (receipt, contract))[1] == (receipt,)
+    assert group_inputs(manifest, contract_case, (receipt, contract))[1] == (contract,)
+
+
+def test_added_lifecycle_source_requires_an_explicit_owner(test_runner_module):
+    runner = test_runner_module
+    manifest = runner.load_manifest(ROOT / "tests/test-impact.json")
+    source = "skills/ceratops-repo-lifecycle/scripts/new_unmapped_operation.py"
+    selection = runner.selection_from_changes(manifest, (runner.ChangedFile("A", (source,)),))
+    assert selection.mapping_gaps == ({"path": source, "reason": "unmapped repository path"},)
+    assert not selection.pytest_targets
+
+
 def test_multiple_domains_produce_sorted_deterministic_union(
     test_runner_module: Any,
 ) -> None:

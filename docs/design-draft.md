@@ -360,7 +360,7 @@ The returned JSON includes collected, executed and reused counts; no model call
 is needed to select or transfer individual results.
 
 Current attempt files are selected by checkout identity. Matching inputs include
-behavior-changing arguments, runtime/platform and producer versions, plus the
+behavior-changing arguments, runtime/platform, plus the
 packages, tools, environment
 variables and production/data paths assigned to each check group. The existing
 `tests/test-impact.json` is read by `select_test_groups.py`; no second dependency
@@ -369,6 +369,14 @@ recursively. Changes flow toward consumers, never from a consumer back to its
 unchanged prerequisites. Test bytes, imported repository helpers and ancestor
 fixtures are separate check inputs. New unignored inputs participate through the
 current Git inventory; missing executable ownership stops before tests start.
+The repository's map separates lifecycle responsibilities and infrastructure
+tools instead of assigning their entire directories to one input group. Shared
+files explicitly name all consuming groups. A group name describes the current
+map, not the work previously tested: splitting or renaming groups compares only
+their currently required input facts, without rewriting stored outcomes. Missing,
+changed or removed required inputs prevent reuse; a newer matching failure still
+blocks an older pass. The result-reporting helper's original version remains in
+the record but is an execution dependency only for checks that exercise it.
 Unknown group package/tool/environment declarations conservatively retain the
 complete corresponding inventory. Known selectors/reporting options are omitted
 from acceptance inputs; unknown options and behavior options remain significant.

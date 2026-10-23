@@ -1909,8 +1909,14 @@ pass; behavior options do.
 
 A full-suite selection does not require every selected test to execute. Explicit
 file ownership limits dependency comparisons even for a full-suite trigger.
-Runner and result-reporting code belongs to the test-infrastructure group;
-changing it does not erase unrelated passing results. The original reporting
+Repository lifecycle tests have separate groups for artifact storage, check reuse,
+compatibility, GitHub contracts, commands, promotion, shipping and other owners;
+the test runner, shell hook and source-search tools also have separate groups.
+Shared files name their consuming groups explicitly. Changing build-receipt code
+does not by itself rerun unrelated GitHub-contract tests. Splitting or renaming
+a group does not erase a pass: every input required by the current group must
+match the original recorded facts, and a newer applicable failure still blocks
+reuse. Original result files and identities are not rewritten. The reporting
 helper version stays in each result, but is not compared as a dependency of
 every test. Tests that exercise that helper still rerun when its inputs change.
 Reused summaries retain the original inputs and use `applicableInputGroup` for

@@ -1307,7 +1307,11 @@ def test_committed_diff_reports_unmapped_retired_configuration(
     assert result["mapping_gaps"][0]["path"] == "deploy/deploy.yml"
     assert result["full_suite"] is False
     assert result["full_suite_fallback"] is False
-    assert result["selected_suites"] == ["repository-lifecycle"]
+    assert result["selected_suites"] == [
+        "artifact-storage", "check-result-reuse", "command-reporting",
+        "github-dependencies", "github-workflows", "pending-work",
+        "repository-operations", "repository-promotion", "repository-shipping",
+    ]
     assert {item["path"] for item in result["selections"]} == {"sdlc/sdlc.yml"}
     assert not execution.final_pytest
 

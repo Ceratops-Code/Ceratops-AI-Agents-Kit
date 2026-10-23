@@ -510,7 +510,11 @@ class ResultStore:
         # The reporting helper's version remains part of the original result,
         # not a dependency of every test. Tests exercising that helper still
         # name it through their product/check inputs and run when it changes.
-        excluded = {"producer", "product_inputs"}
+        # Group names describe today's dependency map, not executed work. A
+        # responsibility split may narrow the map without changing any input
+        # required by this check. Keep the original group in the saved result
+        # and compare the current scope against its recorded facts below.
+        excluded = {"producer", "product_inputs", "group"}
         if "build" in record or "imported" in record:
             # Tagged facts are discovered through this checkout's .build history;
             # their original physical checkout is not a product dependency.
@@ -523,7 +527,11 @@ class ResultStore:
         nodeid = record.get("nodeid", record.get("id"))
         # Thousands of cases share the same dependency group and file list.
         # Cache only this invocation's map calculation, never a test decision.
-        key = (inputs["group"], tuple(sorted(set(previous) | set(current))))
+        # Use the current owner, including when comparing a retained failure's
+        # old inputs after that owner was renamed or split.
+        owners = owning_suites(self.manifest, nodeid.split("::", 1)[0])
+        key = (owners[0] if len(owners) == 1 else nodeid,
+               tuple(sorted(set(previous) | set(current))))
         if key not in self.comparison_groups:
             self.comparison_groups[key] = group_inputs(self.manifest, nodeid, key[1])
         suite, required = self.comparison_groups[key]
@@ -706,18 +714,20 @@ class ResultStore:
                         keep.add(latest["result_id"])
             for record in list(records):
                 if (record["result_id"] not in keep and record["outcome"] != "passed"
-                        and self._failure_blocks_build(record, records)):
+                        and self._failure_blocks_retained_pass(record, records, keep)):
                     keep.add(record["result_id"])
                 if record["result_id"] not in keep and record["result_id"] not in self.protected_ids:
                     self._record_path(record).unlink(missing_ok=True)
                     records.remove(record)
 
-    def _failure_blocks_build(self, failure: Mapping[str, Any], records: Sequence[Mapping[str, Any]]) -> bool:
-        """Keep an expiring failure if deleting it could revive a tagged pass.
+    def _failure_blocks_retained_pass(
+        self, failure: Mapping[str, Any], records: Sequence[Mapping[str, Any]], keep: set[str],
+    ) -> bool:
+        """Keep an expiring failure if deleting it could revive an older pass.
 
-        This rare retention check considers the selected build at each of four
-        levels, not every historical build. A newer alpha build or alpha pass
-        cannot remove a failure that still blocks the previous beta build.
+        Current-check passes also matter after a group split changes their full
+        input digest but not their applicable inputs. Build lookup considers
+        only the selected build at each of four levels, not all history.
         """
         if self.retention_passes is None:
             reader = runpy.run_path(str(pathlib.Path(__file__).resolve().parents[1] / "result_records.py"))
@@ -743,13 +753,19 @@ class ResultStore:
                  and later["completed_ns"] > failure["completed_ns"]]
         if any(later["outcome"] != "passed" for later in newer):
             return False  # The newer failure carries the same constraint.
+        baselines = [*self.retention_passes, *(
+            {**record, "id": record["nodeid"]} for record in records
+            if record["outcome"] == "passed"
+            and (record["result_id"] in keep or record["result_id"] in self.protected_ids)
+        )]
         return any(
             baseline["id"] == failure["nodeid"] and self._same_inputs(baseline, failure["inputs"])
             and baseline["completed_ns"] <= failure["completed_ns"]
-            and not any(later.get("qualificationLevel") in LEVELS
-                        and LEVELS.index(later["qualificationLevel"]) >= LEVELS.index(baseline["qualificationLevel"])
+            and not any((baseline.get("qualificationLevel") is None and later.get("qualificationLevel") is None)
+                        or (baseline.get("qualificationLevel") in LEVELS and later.get("qualificationLevel") in LEVELS
+                            and LEVELS.index(later["qualificationLevel"]) >= LEVELS.index(baseline["qualificationLevel"]))
                         for later in newer)
-            for baseline in self.retention_passes
+            for baseline in baselines
         )
 
     def _write_attempt(self, record: Mapping[str, Any]) -> None:
