@@ -73,8 +73,8 @@ def test_domain_source_change_selects_only_mapped_suite(test_runner_module: Any)
 
 @pytest.mark.parametrize("source,affected,unaffected", [
     ("skills/ceratops-repo-lifecycle/scripts/sdlc_results.py",
-     {"artifact-storage", "check-result-reuse", "repository-operations", "repository-promotion"},
-     {"github-contracts", "repository-compatibility", "repository-health", "skill-checkpoints", "test-runner"}),
+     {"artifact-storage", "check-result-reuse", "repository-operations", "repository-promotion", "test-runner"},
+     {"github-contracts", "repository-compatibility", "repository-health", "skill-checkpoints"}),
     ("skills/ceratops-repo-lifecycle/scripts/github_contract_engine/github_api.py",
      {"github-contracts", "github-workflows", "repository-health"},
      {"artifact-storage", "check-result-reuse", "skill-checkpoints", "test-runner"}),
@@ -85,6 +85,16 @@ def test_domain_source_change_selects_only_mapped_suite(test_runner_module: Any)
      {"github-contracts", "repository-compatibility", "repository-promotion", "source-search", "shell-hook"}),
     ("hooks/windows-shell-sanity.py", {"shell-hook"},
      {"test-runner", "source-search", "repository-promotion"}),
+    ("scripts/result_records.py", {"check-records", "test-runner", "command-reporting"},
+     {"repository-compatibility", "skill-lifecycle", "skill-installation"}),
+    ("skills/ceratops-repo-lifecycle/scripts/ceratops_repo_compatibility_engine/generate_test_script.py",
+     {"repository-compatibility", "skill-installation"},
+     {"skill-lifecycle", "test-runner", "check-records"}),
+    ("skills/ceratops-repo-lifecycle/references/templates/run-tests.py.tmpl",
+     {"repository-compatibility", "skill-installation", "check-records"},
+     {"skill-lifecycle", "test-runner"}),
+    ("skills/ceratops-repo-lifecycle/scripts/promote-repository.py", {"repository-promotion"},
+     {"skill-lifecycle", "skill-installation", "test-runner"}),
 ])
 def test_repository_sources_select_their_consumers_not_entire_test_directories(
     test_runner_module, source, affected, unaffected,

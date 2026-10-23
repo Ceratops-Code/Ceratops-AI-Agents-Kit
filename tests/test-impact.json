@@ -117,7 +117,11 @@
     },
     "skill-lifecycle": {
       "pytest": [
-        "tests/skill_lifecycle"
+        "tests/skill_lifecycle/test_fast_change.py",
+        "tests/skill_lifecycle/test_runtime_transactions.py",
+        "tests/skill_lifecycle/test_source_validation.py",
+        "tests/skill_lifecycle/test_update_workflow.py",
+        "tests/skill_lifecycle/test_write_locks.py"
       ],
       "depends_on": [],
       "packages": [
@@ -727,6 +731,35 @@
         "GITHUB_EVENT_PATH",
         "UV_OFFLINE"
       ]
+    },
+    "skill-installation": {
+      "pytest": [
+        "tests/skill_lifecycle/test_installation.py"
+      ],
+      "depends_on": [],
+      "packages": [
+        "mcp",
+        "packaging",
+        "pyyaml",
+        "jsonschema",
+        "tomlkit"
+      ],
+      "tools": [
+        "git",
+        "uv",
+        "node",
+        "npm",
+        "powershell"
+      ],
+      "environment": [
+        "PATH",
+        "CI",
+        "PYTEST_ADDOPTS",
+        "GITHUB_ACTIONS",
+        "GITHUB_EVENT_NAME",
+        "GITHUB_EVENT_PATH",
+        "UV_OFFLINE"
+      ]
     }
   },
   "rules": [
@@ -791,13 +824,12 @@
     {
       "id": "check-record-source",
       "paths": [
-        "scripts/result_records.py",
-        "docs/result_records.py.tmpl"
+        "scripts/result_records.py"
       ],
       "suites": [
         "check-records",
         "test-runner",
-        "repository-compatibility"
+        "command-reporting"
       ]
     },
     {
@@ -868,14 +900,11 @@
       "id": "repository-compatibility-source",
       "paths": [
         "skills/ceratops-repo-lifecycle/scripts/ceratops_repo_compatibility_engine/**",
-        "skills/ceratops-repo-lifecycle/references/templates/**",
         "skills/ceratops-repo-lifecycle/references/schemas/ceratops-compatibility-contract.schema.json",
         "skills/ceratops-repo-lifecycle/references/schemas/repository-validation-contract.schema.json"
       ],
       "suites": [
         "repository-compatibility",
-        "check-records",
-        "test-runner",
         "artifact-storage",
         "check-result-reuse",
         "repository-operations",
@@ -885,7 +914,7 @@
         "pending-work",
         "github-workflows",
         "github-dependencies",
-        "skill-lifecycle"
+        "skill-installation"
       ]
     },
     {
@@ -906,7 +935,8 @@
         "command-reporting",
         "pending-work",
         "github-workflows",
-        "github-dependencies"
+        "github-dependencies",
+        "test-runner"
       ]
     },
     {
@@ -926,7 +956,8 @@
         "command-reporting",
         "pending-work",
         "github-workflows",
-        "github-dependencies"
+        "github-dependencies",
+        "check-records"
       ]
     },
     {
@@ -964,8 +995,7 @@
         "github-workflows",
         "github-dependencies",
         "command-reporting",
-        "pending-work",
-        "skill-lifecycle"
+        "pending-work"
       ]
     },
     {
@@ -1071,7 +1101,8 @@
       ],
       "suites": [
         "skill-checkpoints",
-        "skill-lifecycle"
+        "skill-lifecycle",
+        "skill-installation"
       ]
     },
     {
@@ -1097,7 +1128,8 @@
         "command-reporting",
         "artifact-storage",
         "check-result-reuse",
-        "pending-work"
+        "pending-work",
+        "skill-installation"
       ]
     },
     {
@@ -1137,6 +1169,67 @@
         "repository-health",
         "repository-shipping"
       ]
+    },
+    {
+      "id": "generated-result-contract",
+      "paths": [
+        "docs/result_records.py.tmpl"
+      ],
+      "suites": [
+        "repository-compatibility"
+      ]
+    },
+    {
+      "id": "generated-test-script",
+      "paths": [
+        "skills/ceratops-repo-lifecycle/references/templates/run-tests.py.tmpl"
+      ],
+      "suites": [
+        "repository-compatibility",
+        "artifact-storage",
+        "check-result-reuse",
+        "repository-operations",
+        "repository-promotion",
+        "repository-shipping",
+        "command-reporting",
+        "pending-work",
+        "github-workflows",
+        "github-dependencies",
+        "skill-installation",
+        "check-records"
+      ]
+    },
+    {
+      "id": "repository-templates",
+      "paths": [
+        "skills/ceratops-repo-lifecycle/references/templates/deploy-skills.py.tmpl",
+        "skills/ceratops-repo-lifecycle/references/templates/issue-template-bug-report.yml.tmpl",
+        "skills/ceratops-repo-lifecycle/references/templates/markdown-package-lock.json.tmpl",
+        "skills/ceratops-repo-lifecycle/references/templates/markdown-package.json.tmpl",
+        "skills/ceratops-repo-lifecycle/references/templates/markdownlint.json.tmpl",
+        "skills/ceratops-repo-lifecycle/references/templates/pull-request-template.md.tmpl",
+        "skills/ceratops-repo-lifecycle/references/templates/run-actionlint.py.tmpl",
+        "skills/ceratops-repo-lifecycle/references/templates/sdlc.v4.yml.tmpl",
+        "skills/ceratops-repo-lifecycle/references/templates/sdlc.yml.tmpl",
+        "skills/ceratops-repo-lifecycle/references/templates/skill-sections.json.tmpl",
+        "skills/ceratops-repo-lifecycle/references/templates/validate-repository.py.tmpl",
+        "skills/ceratops-repo-lifecycle/references/templates/validate.yml.tmpl",
+        "skills/ceratops-repo-lifecycle/references/templates/validation-pyproject.toml.tmpl"
+      ],
+      "suites": [
+        "repository-compatibility",
+        "artifact-storage",
+        "check-result-reuse",
+        "repository-operations",
+        "repository-promotion",
+        "repository-shipping",
+        "command-reporting",
+        "pending-work",
+        "github-workflows",
+        "github-dependencies",
+        "skill-installation",
+        "repository-lint"
+      ]
     }
   ],
   "full_suite_paths": [
@@ -1165,7 +1258,9 @@
     "tests/support/**",
     "tests/test-impact.json",
     "scripts/pyproject.toml",
-    "scripts/uv.lock"
+    "scripts/uv.lock",
+    "tests/skill_lifecycle/support.py",
+    "tests/skill_lifecycle/__init__.py"
   ],
   "ignored_paths": [
     {
