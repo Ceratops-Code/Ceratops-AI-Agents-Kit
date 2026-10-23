@@ -385,6 +385,17 @@ versions; successful pytest reports prove that execution passed. Checks with
 unrepresented dynamic or external-service inputs use `no_result_reuse` and
 execute on every call. Distributed pytest workers also execute normally.
 
+The same input comparison supplies execution explanations: changed required
+source and test paths, missing previous input facts, and changed package, tool,
+environment or runtime field names. Values and argument contents are not emitted.
+When no applicable result matches, differences use the newest eligible pass,
+otherwise the newest pass or remaining result, and identify the compared result.
+No prior result, insufficient qualification, a newer failure and files changed
+after collection are separate reasons. `pytest.execution_reasons` groups equal
+reasons with every affected test ID, alongside the bounded decision sample.
+This is observational output in the existing runner response, not new persistent
+state or a new acceptance rule; original result IDs and retention stay unchanged.
+
 The owner writes canonical `ceratops-pytest-attempt.v1` JSON directly to unique
 `<git-common-dir>/ceratops/results/repository-checks/pytest-attempt-<result-id>.json`
 paths. Records preserve actual passed, failed and interrupted outcomes, phase

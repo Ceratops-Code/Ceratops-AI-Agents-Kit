@@ -956,6 +956,15 @@ def execute_selected(
     if decisions := getattr(result, "check_decisions", None):
         pytest_payload["decisions"] = dict(list(decisions.items())[:32])
         pytest_payload["omitted_decisions"] = max(0, len(decisions) - 32)
+        # Keep every execution explanation, sharing repeated reasons instead of
+        # repeating dependency lists for hundreds of cases in the same group.
+        executions: dict[str, list[str]] = {}
+        for nodeid, decision in decisions.items():
+            if decision["decision"] == "execute":
+                executions.setdefault(decision["reason"], []).append(nodeid)
+        pytest_payload["execution_reasons"] = [
+            {"reason": reason, "checks": nodes} for reason, nodes in executions.items()
+        ]
     if result.returncode != 0:
         pytest_payload.update(
             pytest_diagnostics.pytest_failure_summary(result.stdout, result.stderr)

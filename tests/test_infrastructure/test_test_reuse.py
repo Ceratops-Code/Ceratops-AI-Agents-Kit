@@ -342,6 +342,110 @@ def _mapped_repository(tmp_path):
     return root
 
 
+@pytest.mark.parametrize("change,expected", [
+    ("source", "Source/dependency files changed: b.py."),
+    ("removed", "Source/dependency files absent now: b.py."),
+    ("new", "Source/dependency files not recorded previously: b.data."),
+    ("test", "Test/fixture files changed: tests/b/test_value.py."),
+    ("package", "Packages changed: example-library."),
+    ("tool", "Tools changed: git."),
+    ("environment", "Environment variables changed: INPUT."),
+    ("arguments", "Pytest behavior arguments changed (values omitted)."),
+    ("runtime", "Runtime fields changed: python."),
+    ("level", "Recorded passes do not cover the requested qualification level: final."),
+    ("missing", "No recorded result for this check."),
+    ("failure", "A newer applicable failure requires execution."),
+])
+def test_rerun_reports_concrete_cause_without_values(tmp_path, change, expected):
+    root = _mapped_repository(tmp_path)
+    node = "tests/b/test_value.py::test_value"
+    old = _level_store(root, "beta")
+    passed = old.save(node, old.inputs(node)) if change != "missing" else None
+    original = old._record_path(passed).read_bytes() if passed else None
+    if change in {"source", "test"}:
+        path = root / ("b.py" if change == "source" else "tests/b/test_value.py")
+        path.write_text(path.read_text() + "# Changed\n")
+    elif change == "removed":
+        (root / "b.py").unlink()
+    elif change == "new":
+        (root / "b.data").write_text("new input")
+    elif change == "failure":
+        old.save(node, old.inputs(node), phases={"call": "failed"}, outcome="failed")
+    for _ in range(2):
+        fresh = _level_store(root, "final" if change == "level" else "beta")
+        if change == "package":
+            fresh.context["dependencies"].append(["example-library", "secret-value"])
+        elif change in {"tool", "environment", "runtime"}:
+            field, name = {"tool": ("tools", "git"), "environment": ("environment", "INPUT"),
+                           "runtime": ("runtime", "python")}[change]
+            fresh.context[field][name] = "secret-value"
+        elif change == "arguments":
+            fresh.context["arguments"] = ["--password=secret-value"]
+        assert fresh.matching(node, fresh.inputs(node)) is None
+        decision = fresh.reuse_reasons[node]
+        assert decision["decision"] == "execute" and decision["reason"] == expected
+        assert "secret-value" not in json.dumps(decision)
+        if change not in {"level", "missing", "failure"}:
+            assert passed is not None
+            assert decision["compared_result_id"] == passed["result_id"]
+        if passed:
+            assert old._record_path(passed).read_bytes() == original
+
+
+@pytest.mark.parametrize("newer_outcome", ["failed", "lower-level-pass"])
+def test_rerun_explanation_compares_latest_eligible_pass_not_failed_attempt(tmp_path, newer_outcome):
+    root = _mapped_repository(tmp_path)
+    node = "tests/b/test_value.py::test_value"
+    old = _level_store(root, "beta")
+    first = old.save(node, old.inputs(node))
+    (root / "a.py").write_text("VALUE = 2\n")
+    newer = _level_store(root, "beta")
+    second = newer.save(node, newer.inputs(node))
+    (root / "b.py").write_text("VALUE = 2\n")
+    failed = _level_store(root, "beta")
+    failed.save(node, failed.inputs(node), phases={"call": "failed"}, outcome="failed")
+    (root / "b.py").write_text("VALUE = 3\n")
+    if newer_outcome == "lower-level-pass":
+        lower = _level_store(root, "alpha")
+        lower.save(node, lower.inputs(node))
+    fresh = _level_store(root, "beta")
+    assert fresh.matching(node, fresh.inputs(node)) is None
+    decision = fresh.reuse_reasons[node]
+    assert decision["compared_result_id"] == second["result_id"] != first["result_id"]
+    assert decision["reason"] == "Source/dependency files changed: b.py."
+
+
+def test_public_runner_reports_every_rerun_beyond_decision_sample(test_runner_module, tmp_path, capsys, monkeypatch):
+    for name in ("GITHUB_ACTIONS", "CERATOPS_SDLC_TEST_CONTEXT", "CERATOPS_REPOSITORY_CHECK_CONTEXT"):
+        monkeypatch.delenv(name, raising=False)
+    root = _mapped_repository(tmp_path)
+    path = root / "tests/test-impact.json"
+    manifest = json.loads(path.read_text())
+    manifest["full_suite_paths"] = ["scripts/**", ".github/**", "tests/__init__.py", "tests/support/**", "tests/test-impact.json", ".gitignore"]
+    path.write_text(json.dumps(manifest))
+    (root / "production.py").unlink()
+    for name in "acd":
+        (root / f"tests/{name}/test_value.py").rename(root / f"tests/{name}/test_{name}.py")
+    test = root / "tests/b/test_value.py"
+    test.write_text("import pytest\n@pytest.mark.parametrize('value', range(35))\n"
+                    "def test_value(value):\n    assert value >= 0\n")
+    argv = ["tests/b", "--diagnostic-output", str(tmp_path / "failure.json")]
+    assert test_runner_module.execute(argv, repo_root=root) == 0
+    capsys.readouterr()
+    (root / "b.py").write_text("VALUE = 2\n")
+    assert test_runner_module.execute(argv, repo_root=root) == 0
+    payload = json.loads(capsys.readouterr().out)["pytest"]
+    assert len(payload["decisions"]) == 32 and payload["omitted_decisions"] == 3
+    assert payload["execution_reasons"] == [{
+        "reason": "Source/dependency files changed: b.py.",
+        "checks": sorted(f"tests/b/test_value.py::test_value[{index}]" for index in range(35)),
+    }]
+    assert test_runner_module.execute(argv, repo_root=root) == 0
+    payload = json.loads(capsys.readouterr().out)["pytest"]
+    assert payload["execution_reasons"] == []
+    assert payload["checks"] == {"collected": 35, "executed": 0, "reused": 35}
+
+
 @pytest.mark.parametrize(("changed", "affected"), [("a", "abcd"), ("b", "bd"), ("c", "cd"), ("d", "d")])
 def test_dependency_input_diamond_invalidates_only_consumers(tmp_path, changed, affected):
     from select_test_groups import ChangedFile, load_manifest, selection_from_changes
@@ -1136,6 +1240,7 @@ def test_edits_after_input_snapshot_block_reuse_and_recording(test_runner_module
     with (root / target).open("a") as stream:
         stream.write("\nCHANGED = True\n")
     assert store.matching(nodeid, inputs) is None
+    assert store.reuse_reasons[nodeid]["reason"] == f"Files changed after collection: {target}."
     assert store.save(nodeid, inputs) is None
     assert len(list(store.directory.glob("pytest-attempt-*.json"))) == 1
 

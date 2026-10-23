@@ -1922,6 +1922,16 @@ every test. Tests that exercise that helper still rerun when its inputs change.
 Reused summaries retain the original inputs and use `applicableInputGroup` for
 the current dependency scope, so build completion needs no rewritten test pass.
 
+For each test that executes, `pytest.execution_reasons` names the changed
+source/dependency and test/fixture paths, or the package, tool, environment
+variable or execution setting that prevents reuse. Equal explanations share one
+list of test IDs; none are dropped by the 32-item `pytest.decisions` sample.
+Missing prior facts, insufficient qualification and newer failures have distinct
+reasons. File differences use the newest eligible prior pass when available;
+the sample includes its `compared_result_id`. Values of environment variables,
+arguments and runtime settings are omitted. These explanations use the same
+input comparison as reuse and do not change accepted results or run extra tests.
+
 `ceratops-check-summary.v1` carries `inputGroups`, `checkGroups` and `checks`.
 Tables store repeated input facts once. Outcomes retain original result IDs,
 check versions, qualification levels, required/optional scope and phase facts;

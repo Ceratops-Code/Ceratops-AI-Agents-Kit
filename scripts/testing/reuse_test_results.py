@@ -480,9 +480,7 @@ class ResultStore:
                    *self.tagged_by_check.get(nodeid, []), *self.imported_by_check.get(nodeid, [])]
         candidates = sorted((record for record in records if self._same_inputs(record, inputs)),
                             key=lambda record: (record["completed_ns"], record["result_id"]), reverse=True)
-        self.reuse_reasons[nodeid] = {"decision": "execute", "reason": (
-            "Changed input or dependency." if records else "Missing coverage for this check."
-        )}
+        self.reuse_reasons[nodeid] = {"decision": "execute", "reason": "No recorded result for this check."}
         failures = [record for record in candidates if record["outcome"] != "passed"]
         for record in candidates:
             if record["outcome"] != "passed" or not self._eligible(record.get("qualificationLevel")):
@@ -490,7 +488,8 @@ class ResultStore:
             if any(failure["completed_ns"] >= record["completed_ns"] for failure in failures):
                 self.reuse_reasons[nodeid]["reason"] = "A newer applicable failure requires execution."
                 return None
-            if self._current(inputs):
+            changed_paths: list[str] = []
+            if self._current(inputs, changed_paths=changed_paths):
                 self.protected_ids.add(record["result_id"])
                 self.reuse_reasons[nodeid] = {
                     "decision": "reuse", "reason": ("Git build summary." if "build" in record else
@@ -499,14 +498,40 @@ class ResultStore:
                     "result_id": record["result_id"], **({"build": record["build"]} if "build" in record else {}),
                 }
                 return {**record, "applicable_product_inputs": dict(inputs["product_inputs"])}
-        if candidates:
-            self.reuse_reasons[nodeid]["reason"] = (
-                "A newer applicable failure requires execution." if failures
-                else "Recorded results do not cover the requested qualification level."
-            )
+            self.reuse_reasons[nodeid].update({
+                "reason": "Files changed after collection: " + ", ".join(changed_paths) + ".",
+                "compared_result_id": record["result_id"],
+            })
+            return None
+        if failures:
+            self.reuse_reasons[nodeid]["reason"] = "A newer applicable failure requires execution."
+        elif records:
+            # Explain against the newest eligible pass, not an arbitrary failed
+            # attempt. This is observational: matching and failure precedence
+            # above remain the sole acceptance decision. Never expose values.
+            passes = [record for record in records if record["outcome"] == "passed"]
+            eligible = [record for record in passes if self._eligible(record.get("qualificationLevel"))]
+            previous = max(eligible or passes or records,
+                           key=lambda record: (record["completed_ns"], record["result_id"]))
+            differences: list[str] = []
+            self._same_inputs(previous, inputs, differences=differences)
+            if not passes:
+                differences.insert(0, "No recorded successful result for this check.")
+            elif not eligible:
+                differences.insert(0, "Recorded passes do not cover the requested qualification level: "
+                                   + str(self.qualification_level or "unqualified") + ".")
+            self.reuse_reasons[nodeid].update({
+                "reason": " ".join(differences), "compared_result_id": previous["result_id"],
+            })
         return None
 
-    def _same_inputs(self, record: Mapping[str, Any], inputs: Mapping[str, Any]) -> bool:
+    def _same_inputs(self, record: Mapping[str, Any], inputs: Mapping[str, Any],
+                     *, differences: list[str] | None = None) -> bool:
+        """Compare required facts; optionally describe mismatches without values.
+
+        Sharing projection with reporting prevents descriptions from blaming an
+        ignored group rename, launcher PATH or unrelated old dependency.
+        """
         # The reporting helper's version remains part of the original result,
         # not a dependency of every test. Tests exercising that helper still
         # name it through their product/check inputs and run when it changes.
@@ -523,6 +548,8 @@ class ResultStore:
         previous = original.get("product_inputs")
         current = inputs.get("product_inputs")
         if not isinstance(previous, dict) or not isinstance(current, dict):
+            if differences is not None:
+                differences.append("Previous result lacks per-file source/dependency facts.")
             return False  # A whole-repository digest does not describe per-file inputs.
         nodeid = record.get("nodeid", record.get("id"))
         # Thousands of cases share the same dependency group and file list.
@@ -544,12 +571,50 @@ class ResultStore:
                 # Project both sides without rewriting either original record.
                 facts["environment"] = {key: value for key, value in facts["environment"].items() if key != "PATH"}
             return facts
-        if metadata(original) != metadata(inputs):
+        old_metadata, new_metadata = metadata(original), metadata(inputs)
+        same_metadata = old_metadata == new_metadata
+        if not same_metadata and differences is None:
             return False
         # Project only dependency-map changes. A deleted required input stays in
         # this union and fails comparison; a newly required input needs a result.
         missing = object()
-        return all(previous.get(name, missing) == current.get(name, missing) for name in required)
+        same_products = all(previous.get(name, missing) == current.get(name, missing) for name in required)
+        if differences is not None:
+            self._describe_changed_inputs("Source/dependency files", previous, current, required, differences)
+            for field in sorted(old_metadata.keys() | new_metadata.keys()):
+                before, after = old_metadata.get(field, missing), new_metadata.get(field, missing)
+                if before == after:
+                    continue
+                labels = {"check_inputs": "Test/fixture files", "dependencies": "Packages",
+                          "tools": "Tools", "environment": "Environment variables", "runtime": "Runtime fields"}
+                if field == "dependencies" and isinstance(before, list) and isinstance(after, list):
+                    before, after = dict(before), dict(after)
+                if field in labels and isinstance(before, dict) and isinstance(after, dict):
+                    self._describe_changed_inputs(labels[field], before, after,
+                                                  before.keys() | after.keys(), differences)
+                    if before == after:
+                        differences.append(labels[field] + " inventory ordering changed.")
+                else:
+                    label = {"arguments": "Pytest behavior arguments", "checkout": "Checkout identity"}.get(
+                        field, "Execution field " + field,
+                    )
+                    differences.append(label + " changed (values omitted).")
+        return same_metadata and same_products
+
+    @staticmethod
+    def _describe_changed_inputs(label: str, before: Mapping[str, Any], after: Mapping[str, Any],
+                                 names: Sequence[str] | set[str], differences: list[str]) -> None:
+        """Report missing facts separately: a new mapping need not mean a new file."""
+        missing = object()
+        categories: dict[str, list[str]] = {}
+        for name in sorted(names):
+            if before.get(name, missing) == after.get(name, missing):
+                continue
+            change = ("not recorded previously" if name not in before else
+                      "absent now" if name not in after or after[name] is None else "changed")
+            categories.setdefault(change, []).append(name)
+        for change, fields in categories.items():
+            differences.append(f"{label} {change}: {', '.join(fields)}.")
 
     def _eligible(self, original: str | None) -> bool:
         if self.qualification_level is None:
@@ -606,7 +671,7 @@ class ResultStore:
                     protected.add(check["result_id"])
         return protected
 
-    def _current(self, inputs: Mapping[str, Any]) -> bool:
+    def _current(self, inputs: Mapping[str, Any], *, changed_paths: list[str] | None = None) -> bool:
         """Reject edits made after collection's snapshot without rejecting touches."""
         for name, digest in inputs["product_inputs"].items():
             path = self.root / name
@@ -614,14 +679,19 @@ class ResultStore:
             if current_stat != self.stats[name]:
                 current = hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else None
                 if current != digest:
-                    return False
+                    if changed_paths is None:
+                        return False
+                    changed_paths.append(name)
+                    continue
                 self.stats[name] = current_stat
         for name, digest in inputs["check_inputs"].items():
             path = self.root / name
             current = hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else None
             if current != digest:
-                return False
-        return True
+                if changed_paths is None:
+                    return False
+                changed_paths.append(name)
+        return not changed_paths
 
     def _read_records(self, group: str | None = None) -> list[dict[str, Any]]:
         records = []
