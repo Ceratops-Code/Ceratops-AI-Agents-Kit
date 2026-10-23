@@ -1907,6 +1907,15 @@ Undeclared package/tool/environment lists conservatively include the complete
 corresponding inventory. Pytest selectors and progress options do not erase a
 pass; behavior options do.
 
+A full-suite selection does not require every selected test to execute. Explicit
+file ownership limits dependency comparisons even for a full-suite trigger.
+Runner and result-reporting code belongs to the test-infrastructure group;
+changing it does not erase unrelated passing results. The original reporting
+helper version stays in each result, but is not compared as a dependency of
+every test. Tests that exercise that helper still rerun when its inputs change.
+Reused summaries retain the original inputs and use `applicableInputGroup` for
+the current dependency scope, so build completion needs no rewritten test pass.
+
 `ceratops-check-summary.v1` carries `inputGroups`, `checkGroups` and `checks`.
 Tables store repeated input facts once. Outcomes retain original result IDs,
 check versions, qualification levels, required/optional scope and phase facts;

@@ -313,8 +313,16 @@ def compose_build_check_summary(
         if source_root is not None:
             # The runner supplied execution facts; binding them to this build
             # checks only source-byte applicability, not acceptance again.
-            inventories = list(parsed["checkGroups"].values())
-            for group in parsed["inputGroups"].values():
+            # Reused outcomes keep original inputs as provenance. Their current
+            # dependency scope is separate, so dropped dependencies cannot force
+            # a successful test to run merely to rewrite that original record.
+            inventories = [parsed["checkGroups"][identity] for identity in {
+                check["checkGroup"] for check in parsed["checks"] if "checkGroup" in check
+            }]
+            groups = {check.get("applicableInputGroup", check.get("inputGroup"))
+                      for check in parsed["checks"]}
+            for identity in groups - {None}:
+                group = parsed["inputGroups"][identity]
                 inventories.extend(group[field] for field in ("product_inputs", "check_inputs", "productInputs", "checkInputs")
                                    if field in group)
                 if "productInputs" in group:

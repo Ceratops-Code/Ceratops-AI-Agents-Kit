@@ -231,6 +231,16 @@
   },
   "rules": [
     {
+      "id": "test-runner-source",
+      "paths": [
+        "scripts/result_records.py",
+        "scripts/testing/**"
+      ],
+      "suites": [
+        "test-infrastructure"
+      ]
+    },
+    {
       "id": "ceratops-design-document-lifecycle-source",
       "paths": [
         "skills/ceratops-design-document-lifecycle/**"

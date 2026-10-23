@@ -425,7 +425,7 @@ def group_inputs(manifest: Manifest, nodeid: str, paths: Iterable[str]) -> tuple
         }))
     suite = replace(suite, packages=inherited("packages"), tools=inherited("tools"),
                     environment=inherited("environment"))
-    patterns = [*manifest.full_suite_paths, *(
+    patterns = [*(
         pattern for rule in manifest.rules if dependencies.intersection(rule.suites)
         for pattern in rule.paths
     )]
@@ -438,7 +438,14 @@ def group_inputs(manifest: Manifest, nodeid: str, paths: Iterable[str]) -> tuple
         # invalidate it. Imported check helpers are recorded by the collector.
         if path == "tests/test-impact.json" or (path.startswith("tests/") and path.endswith(".py")):
             continue
-        if any(path_matches(pattern, path) for pattern in patterns) or any(
+        # A full-suite trigger selects checks; an explicit ownership rule still
+        # limits which groups depend on those bytes. Unowned shared paths retain
+        # their conservative all-group meaning.
+        explicitly_owned = any(path_matches(pattern, path)
+                               for rule in manifest.rules for pattern in rule.paths)
+        shared = not explicitly_owned and any(path_matches(pattern, path)
+                                             for pattern in manifest.full_suite_paths)
+        if shared or any(path_matches(pattern, path) for pattern in patterns) or any(
             path == target or path.startswith(target.rstrip("/") + "/") for target in targets
         ):
             selected.append(path)

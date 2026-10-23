@@ -156,12 +156,67 @@ def test_dependency_input_diamond_invalidates_only_consumers(tmp_path, changed, 
     assert changed_inputs == set(affected) == set(selected.suites)
 
 
+@pytest.mark.parametrize("tagged", [False, True])
+@pytest.mark.parametrize("previously_shared", [False, True])
+def test_reporting_helper_edit_reuses_unrelated_original_passes(tmp_path, tagged, previously_shared):
+    from reuse_test_results import compact_results
+
+    from tests.repository_lifecycle.test_completed_builds import (
+        _tag_summary,
+        completion,
+    )
+
+    root = _mapped_repository(tmp_path)
+    _allow_build_records(root)
+    helper = root / "record_checks.py"
+    helper.write_text("FORMAT = 1\n")
+    path = root / "tests/test-impact.json"
+    manifest = json.loads(path.read_text())
+    manifest["full_suite_paths"] = ["record_checks.py"]
+    owner = {"id": "reporting", "paths": ["record_checks.py"], "suites": ["d"]}
+    if not previously_shared:
+        manifest["rules"].append(owner)
+    path.write_text(json.dumps(manifest))
+    nodes = {name: f"tests/{name}/test_value.py::test_value" for name in "abcd"}
+    original = _level_store(root, "alpha")
+    records = {name: original.save(node, original.inputs(node)) for name, node in nodes.items()}
+    references = {name: original.reference(record, reused=False) for name, record in records.items()}
+    if tagged:
+        _tag_summary(root, "1.0.0a1", compact_results(list(references.values())))
+        for record in records.values():
+            original._record_path(record).unlink()
+    if previously_shared:
+        manifest["rules"].append(owner)
+        path.write_text(json.dumps(manifest))
+    helper.write_text("FORMAT = 2\n")
+    for _ in range(2):
+        current = _level_store(root, "alpha")
+        current.context["producer"] = "new-reporting-implementation"
+        reused = []
+        for name in "abc":
+            selected = current.matching(nodes[name], current.inputs(nodes[name]))
+            assert selected is not None
+            reference = current.reference(selected, reused=True)
+            assert reference["result_id"] == references[name]["result_id"]
+            assert reference["check_version"] == references[name]["check_version"]
+            reused.append(reference)
+        assert current.matching(nodes["d"], current.inputs(nodes["d"])) is None
+        completed = completion.compose_build_check_summary(
+            {"sourceChecks": [], "artifactTests": []}, [compact_results(reused)], source_root=root,
+        )
+        assert {check["result_id"] for check in completed["checks"]} == {
+            references[name]["result_id"] for name in "abc"
+        }
+
+
 @pytest.mark.parametrize("change", ["added", "deleted", "renamed", "data", "helper"])
 def test_changed_input_inventory_never_hides_missing_files(tmp_path, change):
     root = _mapped_repository(tmp_path)
     node = "tests/b/test_value.py::test_value"
     helpers = {"tests/b/test_value.py"}
-    original = _result_store(root).inputs(node, helpers)
+    previous = _result_store(root)
+    original = previous.inputs(node, helpers)
+    previous.save(node, original)
     if change == "added":
         (root / "b.json").write_text("{}")
     elif change == "deleted":
@@ -172,7 +227,9 @@ def test_changed_input_inventory_never_hides_missing_files(tmp_path, change):
         (root / "tests/b/data.json").write_text("{}")
     else:
         (root / "tests/b/test_value.py").write_text("def test_value():\n    assert 1 == 1\n")
-    assert _result_store(root).inputs(node, helpers) != original
+    current = _result_store(root)
+    assert current.inputs(node, helpers) != original
+    assert current.matching(node, current.inputs(node, helpers)) is None
 
 
 @pytest.mark.parametrize(("kind", "relevant"), [(kind, relevant) for kind in ("package", "tool", "environment") for relevant in (False, True)])

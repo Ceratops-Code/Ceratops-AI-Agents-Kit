@@ -341,7 +341,8 @@ def parse_check_summary(raw: bytes) -> dict[str, Any]:
         if identity in identities:
             raise ValueError("Check summary repeats one check.")
         identities.add(identity)
-        for field, table in (("inputGroup", "inputGroups"), ("checkGroup", "checkGroups")):
+        for field, table in (("inputGroup", "inputGroups"), ("checkGroup", "checkGroups"),
+                             ("applicableInputGroup", "inputGroups")):
             if field in check and check[field] not in value[table]:
                 raise ValueError("Check summary names an absent input group.")
     return value

@@ -88,6 +88,11 @@ def compact_results(references: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             groups[group_id] = group
             checks[check_id] = inputs["check_inputs"]
             record.update({"kind": "pytest", "inputGroup": group_id, "checkGroup": check_id})
+        if (applicable := record.pop("applicable_product_inputs", None)) is not None:
+            facts = {"product_inputs": applicable}
+            identity = _digest(facts)
+            groups[identity] = facts
+            record["applicableInputGroup"] = identity
         outcomes.append(record)
     return {"schema": SUMMARY_SCHEMA, "inputGroups": groups, "checkGroups": checks,
             "checks": outcomes}
@@ -276,7 +281,7 @@ class ResultStore:
                         "nodeid": check["id"], "outcome": "passed", "inputs": inputs,
                         **{key: check.get(key) for key in ("result_id", "completed_ns", "inputs_digest", "phases", "qualificationLevel")},
                         "tagged_reference": {key: value for key, value in check.items()
-                                             if key not in {"inputGroup", "checkGroup"}},
+                                             if key not in {"inputGroup", "checkGroup", "applicableInputGroup"}},
                         "build": {key: build[key] for key in ("tag", "commit", "receiptPath")},
                     })
         self.inputs_by_group: dict[str, dict[str, Any]] = {}
@@ -369,7 +374,7 @@ class ResultStore:
                     "decision": "reuse", "reason": "Git build summary." if "build" in record else "Current worktree result.",
                     "result_id": record["result_id"], **({"build": record["build"]} if "build" in record else {}),
                 }
-                return record
+                return {**record, "applicable_product_inputs": dict(inputs["product_inputs"])}
         if candidates:
             self.reuse_reasons[nodeid]["reason"] = (
                 "A newer applicable failure requires execution." if failures
@@ -377,15 +382,29 @@ class ResultStore:
             )
         return None
 
-    @staticmethod
-    def _same_inputs(record: Mapping[str, Any], inputs: Mapping[str, Any]) -> bool:
-        if "build" not in record:
-            return bool(record["inputs"] == inputs)
-        # Checkout identity selects live attempt files; it is not a product
-        # input. A committed build is discovered ONLY through this checkout's
-        # .build inventory, even when that history arrived through a merge.
-        return ({key: value for key, value in record["inputs"].items() if key != "checkout"}
-                == {key: value for key, value in inputs.items() if key != "checkout"})
+    def _same_inputs(self, record: Mapping[str, Any], inputs: Mapping[str, Any]) -> bool:
+        # The reporting helper's version remains part of the original result,
+        # not a dependency of every test. Tests exercising that helper still
+        # name it through their product/check inputs and run when it changes.
+        excluded = {"producer", "product_inputs"}
+        if "build" in record:
+            # Tagged facts are discovered through this checkout's .build history;
+            # their original physical checkout is not a product dependency.
+            excluded.add("checkout")
+        original = record["inputs"]
+        if ({key: value for key, value in original.items() if key not in excluded}
+                != {key: value for key, value in inputs.items() if key not in excluded}):
+            return False
+        previous = original.get("product_inputs")
+        current = inputs.get("product_inputs")
+        if not isinstance(previous, dict) or not isinstance(current, dict):
+            return False  # A whole-repository digest does not describe per-file inputs.
+        nodeid = record.get("nodeid", record.get("id"))
+        _, required = group_inputs(self.manifest, nodeid, set(previous) | set(current))
+        # Project only dependency-map changes. A deleted required input stays in
+        # this union and fails comparison; a newly required input needs a result.
+        missing = object()
+        return all(previous.get(name, missing) == current.get(name, missing) for name in required)
 
     def _eligible(self, original: str | None) -> bool:
         if self.qualification_level is None:
@@ -394,14 +413,17 @@ class ResultStore:
 
     def reference(self, record: Mapping[str, Any], *, reused: bool) -> dict[str, Any]:
         """Return original qualification and execution, never a promoted copy."""
+        applicability = ({"applicable_product_inputs": record["applicable_product_inputs"]}
+                         if "applicable_product_inputs" in record else {})
         if "tagged_reference" in record:
             return {**record["tagged_reference"], "reused": reused,
-                    "inputs": record["inputs"], "build": record["build"]}
+                    "inputs": record["inputs"], "build": record["build"], **applicability}
         path = self._record_path(record)
         return {
             "id": record["nodeid"], "status": record["outcome"], "result_id": record["result_id"],
             "qualificationLevel": record.get("qualificationLevel"), "reused": reused,
             "required": True,
+            **applicability,
             "check_version": _digest({
                 "producer": record["inputs"]["producer"],
                 "check_inputs": record["inputs"]["check_inputs"],

@@ -429,6 +429,15 @@ their complete canonical contents. `docs/result_records.py.tmpl` owns repository
 check exports and its generated consumers; the reader rejects a summary that
 contradicts its executed parent. Skips retain a reason and never become passes.
 The envelope contains the facts needed for reuse without following old reports.
+The reporting helper's source version is preserved in that original record,
+not compared as an input of every test. Explicit file ownership takes precedence
+over a full-suite trigger when computing dependencies. Comparing a prior result
+uses the current dependency map over both old and current file names: dropped
+dependencies need no rerun, while new or deleted required files prevent reuse.
+Tests of the changed helper retain their ordinary product/check dependencies.
+`applicableInputGroup` records the compared current product-input scope for a
+reused outcome. Build completion checks those bytes and the original check
+inputs; the original input table, result ID and check version remain unchanged.
 Existing aggregate records own their bounded copy. The completed v3 build owns
 its tracked `check_summary.json` beside `build_receipt.json`; tests alone do not
 create build versions. The receipt's `tag` and `checkSummary` path/size/SHA-256
