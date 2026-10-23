@@ -9,6 +9,8 @@ passes, without execution IDs, saved steps or progress-log parsing.
 The owning store is <git-common-dir>/ceratops/results/repository-checks/. This
 producer owns pytest-attempt-*.json, retained pytest-pass-*.json and .pytest-pass.lock there. It writes
 immutable records directly to final paths under the existing filelock library.
+Explicit imports use one pytest-baseline-<checkout-hash>.json per checkout;
+selected Git build summaries retire that local copy after carrying its passes.
 Startup opens and prunes only the collected checkout/check groups; each completed
 write prunes its affected group. Both retain at most three versions per qualification level,
 preserving referenced facts and failure precedence.
@@ -41,6 +43,7 @@ from filelock import FileLock, Timeout
 from packaging.requirements import Requirement
 from select_test_groups import (
     ImpactError,
+    Suite,
     check_arguments,
     group_inputs,
     load_manifest,
@@ -57,6 +60,7 @@ MAX_GROUP_RECORD_BYTES = 8 * 1024 * 1024
 CONTEXT_SCHEMA = "ceratops-pytest-inputs.v1"
 RETAINED_VERSIONS = 3
 SUMMARY_SCHEMA = "ceratops-check-summary.v1"
+BASELINE_SCHEMA = "ceratops-imported-test-baseline.v1"
 BUILD_REUSE_LEVEL: ContextVar[str | None] = ContextVar("build_reuse_level", default=None)
 
 
@@ -93,9 +97,100 @@ def compact_results(references: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             identity = _digest(facts)
             groups[identity] = facts
             record["applicableInputGroup"] = identity
+        if (comparison := record.pop("comparison_inputs", None)) is not None:
+            identity = _digest(comparison)
+            groups[identity] = comparison
+            record["comparisonInputGroup"] = identity
         outcomes.append(record)
     return {"schema": SUMMARY_SCHEMA, "inputGroups": groups, "checkGroups": checks,
             "checks": outcomes}
+
+
+def compose_imported_test_summary(
+    aggregate: Mapping[str, Any], records: Mapping[str, Mapping[str, Any]],
+    *, historical_files: Mapping[str, str | None],
+    comparison_contexts: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Convert explicitly supplied historical facts, never infer test passes.
+
+    The importer supplies the old file inventory and a measured equivalent
+    execution context in the current format. The old whole-inventory digest
+    must match; original inputs, outcomes, IDs and times are not rewritten.
+    The comparison context is separate provenance for future input matching.
+    """
+    if (aggregate.get("schema") != "ceratops-repository-check-result.v1"
+            or aggregate.get("status") != "passed" or aggregate.get("exit_code") != 0):
+        raise ValueError("Import requires a recorded successful repository test run")
+    references = []
+    shared = {name: digest for name, digest in historical_files.items() if not (
+        name.startswith("tests/") and name.endswith(".py")
+        and (pathlib.PurePosixPath(name).name.startswith("test_") or name.endswith("_test.py"))
+    )}
+    for check in aggregate["checks"]:
+        if check["status"] == "skipped":
+            references.append({**check, "kind": "pytest", "reusable": False, "required": False})
+            continue
+        record = records.get(check["id"])
+        if (check["status"] != "passed" or record is None
+                or record.get("nodeid") != check["id"] or record.get("outcome") != "passed"
+                or record.get("result_id") != check.get("result_id")
+                or record.get("completed_ns") != check.get("completed_ns")
+                or record.get("qualificationLevel") != check.get("qualificationLevel")
+                or record.get("phases") != {"setup": "passed", "call": "passed", "teardown": "passed"}):
+            raise ValueError(f"Import lacks complete original pass facts: {check['id']}")
+        original = record["inputs"]
+        if (record["inputs_digest"] != _digest(original)
+                or check["inputs_digest"] != record["inputs_digest"]
+                or original.get("shared_inputs") != _digest(shared)
+                or check["check_version"] != _digest({
+                    "producer": original["producer"], "check_inputs": original["check_inputs"],
+                })
+                or any(historical_files.get(name) != digest
+                       for name, digest in original["check_inputs"].items())):
+            raise ValueError(f"Import input evidence differs from the original run: {check['id']}")
+        comparison = dict(comparison_contexts[check["id"]])
+        # The former collector included every loaded conftest in every test.
+        # Keep its actual imports, but only ancestor conftest fixtures apply.
+        test_path = pathlib.PurePosixPath(check["id"].split("::", 1)[0])
+        comparison["check_inputs"] = {
+            name: digest for name, digest in original["check_inputs"].items()
+            if pathlib.PurePosixPath(name).name != "conftest.py"
+            or pathlib.PurePosixPath(name).parent in test_path.parents
+        }
+        if any(historical_files.get(name) != digest
+               for name, digest in comparison["product_inputs"].items()):
+            raise ValueError("Comparison inputs must describe the historical source, not today's files")
+        references.append({
+            **check, "inputs": original, "phases": record["phases"], "required": True,
+            "comparison_inputs": comparison,
+            "imported_from": {"result_id": aggregate["result_id"], "commit": aggregate["candidate_id"]},
+        })
+    return compact_results(references)
+
+
+def write_test_baseline(root: pathlib.Path, summary: Mapping[str, Any]) -> pathlib.Path:
+    """Install one explicit baseline for this checkout, without altering evidence.
+
+    A repeated identical import has no effect. A partial direct write can be
+    replaced by repeating the explicit import; normal test runs never accept it.
+    This is an accepted-result input, not an execution checkpoint. One file per
+    checkout is retained until its results are carried by tagged build summaries.
+    """
+    reader = runpy.run_path(str(pathlib.Path(__file__).resolve().parents[1] / "result_records.py"))
+    reader["parse_check_summary"](_json(summary))
+    common = pathlib.Path(_git(root, "rev-parse", "--path-format=absolute", "--git-common-dir").decode().strip())
+    directory = common / "ceratops/results/repository-checks"
+    directory.mkdir(parents=True, exist_ok=True)
+    checkout = _digest(str(root.resolve()))
+    destination = directory / f"pytest-baseline-{checkout}.json"
+    payload = _json({"schema": BASELINE_SCHEMA, "checkout": checkout, "summary": summary}) + b"\n"
+    with FileLock(str(directory / ".pytest-pass.lock"), timeout=0):
+        if not destination.exists() or destination.read_bytes() != payload:
+            with destination.open("wb") as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+    return destination
 
 
 def _git(root: pathlib.Path, *arguments: str) -> bytes:
@@ -252,8 +347,10 @@ class ResultStore:
         }
         self.records_by_check: dict[tuple[str, str], list[dict[str, Any]]] = {}
         self.tagged_by_check: dict[str, list[dict[str, Any]]] = {}
+        self.imported_by_check: dict[str, list[dict[str, Any]]] = {}
         self.retention_passes: list[dict[str, Any]] | None = None
         self.reuse_reasons: dict[str, dict[str, Any]] = {}
+        self.comparison_groups: dict[tuple[str, tuple[str, ...]], tuple[Suite, tuple[str, ...]]] = {}
         if self.qualification_level is not None:
             # This repository-owned reader is also the generated runner's
             # public result contract. No installed skill or artifact store is
@@ -262,28 +359,27 @@ class ResultStore:
             for build in reader["select_build_check_summaries"](
                 self.root, qualification_level=self.qualification_level,
             ):
-                summary = build["summary"]
-                for check in summary["checks"]:
-                    if (check.get("kind") != "pytest" or check.get("status") != "passed"
-                            or check.get("reusable") is False
-                            or not {"inputGroup", "checkGroup", "result_id", "completed_ns", "inputs_digest", "phases"} <= check.keys()):
-                        continue  # Historical/partial facts supply no invented coverage.
-                    inputs = {**summary["inputGroups"][check["inputGroup"]],
-                              "check_inputs": summary["checkGroups"][check["checkGroup"]]}
-                    if (check["inputs_digest"] != _digest(inputs)
-                            or type(check["completed_ns"]) is not int
-                            or check["phases"] != {"setup": "passed", "call": "passed", "teardown": "passed"}
-                            or check.get("check_version") != _digest({
-                                "producer": inputs.get("producer"), "check_inputs": inputs["check_inputs"],
-                            })):
-                        raise ValueError("Tagged pytest outcome conflicts with its recorded execution facts.")
-                    self.tagged_by_check.setdefault(check["id"], []).append({
-                        "nodeid": check["id"], "outcome": "passed", "inputs": inputs,
-                        **{key: check.get(key) for key in ("result_id", "completed_ns", "inputs_digest", "phases", "qualificationLevel")},
-                        "tagged_reference": {key: value for key, value in check.items()
-                                             if key not in {"inputGroup", "checkGroup", "applicableInputGroup"}},
-                        "build": {key: build[key] for key in ("tag", "commit", "receiptPath")},
-                    })
+                self._load_summary(build["summary"], self.tagged_by_check,
+                                   {"build": {key: build[key] for key in ("tag", "commit", "receiptPath")}})
+        baseline = self.directory / f"pytest-baseline-{self.checkout}.json"
+        if baseline.exists():
+            raw = baseline.read_bytes()
+            value = json.loads(raw)
+            if (raw != _json(value) + b"\n" or value.get("schema") != BASELINE_SCHEMA
+                    or value.get("checkout") != self.checkout):
+                raise ValueError("Imported test baseline is incomplete or belongs to another checkout")
+            reader = runpy.run_path(str(pathlib.Path(__file__).resolve().parents[1] / "result_records.py"))
+            summary = reader["parse_check_summary"](_json(value["summary"]))
+            self._load_summary(summary, self.imported_by_check, {"imported": True})
+            tagged_ids = {record["result_id"] for records in self.tagged_by_check.values() for record in records}
+            imported_ids = {record["result_id"] for records in self.imported_by_check.values() for record in records}
+            if imported_ids and imported_ids <= tagged_ids:
+                # The same original facts now live in selected Git builds.
+                # Losing this bounded local copy cannot cause tests to rerun.
+                with self.lock:
+                    if baseline.read_bytes() == raw:
+                        baseline.unlink()
+                self.imported_by_check.clear()
         self.inputs_by_group: dict[str, dict[str, Any]] = {}
         # Inventory names once, then open only this invocation's collected
         # checks. Reading every past check in every worktree dominated startup.
@@ -292,6 +388,32 @@ class ResultStore:
             if path.name.startswith(("pytest-pass-", "pytest-attempt-")):
                 group = path.name.removeprefix("pytest-pass-").removeprefix("pytest-attempt-").split("-", 1)[0]
                 self.paths_by_group.setdefault(group, []).append(path)
+
+    @staticmethod
+    def _load_summary(summary: Mapping[str, Any], target: dict[str, list[dict[str, Any]]],
+                      origin: Mapping[str, Any]) -> None:
+        """Load original outcomes plus explicitly separate input-format facts."""
+        for check in summary["checks"]:
+            if (check.get("kind") != "pytest" or check.get("status") != "passed"
+                    or check.get("reusable") is False
+                    or not {"inputGroup", "checkGroup", "result_id", "completed_ns", "inputs_digest", "phases"} <= check.keys()):
+                continue
+            inputs = {**summary["inputGroups"][check["inputGroup"]],
+                      "check_inputs": summary["checkGroups"][check["checkGroup"]]}
+            if (check["inputs_digest"] != _digest(inputs) or type(check["completed_ns"]) is not int
+                    or check["phases"] != {"setup": "passed", "call": "passed", "teardown": "passed"}
+                    or check.get("check_version") != _digest({
+                        "producer": inputs.get("producer"), "check_inputs": inputs["check_inputs"],
+                    })):
+                raise ValueError("Summary pytest outcome conflicts with its recorded execution facts.")
+            comparison = ({"comparison_inputs": summary["inputGroups"][check["comparisonInputGroup"]]}
+                          if "comparisonInputGroup" in check else {})
+            target.setdefault(check["id"], []).append({
+                "nodeid": check["id"], "outcome": "passed", "inputs": inputs, **origin, **comparison,
+                **{key: check.get(key) for key in ("result_id", "completed_ns", "inputs_digest", "phases", "qualificationLevel")},
+                "summary_reference": {key: value for key, value in check.items()
+                                      if key not in {"inputGroup", "checkGroup", "applicableInputGroup", "comparisonInputGroup"}},
+            })
 
     def _load_check(self, nodeid: str) -> None:
         key = (self.checkout, nodeid)
@@ -355,7 +477,7 @@ class ResultStore:
     def matching(self, nodeid: str, inputs: Mapping[str, Any]) -> dict[str, Any] | None:
         self._load_check(nodeid)
         records = [*self.records_by_check.get((inputs["checkout"], nodeid), []),
-                   *self.tagged_by_check.get(nodeid, [])]
+                   *self.tagged_by_check.get(nodeid, []), *self.imported_by_check.get(nodeid, [])]
         candidates = sorted((record for record in records if self._same_inputs(record, inputs)),
                             key=lambda record: (record["completed_ns"], record["result_id"]), reverse=True)
         self.reuse_reasons[nodeid] = {"decision": "execute", "reason": (
@@ -371,7 +493,9 @@ class ResultStore:
             if self._current(inputs):
                 self.protected_ids.add(record["result_id"])
                 self.reuse_reasons[nodeid] = {
-                    "decision": "reuse", "reason": "Git build summary." if "build" in record else "Current worktree result.",
+                    "decision": "reuse", "reason": ("Git build summary." if "build" in record else
+                                                      "Explicitly imported test baseline." if "imported" in record else
+                                                      "Current worktree result."),
                     "result_id": record["result_id"], **({"build": record["build"]} if "build" in record else {}),
                 }
                 return {**record, "applicable_product_inputs": dict(inputs["product_inputs"])}
@@ -387,20 +511,33 @@ class ResultStore:
         # not a dependency of every test. Tests exercising that helper still
         # name it through their product/check inputs and run when it changes.
         excluded = {"producer", "product_inputs"}
-        if "build" in record:
+        if "build" in record or "imported" in record:
             # Tagged facts are discovered through this checkout's .build history;
             # their original physical checkout is not a product dependency.
             excluded.add("checkout")
-        original = record["inputs"]
-        if ({key: value for key, value in original.items() if key not in excluded}
-                != {key: value for key, value in inputs.items() if key not in excluded}):
-            return False
+        original = record.get("comparison_inputs", record["inputs"])
         previous = original.get("product_inputs")
         current = inputs.get("product_inputs")
         if not isinstance(previous, dict) or not isinstance(current, dict):
             return False  # A whole-repository digest does not describe per-file inputs.
         nodeid = record.get("nodeid", record.get("id"))
-        _, required = group_inputs(self.manifest, nodeid, set(previous) | set(current))
+        # Thousands of cases share the same dependency group and file list.
+        # Cache only this invocation's map calculation, never a test decision.
+        key = (inputs["group"], tuple(sorted(set(previous) | set(current))))
+        if key not in self.comparison_groups:
+            self.comparison_groups[key] = group_inputs(self.manifest, nodeid, key[1])
+        suite, required = self.comparison_groups[key]
+        def metadata(source: Mapping[str, Any]) -> dict[str, Any]:
+            facts = {key: value for key, value in source.items() if key not in excluded}
+            if suite.tools is not None and isinstance(facts.get("environment"), dict):
+                # PATH selects tools. Their recorded identities and the Python
+                # runtime are compared below; unrelated launcher directories
+                # are not inputs when the tool set is explicitly bounded.
+                # Project both sides without rewriting either original record.
+                facts["environment"] = {key: value for key, value in facts["environment"].items() if key != "PATH"}
+            return facts
+        if metadata(original) != metadata(inputs):
+            return False
         # Project only dependency-map changes. A deleted required input stays in
         # this union and fails comparison; a newly required input needs a result.
         missing = object()
@@ -415,9 +552,10 @@ class ResultStore:
         """Return original qualification and execution, never a promoted copy."""
         applicability = ({"applicable_product_inputs": record["applicable_product_inputs"]}
                          if "applicable_product_inputs" in record else {})
-        if "tagged_reference" in record:
-            return {**record["tagged_reference"], "reused": reused,
-                    "inputs": record["inputs"], "build": record["build"], **applicability}
+        if "summary_reference" in record:
+            return {**record["summary_reference"], "reused": reused,
+                    "inputs": record["inputs"], **applicability,
+                    **{key: record[key] for key in ("build", "comparison_inputs") if key in record}}
         path = self._record_path(record)
         return {
             "id": record["nodeid"], "status": record["outcome"], "result_id": record["result_id"],
@@ -587,7 +725,9 @@ class ResultStore:
             for level in LEVELS:
                 for build in reader["select_build_check_summaries"](self.root, qualification_level=level):
                     builds[(build["tag"], build["receiptPath"])] = build
-            self.retention_passes = []
+            self.retention_passes = [
+                {**record, "id": nodeid} for nodeid, records in self.imported_by_check.items() for record in records
+            ]
             for build in builds.values():
                 summary = build["summary"]
                 for check in summary["checks"]:
@@ -597,8 +737,9 @@ class ResultStore:
                         self.retention_passes.append({**check, "build": True, "inputs": {
                             **summary["inputGroups"][check["inputGroup"]],
                             "check_inputs": summary["checkGroups"][check["checkGroup"]],
-                        }})
-        newer = [later for later in records if later["inputs"] == failure["inputs"]
+                        }, **({"comparison_inputs": summary["inputGroups"][check["comparisonInputGroup"]]}
+                              if "comparisonInputGroup" in check else {})})
+        newer = [later for later in records if self._same_inputs(later, failure["inputs"])
                  and later["completed_ns"] > failure["completed_ns"]]
         if any(later["outcome"] != "passed" for later in newer):
             return False  # The newer failure carries the same constraint.

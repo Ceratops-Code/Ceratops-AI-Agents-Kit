@@ -317,8 +317,11 @@ def compose_build_check_summary(
             # dependency scope is separate, so dropped dependencies cannot force
             # a successful test to run merely to rewrite that original record.
             inventories = [parsed["checkGroups"][identity] for identity in {
-                check["checkGroup"] for check in parsed["checks"] if "checkGroup" in check
+                check["checkGroup"] for check in parsed["checks"]
+                if "checkGroup" in check and "comparisonInputGroup" not in check
             }]
+            inventories.extend(parsed["inputGroups"][check["comparisonInputGroup"]]["check_inputs"]
+                               for check in parsed["checks"] if "comparisonInputGroup" in check)
             groups = {check.get("applicableInputGroup", check.get("inputGroup"))
                       for check in parsed["checks"]}
             for identity in groups - {None}:

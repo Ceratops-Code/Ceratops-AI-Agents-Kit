@@ -1177,6 +1177,29 @@ Keep the original check version and stable result identity. Inherited passes kee
 their original level; another receipt or tag cannot promote a lower-level pass.
 This policy does not introduce a public rc command.
 
+An explicitly requested historical test import may supply an earlier recorded
+run when its old metadata format predates compact build summaries. It requires
+actual successful per-test outcomes, matching recorded input hashes and a
+measured equivalent execution context; a test file or aggregate count is not
+enough. Original result IDs, check versions, input facts, times and qualification
+levels remain unchanged. `comparisonInputGroup` holds the converted comparison
+facts separately. An imported skip stays skipped and cannot satisfy a pass.
+For groups that declare their complete tool set, `PATH` is represented by the
+resolved tool identities and Python runtime, not unrelated launcher-directory
+entries. Groups with an unbounded tool set still compare the original `PATH`.
+New or changed tests, affected source/dependencies and newer applicable failures
+still require execution. The import neither creates a build tag nor accepts a
+new artifact, and ordinary runs do not search other worktrees for old results.
+
+The pytest result owner keeps one
+`<git-common-dir>/ceratops/results/repository-checks/pytest-baseline-<checkout-hash>.json`
+per explicitly selected checkout. Repeating the same import does not rewrite it;
+an interrupted import can be repeated, while an incomplete file blocks its use.
+Future build summaries carry the original outcomes and their comparison facts.
+The runner removes the local import when selected Git summaries contain all its
+pass identities. Until then it is bounded accepted-result input, not a checkpoint
+or failure log; deleting it before that transfer would discard reusable passes.
+
 Select the most recent eligible completed baseline for the same release unit and
 target on the candidate's relevant history, recording its exact tag, commit and
 receipt. Do not choose a repository-wide last tag or another branch's newest

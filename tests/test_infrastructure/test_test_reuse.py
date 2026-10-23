@@ -24,6 +24,206 @@ def _level_store(root, level):
     return ResultStore(root, {"arguments": [], "environment": {}, "qualificationLevel": level})
 
 
+def _historical_baseline(root):
+    """An old complete run with one real pass and one explicit skip."""
+    from reuse_test_results import _digest
+
+    (root / "tests/unrelated").mkdir()
+    (root / "tests/unrelated/conftest.py").write_text("FIXTURE = 1\n")
+    node = "tests/b/test_value.py::test_value"
+    store = _level_store(root, "beta")
+    comparison = store.inputs(node)
+    original = {**comparison, "checkout": "original-checkout", "environment": "old-environment-digest",
+                "arguments": ["-q", "tests"], "runtime": ["old-python", "version", "platform"]}
+    original.pop("product_inputs")
+    original.pop("group")
+    original["shared_inputs"] = _digest({name: digest for name, digest in store.files.items() if not (
+        name.startswith("tests/") and name.endswith(".py")
+        and (pathlib.PurePosixPath(name).name.startswith("test_") or name.endswith("_test.py"))
+    )})
+    original["check_inputs"] = {**comparison["check_inputs"],
+                                "tests/unrelated/conftest.py": store.files["tests/unrelated/conftest.py"]}
+    record = {"schema": "ceratops-pytest-attempt.v1", "nodeid": node, "outcome": "passed",
+              "result_id": "original-pass", "completed_ns": 1234, "qualificationLevel": "beta",
+              "inputs": original, "inputs_digest": _digest(original),
+              "phases": {"setup": "passed", "call": "passed", "teardown": "passed"}}
+    check = {"id": node, "status": "passed", "check_version": _digest({
+        "producer": original["producer"], "check_inputs": original["check_inputs"],
+    }), **{key: record[key] for key in ("result_id", "completed_ns", "qualificationLevel", "inputs_digest")}}
+    aggregate = {"schema": "ceratops-repository-check-result.v1", "status": "passed", "exit_code": 0,
+                 "result_id": "old-full-run", "candidate_id": "old-source-commit", "checks": [check, {
+                     "id": "tests/b/test_value.py::test_optional", "status": "skipped", "reason": "Optional tool absent",
+                 }]}
+    return store, aggregate, {node: record}, {node: comparison}
+
+
+def _import_historical_baseline(root):
+    from reuse_test_results import compose_imported_test_summary, write_test_baseline
+
+    store, aggregate, records, contexts = _historical_baseline(root)
+    summary = compose_imported_test_summary(aggregate, records, historical_files=store.files, comparison_contexts=contexts)
+    return write_test_baseline(root, summary), summary, next(iter(records.values()))
+
+
+def test_imported_baseline_keeps_original_results_and_skips(tmp_path):
+    from reuse_test_results import compact_results
+
+    from tests.repository_lifecycle.test_completed_builds import (
+        _tag_summary,
+        completion,
+    )
+
+    root = _mapped_repository(tmp_path)
+    _allow_build_records(root)
+    path, summary, original = _import_historical_baseline(root)
+    assert summary["checks"][1]["status"] == "skipped"
+    assert not summary["checks"][1]["reusable"]
+    (root / "tests/unrelated/conftest.py").write_text("FIXTURE = 2\n")
+    for _ in range(2):
+        fresh = _level_store(root, "alpha")
+        selected = fresh.matching(original["nodeid"], fresh.inputs(original["nodeid"]))
+        assert selected["inputs"] == original["inputs"]
+        reference = fresh.reference(selected, reused=True)
+        assert reference["result_id"] == original["result_id"]
+        assert reference["completed_ns"] == 1234 and reference["qualificationLevel"] == "beta"
+        assert reference["check_version"] == summary["checks"][0]["check_version"]
+        assert "imported" in fresh.reuse_reasons[original["nodeid"]]["reason"]
+    completed = completion.compose_build_check_summary(
+        {"sourceChecks": [], "artifactTests": []}, [compact_results([reference])], source_root=root,
+    )
+    _tag_summary(root, "1.0.0b1", completed)
+    fresh = _level_store(root, "beta")
+    assert not path.exists()  # Its original pass now lives in the selected Git build.
+    selected = fresh.matching(original["nodeid"], fresh.inputs(original["nodeid"]))
+    assert selected["result_id"] == original["result_id"]
+
+
+@pytest.mark.parametrize("change", ["source", "test", "new-helper", "tool", "environment", "package", "level"])
+def test_imported_baseline_does_not_hide_changed_inputs(tmp_path, change):
+    root = _mapped_repository(tmp_path)
+    _, _, original = _import_historical_baseline(root)
+    if change in {"source", "test"}:
+        path = root / ("b.py" if change == "source" else "tests/b/test_value.py")
+        path.write_text(path.read_text() + "# Changed input\n")
+    fresh = _level_store(root, "final" if change == "level" else "beta")
+    if change == "tool":
+        fresh.context["tools"]["git"] = "another-git"
+    elif change == "environment":
+        fresh.context["environment"]["INPUT"] = "another-input"
+    elif change == "package":
+        fresh.context["dependencies"].append(["example-library", "different-version"])
+    helpers = {"a.py"} if change == "new-helper" else set()
+    assert fresh.matching(original["nodeid"], fresh.inputs(original["nodeid"], helpers)) is None
+
+
+def test_newer_failure_blocks_imported_baseline_after_rotation(tmp_path):
+    root = _mapped_repository(tmp_path)
+    _, _, original = _import_historical_baseline(root)
+    node = original["nodeid"]
+    fresh = _level_store(root, "beta")
+    failure = fresh.save(node, fresh.inputs(node), outcome="failed", phases={"call": "failed"})
+    for index in range(5):
+        (root / "b.py").write_text(f"VALUE = {index + 2}\n")
+        current = _level_store(root, "beta")
+        current.save(node, current.inputs(node))
+    (root / "b.py").write_text("VALUE = 1\n")
+    current = _level_store(root, "beta")
+    assert current.matching(node, current.inputs(node)) is None
+    assert current._record_path(failure).exists()
+    assert "newer applicable failure" in current.reuse_reasons[node]["reason"]
+
+
+@pytest.mark.parametrize("damage", ["outcome", "phases", "identity", "digest", "inventory", "aggregate", "today-source"])
+def test_import_requires_original_success_and_input_evidence(tmp_path, damage):
+    from reuse_test_results import compose_imported_test_summary
+
+    root = _mapped_repository(tmp_path)
+    store, aggregate, records, contexts = _historical_baseline(root)
+    record = next(iter(records.values()))
+    if damage == "inventory":
+        store.files["b.py"] = "different"
+    elif damage == "today-source":
+        next(iter(contexts.values()))["product_inputs"]["b.py"] = "today-not-historical"
+    elif damage == "aggregate":
+        aggregate["status"] = "running"
+    else:
+        record[{"outcome": "outcome", "phases": "phases", "identity": "result_id", "digest": "inputs_digest"}[damage]] = "different"
+    with pytest.raises(ValueError):
+        compose_imported_test_summary(aggregate, records, historical_files=store.files, comparison_contexts=contexts)
+
+
+@pytest.mark.parametrize("interruption", ["before", "partial", "after"])
+def test_import_repeats_safely_across_write_interruption(tmp_path, monkeypatch, interruption):
+    import reuse_test_results as reuse
+
+    root = _mapped_repository(tmp_path)
+    store, aggregate, records, contexts = _historical_baseline(root)
+    summary = reuse.compose_imported_test_summary(aggregate, records, historical_files=store.files, comparison_contexts=contexts)
+    destination = store.directory / f"pytest-baseline-{store.checkout}.json"
+    with monkeypatch.context() as patch:
+        original_open = pathlib.Path.open
+        def interrupted_open(path, mode="r", *args, **kwargs):
+            if path == destination and mode == "wb":
+                if interruption == "partial":
+                    with original_open(path, mode) as stream:
+                        stream.write(b'{"schema":')
+                raise OSError("interrupted before completed write")
+            return original_open(path, mode, *args, **kwargs)
+        if interruption == "after":
+            patch.setattr(reuse.os, "fsync", lambda fd: (_ for _ in ()).throw(OSError("interrupted after write")))
+        else:
+            patch.setattr(pathlib.Path, "open", interrupted_open)
+        with pytest.raises(OSError, match="interrupted"):
+            reuse.write_test_baseline(root, summary)
+    if interruption == "partial":
+        with pytest.raises(ValueError):
+            _level_store(root, "beta")
+    assert reuse.write_test_baseline(root, summary) == destination
+    before = destination.stat().st_mtime_ns
+    reuse.write_test_baseline(root, summary)
+    assert destination.stat().st_mtime_ns == before
+    fresh = _level_store(root, "beta")
+    node = next(iter(records))
+    assert fresh.matching(node, fresh.inputs(node))["result_id"] == records[node]["result_id"]
+
+
+@pytest.mark.parametrize("bounded_tools", [False, True])
+def test_path_reuse_uses_declared_tool_identities(tmp_path, bounded_tools):
+    root = _mapped_repository(tmp_path)
+    path = root / "tests/test-impact.json"
+    manifest = json.loads(path.read_text())
+    for suite in manifest["suites"].values():
+        suite["environment"] = ["PATH"]
+        if not bounded_tools:
+            suite.pop("tools")
+    path.write_text(json.dumps(manifest))
+    node = "tests/b/test_value.py::test_value"
+    old = _level_store(root, "beta")
+    old.context["environment"]["PATH"] = "old-launcher-directory"
+    record = old.save(node, old.inputs(node))
+    fresh = _level_store(root, "beta")
+    fresh.context["environment"]["PATH"] = "new-launcher-directory"
+    selected = fresh.matching(node, fresh.inputs(node))
+    assert (selected is not None) is bounded_tools
+    if selected:
+        assert selected["result_id"] == record["result_id"]
+    changed = _level_store(root, "beta")
+    changed.context["tools"]["git"] = "another-version"
+    assert changed.matching(node, changed.inputs(node)) is None
+
+
+def test_runner_consumes_imported_pass_without_executing_test_body(test_runner_module, tmp_path, monkeypatch):
+    root = _mapped_repository(tmp_path)
+    _, _, original = _import_historical_baseline(root)
+    monkeypatch.setenv("CERATOPS_REPOSITORY_CHECK_CONTEXT", json.dumps({
+        "schema": "ceratops-repository-check-inputs.v1", "qualificationLevel": "beta",
+    }))
+    result = test_runner_module.run_text([sys.executable, "-m", "pytest", "-q", original["nodeid"]], root)
+    assert result.returncode == 0
+    assert result.accepted_checks == {"collected": 1, "executed": 0, "reused": 1}
+    assert result.accepted_result_references[0]["result_id"] == original["result_id"]
+
+
 @pytest.mark.parametrize("original_level", ["alpha", "beta", "rc", "final"])
 @pytest.mark.parametrize("requested_level", ["alpha", "beta", "rc", "final"])
 def test_tagged_pass_keeps_its_original_level(tmp_path, original_level, requested_level):
