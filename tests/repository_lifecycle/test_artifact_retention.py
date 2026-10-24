@@ -261,7 +261,7 @@ def test_retained_permissions_survive_copy_repair_and_interruption(
     relative = source.relative_to(base.build.receipt_path.parent) if kind == "artifact" else pathlib.Path(source.name)
     target = root / relative
     copy_mode = shutil.copymode
-    synthetic_modes = {}
+    synthetic_modes: dict[pathlib.Path, int] = {}
     if os.name != "posix":
         # Windows cannot represent execute bits. Exercise the same decisions
         # with explicit modes here; POSIX CI observes real chmod/stat effects.
