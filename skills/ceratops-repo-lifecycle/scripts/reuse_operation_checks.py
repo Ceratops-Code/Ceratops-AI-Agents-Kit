@@ -164,11 +164,22 @@ class CheckPlan:
             summary = build["summary"]
             checks = [dict(item) for item in summary["checks"]
                       if (item.get("kind"), item["id"]) in included]
+            # Keep provenance and current applicability only for these outcomes;
+            # forwarding unrelated tables accumulates obsolete inputs each build.
+            groups = {
+                "inputGroups": {check[field] for check in checks
+                                for field in ("inputGroup", "applicableInputGroup", "comparisonInputGroup")
+                                if field in check},
+                "checkGroups": {check["checkGroup"] for check in checks if "checkGroup" in check},
+            }
+            selected_summary = {**summary, "checks": checks,
+                                **{name: {key: summary[name][key] for key in sorted(keys)}
+                                   for name, keys in groups.items()}}
             return {"operation": prepared.operation, "commit": prepared.commit,
                     "status": "completed", "steps": [], "check_decision": "reused",
                     "check_reason": self.decision["reason"],
                     "check_baseline": {key: build[key] for key in ("tag", "commit", "receiptPath")},
-                    "check_summary": {**summary, "checks": checks}}
+                    "check_summary": selected_summary}
         original_path = self.store.directory / (self.decision["reference"]["result_id"] + ".json")
         if result_reference(original_path) != self.decision["reference"]:
             raise ValueError("Original check evidence changed after selection.")

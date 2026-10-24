@@ -5,8 +5,10 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
+import os
 import pathlib
 import shutil
+import stat
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from unittest.mock import Mock
@@ -235,6 +237,92 @@ def test_bundle_copy_keeps_all_accepted_files_together(accepted):
 
 class StopAttempt(BaseException):
     """Simulate abrupt controller loss at a completed filesystem effect."""
+
+
+@pytest.mark.parametrize("kind", ["artifact", "runnable"])
+@pytest.mark.parametrize("existing", [False, True])
+@pytest.mark.parametrize("timing", ["none", "before", "after"])
+def test_retained_permissions_survive_copy_repair_and_interruption(
+    accepted, tmp_path, monkeypatch, kind, existing, timing,
+):
+    _case, base, scope = accepted
+    value = base
+    source = base.build.artifacts[0]
+    if kind == "runnable":
+        source = tmp_path / "installed" / "run-tool"
+        source.parent.mkdir()
+        source.write_bytes(b"#!/bin/sh\nexit 0\n")
+        value = replace(_version(base, base.version, installed=True), installation_root=source.parent,
+                        runnable_files=[{"path": source.name, "size": source.stat().st_size,
+                                         "sha256": hashlib.sha256(source.read_bytes()).hexdigest()}])
+        scope = replace(scope, root=tmp_path / "destination", pool="deployed")
+    selection = {"approved": value} if kind == "artifact" else {"current": value, "deployments": [value]}
+    root = retention._copy_location(scope, value)
+    relative = source.relative_to(base.build.receipt_path.parent) if kind == "artifact" else pathlib.Path(source.name)
+    target = root / relative
+    copy_mode = shutil.copymode
+    synthetic_modes = {}
+    if os.name != "posix":
+        # Windows cannot represent execute bits. Exercise the same decisions
+        # with explicit modes here; POSIX CI observes real chmod/stat effects.
+        plain = retention._plain_path
+
+        def plain_with_modes(path, **kwargs):
+            resolved, info = plain(path, **kwargs)
+            if resolved in synthetic_modes:
+                fields = list(info)
+                fields[0] = stat.S_IFMT(info.st_mode) | synthetic_modes[resolved]
+                info = os.stat_result(fields)
+            return resolved, info
+
+        monkeypatch.setattr(retention, "_plain_path", plain_with_modes)
+
+    def set_mode(path, mode):
+        if os.name == "posix":
+            path.chmod(mode)
+        else:
+            synthetic_modes[path] = mode
+
+    def mode(path):
+        return stat.S_IMODE(retention._plain_path(path)[1].st_mode)
+
+    def preserve_mode(original, destination, **kwargs):
+        copy_mode(original, destination, **kwargs)
+        if os.name != "posix":
+            synthetic_modes[destination] = mode(original)
+
+    monkeypatch.setattr(shutil, "copymode", preserve_mode)
+    set_mode(source, 0o755)
+    if existing:
+        assert not _run(scope, **selection).deferred
+        set_mode(target, 0o644)
+        before = target.stat().st_mtime_ns
+        blocked = retention.retain_artifact_versions(
+            scope, protection=nullcontext, file_use=lambda _path: "file is running", **selection)
+        assert blocked.deferred and mode(target) == 0o644
+
+    def interrupted(original, destination, **kwargs):
+        if destination == target and timing == "before":
+            raise StopAttempt()
+        preserve_mode(original, destination, **kwargs)
+        if destination == target and timing == "after":
+            raise StopAttempt()
+
+    if timing != "none":
+        with monkeypatch.context() as context:
+            context.setattr(shutil, "copymode", interrupted)
+            with pytest.raises(StopAttempt):
+                _run(scope, **selection)
+    result = _run(scope, **selection)
+    assert not result.deferred
+    assert mode(target) == 0o755 and target.read_bytes() == source.read_bytes()
+    if existing:
+        assert target.stat().st_mtime_ns == before
+    before = target.stat().st_mtime_ns
+    with monkeypatch.context() as context:
+        context.setattr(shutil, "copymode", Mock(side_effect=AssertionError("unchanged permissions")))
+        assert not _run(scope, **selection).deferred
+    assert target.stat().st_mtime_ns == before
 
 
 @pytest.mark.parametrize("effect", ["copy", "owner", "selection", "delete"])

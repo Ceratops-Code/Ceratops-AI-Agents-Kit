@@ -15,6 +15,8 @@ import json
 import os
 import pathlib
 import re
+import shutil
+import stat
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
@@ -205,11 +207,18 @@ def _sha256(path: pathlib.Path) -> str:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def _same_file(path: pathlib.Path, record: Mapping[str, Any]) -> bool:
+def _same_file(
+    path: pathlib.Path, record: Mapping[str, Any], *, source: pathlib.Path | bytes | None = None,
+) -> bool:
     if not os.path.lexists(path):
         return False
     _, info = _plain_path(path, label="Retained file")
-    return info.st_size == record["size"] and _sha256(path) == record["sha256"]
+    if info.st_size != record["size"] or _sha256(path) != record["sha256"]:
+        return False
+    if isinstance(source, pathlib.Path):
+        _, original = _plain_path(source, label="Accepted package file")
+        return stat.S_IMODE(info.st_mode) == stat.S_IMODE(original.st_mode)
+    return True
 
 
 def _inventory(value: RetentionVersion, *, installed: bool = False) -> tuple[dict[str, dict[str, Any]], dict[str, pathlib.Path | bytes]]:
@@ -290,12 +299,16 @@ def _foreign_files(root: pathlib.Path, records: Mapping[str, Any]) -> list[str]:
 
 
 def _copy_file(source: pathlib.Path | bytes, destination: pathlib.Path, record: Mapping[str, Any]) -> None:
-    if _same_file(destination, record):
+    if _same_file(destination, record, source=source):
         return
     if isinstance(source, pathlib.Path) and source == destination:
         # An original build is already in its final directory. Opening that
         # same file for writing would destroy the only remaining evidence.
         raise ValueError(f"Original accepted file is missing or changed: {source}")
+    if isinstance(source, pathlib.Path) and _same_file(destination, record):
+        # Repair permissions on an older copy without rewriting accepted bytes.
+        shutil.copymode(source, destination, follow_symlinks=False)
+        return
     _make_directory(destination.parent)
     if isinstance(source, bytes):
         raw_hash = hashlib.sha256(source).hexdigest()
@@ -315,6 +328,7 @@ def _copy_file(source: pathlib.Path | bytes, destination: pathlib.Path, record: 
         os.fsync(writer.fileno())
     if count != record["size"] or digest.hexdigest() != record["sha256"]:
         raise ValueError(f"Accepted package bytes changed during retention: {source}")
+    shutil.copymode(source, destination, follow_symlinks=False)
 
 
 def copy_retained_version(scope: RetentionScope, value: RetentionVersion, *, file_use: FileUse) -> tuple[pathlib.Path, dict[str, Any]]:
@@ -336,7 +350,9 @@ def copy_retained_version(scope: RetentionScope, value: RetentionVersion, *, fil
     else:
         _make_directory(root.parent)
         root.mkdir()
-    needs_writes = any(not _same_file(root / name, record) for name, record in records.items())
+    # Permission-only repairs are writes too and require the same file-use gate.
+    needs_writes = any(not _same_file(root / name, record, source=sources[name])
+                       for name, record in records.items())
     if needs_writes:
         reason = file_use(root)
         if reason:

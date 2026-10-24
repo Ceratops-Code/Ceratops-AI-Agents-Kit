@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib
 import json
 import os
@@ -93,6 +94,48 @@ def test_git_build_summary_supplies_public_cli_check_without_original_log(tmp_pa
         own = next(item for item in result["check_summary"]["checks"] if item.get("kind") == "repository-check")
         assert own["result_id"] == reference["result_id"] and own["qualificationLevel"] == "beta"
     assert (tmp_path / "source-checks.txt").read_text() == "x"
+
+
+def test_partial_build_reuse_keeps_only_referenced_input_tables():
+    completion = importlib.import_module("complete_artifact_builds")
+
+    def group(value):
+        facts = {"revision": value}
+        identity = hashlib.sha256(json.dumps(facts, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        return identity, facts
+
+    inputs = dict(group(value) for value in ("original", "applicable", "comparison"))
+    checks = dict([group("original-check")])
+    original, applicable, comparison = inputs
+    check_group = next(iter(checks))
+    parent = {"kind": "repository-check", "id": "stable", "status": "passed",
+              "inputGroup": original, "children": [{"kind": "pytest", "id": "stable-child"}]}
+    child = {"kind": "pytest", "id": "stable-child", "status": "passed",
+             "inputGroup": original, "applicableInputGroup": applicable,
+             "comparisonInputGroup": comparison, "checkGroup": check_group}
+    summary = {"schema": "ceratops-check-summary.v1", "inputGroups": inputs,
+               "checkGroups": checks, "checks": [parent, child]}
+    prepared = argparse.Namespace(operation="repository.actions.test", commit="a" * 40)
+    for revision in range(5):
+        stale_input, stale_facts = group(f"changed-{revision}")
+        stale_check, stale_check_facts = group(f"changed-check-{revision}")
+        changed = {"schema": summary["schema"], "inputGroups": {stale_input: stale_facts},
+                   "checkGroups": {stale_check: stale_check_facts}, "checks": [
+                       {"kind": "repository-check", "id": "changed", "status": "passed",
+                        "inputGroup": stale_input, "checkGroup": stale_check}]}
+        summary = completion.compose_build_check_summary(
+            {"sourceChecks": [], "artifactTests": []}, [summary, changed])
+        original_bytes = json.dumps(summary, sort_keys=True)
+        plan = reuse.CheckPlan(context={}, store=None, decision={
+            "record": parent, "reason": "unchanged stable check",
+            "build": {"summary": summary, "tag": f"sample/1.0.0b{revision + 1}",
+                      "commit": prepared.commit, "receiptPath": "build_receipt.json"},
+        })
+        summary = plan.reused_result(prepared)["check_summary"]
+        assert summary["inputGroups"] == inputs
+        assert summary["checkGroups"] == checks
+        assert summary["checks"] == [child, parent]
+        assert json.dumps(plan.decision["build"]["summary"], sort_keys=True) == original_bytes
 
 
 def test_git_baseline_never_hides_newer_repository_check_failure(tmp_path, monkeypatch):
