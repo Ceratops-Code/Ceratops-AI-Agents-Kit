@@ -1,16 +1,15 @@
-"""Install one repository MCP server and emit closed promotion completion evidence.
+"""Install one repository MCP server and return its installation result.
 
-The helper is the deterministic owner between the MCP server manager and repository
-promotion.  A normal run invokes the installed manager exactly once.  Recovery
+The helper owns the call to the MCP server manager, not repository reports.
+A normal run invokes the installed manager exactly once. Recovery
 may instead consume a caller-retained manager result, but only after the active
 selection and immutable installation receipt match that result.  It never
-reinstalls merely to recreate promotion evidence.
+reinstalls merely to recreate its installation result.
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import importlib
 import json
 import os
@@ -62,8 +61,6 @@ class InstallOptions(NamedTuple):
     package_wheel: pathlib.Path | None = None
     package_lock: pathlib.Path | None = None
     manager_result: pathlib.Path | None = None
-    promotion_result: pathlib.Path | None = None
-    operation: str | None = None
     evidence_output: pathlib.Path | None = None
 
 
@@ -127,87 +124,6 @@ def _source_commit(repo_root: pathlib.Path) -> str | None:
     return commit
 
 
-def _promotion_binding(
-    path_value: pathlib.Path | None,
-    operation: str | None,
-    repo_root: pathlib.Path,
-    commit: str | None,
-) -> dict[str, Any] | None:
-    if path_value is None and operation is None:
-        return None
-    if path_value is None or operation is None:
-        raise InstallCompletionError(
-            "promotion-result and operation must be supplied together"
-        )
-    if commit is None:
-        raise InstallCompletionError(
-            "promotion completion requires an exact clean source commit"
-        )
-    path = _plain_file(path_value, "promotion result")
-    common = pathlib.Path(
-        _git(
-            repo_root,
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-common-dir",
-        )
-    )
-    task_parent = common.parent.parent / "tmp" / common.parent.name
-    if path.parent.parent != task_parent:
-        raise InstallCompletionError(
-            "promotion result must be inside one repository task directory"
-        )
-    identity_fields = (
-        "st_dev",
-        "st_ino",
-        "st_mtime_ns",
-        "st_size",
-        "st_mode",
-        "st_nlink",
-    )
-    before = path.stat()
-    identity = [getattr(before, field) for field in identity_fields]
-    data = path.read_bytes()
-    if [getattr(path.stat(), field) for field in identity_fields] != identity:
-        raise InstallCompletionError("promotion result changed while being read")
-    record = _json_object(data, "promotion result")
-    pending = record.get("status") == "handoff_required" and record.get("phase") == "deployment"
-    promotion = record.get("promotion") if pending else record
-    if not isinstance(promotion, dict) or promotion.get("status") != "ready" or promotion.get("head") != commit:
-        raise InstallCompletionError(
-            "promotion result does not identify this ready source commit"
-        )
-    operations = record.get("operations")
-    if (
-        not isinstance(operations, dict)
-        or operations.get("status") != ("handoff_required" if pending else "completed")
-        or not isinstance(operations.get("pending_operations"), list)
-        or (operation not in operations["pending_operations"] if pending else operations["pending_operations"] != [])
-        or not isinstance(operations.get("results"), list)
-    ):
-        raise InstallCompletionError("promotion operations are incomplete")
-    matches = [
-        item
-        for item in operations["results"]
-        if isinstance(item, dict) and item.get("operation") == operation
-    ]
-    if (
-        len(matches) != 1
-        or matches[0].get("handoff") != "ceratops-mcp-server-lifecycle/install"
-        or matches[0].get("handoff_completed")
-        or matches[0].get("status") not in ({"handoff_required"} if pending else {"completed", "advisory"})
-        or matches[0].get("commit") != commit
-        or (matches[0].get("status") == "advisory" and matches[0].get("steps"))
-    ):
-        raise InstallCompletionError(
-            "promotion result has no matching pending MCP server install handoff"
-        )
-    return {
-        "result_file": str(path),
-        "sha256": hashlib.sha256(data).hexdigest(),
-        "identity": identity,
-        "operation": operation,
-    }
 
 
 def _manager_payload(path: pathlib.Path) -> dict[str, Any]:
@@ -382,12 +298,20 @@ def _selected_transaction(payload: dict[str, Any]) -> tuple[str, str]:
     return mcp_server_name, instance
 
 
-def _write_output(path_value: pathlib.Path, receipt: dict[str, Any]) -> None:
+def _output_path(path_value: pathlib.Path) -> pathlib.Path:
+    """Check a caller's optional output location before launching installation."""
     path = pathlib.Path(os.path.abspath(path_value.expanduser()))
-    if any(_is_link(item) for item in (path.parent, *path.parent.parents)):
+    if any(_is_link(item) for item in (path, *path.parents)):
         raise InstallCompletionError("evidence output rejects linked paths")
     if not path.parent.is_dir():
         raise InstallCompletionError("evidence output parent does not exist")
+    if path.exists() and (not path.is_file() or path.stat().st_nlink != 1):
+        raise InstallCompletionError("evidence output must be an unlinked regular file")
+    return path
+
+
+def _write_output(path_value: pathlib.Path, receipt: dict[str, Any]) -> None:
+    path = _output_path(path_value)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     if temporary.exists():
         temporary.unlink()
@@ -417,8 +341,6 @@ def build_parser() -> argparse.ArgumentParser:
         type=pathlib.Path,
         help="Completed manager result to attest without reinstalling.",
     )
-    parser.add_argument("--promotion-result", type=pathlib.Path)
-    parser.add_argument("--operation")
     parser.add_argument("--evidence-output", type=pathlib.Path)
     return parser
 
@@ -438,21 +360,14 @@ def install_mcp_server(args: InstallOptions) -> dict[str, Any]:
             try:
                 os.chdir(repo_root)
                 commit = _source_commit(repo_root)
-                promotion = _promotion_binding(
-                    args.promotion_result, args.operation, repo_root, commit
-                )
                 # Receipt routing is a caller precondition, not a post-install failure.
                 output = None
                 if args.evidence_output is not None:
-                    if promotion is None:
+                    output = _output_path(args.evidence_output)
+                    if any(path is not None and output == path.expanduser().resolve()
+                           for path in (args.manager_result, args.package_wheel, args.package_lock)):
                         raise InstallCompletionError(
-                            "evidence-output requires a bound promotion result"
-                        )
-                    output = pathlib.Path(os.path.abspath(args.evidence_output.expanduser()))
-                    result_file = pathlib.Path(promotion["result_file"])
-                    if output.parent != result_file.parent:
-                        raise InstallCompletionError(
-                            "evidence output must share the promotion task directory"
+                            "evidence output cannot overwrite an installation input"
                         )
                 if args.manager_result is not None:
                     if any(
@@ -495,8 +410,9 @@ def install_mcp_server(args: InstallOptions) -> dict[str, Any]:
                     "removed": [],
                     "transaction_id": transaction_id,
                     "cleanup_debt": list(payload.get("maintenance", {}).get("errors", [])),
-                    "promotion": promotion,
                 }
+                if "maintenance" in payload:
+                    receipt["maintenance"] = payload["maintenance"]
                 phase = "completion_receipt"
                 if output is not None:
                     _write_output(output, receipt)

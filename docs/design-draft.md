@@ -13,8 +13,9 @@ output lifetimes; the refactor plan records delivery order. The working-folder
 methodology below distinguishes implemented versioned storage, receipt preparation,
 final-commit binding, completion tags, effect-derived recovery and shared
 checkpoint storage and connected release-lock protection from planned
-receipt-driven public lifecycle routing. Steps through 4E and standalone 6A are
-implemented; later phase scheduling and artifact-only installation remain planned.
+receipt-driven public lifecycle routing. Steps through 4G and standalone 6A are
+implemented; 4F provides internal retention functions, not the later public
+connections. Later phase scheduling and artifact-only installation remain planned.
 
 The intended users are agents and CI working on Ceratops-compatible
 repositories, including repositories other than Ceratops-AI-Agents-Kit and
@@ -358,15 +359,42 @@ An empty collection and actual pytest failures retain their failure exit codes.
 The returned JSON includes collected, executed and reused counts; no model call
 is needed to select or transfer individual results.
 
-Matching inputs include checkout identity, exact arguments, caller environment
-digest (excluding worker-monitoring IDs), runtime/platform, Git/uv versions,
-installed distribution versions, the producer version,
-test bytes, imported repository helpers and the conservative non-test input
-inventory. All fixture/helper/data files and new unignored inputs participate.
+Current attempt files are selected by checkout identity. Matching inputs include
+behavior-changing arguments, runtime/platform, plus the
+packages, tools, environment
+variables and production/data paths assigned to each check group. The existing
+`tests/test-impact.json` is read by `select_test_groups.py`; no second dependency
+graph is maintained. A consumer includes its prerequisites' inputs and settings,
+recursively. Changes flow toward consumers, never from a consumer back to its
+unchanged prerequisites. Test bytes, imported repository helpers and ancestor
+fixtures are separate check inputs. New unignored inputs participate through the
+current Git inventory; missing executable ownership stops before tests start.
+The repository's map separates lifecycle responsibilities and infrastructure
+tools instead of assigning their entire directories to one input group. Shared
+files explicitly name all consuming groups. A group name describes the current
+map, not the work previously tested: splitting or renaming groups compares only
+their currently required input facts, without rewriting stored outcomes. Missing,
+changed or removed required inputs prevent reuse; a newer matching failure still
+blocks an older pass. The result-reporting helper's original version remains in
+the record but is an execution dependency only for checks that exercise it.
+Unknown group package/tool/environment declarations conservatively retain the
+complete corresponding inventory. Known selectors/reporting options are omitted
+from acceptance inputs; unknown options and behavior options remain significant.
 Documentation-only patterns come from `tests/test-impact.json`. Hashes identify
 versions; successful pytest reports prove that execution passed. Checks with
 unrepresented dynamic or external-service inputs use `no_result_reuse` and
 execute on every call. Distributed pytest workers also execute normally.
+
+The same input comparison supplies execution explanations: changed required
+source and test paths, missing previous input facts, and changed package, tool,
+environment or runtime field names. Values and argument contents are not emitted.
+When no applicable result matches, differences use the newest eligible pass,
+otherwise the newest pass or remaining result, and identify the compared result.
+No prior result, insufficient qualification, a newer failure and files changed
+after collection are separate reasons. `pytest.execution_reasons` groups equal
+reasons with every affected test ID, alongside the bounded decision sample.
+This is observational output in the existing runner response, not new persistent
+state or a new acceptance rule; original result IDs and retention stay unchanged.
 
 The owner writes canonical `ceratops-pytest-attempt.v1` JSON directly to unique
 `<git-common-dir>/ceratops/results/repository-checks/pytest-attempt-<result-id>.json`
@@ -376,17 +404,27 @@ records remain unchanged; a missing historical level is eligible only for the
 legacy unqualified runner. Qualified calls use the shared level matrix, and a
 newer applicable failed or interrupted attempt blocks older passes for that
 individual test. A later matching pass resolves only its covered failure.
+When a failure would expire, retention also considers the selected build at
+each qualification level, at most four per unit/target. Newer alpha work cannot
+erase a failure still blocking an older beta build. These are compact tagged
+summaries; retention does not open packages or another worktree's build history.
 
 `.pytest-pass.lock` serializes reads, final writes and pruning; a busy writer
 leaves another invocation free to execute its checks normally. Startup and each
 completed write retain current plus two predecessors per checkout, test and
 qualification level, protecting original results referenced by retained aggregate
 records and failures that can still block a retained pass. Other producers'
-files are untouched. Results survive task-temp and worktree deletion. The
+files are untouched. Startup inventories filenames once and opens only collected
+checkout/test groups; each save
+refreshes, matches and prunes only its affected group through an in-memory index.
+No persistent index or additional storage is introduced. Failure precedence and
+retained references stay within that group, so unrelated histories need no
+per-save traversal. Results survive task-temp and worktree deletion. The
 caller-owned `pytest-results.json` lives inside pytest's isolated temp directory,
 carries returned counts and original result references, and is removed by that
 directory's existing owner. Aggregate records retain those child identities,
-check versions and levels without changing the normal counts-only stdout.
+check versions and levels. Stdout adds at most 32 per-check decisions and an
+omitted count; stderr streams each decision before test bodies execute.
 The private `nonreusable_checks` transport carries explicit `reusable: false`
 facts for always-run tests, distributed execution and unrepresented child scope.
 Aggregate records preserve these constraints alongside original child references;
@@ -402,10 +440,76 @@ They preserve actual execution facts without inventing individual result IDs.
 Changed input bytes remain a reuse constraint; a busy optimization is distinct
 from incomplete execution evidence.
 
-This is runner-level reuse with qualified provenance. Release-unit qualification,
-historical baseline selection and broader lifecycle receipt composition remain
-later refactor-plan work; they must consume this owner rather than create another
-result store.
+The compact `ceratops-check-summary.v1` export contains `inputGroups` and
+`checkGroups` tables plus `checks`. Each outcome references its inlined facts and
+keeps the original result ID, check version, qualification level, required scope,
+phase outcomes and whether it was executed or reused. The input table keys hash
+their complete canonical contents. `docs/result_records.py.tmpl` owns repository
+check exports and its generated consumers; the reader rejects a summary that
+contradicts its executed parent. Skips retain a reason and never become passes.
+The envelope contains the facts needed for reuse without following old reports.
+The reporting helper's source version is preserved in that original record,
+not compared as an input of every test. Explicit file ownership takes precedence
+over a full-suite trigger when computing dependencies. Comparing a prior result
+uses the current dependency map over both old and current file names: dropped
+dependencies need no rerun, while new or deleted required files prevent reuse.
+Tests of the changed helper retain their ordinary product/check dependencies.
+`applicableInputGroup` records the compared current product-input scope for a
+reused outcome. Build completion checks those bytes and the original check
+inputs; the original input table, result ID and check version remain unchanged.
+Existing aggregate records own their bounded copy. The completed v3 build owns
+its tracked `check_summary.json` beside `build_receipt.json`; tests alone do not
+create build versions. The receipt's `tag` and `checkSummary` path/size/SHA-256
+bind the summary to the intended `<unit>/<version>` tag. Receipt and summary enter
+the same result-only commit; artifact binding follows, and tag creation is last.
+
+`sdlc_results.select_build_check_summaries()` discovers only the current worktree's
+`.build/<unit>/<version>/[<target>/]build_receipt.json` records. It chooses the
+highest completed eligible version for each requested unit/target and reads exact
+receipt and summary blobs at that tag. It neither walks commit ancestry nor reads
+other worktrees, deployments, packages or full logs. The portable reader is part
+of `docs/result_records.py.tmpl`, with generated repository/template consumers;
+repository maintenance does not import the installed skill implementation.
+
+Alpha accepts alpha/beta/rc/final results, beta accepts beta/rc/final, rc accepts
+rc/final, and final accepts final only. Both the selected version and each
+original result must qualify. Missing historical summary facts supply no
+coverage; malformed committed links or content hashes stop selection. The latest
+eligible historical record with no summary does not silently select an older one.
+Checkout copies supply selection identities only, never acceptance bytes.
+
+`--auto` local/promotion execution collects the current required inventory once
+and compares each case's product/check inputs, arguments, runtime, relevant
+dependencies and settings. Only uncovered or affected cases execute. A Git
+summary's original checkout location is not an executable input; its discovery
+still comes exclusively from this checkout's build records. Current attempt
+files remain worktree-scoped and can supersede tagged results after corrections.
+Newer applicable failures block old passes, including after retention. Tests
+without represented inputs execute instead of receiving fabricated coverage.
+
+`reuse_operation_checks` supplies the same selection to declared SDLC checks,
+including checks requested by current Build and promotion callers. Git-backed
+results return their original summary and tag/commit/receipt path without
+depending on a canonical log file or allocating a replacement result ID.
+`prepare_versioned_receipt(..., check_summaries=...)` composes the next build's
+summary from the supplied actual outcomes, retaining original IDs, versions and
+levels and checking that recorded source bytes still match. A failed required
+check cannot produce the new receipt. Existing historical receipts remain
+unchanged. Native v3 Build and receipt-driven promotion routing are still assigned
+to steps 16/22; they consume this foundation rather than adding another history.
+
+Pytest's maintained collection hook checks all requested targets and passes the
+same items to execution/reuse. Collection probes remain only for explicit
+collection/manifest modes, not a prelude repeated for each execution target.
+Shared input calculations run once per group, module and fixture; summary tables
+also deduplicate those facts. Counts and collection/execution durations report
+actual work. A focused startup against roughly 37,000 existing result files
+fell from over 300 seconds before collection to the first progress interval
+after scoped loading. This measures startup overhead, not faster test bodies.
+A 33-case impact-suite sample then measured 0.43 seconds collection and 12.44
+seconds execution. After an unrelated check-file edit it reused all 33 original
+results, with 0.17 seconds collection and 0.002 seconds execution. The result
+demonstrates preserved acceptance after that edit, not a whole-suite benchmark.
 
 ## Pytest failure diagnostics
 
@@ -889,6 +993,14 @@ complete resolution calls the writing helper's `remove_failure_report()`.
 It retains uncertain writers and files with different ownership or format.
 An I/O error is returned as `report_cleanup_error` on the successful result;
 it does not revoke that success or schedule another check/build/delivery.
+On the next normal call, an applicable saved success takes this same cleanup
+path without repeating its effect. An interruption before deletion leaves the
+report for that call; after deletion, absence is already success. Successful
+cleanup clears an earlier cleanup error. A newer failure that prevents result
+reuse, or an unresolved different check, keeps its diagnostics.
+No file is created unless the caller selected an output path and there is no
+existing complete child report to reference; without a selected path the complete
+error stays in the returned result.
 
 `ship.py::run_parallel_gates()` retires the selected repository/PR's CI failure
 after its existing exact-head check succeeds and the concurrent waits finish,
@@ -1083,6 +1195,29 @@ arguments, dependencies and compatible platform/tool/runtime/environment scope.
 Keep the original check version and stable result identity. Inherited passes keep
 their original level; another receipt or tag cannot promote a lower-level pass.
 This policy does not introduce a public rc command.
+
+An explicitly requested historical test import may supply an earlier recorded
+run when its old metadata format predates compact build summaries. It requires
+actual successful per-test outcomes, matching recorded input hashes and a
+measured equivalent execution context; a test file or aggregate count is not
+enough. Original result IDs, check versions, input facts, times and qualification
+levels remain unchanged. `comparisonInputGroup` holds the converted comparison
+facts separately. An imported skip stays skipped and cannot satisfy a pass.
+For groups that declare their complete tool set, `PATH` is represented by the
+resolved tool identities and Python runtime, not unrelated launcher-directory
+entries. Groups with an unbounded tool set still compare the original `PATH`.
+New or changed tests, affected source/dependencies and newer applicable failures
+still require execution. The import neither creates a build tag nor accepts a
+new artifact, and ordinary runs do not search other worktrees for old results.
+
+The pytest result owner keeps one
+`<git-common-dir>/ceratops/results/repository-checks/pytest-baseline-<checkout-hash>.json`
+per explicitly selected checkout. Repeating the same import does not rewrite it;
+an interrupted import can be repeated, while an incomplete file blocks its use.
+Future build summaries carry the original outcomes and their comparison facts.
+The runner removes the local import when selected Git summaries contain all its
+pass identities. Until then it is bounded accepted-result input, not a checkpoint
+or failure log; deleting it before that transfer would discard reusable passes.
 
 Select the most recent eligible completed baseline for the same release unit and
 target on the candidate's relevant history, recording its exact tag, commit and
@@ -1409,8 +1544,9 @@ explicit, separate target-specific purpose; it must not repeat the artifact's
 acceptance tests under another name.
 
 The operation runner owns qualification. The internal artifact route now has
-two imported owners: `store_artifacts.py` allocates final directories and owns
-retention; `complete_artifact_builds.py` prepares accepted receipts and completes
+three imported owners: `store_artifacts.py` allocates final directories and provides
+store protection, `retain_artifact_versions.py` selects and retains scoped copies,
+and `complete_artifact_builds.py` prepares accepted receipts and completes
 result-only commit C, artifact receipts and the immutable tag. The v2 producer
 keeps its existing transaction until its later retirement. Public adoption of
 the directory-first route remains steps 16/22.
@@ -1463,9 +1599,10 @@ not another worktree's normal build.
 Only cross-version deletion takes the existing short store lock. Allocation
 tries startup retention without waiting if that lock is busy; completed calls
 finish retention under the lock. Requests and untagged directories protect
-unfinished or uncertain output. The current bound is three completed outputs
-per repository/unit/target/alpha-beta-stable class; 4F's later shared policy is
-not active here. Pruning bytes does not remove tags or historical acceptance.
+unfinished or uncertain output. Unconnected callers keep three completed outputs
+per repository/unit/target/alpha-beta-stable class. That older rotation excludes
+4F-managed originals and the shared beta/stable pool. Pruning bytes does not
+remove tags or historical acceptance.
 
 This replaces 1d/1e's separate reservations. At authorized deployment after old
 writers stop, transfer still-needed old reservation data to its matching version
@@ -1473,6 +1610,64 @@ request and remove only the replaced file. Receipt/tag evidence permits removal
 of completed obsolete reservations; uncertain records stay. No recurring
 migration detector is installed. The source/helper split changes no receipt
 format or release/destination lock.
+
+### Scoped retained artifact copies (4F)
+
+`retain_artifact_versions.py` accepts one `RetentionScope`: an absolute managed
+root, release unit, target, pool and (for original builds) existing worktree ID.
+A bundle occupies its release-unit directory. Separate member versions remain
+step 8C; this library does not add receipt fields for them.
+
+`select_retained_versions()` uses the caller's existing accepted build and
+successful installation records, oldest deployment first. Shared beta/stable
+storage keeps the two most recently successfully deployed distinct beta/stable
+versions and the latest approved beta/stable version. A destination keeps its
+current and previous successful generations and latest deployed beta/stable
+generation. Alpha-only destinations have no invented beta/stable slot. A named
+worktree keeps its latest approved build, including alpha. Overlapping slots
+deduplicate; failed installations cannot advance a successful slot.
+
+`retain_artifact_versions()` copies each complete selected package, dependencies,
+supporting files and original receipt bytes directly to
+`<git-common-dir>/ceratops/artifacts/beta-stable/<unit>/<version>/<target>/`, or
+`<destination>/deployed/<unit>/<existing-generation>/<target>/`. Destination
+copies also include the installer's recorded runnable files and successful
+installation result. Original worktree output stays at the 4E allocated path.
+The caller holds its existing release/destination ownership and supplies current
+facts and file-use information; this is not a new worktree lock or process manager.
+
+Each copy's `.retained-files.json` records its exact files and ownership.
+`.build_receipt.json` contains the unchanged committed receipt, and destination
+copies also contain `.installation_receipt.json`. The original artifact receipt
+is copied last. The group's `.retention/<target>/<pool-or-worktree>.json` records
+only selected copies and unresolved deletion candidates, not worker progress.
+There are no temporary copies, timestamp-based choices or growing history.
+`store_artifacts.retain_completed_artifacts()` uses the existing short cleanup
+lock for selection-record changes and deletion, not copying or builds.
+
+Only the named group and its supplied record paths are read. File-use information
+is required before changing incomplete bytes or deleting a candidate. Running or
+pending installations protect their generations even when the recorded current
+selection differs. Unknown ownership, changed files, missing use information or
+unrecorded files leave the affected copy intact and return its path and cause.
+An incomplete replacement never displaces the previous successful selection.
+Repeated ordinary calls finish missing copy/delete effects; an unreadable ownership
+record remains explicit unresolved data, not guessed permission to remove files.
+
+The current receipt reader accepts identical original/shared copies and reports
+the selected shared paths. `read_versioned_build()` likewise finds retained-only
+completed output. Neither changes acceptance, result IDs, check versions, commit,
+receipt bytes or tags, nor executes checks. Successful test/build result retention
+remains with their result owner. Removing a worktree original after promotion
+requires the release branch to select the accepted replacement commit and the
+complete beta/stable copy to exist; any separately deployed copy stays independent.
+
+Build approval (7/16), installation (17–19), promotion replacement (22), and Codex
+(31) connect these functions later. Dedicated worktree/abandonment cleanup remains
+21. Tests in `test_artifact_retention.py` cover scoped selection, original receipt
+identity, complete copies, failed activation, live users and interruptions around
+copying, recording selection and deletion. No public Build/Deploy policy changes
+are implied by the library's availability.
 
 ### Skill-update checkpoint storage (implemented)
 
@@ -1566,9 +1761,17 @@ or whole-system recovery.
 
 ### Shipped task work and planned abandoned-work cleanup
 
-Implemented Ship cleanup is owned by `retire_shipped_work.py`. After selected
-operations succeed, it finalizes the optional promotion scope and discovers task
-worktrees and unchecked-out local `codex/` task branches throughout the repository.
+Implemented Ship cleanup is owned by `retire_shipped_work.py`. Explicit
+`--preserve-worktree` paths protect active manual
+worktrees, their branches and task files even without a catalog ownership record.
+Ship checks that requested paths are canonical registered task worktrees in the
+selected repository before remote effects; the terminal cleanup and returned
+rerun command carry the same protection. Unfinished removal records for these
+paths remain untouched until a later invocation releases the paths. This
+retention does not bypass source, pending-work, review or CI checks. After selected
+operations succeed, the helper finalizes the optional promotion scope and
+discovers task worktrees and unchecked-out local `codex/` task branches throughout
+the repository.
 An absent scope does not suppress discovery. Removal requires clean Git state
 including untracked files, exact head ancestry in the synchronized shipped commit,
 and archived or absent associated Codex threads. The existing thread catalog is
@@ -1652,7 +1855,7 @@ they do not rename old files, alter tags or rerun accepted builds/tests.
 | `ceratops/locks/release-local` | Implemented internal write-lock helper; one persistent native lock per Git common directory, with an in-place one-byte unfinished-run flag. Clear only after explicit clean completion, never during checkpoint cleanup or worktree removal. Current release writers use it in 2B; steps 3 and 4 complete the batch. |
 | `<destination>/locks/install` | Planned in steps 17–19; use the same helper and unfinished-run flag across source worktrees, through generation production, activation and cleanup. Retain the file; no mandatory OS process groups. |
 | Committed build receipt/evidence | Producer; current record plus at most two predecessors per unit/check group in the checkout; Git commit history supplies historical retrieval without an extra record database |
-| `ceratops/artifacts/<unit>/<version>/` with optional target subdirectory | Artifact store; immutable artifacts, supporting files and artifact receipt; current plus two predecessors per repository/unit/target and alpha/beta/stable retention group; later consumers supply explicitly bounded active/current/rollback protection |
+| `ceratops/artifacts/<unit>/<version>/` with optional target subdirectory | Artifact store; immutable artifacts, supporting files and artifact receipt. The 4F retention functions keep each unpromoted worktree's latest approved build and the separate shared/destination selections described above. Unconnected callers retain the existing current-plus-two policy per repository/unit/target and version class until their planned adoption. |
 | `ceratops/artifacts/<unit>/<version>/build_request.json` | Artifact allocation and input binding; immediately records the registered worktree and whole target set, then exact B/inputs before artifacts. No allocation lock. Remove after receipt/tag completion; preserve unfinished and uncertain requests. |
 | `.build/<unit>/<version>/build_receipt.json` with optional target directory | Operation runner; directly written final result, validated and reused by exact bytes, committed at C with other declared Git evidence and retained historically by Git |
 | `artifacts/<unit>/<version>/` with optional target directory | Direct final output; protected while a build request exists or the immutable tag is absent. Complete target receipts and the tag bind it to C. Directory creation, not a reservation file, allocates the version. |
@@ -1717,7 +1920,7 @@ builder keeps its source repository in module variables. Calls restore the
 caller's working directory unless installation retired that directory; this
 uses an in-memory lock, not another lock file or saved operation record.
 Before installation it resolves the source and destination, exact deployment
-mode, selected skill names, and any supplied promotion bindings. It runs the
+mode and selected skill names. It runs the
 existing source-check script with the current interpreter: `full` for an
 all-managed request, or `skill` with the exact explicit or base-derived names.
 Source-check failure prevents the runtime transaction from starting. Inventory,
@@ -1730,15 +1933,29 @@ installed skills. Each call receives its repository and selection explicitly;
 the helper stores no repository selection, writes no files and adds no CLI.
 Clean Git sources are checked for commit movement before installation and
 before reporting commit-bound completion. Dirty and non-Git source installs
-remain supported, but they carry no commit attestation and cannot complete a
-saved promotion. This flow does not freeze files against simultaneous edits.
+remain supported, but carry no commit attestation. This flow does not freeze
+files against simultaneous edits.
 
 The existing runtime transaction remains responsible for destination ownership,
 activation, rollback and retired-output cleanup. The installer adds no storage
-layer, source-check history, implicit package build or deployment retry. A
-successful installation followed by failed promotion cleanup keeps the actual
-completion receipt, complete cleanup error output and cleanup-only command.
-The caller may pass that receipt to the existing finalizer without reinstalling.
+layer, source-check history, implicit package build or deployment retry. It takes
+no promotion-report path, operation binding, report hash or repository-helper
+path. Its result contains only the actual installation outcome, installed and
+removed names, destination, source commit, transaction ID and runtime-cleanup debt.
+The MCP installer follows the same separation and also returns the manager's
+complete `maintenance` object (`removed`, `deferred`, `errors`).
+
+Repo lifecycle records the result of its own requested installation, then removes
+only its completed caller-selected promotion report through the existing
+`--finalize-result` command. The report's digest selects the exact file to remove;
+it is not passed to installers or attached to installation results. Pending,
+failed or cleanup-blocked installations keep the report. No external receipt can
+turn a saved pending handoff into completion. Cleanup never runs installation or
+replays promotion; repeating it after the exact report is absent succeeds.
+Build receipts, successful results and unrelated files are excluded. An optional
+MCP `--evidence-output` is a caller-owned installation result, not a promotion
+record; its parent must exist and it cannot overwrite an installation input.
+It keeps one current file; its caller removes it after use.
 Repository package build/test acceptance remains with the SDLC caller: current
 installer inputs do not independently identify those accepted package results.
 
@@ -1777,56 +1994,64 @@ were written; release-lock cases cover interruption before and after command eff
 `<git-common-dir>/ceratops/operations/skill-updates/<worktree-id>/` without a
 checkpoint or worktree lock. No operation UUID or caller-supplied
 state/evidence paths are required. The caller's request has schema
-`ceratops-skill-update-request.v3` and fields `selected_skills`,
-`allowed_paths`, `change_groups` and non-test `checks`.
+`ceratops-skill-update-request.v4` and fields `selected_skills` and non-test
+`checks`, alongside `schema`. There is no file allowlist or change-group field.
 
-Declared files may be existing, untracked or not yet created, including files
-whose parent directories do not yet exist. The selected checkout's resolved
-root bounds their location; the request's exact paths bound the change scope.
-Opening a request and loading its recorded scope use the same file-target
-checks: Git internals, symlinks, junctions, directories and paths outside the
-checkout are rejected. Git tracking is not an eligibility condition. Selected
-skills still require an owned source path in the declared scope.
+The first call records the task branch, original commit and pre-existing
+uncommitted edits. Each check run asks Git for the net changed files since that
+commit, including staged, committed, deleted, renamed and new untracked files.
+Ignored generated output is excluded. Adding a changed file needs no request
+amendment, and a selected skill need not have a skill-local source edit when the
+requested work changes its tests, dependencies or shared files instead.
+The helper does not grant editing permission; the user's request governs the
+calling task's edits.
 
-The ordinary driver boundary is deterministic: `init` derives that closed
-request from repeated skill/path groups plus UTF-8 command files, and `run`
-performs only the needed verification or emits the recorded result and one
-next action. Governance proposals use the same boundary: `init` converts UTF-8
-context and replacement declarations into the existing proposal state machine,
-while `run` transports one explicit semantic assessment and decision. Neither
-driver chooses scope, edits governed sources, makes semantic judgments,
-commits, deploys, or weakens the lower-level recovery commands.
+Pre-existing edits must remain unchanged. The branch must retain the original
+commit as an ancestor. Changed files and declared search inputs must be regular
+file paths inside the checkout, without Git-internal paths or linked components.
+Deleted files and not-yet-created search inputs may be absent. Git whitespace
+checks apply to the current changes. Saved passes bind to the actual inputs;
+changes while checks run cannot be recorded as a pass.
+
+The ordinary driver is `init` followed by `run`: the former records selected
+skills and check declarations; the latter runs only needed checks or returns the
+saved result and one next action. Governance proposals have their own driver:
+`init` accepts UTF-8 context and replacement declarations, while `run` submits
+one explicit semantic assessment and decision. Neither driver makes semantic
+judgments, edits governed sources, commits or deploys.
 
 From the source repository, using its managed Python runtime:
 
 ```text
-python skills/ceratops-skill-lifecycle/scripts/skill-update-workflow.py init --repo-root WORKTREE --selected-skill SKILL --group NAME PATH
+python skills/ceratops-skill-lifecycle/scripts/skill-update-workflow.py init --repo-root WORKTREE --selected-skill SKILL
 python skills/ceratops-skill-lifecycle/scripts/skill-update-workflow.py run --repo-root WORKTREE
 python skills/ceratops-skill-lifecycle/scripts/skill-update-workflow.py run --repo-root WORKTREE --caller-use-complete
 python skills/ceratops-skill-lifecycle/scripts/skill-update-workflow.py open_skill_change --repo-root WORKTREE --change-request REQUEST
-python skills/ceratops-skill-lifecycle/scripts/skill-update-workflow.py expand_skill_scope --repo-root WORKTREE --change-request REQUEST
 python skills/ceratops-skill-lifecycle/scripts/skill-update-workflow.py run_skill_checks --repo-root WORKTREE
 python skills/ceratops-skill-lifecycle/scripts/skill-update-workflow.py replace_failed_request --repo-root WORKTREE --change-request REQUEST
 python skills/ceratops-skill-lifecycle/scripts/skill-update-workflow.py close_skill_change --repo-root WORKTREE
 ```
 
-`WORKTREE` is the selected task checkout; `REQUEST` is the caller's JSON file
-for the lower-level request interface. `init` records the same approval and
-original Git/dirty baseline without caller-authored JSON; the caller, not this
-helper, edits source. Expansion adds approved scope before or after checks,
-using the original baseline even for newly added paths. Failed-request
-replacement may revise checks but cannot shrink scope or hide unrelated work.
-Source ownership, descendant-commit and whitespace gates remain. Tests still
-belong to the SDLC runner. Commit and explicitly requested promotion/deployment
-remain separate caller actions; `run --caller-use-complete` or the lower-level
-close command follows their completed use.
+`WORKTREE` is the selected task checkout; `REQUEST` is a caller-owned JSON file.
+Repeat `--selected-skill` for multiple skills. `--command-check-file FILE`
+reads one exact command argument per nonempty UTF-8 line;
+`--search-check EXPECTED PATTERN PATH` declares a search.
+Repeat `init` or `open_skill_change` with the complete declarations to append
+skills or checks. Identical calls do nothing; additions preserve the original
+Git/dirty baseline and applicable passing results. Existing declarations cannot
+be removed by this append path. `replace_failed_request` may revise failed
+checks without replacing that baseline. No command exists to expand file scope.
+
+Tests belong to the SDLC runner. Commit and explicitly requested
+promotion/deployment remain separate caller actions; `run --caller-use-complete`
+or the lower-level close command follows their completed use.
 
 The helper owns these direct-written records:
 
 | Record | Purpose and lifetime |
 | --- | --- |
 | `update_request.json` | Original request, initial baseline and worktree identity; immutable until successful cleanup. The caller's input file is separate and never deleted. |
-| `states/N.json` | Approved scope, baseline, status and predecessor hash; retain current plus two predecessors. |
+| `states/N.json` | Selected skills, check declarations, original baseline, status and predecessor hash; retain current plus two predecessors. |
 | `check_results/N.json` | Checked commit/input hash, changed paths, individual results, overall status and failures for checking state N. State N+1 records its hash; retain results referenced by kept states. |
 | `completion_receipt.json` | Saved successful state/result identity used to finish cleanup without rechecking source; delete last. |
 

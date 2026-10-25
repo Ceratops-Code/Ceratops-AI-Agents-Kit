@@ -177,7 +177,7 @@ def _plain(path: pathlib.Path) -> None:
 def _time(value: Any) -> datetime:
     if not isinstance(value, str) or not value:
         raise ValueError("Check execution time is missing.")
-    result = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    result = datetime.fromisoformat(value)
     if result.tzinfo is None:
         raise ValueError("Check execution time requires a timezone.")
     return result
@@ -202,7 +202,7 @@ def _load(path: pathlib.Path) -> tuple[dict[str, Any], bytes]:
         raise ValueError("Check result is not canonical complete JSON.")
     required = {"schema", "result_id", "candidate_id", "check_id", "check_version",
                 "invocation", "status", "exit_code", "inputs", "execution"}
-    if not required.issubset(value) or set(value) - required - {"checks"}:
+    if not required.issubset(value) or set(value) - required - {"checks", "check_summary"}:
         raise ValueError("Check result fields differ from the runner contract.")
     if (value.get("schema") != RESULT_SCHEMA or value.get("result_id") != path.stem
             or not all(isinstance(value.get(key), str) and value[key].strip()
@@ -210,6 +210,28 @@ def _load(path: pathlib.Path) -> tuple[dict[str, Any], bytes]:
             or not isinstance(value.get("invocation"), dict)):
         raise ValueError("Check result identity does not match its final path.")
     inputs = check_context(value.get("inputs", {}))
+    if "check_summary" in value:
+        summary = value["check_summary"]
+        if (not isinstance(summary, dict) or set(summary) != {"schema", "inputGroups", "checkGroups", "checks"}
+                or summary["schema"] != "ceratops-check-summary.v1"
+                or not isinstance(summary["inputGroups"], dict)
+                or not isinstance(summary["checkGroups"], dict)
+                or not isinstance(summary["checks"], list)):
+            raise ValueError("Compact check summary has incomplete input tables.")
+        for table in (summary["inputGroups"], summary["checkGroups"]):
+            if any(hashlib.sha256(canonical(item).rstrip(b"\n")).hexdigest() != identity
+                   for identity, item in table.items()):
+                raise ValueError("Compact input-group identity does not match its facts.")
+        for check in summary["checks"]:
+            if (not isinstance(check, dict)
+                    or ("inputGroup" in check and check["inputGroup"] not in summary["inputGroups"])
+                    or ("checkGroup" in check and check["checkGroup"] not in summary["checkGroups"])):
+                raise ValueError("Compact check outcome names an absent input group.")
+            if (check.get("kind") == "repository-check" and check.get("id") == value["check_id"]
+                    and (check.get("status") != value["status"] or check.get("result_id") != value["result_id"]
+                        or check.get("check_version") != value["check_version"]
+                        or summary["inputGroups"].get(check.get("inputGroup")) != inputs)):
+                raise ValueError("Compact outcome conflicts with its executed repository check.")
     if (inputs["checkVersion"] != value["check_version"]
             or inputs["workVersion"] != value["candidate_id"]
             or ("operation" in inputs["scope"] and inputs["scope"]["operation"] != value["check_id"])):
@@ -332,6 +354,7 @@ class CheckResultStore:
     """Read/prune the canonical store shared by every worktree of a repository."""
 
     def __init__(self, repo_root: pathlib.Path) -> None:
+        self.repo_root = repo_root.resolve()
         completed = subprocess.run(
             ["git", "-C", str(repo_root), "rev-parse", "--path-format=absolute", "--git-common-dir"],
             capture_output=True, text=True, encoding="utf-8", check=True,
@@ -361,7 +384,8 @@ class CheckResultStore:
                 invalid.append(path)
         return records, invalid
 
-    def select(self, context: Mapping[str, Any], *, check_id: str) -> dict[str, Any]:
+    def select(self, context: Mapping[str, Any], *, check_id: str,
+               builds: Iterable[Mapping[str, Any]] = ()) -> dict[str, Any]:
         """Choose original eligible evidence, refusing newer applicable failures."""
         request = check_context(context)
         self.active_inputs.append(request)
@@ -383,15 +407,48 @@ class CheckResultStore:
             return decision
         failures = [record for _, record, _ in matching
                     if record["status"] in {"failed", "interrupted"}]
+        candidates: list[tuple[int, str, dict[str, Any], pathlib.Path | None, Mapping[str, Any] | None]] = []
         for path, record, _raw in matching:
+            candidates.append((int(_order(record)[0].timestamp() * 1_000_000_000),
+                               record["result_id"], record, path, None))
+        for build in builds:
+            summary = build["summary"]
+            for check in summary["checks"]:
+                if (check.get("kind") != "repository-check" or check.get("id") != check_id
+                        or check.get("status") != "passed" or check.get("reusable") is False
+                        or not {"inputGroup", "result_id", "check_version", "completed_ns"} <= check.keys()):
+                    continue
+                original = check_context(summary["inputGroups"][check["inputGroup"]])
+                if (check.get("inputs_digest") != original["fingerprint"]
+                        or check["check_version"] != original["checkVersion"]
+                        or check.get("qualificationLevel") != original["qualificationLevel"]
+                        or type(check["completed_ns"]) is not int):
+                    raise ValueError("Tagged repository check conflicts with its original inputs.")
+                compared = dict(original)
+                compared["scope"] = dict(original["scope"])
+                if "worktree" in request["scope"]:
+                    compared["scope"]["worktree"] = request["scope"]["worktree"]
+                compared["fingerprint"] = fingerprint(compared)
+                if check_inputs_match_for_reuse(compared, request):
+                    candidates.append((check["completed_ns"], check["result_id"],
+                                       {**check, "inputs": original}, None, build))
+                    # Keep any newer failure while this recorded pass can still
+                    # be selected. This is an applicability scope, not a cursor.
+                    self.active_inputs.append(compared)
+        candidates.sort(key=lambda item: item[:2], reverse=True)
+        for completed_ns, _identity, record, candidate_path, source_build in candidates:
             if record["status"] != "passed":
                 continue
             if LEVELS.index(record["inputs"]["qualificationLevel"]) < LEVELS.index(request["qualificationLevel"]):
                 continue
-            if any(_order(failure) >= _order(record) for failure in failures):
+            if any(int(_order(failure)[0].timestamp() * 1_000_000_000) >= completed_ns for failure in failures):
                 decision["reason"] = "A newer applicable failed attempt blocks the earlier pass."
                 return decision
-            reference = result_reference(path)
+            if source_build is not None:
+                return {"decision": "reuse", "reason": "Matching original result from Git build summary.",
+                        "record": record, "reference": None, "build": source_build}
+            assert candidate_path is not None
+            reference = result_reference(candidate_path)
             return {"decision": "reuse", "reason": "Matching original executed pass.",
                     "record": record, "reference": reference}
         if failures:
@@ -490,6 +547,27 @@ class CheckResultStore:
                 protected = set(protected_ids) | self._references()
                 requests = [(check_context(item), True)
                             for item in (*self.active_inputs, *active_inputs)]
+                if any(record["status"] in {"failed", "interrupted"} for _, record, _ in records):
+                    # Failure retention must cover the selected build at every
+                    # level, including a beta build older than the newest alpha.
+                    # This reads only this checkout's bounded selected summaries.
+                    from sdlc_results import select_build_check_summaries
+
+                    builds = {}
+                    for level in LEVELS:
+                        for build in select_build_check_summaries(self.repo_root, qualification_level=level):
+                            builds[(build["tag"], build["receiptPath"])] = build
+                    for build in builds.values():
+                        summary = build["summary"]
+                        for check in summary["checks"]:
+                            if (check.get("kind") != "repository-check" or check.get("status") != "passed"
+                                    or "inputGroup" not in check):
+                                continue
+                            inputs = check_context(summary["inputGroups"][check["inputGroup"]])
+                            if "worktree" in inputs["scope"]:
+                                inputs["scope"] = {**inputs["scope"], "worktree": hashlib.sha256(str(self.repo_root).encode()).hexdigest()}
+                                inputs["fingerprint"] = fingerprint(inputs)
+                            requests.append((inputs, False))
                 # Historical references retain their exact acceptance and any
                 # applicable failure; they do not create a current candidate
                 # that would pin an additional unreferenced passing version.

@@ -1488,7 +1488,7 @@ def test_installer_completion_receipt_identifies_actual_transaction(tmp_path: pa
     assert receipt["status"] == ("no_op" if mode == "no-op" else "completed")
     expected = [] if mode == "no-op" else ["alpha-tool"] if mode == "selected" else ["alpha-tool", "beta-tool"]
     assert receipt["deployed"] == expected and receipt["removed"] == []
-    assert receipt["cleanup_debt"] == [] and receipt["promotion"] is None
+    assert receipt["cleanup_debt"] == []
     for skill in expected:
         assert (destination / skill / "SKILL.md").is_file()
 
@@ -1570,7 +1570,7 @@ def test_managed_deploy_callable_and_cli_share_exact_source_scope(tmp_path, monk
 @pytest.mark.parametrize("invalid", [
     "missing-root", "missing-manifest", "bad-source", "bad-profile", "duplicate",
     "unsafe", "unknown", "remove-present", "conflicting", "base-and-selected",
-    "bad-base", "same-owner", "empty-owner", "partial-promotion", "orphan-evidence",
+    "bad-base", "same-owner", "empty-owner",
     "inventory-conflict", "runtime-file", "selection-string",
 ])
 def test_managed_deploy_preflight_failure_has_no_effects(tmp_path, monkeypatch, invalid):
@@ -1605,10 +1605,6 @@ def test_managed_deploy_preflight_failure_has_no_effects(tmp_path, monkeypatch, 
             values.pop("skill")
     elif invalid in {"same-owner", "empty-owner"}:
         values["previous_runtime_source_id"] = "example/deploy" if invalid == "same-owner" else ""
-    elif invalid == "partial-promotion":
-        values["promotion_result"] = tmp_path / "promotion.json"
-    elif invalid == "orphan-evidence":
-        values["deployment_evidence"] = [tmp_path / "receipt.json"]
     elif invalid == "inventory-conflict":
         values["inventory_output"] = tmp_path / "inventory.json"
     elif invalid == "runtime-file":
