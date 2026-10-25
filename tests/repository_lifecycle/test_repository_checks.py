@@ -25,6 +25,89 @@ from tests.support.processes import (
 from tests.support.repositories import run_ci_action
 
 
+@pytest.mark.parametrize("scenario,passes", [
+    ("isolated", True), ("old-node", False), ("old-npm", False),
+    ("missing", False), ("later-setup", False), ("node-reset", False),
+    ("conditional", False), ("matrix", True), ("unknown-matrix", False),
+    ("malformed", False), ("range", False), ("other-publisher", False),
+    ("guarded-install", False), ("same-line", True), ("malformed-job", False),
+    ("interrupted-read", True),
+])
+def test_npm_runtime_contract_uses_each_publishing_environment(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, scenario: str, passes: bool,
+) -> None:
+    """Exercise collector output through the contract's actual version assertions."""
+    monkeypatch.syspath_prepend(str(REPOSITORY_LIFECYCLE_SCRIPTS))
+    collector = importlib.import_module("github_contract_engine.collectors.local_repository")
+    comparison = importlib.import_module("github_contract_engine.compare_states")
+    steps: list[dict[str, Any]] = [
+        {"uses": "actions/setup-node@v6", "with": {"node-version": "22.14.0"}},
+        {"run": "npm install --global npm@11.5.1"},
+        {"run": "npm ci\nnpm publish --provenance"},
+        {"uses": "actions/setup-node@v6", "with": {"node-version": "20"}},
+        {"run": "npm install --global npm@9"},
+    ]
+    old_steps = [
+        {"uses": "actions/setup-node@v6", "with": {"node-version": "18"}},
+        {"run": "npm install -g npm@9\nnpm test"},
+    ]
+    jobs: dict[str, Any] = {"test": {"steps": old_steps}, "release": {"steps": steps}}
+    if scenario == "old-node":
+        steps[0]["with"]["node-version"] = "20"
+    elif scenario == "old-npm":
+        steps[1]["run"] = "npm install -g npm@10"
+    elif scenario == "missing":
+        del steps[:2]
+    elif scenario == "later-setup":
+        steps[:] = [steps[2], *steps[:2]]
+    elif scenario == "node-reset":
+        steps.insert(2, {"uses": "actions/setup-node@v6", "with": {"node-version": "24"}})
+    elif scenario == "conditional":
+        steps[1]["if"] = "${{ inputs.upgrade }}"
+    elif scenario in ("matrix", "unknown-matrix"):
+        steps[0]["with"]["node-version"] = "${{ matrix.node }}"
+        jobs["release"]["strategy"] = {"matrix": {"node": ["22.14.0", "24"]}} if scenario == "matrix" else None
+    elif scenario == "range":
+        steps[0]["with"]["node-version"] = "22.14.0 || 20"
+    elif scenario == "other-publisher":
+        jobs["unresolved"] = {"steps": [{"run": "npm publish"}]}
+    elif scenario == "guarded-install":
+        steps[1]["run"] = "false && npm install -g npm@11.5.1; npm publish"
+    elif scenario == "same-line":
+        steps[1]["run"] = "npm install -g npm@11.5.1 && npm publish"
+    elif scenario == "malformed-job":
+        jobs["unresolved"] = {"steps": {"run": "npm publish"}}
+    workflows = tmp_path / ".github/workflows"
+    workflows.mkdir(parents=True)
+    path = workflows / "publish.yml"
+    path.write_text("jobs: [\nnpm publish" if scenario == "malformed" else yaml.safe_dump({"jobs": jobs}), encoding="utf-8")
+    original = path.read_bytes()
+    contract = json.loads((REPOSITORY_LIFECYCLE_SOURCE / "references/contracts/artifact-deterministic-contract.json").read_text(encoding="utf-8"))
+    rule = next(item for item in contract["checks"] if item["id"] == "npm.trusted_publishing_and_provenance")
+    outcomes = []
+    for _ in range(2):
+        if scenario == "interrupted-read":
+            def interrupt_parse(_text: str) -> None:
+                raise KeyboardInterrupt
+
+            with monkeypatch.context() as interrupted:
+                interrupted.setattr(collector.yaml, "safe_load", interrupt_parse)
+                with pytest.raises(KeyboardInterrupt):
+                    collector.collect_local_repository(str(tmp_path), [])
+        local = collector.collect_local_repository(str(tmp_path), [])
+        if scenario in ("malformed", "malformed-job"):
+            assert any(item.get("reason") for item in local["workflows"]["npm_publishing"]["environments"])
+        outcomes.append([
+            comparison.OPERATORS[item["operator"]](
+                comparison.pointer_get({"local": local}, item["path"]),
+                comparison.pointer_get(rule, item["desired_path"]),
+            ) for item in rule["assertions"] if item["operator"] == "all_versions_gte"
+        ])
+    assert outcomes[0] == outcomes[1]
+    assert all(outcomes[0]) is passes
+    assert path.read_bytes() == original
+
+
 def test_android_coverage_requires_declared_non_test_gradle_validation(
     tmp_path: pathlib.Path,
 ) -> None:

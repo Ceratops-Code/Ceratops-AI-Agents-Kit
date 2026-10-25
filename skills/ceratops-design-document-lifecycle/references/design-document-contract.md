@@ -16,7 +16,8 @@ use prose for trivial relationships. Keep names, boundaries, directions,
 protocols, cardinality, and runtime ordering consistent with prose and
 evidence. Give each diagram a title stating its type and scope and a legend;
 label element types, responsibilities, and relationship intent, with
-technologies and protocols at the appropriate abstraction level.
+technologies and protocols at the appropriate abstraction level. Use a
+labelled, unidirectional line for each C4 relationship.
 
 Treat system context, container, and deployment views as C4-recommended
 defaults. Omit one only when the document records why its intended readers and
@@ -66,7 +67,7 @@ inspected, so do not assert clause-level conformance.
 
 ## Authoritative References
 
-Captured 2026-10-11. Recheck official sources for concrete
+Captured 2026-10-25. Recheck official sources for concrete
 standards ambiguities; do not perform a standards refresh on every invocation.
 
 - [arc42 overview](https://arc42.org/overview/):
@@ -104,3 +105,12 @@ standards ambiguities; do not perform a standards refresh on every invocation.
   Inactive-reserved since 2020-03-05. Public scope supports stakeholder-
   oriented software design descriptions, including reconstruction from
   implementation; licensed clauses were not inspected.
+- [Google Technical Writing: Documents](https://developers.google.com/tech-writing/one/documents):
+  Documentation guidance for audience, prerequisite knowledge, scope and
+  reader goals; not an architecture standard.
+- [Diataxis explanation](https://diataxis.fr/explanation/):
+  Documentation guidance for design rationale, alternatives and bounded
+  explanation; not an architecture standard.
+- [Write the Docs: Software documentation](https://www.writethedocs.org/guide/writing/beginners-guide-to-docs/):
+  Documentation guidance for audience needs, useful scope and maintained
+  source links; not an architecture standard.

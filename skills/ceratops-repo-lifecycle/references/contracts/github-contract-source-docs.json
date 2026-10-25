@@ -1,7 +1,7 @@
 {
   "source_docs_version": 1,
   "name": "ceratops_github_contract_source_docs",
-  "captured_on": "2026-10-11",
+  "captured_on": "2026-10-25",
   "policy": {
     "use_order": [
       "official_docs",
@@ -140,6 +140,14 @@
         "org"
       ],
       "url": "https://docs.github.com/en/organizations/managing-organization-settings/actions-policies/workflow-execution-protections"
+    },
+    {
+      "id": "github.actions.workflow_dependency_lockfiles",
+      "scope": [
+        "repo",
+        "org"
+      ],
+      "url": "https://docs.github.com/en/actions/concepts/security/workflow-dependency-lockfiles"
     },
     {
       "id": "github.rest.actions.oidc",

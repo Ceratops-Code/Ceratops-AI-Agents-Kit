@@ -1184,7 +1184,9 @@ Each repository owns one lifecycle contract:
 - `skills/ceratops-repo-lifecycle/references/contracts/artifact-deterministic-contract.json`
   defines external artifact checks for PyPI, npm, DockerHub or OCI registries,
   GitHub Container Registry, GitHub releases, docs sites, and other package
-  registries.
+  registries. npm runtime requirements use the declarations preceding each
+  publishing command in its own job; unrelated jobs and later setup steps do
+  not supply version evidence. Unresolved versions remain blocking findings.
 - `skills/ceratops-skill-lifecycle/references/contracts/skill-contract-source-docs.json`
   records official skill-standard documents and installed OpenAI skill
   references used by skill-design contracts.

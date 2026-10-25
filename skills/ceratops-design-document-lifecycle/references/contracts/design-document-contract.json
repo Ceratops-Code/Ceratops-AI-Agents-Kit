@@ -2,7 +2,7 @@
   "contract_format_version": 1,
   "kind": "design_document_contract",
   "name": "design_document_lifecycle_contract",
-  "captured_on": "2026-10-11",
+  "captured_on": "2026-10-25",
   "field_roles": {
     "executable": ["contract_format_version", "kind", "field_roles", "sections.id", "sections.heading", "sections.group", "sections.required"],
     "annotation_only": ["name", "captured_on", "annotations", "sections.content", "views", "source_files"]
@@ -10,7 +10,7 @@
   "annotations": {
     "organization": "Use a tailored arc42 organization. Preserve an adequate project layout by mapping these topics to its headings; consolidate related sections when useful.",
     "completeness": "Account for every topic with evidence. Distinguish implemented facts, accepted target design, assumptions, and unverified coverage. Conditional topics may be inapplicable only with a reason.",
-    "diagrams": "The required, optional, and unnecessary criteria below are this skill's tailoring policy. Include a view only when it materially improves explanation; use prose for trivial relationships. Keep names, boundaries, directions, protocols, cardinality, and runtime ordering consistent with prose and evidence. Give each diagram a title stating its type and scope and a legend; label element types, responsibilities, and relationship intent, with technologies and protocols at the appropriate abstraction level.",
+    "diagrams": "The required, optional, and unnecessary criteria below are this skill's tailoring policy. Include a view only when it materially improves explanation; use prose for trivial relationships. Keep names, boundaries, directions, protocols, cardinality, and runtime ordering consistent with prose and evidence. Give each diagram a title stating its type and scope and a legend; label element types, responsibilities, and relationship intent, with technologies and protocols at the appropriate abstraction level. Use a labelled, unidirectional line for each C4 relationship.",
     "c4_defaults": "Treat system context, container, and deployment views as C4-recommended defaults. Omit one only when the document records why its intended readers and scope do not benefit; component, dynamic, and code views remain value-driven.",
     "limits": "Mechanical validation checks declarations and syntax only. Section presence, declared coverage, link existence, and rendered Mermaid never prove architectural quality, behavioral truth, security, or complete review.",
     "references": "The wording and template are original. IEEE 1016-2009 is an inactive-reserved historical completeness reference; its public official scope supports design information and stakeholder communication. The licensed full text was not inspected, so do not assert clause-level conformance."
@@ -54,6 +54,9 @@
     {"title": "C4 code", "url": "https://c4model.com/diagrams/code", "note": "Use only for important complex implementation structure, preferably generated from source."},
     {"title": "C4 deployment", "url": "https://c4model.com/diagrams/deployment", "note": "Map system or container instances to infrastructure in a named environment."},
     {"title": "C4 dynamic", "url": "https://c4model.com/diagrams/dynamic", "note": "Use ordered interactions sparingly for consequential runtime patterns."},
-    {"title": "IEEE 1016-2009 official record", "url": "https://standards.ieee.org/ieee/1016/4502/", "note": "Inactive-reserved since 2020-03-05. Public scope supports stakeholder-oriented software design descriptions, including reconstruction from implementation; licensed clauses were not inspected."}
+    {"title": "IEEE 1016-2009 official record", "url": "https://standards.ieee.org/ieee/1016/4502/", "note": "Inactive-reserved since 2020-03-05. Public scope supports stakeholder-oriented software design descriptions, including reconstruction from implementation; licensed clauses were not inspected."},
+    {"title": "Google Technical Writing: Documents", "url": "https://developers.google.com/tech-writing/one/documents", "note": "Documentation guidance for audience, prerequisite knowledge, scope and reader goals; not an architecture standard."},
+    {"title": "Diataxis explanation", "url": "https://diataxis.fr/explanation/", "note": "Documentation guidance for design rationale, alternatives and bounded explanation; not an architecture standard."},
+    {"title": "Write the Docs: Software documentation", "url": "https://www.writethedocs.org/guide/writing/beginners-guide-to-docs/", "note": "Documentation guidance for audience needs, useful scope and maintained source links; not an architecture standard."}
   ]
 }
