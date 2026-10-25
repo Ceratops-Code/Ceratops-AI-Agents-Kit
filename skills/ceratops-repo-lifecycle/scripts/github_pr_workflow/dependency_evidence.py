@@ -411,6 +411,22 @@ def fetch_pr_body(repo: str, number: int, expected_head: str) -> dict[str, Any]:
     return {"status": "ok", "body": body}
 
 
+def dependabot_branch_ecosystem(head_ref: str) -> str | None:
+    """Keep the bot's ecosystem when a repaired PR also changes CI or other locks.
+
+    Dependabot's branch prefix identifies its package manager. Unsupported
+    managers retain their own name so registry checks fail with the real cause.
+    Ordinary branch names leave the existing manifest inference in control.
+    """
+
+    parts = head_ref.split("/", 2)
+    if len(parts) != 3 or parts[0] != "dependabot" or not parts[1]:
+        return None
+    return {
+        "github_actions": "github-actions", "npm_and_yarn": "npm", "uv": "pip",
+    }.get(parts[1], parts[1])
+
+
 def build_update(
     package: str | None,
     current: str | None,

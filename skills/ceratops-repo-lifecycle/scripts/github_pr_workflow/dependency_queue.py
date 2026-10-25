@@ -29,6 +29,7 @@ from .dependency_common import (
 )
 from .dependency_evidence import (
     branch_freshness,
+    dependabot_branch_ecosystem,
     dependency_tree_evidence,
     exact_ci_evidence,
     fetch_ci_annotations,
@@ -395,6 +396,10 @@ def preflight(args: argparse.Namespace) -> int:
                             ],
                         }
                     )
+
+            branch_ecosystem = dependabot_branch_ecosystem(str(live.get("head_ref") or ""))
+            if branch_ecosystem:
+                updates = [{**update, "ecosystem": branch_ecosystem} for update in updates]
 
             update_evidence = []
             for update in updates:

@@ -27,7 +27,9 @@ def test_dependency_preflight_collects_evidence_after_rebase_wait(
         "head_oid": "a" * 40, "files": [{"path": "old.txt"}],
     }
     new = {
-        **old, "head_oid": "b" * 40, "files": [{"path": "package.json"}],
+        **old, "head_oid": "b" * 40,
+        "head_ref": "dependabot/npm_and_yarn/demo-1.0.1",
+        "files": [{"path": ".github/workflows/ci.yml"}, {"path": "package.json"}],
         "rebase_wait": {"status": wait_status},
     }
     pr = {"repo": "owner/repo", "number": 1, "title": old["title"]}
@@ -79,6 +81,7 @@ def test_dependency_preflight_collects_evidence_after_rebase_wait(
 
     def tree(checkout: pathlib.Path, update: dict[str, Any], files: list[Any], alerts: list[Any], commit: str):
         assert files == new["files"]
+        assert update["ecosystem"] == "npm"
         assert commit == new["head_oid"]
         assert order == ["wait", "ci"]
         order.append("tree")
@@ -126,6 +129,23 @@ def test_dependency_preflight_collects_evidence_after_rebase_wait(
     repeated = json.loads(output.read_text(encoding="utf-8"))
     assert repeated["repositories"] == payload["repositories"]
     assert repeated["summary"] == payload["summary"]
+
+
+@pytest.mark.parametrize("head_ref,expected", [
+    ("dependabot/npm_and_yarn/vendor/demo-2", "npm"),
+    ("dependabot/uv/scripts/ruff-0.17.1", "pip"),
+    ("dependabot/pip/pypdf-6.21.2", "pip"),
+    ("dependabot/github_actions/owner/action-v2", "github-actions"),
+    ("dependabot/gradle/wrapper-9.8", "gradle"),
+    ("dependabot/composer/vendor/package-2", "composer"),
+    ("codex/dependency-repairs", None),
+    ("dependabot//unknown", None),
+    ("", None),
+])
+def test_dependabot_branch_keeps_its_package_manager(monkeypatch, head_ref, expected):
+    evidence = load_pr_workflow_module(monkeypatch, "dependency_evidence")
+    for _ in range(2):
+        assert evidence.dependabot_branch_ecosystem(head_ref) == expected
 
 
 @pytest.mark.parametrize(
