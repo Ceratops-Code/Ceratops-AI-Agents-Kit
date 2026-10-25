@@ -142,6 +142,8 @@ def prepare_result(
             allowed.add("execution")
         if isinstance(saved, dict) and "checks" in saved:
             allowed.add("checks")
+        if isinstance(saved, dict) and "check_summary" in saved:
+            allowed.add("check_summary")
         if (isinstance(saved, dict) and set(saved) == allowed
                 and all(saved.get(key) == value for key, value in expected.items())
                 and saved.get("status") == "passed"
@@ -328,9 +330,227 @@ def check_current_inputs(context: Mapping[str, Any], root: pathlib.Path) -> None
             raise ValueError("repository check locked runtime differs from the selected runtime")
 
 
+
+def parse_check_summary(raw: bytes) -> dict[str, Any]:
+    """Read self-contained check facts; missing historical facts grant no reuse."""
+    if len(raw) > 16 * 1024 * 1024:
+        raise ValueError("Check summary exceeds the size limit.")
+    value = json.loads(raw)
+    if (not isinstance(value, dict)
+            or set(value) != {"schema", "inputGroups", "checkGroups", "checks"}
+            or value["schema"] != "ceratops-check-summary.v1"
+            or not isinstance(value["checks"], list)):
+        raise ValueError("Check summary has incomplete fields.")
+    for name in ("inputGroups", "checkGroups"):
+        table = value[name]
+        if not isinstance(table, dict):
+            raise ValueError("Check summary input table is missing.")
+        for identity, facts in table.items():
+            digest = hashlib.sha256(json.dumps(facts, sort_keys=True, ensure_ascii=True,
+                                               separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+            if identity != digest or not isinstance(facts, dict):
+                raise ValueError("Check summary input hash differs from its facts.")
+    identities = set()
+    for check in value["checks"]:
+        if (not isinstance(check, dict) or not isinstance(check.get("id"), str)
+                or not isinstance(check.get("status"), str)
+                or ("required" in check and type(check["required"]) is not bool)):
+            raise ValueError("Check summary outcome is incomplete.")
+        identity = (check.get("kind"), check["id"])
+        if identity in identities:
+            raise ValueError("Check summary repeats one check.")
+        identities.add(identity)
+        for field, table in (("inputGroup", "inputGroups"), ("checkGroup", "checkGroups"),
+                             ("applicableInputGroup", "inputGroups"), ("comparisonInputGroup", "inputGroups")):
+            if field in check and check[field] not in value[table]:
+                raise ValueError("Check summary names an absent input group.")
+    return value
+
+
+def build_qualification(version: str) -> str:
+    """Use the existing PEP 440 version format, not tag-name substring guesses."""
+    from packaging.version import Version
+
+    parsed = Version(version)
+    if parsed.dev is not None:
+        return "alpha"
+    return {"a": "alpha", "b": "beta", "rc": "rc"}[parsed.pre[0]] if parsed.pre else "final"
+
+
+def _build_git(root: pathlib.Path, *arguments: str, missing: bool = False) -> bytes:
+    command = ["git", "-C", str(root), *arguments]
+    try:
+        result = subprocess.run(command, cwd=root, capture_output=True, check=False)
+    except OSError as exc:
+        result = None
+        cause = str(exc)
+    else:
+        assert result is not None
+        if result.returncode == 0:
+            return result.stdout
+        if missing and result.returncode == 1:
+            return b""
+        cause = "Git could not read the selected build."
+    details = json.dumps({
+        "operation": "read-build-history", "target": str(root), "command": command,
+        "python_runtime": sys.executable, "cwd": str(root),
+        "exit_status": result.returncode if result is not None else None,
+        "cause": cause,
+        "stdout": (result.stdout.decode("utf-8", "replace") or "<empty>") if result is not None else "<unavailable: launch failed>",
+        "stderr": (result.stderr.decode("utf-8", "replace") or "<empty>") if result is not None else "<unavailable: launch failed>",
+    })
+    for name, value in os.environ.items():
+        if len(value) >= 4 and any(word in name.upper() for word in ("TOKEN", "PASSWORD", "SECRET", "API_KEY")):
+            details = details.replace(value, "<redacted>")
+    raise ValueError(details)
+
+
+def _build_blob(root: pathlib.Path, commit: str, path: str, limit: int) -> bytes:
+    """Only literal regular Git files can supply committed reuse facts."""
+    if ("\\" in path or path.startswith("/") or ":" in path
+            or any(part in {"", ".", ".."} for part in path.split("/"))):
+        raise ValueError("Build record path must be repository-relative.")
+    entry = _build_git(root, "ls-tree", "-z", commit, "--", f":(literal){path}")
+    metadata, separator, actual = entry.rstrip(b"\0").partition(b"\t")
+    fields = metadata.split()
+    if (not separator or actual != path.encode() or len(fields) != 3
+            or fields[0] not in {b"100644", b"100755"} or fields[1] != b"blob"):
+        raise ValueError("Build history requires a regular committed file: " + path)
+    oid = fields[2].decode("ascii")
+    if int(_build_git(root, "cat-file", "-s", oid)) > limit:
+        raise ValueError("Committed build record exceeds its size limit.")
+    return _build_git(root, "cat-file", "blob", oid)
+
+
+def read_build_check_summary(root: pathlib.Path, tag: str, receipt_path: str) -> dict[str, Any]:
+    """Read only the tagged receipt and summary; never open packages or full logs."""
+    _build_git(root, "check-ref-format", "refs/tags/" + tag)
+    commit = _build_git(root, "rev-parse", "--verify", "--end-of-options",
+                        f"refs/tags/{tag}^{{commit}}").decode().strip()
+    raw = _build_blob(root, commit, receipt_path, 1024 * 1024)
+    receipt = json.loads(raw)
+    identity = receipt["identity"]
+    expected_tag = identity["releaseUnit"] + "/" + identity["version"]
+    parent = f'.build/{identity["releaseUnit"]}/{identity["version"]}'
+    expected_paths = {parent + "/build_receipt.json",
+                      parent + "/" + identity["target"] + "/build_receipt.json"}
+    if (receipt.get("schema") != "ceratops-build-result.v3" or receipt.get("status") != "passed"
+            or receipt.get("receiptPath") != receipt_path or receipt_path not in expected_paths
+            or tag != expected_tag or receipt.get("tag", tag) != tag):
+        raise ValueError("Build tag, identity and committed receipt path disagree.")
+    summary = {"schema": "ceratops-check-summary.v1", "inputGroups": {}, "checkGroups": {}, "checks": []}
+    reference = receipt.get("checkSummary")
+    if reference is not None:
+        expected = str(pathlib.PurePosixPath(receipt_path).with_name("check_summary.json"))
+        if (receipt.get("tag") != tag or reference.get("root") != "git"
+                or reference.get("path") != expected
+                or expected not in receipt["committedResultPaths"]):
+            raise ValueError("Build receipt has an invalid check-summary link.")
+        content = _build_blob(root, commit, expected, 16 * 1024 * 1024)
+        if len(content) != reference["size"] or hashlib.sha256(content).hexdigest() != reference["sha256"]:
+            raise ValueError("Committed check summary differs from its receipt.")
+        summary = parse_check_summary(content)
+    return {"tag": tag, "commit": commit, "receiptPath": receipt_path,
+            "receipt": receipt, "summary": summary}
+
+
+def select_build_check_summaries(
+    root: pathlib.Path, *, qualification_level: str = "alpha",
+    unit: str | None = None, target: str | None = None,
+) -> list[dict[str, Any]]:
+    """Choose the newest eligible version in this checkout's .build records.
+
+    Git tags prove completion; the checkout supplies only selection identities.
+    No ancestry walk, other checkout, deployment history or artifact-store scan.
+    A newer completed historical build with no summary supplies no coverage,
+    instead of silently borrowing an older build.
+    """
+    from packaging.version import InvalidVersion, Version
+
+    levels = ("alpha", "beta", "rc", "final")
+    if qualification_level not in levels:
+        raise ValueError("Unsupported build qualification level.")
+    history = root / ".build"
+    if not history.is_dir():
+        return []
+    candidates: list[tuple[Any, str, str, pathlib.Path, str]] = []
+    for pattern in ("*/*/build_receipt.json", "*/*/*/build_receipt.json"):
+        for path in history.glob(pattern):
+            if any(parent.is_symlink() or parent.is_junction() for parent in (path, *path.parents)):
+                raise ValueError("Build history cannot traverse directory links.")
+            if path.stat().st_size > 1024 * 1024:
+                raise ValueError("Local build receipt exceeds its size limit.")
+            try:
+                receipt = json.loads(path.read_bytes())
+                identity = receipt["identity"]
+                name, destination, version = identity["releaseUnit"], identity["target"], identity["version"]
+                level = build_qualification(version)
+                if (unit is not None and name != unit) or (target is not None and destination != target):
+                    continue
+                if levels.index(level) < levels.index(qualification_level):
+                    continue
+                tag = name + "/" + version
+                if receipt.get("status") != "passed" or receipt.get("tag", tag) != tag:
+                    continue
+                candidates.append((Version(version), name, destination, path, tag))
+            except (ValueError, KeyError, TypeError, InvalidVersion):
+                continue  # Interrupted local preparation is not a completed build.
+    chosen: dict[tuple[str, str], dict[str, Any]] = {}
+    for _version, name, destination, path, tag in sorted(candidates, key=lambda row: (row[0], str(row[3])), reverse=True):
+        if (name, destination) in chosen:
+            continue
+        # An absent tag is an unfinished preparation, not an accepted baseline.
+        if not _build_git(root, "rev-parse", "--verify", "--quiet", "--end-of-options",
+                          "refs/tags/" + tag, missing=True):
+            continue
+        selected = read_build_check_summary(root, tag, path.relative_to(root).as_posix())
+        identity = selected["receipt"]["identity"]
+        if (identity["releaseUnit"], identity["target"]) != (name, destination):
+            raise ValueError("Local build selector differs from the tagged identity.")
+        chosen[(name, destination)] = selected
+    return [chosen[key] for key in sorted(chosen)]
+
+
+def summarize_check_result(record: Mapping[str, Any], children: Any = None) -> dict[str, Any]:
+    """Export compact original outcomes with all applicability facts inlined.
+
+    Tables deduplicate group and test-file inputs. No receipt, log or package
+    must survive elsewhere for these facts to remain usable. Absent historical
+    inputs stay absent; this exporter never invents an executed check.
+    """
+    result: dict[str, Any] = {"schema": "ceratops-check-summary.v1", "inputGroups": {},
+              "checkGroups": {}, "checks": []}
+    if children:
+        if not isinstance(children, dict) or children.get("schema") != result["schema"]:
+            raise ValueError("unsupported compact check summary")
+        result["inputGroups"].update(children["inputGroups"])
+        result["checkGroups"].update(children["checkGroups"])
+        result["checks"].extend(dict(item) for item in children["checks"])
+    represented = {item["id"] for item in result["checks"]}
+    result["checks"].extend({**item, **({"required": False} if item.get("status") in {"skipped", "scope-unrepresented"} else {})}
+                            for item in record.get("checks", [])
+                            if item.get("id") not in represented)
+    if isinstance(record.get("inputs"), dict) and record.get("execution", {}).get("finishedAt"):
+        context = record["inputs"]
+        group = hashlib.sha256(canonical(context).rstrip(b"\n")).hexdigest()
+        result["inputGroups"][group] = context
+        finished = datetime.datetime.fromisoformat(record["execution"]["finishedAt"])
+        result["checks"].append({
+            "kind": "repository-check", "id": record["check_id"], "status": record["status"], "required": True,
+            "result_id": record["result_id"], "check_version": record["check_version"],
+            "candidate_id": record["candidate_id"], "qualificationLevel": context["qualificationLevel"],
+            "completed_ns": int(finished.timestamp() * 1_000_000_000),
+            "inputGroup": group, "inputs_digest": context["fingerprint"],
+            "reusable": not any(item.get("reusable") is False for item in record.get("checks", [])),
+            "children": [{"kind": item.get("kind"), "id": item["id"]} for item in result["checks"]],
+        })
+    return result
+
+
 def run_recorded_check(
     callback: Callable[[], int], args: argparse.Namespace, invocation: Mapping[str, Any],
     *, checks: Callable[[], Any] | None = None, repo_root: pathlib.Path | None = None,
+    summary: Callable[[], Any] | None = None,
 ) -> int:
     """Write actual runner outcomes before success and preserve original attempts.
 
@@ -405,6 +625,8 @@ def run_recorded_check(
             }
         if checks is not None:
             completed["checks"] = checks()
+        if context is not None or summary is not None:
+            completed["check_summary"] = summarize_check_result(completed, summary() if summary else None)
         if read_result(path)[1] != running:
             raise ValueError("running result changed; refusing to overwrite it")
         write_result(path, completed, exclusive=False)

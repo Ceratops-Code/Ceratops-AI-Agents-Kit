@@ -111,6 +111,8 @@ def test_android_coverage_requires_declared_non_test_gradle_validation(
             ["rustfmt", "clippy"],
         ),
         ("dotnet", "project/app.csproj", ["dotnet-format-check"], ["dotnet-sdk"]),
+        ("dotnet", "project/app.fsproj", ["dotnet-format-check"], ["dotnet-sdk"]),
+        ("dotnet", "project/app.vbproj", ["dotnet-format-check"], ["dotnet-sdk"]),
         ("shell", "project/check.sh", ["shellcheck"], ["shellcheck"]),
     ],
 )
@@ -180,8 +182,98 @@ def test_ecosystem_coverage_requires_declared_repository_checks(
     assert any(missing_capability in error for error in incomplete["errors"])
 
 
+def test_native_cpp_solutions_do_not_require_dotnet_checks(tmp_path: pathlib.Path) -> None:
+    """A solution container alone says nothing about its project language."""
+    native = tmp_path / "native"
+    native.mkdir()
+    (native / "app.sln").write_text(
+        'Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "app", "app.vcxproj", "{id}"\n',
+        encoding="utf-8",
+    )
+    (native / "app.vcxproj").write_text("<Project />\n", encoding="utf-8")
+    compatibility = importlib.import_module(
+        "ceratops_repo_compatibility_engine.validate_ceratops_compatibility"
+    )
+    contracts = importlib.import_module(
+        "ceratops_repo_compatibility_engine.repository_validation_contract"
+    )
+    sdlc = {"version": 4, "repository": {"capabilities": {}, "actions": {}}}
+    for _ in range(2):
+        assert compatibility._validation_coverage_errors(
+            native, sdlc, contracts.load_validation_contract()
+        ) == []
+    (native / "managed.csproj").write_text("<Project />\n", encoding="utf-8")
+    assert any("coverage dotnet" in error for error in compatibility._validation_coverage_errors(
+        native, sdlc, contracts.load_validation_contract()
+    ))
+
+
 def _ruff_tools() -> Any:
     return importlib.import_module("ceratops_repo_compatibility_engine.python_tool_configuration")
+
+
+@pytest.mark.parametrize("encoding", ["windows-1252", "iso-8859-1", "utf-8"])
+def test_repository_scan_reads_declared_html_without_weakening_code_reads(
+    tmp_path: pathlib.Path, encoding: str,
+) -> None:
+    collector = importlib.import_module("github_contract_engine.collectors.local_repository")
+    copyright_text = chr(0xA9) + " Original authors"
+    html = f'<html><meta http-equiv="Content-Type" content="text/html; charset={encoding}">\n{copyright_text}</html>'
+    (tmp_path / "README.html").write_bytes(html.encode(encoding))
+    (tmp_path / "broken.py").write_bytes(b"# invalid UTF-8: \xff\n")
+    before = {p.name: p.read_bytes() for p in tmp_path.iterdir()}
+    for _ in range(2):
+        result = collector.scan_local(str(tmp_path))
+        assert copyright_text in result["texts"]["README.html"]
+        assert "broken.py" not in result["texts"]
+        assert len(result["errors"]) == 1 and result["errors"][0].startswith("broken.py:")
+        assert {p.name: p.read_bytes() for p in tmp_path.iterdir()} == before
+
+
+def test_shell_compatibility_declares_its_generated_check_and_repeats(tmp_path: pathlib.Path) -> None:
+    """A fresh shell repository gets a runnable command and matching SDLC setup."""
+    repo = tmp_path / "shell-repo"
+    repo.mkdir()
+    (repo / ".git").write_text("gitdir: test\n", encoding="utf-8")
+    (repo / "README.md").write_text("# Shell repository\n", encoding="utf-8")
+    (repo / "build.sh").write_text("#!/bin/sh\necho OK\n", encoding="utf-8")
+    for _ in range(2):
+        result = run_compatibility_engine(
+            REPOSITORY_LIFECYCLE_SCRIPTS, "apply", "--target-repo-root", str(repo)
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        sdlc = yaml.safe_load((repo / "sdlc/sdlc.yml").read_text(encoding="utf-8"))
+        check = sdlc["repository"]["actions"]["validate"]
+        assert check["validation-capabilities"] == ["shellcheck"]
+        assert "shellcheck" in check["requires"]["capabilities"]
+        generator = importlib.import_module(
+            "ceratops_repo_compatibility_engine.generate_repository_checks"
+        )
+        shell = next(item for item in generator.contract_checks(repo) if item["id"] == "shellcheck")
+        assert shell["command"] == ["shellcheck", "--severity=error", "--", "build.sh"]
+
+
+def test_language_checks_respect_git_vendor_and_generated_attributes(tmp_path: pathlib.Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "--quiet"], cwd=repo, check=True)
+    (repo / ".gitattributes").write_text(
+        "captured/** linguist-vendored=true\noutput/** linguist-generated\n", encoding="utf-8"
+    )
+    for directory in ["captured", "output", "owned"]:
+        (repo / directory).mkdir()
+        (repo / directory / "build.sh").write_text("#!/bin/sh\necho OK\n", encoding="utf-8")
+    (repo / "captured/managed.csproj").write_text("<Project />\n", encoding="utf-8")
+    generator = importlib.import_module("ceratops_repo_compatibility_engine.generate_repository_checks")
+    compatibility = importlib.import_module("ceratops_repo_compatibility_engine.validate_ceratops_compatibility")
+    for _ in range(2):
+        shell = next(item for item in generator.contract_checks(repo) if item["id"] == "shellcheck")
+        assert shell["command"] == ["shellcheck", "--severity=error", "--", "owned/build.sh"]
+        errors = compatibility._validation_coverage_errors(
+            repo, {"version": 4, "repository": {"capabilities": {}, "actions": {}}},
+            generator.load_validation_contract(),
+        )
+        assert len(errors) == 1 and "coverage shell" in errors[0]
 
 
 def _ruff_policy() -> dict[str, Any]:
@@ -603,10 +695,10 @@ def test_compatibility_materializer_supports_repositories_without_skills(
             "scripts": {"lint": "echo lint", "test": "echo test"},
         }), encoding="utf-8")
         (nested / "scripts" / lockfile).write_text("{}\n", encoding="utf-8")
-        check = next(item for item in materializer.contract_checks(nested) if item["id"] == manager + "-lint")
+        check = next(item for item in materializer.repository_checks.contract_checks(nested) if item["id"] == manager + "-lint")
         assert check["command"] == ["{" + manager + "}", flag, "scripts", "run", "lint"]
-        assert materializer.default_markdown_files(nested) == {}
-        _, setup = materializer._validation_workflow(nested, [check], markdown_files={})
+        assert materializer.repository_checks.default_markdown_files(nested) == {}
+        _, setup = materializer.repository_checks._validation_workflow(nested, [check], markdown_files={})
         assert f"{manager} {flag} scripts " in setup
         (nested / ".build").mkdir()
         (nested / ".build/test_diagnostic.py").write_text("raise AssertionError\n", encoding="utf-8")

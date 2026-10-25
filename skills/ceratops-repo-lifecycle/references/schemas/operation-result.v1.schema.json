@@ -1072,6 +1072,10 @@
       "description": "A successful target qualification prepared before the final receipt-only commit. It deliberately omits its own hash and the not-yet-created final commit.",
       "type": "object",
       "additionalProperties": false,
+      "dependentRequired": {
+        "tag": ["checkSummary"],
+        "checkSummary": ["tag"]
+      },
       "required": [
         "schema",
         "status",
@@ -1118,6 +1122,13 @@
         },
         "receiptPath": {
           "$ref": "#/$defs/bundlePath"
+        },
+        "tag": {
+          "type": "string",
+          "minLength": 1
+        },
+        "checkSummary": {
+          "$ref": "#/$defs/receiptFile"
         },
         "artifactInputs": {
           "type": "array",

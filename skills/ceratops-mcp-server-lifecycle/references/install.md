@@ -12,13 +12,13 @@ validation.
 - (D) Repository installation runs `python
   <skill-root>/scripts/install-mcp-server.py --repo-root <repo-root>
   [--source <mcp-server-source>] [--mcp-server-name <name>]
-  [--package-wheel <wheel> --package-lock <lock>]`. For a saved promotion
-  handoff, also pass `--promotion-result <record> --operation <location>` and
-  optionally `--evidence-output <task-temp-file>`.
+  [--package-wheel <wheel> --package-lock <lock>]
+  [--evidence-output <caller-selected-file>]`. The optional output contains this
+  installation's result, not a promotion-report binding.
 - (D) A completed installation whose manager result was retained may replace
-  installation inputs with `--manager-result <file>` and the same promotion
-  arguments. The helper must match the active selection and immutable receipt
-  before emitting completion evidence; it never reinstalls for this recovery.
+  installation inputs with `--manager-result <file>`. The helper checks the active
+  selection and immutable receipt against that result before emitting completion
+  evidence; it never reinstalls for this recovery.
 
 ## SDLC execution
 
@@ -66,12 +66,13 @@ source-build path.
 3. Treat a failed candidate as an installation failure; report its error and
    preserve the active installation. Fix the owning source or release inputs
    before another attempt when the cause is deterministic.
-4. Inspect versions after success. For a saved promotion, retain the helper's
-   bound receipt and pass all completed handoff receipts together to the
-   repository promotion finalizer. The caller removes the optional evidence
-   output after finalization; the helper atomically keeps only that current
-   file and no predecessors. For the manager itself, finish the current
-   request and reconnect to activate the selected version on the next launch.
+4. Inspect versions after success and return the actual installation result,
+   including manager maintenance metadata. Repository lifecycle consumes its
+   requested installation's returned result and owns its own report cleanup;
+   this installer neither receives a promotion report nor calls repo cleanup.
+   The caller removes optional evidence output after use; the helper keeps only
+   that current file. For the manager itself, finish the current request and
+   reconnect to activate the selected version on the next launch.
 
 ## Completion Gate
 

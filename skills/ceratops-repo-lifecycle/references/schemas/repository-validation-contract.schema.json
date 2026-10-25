@@ -45,7 +45,7 @@
       "items": {"$ref": "#/$defs/coverageRequirement"}
     },
     "checks": {
-      "description": "Executable check selection and command data consumed by apply_ceratops_compatibility.contract_checks and the generated repository validator.",
+      "description": "Executable check selection and command data consumed by generate_repository_checks.contract_checks and the generated repository validator.",
       "type": "array",
       "minItems": 1,
       "items": {"$ref": "#/$defs/check"}
@@ -88,7 +88,7 @@
       }
     },
     "condition": {
-      "description": "Executable predicates consumed by apply_ceratops_compatibility._validation_condition_matches.",
+      "description": "Executable predicates consumed by generate_repository_checks._validation_condition_matches.",
       "oneOf": [
         {"$ref": "#/$defs/packageScript"},
         {"$ref": "#/$defs/pathAny"},
