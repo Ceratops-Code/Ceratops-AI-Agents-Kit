@@ -1,8 +1,9 @@
 """Parse repository test requests without running tests or mutating files.
 
 Only explicit ``--auto`` requests inspect GitHub context: pull requests retain
-the repository's base/head impact selection; local runs, pushes and promotions
-run all tests. SDLC supplies promotion context only to the test subprocess.
+the repository's base/head impact selection; local runs and promotions use
+eligible build summaries and current worktree results. Push keeps all-group
+selection. SDLC supplies promotion context only to the test subprocess.
 Malformed or unsupported context fails closed before collection.
 """
 
@@ -26,7 +27,7 @@ def parse_request(argv: Sequence[str] | None) -> tuple[argparse.Namespace, str |
     parser = argparse.ArgumentParser()
     parser.add_argument("targets", nargs="*", help="Repository test paths or pytest node IDs.")
     parser.add_argument("--all", action="store_true")
-    parser.add_argument("--auto", action="store_true", help="PR impact tests in GitHub; all tests locally or on push.")
+    parser.add_argument("--auto", action="store_true", help="PR impact checks; Git build-summary reuse locally and during promotion.")
     parser.add_argument("--base")
     parser.add_argument("--head")
     parser.add_argument("--diagnostic-output", type=pathlib.Path)
@@ -40,6 +41,7 @@ def parse_request(argv: Sequence[str] | None) -> tuple[argparse.Namespace, str |
     _result_writer["add_result_arguments"](parser)
     args = parser.parse_args(list(argv) if argv is not None else None)
     args.context = None
+    args.build_history = False
     modes = sum((bool(args.targets), args.all, args.auto, args.validate_manifest,
                  args.worktree, args.write_collection is not None,
                  args.reconcile_collection is not None,
@@ -72,10 +74,10 @@ def parse_request(argv: Sequence[str] | None) -> tuple[argparse.Namespace, str |
                 ):
                     raise ValueError("invalid or conflicting promotion test context")
                 args.context = context
-                args.all = True
+                args.build_history = True
             elif os.environ.get("GITHUB_ACTIONS") != "true":
                 args.context = {"trigger": "local"}
-                args.all = True
+                args.build_history = True
             elif os.environ.get("GITHUB_EVENT_NAME") == "push":
                 args.context = {"trigger": "push", "branch": os.environ.get("GITHUB_REF_NAME", "")}
                 args.all = True
@@ -126,6 +128,7 @@ def run_recorded_request(
     args: argparse.Namespace, callback: Callable[[], int], *,
     repo_root: pathlib.Path, request_error: str | None = None,
     checks: Callable[[], object] | None = None,
+    summary: Callable[[], object] | None = None,
 ) -> int:
     """Keep custom selection/output while the declared runner writes outcomes."""
     if args.describe_test_results:
@@ -147,4 +150,4 @@ def run_recorded_request(
         "targets": list(args.targets), "all": args.all, "auto": args.auto,
         "base": args.base, "head": args.head, "worktree": args.worktree,
         "select_only": args.select_only, "probe_command": args.probe_command,
-    }, repo_root=repo_root, checks=checks)
+    }, repo_root=repo_root, checks=checks, summary=summary)

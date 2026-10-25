@@ -167,6 +167,29 @@ def test_declared_writer_preserves_actual_attempt_and_original_timing(
     assert calls == ["executed"] and path.read_bytes() == saved
 
 
+def test_compact_repository_summary_keeps_scope_inputs_and_original_result(
+    check_writer: dict[str, Any], tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    context = _context(tmp_path)
+    monkeypatch.setenv("CERATOPS_REPOSITORY_CHECK_CONTEXT", json.dumps(context))
+    path = tmp_path / ".git/result.json"
+    request = _request(path)
+    observed = [{"id": "optional-probe", "status": "skipped", "required": False,
+                 "reason": "This repository has no optional service."}]
+    assert check_writer["run_recorded_check"](lambda: 0, request, {}, checks=lambda: observed) == 0
+    record = json.loads(path.read_bytes())
+    summary = record["check_summary"]
+    own = next(check for check in summary["checks"] if check.get("kind") == "repository-check")
+    assert summary["inputGroups"][own["inputGroup"]] == context
+    assert own["result_id"] == record["result_id"]
+    assert own["check_version"] == record["check_version"]
+    assert own["qualificationLevel"] == "beta" and own["status"] == "passed"
+    assert observed[0] in summary["checks"]
+    exists, reopened = check_writer["read_result"](path)
+    assert exists and reopened["check_summary"] == summary
+
+
 @pytest.mark.parametrize("mutation", ["changed", "added", "deleted", "dependency", "environment", "tool", "runtime"])
 @pytest.mark.parametrize("boundary", ["before", "after"])
 def test_declared_writer_rejects_input_drift_at_each_execution_boundary(
@@ -491,7 +514,7 @@ def test_qualified_group_retains_the_original_inherited_child_level(
     import importlib
     import uuid
 
-    from tests.test_infrastructure.test_pytest_execution import (
+    from tests.test_infrastructure.test_test_reuse import (
         _acceptance_repository,
         _acceptance_test,
     )
@@ -579,7 +602,7 @@ def test_aggregate_reuse_preserves_external_input_markers_and_original_child_pas
 ) -> None:
     import uuid
 
-    from tests.test_infrastructure.test_pytest_execution import (
+    from tests.test_infrastructure.test_test_reuse import (
         _acceptance_repository,
         _acceptance_test,
     )
@@ -624,6 +647,7 @@ def test_aggregate_reuse_preserves_external_input_markers_and_original_child_pas
             # Historical aggregate producers did not export child scope facts.
             # Such an older pass must never bypass the explicit current constraint.
             historical = {**record, "result_id": str(uuid.uuid4()), "checks": []}
+            historical.pop("check_summary", None)
             historical["execution"] = {**record["execution"], "startedAt": "2000-01-01T00:00:00+00:00",
                                        "finishedAt": "2000-01-01T00:00:00+00:00", "durationSeconds": 0}
             historical_path = store.directory / f'{historical["result_id"]}.json'
@@ -643,6 +667,7 @@ def test_aggregate_reuse_preserves_external_input_markers_and_original_child_pas
     # scope prohibits reuse. Ordinary retention still bounds unrelated revisions.
     for version in range(3):
         unrelated = json.loads(json.dumps(saved[-1]))
+        unrelated.pop("check_summary", None)
         unrelated["result_id"] = str(uuid.uuid4())
         unrelated["check_version"] = f"{version + 4:064x}"
         unrelated["inputs"]["checkVersion"] = unrelated["check_version"]
@@ -681,7 +706,7 @@ def test_aggregate_expected_skips_keep_actual_outcomes_and_complete_scope(
     test_runner_module: Any, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
     boundary: str,
 ) -> None:
-    from tests.test_infrastructure.test_pytest_execution import _acceptance_repository
+    from tests.test_infrastructure.test_test_reuse import _acceptance_repository
 
     reader = runpy.run_path(str(ROOT / "skills/ceratops-repo-lifecycle/scripts/retain_check_results.py"))
     root = _acceptance_repository(tmp_path)
@@ -769,7 +794,7 @@ def test_aggregate_owns_complete_passes_when_only_individual_storage_is_busy(
     test_runner_module: Any, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
     boundary: str,
 ) -> None:
-    from tests.test_infrastructure.test_pytest_execution import (
+    from tests.test_infrastructure.test_test_reuse import (
         _acceptance_repository,
         _acceptance_test,
     )

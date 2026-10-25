@@ -19,18 +19,14 @@ def check_deployment_receipt(
     repo_root: pathlib.Path,
     commit: str,
     outcome: dict[str, Any],
-    binding: dict[str, Any] | None,
     error_type: type[RuntimeError],
-    read_promotion_bindings: Callable[[dict[str, Any]], list[dict[str, Any]]],
     check_destination_path: Callable[[pathlib.Path], pathlib.Path],
 ) -> None:
     """Check closed completion evidence without scanning or deploying installed files.
 
-    The producer attests its actual transaction. An external handoff receipt
-    must bind the exact saved promotion bytes; inline executed-action evidence
-    is already held by the lifecycle envelope. Neither path replays deployment.
-    The caller owns its error class, record-binding parser and linked-path guard;
-    injecting them preserves those boundaries without a circular import.
+    The operation runner holds the requested installer's returned result.
+    There is no separately supplied promotion report or external receipt to
+    match. The caller owns its error class and destination-path guard.
     """
     fields = {
         "schema",
@@ -43,12 +39,11 @@ def check_deployment_receipt(
         "removed",
         "transaction_id",
         "cleanup_debt",
-        "promotion",
     }
     if (
         not isinstance(receipt, dict)
         or not fields.issubset(receipt)
-        or set(receipt) - fields - {"promotion_cleanup"}
+        or set(receipt) - fields - {"maintenance"}
         or receipt.get("schema") != "ceratops-deployment-completion.v1"
         or receipt.get("status") != "completed"
         or receipt.get("cleanup_debt") != []
@@ -60,13 +55,18 @@ def check_deployment_receipt(
         raise error_type(
             "Deployment completion evidence identifies a different repository or commit."
         )
-    promotion_matches = receipt["promotion"] is None and binding is None
-    if binding is not None:
-        promotion_matches = binding in read_promotion_bindings(receipt)
-    if receipt["producer"] != outcome.get("handoff") or not promotion_matches:
+    if receipt["producer"] != outcome.get("handoff"):
         raise error_type(
-            "Deployment completion evidence does not match this handoff and saved record."
+            "Deployment completion evidence identifies a different installer."
         )
+    if "maintenance" in receipt:
+        maintenance = receipt["maintenance"]
+        if (not isinstance(maintenance, dict)
+                or set(maintenance) != {"removed", "deferred", "errors"}
+                or any(not isinstance(items, list) or any(not isinstance(item, str) for item in items)
+                       for items in maintenance.values())
+                or maintenance["errors"] != receipt["cleanup_debt"]):
+            raise error_type("Deployment maintenance metadata is incomplete.")
     destination = receipt["install_root"]
     if not isinstance(destination, str) or not pathlib.Path(destination).is_absolute():
         raise error_type(

@@ -2,7 +2,7 @@
 """Check source inputs and transactionally deploy exact managed skill batches.
 
 One callable owns request preflight, the existing source-check command, the
-transactional builder, and promotion cleanup. It resolves explicit selections,
+transactional builder, and installer-owned cleanup. It resolves explicit selections,
 a structured Git affected set, or one all-managed snapshot. Inventory reads only
 direct child runtime manifests and writes routing evidence to a caller-selected
 file without comparing installed files with source.
@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
-import hashlib
 import importlib
 import json
 import os
@@ -121,8 +120,7 @@ class DeployOptions:
     """Inputs shared by the public deployment callable and its CLI adapter.
 
     No selection means all managed skills; an explicitly empty selection is a
-    no-op. Promotion fields bind cleanup to an existing caller-owned record,
-    not to a saved execution checkpoint or permission to rerun repository work.
+    no-op. Repository reports are not installer inputs.
     """
 
     repo_root: pathlib.Path | None = None
@@ -132,11 +130,6 @@ class DeployOptions:
     base_revision: str | None = None
     previous_runtime_source_id: str | None = None
     inventory_output: pathlib.Path | None = None
-    promotion_result: pathlib.Path | None = None
-    operation: Sequence[str] | None = None
-    task_temp_root: pathlib.Path | None = None
-    finalize_promotion_with: pathlib.Path | None = None
-    deployment_evidence: Sequence[pathlib.Path] | None = None
 
 
 def default_install_root() -> pathlib.Path:
@@ -679,185 +672,15 @@ def _source_commit(repo_root: pathlib.Path) -> str | None:
     return _git_text(repo_root, "rev-parse", "HEAD").strip()
 
 
-def _plain_path(path: pathlib.Path) -> pathlib.Path:
-    """Reject path redirection before reading an explicitly supplied record."""
-    path = pathlib.Path(os.path.abspath(path.expanduser()))
-    if any(part.is_symlink() or part.is_junction() for part in (path, *path.parents)):
-        raise InstallerError("promotion cleanup rejects linked paths")
-    return path
-
-
-def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise InstallerError("duplicate completion-record field")
-        result[key] = value
-    return result
-
-
-def _promotion_bindings(
-    args: DeployOptions,
-    repo_root: pathlib.Path,
-    commit: str | None,
-) -> list[dict[str, Any]] | None:
-    """Bind one transaction to all selected handoffs in an unchanged record.
-
-    Preflight does not complete, rewrite, or delete the old record. Only the
-    caller-selected repository lifecycle helper owns its eventual finalization.
-    """
-    options = (
-        args.promotion_result,
-        args.operation,
-        args.task_temp_root,
-        args.finalize_promotion_with,
-    )
-    if not any(options):
-        if args.deployment_evidence:
-            raise InstallerError("deployment evidence requires promotion cleanup inputs")
-        return None
-    if (
-        not args.promotion_result
-        or not args.operation
-        or not args.task_temp_root
-        or not args.finalize_promotion_with
-    ):
-        raise InstallerError(
-            "promotion cleanup requires promotion-result, operation, "
-            "task-temp-root, and finalize-promotion-with"
-        )
-    if commit is None:
-        raise InstallerError("promotion deployment requires an exact clean source commit")
-    selected_operations = list(args.operation)
-    if len(selected_operations) != len(set(selected_operations)):
-        raise InstallerError("promotion operations must be unique")
-    path = _plain_path(args.promotion_result)
-    task = _plain_path(args.task_temp_root)
-    helper = _plain_path(args.finalize_promotion_with)
-    common = pathlib.Path(_git_text(repo_root, "rev-parse", "--path-format=absolute", "--git-common-dir").strip())
-    if common.name != ".git" or task.parent != common.parent.parent / "tmp" / common.parent.name:
-        raise InstallerError("promotion cleanup requires the repository's task temp directory")
-    if not task.is_dir() or not path.is_relative_to(task) or not path.is_file() or path.stat().st_nlink != 1:
-        raise InstallerError("promotion record must be an unlinked file inside task-temp-root")
-    if not helper.is_file() or helper.suffix != ".py":
-        raise InstallerError("selected promotion finalizer is unavailable")
-    identity_fields = ("st_dev", "st_ino", "st_mtime_ns", "st_size", "st_mode", "st_nlink")
-    before = path.stat()
-    identity = [getattr(before, field) for field in identity_fields]
-    data = path.read_bytes()
-    if [getattr(path.stat(), field) for field in identity_fields] != identity:
-        raise InstallerError("promotion record changed during preflight")
-    record = json.loads(data, object_pairs_hook=_unique_object)
-    pending = isinstance(record, dict) and record.get("status") == "handoff_required" and record.get("phase") == "deployment"
-    promotion = record.get("promotion") if pending else record
-    if not isinstance(promotion, dict) or promotion.get("status") != "ready" or promotion.get("head") != commit:
-        raise InstallerError("promotion record does not identify this ready source commit")
-    operations = record.get("operations")
-    if (not isinstance(operations, dict)
-            or operations.get("status") != ("handoff_required" if pending else "completed")
-            or not isinstance(operations.get("pending_operations"), list)
-            or (not pending and operations["pending_operations"] != [])):
-        raise InstallerError("promotion record has incomplete repository operations")
-    if not isinstance(operations.get("results"), list):
-        raise InstallerError("promotion operation results are missing")
-    bindings: list[dict[str, Any]] = []
-    for operation in selected_operations:
-        matches = [
-            item
-            for item in operations["results"]
-            if isinstance(item, dict) and item.get("operation") == operation
-        ]
-        if (
-            len(matches) != 1
-            or matches[0].get("handoff") != "ceratops-skill-lifecycle/deploy"
-            or matches[0].get("handoff_completed")
-            or (pending and operation not in operations["pending_operations"])
-        ):
-            raise InstallerError(
-                "promotion record does not contain the selected pending skill deployment"
-            )
-        if (
-            matches[0].get("status") not in ({"handoff_required"} if pending else {"completed", "advisory"})
-            or matches[0].get("commit") != commit
-            or (
-                matches[0].get("status") == "advisory"
-                and matches[0].get("steps")
-            )
-        ):
-            raise InstallerError(
-                "promotion handoff has not completed its repository phase"
-            )
-        bindings.append(
-            {
-                "result_file": str(path),
-                "sha256": hashlib.sha256(data).hexdigest(),
-                "identity": list(identity),
-                "operation": operation,
-            }
-        )
-    return bindings
-
-
-def _additional_deployment_evidence(
-    args: DeployOptions, repo_root: pathlib.Path, commit: str | None,
-    promotion: list[dict[str, Any]] | None,
-) -> list[str]:
-    """Reject unavailable or unrelated caller receipts before any installation.
-
-    The repository finalizer owns complete producer-contract checks and record
-    deletion. This transport preflight only binds already-completed sibling
-    handoffs to the same immutable promotion; it never replays their effects.
-    Caller evidence remains caller-owned and is not rewritten or removed here.
-    """
-    paths: list[str] = []
-    seen = {binding["operation"] for binding in promotion or ()}
-    for supplied in args.deployment_evidence or ():
-        path = _plain_path(supplied)
-        if not path.is_file() or path.stat().st_nlink != 1:
-            raise InstallerError("deployment evidence must be an unlinked regular file")
-        record = json.loads(path.read_bytes(), object_pairs_hook=_unique_object)
-        if (
-            not isinstance(record, dict)
-            or record.get("schema") != "ceratops-deployment-completion.v1"
-            or record.get("status") != "completed"
-            or record.get("cleanup_debt") != []
-            or record.get("commit") != commit
-            or record.get("repo_root") != str(repo_root)
-            or not promotion
-        ):
-            raise InstallerError("deployment evidence must describe this completed source commit")
-        bindings = record.get("promotion")
-        bindings = bindings if isinstance(bindings, list) else [bindings]
-        for binding in bindings:
-            if (
-                not isinstance(binding, dict)
-                or any(binding.get(key) != promotion[0][key]
-                       for key in ("result_file", "sha256", "identity"))
-                or not isinstance(binding.get("operation"), str)
-                or binding["operation"] in seen
-            ):
-                raise InstallerError("deployment evidence must bind unique sibling promotion operations")
-            seen.add(binding["operation"])
-        if not bindings:
-            raise InstallerError("deployment evidence has no promotion operation")
-        paths.append(str(path))
-    return paths
-
-
 def _completion_receipt(result: runtime_builder.TransactionResult, repo_root: pathlib.Path,
-                        install_root: pathlib.Path, commit: str | None,
-                        promotion: list[dict[str, Any]] | None) -> dict[str, Any]:
-    """Serialize the transaction's actual result, never inferred runtime state."""
-    serialized_promotion: object = None
-    if promotion is not None:
-        serialized_promotion = promotion[0] if len(promotion) == 1 else promotion
+                        install_root: pathlib.Path, commit: str | None) -> dict[str, Any]:
+    """Return only this installation's actual outcome and runtime cleanup debt."""
     return {
         "schema": "ceratops-deployment-completion.v1", "producer": "ceratops-skill-lifecycle/deploy",
         "status": "completed" if result.status == "ok" else result.status,
         "repo_root": str(repo_root), "commit": commit, "install_root": str(install_root),
         "deployed": list(result.deployed), "removed": list(result.removed),
         "transaction_id": result.transaction_id, "cleanup_debt": list(result.retained_retired),
-        "promotion": serialized_promotion,
     }
 
 
@@ -877,17 +700,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Exact prior owner accepted only for this transactional migration.",
     )
     parser.add_argument("--inventory-output", type=pathlib.Path)
-    parser.add_argument("--promotion-result", type=pathlib.Path)
-    parser.add_argument(
-        "--operation",
-        action="append",
-        help="Exact pending SDLC deployment location; repeat for one batch.",
-    )
-    parser.add_argument("--task-temp-root", type=pathlib.Path)
-    parser.add_argument("--finalize-promotion-with", type=pathlib.Path,
-                        help="Caller-selected promotion helper; invoked only for cleanup, never deployment.")
-    parser.add_argument("--deployment-evidence", type=pathlib.Path, action="append",
-                        help="Completed sibling handoff receipt forwarded to promotion cleanup; repeat as needed.")
     return parser
 
 
@@ -895,31 +707,19 @@ def _request_paths(args: DeployOptions) -> DeployOptions:
     """Resolve caller-relative paths before leaving an installed working directory."""
 
     paths: dict[str, Any] = {}
-    for name in ("repo_root", "install_root", "inventory_output", "promotion_result",
-                 "task_temp_root", "finalize_promotion_with"):
+    for name in ("repo_root", "install_root", "inventory_output"):
         value = getattr(args, name)
         if value is not None:
             if not isinstance(value, (str, os.PathLike)):
                 raise InstallerError(f"{name} must be a filesystem path", phase="preflight")
-            # Promotion evidence retains its lexical path until _plain_path can
-            # reject redirection. Ordinary roots retain their existing resolution.
             paths[name] = pathlib.Path(os.path.abspath(pathlib.Path(value).expanduser()))
-    for name in ("skill", "remove_skill", "operation"):
+    for name in ("skill", "remove_skill"):
         value = getattr(args, name)
         if value is not None:
             if (not isinstance(value, Sequence) or isinstance(value, str)
                     or not all(isinstance(item, str) and item for item in value)):
                 raise InstallerError(f"{name} must be a sequence of nonempty names", phase="preflight")
             paths[name] = tuple(value)
-    if args.deployment_evidence is not None:
-        if (not isinstance(args.deployment_evidence, Sequence)
-                or isinstance(args.deployment_evidence, (str, bytes))
-                or not all(isinstance(path, (str, os.PathLike)) for path in args.deployment_evidence)):
-            raise InstallerError("deployment_evidence must be a sequence of paths", phase="preflight")
-        paths["deployment_evidence"] = tuple(
-            pathlib.Path(os.path.abspath(pathlib.Path(path).expanduser()))
-            for path in args.deployment_evidence
-        )
     return replace(args, **paths)
 
 
@@ -1007,9 +807,9 @@ def deploy_managed_skills(args: DeployOptions) -> dict[str, Any] | str:
 
     Source checks finish before the builder can acquire its runtime lock or
     stage files. The builder owns activation, rollback, and retired-tree cleanup.
-    Promotion cleanup consumes its actual receipt; failure returns that receipt
-    and a cleanup-only call, never an automatic second deployment. Package
-    acceptance is a caller prerequisite: this interface has no package receipts.
+    Return the actual installation result to the caller without touching its
+    repository reports. Package acceptance is a caller prerequisite: this
+    interface has no package receipts.
     Calls are serialized because the builder's repository selection and the
     working directory are process state. The entry directory is restored unless
     activation retired or replaced that directory; in that case the call stays
@@ -1037,8 +837,7 @@ def deploy_managed_skills(args: DeployOptions) -> dict[str, Any] | str:
                 if args.inventory_output is not None:
                     if any(value is not None for value in (
                         args.repo_root, args.skill, args.remove_skill, args.base_revision,
-                        args.previous_runtime_source_id, args.promotion_result, args.operation,
-                        args.task_temp_root, args.finalize_promotion_with, args.deployment_evidence,
+                        args.previous_runtime_source_id,
                     )):
                         raise InstallerError("--inventory-output cannot be combined with installation inputs", phase="preflight")
                     try:
@@ -1051,11 +850,9 @@ def deploy_managed_skills(args: DeployOptions) -> dict[str, Any] | str:
                 repo_root = args.repo_root.resolve()
                 affected = _deployment_scope(args, repo_root)
                 commit = _source_commit(repo_root)
-                promotion = _promotion_bindings(args, repo_root, commit)
-                deployment_evidence = _additional_deployment_evidence(args, repo_root, commit, promotion)
                 if not affected.all_managed and not affected.deploy and not affected.remove:
                     receipt = _completion_receipt(runtime_builder.TransactionResult("ok", (), (), ""),
-                                                  repo_root, install_root, commit, promotion)
+                                                  repo_root, install_root, commit)
                     receipt["status"] = "no_op"
                     return receipt
                 _check_deployment_sources(repo_root, affected)
@@ -1077,37 +874,13 @@ def deploy_managed_skills(args: DeployOptions) -> dict[str, Any] | str:
                 if isinstance(exc, (runtime_builder.TransactionError, InstallerError)):
                     return exc.result()
                 return InstallerError(str(exc)).result()
-            receipt = _completion_receipt(result, repo_root, install_root, commit, promotion)
+            receipt = _completion_receipt(result, repo_root, install_root, commit)
             try:
                 if _source_commit(repo_root) != commit:
                     receipt["status"] = "source_changed"
             except (InstallerError, OSError) as exc:
                 receipt["status"] = "source_changed"
                 receipt["message"] = str(exc)
-            if promotion is not None and receipt["status"] == "completed":
-                first_binding = promotion[0]
-                command = [sys.executable, str(args.finalize_promotion_with), "--repo-root", str(repo_root),
-                           "--finalize-result", "--result-file", first_binding["result_file"],
-                           "--task-temp-root", str(args.task_temp_root), "--expected-commit", str(commit),
-                           "--deployment-evidence", "-",
-                           *[argument for path in deployment_evidence
-                             for argument in ("--deployment-evidence", path)]]
-                receipt_input = json.dumps(receipt)
-                try:
-                    finalized = source_locks.run_protected_command(command, input=receipt_input, cwd=repo_root,
-                                               capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
-                                               env={**os.environ, "PYTHONIOENCODING": "utf-8"})
-                    cleanup: dict[str, Any] = {"status": "completed" if finalized.returncode == 0 else "failed",
-                                               "replay_required": False}
-                    if finalized.returncode:
-                        cleanup.update(returncode=finalized.returncode, stdout=finalized.stdout, stderr=finalized.stderr,
-                                       message=finalized.stderr.strip() or finalized.stdout.strip())
-                except OSError as exc:
-                    cleanup = {"status": "failed", "message": str(exc), "replay_required": False,
-                               "returncode": None, "stdout": "", "stderr": str(exc)}
-                if cleanup["status"] == "failed":
-                    cleanup["next_action"] = {"command": command, "stdin": receipt_input}
-                receipt["promotion_cleanup"] = cleanup
             return receipt
         finally:
             try:
@@ -1127,8 +900,7 @@ def main(argv: list[str] | None = None) -> int:
         print(result)
         return 0
     status = result.get("status")
-    failed_cleanup = result.get("promotion_cleanup", {}).get("status") == "failed"
-    code = (0 if status in {"completed", "no_op"} and not failed_cleanup else
+    code = (0 if status in {"completed", "no_op"} else
             2 if status in {"decision_required", "cleanup_blocked", "source_changed", "completed"} else 1)
     print(json.dumps(result, separators=(",", ":")), file=sys.stderr if code else sys.stdout)
     return code

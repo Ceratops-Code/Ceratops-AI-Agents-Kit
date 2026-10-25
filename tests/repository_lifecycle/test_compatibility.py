@@ -130,12 +130,12 @@ def test_actionlint_contract_selects_recursive_workflows_once(
     (nested / "reusable.yaml").write_text("name: nested\n", encoding="utf-8")
     (nested.parent / "validate.yml").write_text("name: direct\n", encoding="utf-8")
 
-    selected = materializer.contract_checks(repository)
+    selected = materializer.repository_checks.contract_checks(repository)
     assert [check["id"] for check in selected].count("actionlint") == 1
 
     generated = tmp_path / "generated"
     generated.mkdir()
-    planned = materializer.contract_checks(
+    planned = materializer.repository_checks.contract_checks(
         generated,
         planned_paths={".github/workflows/validate.yml"},
     )
@@ -347,14 +347,14 @@ def test_compatibility_materializer_supplies_target_identity_and_assignments(
             "extends: default\nrules:\n  document-start: disable\n  line-length: disable\n",
             encoding="utf-8", newline="\n",
         )
-        check = next(item for item in materializer.contract_checks(repo) if item["id"] == "yaml-lint")
+        check = next(item for item in materializer.repository_checks.contract_checks(repo) if item["id"] == "yaml-lint")
         command = [sys.executable if value == "{python}" else probe.name if value == "." else value for value in check["command"]]
         assert command[-2:] == ["--config-file", f"scripts/{name}"]
         lint = subprocess.run(command, cwd=repo, capture_output=True, text=True, check=False)
         assert lint.returncode == 0, lint.stdout + lint.stderr
         root_configuration = repo / ".yamllint"
         root_configuration.write_text("extends: default\n", encoding="utf-8", newline="\n")
-        root_check = next(item for item in materializer.contract_checks(repo) if item["id"] == "yaml-lint")
+        root_check = next(item for item in materializer.repository_checks.contract_checks(repo) if item["id"] == "yaml-lint")
         root_command = [sys.executable if value == "{python}" else probe.name if value == "." else value for value in root_check["command"]]
         root_lint = subprocess.run(root_command, cwd=repo, capture_output=True, text=True, check=False)
         assert root_lint.returncode == 1 and "line-length" in root_lint.stdout
@@ -1291,7 +1291,7 @@ def test_ci_action_reconciliation_preserves_pins_and_rejects_unsafe_bindings(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     ci = importlib.import_module("ceratops_repo_compatibility_engine.ci_workflow")
-    generator = importlib.import_module("ceratops_repo_compatibility_engine.apply_ceratops_compatibility")
+    generator = importlib.import_module("ceratops_repo_compatibility_engine.generate_repository_checks")
     action = generator.load_compatibility_contract()["ci_action"]
     (tmp_path / "scripts").mkdir()
     (tmp_path / "scripts/validate-repository.py").write_text("print('OK')\n")
@@ -1324,7 +1324,7 @@ def test_source_repository_can_validate_its_checked_out_local_action(
     tmp_path: pathlib.Path,
 ) -> None:
     ci = importlib.import_module("ceratops_repo_compatibility_engine.ci_workflow")
-    generator = importlib.import_module("ceratops_repo_compatibility_engine.apply_ceratops_compatibility")
+    generator = importlib.import_module("ceratops_repo_compatibility_engine.generate_repository_checks")
     action = generator.load_compatibility_contract()["ci_action"]
     identity = action["uses"].split("/", 2)
     local_action = tmp_path.joinpath(*pathlib.PurePosixPath(identity[2]).parts, "action.yml")
@@ -1375,7 +1375,7 @@ def test_unpublished_ci_action_blocks_compatibility_before_target_writes(
     def unavailable(*args, **kwargs):
         raise RuntimeError("CI action publication is unavailable")
 
-    monkeypatch.setattr(generator, "resolve_action", unavailable)
+    monkeypatch.setattr(generator.repository_checks, "resolve_action", unavailable)
     assert generator.main(["--target-repo-root", str(tmp_path)]) == 1
     result = json.loads(capsys.readouterr().out)
     assert result["phase"] == "compatibility_planning"
