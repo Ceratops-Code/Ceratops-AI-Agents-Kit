@@ -425,8 +425,9 @@ def test_promote_and_deploy_rejects_operation_created_repository_work(
 @pytest.mark.parametrize("entrypoint", ["callable", "cli"])
 @pytest.mark.parametrize("effect", ["record", "delete"])
 @pytest.mark.parametrize("after", [False, True])
+@pytest.mark.parametrize("result_kind", ["deployment", "shipping-empty", "shipping-install", "shipping-no-op"])
 def test_repo_owns_installation_result_recording_and_cleanup(
-    tmp_path, monkeypatch, capsys, entrypoint, effect, after,
+    tmp_path, monkeypatch, capsys, entrypoint, effect, after, result_kind,
 ):
     from tests.repository_lifecycle.test_sdlc_handoffs import (
         _registered_skill_fixture,
@@ -454,6 +455,19 @@ def test_repo_owns_installation_result_recording_and_cleanup(
         "operations": {"status": "completed", "pending_operations": [],
                        "completed_operations": [operation], "results": [outcome]},
     }
+    if result_kind.startswith("shipping"):
+        assert run_git(repo, "remote", "add", "origin", "https://github.com/owner/repo.git").returncode == 0
+        empty = {"status": "completed", "completed_operations": [], "pending_operations": [], "results": []}
+        result = {
+            "status": "shipped", "repository": "owner/repo", "commit": prepared.commit,
+            "pr": 1, "merge_commit": prepared.commit, "synchronized_head": prepared.commit,
+            "release_publication": empty, "deployment": result["operations"] if result_kind == "shipping-install" else empty,
+            "finalization": {"status": "finalized"},
+        }
+        if result_kind == "shipping-no-op":
+            noop = {"status": "no_op", "operation": operation, "commit": prepared.commit,
+                    "steps": [], "reason": "Explicitly declared no-op"}
+            result["deployment"] = {**empty, "completed_operations": [operation], "results": [noop]}
     original_replace, original_unlink = pathlib.Path.replace, pathlib.Path.unlink
 
     def interrupted_replace(source, target):
@@ -509,7 +523,8 @@ def test_repo_owns_installation_result_recording_and_cleanup(
 
 
 @pytest.mark.parametrize("fault", ["pending", "failed", "cleanup-debt", "missing-result"])
-def test_repo_cleanup_keeps_unfinished_installation_report(tmp_path, monkeypatch, fault):
+@pytest.mark.parametrize("result_kind", ["deployment", "shipping"])
+def test_repo_cleanup_keeps_unfinished_installation_report(tmp_path, monkeypatch, fault, result_kind):
     from tests.repository_lifecycle.test_sdlc_handoffs import (
         _registered_skill_fixture,
         runner,
@@ -532,6 +547,14 @@ def test_repo_cleanup_keeps_unfinished_installation_report(tmp_path, monkeypatch
     result = {"status": "ready", "head": prepared.commit, "release_branch": "release/local",
               "operations": {"status": "completed", "pending_operations": [],
                              "completed_operations": [operation], "results": [outcome]}}
+    if result_kind == "shipping":
+        assert run_git(repo, "remote", "add", "origin", "https://github.com/owner/repo.git").returncode == 0
+        result = {
+            "status": "shipped", "repository": "owner/repo", "commit": prepared.commit,
+            "pr": 1, "merge_commit": prepared.commit, "synchronized_head": prepared.commit,
+            "release_publication": {"status": "completed", "completed_operations": [], "pending_operations": [], "results": []},
+            "deployment": result["operations"], "finalization": {"status": "finalized"},
+        }
     task = repo.parent / "tmp" / repo.name / "pending"
     task.mkdir(parents=True)
     report = task / "promotion.json"
@@ -547,3 +570,51 @@ def test_repo_cleanup_keeps_unfinished_installation_report(tmp_path, monkeypatch
             module["finalize_result"](args)
         assert report.read_bytes() == before
     assert len((repo / "calls.jsonl").read_text().splitlines()) == 1
+
+
+@pytest.mark.parametrize("fault", ["wrong-repo", "wrong-commit", "missing-merge", "pending-publication",
+                                  "pending-deployment", "unfinished-finalization", "cleanup-error",
+                                  "wrong-operation", "invalid-noop"])
+def test_repo_cleanup_retains_mismatched_or_incomplete_shipping_results(tmp_path, monkeypatch, fault):
+    from tests.repository_lifecycle.test_sdlc_handoffs import _registered_skill_fixture
+
+    repo = _registered_skill_fixture(tmp_path, monkeypatch)
+    assert run_git(repo, "remote", "add", "origin", "https://github.com/owner/repo.git").returncode == 0
+    commit = run_git(repo, "rev-parse", "HEAD").stdout.strip()
+    module = runpy.run_path(str(PROMOTE_REPOSITORY))
+    empty = {"status": "completed", "completed_operations": [], "pending_operations": [], "results": []}
+    result = {"status": "shipped", "repository": "owner/repo", "commit": commit, "pr": 1,
+              "merge_commit": commit, "synchronized_head": commit,
+              "release_publication": dict(empty), "deployment": dict(empty),
+              "finalization": {"status": "finalized"}}
+    if fault == "wrong-repo":
+        result["repository"] = "other/repo"
+    elif fault == "wrong-commit":
+        result["commit"] = "b" * 40
+    elif fault == "missing-merge":
+        result["merge_commit"] = None
+    elif fault.startswith("pending-"):
+        result["release_publication" if fault.endswith("publication") else "deployment"]["pending_operations"] = ["pending"]
+    elif fault == "unfinished-finalization":
+        result["finalization"]["status"] = "pending"
+    elif fault == "cleanup-error":
+        result["finalization"]["repository_cleanup"] = {"status": "completed", "errors": ["busy"]}
+    else:
+        operation = "deliverables.apps.sample.actions.install"
+        noop = {"status": "no_op", "operation": "wrong" if fault == "wrong-operation" else operation,
+                "steps": [], "reason": "" if fault == "invalid-noop" else "No install", "configured": False}
+        result["deployment"] = {**empty, "completed_operations": [operation], "results": [noop]}
+    task = repo.parent / "tmp" / repo.name / "shipping-result"
+    task.mkdir(parents=True)
+    report = task / "shipping.json"
+    module["_save_result"](report, result)
+    original = report.read_bytes()
+    args = module["build_parser"]().parse_args([
+        "--repo-root", str(repo), "--finalize-result", "--result-file", str(report),
+        "--task-temp-root", str(task), "--expected-commit", commit,
+        "--verified-result-sha256", hashlib.sha256(original).hexdigest(),
+    ])
+    for _ in range(2):
+        with pytest.raises(module["PromotionError"]):
+            module["finalize_result"](args)
+        assert report.read_bytes() == original

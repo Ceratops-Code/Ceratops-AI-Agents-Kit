@@ -236,6 +236,9 @@ def test_alert_preflight_distinguishes_missing_patch_and_repeats_after_interrupt
     })
     monkeypatch.setattr(queue, "exact_ci_evidence", lambda _: {"status": "ok"})
     monkeypatch.setattr(queue, "dependency_tree_evidence", lambda *_: {"status": "ok"})
+    monkeypatch.setattr(queue, "fetch_default_branch_head", lambda *_: {
+        "status": "ok", "branch": "main", "commit": "a" * 40,
+    })
     registry_targets: list[str] = []
 
     def registry(update: dict[str, Any]) -> dict[str, str]:
@@ -576,7 +579,7 @@ def test_dependency_commit_read_failures_preserve_cause_without_local_fallback(
     assert first["status"] in {"unavailable", "blocked"}
     assert first["sources"] == []
     failure = first["errors"][0]
-    assert failure["operation"] == "read_pr_commit_files"
+    assert failure["operation"] == "read_dependency_commit_files"
     assert failure["checkout"] == str(checkout) and failure["commit"] == head
     assert pathlib.Path(failure["command"][0]).is_absolute()
     assert operation in failure["command"]
@@ -601,7 +604,7 @@ def test_dependency_commit_reader_requires_exact_head(
     for _ in range(2):
         result = evidence.dependency_tree_evidence(tmp_path, {"package": "demo"}, [], [], head)
         assert result["status"] == "unavailable" and result["sources"] == []
-        assert result["errors"][0]["error"] == "PR head must be an exact commit ID"
+        assert result["errors"][0]["error"] == "Dependency source must be an exact commit ID"
 
 
 @pytest.mark.parametrize("fault", ["malformed", "escape", "absolute", "symlink", "gitlink"])
@@ -627,7 +630,7 @@ def test_dependency_commit_reader_rejects_unsafe_or_malformed_sources(
         if fault in {"escape", "absolute"}:
             assert result["errors"][0]["error"] == "path_outside_checkout"
         elif fault in {"symlink", "gitlink"}:
-            assert result["errors"][0]["error"] == "PR dependency source is not a regular file"
+            assert result["errors"][0]["error"] == "Committed dependency source is not a regular file"
     assert _checkout_state(checkout) == before
 
 
@@ -649,5 +652,116 @@ def test_dependency_commit_wrapper_uses_only_bounded_committed_jar(
         result = evidence.dependency_tree_evidence(checkout, update, [{"path": relative}], [], head)
         assert result["status"] == "blocked" and result["sources"] == []
         assert result["errors"][0]["error"] == (
-            "file_missing_from_pr_commit" if fault == "missing_jar" else "wrapper JAR exceeds the evidence size bound"
+            "file_missing_from_dependency_commit" if fault == "missing_jar" else "wrapper JAR exceeds the evidence size bound"
         )
+
+
+@pytest.mark.parametrize("fault", ["none", "missing_branch", "denied", "bad_commit", "timeout", "spawn"])
+def test_alert_default_branch_query_keeps_exact_commit_and_failures(monkeypatch, fault):
+    evidence = load_pr_workflow_module(monkeypatch, "dependency_evidence")
+    calls = []
+
+    def query(command, **kwargs):
+        calls.append(command)
+        assert command == ["gh", "api", "repos/owner/repo/commits/release%2Fstable", "--jq", ".sha"]
+        assert kwargs["timeout"] == 30
+        if fault == "timeout":
+            raise subprocess.TimeoutExpired(command, 30, output="partial", stderr="timed out")
+        if fault == "spawn":
+            raise OSError("GitHub CLI unavailable")
+        return subprocess.CompletedProcess(command, 1 if fault == "denied" else 0,
+                                           "not-a-commit" if fault == "bad_commit" else "A" * 40 + "\n",
+                                           "HTTP 403" if fault == "denied" else "")
+
+    monkeypatch.setattr(evidence, "run_command", query)
+    for _ in range(2):
+        result = evidence.fetch_default_branch_head("owner/repo", None if fault == "missing_branch" else "release/stable")
+        assert result["status"] == ("ok" if fault == "none" else "unavailable")
+        if fault == "none":
+            assert result["commit"] == "a" * 40 and result["branch"] == "release/stable"
+        elif fault != "missing_branch":
+            assert result["command"] == calls[-1]
+            assert result["stdout"] and result["stderr"] and result["cause"]
+            assert result["exit_code"] == (None if fault in {"timeout", "spawn"} else int(fault == "denied"))
+    assert len(calls) == (0 if fault == "missing_branch" else 2)
+
+
+@pytest.mark.parametrize("source_available", [True, False])
+@pytest.mark.parametrize("interruption", ["none", "before_write", "after_write"])
+def test_alert_preflight_reads_live_default_tree_without_touching_release_checkout(
+    tmp_path, monkeypatch, source_available, interruption,
+):
+    queue = load_pr_workflow_module(monkeypatch, "dependency_queue")
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    for arguments in [("init", "-b", "main"), ("config", "user.name", "Test"),
+                      ("config", "user.email", "test@example.invalid")]:
+        assert run_git(checkout, *arguments).returncode == 0
+    lock = checkout / "package-lock.json"
+    lock.write_text(json.dumps({"packages": {"node_modules/demo": {"version": "1.0.0"}}}))
+    assert run_git(checkout, "add", ".").returncode == 0
+    assert run_git(checkout, "commit", "-m", "published dependency").returncode == 0
+    published = run_git(checkout, "rev-parse", "HEAD").stdout.strip()
+    assert run_git(checkout, "checkout", "-b", "release/local").returncode == 0
+    lock.unlink()
+    assert run_git(checkout, "add", "-A").returncode == 0
+    assert run_git(checkout, "commit", "-m", "local release no longer has old tooling").returncode == 0
+    before = _checkout_state(checkout)
+    alerts = [{"repo": "owner/repo", "number": number, "package": "demo", "ecosystem": "npm",
+               "patched_versions": "1.0.1", "manifest_path": "package-lock.json"} for number in (1, 2)]
+    snapshot = {"outcome": {"blocked": False}, "summary": {"org": "owner"},
+                "open_dependabot_prs": [], "open_dependabot_alerts": alerts}
+    monkeypatch.setattr(queue, "refresh_snapshot", lambda *_: (snapshot, subprocess.CompletedProcess([], 0, "", "")))
+    monkeypatch.setattr(queue, "fetch_pr_batch", lambda *_: ({}, []))
+    monkeypatch.setattr(queue, "wait_for_dependabot_rebases", lambda *_: ({}, []))
+    monkeypatch.setattr(queue, "queued_repositories", lambda _: [{"repo": "owner/repo", "default_branch": "main"}])
+    monkeypatch.setattr(queue, "resolve_checkout", lambda *_, **__: {"status": "found", "path": str(checkout)})
+    monkeypatch.setattr(queue, "exact_ci_evidence", lambda _: {"status": "ok"})
+    monkeypatch.setattr(queue, "registry_evidence", lambda _: {"status": "ok"})
+    monkeypatch.setattr(queue, "emit_result", lambda *_: None)
+    heads = []
+
+    def source(repo, branch):
+        heads.append((repo, branch))
+        return {"status": "ok", "commit": published} if source_available else {"status": "unavailable", "reason": "HTTP 403"}
+
+    monkeypatch.setattr(queue, "fetch_default_branch_head", source)
+    original_tree = queue.dependency_tree_evidence
+    tree_reads = []
+
+    def tree(*arguments):
+        tree_reads.append(arguments[-1])
+        return original_tree(*arguments)
+
+    monkeypatch.setattr(queue, "dependency_tree_evidence", tree)
+    output = tmp_path / "preflight.json"
+    argv = ["preflight", "--org", "owner", "--snapshot-helper", str(tmp_path / "snapshot.py"),
+            "--snapshot", str(tmp_path / "snapshot.json"), "--output", str(output), "--workspace-root", str(tmp_path)]
+    original_write = queue.write_json
+
+    def interrupted_write(path, payload):
+        if interruption == "after_write":
+            original_write(path, payload)
+        raise OSError("interrupted report write")
+
+    if interruption != "none":
+        with monkeypatch.context() as patch:
+            patch.setattr(queue, "write_json", interrupted_write)
+            assert queue.main(argv) == 1
+        assert output.exists() == (interruption == "after_write")
+    for _ in range(2):
+        previous = len(heads)
+        previous_trees = len(tree_reads)
+        assert queue.main(argv) == 0
+        assert len(heads) == previous + 1
+        assert len(tree_reads) == previous_trees + int(source_available)
+        payload = json.loads(output.read_text())
+        assert payload["outcome"]["blocked"] != source_available
+        for alert in payload["repositories"][0]["alerts"]:
+            tree = alert["preflight"]["dependency_tree"]
+            if source_available:
+                assert tree["status"] == "ok" and tree["commit"] == published
+                assert tree["sources"][0]["matches"][0]["version"] == "1.0.0"
+            else:
+                assert tree["status"] == "unavailable" and tree["sources"] == []
+        assert _checkout_state(checkout) == before and not lock.exists()
