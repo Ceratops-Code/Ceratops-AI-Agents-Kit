@@ -27,6 +27,7 @@ import yaml
 
 from .ci_workflow import workflow_errors
 from .compatibility_contract import load_compatibility_contract, template_path
+from .generate_repository_checks import repository_owned_paths
 from .generate_test_script import discover_python_tests
 from .python_tool_configuration import ruff_policy_errors
 from .repository_validation_contract import load_validation_contract
@@ -88,28 +89,7 @@ def _validation_coverage_errors(
     entries = operation_entries(sdlc)
     version = int(sdlc["version"])
     errors: list[str] = []
-    # Installed dependencies and Git-ignored outputs do not create first-party
-    # language obligations, even when a captured package tracks vendor files.
-    dependency_dirs = {".git", "node_modules", ".venv", "venv", "__pycache__"}
-    inventory = subprocess.run(
-        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
-        cwd=root, capture_output=True, check=False,
-    )
-    if inventory.returncode == 0:
-        paths = [root / os.fsdecode(value) for value in inventory.stdout.split(b"\0") if value]
-    else:
-        paths = []
-        for directory, directories, names in os.walk(root, followlinks=False):
-            directories[:] = [
-                name for name in directories
-                if name not in dependency_dirs and not (pathlib.Path(directory) / name).is_symlink()
-            ]
-            paths.extend(pathlib.Path(directory) / name for name in names)
-    owned_paths = [
-        path.relative_to(root).as_posix() for path in paths
-        if path.is_file() and not path.is_symlink()
-        and not dependency_dirs.intersection(path.relative_to(root).parts)
-    ]
+    owned_paths = repository_owned_paths(root)
     for requirement in validation_contract["coverage_requirements"]:
         active = any(
             fnmatch.fnmatchcase(path, pattern)
@@ -637,7 +617,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         command = json.loads(args.runner_command)
         if not isinstance(command, list):
-            raise ValueError("runner-command must be a JSON argv")
+            # The CLI handles malformed JSON and a wrong JSON root together.
+            raise ValueError("runner-command must be a JSON argv")  # noqa: TRY004
         errors = probe_test_results(args.repo_root, command, args.result_directory)
     except ValueError as exc:
         errors = [str(exc)]

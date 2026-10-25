@@ -1,7 +1,7 @@
 """Immutable skill-change records and filesystem boundaries.
 
 The skill-owned checkpoint helper owns this component's worktree-specific directory.
-This module owns numbered skill-change states, their original approval/baseline,
+This module owns numbered skill-change states, their original Git/dirty snapshot,
 and check-result retention. The caller's request file is never cleanup-owned.
 """
 from __future__ import annotations
@@ -12,7 +12,6 @@ import json
 import os
 import pathlib
 import re
-import subprocess
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from functools import lru_cache
@@ -20,13 +19,12 @@ from typing import Any
 
 from skill_update_checks import UpdateExecutionError, _run
 
-REQUEST_SCHEMA = "ceratops-skill-update-request.v3"
-STATE_SCHEMA = "ceratops-skill-update-state.v3"
+REQUEST_SCHEMA = "ceratops-skill-update-request.v4"
+STATE_SCHEMA = "ceratops-skill-update-state.v4"
 RESULT_SCHEMA = "ceratops-skill-check-result.v1"
 UPDATE_SCHEMA = "ceratops-skill-update.v1"
 COMPLETION_SCHEMA = "ceratops-skill-update-completion.v1"
-REQUEST_FIELDS = {"schema", "selected_skills", "allowed_paths", "change_groups", "checks"}
-GROUP_FIELDS = {"name", "paths"}
+REQUEST_FIELDS = {"schema", "selected_skills", "checks"}
 CHECK_FIELDS = {
     "command": {"kind", "argv"},
     "search": {"kind", "pattern", "paths", "expected_matches"},
@@ -35,24 +33,6 @@ SKILL_NAME_RE = re.compile(r"^(?![a-z0-9-]*--)[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9]
 OWNER = "skill-updates"
 
 
-def _run_bytes(
-    arguments: Sequence[str],
-    *,
-    cwd: pathlib.Path,
-) -> subprocess.CompletedProcess[bytes]:
-    """Run one Git object query without decoding repository bytes."""
-
-    try:
-        return subprocess.run(
-            list(arguments),
-            cwd=cwd,
-            capture_output=True,
-            check=False,
-        )
-    except OSError as exc:
-        raise UpdateExecutionError(
-            f"could not start {arguments[0]}: {exc}"
-        ) from exc
 
 def _git(repo_root: pathlib.Path, *arguments: str) -> str:
     result = _run(["git", "-C", str(repo_root), *arguments], cwd=repo_root)
@@ -192,22 +172,22 @@ def _dirty_paths(repo_root: pathlib.Path) -> set[str]:
         paths.update(path.replace("\\", "/") for path in output.split("\0") if path)
     return paths
 
-def _allowed_file_target(repo_root: pathlib.Path, value: str) -> pathlib.Path:
-    """Accept declared files within this checkout, independent of Git tracking.
+def _file_target(repo_root: pathlib.Path, value: str) -> pathlib.Path:
+    """Bound a Git-observed file or declared search input to this checkout.
 
-    Missing files and parents are allowed so scope can be recorded before
-    creation. Git internals, linked components and non-file targets are excluded.
+    Deleted files and future search inputs may be absent. Never follow linked
+    components, inspect Git internals or treat a directory as a file.
     """
 
-    pure = _safe_relative(value, "allowed path")
+    pure = _safe_relative(value, "file path")
     if any(part.casefold() == ".git" for part in pure.parts):
-        raise UpdateExecutionError(f"allowed path cannot name Git internals: {value}")
+        raise UpdateExecutionError(f"file path cannot name Git internals: {value}")
     target = _target(repo_root, value)
-    _reject_link_chain(target, "allowed path")
+    _reject_link_chain(target, "file path")
     if target.exists() and not target.is_file():
-        raise UpdateExecutionError(f"allowed path must be a regular file target: {value}")
+        raise UpdateExecutionError(f"file path must be a regular file target: {value}")
     if any(parent.exists() and not parent.is_dir() for parent in target.parents):
-        raise UpdateExecutionError(f"allowed path parent is not a directory: {value}")
+        raise UpdateExecutionError(f"file path parent is not a directory: {value}")
     return target
 
 def _content_snapshot(target: pathlib.Path) -> dict[str, object]:
@@ -401,7 +381,6 @@ def load_update(context: Any) -> dict[str, Any]:
         if (state.get("schema") != STATE_SCHEMA or state.get("generation") != number
                 or state.get("update_request_sha256") != record_hash(original)
                 or state.get("status") not in {"pending", "checking", "passed", "failed"}
-                or not isinstance(state.get("baseline_targets"), dict)
                 or not isinstance(state.get("baseline_dirty"), dict)):
             raise UpdateExecutionError("conflicting state generation")
         if previous is not None and (
@@ -412,9 +391,6 @@ def load_update(context: Any) -> dict[str, Any]:
         for key in ("head", "branch", "baseline_dirty", "repo_root"):
             if state.get(key) != original["initial_state"].get(key):
                 raise UpdateExecutionError(f"original {key} changed")
-        for path, baseline in original["initial_state"]["baseline_targets"].items():
-            if state["baseline_targets"].get(path) != baseline:
-                raise UpdateExecutionError("original target baseline changed")
         read_result(context, state)
         previous = state
     if previous is None:

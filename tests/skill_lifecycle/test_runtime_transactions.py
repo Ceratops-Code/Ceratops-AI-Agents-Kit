@@ -197,102 +197,64 @@ def test_current_source_still_repairs_target_drift(tmp_path, drift):
     assert builder["install_transaction"](repo, destination, all_managed=True).status == "no_op"
 
 
-@pytest.mark.parametrize("failure", [None, "before-finalize", "after-finalize", "failed-finalize", "missing", "wrong-commit", "duplicate"])
-def test_installer_forwards_completed_sibling_receipts_without_reinstalling(
-    tmp_path, monkeypatch, capsys, failure,
-):
+@pytest.mark.parametrize("entrypoint", ["callable", "cli"])
+@pytest.mark.parametrize("failed", [False, True])
+def test_installer_returns_only_its_own_result(tmp_path, monkeypatch, capsys, entrypoint, failed):
     installer = load_runtime_installer()
     builder = installer["runtime_builder"]
-    repo = tmp_path / "repo"
-    create_compatible_repo(repo, "example/promotion", ["alpha-tool"])
+    repo, destination = tmp_path / "repo", tmp_path / "installed"
+    create_compatible_repo(repo, "example/installation", ["alpha-tool"])
+    report = tmp_path / "promotion.json"
+    report.write_text("not even JSON")
     monkeypatch.chdir(tmp_path)
-    destination = tmp_path / "installed"
-    record = tmp_path / "promotion.json"
-    record.write_text("promotion")
-    binding = {"result_file": str(record), "sha256": "a" * 64,
-               "identity": [1, 2**63 + 17, 3, 4, 5, 1],
-               "operation": "deliverables.skills.alpha-tool.actions.install"}
-    sibling = {**binding, "operation": "deliverables.mcp-servers.source_search_mcp.actions.install"}
-    evidence = tmp_path / "mcp-receipt.json"
-    receipt = {"schema": "ceratops-deployment-completion.v1",
-               "producer": "ceratops-mcp-server-lifecycle/install", "status": "completed",
-               "cleanup_debt": [], "repo_root": str(repo), "commit": "b" * 40,
-               "promotion": sibling}
-    if failure == "wrong-commit":
-        receipt["commit"] = "c" * 40
-    elif failure == "duplicate":
-        receipt["promotion"] = binding
-    if failure != "missing":
-        evidence.write_text(json.dumps(receipt), encoding="utf-8")
-    main_globals = installer["main"].__globals__
-    monkeypatch.setitem(main_globals, "_source_commit", lambda root: "b" * 40)
-    monkeypatch.setitem(main_globals, "_promotion_bindings", lambda *args: [binding])
-    monkeypatch.setitem(main_globals, "_check_deployment_sources", lambda *args: None)
+    scope = installer["deploy_managed_skills"].__globals__
+    monkeypatch.setitem(scope, "_source_commit", lambda _root: "b" * 40)
+    monkeypatch.setitem(scope, "_check_deployment_sources", lambda *_args: None)
+    original_read = pathlib.Path.read_bytes
+    original_text = pathlib.Path.read_text
     effects = []
-    finalizations = []
-    run_command = subprocess.run
 
-    def install(*args, **kwargs):
+    def guard_read(path, *args, **kwargs):
+        assert path != report, "the installer must not read repository reports"
+        return original_read(path, *args, **kwargs)
+
+    def guard_text(path, *args, **kwargs):
+        assert path != report, "the installer must not read repository reports"
+        return original_text(path, *args, **kwargs)
+
+    def install(*_args, **_kwargs):
         effects.append("install")
-        return builder.TransactionResult("ok", ("alpha-tool",), (), "transaction")
-
-    def finalize(argv, **kwargs):
-        if argv[0] == "git":
-            return run_command(argv, **kwargs)
-        finalizations.append((argv, kwargs["input"]))
-        if failure == "before-finalize":
-            raise OSError("finalizer unavailable")
-        assert argv[-4:] == ["--deployment-evidence", "-", "--deployment-evidence", str(evidence)]
-        assert json.loads(evidence.read_text())["promotion"]["identity"][1] == 2**63 + 17
-        record.unlink(missing_ok=True)
-        if failure == "after-finalize":
-            raise OSError("finalizer acknowledgement interrupted")
-        if failure == "failed-finalize":
-            return subprocess.CompletedProcess(argv, 7, "full output\n" * 500, "full cause\n" * 500)
-        return subprocess.CompletedProcess(argv, 0, "OK", "")
+        if failed:
+            raise installer["InstallerError"]("destination denied", phase="installation")
+        return builder.TransactionResult("ok", ("alpha-tool",), (), "a" * 32)
 
     monkeypatch.setattr(builder, "install_transaction", install)
-    monkeypatch.setattr(installer["subprocess"], "run", finalize)
-    argv = ["--repo-root", str(repo), "--install-root", str(destination), "--skill", "alpha-tool",
-            "--promotion-result", str(record), "--operation", binding["operation"],
-            "--task-temp-root", str(tmp_path), "--finalize-promotion-with", str(tmp_path / "finalizer.py"),
-            "--deployment-evidence", str(evidence)]
-    before = evidence.read_bytes() if evidence.exists() else None
-    code = installer["main"](argv)
-    output = capsys.readouterr()
-    invalid = failure in {"missing", "wrong-commit", "duplicate"}
-    assert effects == ([] if invalid else ["install"])
-    assert len(finalizations) == (0 if invalid else 1)
-    assert code == (0 if failure is None else (1 if invalid else 2))
-    if not invalid:
-        result = json.loads(output.out if code == 0 else output.err)
-        assert result["promotion"]["identity"][1] == 2**63 + 17
-        assert result["promotion_cleanup"]["status"] == ("completed" if failure is None else "failed")
-        if failure:
-            assert result["promotion_cleanup"]["replay_required"] is False
-            next_action = result["promotion_cleanup"]["next_action"]
-            completed = json.loads(next_action["stdin"])
-            assert completed["status"] == "completed"
-            assert completed["deployed"] == ["alpha-tool"]
-            assert completed["transaction_id"] == "transaction"
-            assert "promotion_cleanup" not in completed
-            if failure == "failed-finalize":
-                assert result["promotion_cleanup"]["stdout"] == "full output\n" * 500
-                assert result["promotion_cleanup"]["stderr"] == "full cause\n" * 500
-                assert result["promotion_cleanup"]["returncode"] == 7
-            # A cleanup-only repeat consumes the preserved receipt, not the
-            # installer entry point; an interrupted acknowledgement is harmless.
-            failure = None
-            for _ in range(2):
-                assert finalize(next_action["command"], input=next_action["stdin"]).returncode == 0
-            assert effects == ["install"]
-    assert (evidence.read_bytes() if evidence.exists() else None) == before
-    # The transport preflight is read-only and repeatable; interrupted cleanup
-    # retains the actual receipt rather than requesting a second installation.
-    if not invalid:
-        args = installer["build_parser"]().parse_args(argv)
-        for _ in range(2):
-            assert installer["_additional_deployment_evidence"](args, repo, "b" * 40, [binding]) == [str(evidence)]
+    with monkeypatch.context() as patch:
+        patch.setattr(pathlib.Path, "read_bytes", guard_read)
+        patch.setattr(pathlib.Path, "read_text", guard_text)
+        if entrypoint == "callable":
+            result = installer["deploy_managed_skills"](installer["DeployOptions"](
+                repo_root=repo, install_root=destination, skill=("alpha-tool",),
+            ))
+        else:
+            code = installer["main"](["--repo-root", str(repo), "--install-root", str(destination),
+                                      "--skill", "alpha-tool"])
+            captured = capsys.readouterr()
+            assert code == (1 if failed else 0)
+            result = json.loads(captured.err if failed else captured.out)
+    assert effects == ["install"]
+    assert report.read_text() == "not even JSON"
+    if failed:
+        assert result["reason"] == "destination denied"
+        assert result["phase"] == "installation"
+    else:
+        assert result == {
+            "schema": "ceratops-deployment-completion.v1",
+            "producer": "ceratops-skill-lifecycle/deploy", "status": "completed",
+            "repo_root": str(repo), "commit": "b" * 40, "install_root": str(destination),
+            "deployed": ["alpha-tool"], "removed": [], "transaction_id": "a" * 32,
+            "cleanup_debt": [],
+        }
 
 
 def test_runtime_installer_releases_installed_working_directory(

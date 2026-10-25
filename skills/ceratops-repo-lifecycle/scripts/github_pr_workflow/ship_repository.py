@@ -36,6 +36,7 @@ from repository_operation import (
 from repository_operation import (
     validation_operations as resolve_validations,
 )
+from retire_shipped_work import CleanupError, select_preserved_worktrees
 
 from github_pr_workflow import preserve_check_references
 from github_pr_workflow import ship as github_ship
@@ -76,6 +77,7 @@ class ShipOptions:
     merge_method: str = "merge"
     delete_branch: bool = False
     reusable_head: bool = False
+    preserve_worktree: list[pathlib.Path] | None = None
     sdlc_contract: pathlib.Path = DEFAULT_SDLC_CONTRACT
     validation_operation: list[str] | None = None
     publish_operation: list[str] | None = None
@@ -725,6 +727,7 @@ def _pending_command(
     target_commit: str,
     current_branch: str | None = None,
     current_commit: str | None = None,
+    preserve_worktrees: list[pathlib.Path] | None = None,
 ) -> list[str]:
     command = [
         sys.executable,
@@ -750,6 +753,8 @@ def _pending_command(
                 current_commit,
             )
         )
+        for path in preserve_worktrees or []:
+            command.extend(("--preserve-worktree", str(path)))
     return command
 
 
@@ -815,6 +820,8 @@ def _resume_ship_command(
         command.append("--delete-branch")
     if args.reusable_head:
         command.append("--reusable-head")
+    for path in getattr(args, "preserve_worktree", None) or []:
+        command.extend(("--preserve-worktree", str(path)))
     if diagnostic_output := getattr(args, "diagnostic_output", None):
         command.extend(("--diagnostic-output", str(diagnostic_output)))
         if owner := getattr(args, "diagnostic_owner", None):
@@ -1100,6 +1107,12 @@ def _ship_repository(args: ShipOptions) -> dict[str, object]:
     """Run complete shipping, release publication, deployment, and cleanup."""
 
     repo_root = args.repo_root.expanduser().resolve(strict=True)
+    try:
+        explicit_preserved = select_preserved_worktrees(
+            repo_root, tuple(getattr(args, "preserve_worktree", None) or []),
+        )
+    except CleanupError as exc:
+        raise RepositoryShipError(str(exc)) from exc
     if _local_branch_exists(repo_root, "release"):
         raise RepositoryShipError(
             "refs/heads/release blocks the required release/local branch namespace."
@@ -1136,6 +1149,10 @@ def _ship_repository(args: ShipOptions) -> dict[str, object]:
         )
     pending_scope = _prepared_scope(prepared)
     preserved_worktrees = _prepared_preserved_worktrees(prepared)
+    preserved_worktrees.extend(
+        item for item in explicit_preserved
+        if not any(item["path"] == existing["path"] for existing in preserved_worktrees)
+    )
     prepared_target_commit = _prepared_target_commit(
         prepared,
         pending_scope,
@@ -1296,6 +1313,7 @@ def _ship_repository(args: ShipOptions) -> dict[str, object]:
             target_commit=target_commit,
             current_branch=args.base_branch,
             current_commit=synchronized_head,
+            preserve_worktrees=getattr(args, "preserve_worktree", None),
         ),
         repo_root=repo_root,
     )

@@ -125,7 +125,7 @@ def collect(request_path: Path, output: Path) -> None:
     request = load(request_path)
     allowed = {"version", "mode", "days", "end", "timezone", "task_temp_root", "request_disposable",
                "local", "hosts", "sources", "codex_home", "task_ids", "project", "context_before",
-               "context_after", "selector", "control_example", "coverage_notes"}
+               "context_after", "selector", "control_example", "coverage_notes", "assistant_scope"}
     if not isinstance(request, dict) or set(request) - allowed:
         raise ValueError("request contains unknown fields; use the documented scope keys")
     if any(not isinstance(request.get(key, False), bool) for key in ("local", "request_disposable")):
@@ -137,6 +137,9 @@ def collect(request_path: Path, output: Path) -> None:
         raise ValueError("sources must be a list of source objects")
     if request.get("version") != 1 or request.get("mode") not in ("history", "case"):
         raise ValueError("request requires version=1 and mode=history or case")
+    assistant_scope = request.get("assistant_scope", "visible")
+    if assistant_scope not in ("visible", "final"):
+        raise ValueError("assistant_scope must be visible or final")
     root = temp_root(request["task_temp_root"])
     output = safe_temp(output.absolute(), root)
     frozen = window(request)
@@ -168,7 +171,7 @@ def collect(request_path: Path, output: Path) -> None:
         entry = {"path": source["path"], "format": source["format"],
                  "task": source.get("task"), "index": source.get("index"), "gaps": []}
         try:
-            records, gaps = read_source(source)
+            records, gaps = read_source({**source, "assistant_scope": assistant_scope})
             for record in records:
                 record["source_format"] = source["format"]
             if task_ids and any(record["task"]["id"] not in task_ids for record in records):
@@ -238,6 +241,7 @@ def collect(request_path: Path, output: Path) -> None:
         "coverage": coverage, "coverage_notes": request.get("coverage_notes", []),
         "host_scope": request.get("hosts", ["local"]), "patterns": PATTERNS,
         "context_bounds": {"before": context_before, "after": context_after},
+        "assistant_scope": assistant_scope,
         "messages": selected, "eligible_ids": sorted(eligible),
         "literal_candidate_ids": [record["id"] for record in selected if record["signals"]],
         "control_example": request.get("control_example"),
@@ -319,6 +323,7 @@ def validate_review(packet: dict[str, Any], review: dict[str, Any]) -> dict[str,
         "schema": "ceratops-misunderstanding-ledger.v1", "window": packet["window"],
         "coverage": packet["coverage"], "coverage_notes": packet["coverage_notes"],
         "host_scope": packet["host_scope"], "patterns": packet["patterns"], "counts": counts,
+        "assistant_scope": packet.get("assistant_scope", "visible"),
         "semantic_sweep_count": len(eligible), "candidates": candidates,
         "chains": [{**chain, "messages": [messages[item] for item in chain["message_ids"]]} for chain in chains],
         "control_check": review.get("control_check"),
@@ -417,12 +422,44 @@ def finalize(packet_path: Path, review_path: Path, ledger_path: Path, report_pat
             raise ValueError(f"deliverables saved; cleanup incomplete: {path}")
 
 
+def inspect_packet(packet_path: Path, view: str, task_id: str | None, offset: int, limit: int) -> dict[str, Any]:
+    """Return a bounded, read-only review page; selection never uses keywords.
+
+    The packet remains the evidence owner. HTML annotation metadata is omitted
+    from the display, while the packet retains exact text and source locations.
+    """
+    if offset < 0 or not 1 <= limit <= 100:
+        raise ValueError("inspection requires offset >= 0 and limit between 1 and 100")
+    packet = load(packet_path)
+    if packet.get("schema") != "ceratops-misunderstanding-packet.v1":
+        raise ValueError("unsupported packet schema")
+    records = [record for record in packet["messages"] if not task_id or record["task"]["id"] == task_id]
+    if view == "users":
+        records = [record for record in records if record["role"] == "user" and record["in_scope"]]
+    elif view == "coverage":
+        records = [source for source in packet["coverage"] if not task_id or (source.get("task") or {}).get("id") == task_id]
+    page = records[offset:offset + limit]
+    if view != "coverage":
+        page = [{key: record[key] for key in ("id", "role", "task", "timestamp", "in_scope", "signals")}
+                | {"text": re.sub(r"<!--[\s\S]*?-->", "", record["text"]).strip(),
+                   "source_versions": record.get("source_versions", [])} for record in page]
+    return {"packet_sha256": file_hash(packet_path), "assistant_scope": packet.get("assistant_scope", "visible"),
+            "total": len(records), "offset": offset, "next_offset": offset + len(page) if offset + len(page) < len(records) else None,
+            "records": page}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     start = commands.add_parser("collect")
     start.add_argument("--request", type=Path, required=True)
     start.add_argument("--output", type=Path, required=True)
+    inspect = commands.add_parser("inspect")
+    inspect.add_argument("--packet", type=Path, required=True)
+    inspect.add_argument("--view", choices=("users", "conversation", "coverage"), default="users")
+    inspect.add_argument("--task-id")
+    inspect.add_argument("--offset", type=int, default=0)
+    inspect.add_argument("--limit", type=int, default=25)
     finish = commands.add_parser("finalize")
     for name in ("packet", "review", "ledger", "report"):
         finish.add_argument(f"--{name}", type=Path, required=True)
@@ -431,6 +468,11 @@ def main() -> int:
     try:
         if args.command == "collect":
             collect(args.request, args.output)
+        elif args.command == "inspect":
+            if hasattr(sys.stdout, "reconfigure"):
+                sys.stdout.reconfigure(encoding="utf-8")
+            print(json.dumps(inspect_packet(args.packet, args.view, args.task_id, args.offset, args.limit), ensure_ascii=False))
+            return 0
         else:
             finalize(args.packet, args.review, args.ledger, args.report, args.cleanup)
     except (OSError, ValueError, KeyError, TypeError) as error:

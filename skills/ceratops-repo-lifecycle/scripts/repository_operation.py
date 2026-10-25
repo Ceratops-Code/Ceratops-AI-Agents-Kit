@@ -296,10 +296,14 @@ def prepare_versioned_receipt(
     transaction: ArtifactVersionTransaction,
     target: str,
     receipt: Mapping[str, Any],
+    *,
+    check_summaries: Sequence[Mapping[str, Any]] = (),
 ) -> PreparedBuildReceipt:
     """Write one qualified target receipt to its final worktree path."""
 
-    return complete_artifact_builds.prepare_versioned_build_receipt(transaction, target, receipt)
+    return complete_artifact_builds.prepare_versioned_build_receipt(
+        transaction, target, receipt, check_summaries=check_summaries,
+    )
 
 
 def complete_versioned_build(
@@ -653,7 +657,12 @@ def execute_prepared_operation(
             if current["fingerprint"] != check_plan.context["fingerprint"]:
                 check_plan = reuse_operation_checks.plan_operation(prepared)
             else:
-                check_plan.decision = check_plan.store.select(current, check_id=prepared.operation)
+                check_plan.decision = check_plan.store.select(
+                    current, check_id=prepared.operation,
+                    builds=sdlc_results.select_build_check_summaries(
+                        prepared.repo_root, qualification_level=prepared.qualification_level,
+                    ),
+                )
                 if check_plan.decision["decision"] == "blocked":
                     raise ValueError("Recorded check evidence blocks reuse: " + check_plan.decision["reason"])
             if check_plan.decision["decision"] == "reuse":
@@ -806,6 +815,8 @@ def execute_prepared_operation(
         if check_plan is not None and code is not None:
             try:
                 base["check_result"] = check_plan.completed(prepared, passed=code == 0)
+                if check_plan.summary is not None:
+                    base["check_summary"] = check_plan.summary
             except (OSError, ValueError) as exc:
                 failure = {
                     **base, "status": "result_invalid", "steps": completed,
@@ -831,6 +842,9 @@ def execute_prepared_operation(
                     captured["result_omitted"] = "output_limit"
                 if captured:
                     child_results[stream] = captured
+            cause = failure_excerpt(f"{stderr}\n{stdout}") or (
+                f"Command exited with code {code}." if code is not None else "Command could not start."
+            )
             failure = {
                 **base,
                 "status": "validation_failed"
@@ -838,17 +852,12 @@ def execute_prepared_operation(
                 else "tests_failed"
                 if prepared.category == "tests"
                 else "operation_failed",
-                "message": f"SDLC step failed: {prepared.operation} step {step.position}",
+                "message": f"SDLC step failed: {prepared.operation} step {step.position}\n{cause}",
                 "steps": completed,
                 "failed_step": step.position,
                 "diagnostic": {
                     "exit_code": code,
-                    "message": failure_excerpt(f"{stderr}\n{stdout}")
-                    or (
-                        f"Command exited with code {code}."
-                        if code is not None
-                        else "Command could not start."
-                    ),
+                    "message": cause,
                     "stdout_tail": _bounded_tail(stdout),
                     "stderr_tail": _bounded_tail(stderr),
                     **({"child_results": child_results} if child_results else {}),
@@ -1243,6 +1252,9 @@ def main(argv: list[str] | None = None) -> int:
                                     if item.get("check_result")]
                 if check_references:
                     result["check_results"] = check_references
+                check_summaries = [item["check_summary"] for item in checks["results"] if item.get("check_summary")]
+                if check_summaries:
+                    result["check_summaries"] = check_summaries
                 advisory_checks = [
                     item
                     for item in checks["results"]

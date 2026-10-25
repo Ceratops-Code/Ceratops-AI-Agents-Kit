@@ -84,46 +84,38 @@ repo docs, then update the narrowest correct source that exists.
 `SKILL_ROOT/.runtime-manifest.json`.
 
 - (D) Before editing helper-runtime code or a multi-file contract, run `uv run
-  --no-project --python "PYTHON_RUNTIME"   python
+  --no-project --python "PYTHON_RUNTIME" python
   "SKILL_ROOT/scripts/skill-update-workflow.py" init --repo-root WORKTREE
-  --selected-skill   SKILL --group NAME PATH`.
-- Repeat `--selected-skill` and `--group` as needed, and declare non-test checks
-  with `--command-check-file FILE` or `--search-check EXPECTED PATTERN PATH`.
-  `init` derives allowed paths from the groups, records the closed request in
-  the worktree-owned checkpoint, and returns one next action. Command-check
-  files are UTF-8 with one exact argument per nonempty line.
-- For a caller-owned complete `ceratops-skill-update-request.v3`, run `uv run
-  --no-project --python "PYTHON_RUNTIME"   python
-  "SKILL_ROOT/scripts/skill-update-workflow.py" open_skill_change --repo-root
-  WORKTREE   --change-request REQUEST`. `WORKTREE` is the selected task
-  worktree;   `REQUEST` is the caller's JSON file. Run these commands with the
-  skill's   managed Python runtime.
-- The calling task applies the requested source edits. This helper records
-  approved scope and checks; it does not edit, commit, promote or deploy source.
-- (D) After editing, run `uv run --no-project --python "PYTHON_RUNTIME"   python
-  "SKILL_ROOT/scripts/skill-update-workflow.py" run   --repo-root WORKTREE`.
-- `run` performs only the needed verification, then returns the recorded status
-  and one next action. Caller-owned request flows may use the lower-level
-  `run_skill_checks --repo-root WORKTREE` command.
-- Preserve the original Git and dirty-file baselines, explicit approved scope,
-  shared-source ownership and Git whitespace gates. Tests remain owned by the
-  repository-declared SDLC test phase; requests contain only non-test checks.
-- (D) For approved additional scope, update the caller's request and run   `uv
-  run --no-project --python "PYTHON_RUNTIME"   python
-  "SKILL_ROOT/scripts/skill-update-workflow.py" expand_skill_scope   --repo-root
-  WORKTREE --change-request REQUEST` before editing added paths.
-- Scope expansion preserves existing approvals and the original baseline.
-  Changed inputs create a pending generation before checks. Reuse saved passed
-  commands for unchanged complete inputs and saved searches for unchanged
-  declared inputs; an identical successful retry does no check work.
+  --selected-skill SKILL`.
+- Repeat `--selected-skill` as needed. Declare non-test checks with
+  `--command-check-file FILE` or `--search-check EXPECTED PATTERN PATH`.
+  Command files contain one exact argument per nonempty UTF-8 line.
+  `init` records the original Git commit and pre-existing edits; Git supplies
+  changed paths when checks run. Do not supply file allowlists or change groups.
+- For a caller-owned `ceratops-skill-update-request.v4` containing
+  `schema`, `selected_skills` and `checks`, run `uv run --no-project
+  --python "PYTHON_RUNTIME" python "SKILL_ROOT/scripts/skill-update-workflow.py"
+  open_skill_change --repo-root WORKTREE --change-request REQUEST`.
+  `WORKTREE` is the selected task checkout; `REQUEST` is the caller's JSON file.
+- The calling task edits source within the user's request. The helper records
+  check results; it does not grant editing permission, edit, commit, promote or
+  deploy source. Adding another source file requires no request amendment.
+- (D) After editing, run `uv run --no-project --python "PYTHON_RUNTIME" python
+  "SKILL_ROOT/scripts/skill-update-workflow.py" run --repo-root WORKTREE`.
+- `run` runs only the needed checks and returns their status and one next
+  action. The lower-level equivalent is `run_skill_checks --repo-root WORKTREE`.
+  Tests remain with the repository's SDLC runner.
+- Repeat `init` or `open_skill_change` with the complete declarations to add
+  skills or checks without replacing the original Git/dirty baseline. Existing
+  declarations remain intact; revise failed checks through the command below.
+- Pre-existing edits must remain unchanged. Source changes must stay within
+  the task checkout; the original commit must remain an ancestor of its HEAD.
+  Git whitespace checks and exact-input reuse remain enforced by the helper.
 - The helper discovers one unfinished update per worktree beneath the Git
-  common directory without a checkpoint or worktree lock. Immutable states and check
-  results recover interrupted recording; caller request files remain owned by
-  the caller. Do not supply state, evidence or operation-ID paths.
-- Do not use the workflow for skill-local text-only updates.
-- The update helper must count manifest-declared shared sources as ownership
-  for their selected skill consumers and reject selected skills without an
-  owned allowed path.
+  common directory without a checkpoint or worktree lock. It keeps immutable
+  states and check results until completion; caller request files remain
+  caller-owned. Do not supply state, evidence or operation-ID paths.
+- Do not use this workflow for skill-local text-only updates.
 - Update skills, shared sections, manifest, runtime payloads, runtime generation
   or validation scripts, helper-runtime files or claims, contracts, and repo
   docs only where ownership requires it.
@@ -141,12 +133,11 @@ repo docs, then update the narrowest correct source that exists.
 - If runtime generation or validation flow no longer matches the section model,
   fix the scripts instead of working around them in skill text.
 
-- (D) For an explicitly revised request after failed checks, run   `uv run
-  --no-project --python "PYTHON_RUNTIME"   python
-  "SKILL_ROOT/scripts/skill-update-workflow.py" replace_failed_request
-  --repo-root WORKTREE --change-request REQUEST` before editing added paths.
-  Preserve the original baseline, existing scope and saved successful checks;
-  the new request may revise failed checks without concealing unrelated work.
+- (D) For revised failed checks, run `uv run --no-project --python
+  "PYTHON_RUNTIME" python "SKILL_ROOT/scripts/skill-update-workflow.py"
+  replace_failed_request --repo-root WORKTREE --change-request REQUEST`.
+  The helper preserves the original Git/dirty baseline and applicable passing
+  results. Identical retries do not add another state or repeat checks.
 
 #### 4. Run needed checks
 

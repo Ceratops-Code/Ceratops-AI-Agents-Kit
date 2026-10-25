@@ -313,6 +313,7 @@ def _ship_after_promotion(
         remote_name=args.remote_name,
         commit=target_commit,
         reusable_head=True,
+        preserve_worktree=getattr(args, "preserve_worktree", None),
         sdlc_contract=args.sdlc_contract,
         title=getattr(args, "title", None),
         body=getattr(args, "body", None),
@@ -351,6 +352,8 @@ def _promotion_inputs(args: argparse.Namespace) -> tuple[pathlib.Path, list[str]
         raise PromotionError(f"release_branch must be {RELEASE_BRANCH}.")
     branches = list(dict.fromkeys(args.source_branch or []))
     ship_after_promotion = bool(getattr(args, "ship_after_promotion", False))
+    if not ship_after_promotion and getattr(args, "preserve_worktree", None):
+        raise PromotionError("Worktree preservation requires --ship-after-promotion.")
     if not ship_after_promotion and any(
         getattr(args, field, None) is not None for field in ("title", "body")
     ):
@@ -805,33 +808,6 @@ def _cleanup_path(path: pathlib.Path) -> pathlib.Path:
     return absolute
 
 
-def _receipt_promotion_bindings(receipt: dict[str, Any]) -> list[dict[str, Any]]:
-    """Return one or more unique promotion bindings from a completion receipt."""
-    raw = receipt.get("promotion")
-    values = [raw] if isinstance(raw, dict) else raw
-    if (
-        not isinstance(values, list)
-        or not values
-        or not all(isinstance(item, dict) for item in values)
-    ):
-        raise PromotionError(
-            "Completion evidence operation is missing or duplicated."
-        )
-    operations: set[str] = set()
-    bindings: list[dict[str, Any]] = []
-    for item in values:
-        operation = item.get("operation")
-        if (
-            not isinstance(operation, str)
-            or not operation
-            or operation in operations
-        ):
-            raise PromotionError(
-                "Completion evidence operation is missing or duplicated."
-            )
-        operations.add(operation)
-        bindings.append(item)
-    return bindings
 
 
 def _completed_deployment(
@@ -840,45 +816,30 @@ def _completed_deployment(
     *,
     release_branch: str | None = None,
     repo_root: pathlib.Path | None = None,
-    external: dict[str, dict[str, Any]] | None = None,
-    record_binding: dict[str, Any] | None = None,
-    caller_verified: bool = True,
 ) -> None:
-    """Require complete operations and validate bound handoff completions.
+    """Require the actual installation outcomes recorded by the operation runner.
 
-    Arbitrary command receipts retain the caller-validation gate. The closed
-    completion protocol is checked here and never inferred from OK or a route.
+    No separate installer receipt can complete a pending saved handoff.
     The runner records steps only after zero exits; structured output is optional
     and its receipts form an ordered subset of those completed steps.
     """
     if not isinstance(result, dict):
         raise PromotionError("Result is not a successful promote-and-deploy outcome.")
-    pending_handoffs = (
-        result.get("status") == "handoff_required"
-        and result.get("phase") == "deployment"
-    )
-    promotion = result.get("promotion") if pending_handoffs else result
-    if not isinstance(promotion, dict) or promotion.get("status") != "ready":
-        raise PromotionError("Result is not a successful promote-and-deploy outcome.")
-    if promotion.get("head") != commit:
+    if result.get("status") != "ready":
+        raise PromotionError("Deployment is missing or incomplete; retain the result.")
+    if result.get("head") != commit:
         raise PromotionError("Result head does not match expected-commit.")
-    if release_branch is not None and promotion.get("release_branch") != release_branch:
-        raise PromotionError(
-            "Result promotion branch does not match finalization inputs."
-        )
+    if release_branch is not None and result.get("release_branch") != release_branch:
+        raise PromotionError("Result promotion branch does not match finalization inputs.")
     operations = result.get("operations")
     if (
         not isinstance(operations, dict)
-        or operations.get("status") != ("handoff_required" if pending_handoffs else "completed")
-        or (not pending_handoffs and operations.get("pending_operations") != [])
+        or operations.get("status") != "completed"
+        or operations.get("pending_operations") != []
     ):
         raise PromotionError("Deployment is missing or incomplete; retain the result.")
-    completed = operations.get("completed_operations")
-    pending = operations.get("pending_operations")
+    selected = operations.get("completed_operations")
     outcomes = operations.get("results")
-    if not isinstance(pending, list) or (pending_handoffs and not pending):
-        raise PromotionError("Pending deployment operations are missing or ambiguous.")
-    selected = completed + pending if isinstance(completed, list) else None
     if (
         not isinstance(selected, list)
         or not selected
@@ -887,56 +848,19 @@ def _completed_deployment(
         or not isinstance(outcomes, list)
         or len(outcomes) != len(selected)
     ):
-        raise PromotionError(
-            "Completed deployment operations are missing or ambiguous."
-        )
-    external = dict(external or {})
+        raise PromotionError("Completed deployment operations are missing or ambiguous.")
     for operation, outcome in zip(selected, outcomes, strict=True):
-        supplied = external.pop(operation, None)
-        if operation in pending and supplied is None:
-            raise PromotionError("Deployment handoff lacks bound completion evidence.")
-        bound_advisory = (
-            supplied is not None
-            and isinstance(outcome, dict)
-            and outcome.get("status") == "advisory"
-            and outcome.get("steps") == []
-        )
-        bound_pending = (
-            pending_handoffs and operation in pending and supplied is not None
-            and isinstance(outcome, dict) and outcome.get("status") == "handoff_required"
-            and bool(outcome.get("handoff")) and not outcome.get("handoff_completed")
-        )
         if (
             not isinstance(outcome, dict)
             or outcome.get("operation") != operation
-            or (outcome.get("status") != "completed" and not bound_advisory and not bound_pending)
-            or (operation in pending and not bound_pending)
+            or outcome.get("status") != "completed"
             or outcome.get("commit") != commit
         ):
             raise PromotionError(
                 f"Deployment outcome is incomplete or has a different commit: {operation}"
             )
-        if supplied is not None:
-            assert repo_root is not None and record_binding is not None
-            if outcome.get("handoff_completed"):
-                raise PromotionError(
-                    "External evidence cannot replace an already executed handoff."
-                )
-            check_deployment_receipt(
-                supplied,
-                repo_root=repo_root,
-                commit=commit,
-                outcome=outcome,
-                binding={**record_binding, "operation": operation},
-                error_type=PromotionError,
-                read_promotion_bindings=_receipt_promotion_bindings,
-                check_destination_path=_cleanup_path,
-            )
-            # Any preceding repository-owned commands keep their original receipt gate.
-            if not outcome.get("steps"):
-                continue
-        elif outcome.get("handoff") and not outcome.get("handoff_completed"):
-            raise PromotionError("Deployment handoff lacks bound completion evidence.")
+        if outcome.get("handoff") and not outcome.get("handoff_completed"):
+            raise PromotionError("Deployment handoff has not completed.")
         steps = outcome.get("steps")
         receipts = outcome.get("step_results", [])
         if outcome.get("handoff_completed") and isinstance(receipts, list) and receipts:
@@ -964,9 +888,7 @@ def _completed_deployment(
                     repo_root=repo_root,
                     commit=commit,
                     outcome=outcome,
-                    binding=None,
                     error_type=PromotionError,
-                    read_promotion_bindings=_receipt_promotion_bindings,
                     check_destination_path=_cleanup_path,
                 )
                 continue
@@ -985,10 +907,6 @@ def _completed_deployment(
             )
         if not isinstance(receipts, list):
             raise PromotionError(f"Step receipts must be a list: {operation}")
-        if receipts and not caller_verified:
-            raise PromotionError(
-                "Ordinary producer receipts require caller validation before cleanup."
-            )
         remaining_steps = iter(steps)
         for item in receipts:
             # Advancing the iterator rejects unknown, duplicate and reordered
@@ -1013,10 +931,6 @@ def _completed_deployment(
                 raise PromotionError(
                     f"Producer schema/status is missing: {operation}, step {step}"
                 )
-    if external:
-        raise PromotionError(
-            "Completion evidence names an unselected deployment operation."
-        )
 
 
 def _completed_promotion_only(
@@ -1047,13 +961,14 @@ def _completed_promotion_only(
 
 
 def finalize_result(args: argparse.Namespace) -> None:
-    """Remove only a caller-validated receipt; never invoke lifecycle operations.
+    """Remove only the caller's completed report; never run lifecycle operations.
 
     This explicit completion trigger owns the temporary result file only. The
-    supplied SHA-256 binds the caller's producer validation to the bytes removed.
+    supplied SHA-256 identifies the exact report bytes selected for deletion.
     Hex letter case does not change that digest.
     All checks precede unlink; other task files and pending-work state belong to
-    their respective owners. Failed cleanup can be retried without deployment.
+    their respective owners. An absent report is already cleaned; repeated
+    cleanup never runs deployment or restores work from this report.
     """
     execution_options = (
         args.source_branch,
@@ -1079,13 +994,11 @@ def finalize_result(args: argparse.Namespace) -> None:
     verified_digest = args.verified_result_sha256
     if verified_digest is not None:
         verified_digest = verified_digest.lower()
-    if args.promotion_only and args.deployment_evidence:
-        raise PromotionError("Promotion-only cleanup cannot use deployment evidence.")
-    if (args.promotion_only or not args.deployment_evidence) and not re.fullmatch(
+    if not re.fullmatch(
         r"[0-9a-f]{64}", verified_digest or ""
     ):
         raise PromotionError(
-            "Supply verified-result-sha256 only after validating every producer receipt."
+            "Supply verified-result-sha256 for the exact completed report."
         )
     repo_root = args.repo_root.expanduser().resolve(strict=True)
     common_dir = pathlib.Path(
@@ -1122,6 +1035,8 @@ def finalize_result(args: argparse.Namespace) -> None:
         raise PromotionError(
             "result-file must be outside Git worktrees and repository state."
         )
+    if not path.exists():
+        return
     original_stat = path.stat()
     if not stat.S_ISREG(original_stat.st_mode) or original_stat.st_nlink != 1:
         raise PromotionError("result-file must be a regular file without hard links.")
@@ -1129,39 +1044,9 @@ def finalize_result(args: argparse.Namespace) -> None:
     digest = hashlib.sha256(data).hexdigest()
     if verified_digest is not None and digest != verified_digest:
         raise PromotionError(
-            "Result changed since producer validation; revalidate the saved result."
+            "Result does not match the supplied digest; select the current completed report."
         )
     result = json.loads(data, object_pairs_hook=_unique_result_object)
-    external: dict[str, dict[str, Any]] = {}
-    evidence_files: dict[pathlib.Path, bytes] = {}
-    sources = getattr(args, "deployment_evidence", None) or []
-    if sources.count("-") > 1:
-        raise PromotionError("Completion evidence may read stdin only once.")
-    for source in sources:
-        if source == "-":
-            evidence = sys.stdin.read(4_194_305).encode()
-        else:
-            evidence_path = _cleanup_path(pathlib.Path(source))
-            if not evidence_path.is_file() or evidence_path.stat().st_nlink != 1:
-                raise PromotionError(
-                    "Completion evidence must be an unlinked regular file."
-                )
-            evidence = evidence_path.read_bytes()
-            evidence_files[evidence_path] = evidence
-        if len(evidence) > 4_194_304:
-            raise PromotionError("Completion evidence exceeds the supported size.")
-        value = json.loads(evidence, object_pairs_hook=_unique_result_object)
-        if not isinstance(value, dict):
-            raise PromotionError(
-                "Completion evidence operation is missing or duplicated."
-            )
-        for binding in _receipt_promotion_bindings(value):
-            operation = binding["operation"]
-            if operation in external:
-                raise PromotionError(
-                    "Completion evidence operation is missing or duplicated."
-                )
-            external[operation] = value
     if args.promotion_only:
         _completed_promotion_only(result, args.expected_commit, args.release_branch)
     else:
@@ -1170,28 +1055,7 @@ def finalize_result(args: argparse.Namespace) -> None:
             args.expected_commit,
             release_branch=args.release_branch,
             repo_root=repo_root,
-            external=external,
-            record_binding={
-                "result_file": str(path),
-                "sha256": digest,
-                "identity": [
-                    getattr(original_stat, key)
-                    for key in (
-                        "st_dev",
-                        "st_ino",
-                        "st_mtime_ns",
-                        "st_size",
-                        "st_mode",
-                        "st_nlink",
-                    )
-                ],
-            },
-            caller_verified=bool(verified_digest),
         )
-    for evidence_path, evidence in evidence_files.items():
-        _cleanup_path(evidence_path)
-        if evidence_path.stat().st_nlink != 1 or evidence_path.read_bytes() != evidence:
-            raise PromotionError("Completion evidence changed during cleanup.")
     # Recheck identity and contents immediately before the only destructive step.
     _cleanup_path(path)
     current_stat = path.stat()
@@ -1246,12 +1110,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--verified-result-sha256",
-        help="Digest of the exact saved result after caller validation of every producer receipt.",
-    )
-    parser.add_argument(
-        "--deployment-evidence",
-        action="append",
-        help="Bound deployment completion JSON file, or - for stdin; repeat for distinct handoffs.",
+        help="SHA-256 of the exact completed report selected for deletion.",
     )
     parser.add_argument("--main-branch", default="main")
     parser.add_argument(
@@ -1297,6 +1156,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--sdlc-contract",
         type=pathlib.Path,
         default=DEFAULT_SDLC_CONTRACT,
+    )
+    parser.add_argument(
+        "--preserve-worktree", type=pathlib.Path, action="append",
+        help="Keep this active task worktree and its files after composed shipping; repeat as needed.",
     )
     parser.add_argument(
         "--validation-operation",
@@ -1345,7 +1208,6 @@ def main(argv: list[str] | None = None) -> int:
             args.task_temp_root,
             args.expected_commit,
             args.verified_result_sha256,
-            args.deployment_evidence,
         )
     ):
         parser.error("result cleanup arguments require --finalize-result")

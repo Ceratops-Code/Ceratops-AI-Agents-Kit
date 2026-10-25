@@ -86,6 +86,17 @@ per-worktree files under `<git-common-dir>/ceratops/locks/` await one-time
 retirement at the next authorized deployment after old invocations stop.
 Files still in use are retained and reported; other locks and requests remain.
 
+4F supplies internal scoped retention functions in `retain_artifact_versions.py`,
+with store protection supplied by `store_artifacts.retain_completed_artifacts()`.
+They retain complete unchanged packages for one unit/target and named worktree
+or destination. Shared beta/stable storage keeps two successfully deployed
+versions and the latest approved build; a destination keeps current/previous
+installations and its latest deployed beta/stable version. A worktree keeps its
+own latest approved build. Existing receipts and successful-result identities
+remain unchanged. Readers report the actual retained paths. Build, Promote and
+Deploy connect these functions in their later adoption steps; their availability
+does not change this action's current installation route.
+
 ### Complete failure details
 
 Add `--diagnostic-output FILE` to the promotion command. FILE is one stable
@@ -233,16 +244,14 @@ branches, and pending-work scope before finalization. The helper requires a
 ready result for the expected commit with no deployment operations or evidence.
 Without `--promotion-only`, deployment completion checks still apply.
 
-For completed handoffs, add `--deployment-evidence FILE` or pass JSON on
-stdin with `--deployment-evidence -`. One receipt may bind one operation or a
-nonempty ordered list of operations from the same unchanged promotion record.
-Bound evidence permits omission of the caller digest when every outcome uses
-this protocol. The receipt must bind the original record digest and operations
-to its producer, repository, clean commit, installation destination, exact
-deployed and removed skills, transaction, and cleanup debt. Finalization maps
-the receipt to every bound operation, rejects duplicate or unselected
-operations, and requires completed status with no debt; a handoff or `OK` alone
-cannot establish completion.
+The operation runner records the result returned by each requested installation.
+Installers receive installation inputs only; they do not read this report, bind
+its path/hash/file identity, or invoke the repo finalizer. Completion consumes
+those recorded actual outcomes without another promotion-matching stage. A
+pending or failed installation keeps the needed report; no external receipt can
+turn a pending handoff into completion. Use the repo cleanup command above after
+all requested work completes, without reinstalling or replaying promotion.
+Repeating cleanup after the owned report is already absent succeeds without effects.
 
 Finalization deletes only the named promotion record. It preserves failed,
 incomplete, mismatched, changed, linked, and out-of-scope records, other task
