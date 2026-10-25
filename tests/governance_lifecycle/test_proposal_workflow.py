@@ -417,18 +417,24 @@ def test_proposal_workflow_validates_context_and_owns_iteration_transition(
         newline="\n",
     )
     target_repository_markdown_policy(target_dir)
-    current_text = (
-        "- [SKILLS-GOV-01] Before proposing or editing a repository control surface,\n"
-        "  including `AGENTS.md`, `automation.toml`, `SKILL.md`, skill manifests, shared\n"
-        "  sections, or helper contracts, re-open the relevant files from disk and use\n"
-        "  the current contents as the source of truth.\n"
-        "  - self: list-heavy"
-    )
-    assert current_text in (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    # Context lookup needs stable test-owned rules and decisions, independent
+    # of instruction edits in the repository running this behavior test.
+    context_dir = tmp_path / "context-source"
+    context_dir.mkdir()
+    context_rules = context_dir / "AGENTS.md"
+    context_history = context_dir / "AGENTS.history.json"
+    current_text = "- [CONTEXT-01] Read the current source before proposing changes."
+    context_rules.write_text("# Context\n\n" + current_text + "\n", encoding="utf-8")
+    context_history.write_text(json.dumps({"version": 2, "entries": [{
+        "rules": ["CONTEXT-01"],
+        "decision": "Use current source evidence.",
+        "reason": "Proposals must describe the actual governed text.",
+        "regression": "Preserve exact source matching.",
+    }]}) + "\n", encoding="utf-8")
     history_source: dict[str, object] = {
-        "rules": str(ROOT / "AGENTS.md"),
-        "history": str(ROOT / "AGENTS.history.json"),
-        "rule_ids": ["SKILLS-GOV-01"],
+        "rules": str(context_rules),
+        "history": str(context_history),
+        "rule_ids": ["CONTEXT-01"],
         "expected_text": [current_text],
         "candidate_target": False,
         "markdown_policy": None,
@@ -548,7 +554,7 @@ def test_proposal_workflow_validates_context_and_owns_iteration_transition(
         assert original_spec == json.loads(spec_path.read_text(encoding="utf-8"))
         generated_request = json.loads(request_path.read_text(encoding="utf-8"))
         assert generated_request["mutation_authorized"] is False
-        assert "Before proposing or editing" in generated_request["sources"][0]["expected_text"][0]
+        assert generated_request["sources"][0]["expected_text"] == [current_text]
     context = json.loads(evidence.read_text(encoding="utf-8"))
     assert context["schema"] == "ceratops-governance-proposal-context.v3"
     assert context["history_lookup"]["unknown"] == []
