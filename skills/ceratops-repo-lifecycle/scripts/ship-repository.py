@@ -50,6 +50,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--delete-branch", action="store_true")
     parser.add_argument("--reusable-head", action="store_true")
     parser.add_argument(
+        "--preserve-worktree", type=pathlib.Path, action="append",
+        help="Keep this active task worktree, its branch and task files after shipping; repeat as needed.",
+    )
+    parser.add_argument(
         "--sdlc-contract",
         type=pathlib.Path,
         default=defaults.sdlc_contract,

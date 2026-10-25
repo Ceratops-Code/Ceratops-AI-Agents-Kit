@@ -86,7 +86,6 @@
         {
           "kind": "path-any",
           "value": [
-            "**/*.sln",
             "**/*.csproj",
             "**/*.fsproj",
             "**/*.vbproj"
@@ -123,6 +122,12 @@
     }
   ],
   "checks": [
+    {
+      "id": "shellcheck",
+      "when": [{"kind": "path-any", "value": ["**/*.sh"]}],
+      "command": ["shellcheck", "--severity=error", "--"],
+      "cwd": "."
+    },
     {
       "id": "npm-markdown-lint",
       "when": [
