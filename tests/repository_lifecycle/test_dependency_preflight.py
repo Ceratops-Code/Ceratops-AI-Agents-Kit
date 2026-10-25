@@ -758,10 +758,10 @@ def test_alert_preflight_reads_live_default_tree_without_touching_release_checko
         payload = json.loads(output.read_text())
         assert payload["outcome"]["blocked"] != source_available
         for alert in payload["repositories"][0]["alerts"]:
-            tree = alert["preflight"]["dependency_tree"]
+            alert_tree = alert["preflight"]["dependency_tree"]
             if source_available:
-                assert tree["status"] == "ok" and tree["commit"] == published
-                assert tree["sources"][0]["matches"][0]["version"] == "1.0.0"
+                assert alert_tree["status"] == "ok" and alert_tree["commit"] == published
+                assert alert_tree["sources"][0]["matches"][0]["version"] == "1.0.0"
             else:
-                assert tree["status"] == "unavailable" and tree["sources"] == []
+                assert alert_tree["status"] == "unavailable" and alert_tree["sources"] == []
         assert _checkout_state(checkout) == before and not lock.exists()

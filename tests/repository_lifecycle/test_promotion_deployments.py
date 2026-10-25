@@ -6,6 +6,7 @@ import pathlib
 import runpy
 import subprocess
 import sys
+from typing import Any
 
 import pytest
 
@@ -583,7 +584,7 @@ def test_repo_cleanup_retains_mismatched_or_incomplete_shipping_results(tmp_path
     commit = run_git(repo, "rev-parse", "HEAD").stdout.strip()
     module = runpy.run_path(str(PROMOTE_REPOSITORY))
     empty = {"status": "completed", "completed_operations": [], "pending_operations": [], "results": []}
-    result = {"status": "shipped", "repository": "owner/repo", "commit": commit, "pr": 1,
+    result: dict[str, Any] = {"status": "shipped", "repository": "owner/repo", "commit": commit, "pr": 1,
               "merge_commit": commit, "synchronized_head": commit,
               "release_publication": dict(empty), "deployment": dict(empty),
               "finalization": {"status": "finalized"}}
