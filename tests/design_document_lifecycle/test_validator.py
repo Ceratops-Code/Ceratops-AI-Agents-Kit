@@ -289,12 +289,21 @@ def test_contract_covers_current_c4_view_and_notation_sources() -> None:
     assert contract["annotations"]["c4_defaults"].startswith(
         "Treat system context, container, and deployment views"
     )
+    assert "Use a labelled, unidirectional line for each C4 relationship." in contract["annotations"]["diagrams"]
     source_urls = {source["url"] for source in contract["source_files"]}
     assert {
         "https://c4model.com/diagrams/notation",
         "https://c4model.com/diagrams/system-landscape",
         "https://c4model.com/diagrams/code",
     } <= source_urls
+    writing_sources = {
+        "https://developers.google.com/tech-writing/one/documents",
+        "https://diataxis.fr/explanation/",
+        "https://www.writethedocs.org/guide/writing/beginners-guide-to-docs/",
+    }
+    assert writing_sources <= source_urls
+    assert all("not an architecture standard" in source["note"]
+               for source in contract["source_files"] if source["url"] in writing_sources)
 
 
 def test_generated_resources_match_contract_and_seed_requires_evidence(tmp_path: pathlib.Path) -> None:

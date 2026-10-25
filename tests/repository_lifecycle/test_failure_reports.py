@@ -457,19 +457,36 @@ def test_complete_error_without_selected_output_needs_no_report(report_repo, mon
     assert "diagnostic_output" not in result and not path.exists()
 
 
-def test_success_evidence_is_not_mistaken_for_a_child_failure_report(report_repo):
+@pytest.mark.parametrize("state_field", ["status", "result"])
+@pytest.mark.parametrize("state", ["passed", "completed", "reused"])
+def test_success_evidence_is_not_mistaken_for_a_child_failure_report(report_repo, state_field, state):
     repo, path = report_repo
     accepted = repo / "accepted.json"
     accepted.write_text("accepted results", encoding="utf-8")
     result = command.report_failure(
         {"status": "tests_failed", "step_results": [
-            {"result": {"status": "passed", "evidence_file": str(accepted)}},
+            {"result": {state_field: state, "evidence_file": str(accepted)}},
         ]},
         diagnostic_output=path, repo_root=repo, action="promote", stderr="full failure",
     )
     assert result["diagnostic_output"] == str(path)
     assert json.loads(path.read_text())["successful_result_paths"] == [str(accepted)]
     assert accepted.read_text() == "accepted results"
+
+
+def test_explicit_failed_status_is_not_overruled_by_a_passing_result(report_repo, tmp_path):
+    repo, path = report_repo
+    child = tmp_path / "actual-failure.json"
+    child.write_text("actual failed command", encoding="utf-8")
+    for _ in range(2):
+        result = command.report_failure(
+            {"status": "tests_failed", "child": {
+                "status": "failed", "result": "passed", "diagnostic_output": str(child),
+            }}, diagnostic_output=path, repo_root=repo, action="promote",
+        )
+        assert result["diagnostic_output"] == str(child)
+        assert not path.exists()
+        assert child.read_text() == "actual failed command"
 
 
 def test_test_runner_diagnostic_reference_is_forwarded(report_repo, tmp_path):
@@ -629,14 +646,16 @@ def test_operation_list_saves_large_failure_and_preserves_prior_success(report_r
     assert accepted.read_text() == "original accepted bytes"
 
 
-def test_single_operation_uses_existing_large_child_report(report_repo, tmp_path):
+@pytest.mark.parametrize("state_field", ["status", "result"])
+@pytest.mark.parametrize("stream", ["stdout", "stderr"])
+def test_single_operation_uses_existing_large_child_report(report_repo, tmp_path, state_field, stream):
     repo, path = report_repo
     child = tmp_path / "child.json"
     child.write_text("full child report", encoding="utf-8")
-    output = {"status": "failed", "diagnostic_output": str(child), "noise": "x" * 2100000}
+    output = {state_field: "failed", "diagnostic_output": str(child), "noise": "x" * 2100000}
     payload_file = tmp_path / "child-output.json"
     payload_file.write_text(json.dumps(output), encoding="utf-8")
-    operation = prepared(repo, "tests.unit", f"import pathlib,sys; print(pathlib.Path({str(payload_file)!r}).read_text()); sys.exit(1)")
+    operation = prepared(repo, "tests.unit", f"import pathlib,sys; print(pathlib.Path({str(payload_file)!r}).read_text(), file=sys.{stream}); sys.exit(1)")
     result = runner.execute_prepared_operation(operation, diagnostic_output=path)
     assert result["diagnostic_output"] == str(child)
     assert not path.exists()

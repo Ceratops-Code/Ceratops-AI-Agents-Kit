@@ -1095,8 +1095,8 @@ def test_explicit_worktree_mode_selects_tracked_and_untracked_changes(
     runner = test_runner_module
     execution = DeterministicExecution(
         runner,
-        b"M\0skills/ceratops-credit-savings-analysis/SKILL.md\0",
-        untracked=b"skills/ceratops-governance-lifecycle/new.py\0",
+        b"M\0skills/ceratops-credit-savings-analysis/scripts/credit-analysis-workflow.py\0",
+        untracked=b"skills/ceratops-governance-lifecycle/scripts/new.py\0",
     )
 
     exit_code = runner.execute(
@@ -1114,11 +1114,13 @@ def test_explicit_worktree_mode_selects_tracked_and_untracked_changes(
     assert result["selected_suites"] == ["credit-analysis", "governance-lifecycle"]
     assert result["changed"] == [
         {
-            "paths": ["skills/ceratops-credit-savings-analysis/SKILL.md"],
+            "paths": [
+                "skills/ceratops-credit-savings-analysis/scripts/credit-analysis-workflow.py"
+            ],
             "status": "M",
         },
         {
-            "paths": ["skills/ceratops-governance-lifecycle/new.py"],
+            "paths": ["skills/ceratops-governance-lifecycle/scripts/new.py"],
             "status": "A",
         },
     ]
@@ -1308,9 +1310,9 @@ def test_committed_diff_reports_unmapped_retired_configuration(
     assert result["full_suite"] is False
     assert result["full_suite_fallback"] is False
     assert result["selected_suites"] == [
-        "artifact-storage", "check-result-reuse", "command-reporting",
-        "github-dependencies", "github-workflows", "pending-work",
+        "release-locking", "repository-checks", "repository-lint",
         "repository-operations", "repository-promotion", "repository-shipping",
+        "sdlc-handoffs",
     ]
     assert {item["path"] for item in result["selections"]} == {"sdlc/sdlc.yml"}
     assert not execution.final_pytest

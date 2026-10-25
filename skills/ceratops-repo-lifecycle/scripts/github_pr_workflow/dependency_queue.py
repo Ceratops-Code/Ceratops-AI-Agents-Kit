@@ -29,9 +29,11 @@ from .dependency_common import (
 )
 from .dependency_evidence import (
     branch_freshness,
+    dependabot_branch_ecosystem,
     dependency_tree_evidence,
     exact_ci_evidence,
     fetch_ci_annotations,
+    fetch_default_branch_head,
     fetch_pr_batch,
     fetch_pr_body,
     minimum_patched_version,
@@ -264,6 +266,15 @@ def preflight(args: argparse.Namespace) -> int:
             )
         enriched_alerts = []
         repo_alerts = alerts_by_repo.get(key, [])
+        # GitHub alerts describe published default-branch content. A local
+        # release checkout may intentionally contain a different dependency tree.
+        default_source = (
+            fetch_default_branch_head(full_name, repo.get("default_branch"))
+            if repo_alerts and checkout.get("status") == "found" else None
+        )
+        # Multiple advisories often name the same package and manifest. Their
+        # immutable default-commit tree is read once per fresh preflight call.
+        alert_trees: dict[tuple[str, str, str], dict[str, Any]] = {}
         for alert in repo_alerts:
             alert_number = alert.get("number")
             update = {
@@ -283,16 +294,23 @@ def preflight(args: argparse.Namespace) -> int:
                 registry = {"status": "unavailable", "reason": "unparsed_patched_version_range"}
             else:
                 registry = registry_evidence(update)
-            dependency_tree = (
-                dependency_tree_evidence(
-                    pathlib.Path(str(checkout["path"])),
-                    update,
-                    [],
-                    [alert],
-                )
-                if checkout.get("status") == "found"
-                else {"status": "unavailable", "reason": "local_checkout_not_found", "sources": []}
+            tree_key = (
+                str(update.get("ecosystem")).lower(),
+                str(update.get("package")).lower().replace("_", "-"),
+                str(alert.get("manifest_path") or ""),
             )
+            if tree_key not in alert_trees:
+                alert_trees[tree_key] = (
+                    dependency_tree_evidence(
+                        pathlib.Path(str(checkout["path"])), update, [], [alert],
+                        str(default_source["commit"]),
+                    )
+                    if default_source is not None and default_source.get("status") == "ok"
+                    else {"status": "unavailable", "sources": [],
+                          "reason": "local_checkout_not_found" if default_source is None
+                          else "default_branch_commit_unavailable", "source": default_source}
+                )
+            dependency_tree = alert_trees[tree_key]
             if registry.get("status") != "ok":
                 repo_blockers.append(
                     {
@@ -378,6 +396,10 @@ def preflight(args: argparse.Namespace) -> int:
                             ],
                         }
                     )
+
+            branch_ecosystem = dependabot_branch_ecosystem(str(live.get("head_ref") or ""))
+            if branch_ecosystem:
+                updates = [{**update, "ecosystem": branch_ecosystem} for update in updates]
 
             update_evidence = []
             for update in updates:

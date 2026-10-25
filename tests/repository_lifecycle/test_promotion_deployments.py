@@ -6,6 +6,7 @@ import pathlib
 import runpy
 import subprocess
 import sys
+from typing import Any
 
 import pytest
 
@@ -425,8 +426,10 @@ def test_promote_and_deploy_rejects_operation_created_repository_work(
 @pytest.mark.parametrize("entrypoint", ["callable", "cli"])
 @pytest.mark.parametrize("effect", ["record", "delete"])
 @pytest.mark.parametrize("after", [False, True])
+@pytest.mark.parametrize("result_kind", ["deployment", "shipping-empty", "shipping-install", "shipping-no-op",
+                                       "shipping-publication", "shipping-recovered", "shipping-advanced"])
 def test_repo_owns_installation_result_recording_and_cleanup(
-    tmp_path, monkeypatch, capsys, entrypoint, effect, after,
+    tmp_path, monkeypatch, capsys, entrypoint, effect, after, result_kind,
 ):
     from tests.repository_lifecycle.test_sdlc_handoffs import (
         _registered_skill_fixture,
@@ -454,6 +457,36 @@ def test_repo_owns_installation_result_recording_and_cleanup(
         "operations": {"status": "completed", "pending_operations": [],
                        "completed_operations": [operation], "results": [outcome]},
     }
+    if result_kind.startswith("shipping"):
+        assert run_git(repo, "remote", "add", "origin", "https://github.com/owner/repo.git").returncode == 0
+        empty = {"status": "completed", "completed_operations": [], "pending_operations": [], "results": []}
+        synchronized = prepared.commit
+        if result_kind == "shipping-advanced":
+            assert run_git(repo, "commit", "--allow-empty", "-m", "Concurrent merge").returncode == 0
+            synchronized = run_git(repo, "rev-parse", "HEAD").stdout.strip()
+            assert synchronized != prepared.commit
+        result = {
+            "status": "already_shipped" if result_kind == "shipping-recovered" else "shipped",
+            "repository": "owner/repo", "commit": prepared.commit,
+            "pr": 1, "merge_commit": prepared.commit, "synchronized_head": synchronized,
+            "release_publication": empty,
+            "deployment": result["operations"] if result_kind in ("shipping-install", "shipping-recovered") else empty,
+            "finalization": {"status": "finalized"},
+        }
+        if result_kind == "shipping-no-op":
+            noop = {"status": "no_op", "operation": operation, "commit": prepared.commit,
+                    "steps": [], "reason": "Explicitly declared no-op"}
+            result["deployment"] = {**empty, "completed_operations": [operation], "results": [noop]}
+        if result_kind == "shipping-publication":
+            publication = "deliverables.packages.installer.actions.publish"
+            # Match the public terminal report: publishing emits step evidence,
+            # has no local installation, and need not emit a JSON step receipt.
+            result["release_publication"] = {
+                **empty, "completed_operations": [publication], "results": [{
+                    "operation": publication, "commit": prepared.commit,
+                    "status": "completed", "steps": [1],
+                }],
+            }
     original_replace, original_unlink = pathlib.Path.replace, pathlib.Path.unlink
 
     def interrupted_replace(source, target):
@@ -509,7 +542,8 @@ def test_repo_owns_installation_result_recording_and_cleanup(
 
 
 @pytest.mark.parametrize("fault", ["pending", "failed", "cleanup-debt", "missing-result"])
-def test_repo_cleanup_keeps_unfinished_installation_report(tmp_path, monkeypatch, fault):
+@pytest.mark.parametrize("result_kind", ["deployment", "shipping"])
+def test_repo_cleanup_keeps_unfinished_installation_report(tmp_path, monkeypatch, fault, result_kind):
     from tests.repository_lifecycle.test_sdlc_handoffs import (
         _registered_skill_fixture,
         runner,
@@ -532,6 +566,14 @@ def test_repo_cleanup_keeps_unfinished_installation_report(tmp_path, monkeypatch
     result = {"status": "ready", "head": prepared.commit, "release_branch": "release/local",
               "operations": {"status": "completed", "pending_operations": [],
                              "completed_operations": [operation], "results": [outcome]}}
+    if result_kind == "shipping":
+        assert run_git(repo, "remote", "add", "origin", "https://github.com/owner/repo.git").returncode == 0
+        result = {
+            "status": "shipped", "repository": "owner/repo", "commit": prepared.commit,
+            "pr": 1, "merge_commit": prepared.commit, "synchronized_head": prepared.commit,
+            "release_publication": {"status": "completed", "completed_operations": [], "pending_operations": [], "results": []},
+            "deployment": result["operations"], "finalization": {"status": "finalized"},
+        }
     task = repo.parent / "tmp" / repo.name / "pending"
     task.mkdir(parents=True)
     report = task / "promotion.json"
@@ -547,3 +589,107 @@ def test_repo_cleanup_keeps_unfinished_installation_report(tmp_path, monkeypatch
             module["finalize_result"](args)
         assert report.read_bytes() == before
     assert len((repo / "calls.jsonl").read_text().splitlines()) == 1
+
+
+@pytest.mark.parametrize("fault", ["wrong-repo", "wrong-commit", "missing-merge", "invalid-merge", "pending-publication",
+                                  "pending-deployment", "unfinished-finalization", "cleanup-error",
+                                  "wrong-operation", "invalid-noop"])
+def test_repo_cleanup_retains_mismatched_or_incomplete_shipping_results(tmp_path, monkeypatch, fault):
+    from tests.repository_lifecycle.test_sdlc_handoffs import _registered_skill_fixture
+
+    repo = _registered_skill_fixture(tmp_path, monkeypatch)
+    assert run_git(repo, "remote", "add", "origin", "https://github.com/owner/repo.git").returncode == 0
+    commit = run_git(repo, "rev-parse", "HEAD").stdout.strip()
+    module = runpy.run_path(str(PROMOTE_REPOSITORY))
+    empty = {"status": "completed", "completed_operations": [], "pending_operations": [], "results": []}
+    result: dict[str, Any] = {"status": "shipped", "repository": "owner/repo", "commit": commit, "pr": 1,
+              "merge_commit": commit, "synchronized_head": commit,
+              "release_publication": dict(empty), "deployment": dict(empty),
+              "finalization": {"status": "finalized"}}
+    if fault == "wrong-repo":
+        result["repository"] = "other/repo"
+    elif fault == "wrong-commit":
+        result["commit"] = "b" * 40
+    elif fault == "missing-merge":
+        result["merge_commit"] = None
+    elif fault == "invalid-merge":
+        result["merge_commit"] = "not-a-commit"
+    elif fault.startswith("pending-"):
+        result["release_publication" if fault.endswith("publication") else "deployment"]["pending_operations"] = ["pending"]
+    elif fault == "unfinished-finalization":
+        result["finalization"]["status"] = "pending"
+    elif fault == "cleanup-error":
+        result["finalization"]["repository_cleanup"] = {"status": "completed", "errors": ["busy"]}
+    else:
+        operation = "deliverables.apps.sample.actions.install"
+        noop = {"status": "no_op", "operation": "wrong" if fault == "wrong-operation" else operation,
+                "steps": [], "reason": "" if fault == "invalid-noop" else "No install", "configured": False}
+        result["deployment"] = {**empty, "completed_operations": [operation], "results": [noop]}
+    task = repo.parent / "tmp" / repo.name / "shipping-result"
+    task.mkdir(parents=True)
+    report = task / "shipping.json"
+    module["_save_result"](report, result)
+    original = report.read_bytes()
+    args = module["build_parser"]().parse_args([
+        "--repo-root", str(repo), "--finalize-result", "--result-file", str(report),
+        "--task-temp-root", str(task), "--expected-commit", commit,
+        "--verified-result-sha256", hashlib.sha256(original).hexdigest(),
+    ])
+    for _ in range(2):
+        with pytest.raises(module["PromotionError"]):
+            module["finalize_result"](args)
+        assert report.read_bytes() == original
+
+
+@pytest.mark.parametrize("caller", ["primary", "worktree", "subdirectory"])
+@pytest.mark.parametrize("outcome", ["shipped", "failed", "interrupted"])
+def test_composed_shipping_preserves_its_live_workspace_and_task_files(tmp_path, monkeypatch, caller, outcome):
+    repo, _head, _log, _environment = prepare_repository_lifecycle_repo(tmp_path)
+    workspace = tmp_path / "worktrees" / repo.name / "active-task"
+    assert run_git(repo, "worktree", "add", "-b", "active-task", str(workspace), "approved").returncode == 0
+    nested = workspace / "source-subdirectory"
+    nested.mkdir()
+    task = tmp_path / "tmp" / repo.name / "active-task"
+    task.mkdir(parents=True)
+    retained = task / "accepted-output"
+    retained.write_bytes(b"accepted product and original checks")
+    scope = repo / ".git" / "selected-scope.json"
+    scope.write_text("{}")
+    module = runpy.run_path(str(PROMOTE_REPOSITORY))
+    requested = repo if caller == "primary" else nested if caller == "subdirectory" else workspace
+    args = module["build_parser"]().parse_args([
+        "--repo-root", str(requested), "--source-branch", "active-task", "--ship-after-promotion",
+    ])
+    commit = run_git(workspace, "rev-parse", "HEAD").stdout.strip()
+    original_branch = run_git(workspace, "branch", "--show-current").stdout.strip()
+    owner = module["repository_ship"]
+
+    def ship(request):
+        assert request.repo_root == repo
+        assert request.commit == commit
+        assert request.diagnostic_owner == (requested, "promote")
+        assert request.preserve_worktree == (None if caller == "primary" else [workspace])
+        if outcome == "failed":
+            raise owner.RepositoryShipError("remote gate refused")
+        if outcome == "interrupted":
+            raise KeyboardInterrupt("interrupted before remote effect")
+        return {"status": "shipped", "commit": commit, "synchronized_head": commit,
+                "release_publication": {}, "deployment": {}, "finalization": {}}
+
+    monkeypatch.setattr(owner, "ship_repository", ship)
+    monkeypatch.chdir(requested)
+    for _ in range(2):
+        def call():
+            return module["_ship_after_promotion"](
+                args, repo, target_commit=commit, pending_work_scope=str(scope),
+            )
+        if outcome == "shipped":
+            assert call()["status"] == "shipped"
+        else:
+            expected = KeyboardInterrupt if outcome == "interrupted" else module["PromotionError"]
+            with pytest.raises(expected):
+                call()
+        assert pathlib.Path.cwd() == requested
+        assert retained.read_bytes() == b"accepted product and original checks"
+        assert run_git(workspace, "rev-parse", "HEAD").stdout.strip() == commit
+        assert run_git(workspace, "branch", "--show-current").stdout.strip() == original_branch

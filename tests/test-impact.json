@@ -117,11 +117,7 @@
     },
     "skill-lifecycle": {
       "pytest": [
-        "tests/skill_lifecycle/test_fast_change.py",
-        "tests/skill_lifecycle/test_runtime_transactions.py",
-        "tests/skill_lifecycle/test_source_validation.py",
-        "tests/skill_lifecycle/test_update_workflow.py",
-        "tests/skill_lifecycle/test_write_locks.py"
+        "tests/skill_lifecycle/test_runtime_transactions.py"
       ],
       "depends_on": [],
       "packages": [
@@ -233,8 +229,7 @@
     },
     "repository-compatibility": {
       "pytest": [
-        "tests/repository_lifecycle/test_compatibility.py",
-        "tests/repository_lifecycle/test_repository_checks.py"
+        "tests/repository_lifecycle/test_compatibility.py"
       ],
       "depends_on": [],
       "packages": [
@@ -263,10 +258,7 @@
     },
     "github-contracts": {
       "pytest": [
-        "tests/repository_lifecycle/test_community_profile.py",
-        "tests/repository_lifecycle/test_contract_engine.py",
-        "tests/repository_lifecycle/test_dependabot_coverage.py",
-        "tests/repository_lifecycle/test_format_contract_reports.py"
+        "tests/repository_lifecycle/test_contract_engine.py"
       ],
       "depends_on": [],
       "packages": [
@@ -325,8 +317,7 @@
     },
     "command-reporting": {
       "pytest": [
-        "tests/repository_lifecycle/test_command_progress.py",
-        "tests/repository_lifecycle/test_failure_reports.py"
+        "tests/repository_lifecycle/test_command_progress.py"
       ],
       "depends_on": [],
       "packages": [
@@ -415,9 +406,7 @@
     },
     "repository-operations": {
       "pytest": [
-        "tests/repository_lifecycle/test_mcp_identities.py",
-        "tests/repository_lifecycle/test_operations.py",
-        "tests/repository_lifecycle/test_sdlc_handoffs.py"
+        "tests/repository_lifecycle/test_operations.py"
       ],
       "depends_on": [],
       "packages": [
@@ -477,8 +466,7 @@
     "repository-promotion": {
       "pytest": [
         "tests/repository_lifecycle/test_promotion.py",
-        "tests/repository_lifecycle/test_promotion_deployments.py",
-        "tests/repository_lifecycle/test_release_locking.py"
+        "tests/repository_lifecycle/test_promotion_deployments.py"
       ],
       "depends_on": [],
       "packages": [
@@ -566,9 +554,7 @@
     "test-runner": {
       "pytest": [
         "tests/test_infrastructure/test_run_tests.py",
-        "tests/test_infrastructure/test_pytest_execution.py",
-        "tests/test_infrastructure/test_test_impact.py",
-        "tests/test_infrastructure/test_test_reuse.py"
+        "tests/test_infrastructure/test_pytest_execution.py"
       ],
       "depends_on": [],
       "packages": [
@@ -760,13 +746,387 @@
         "GITHUB_EVENT_PATH",
         "UV_OFFLINE"
       ]
+    },
+    "skill-source-contracts": {
+      "pytest": [
+        "tests/skill_lifecycle/test_source_validation.py"
+      ],
+      "depends_on": [],
+      "packages": [
+        "mcp",
+        "packaging",
+        "pyyaml",
+        "jsonschema",
+        "tomlkit"
+      ],
+      "tools": [
+        "git",
+        "uv",
+        "node",
+        "npm",
+        "powershell"
+      ],
+      "environment": [
+        "PATH",
+        "CI",
+        "PYTEST_ADDOPTS",
+        "GITHUB_ACTIONS",
+        "GITHUB_EVENT_NAME",
+        "GITHUB_EVENT_PATH",
+        "UV_OFFLINE"
+      ]
+    },
+    "write-locks": {
+      "pytest": [
+        "tests/skill_lifecycle/test_write_locks.py"
+      ],
+      "depends_on": [],
+      "packages": [],
+      "tools": [
+        "git",
+        "uv"
+      ],
+      "environment": [
+        "CI",
+        "PYTEST_ADDOPTS",
+        "UV_OFFLINE"
+      ]
+    },
+    "repository-profile": {
+      "pytest": [
+        "tests/repository_lifecycle/test_community_profile.py"
+      ],
+      "depends_on": [],
+      "packages": [],
+      "tools": [
+        "uv"
+      ],
+      "environment": [
+        "CI",
+        "PYTEST_ADDOPTS",
+        "UV_OFFLINE"
+      ]
+    },
+    "dependabot-coverage": {
+      "pytest": [
+        "tests/repository_lifecycle/test_dependabot_coverage.py"
+      ],
+      "depends_on": [],
+      "packages": [
+        "mcp",
+        "packaging",
+        "pyyaml",
+        "jsonschema",
+        "tomlkit"
+      ],
+      "tools": [
+        "git",
+        "uv",
+        "node",
+        "npm",
+        "powershell"
+      ],
+      "environment": [
+        "PATH",
+        "CI",
+        "PYTEST_ADDOPTS",
+        "GITHUB_ACTIONS",
+        "GITHUB_EVENT_NAME",
+        "GITHUB_EVENT_PATH",
+        "UV_OFFLINE"
+      ]
+    },
+    "contract-reporting": {
+      "pytest": [
+        "tests/repository_lifecycle/test_format_contract_reports.py"
+      ],
+      "depends_on": [],
+      "packages": [],
+      "tools": [
+        "uv"
+      ],
+      "environment": [
+        "CI",
+        "PYTEST_ADDOPTS",
+        "UV_OFFLINE"
+      ]
+    },
+    "repository-checks": {
+      "pytest": [
+        "tests/repository_lifecycle/test_repository_checks.py"
+      ],
+      "depends_on": [],
+      "packages": [
+        "mcp",
+        "packaging",
+        "pyyaml",
+        "jsonschema",
+        "tomlkit"
+      ],
+      "tools": [
+        "git",
+        "uv",
+        "node",
+        "npm",
+        "powershell"
+      ],
+      "environment": [
+        "PATH",
+        "CI",
+        "PYTEST_ADDOPTS",
+        "GITHUB_ACTIONS",
+        "GITHUB_EVENT_NAME",
+        "GITHUB_EVENT_PATH",
+        "UV_OFFLINE"
+      ]
+    },
+    "mcp-identities": {
+      "pytest": [
+        "tests/repository_lifecycle/test_mcp_identities.py"
+      ],
+      "depends_on": [],
+      "packages": [
+        "mcp",
+        "packaging",
+        "pyyaml",
+        "jsonschema",
+        "tomlkit"
+      ],
+      "tools": [
+        "git",
+        "uv",
+        "node",
+        "npm",
+        "powershell"
+      ],
+      "environment": [
+        "PATH",
+        "CI",
+        "PYTEST_ADDOPTS",
+        "GITHUB_ACTIONS",
+        "GITHUB_EVENT_NAME",
+        "GITHUB_EVENT_PATH",
+        "UV_OFFLINE"
+      ]
+    },
+    "release-locking": {
+      "pytest": [
+        "tests/repository_lifecycle/test_release_locking.py"
+      ],
+      "depends_on": [],
+      "packages": [
+        "mcp",
+        "packaging",
+        "pyyaml",
+        "jsonschema",
+        "tomlkit"
+      ],
+      "tools": [
+        "git",
+        "uv",
+        "node",
+        "npm",
+        "powershell"
+      ],
+      "environment": [
+        "PATH",
+        "CI",
+        "PYTEST_ADDOPTS",
+        "GITHUB_ACTIONS",
+        "GITHUB_EVENT_NAME",
+        "GITHUB_EVENT_PATH",
+        "UV_OFFLINE"
+      ]
+    },
+    "failure-reporting": {
+      "pytest": [
+        "tests/repository_lifecycle/test_failure_reports.py"
+      ],
+      "depends_on": [],
+      "packages": [
+        "mcp",
+        "packaging",
+        "pyyaml",
+        "jsonschema",
+        "tomlkit"
+      ],
+      "tools": [
+        "git",
+        "uv",
+        "node",
+        "npm",
+        "powershell"
+      ],
+      "environment": [
+        "PATH",
+        "CI",
+        "PYTEST_ADDOPTS",
+        "GITHUB_ACTIONS",
+        "GITHUB_EVENT_NAME",
+        "GITHUB_EVENT_PATH",
+        "UV_OFFLINE"
+      ]
+    },
+    "test-impact": {
+      "pytest": [
+        "tests/test_infrastructure/test_test_impact.py"
+      ],
+      "depends_on": [],
+      "packages": [
+        "mcp",
+        "packaging",
+        "pyyaml",
+        "jsonschema",
+        "tomlkit",
+        "ruff",
+        "mypy",
+        "yamllint",
+        "tzdata"
+      ],
+      "tools": [
+        "git",
+        "uv",
+        "node",
+        "npm",
+        "powershell"
+      ],
+      "environment": [
+        "PATH",
+        "CI",
+        "PYTEST_ADDOPTS",
+        "GITHUB_ACTIONS",
+        "GITHUB_EVENT_NAME",
+        "GITHUB_EVENT_PATH",
+        "UV_OFFLINE"
+      ]
+    },
+    "pytest-reuse": {
+      "pytest": [
+        "tests/test_infrastructure/test_test_reuse.py"
+      ],
+      "depends_on": [],
+      "packages": [
+        "mcp",
+        "packaging",
+        "pyyaml",
+        "jsonschema",
+        "tomlkit",
+        "ruff",
+        "mypy",
+        "yamllint",
+        "tzdata"
+      ],
+      "tools": [
+        "git",
+        "uv",
+        "node",
+        "npm",
+        "powershell"
+      ],
+      "environment": [
+        "PATH",
+        "CI",
+        "PYTEST_ADDOPTS",
+        "GITHUB_ACTIONS",
+        "GITHUB_EVENT_NAME",
+        "GITHUB_EVENT_PATH",
+        "UV_OFFLINE"
+      ]
+    },
+    "skill-update": {
+      "pytest": [
+        "tests/skill_lifecycle/test_update_workflow.py"
+      ],
+      "depends_on": [],
+      "packages": [
+        "mcp",
+        "packaging",
+        "pyyaml",
+        "jsonschema",
+        "tomlkit"
+      ],
+      "tools": [
+        "git",
+        "uv",
+        "node",
+        "npm",
+        "powershell"
+      ],
+      "environment": [
+        "PATH",
+        "CI",
+        "PYTEST_ADDOPTS",
+        "GITHUB_ACTIONS",
+        "GITHUB_EVENT_NAME",
+        "GITHUB_EVENT_PATH",
+        "UV_OFFLINE"
+      ]
+    },
+    "skill-fast-change": {
+      "pytest": [
+        "tests/skill_lifecycle/test_fast_change.py"
+      ],
+      "depends_on": [],
+      "packages": [
+        "mcp",
+        "packaging",
+        "pyyaml",
+        "jsonschema",
+        "tomlkit"
+      ],
+      "tools": [
+        "git",
+        "uv",
+        "node",
+        "npm",
+        "powershell"
+      ],
+      "environment": [
+        "PATH",
+        "CI",
+        "PYTEST_ADDOPTS",
+        "GITHUB_ACTIONS",
+        "GITHUB_EVENT_NAME",
+        "GITHUB_EVENT_PATH",
+        "UV_OFFLINE"
+      ]
+    },
+    "sdlc-handoffs": {
+      "pytest": [
+        "tests/repository_lifecycle/test_sdlc_handoffs.py"
+      ],
+      "depends_on": [],
+      "packages": [
+        "mcp",
+        "packaging",
+        "pyyaml",
+        "jsonschema",
+        "tomlkit"
+      ],
+      "tools": [
+        "git",
+        "uv",
+        "node",
+        "npm",
+        "powershell"
+      ],
+      "environment": [
+        "PATH",
+        "CI",
+        "PYTEST_ADDOPTS",
+        "GITHUB_ACTIONS",
+        "GITHUB_EVENT_NAME",
+        "GITHUB_EVENT_PATH",
+        "UV_OFFLINE"
+      ]
     }
   },
   "rules": [
     {
       "id": "ceratops-design-document-lifecycle-source",
       "paths": [
-        "skills/ceratops-design-document-lifecycle/**"
+        "skills/ceratops-design-document-lifecycle/scripts/**",
+        "skills/ceratops-design-document-lifecycle/references/**"
       ],
       "suites": [
         "ceratops-design-document-lifecycle"
@@ -786,8 +1146,11 @@
     {
       "id": "credit-analysis-source",
       "paths": [
-        "skills/ceratops-credit-savings-analysis/**",
-        "skills/ceratops-misunderstanding-audit/**"
+        "skills/ceratops-credit-savings-analysis/scripts/**",
+        "skills/ceratops-credit-savings-analysis/references/**",
+        "skills/ceratops-misunderstanding-audit/scripts/**",
+        "skills/ceratops-misunderstanding-audit/references/**",
+        "skills/ceratops-credit-savings-analysis/README.md"
       ],
       "suites": [
         "credit-analysis"
@@ -796,7 +1159,8 @@
     {
       "id": "governance-lifecycle-source",
       "paths": [
-        "skills/ceratops-governance-lifecycle/**"
+        "skills/ceratops-governance-lifecycle/scripts/**",
+        "skills/ceratops-governance-lifecycle/references/**"
       ],
       "suites": [
         "governance-lifecycle"
@@ -805,7 +1169,8 @@
     {
       "id": "task-lifecycle-source",
       "paths": [
-        "skills/ceratops-task-lifecycle/**"
+        "skills/ceratops-task-lifecycle/scripts/**",
+        "skills/ceratops-task-lifecycle/references/**"
       ],
       "suites": [
         "task-lifecycle"
@@ -818,7 +1183,10 @@
       ],
       "suites": [
         "test-runner",
-        "command-reporting"
+        "command-reporting",
+        "failure-reporting",
+        "test-impact",
+        "pytest-reuse"
       ]
     },
     {
@@ -829,7 +1197,9 @@
       "suites": [
         "check-records",
         "test-runner",
-        "command-reporting"
+        "command-reporting",
+        "failure-reporting",
+        "pytest-reuse"
       ]
     },
     {
@@ -879,42 +1249,49 @@
     {
       "id": "repository-contract-source",
       "paths": [
-        "skills/ceratops-repo-lifecycle/scripts/github_contract_engine/**",
-        "skills/ceratops-repo-lifecycle/references/contracts/**",
-        "skills/ceratops-repo-lifecycle/references/schemas/github-*.json",
-        "skills/ceratops-repo-lifecycle/references/schemas/nondeterministic-contract.schema.json"
+        "skills/ceratops-repo-lifecycle/scripts/github_contract_engine/__init__.py",
+        "skills/ceratops-repo-lifecycle/scripts/github_contract_engine/__main__.py",
+        "skills/ceratops-repo-lifecycle/scripts/github_contract_engine/cli.py",
+        "skills/ceratops-repo-lifecycle/scripts/github_contract_engine/codeql_disposition.py",
+        "skills/ceratops-repo-lifecycle/scripts/github_contract_engine/collect_non_deterministic_evidence.py",
+        "skills/ceratops-repo-lifecycle/scripts/github_contract_engine/collect_observed_states.py",
+        "skills/ceratops-repo-lifecycle/scripts/github_contract_engine/collectors/__init__.py",
+        "skills/ceratops-repo-lifecycle/scripts/github_contract_engine/collectors/organization.py",
+        "skills/ceratops-repo-lifecycle/scripts/github_contract_engine/collectors/registries.py",
+        "skills/ceratops-repo-lifecycle/scripts/github_contract_engine/operations.py",
+        "skills/ceratops-repo-lifecycle/scripts/github_contract_engine/organization_validator.py",
+        "skills/ceratops-repo-lifecycle/scripts/github_contract_engine/remediations/__init__.py",
+        "skills/ceratops-repo-lifecycle/scripts/github_contract_engine/remediations/organization.py",
+        "skills/ceratops-repo-lifecycle/scripts/github_contract_engine/remediations/repository.py",
+        "skills/ceratops-repo-lifecycle/scripts/github_contract_engine/repository_validator.py"
       ],
       "suites": [
         "github-contracts",
-        "repository-compatibility",
-        "github-dependencies",
-        "github-workflows",
-        "repository-health",
-        "repository-shipping",
-        "repository-promotion",
-        "pending-work",
-        "command-reporting"
+        "github-workflows"
       ]
     },
     {
       "id": "repository-compatibility-source",
       "paths": [
-        "skills/ceratops-repo-lifecycle/scripts/ceratops_repo_compatibility_engine/**",
-        "skills/ceratops-repo-lifecycle/references/schemas/ceratops-compatibility-contract.schema.json",
-        "skills/ceratops-repo-lifecycle/references/schemas/repository-validation-contract.schema.json"
+        "skills/ceratops-repo-lifecycle/scripts/ceratops_repo_compatibility_engine/__init__.py",
+        "skills/ceratops-repo-lifecycle/scripts/ceratops_repo_compatibility_engine/compatibility_contract.py",
+        "skills/ceratops-repo-lifecycle/scripts/ceratops_repo_compatibility_engine/sdlc_contract_validation.py",
+        "skills/ceratops-repo-lifecycle/references/schemas/ceratops-compatibility-contract.schema.json"
       ],
       "suites": [
         "repository-compatibility",
+        "repository-checks",
+        "repository-operations",
+        "mcp-identities",
         "artifact-storage",
         "check-result-reuse",
-        "repository-operations",
         "repository-promotion",
+        "release-locking",
         "repository-shipping",
         "command-reporting",
-        "pending-work",
-        "github-workflows",
-        "github-dependencies",
-        "skill-installation"
+        "failure-reporting",
+        "skill-installation",
+        "sdlc-handoffs"
       ]
     },
     {
@@ -936,7 +1313,12 @@
         "pending-work",
         "github-workflows",
         "github-dependencies",
-        "test-runner"
+        "release-locking",
+        "failure-reporting",
+        "mcp-identities",
+        "pytest-reuse",
+        "check-records",
+        "sdlc-handoffs"
       ]
     },
     {
@@ -957,7 +1339,11 @@
         "pending-work",
         "github-workflows",
         "github-dependencies",
-        "check-records"
+        "check-records",
+        "release-locking",
+        "failure-reporting",
+        "mcp-identities",
+        "sdlc-handoffs"
       ]
     },
     {
@@ -966,10 +1352,7 @@
         "skills/ceratops-repo-lifecycle/scripts/repository_operation.py",
         "skills/ceratops-repo-lifecycle/scripts/execute_skill_actions.py",
         "skills/ceratops-repo-lifecycle/scripts/check_deployment_receipts.py",
-        "skills/ceratops-repo-lifecycle/scripts/collect_repository_targets.py",
-        "skills/ceratops-repo-lifecycle/scripts/rename-repository-path.py",
-        "skills/ceratops-repo-lifecycle/references/schemas/sdlc.v*.schema.json",
-        "sdlc/**"
+        "skills/ceratops-repo-lifecycle/references/schemas/sdlc.v*.schema.json"
       ],
       "suites": [
         "artifact-storage",
@@ -980,7 +1363,11 @@
         "command-reporting",
         "pending-work",
         "github-workflows",
-        "github-dependencies"
+        "github-dependencies",
+        "release-locking",
+        "failure-reporting",
+        "mcp-identities",
+        "sdlc-handoffs"
       ]
     },
     {
@@ -991,11 +1378,11 @@
       ],
       "suites": [
         "repository-promotion",
+        "release-locking",
         "repository-shipping",
-        "github-workflows",
-        "github-dependencies",
+        "pending-work",
         "command-reporting",
-        "pending-work"
+        "failure-reporting"
       ]
     },
     {
@@ -1009,8 +1396,7 @@
         "pending-work",
         "repository-promotion",
         "repository-shipping",
-        "github-dependencies",
-        "command-reporting"
+        "release-locking"
       ]
     },
     {
@@ -1037,7 +1423,11 @@
         "pending-work",
         "github-workflows",
         "github-dependencies",
-        "repository-compatibility"
+        "repository-compatibility",
+        "release-locking",
+        "failure-reporting",
+        "mcp-identities",
+        "sdlc-handoffs"
       ]
     },
     {
@@ -1062,7 +1452,9 @@
         "repository-shipping",
         "repository-promotion",
         "pending-work",
-        "command-reporting"
+        "command-reporting",
+        "release-locking",
+        "failure-reporting"
       ]
     },
     {
@@ -1076,7 +1468,9 @@
         "repository-shipping",
         "repository-promotion",
         "pending-work",
-        "command-reporting"
+        "command-reporting",
+        "release-locking",
+        "failure-reporting"
       ]
     },
     {
@@ -1091,7 +1485,9 @@
         "pending-work",
         "command-reporting",
         "github-workflows",
-        "github-dependencies"
+        "github-dependencies",
+        "release-locking",
+        "failure-reporting"
       ]
     },
     {
@@ -1101,73 +1497,27 @@
       ],
       "suites": [
         "skill-checkpoints",
-        "skill-lifecycle",
-        "skill-installation"
-      ]
-    },
-    {
-      "id": "skill-lifecycle-source",
-      "paths": [
-        "scripts/deploy-skills.py",
-        "skills/ceratops-skill-lifecycle/SKILL.md",
-        "skills/ceratops-skill-lifecycle/agents/**",
-        "skills/ceratops-skill-lifecycle/assets/**",
-        "skills/ceratops-skill-lifecycle/references/**",
-        "skills/ceratops-skill-lifecycle/scripts/check_skill_runtime_inputs.py",
-        "skills/ceratops-skill-lifecycle/scripts/fast-change.py",
-        "skills/ceratops-skill-lifecycle/scripts/runtime/**",
-        "skills/ceratops-skill-lifecycle/scripts/skill-update-workflow.py",
-        "skills/ceratops-skill-lifecycle/scripts/skill_update_*.py",
-        "skills/ceratops-skill-lifecycle/scripts/skills-consistency-*.py"
-      ],
-      "suites": [
-        "skill-lifecycle",
-        "repository-operations",
-        "repository-promotion",
-        "repository-shipping",
-        "command-reporting",
-        "artifact-storage",
-        "check-result-reuse",
-        "pending-work",
-        "skill-installation"
+        "skill-update"
       ]
     },
     {
       "id": "mcp-server-lifecycle-source",
       "paths": [
-        "skills/ceratops-mcp-server-lifecycle/**"
+        "skills/ceratops-mcp-server-lifecycle/scripts/**",
+        "skills/ceratops-mcp-server-lifecycle/references/**"
       ],
       "suites": [
         "mcp_server_manager",
-        "repository-operations",
-        "repository-promotion",
-        "repository-shipping",
-        "command-reporting"
+        "mcp-identities"
       ]
     },
     {
       "id": "repository-lifecycle-instructions",
       "paths": [
-        "skills/ceratops-repo-lifecycle/SKILL.md",
-        "skills/ceratops-repo-lifecycle/agents/**",
-        "skills/ceratops-repo-lifecycle/assets/**",
-        "skills/ceratops-repo-lifecycle/references/*.md",
-        "skills/ceratops-repo-lifecycle/scripts/action.yml"
+        "skills/ceratops-repo-lifecycle/references/*.md"
       ],
       "suites": [
-        "artifact-storage",
-        "check-result-reuse",
-        "repository-compatibility",
-        "github-contracts",
-        "github-dependencies",
-        "command-reporting",
-        "github-workflows",
-        "skill-checkpoints",
-        "repository-operations",
-        "pending-work",
-        "repository-promotion",
-        "repository-health",
-        "repository-shipping"
+        "skill-source-contracts"
       ]
     },
     {
@@ -1186,17 +1536,8 @@
       ],
       "suites": [
         "repository-compatibility",
-        "artifact-storage",
-        "check-result-reuse",
-        "repository-operations",
-        "repository-promotion",
-        "repository-shipping",
-        "command-reporting",
-        "pending-work",
-        "github-workflows",
-        "github-dependencies",
-        "skill-installation",
-        "check-records"
+        "repository-checks",
+        "skill-installation"
       ]
     },
     {
@@ -1218,6 +1559,590 @@
       ],
       "suites": [
         "repository-compatibility",
+        "repository-checks",
+        "skill-installation",
+        "repository-lint"
+      ]
+    },
+    {
+      "id": "repository-contract-data",
+      "paths": [
+        "skills/ceratops-repo-lifecycle/references/contracts/artifact-nondeterministic-contract.json",
+        "skills/ceratops-repo-lifecycle/references/contracts/ceratops-compatibility-nondeterministic-contract.json",
+        "skills/ceratops-repo-lifecycle/references/contracts/code-comment-nondeterministic-contract.json",
+        "skills/ceratops-repo-lifecycle/references/contracts/code-repo-deterministic-contract.json",
+        "skills/ceratops-repo-lifecycle/references/contracts/code-repo-nondeterministic-contract.json",
+        "skills/ceratops-repo-lifecycle/references/contracts/github-org-deterministic-contract.json",
+        "skills/ceratops-repo-lifecycle/references/contracts/github-org-nondeterministic-contract.json",
+        "skills/ceratops-repo-lifecycle/references/contracts/github-pr-readiness-nondeterministic-contract.json",
+        "skills/ceratops-repo-lifecycle/references/contracts/github-repo-deterministic-contract.json",
+        "skills/ceratops-repo-lifecycle/references/contracts/github-repo-nondeterministic-contract.json"
+      ],
+      "suites": [
+        "github-contracts"
+      ]
+    },
+    {
+      "id": "repository-contract-schemas",
+      "paths": [
+        "skills/ceratops-repo-lifecycle/references/schemas/github-contract-source-docs.schema.json",
+        "skills/ceratops-repo-lifecycle/references/schemas/github-lifecycle-deterministic-contract.schema.json",
+        "skills/ceratops-repo-lifecycle/references/schemas/nondeterministic-contract.schema.json"
+      ],
+      "suites": [
+        "github-contracts"
+      ]
+    },
+    {
+      "id": "repository-check-contract",
+      "paths": [
+        "skills/ceratops-repo-lifecycle/references/contracts/repository-validation-contract.json",
+        "skills/ceratops-repo-lifecycle/references/schemas/repository-validation-contract.schema.json"
+      ],
+      "suites": [
+        "repository-compatibility",
+        "repository-checks",
+        "dependabot-coverage",
+        "github-contracts"
+      ]
+    },
+    {
+      "id": "repository-check-generation",
+      "paths": [
+        "skills/ceratops-repo-lifecycle/scripts/ceratops_repo_compatibility_engine/generate_test_script.py",
+        "skills/ceratops-repo-lifecycle/scripts/ceratops_repo_compatibility_engine/generate_repository_checks.py",
+        "skills/ceratops-repo-lifecycle/scripts/ceratops_repo_compatibility_engine/python_tool_configuration.py",
+        "skills/ceratops-repo-lifecycle/scripts/ceratops_repo_compatibility_engine/repository_validation_contract.py"
+      ],
+      "suites": [
+        "repository-compatibility",
+        "repository-checks",
+        "skill-installation",
+        "dependabot-coverage"
+      ]
+    },
+    {
+      "id": "repository-target-source",
+      "paths": [
+        "skills/ceratops-repo-lifecycle/scripts/collect_repository_targets.py"
+      ],
+      "suites": [
+        "repository-health",
+        "repository-operations",
+        "mcp-identities",
+        "sdlc-handoffs"
+      ]
+    },
+    {
+      "id": "repository-rename-source",
+      "paths": [
+        "skills/ceratops-repo-lifecycle/scripts/rename-repository-path.py"
+      ],
+      "suites": [
+        "repository-operations",
+        "mcp-identities",
+        "sdlc-handoffs"
+      ]
+    },
+    {
+      "id": "repository-sdlc",
+      "paths": [
+        "sdlc/**"
+      ],
+      "suites": [
+        "repository-lint",
+        "repository-checks",
+        "repository-operations",
+        "repository-promotion",
+        "release-locking",
+        "repository-shipping",
+        "sdlc-handoffs"
+      ]
+    },
+    {
+      "id": "skill-contract-source",
+      "paths": [
+        "skills/ceratops-skill-lifecycle/references/contracts/**",
+        "skills/ceratops-skill-lifecycle/references/schemas/**"
+      ],
+      "suites": [
+        "skill-source-contracts"
+      ]
+    },
+    {
+      "id": "skill-source-checker",
+      "paths": [
+        "skills/ceratops-skill-lifecycle/scripts/check_skill_runtime_inputs.py",
+        "skills/ceratops-skill-lifecycle/scripts/skills-consistency-*.py"
+      ],
+      "suites": [
+        "skill-source-contracts",
+        "skill-installation",
+        "skill-lifecycle",
+        "skill-fast-change"
+      ]
+    },
+    {
+      "id": "skill-update-source",
+      "paths": [
+        "skills/ceratops-skill-lifecycle/scripts/skill-update-workflow.py",
+        "skills/ceratops-skill-lifecycle/scripts/skill_update_*.py"
+      ],
+      "suites": [
+        "skill-update"
+      ]
+    },
+    {
+      "id": "skill-fast-change-source",
+      "paths": [
+        "skills/ceratops-skill-lifecycle/scripts/fast-change.py"
+      ],
+      "suites": [
+        "skill-fast-change",
+        "release-locking"
+      ]
+    },
+    {
+      "id": "skill-runtime-source",
+      "paths": [
+        "skills/ceratops-skill-lifecycle/scripts/runtime/**"
+      ],
+      "suites": [
+        "skill-lifecycle",
+        "skill-installation",
+        "repository-operations",
+        "mcp-identities",
+        "repository-promotion",
+        "release-locking",
+        "sdlc-handoffs",
+        "skill-fast-change"
+      ]
+    },
+    {
+      "id": "bootstrap-installer-source",
+      "paths": [
+        "scripts/deploy-skills.py"
+      ],
+      "suites": [
+        "skill-installation",
+        "skill-source-contracts"
+      ]
+    },
+    {
+      "id": "skill-reference-source",
+      "paths": [
+        "skills/ceratops-skill-lifecycle/references/*.md",
+        "skills/ceratops-skill-lifecycle/references/templates/**"
+      ],
+      "suites": [
+        "skill-source-contracts",
+        "skill-installation"
+      ]
+    },
+    {
+      "id": "skill-metadata",
+      "paths": [
+        "skills/*/SKILL.md",
+        "skills/*/agents/**",
+        "skills/*/assets/**"
+      ],
+      "suites": [
+        "skill-source-contracts"
+      ]
+    },
+    {
+      "id": "code-consistency-source",
+      "paths": [
+        "skills/ceratops-code-consistency-audit/scripts/**",
+        "skills/ceratops-code-consistency-audit/references/**"
+      ],
+      "suites": [
+        "code-consistency-audit"
+      ]
+    },
+    {
+      "id": "instruction-only-skills",
+      "paths": [
+        "skills/codex-desktop-upgrade/references/**"
+      ],
+      "suites": [
+        "skill-source-contracts"
+      ]
+    },
+    {
+      "id": "repository-ci-action",
+      "paths": [
+        "skills/ceratops-repo-lifecycle/scripts/action.yml"
+      ],
+      "suites": [
+        "repository-lint",
+        "repository-checks"
+      ]
+    },
+    {
+      "id": "shared-skill-sections",
+      "paths": [
+        "skills/skill-sections.json",
+        "skills/sections/*.md"
+      ],
+      "suites": [
+        "skill-source-contracts",
+        "skill-installation",
+        "skill-lifecycle",
+        "repository-compatibility",
+        "github-contracts",
+        "skill-fast-change"
+      ]
+    },
+    {
+      "id": "shared-skill-python",
+      "paths": [
+        "skills/sections/python/**"
+      ],
+      "suites": [
+        "skill-installation",
+        "skill-lifecycle",
+        "repository-operations",
+        "repository-promotion",
+        "release-locking",
+        "repository-shipping",
+        "github-workflows",
+        "github-dependencies",
+        "sdlc-handoffs",
+        "skill-fast-change"
+      ]
+    },
+    {
+      "id": "shared-write-lock",
+      "paths": [
+        "skills/sections/scripts/hold_write_lock.py"
+      ],
+      "suites": [
+        "write-locks",
+        "release-locking",
+        "skill-lifecycle",
+        "skill-installation",
+        "repository-operations",
+        "repository-promotion",
+        "repository-shipping",
+        "pending-work",
+        "github-workflows",
+        "sdlc-handoffs",
+        "skill-fast-change"
+      ]
+    },
+    {
+      "id": "repository-workflows",
+      "paths": [
+        ".github/workflows/**",
+        ".github/dependabot.yml"
+      ],
+      "suites": [
+        "repository-lint",
+        "repository-checks",
+        "dependabot-coverage"
+      ]
+    },
+    {
+      "id": "repository-lint-settings",
+      "paths": [
+        "scripts/.markdownlint.json",
+        "scripts/.yamllint.yml",
+        "scripts/package-lock.json",
+        "scripts/package.json"
+      ],
+      "suites": [
+        "repository-lint"
+      ]
+    },
+    {
+      "id": "repository-governance",
+      "paths": [
+        "AGENTS.md",
+        "AGENTS.history.json"
+      ],
+      "suites": [
+        "governance-lifecycle",
+        "skill-source-contracts"
+      ]
+    },
+    {
+      "id": "repository-ignore",
+      "paths": [
+        ".gitignore"
+      ],
+      "suites": [
+        "test-runner",
+        "test-impact",
+        "pytest-reuse",
+        "check-records"
+      ]
+    },
+    {
+      "id": "repository-test-fixtures",
+      "paths": [
+        "tests/repository_lifecycle/support.py"
+      ],
+      "suites": [
+        "artifact-storage",
+        "check-result-reuse",
+        "repository-compatibility",
+        "repository-checks",
+        "github-workflows",
+        "github-dependencies",
+        "repository-operations",
+        "mcp-identities",
+        "repository-promotion",
+        "release-locking",
+        "repository-shipping",
+        "pending-work",
+        "command-reporting",
+        "failure-reporting",
+        "pytest-reuse",
+        "check-records",
+        "sdlc-handoffs"
+      ]
+    },
+    {
+      "id": "skill-test-fixtures",
+      "paths": [
+        "tests/skill_lifecycle/support.py"
+      ],
+      "suites": [
+        "skill-lifecycle",
+        "skill-source-contracts",
+        "skill-installation",
+        "repository-compatibility",
+        "release-locking",
+        "skill-fast-change",
+        "skill-update"
+      ]
+    },
+    {
+      "id": "infrastructure-test-fixtures",
+      "paths": [
+        "tests/test_infrastructure/conftest.py",
+        "tests/test_infrastructure/__init__.py"
+      ],
+      "suites": [
+        "test-runner",
+        "test-impact",
+        "pytest-reuse",
+        "check-records",
+        "repository-lint",
+        "source-search",
+        "shell-hook"
+      ]
+    },
+    {
+      "id": "shared-test-fixtures",
+      "paths": [
+        "tests/support/repositories.py",
+        "tests/support/__init__.py"
+      ],
+      "suites": [
+        "artifact-storage",
+        "check-records",
+        "check-result-reuse",
+        "command-reporting",
+        "credit-analysis",
+        "failure-reporting",
+        "github-contracts",
+        "github-dependencies",
+        "github-workflows",
+        "governance-lifecycle",
+        "mcp-identities",
+        "pending-work",
+        "pytest-reuse",
+        "release-locking",
+        "repository-checks",
+        "repository-compatibility",
+        "repository-operations",
+        "repository-promotion",
+        "repository-shipping",
+        "sdlc-handoffs",
+        "skill-checkpoints",
+        "skill-fast-change",
+        "skill-installation",
+        "skill-lifecycle",
+        "skill-source-contracts",
+        "skill-update",
+        "task-lifecycle",
+        "test-impact",
+        "test-runner",
+        "write-locks"
+      ]
+    },
+    {
+      "id": "repository-source-catalog",
+      "paths": [
+        "skills/ceratops-repo-lifecycle/references/contracts/github-contract-source-docs.json"
+      ],
+      "suites": [
+        "github-contracts"
+      ]
+    },
+    {
+      "id": "skill-action-bindings",
+      "paths": [
+        "skills/ceratops-skill-lifecycle/references/action-executors.json"
+      ],
+      "suites": [
+        "repository-operations",
+        "mcp-identities",
+        "repository-promotion",
+        "release-locking",
+        "repository-shipping",
+        "skill-installation",
+        "sdlc-handoffs"
+      ]
+    },
+    {
+      "id": "contract-local_repository",
+      "paths": [
+        "skills/ceratops-repo-lifecycle/scripts/github_contract_engine/collectors/local_repository.py"
+      ],
+      "suites": [
+        "github-contracts",
+        "repository-checks",
+        "dependabot-coverage",
+        "repository-operations"
+      ]
+    },
+    {
+      "id": "contract-compare_states",
+      "paths": [
+        "skills/ceratops-repo-lifecycle/scripts/github_contract_engine/compare_states.py"
+      ],
+      "suites": [
+        "github-contracts",
+        "repository-checks",
+        "dependabot-coverage",
+        "repository-profile",
+        "github-workflows"
+      ]
+    },
+    {
+      "id": "contract-compose_desired_state",
+      "paths": [
+        "skills/ceratops-repo-lifecycle/scripts/github_contract_engine/compose_desired_state.py"
+      ],
+      "suites": [
+        "github-contracts",
+        "github-workflows"
+      ]
+    },
+    {
+      "id": "contract-source_documents",
+      "paths": [
+        "skills/ceratops-repo-lifecycle/scripts/github_contract_engine/source_documents.py"
+      ],
+      "suites": [
+        "github-contracts"
+      ]
+    },
+    {
+      "id": "contract-consistency",
+      "paths": [
+        "skills/ceratops-repo-lifecycle/scripts/github_contract_engine/consistency.py"
+      ],
+      "suites": [
+        "github-contracts"
+      ]
+    },
+    {
+      "id": "contract-audit_snapshot",
+      "paths": [
+        "skills/ceratops-repo-lifecycle/scripts/github_contract_engine/audit_snapshot.py"
+      ],
+      "suites": [
+        "github-contracts"
+      ]
+    },
+    {
+      "id": "contract-repository_artifact_contracts",
+      "paths": [
+        "skills/ceratops-repo-lifecycle/scripts/github_contract_engine/repository_artifact_contracts.py"
+      ],
+      "suites": [
+        "github-contracts",
+        "repository-operations"
+      ]
+    },
+    {
+      "id": "compatibility-application",
+      "paths": [
+        "skills/ceratops-repo-lifecycle/scripts/ceratops_repo_compatibility_engine/__main__.py",
+        "skills/ceratops-repo-lifecycle/scripts/ceratops_repo_compatibility_engine/apply_ceratops_compatibility.py",
+        "skills/ceratops-repo-lifecycle/scripts/ceratops_repo_compatibility_engine/bootstrap_installer_synchronization.py",
+        "skills/ceratops-repo-lifecycle/scripts/ceratops_repo_compatibility_engine/ci_workflow.py",
+        "skills/ceratops-repo-lifecycle/scripts/ceratops_repo_compatibility_engine/validate_ceratops_compatibility.py",
+        "skills/ceratops-repo-lifecycle/scripts/ceratops_repo_compatibility_engine/validation_environment.py"
+      ],
+      "suites": [
+        "repository-compatibility",
+        "repository-checks",
+        "skill-installation",
+        "dependabot-coverage"
+      ]
+    },
+    {
+      "id": "contract-data-artifact-deterministic-contract",
+      "paths": [
+        "skills/ceratops-repo-lifecycle/references/contracts/artifact-deterministic-contract.json"
+      ],
+      "suites": [
+        "github-contracts",
+        "repository-checks"
+      ]
+    },
+    {
+      "id": "contract-data-ceratops-compatibility-deterministic-contract",
+      "paths": [
+        "skills/ceratops-repo-lifecycle/references/contracts/ceratops-compatibility-deterministic-contract.json"
+      ],
+      "suites": [
+        "github-contracts",
+        "repository-compatibility",
+        "repository-checks"
+      ]
+    },
+    {
+      "id": "contract-data-github-pr-readiness-deterministic-contract",
+      "paths": [
+        "skills/ceratops-repo-lifecycle/references/contracts/github-pr-readiness-deterministic-contract.json"
+      ],
+      "suites": [
+        "github-contracts",
+        "github-workflows",
+        "github-dependencies",
+        "repository-shipping",
+        "release-locking",
+        "failure-reporting"
+      ]
+    },
+    {
+      "id": "pr-readiness-schema",
+      "paths": [
+        "skills/ceratops-repo-lifecycle/references/schemas/github-pr-readiness-deterministic-contract.schema.json"
+      ],
+      "suites": [
+        "github-contracts",
+        "github-workflows",
+        "github-dependencies",
+        "repository-shipping",
+        "release-locking",
+        "failure-reporting"
+      ]
+    },
+    {
+      "id": "shared-github-transport",
+      "paths": [
+        "skills/ceratops-repo-lifecycle/scripts/github_contract_engine/github_api.py",
+        "skills/ceratops-repo-lifecycle/scripts/github_contract_engine/format_report.py",
+        "skills/ceratops-repo-lifecycle/scripts/github_contract_engine/levels.py"
+      ],
+      "suites": [
         "artifact-storage",
         "check-result-reuse",
         "repository-operations",
@@ -1227,40 +2152,128 @@
         "pending-work",
         "github-workflows",
         "github-dependencies",
+        "repository-compatibility",
+        "release-locking",
+        "failure-reporting",
+        "mcp-identities",
+        "sdlc-handoffs",
+        "github-contracts",
+        "dependabot-coverage",
+        "repository-profile",
+        "contract-reporting",
+        "repository-health"
+      ]
+    },
+    {
+      "id": "contract-schema-reader",
+      "paths": [
+        "skills/ceratops-repo-lifecycle/scripts/github_contract_engine/schema_validation.py"
+      ],
+      "suites": [
+        "github-contracts",
+        "github-workflows",
+        "github-dependencies",
+        "repository-shipping",
+        "release-locking",
+        "failure-reporting"
+      ]
+    },
+    {
+      "id": "remote-repository-collector",
+      "paths": [
+        "skills/ceratops-repo-lifecycle/scripts/github_contract_engine/collectors/repository.py"
+      ],
+      "suites": [
+        "github-contracts",
+        "dependabot-coverage",
+        "github-workflows"
+      ]
+    },
+    {
+      "id": "python-project-declarations",
+      "paths": [
+        "scripts/pyproject.toml",
+        "scripts/uv.lock"
+      ],
+      "suites": [
+        "repository-lint",
+        "repository-checks",
+        "repository-compatibility",
         "skill-installation",
-        "repository-lint"
+        "skill-source-contracts"
+      ]
+    },
+    {
+      "id": "test-process-fixtures",
+      "paths": [
+        "tests/support/processes.py"
+      ],
+      "suites": [
+        "artifact-storage",
+        "mcp-identities",
+        "repository-checks",
+        "repository-compatibility",
+        "sdlc-handoffs",
+        "skill-installation",
+        "pytest-reuse",
+        "check-records"
+      ]
+    },
+    {
+      "id": "repository-test-package",
+      "paths": [
+        "tests/repository_lifecycle/__init__.py"
+      ],
+      "suites": [
+        "artifact-storage",
+        "check-records",
+        "check-result-reuse",
+        "command-reporting",
+        "contract-reporting",
+        "dependabot-coverage",
+        "failure-reporting",
+        "github-contracts",
+        "github-dependencies",
+        "github-workflows",
+        "mcp-identities",
+        "pending-work",
+        "pytest-reuse",
+        "release-locking",
+        "repository-checks",
+        "repository-compatibility",
+        "repository-health",
+        "repository-operations",
+        "repository-profile",
+        "repository-promotion",
+        "repository-shipping",
+        "sdlc-handoffs",
+        "skill-checkpoints"
+      ]
+    },
+    {
+      "id": "skill-test-package",
+      "paths": [
+        "tests/skill_lifecycle/__init__.py"
+      ],
+      "suites": [
+        "release-locking",
+        "repository-compatibility",
+        "skill-fast-change",
+        "skill-installation",
+        "skill-lifecycle",
+        "skill-source-contracts",
+        "skill-update",
+        "write-locks"
       ]
     }
   ],
   "full_suite_paths": [
     "scripts/testing/run-tests.py",
-    "scripts/validate-repository.py",
-    "tests/repository_lifecycle/support.py",
-    "tests/repository_lifecycle/__init__.py",
-    "tests/test_infrastructure/conftest.py",
-    "tests/test_infrastructure/__init__.py",
-    ".github/dependabot.yml",
-    ".github/workflows/**",
-    ".gitignore",
-    "AGENTS.history.json",
-    "AGENTS.md",
-    "scripts/.markdownlint.json",
-    "scripts/.yamllint.yml",
-    "scripts/package-lock.json",
-    "scripts/package.json",
-    "skills/ceratops-automation-run/**",
-    "skills/ceratops-code-consistency-audit/**",
-    "skills/codex-desktop-upgrade/**",
-    "skills/sections/**",
-    "skills/skill-sections.json",
-    "tests/__init__.py",
-    "tests/conftest.py",
-    "tests/support/**",
-    "tests/test-impact.json",
     "scripts/pyproject.toml",
     "scripts/uv.lock",
-    "tests/skill_lifecycle/support.py",
-    "tests/skill_lifecycle/__init__.py"
+    "tests/__init__.py",
+    "tests/conftest.py",
+    "tests/test-impact.json"
   ],
   "ignored_paths": [
     {

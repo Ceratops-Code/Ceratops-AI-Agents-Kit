@@ -29,7 +29,7 @@ from .dependency_common import (
 )
 
 DEPENDABOT_TITLE_PREFIX_RE = re.compile(
-    r"^build\(deps(?:-dev)?\):\s*",
+    r"^(?:build|chore)\(deps(?:-dev)?\):\s*",
     re.IGNORECASE,
 )
 GROUPED_BODY_UPDATE_RE = re.compile(
@@ -217,6 +217,35 @@ def _pr_query(command: list[str], timeout: float) -> subprocess.CompletedProcess
         )
 
 
+def fetch_default_branch_head(repo: str, branch: object) -> dict[str, Any]:
+    """Bind alert reads to one live default-branch commit, never checkout HEAD.
+
+    GitHub CLI owns authentication. Missing or failed branch evidence stays
+    unavailable; callers must not substitute local release or dirty files.
+    """
+    if not isinstance(branch, str) or not branch.strip():
+        return {"status": "unavailable", "reason": "default_branch_missing"}
+    command = ["gh", "api", f"repos/{repo}/commits/{urllib.parse.quote(branch, safe='')}",
+               "--jq", ".sha"]
+    try:
+        completed = run_command(command, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        details = {"command": command, "exit_code": None,
+                   "stdout": getattr(exc, "stdout", None) or "<absent>",
+                   "stderr": getattr(exc, "stderr", None) or "<absent>", "cause": str(exc)}
+    else:
+        commit = completed.stdout.strip()
+        if completed.returncode == 0 and re.fullmatch(r"[0-9a-fA-F]{40}", commit):
+            return {"status": "ok", "branch": branch, "commit": commit.lower()}
+        details = {"command": command, "exit_code": completed.returncode,
+                   "stdout": completed.stdout or "<absent>",
+                   "stderr": completed.stderr or "<absent>",
+                   "cause": "default branch query failed or returned no exact commit"}
+    return {"status": "unavailable", "reason": "default_branch_commit_unavailable",
+            "repo": repo, "branch": branch,
+            **sanitize_for_output(details, retain_diagnostics=True)}
+
+
 def branch_freshness(
     repo: str, live: dict[str, Any], *, timeout: float = 30
 ) -> dict[str, Any]:
@@ -380,6 +409,22 @@ def fetch_pr_body(repo: str, number: int, expected_head: str) -> dict[str, Any]:
     if not isinstance(body, str):
         return {"status": "blocked", "error": "PR body is unavailable"}
     return {"status": "ok", "body": body}
+
+
+def dependabot_branch_ecosystem(head_ref: str) -> str | None:
+    """Keep the bot's ecosystem when a repaired PR also changes CI or other locks.
+
+    Dependabot's branch prefix identifies its package manager. Unsupported
+    managers retain their own name so registry checks fail with the real cause.
+    Ordinary branch names leave the existing manifest inference in control.
+    """
+
+    parts = head_ref.split("/", 2)
+    if len(parts) != 3 or parts[0] != "dependabot" or not parts[1]:
+        return None
+    return {
+        "github_actions": "github-actions", "npm_and_yarn": "npm", "uv": "pip",
+    }.get(parts[1], parts[1])
 
 
 def build_update(
@@ -673,9 +718,9 @@ class _DependencySourceError(WorkflowError):
 
 
 class _DependencyFileReader:
-    """Read one immutable PR tree, or local files for an alert without a PR.
+    """Read an immutable dependency tree, or explicitly requested local files.
 
-    A missing PR object is fetched by its exact ID without changing refs, HEAD,
+    A missing commit object is fetched by its exact ID without changing refs, HEAD,
     index or working files. Git objects are the only persistent output, owned
     and eventually pruned by Git. No failed commit read falls back to local data.
     """
@@ -689,13 +734,13 @@ class _DependencyFileReader:
         if commit is None:
             return
         if not re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", commit):
-            raise _DependencySourceError("PR head must be an exact commit ID", {"commit": commit})
+            raise _DependencySourceError("Dependency source must be an exact commit ID", {"commit": commit})
         present = self._git(["rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}"], allowed=(0, 1))
         if present.returncode == 1:
             self._git(["fetch", "--no-tags", "--no-write-fetch-head", "origin", commit])
             present = self._git(["rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}"])
         if present.stdout.decode("ascii").strip().lower() != commit.lower():
-            raise _DependencySourceError("Git returned a different PR commit", {"commit": commit})
+            raise _DependencySourceError("Git returned a different dependency commit", {"commit": commit})
         selected = {self._relative(self.path(relative)) for relative in paths}
         selected.update(
             str(pathlib.PurePosixPath(relative).with_name("gradle-wrapper.jar"))
@@ -730,7 +775,7 @@ class _DependencyFileReader:
             return (value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value) or "<absent>"
 
         details = sanitize_for_output({
-            "operation": "read_pr_commit_files", "checkout": str(self.checkout), "commit": self.commit,
+            "operation": "read_dependency_commit_files", "checkout": str(self.checkout), "commit": self.commit,
             "command": command, "exit_code": exit_code,
             "stdout": output(stdout), "stderr": output(stderr), "cause": message,
         }, retain_diagnostics=True)
@@ -768,7 +813,7 @@ class _DependencyFileReader:
             return path.is_file()
         entry = self.entries.get(self._relative(path))
         if entry and entry[0] not in {"100644", "100755"}:
-            raise _DependencySourceError("PR dependency source is not a regular file", {"file": self._relative(path), "mode": entry[0]})
+            raise _DependencySourceError("Committed dependency source is not a regular file", {"file": self._relative(path), "mode": entry[0]})
         return entry is not None
 
     def read_bytes(self, path: pathlib.Path, *, size_limit: int | None = None) -> bytes:
@@ -778,7 +823,7 @@ class _DependencyFileReader:
                 raise WorkflowError("wrapper JAR exceeds the evidence size bound")
             return path.read_bytes()
         if not self.is_file(path):
-            raise _DependencySourceError("file_missing_from_pr_commit", {"file": self._relative(path)})
+            raise _DependencySourceError("file_missing_from_dependency_commit", {"file": self._relative(path)})
         _, oid, size = self.entries[self._relative(path)]
         if size_limit is not None and size > size_limit:
             raise WorkflowError("wrapper JAR exceeds the evidence size bound")
@@ -1009,7 +1054,7 @@ def dependency_tree_evidence(
     alerts: list[dict[str, Any]],
     commit: str | None = None,
 ) -> dict[str, Any]:
-    """Collect dependency facts at the PR head; alerts alone use local context.
+    """Collect facts from the selected commit or explicit local context.
 
     This is source evidence for the existing review and release/local flow,
     never permission to merge or a substitute for candidate checks.

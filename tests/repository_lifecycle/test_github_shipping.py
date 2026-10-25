@@ -1086,7 +1086,10 @@ def test_ship_reconciles_merged_pr_before_actions_outage(
     assert events == ["recover", "live", "sync"]
 
 
-@pytest.mark.parametrize("prefix", ["build(deps): ", "build(deps-dev): "])
+@pytest.mark.parametrize(
+    "prefix",
+    ["build(deps): ", "build(deps-dev): ", "chore(deps): ", "chore(deps-dev): "],
+)
 def test_dependabot_bump_title_accepts_configured_prefixes(
     monkeypatch: pytest.MonkeyPatch,
     prefix: str,
@@ -1115,7 +1118,7 @@ def test_dependabot_bump_title_rejects_unconfigured_prefix(
     dependency = load_pr_workflow_module(monkeypatch, "dependency_evidence")
 
     update = dependency.parse_update(
-        "chore(deps): bump ruff from 0.16.8 to 0.16.9 in /scripts",
+        "ci(deps): bump ruff from 0.16.8 to 0.16.9 in /scripts",
         [{"path": "scripts/uv.lock"}],
         [],
     )

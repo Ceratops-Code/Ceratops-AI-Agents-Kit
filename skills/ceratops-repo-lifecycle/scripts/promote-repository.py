@@ -41,6 +41,7 @@ from github_pr_workflow.command import (
     run_command,
     run_command_for_json,
 )
+from github_pr_workflow.dependency_common import normalize_github_repo
 from repository_operation import (
     OperationError,
     OperationRequest,
@@ -306,6 +307,18 @@ def _ship_after_promotion(
     scope = pathlib.Path(pending_work_scope)
     if not scope.is_absolute() or not scope.resolve(strict=True).is_file():
         raise PromotionError("Recorded pending-work scope is unavailable for shipping.")
+    preserved = list(getattr(args, "preserve_worktree", None) or [])
+    requested_root = args.repo_root.expanduser().resolve(strict=True)
+    if requested_root != repo_root:
+        # Promotion routes release effects to the primary checkout, but its
+        # requesting workspace is still live. Protect that registered worktree
+        # (and its task outputs) before Ship evaluates destructive finalization.
+        workspace = pathlib.Path(require_output(
+            git_branches._git(requested_root, "rev-parse", "--show-toplevel"),
+            cwd=requested_root,
+        )).resolve(strict=True)
+        if workspace != repo_root and workspace not in {path.resolve() for path in preserved}:
+            preserved.append(workspace)
     request = repository_ship.ShipOptions(
         repo_root=repo_root,
         head_branch=args.release_branch,
@@ -313,7 +326,7 @@ def _ship_after_promotion(
         remote_name=args.remote_name,
         commit=target_commit,
         reusable_head=True,
-        preserve_worktree=getattr(args, "preserve_worktree", None),
+        preserve_worktree=preserved or None,
         sdlc_contract=args.sdlc_contract,
         title=getattr(args, "title", None),
         body=getattr(args, "body", None),
@@ -960,6 +973,76 @@ def _completed_promotion_only(
         raise PromotionError("Promotion-only result is incomplete; retain the result.")
 
 
+def _completed_shipping(
+    result: dict[str, Any], commit: str, repo_root: pathlib.Path, release_branch: str,
+) -> None:
+    """Accept the terminal composed-Ship contract without replaying any effect.
+
+    Shipping names the selected commit separately from the synchronized merge.
+    Its two ordered operation batches can be empty or declared no-ops. Executed
+    operations retain the same step and receipt requirements as local deployment.
+    """
+    remote = normalize_github_repo(require_output(
+        git_branches._git(repo_root, "remote", "get-url", "origin"), cwd=repo_root,
+    ).strip())
+    synchronized = result.get("synchronized_head")
+    merged = result.get("merge_commit")
+    # Synchronization may include another PR merged after this one. Each identity
+    # retains its producer meaning; operation receipts bind to synchronized_head.
+    if (
+        result.get("commit") != commit
+        or not isinstance(result.get("repository"), str)
+        or remote is None or result["repository"].lower() != remote.lower()
+        or not isinstance(synchronized, str)
+        or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", synchronized)
+        or not isinstance(merged, str)
+        or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", merged)
+        or type(result.get("pr")) is not int or result["pr"] <= 0
+    ):
+        raise PromotionError("Shipping result identity does not match finalization inputs.")
+    finalized = result.get("finalization")
+    if not isinstance(finalized, dict) or finalized.get("status") != "finalized":
+        raise PromotionError("Shipping finalization is incomplete; retain the result.")
+    cleanup = finalized.get("repository_cleanup")
+    if cleanup is not None and (
+        not isinstance(cleanup, dict) or cleanup.get("status") != "completed"
+        or cleanup.get("errors") != []
+    ):
+        raise PromotionError("Shipping cleanup is incomplete; retain the result.")
+    for phase in ("release_publication", "deployment"):
+        batch = result.get(phase)
+        if not isinstance(batch, dict) or batch.get("status") != "completed" or batch.get("pending_operations") != []:
+            raise PromotionError(f"Shipping {phase} is incomplete; retain the result.")
+        selected, outcomes = batch.get("completed_operations"), batch.get("results")
+        if (
+            not isinstance(selected, list) or not isinstance(outcomes, list)
+            or not all(isinstance(item, str) and item for item in selected)
+            or len(set(selected)) != len(selected) or len(outcomes) != len(selected)
+        ):
+            raise PromotionError(f"Shipping {phase} operations are missing or ambiguous.")
+        executed, executed_outcomes = [], []
+        for operation, outcome in zip(selected, outcomes, strict=True):
+            if not isinstance(outcome, dict) or outcome.get("operation") != operation:
+                raise PromotionError(f"Shipping {phase} operation identity is incomplete.")
+            if outcome.get("status") == "no_op":
+                if (
+                    outcome.get("steps") != [] or not isinstance(outcome.get("reason"), str)
+                    or not outcome["reason"].strip() or outcome.get("handoff")
+                    or (outcome.get("commit") != synchronized and outcome.get("configured") is not False)
+                ):
+                    raise PromotionError(f"Shipping {phase} no-op is incomplete.")
+            else:
+                executed.append(operation)
+                executed_outcomes.append(outcome)
+        if executed:
+            _completed_deployment(
+                {"status": "ready", "head": synchronized, "release_branch": release_branch,
+                 "operations": {"status": "completed", "pending_operations": [],
+                                "completed_operations": executed, "results": executed_outcomes}},
+                synchronized, release_branch=release_branch, repo_root=repo_root,
+            )
+
+
 def finalize_result(args: argparse.Namespace) -> None:
     """Remove only the caller's completed report; never run lifecycle operations.
 
@@ -1049,6 +1132,8 @@ def finalize_result(args: argparse.Namespace) -> None:
     result = json.loads(data, object_pairs_hook=_unique_result_object)
     if args.promotion_only:
         _completed_promotion_only(result, args.expected_commit, args.release_branch)
+    elif isinstance(result, dict) and result.get("status") in {"shipped", "already_shipped"}:
+        _completed_shipping(result, args.expected_commit, repo_root, args.release_branch)
     else:
         _completed_deployment(
             result,

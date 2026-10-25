@@ -8,6 +8,7 @@ import os
 import pathlib
 import posixpath
 import re
+import shlex
 import subprocess
 import tomllib
 import xml.etree.ElementTree as ET
@@ -673,22 +674,117 @@ def _workflow_uses_github_artifact_attestation(text: str) -> bool:
     return re.search(r"(?i)\bactions/attest(?:-[a-z0-9_-]+)?@", text) is not None
 
 
-def _visible_versions(text: str, tool: str) -> list[str]:
-    """Extract explicitly visible runtime or CLI versions from workflow text."""
+def _npm_publishing_runtimes(workflows: dict[str, str]) -> dict[str, Any]:
+    """Collect declared versions at direct npm publish commands, without execution.
 
-    patterns = (
-        [
-            r"(?im)node-version\s*:\s*['\"]?([^'\"\s#]+)",
-            r"(?i)setup-node@[^\n]+\n(?:.*\n){0,8}?.*node-version\s*:\s*['\"]?([^'\"\s#]+)",
-        ]
-        if tool == "node"
-        else [
-            r"(?i)npm(?:@|\s+install\s+(?:--global\s+|-g\s+)?npm@)([0-9]+(?:\.[0-9]+){0,2}|latest|next)"
-        ]
-    )
-    return sorted(
-        {match for pattern in patterns for match in re.findall(pattern, text)}
-    )
+    Jobs start with unknown versions. setup-node changes Node and resets npm;
+    a global npm installation changes only npm. Each publish observes only the
+    preceding assignments in its own job. Unsupported expressions, malformed
+    workflows and ambiguous conditional assignments remain ``unknown``, which
+    fails the contract's version comparison rather than borrowing other jobs'
+    evidence. No packages, workflow commands or external services are invoked.
+    """
+
+    environments: list[dict[str, Any]] = []
+    publish = re.compile(r"\bnpm\s+(?:stage\s+)?publish\b", re.IGNORECASE)
+
+    def declared_versions(value: Any, job: dict[str, Any]) -> list[str]:
+        expression = re.fullmatch(r"\$\{\{\s*matrix\.([\w-]+)\s*\}\}", str(value))
+        if expression:
+            strategy = job.get("strategy", {})
+            matrix = strategy.get("matrix", {}) if isinstance(strategy, dict) else None
+            if not isinstance(matrix, dict):
+                return ["unknown"]
+            values = matrix.get(expression[1], [])
+            includes = matrix.get("include", [])
+            if not isinstance(values, list) or not isinstance(includes, list):
+                return ["unknown"]
+            values = [*values, *(
+                item[expression[1]] for item in includes
+                if isinstance(item, dict) and expression[1] in item
+            )]
+        else:
+            values = [value]
+        return [str(item) if re.fullmatch(r"v?\d+(?:\.\d+){0,2}", str(item))
+                else "unknown" for item in values] or ["unknown"]
+
+    def record(path: str, job: str, step: int, node: list[str], npm: list[str], reason: str = "") -> None:
+        environments.append({"workflow": path, "job": job, "step": step,
+                             "node_versions": node[:], "npm_versions": npm[:]})
+        if reason:
+            environments[-1]["reason"] = reason
+
+    for path, text in sorted(workflows.items()):
+        if not publish.search(text):
+            continue
+        try:
+            workflow = yaml.safe_load(text)
+        except yaml.YAMLError as exc:
+            record(path, "unknown", 0, ["unknown"], ["unknown"], str(exc))
+            continue
+        jobs = workflow.get("jobs") if isinstance(workflow, dict) else None
+        if not isinstance(jobs, dict):
+            record(path, "unknown", 0, ["unknown"], ["unknown"], "Publishing workflow has no jobs mapping")
+            continue
+        for job_id, job in jobs.items():
+            if not isinstance(job, dict) or not isinstance(job.get("steps"), list):
+                if publish.search(yaml.safe_dump(job)):
+                    record(path, str(job_id), 0, ["unknown"], ["unknown"], "Publishing job has no list of steps")
+                continue
+            node, npm = ["unknown"], ["unknown"]
+            for index, step in enumerate(job["steps"], 1):
+                if not isinstance(step, dict) or step.get("if") is False:
+                    continue
+                conditional = step.get("if") not in (None, True) or bool(step.get("continue-on-error"))
+                if str(step.get("uses", "")).startswith("actions/setup-node@"):
+                    inputs = step.get("with", {})
+                    value = inputs.get("node-version") if isinstance(inputs, dict) else None
+                    selected = declared_versions(value, job)
+                    node = list(dict.fromkeys([*node, *selected])) if conditional else selected
+                    npm = ["unknown"]
+                script = step.get("run", "")
+                if not isinstance(script, str):
+                    continue
+                shell_controlled = bool(re.search(
+                    r"(?:^|[;\n])\s*(?:if|then|elif|else|case|for|while|until)\b", script,
+                ))
+                for line in script.splitlines():
+                    if not line.strip() or line.lstrip().startswith("#"):
+                        continue
+                    for command_index, command in enumerate(re.split(r"&&|\|\||;", line)):
+                        try:
+                            tokens = shlex.split(command, comments=True)
+                        except ValueError as exc:
+                            if publish.search(command):
+                                record(path, str(job_id), index, ["unknown"], ["unknown"], str(exc))
+                            continue
+                        if not tokens:
+                            continue
+                        install_index = next((position for position, token in enumerate(tokens)
+                                              if token in ("npm", "npm.cmd")
+                                              and tokens[position + 1:position + 2] in (["install"], ["i"], ["add"])), None)
+                        if (install_index is not None
+                                and any(flag in tokens[install_index + 2:] for flag in ("-g", "--global"))):
+                            package = next((item for item in tokens[install_index + 2:]
+                                            if item == "npm" or item.startswith("npm@")), None)
+                            if package is not None:
+                                # shlex does not execute shell control flow or wrappers.
+                                # An unresolved installation must clear earlier evidence;
+                                # a later direct run step can establish it again.
+                                selected = (["unknown"] if install_index or shell_controlled else
+                                            declared_versions(package.partition("@")[2] or None, job))
+                                uncertain = conditional or "|" in line or (command_index > 0 and "&&" in line)
+                                npm = list(dict.fromkeys([*npm, *selected])) if uncertain else selected
+                        if not publish.search(" ".join(tokens)):
+                            continue
+                        direct = tokens[0] in ("npm", "npm.cmd") and (
+                            tokens[1:2] == ["publish"] or tokens[1:3] == ["stage", "publish"]
+                        )
+                        record(path, str(job_id), index, node if direct else ["unknown"],
+                               npm if direct else ["unknown"])
+    return {"environments": environments,
+            "node_versions": [value for item in environments for value in item["node_versions"]],
+            "npm_versions": [value for item in environments for value in item["npm_versions"]]}
 
 
 def _git_state(local: dict[str, Any], default_branch: str | None) -> dict[str, Any]:
@@ -1274,8 +1370,7 @@ def collect_local_repository(
                 )
             ),
             "contents_read_present": "contents: read" in workflow_text,
-            "node_versions": _visible_versions(workflow_text, "node"),
-            "npm_versions": _visible_versions(workflow_text, "npm"),
+            "npm_publishing": _npm_publishing_runtimes(workflows),
         },
         "dependabot": {
             "config_path": next(

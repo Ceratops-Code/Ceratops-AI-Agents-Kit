@@ -466,7 +466,7 @@ def successful_result_paths(value: Any) -> tuple[str, ...]:
     """Extract existing result references, without reading or copying accepted files."""
     paths: set[str] = set()
     if isinstance(value, dict):
-        if str(value.get("status", "")).lower() in {"ok", "passed", "completed", "success"}:
+        if str(value.get("status", value.get("result", ""))).lower() in {"ok", "passed", "completed", "success", "reused"}:
             for key in ("path", "result_path", "receipt_path", "evidence_file"):
                 if isinstance(value.get(key), str):
                     paths.add(value[key])
@@ -538,7 +538,7 @@ def _child_report_paths(value: Any, repo_root: pathlib.Path) -> list[str]:
     """Use only explicit child diagnostic references; never mistake a receipt for one."""
     paths: set[str] = set()
     if isinstance(value, dict):
-        if str(value.get("status", "")).lower() in {"ok", "passed", "completed", "success"}:
+        if str(value.get("status", value.get("result", ""))).lower() in {"ok", "passed", "completed", "success", "reused"}:
             return []
         for key in ("diagnostic_output", "evidence_file"):
             candidate = value.get(key)

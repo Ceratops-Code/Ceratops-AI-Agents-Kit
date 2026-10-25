@@ -31,11 +31,13 @@ finishes result handling and any requested code-consistency handoff; the health
 cleanup entrypoint then removes only its declared files and empty task root.
 
 The code-consistency skill owns `scripts/prepare_repository_audit.{cmd,py}` in
-its own bundle. Preflight discovers the Git root, runtime commands and declared
-checks without running them. It owns the returned
-`<repo-parent>/tmp/<repo-name>/<task-id>` directory and optional evidence until
-its cleanup entrypoint removes matching evidence and empty directories. Unknown
-contents or links block cleanup. Both operations support fresh calls after an
+its own bundle. Preflight discovers the selected Git root, runtime commands and
+declared checks without running them. Linked worktrees and their subdirectories
+keep that source identity; Git's primary checkout determines the returned
+`<repo-parent>/tmp/<repo-name>/<task-id>` storage root. Cleanup removes matching
+evidence and empty directories. A run without requested evidence leaves an
+existing nonempty task directory untouched; otherwise unknown contents or links
+block cleanup. Both operations support fresh calls after an
 interruption and preserve unrelated output. The two skills exchange repository
 results through the model; their scripts remain inside their own skill.
 
@@ -231,7 +233,7 @@ without repository deduplication.
 | `skills/ceratops-governance-lifecycle/scripts/rule_graph.py` | Parses canonical AGENTS rules and rejects structural syntax or rule-local explicit-user override escape clauses. |
 | `skills/ceratops-repo-lifecycle/scripts/github_contract_engine/` | Package CLI for compact local audit snapshots, contract evaluation, shared GitHub API access, sanitized evidence, and evidence-gated CodeQL disposition. |
 | `skills/ceratops-repo-lifecycle/scripts/github_pr_workflow/` | Package CLI for individual PR operations, opt-in scoped branch/stage/commit preparation and checked draft or fork PR publication in `ensure_pr.py`, bounded standalone review and CI inspectors with caller-owned evidence files, shared readiness-owned CI diagnostics, one-call retry-safe review replies and resolutions, decision-complete gate blockers, single-snapshot terminal Actions outage detection, exact-commit checkpointed shipping, four-proof obsolete-prepared-checkpoint cleanup before automatic resume, scoped pending-work checks, concurrent gates, integrated admin merge, reusable-branch restoration, and terminal cleanup. Dependency preflight reads exact-head CheckRun annotations even for successful jobs, counts notices separately, retains up to fifty warning/failure messages per PR in its current report, reports omitted-message counts, and blocks the affected PR when annotation reads are unavailable. Dependency release batches require merge commits so every approved update remains an ancestor of the published branch. |
-| `skills/ceratops-repo-lifecycle/scripts/promote-repository.py` | Prepares the required local `release/local` promotion branch and rejects repositories where `refs/heads/release` occupies that namespace; promotes selected branches with no deployment or an explicit ordered operation selection; or composes promotion into exact-head shipping with ordered release and deploy selections, finalization, and cleanup; checks live publication before rebasing only task commits while preserving shared history; records outcomes, recreating the output directory at save time when needed, and finalizes verified promotion-only or bound deployment results within the task temp root without replay. |
+| `skills/ceratops-repo-lifecycle/scripts/promote-repository.py` | Prepares the required local `release/local` promotion branch and rejects repositories where `refs/heads/release` occupies that namespace; promotes selected branches with no deployment or an explicit ordered operation selection; or composes promotion into exact-head shipping with ordered release and deploy selections, finalization, and cleanup, automatically retaining the requesting linked worktree and its task files; checks live publication before rebasing only task commits while preserving shared history; records outcomes, recreating the output directory at save time when needed, and finalizes verified promotion-only or bound deployment results within the task temp root without replay. |
 | `skills/ceratops-repo-lifecycle/scripts/git_branch_operations.py` | Imported local branch/worktree lookup, checkout restoration, rebase, fast-forward and alignment functions shared by promotion, sync and Ship; no CLI or lock acquisition. |
 | `skills/ceratops-repo-lifecycle/scripts/check_deployment_receipts.py` | Checks closed deployment receipts for promotion finalization, preserving MCP server underscores while keeping skill identities unchanged; rejects mismatched records, unfinished cleanup and duplicate identities without running installation or publication. |
 | `skills/ceratops-repo-lifecycle/scripts/manage-pending-work.py` | Records, checks, automatically resumes the retained target commit, and progressively finalizes the exact selected scope; preflight preserves and reports non-cleanup-eligible worktrees, while eligible residual-worktree and identity-matched task-temp cleanup delegates bounded removal to `pending-work-cleanup.py`. |
@@ -748,6 +750,9 @@ worktree identity, and the command runner does not initialize these settings.
 before returning a short error with `diagnostic_output`. It references existing
 successful test/build result files without copying them. An existing complete
 child report is referenced unchanged and remains owned by that child's helper.
+Both `status` and `result` outcome fields identify successful evidence, including
+reused passes; an explicit failed `status` takes precedence over a conflicting
+passing `result`. A successful receipt cannot become a child's failure report.
 Without a selected path, or when writing it fails, the complete diagnostics
 remain in the returned error instead of being silently shortened.
 
@@ -772,6 +777,7 @@ GitHub check waiting now lives in `github_pr_workflow/wait_pr_checks.py`; its
 behavior is unchanged. Ship retires a matching PR's CI failure after its checks
 pass, even if review still needs attention. Saved successful delivery results
 also permit cleanup without executing publication or installation again.
+This includes completed release publication without local installation.
 Cleanup errors accompany the successful result without changing it into failure.
 Step 6E handles test-runner-owned reports; 20C/21 connect explicit request
 abandonment/replacement and worktree removal, which are separate cleanup triggers.
@@ -1178,7 +1184,9 @@ Each repository owns one lifecycle contract:
 - `skills/ceratops-repo-lifecycle/references/contracts/artifact-deterministic-contract.json`
   defines external artifact checks for PyPI, npm, DockerHub or OCI registries,
   GitHub Container Registry, GitHub releases, docs sites, and other package
-  registries.
+  registries. npm runtime requirements use the declarations preceding each
+  publishing command in its own job; unrelated jobs and later setup steps do
+  not supply version evidence. Unresolved versions remain blocking findings.
 - `skills/ceratops-skill-lifecycle/references/contracts/skill-contract-source-docs.json`
   records official skill-standard documents and installed OpenAI skill
   references used by skill-design contracts.

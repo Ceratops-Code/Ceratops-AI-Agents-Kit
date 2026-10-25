@@ -1125,12 +1125,12 @@
           "level": "WARN"
         },
         {
-          "path": "/local/workflows/node_versions",
+          "path": "/local/workflows/npm_publishing/node_versions",
           "operator": "all_versions_gte",
           "desired_path": "/desired/node_version_minimum"
         },
         {
-          "path": "/local/workflows/npm_versions",
+          "path": "/local/workflows/npm_publishing/npm_versions",
           "operator": "all_versions_gte",
           "desired_path": "/desired/npm_cli_version_minimum"
         }

@@ -534,8 +534,15 @@ def selection_from_changes(
                     if not owners
                     else f"ambiguous test ownership: {', '.join(owners)}"
                 )
-                gaps.append({"path": path, "reason": detail})
-                continue
+                # Shared fixture modules have explicit consumer rules instead
+                # of pytest ownership. Unknown or ambiguous tests still stop
+                # before collection; a helper rule never masks two owners.
+                if owners or not any(
+                    path_matches(pattern, ownership_path)
+                    for rule in manifest.rules for pattern in rule.paths
+                ):
+                    gaps.append({"path": path, "reason": detail})
+                    continue
             matched_rules = sorted(
                 (
                     rule

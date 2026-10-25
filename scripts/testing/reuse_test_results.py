@@ -327,9 +327,13 @@ class ResultStore:
             self.files[name] = hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else None
             self.stats[name] = self._stat(path)
         distributions = list(importlib.metadata.distributions())
+        # Distribution extras and requirements for another interpreter are not
+        # dependencies of this runtime. Keep package parsing with packaging.
         self.package_requirements = {
             dist.metadata.get("Name", "").lower().replace("_", "-"):
-            [Requirement(value).name.lower().replace("_", "-") for value in (getattr(dist, "requires", None) or [])]
+            [requirement.name.lower().replace("_", "-")
+             for value in (getattr(dist, "requires", None) or [])
+             if (requirement := Requirement(value)).marker is None or requirement.marker.evaluate()]
             for dist in distributions
         }
         self.context = {
@@ -564,6 +568,18 @@ class ResultStore:
         suite, required = self.comparison_groups[key]
         def metadata(source: Mapping[str, Any]) -> dict[str, Any]:
             facts = {key: value for key, value in source.items() if key not in excluded}
+            # Narrowing declared inputs keeps the original pass and its check
+            # version. Newly required or missing facts still differ below.
+            for field, names in (("environment", suite.environment), ("tools", suite.tools)):
+                if names is not None and isinstance(facts.get(field), dict):
+                    facts[field] = {name: value for name, value in facts[field].items() if name in names}
+            if suite.packages is not None and isinstance(facts.get("dependencies"), list):
+                required_packages = {name for name, _version in inputs["dependencies"]}
+                facts["dependencies"] = sorted(
+                    [name.lower().replace("_", "-"), version]
+                    for name, version in facts["dependencies"]
+                    if name.lower().replace("_", "-") in required_packages
+                )
             if suite.tools is not None and isinstance(facts.get("environment"), dict):
                 # PATH selects tools. Their recorded identities and the Python
                 # runtime are compared below; unrelated launcher directories

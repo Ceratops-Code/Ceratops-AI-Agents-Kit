@@ -1,7 +1,7 @@
 {
   "source_docs_version": 1,
   "name": "ceratops_skill_contract_source_docs",
-  "captured_on": "2026-10-11",
+  "captured_on": "2026-10-25",
   "policy": {
     "use_order": [
       "official_docs",
@@ -42,6 +42,13 @@
         "skill"
       ],
       "url": "https://openagentskills.dev/docs/writing-skill-md"
+    },
+    {
+      "id": "openai.skills.build_skills",
+      "scope": [
+        "skill"
+      ],
+      "url": "https://learn.chatgpt.com/docs/build-skills"
     },
     {
       "id": "openai.skills.skill_creator",
