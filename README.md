@@ -983,7 +983,11 @@ Unrelated entries stay intact, and interrupted removal cannot leave a missing
 For an ordinary proposal, run `proposal-workflow.py init` with a verified task
 root, UTF-8 failure and regression files, repeated `--context RULES HISTORY
 RULE_IDS`, and repeated `--replacement RULES HISTORY EXPECTED_FILE
-REPLACEMENT_FILE`. Use `-` for a source without history. The helper constructs
+REPLACEMENT_FILE`. Use `-` for a source without history. For an `AGENTS.md`
+target this selects its adjacent `AGENTS.history.json`, even when absent;
+the review template requests the first decision and acceptance freezes both
+outputs. Context declarations are optional for a first-history-only proposal.
+The helper constructs
 and prepares the closed request and emits the candidate paths plus one
 `next_action`. Pending review responses also include the annotation-only
 `review_input_template` for the caller:

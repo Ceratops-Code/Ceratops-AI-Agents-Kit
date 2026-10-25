@@ -77,20 +77,13 @@ Project-specific rules for this skills repository.
 
 ## Instruction and skill maintenance
 
-- [SKILLS-GOV-01] Before proposing or editing a repository control surface,
-  including `AGENTS.md`, `automation.toml`, `SKILL.md`, skill manifests, shared
-  sections, or helper contracts, re-open the relevant files from disk and use
-  the current contents as the source of truth.
-  - self: list-heavy
+- [SKILLS-GOV-01] Before proposing a repository control change, determine
+  its scope and ownership from the exact current governing text.
 - [SKILLS-GOV-02] Treat recommendations about instruction, automation, skill,
   and helper-contract changes as advisory.
   - self: gate
 - [SKILLS-PORT-01] In repo-tracked files intended for public sharing or GitHub,
-  including `AGENTS.md`, `automation.toml`, `SKILL.md`, generated runtime
-  skill files, scripts, docs, and examples, do not hardcode user-local absolute
-  filesystem paths unless an external runtime explicitly requires them; use
-  repo-relative paths or portable variables such as `$CODEX_HOME`.
-  - self: list-heavy
+  use repo-relative paths or portable variables under the global path policy.
 - [SKILLS-RUNTIME-01] Keep every producer and consumer of the repository's
   skill-runtime execution contract aligned with its behavioral tests; skill and
   action instructions that invoke a deterministic helper must specify the exact

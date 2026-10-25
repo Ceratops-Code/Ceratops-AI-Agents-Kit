@@ -29,8 +29,9 @@ import subprocess
 import sys
 import tempfile
 import tomllib
+from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, Mapping, Never, Sequence, cast
+from typing import Any, Never, cast
 
 import yaml
 from rule_candidate_source import (
@@ -1206,7 +1207,10 @@ def _validate_candidate_shape(
                 history_value,
                 f"candidate target {target_index} history",
             )
-            load_history_source(history)
+            if history.exists():
+                load_history_source(history)
+            elif rules.name.casefold() != "agents.md" or history != rules.with_name("AGENTS.history.json"):
+                raise RuleCandidateValidationError(f"missing history is not the AGENTS companion: {history}")
             target["history"] = str(history)
         if not _valid_sha256(target["source_sha256"]):
             raise RuleCandidateValidationError(
