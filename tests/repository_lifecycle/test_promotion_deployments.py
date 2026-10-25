@@ -426,7 +426,7 @@ def test_promote_and_deploy_rejects_operation_created_repository_work(
 @pytest.mark.parametrize("entrypoint", ["callable", "cli"])
 @pytest.mark.parametrize("effect", ["record", "delete"])
 @pytest.mark.parametrize("after", [False, True])
-@pytest.mark.parametrize("result_kind", ["deployment", "shipping-empty", "shipping-install", "shipping-no-op"])
+@pytest.mark.parametrize("result_kind", ["deployment", "shipping-empty", "shipping-install", "shipping-no-op", "shipping-publication"])
 def test_repo_owns_installation_result_recording_and_cleanup(
     tmp_path, monkeypatch, capsys, entrypoint, effect, after, result_kind,
 ):
@@ -469,6 +469,16 @@ def test_repo_owns_installation_result_recording_and_cleanup(
             noop = {"status": "no_op", "operation": operation, "commit": prepared.commit,
                     "steps": [], "reason": "Explicitly declared no-op"}
             result["deployment"] = {**empty, "completed_operations": [operation], "results": [noop]}
+        if result_kind == "shipping-publication":
+            publication = "deliverables.packages.installer.actions.publish"
+            # Match the public terminal report: publishing emits step evidence,
+            # has no local installation, and need not emit a JSON step receipt.
+            result["release_publication"] = {
+                **empty, "completed_operations": [publication], "results": [{
+                    "operation": publication, "commit": prepared.commit,
+                    "status": "completed", "steps": [1],
+                }],
+            }
     original_replace, original_unlink = pathlib.Path.replace, pathlib.Path.unlink
 
     def interrupted_replace(source, target):
@@ -619,3 +629,57 @@ def test_repo_cleanup_retains_mismatched_or_incomplete_shipping_results(tmp_path
         with pytest.raises(module["PromotionError"]):
             module["finalize_result"](args)
         assert report.read_bytes() == original
+
+
+@pytest.mark.parametrize("caller", ["primary", "worktree", "subdirectory"])
+@pytest.mark.parametrize("outcome", ["shipped", "failed", "interrupted"])
+def test_composed_shipping_preserves_its_live_workspace_and_task_files(tmp_path, monkeypatch, caller, outcome):
+    repo, _head, _log, _environment = prepare_repository_lifecycle_repo(tmp_path)
+    workspace = tmp_path / "worktrees" / repo.name / "active-task"
+    assert run_git(repo, "worktree", "add", "-b", "active-task", str(workspace), "approved").returncode == 0
+    nested = workspace / "source-subdirectory"
+    nested.mkdir()
+    task = tmp_path / "tmp" / repo.name / "active-task"
+    task.mkdir(parents=True)
+    retained = task / "accepted-output"
+    retained.write_bytes(b"accepted product and original checks")
+    scope = repo / ".git" / "selected-scope.json"
+    scope.write_text("{}")
+    module = runpy.run_path(str(PROMOTE_REPOSITORY))
+    requested = repo if caller == "primary" else nested if caller == "subdirectory" else workspace
+    args = module["build_parser"]().parse_args([
+        "--repo-root", str(requested), "--source-branch", "active-task", "--ship-after-promotion",
+    ])
+    commit = run_git(workspace, "rev-parse", "HEAD").stdout.strip()
+    original_branch = run_git(workspace, "branch", "--show-current").stdout.strip()
+    owner = module["repository_ship"]
+
+    def ship(request):
+        assert request.repo_root == repo
+        assert request.commit == commit
+        assert request.diagnostic_owner == (requested, "promote")
+        assert request.preserve_worktree == (None if caller == "primary" else [workspace])
+        if outcome == "failed":
+            raise owner.RepositoryShipError("remote gate refused")
+        if outcome == "interrupted":
+            raise KeyboardInterrupt("interrupted before remote effect")
+        return {"status": "shipped", "commit": commit, "synchronized_head": commit,
+                "release_publication": {}, "deployment": {}, "finalization": {}}
+
+    monkeypatch.setattr(owner, "ship_repository", ship)
+    monkeypatch.chdir(requested)
+    for _ in range(2):
+        def call():
+            return module["_ship_after_promotion"](
+                args, repo, target_commit=commit, pending_work_scope=str(scope),
+            )
+        if outcome == "shipped":
+            assert call()["status"] == "shipped"
+        else:
+            expected = KeyboardInterrupt if outcome == "interrupted" else module["PromotionError"]
+            with pytest.raises(expected):
+                call()
+        assert pathlib.Path.cwd() == requested
+        assert retained.read_bytes() == b"accepted product and original checks"
+        assert run_git(workspace, "rev-parse", "HEAD").stdout.strip() == commit
+        assert run_git(workspace, "branch", "--show-current").stdout.strip() == original_branch

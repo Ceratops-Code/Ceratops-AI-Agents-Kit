@@ -106,6 +106,39 @@ class RepositoryAuditPreflightTests(unittest.TestCase):
             self.assertEqual(payload["declared_validators"], [])
 
 
+    def test_linked_checkout_uses_primary_storage_and_keeps_existing_task_files(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="audit linked parent ") as raw:
+            parent = pathlib.Path(raw)
+            repo = self.init_repo(parent, "repository with spaces")
+            self.track(repo, "README.md", "fixture\n")
+            subprocess.run([self.git, "-C", str(repo), "-c", "user.name=Audit test",
+                "-c", "user.email=audit@example.invalid", "commit", "--quiet", "-m", "fixture"],
+                check=True, capture_output=True)
+            workspace = parent / "worktrees" / repo.name / "active-task"
+            subprocess.run([self.git, "-C", str(repo), "worktree", "add", "-b", "audit-task",
+                str(workspace)], check=True, capture_output=True)
+            child = workspace / "source"
+            child.mkdir()
+            expected = parent / "tmp" / repo.name / "active-task"
+            for requested in (workspace, child, workspace):
+                result = preflight.run_preflight(str(requested), "active-task",
+                    runtime_commands=self.runtimes(), git_command=self.git)
+                self.assertEqual(pathlib.Path(result["repo_root"]), workspace.resolve())
+                self.assertEqual(pathlib.Path(result["task_temp"]), expected.resolve())
+            self.assertFalse((workspace.parent / "tmp").exists())
+            keep = expected / "_accepted-result.json"
+            keep.write_bytes(b"another completed task output")
+            for _ in range(2):
+                preflight.cleanup_repository_audit(str(child), "active-task", git_command=self.git)
+                self.assertEqual(keep.read_bytes(), b"another completed task output")
+            keep.unlink()
+            for _ in range(2):
+                preflight.cleanup_repository_audit(str(workspace), "active-task", git_command=self.git)
+                self.assertFalse(expected.exists())
+            self.assertTrue(workspace.is_dir())
+            self.assertTrue((workspace / "README.md").is_file())
+
+
     def test_non_git_input_returns_bounded_error(self) -> None:
         with tempfile.TemporaryDirectory() as raw, self.assertRaises(preflight.PreflightError) as raised:
             preflight.run_preflight(

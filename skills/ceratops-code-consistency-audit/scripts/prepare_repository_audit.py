@@ -329,6 +329,23 @@ def resolve_git_root(repository: str, git_command: str | None = None) -> tuple[p
     return root, resolved_git
 
 
+def resolve_primary_checkout(repo_root: pathlib.Path, git_command: str) -> pathlib.Path:
+    """Use Git's common directory for storage, retaining the audited checkout identity."""
+    output = run_git(git_command,
+        ("-C", str(repo_root), "rev-parse", "--path-format=absolute", "--git-common-dir"),
+        "not_git_repository")
+    lines = output.decode("utf-8", errors="replace").splitlines()
+    if len(lines) != 1 or not lines[0].strip():
+        raise PreflightError("not_git_repository", "Git returned an invalid common directory")
+    try:
+        common = pathlib.Path(lines[0].strip()).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise PreflightError("not_git_repository", "Git common directory is unavailable") from exc
+    if common.name != ".git" or not common.is_dir():
+        raise PreflightError("not_git_repository", "Audit storage requires an available primary checkout")
+    return common.parent
+
+
 def create_task_temp(repo_root: pathlib.Path, task_id: str) -> tuple[pathlib.Path, pathlib.Path]:
     """Create only ``<repo-parent>/tmp/<repo-name>/<task-id>`` after safety checks."""
 
@@ -843,7 +860,8 @@ def run_preflight(
     available, missing = discover_runtimes(runtime_locator, runtime_commands)
     validators, inspected = discover_validators(repo_root, resolved_git)
     # Discovery failures must not leave a newly created task directory behind.
-    task_temp, temp_boundary = create_task_temp(repo_root, task_id)
+    primary_root = resolve_primary_checkout(repo_root, resolved_git)
+    task_temp, temp_boundary = create_task_temp(primary_root, task_id)
     result: dict[str, object] = {
         "available_runtime_commands": available,
         "declared_validators": validators,
@@ -882,14 +900,19 @@ def cleanup_repository_audit(
     """
 
     validate_task_id(task_id)
-    repo_root, _ = resolve_git_root(repository, git_command)
-    task_temp = repo_root.parent / "tmp" / repo_root.name / task_id
-    reject_reparse_components(repo_root.parent, task_temp)
+    repo_root, resolved_git = resolve_git_root(repository, git_command)
+    primary_root = resolve_primary_checkout(repo_root, resolved_git)
+    task_temp = primary_root.parent / "tmp" / primary_root.name / task_id
+    reject_reparse_components(primary_root.parent, task_temp)
     if not task_temp.exists():
         return
     task_temp = task_temp.resolve(strict=True)
     if not task_temp.is_dir():
         raise PreflightError("cleanup_blocked", f"task output is not a directory: {task_temp}")
+    if evidence_file is None and any(task_temp.iterdir()):
+        # No evidence was requested, so none of these existing files is ours.
+        # A shared task directory must not become an audit-cleanup blocker.
+        return
     destination = (
         evidence_path(evidence_file, task_temp, create_parents=False)
         if evidence_file is not None else None
