@@ -29,7 +29,7 @@ from .dependency_common import (
 )
 
 DEPENDABOT_TITLE_PREFIX_RE = re.compile(
-    r"^build\(deps(?:-dev)?\):\s*",
+    r"^(?:build|chore)\(deps(?:-dev)?\):\s*",
     re.IGNORECASE,
 )
 GROUPED_BODY_UPDATE_RE = re.compile(
