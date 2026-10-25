@@ -645,12 +645,9 @@ def validate_manifest(
                 f"test file must have exactly one suite owner: {path}: {list(owners)}"
             )
     required_full = {
-        ".github/workflows/validate.yml",
         "scripts/pyproject.toml",
         "scripts/testing/run-tests.py",
-        "scripts/validate-repository.py",
         "tests/__init__.py",
-        "tests/support/example.py",
         "tests/test-impact.json",
     }
     if (repo_root / "tests" / "conftest.py").exists():

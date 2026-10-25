@@ -11,6 +11,8 @@ import pytest
 from tests.test_infrastructure.test_run_tests import assert_pretest_diagnostic, payload
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+REPOSITORY_SKILL = "skills/ceratops-repo-lifecycle/"
+LIFECYCLE_SKILL = "skills/ceratops-skill-lifecycle/"
 
 
 def sample_manifest(
@@ -73,13 +75,13 @@ def test_domain_source_change_selects_only_mapped_suite(test_runner_module: Any)
 
 @pytest.mark.parametrize("source,affected,unaffected", [
     ("skills/ceratops-repo-lifecycle/scripts/sdlc_results.py",
-     {"artifact-storage", "check-result-reuse", "repository-operations", "repository-promotion", "test-runner"},
+     {"artifact-storage", "check-result-reuse", "repository-operations", "repository-promotion", "pytest-reuse"},
      {"github-contracts", "repository-compatibility", "repository-health", "skill-checkpoints"}),
     ("skills/ceratops-repo-lifecycle/scripts/github_contract_engine/github_api.py",
-     {"github-contracts", "github-workflows", "repository-health"},
-     {"artifact-storage", "check-result-reuse", "skill-checkpoints", "test-runner"}),
+     {"github-contracts", "github-workflows", "repository-health", "artifact-storage", "check-result-reuse"},
+     {"skill-checkpoints", "test-runner"}),
     ("skills/ceratops-skill-lifecycle/scripts/manage_checkpoints.py",
-     {"skill-checkpoints", "skill-lifecycle"},
+     {"skill-checkpoints", "skill-update"},
      {"github-contracts", "repository-compatibility", "repository-promotion", "test-runner"}),
     ("scripts/testing/reuse_test_results.py", {"test-runner", "command-reporting"},
      {"github-contracts", "repository-compatibility", "repository-promotion", "source-search", "shell-hook"}),
@@ -91,8 +93,8 @@ def test_domain_source_change_selects_only_mapped_suite(test_runner_module: Any)
      {"repository-compatibility", "skill-installation"},
      {"skill-lifecycle", "test-runner", "check-records"}),
     ("skills/ceratops-repo-lifecycle/references/templates/run-tests.py.tmpl",
-     {"repository-compatibility", "skill-installation", "check-records"},
-     {"skill-lifecycle", "test-runner"}),
+     {"repository-compatibility", "repository-checks", "skill-installation"},
+     {"skill-lifecycle", "test-runner", "check-records"}),
     ("skills/ceratops-repo-lifecycle/scripts/promote-repository.py", {"repository-promotion"},
      {"skill-lifecycle", "skill-installation", "test-runner"}),
 ])
@@ -114,7 +116,7 @@ def test_repository_group_input_scopes_keep_unrelated_receipt_changes_out(test_r
 
     manifest = test_runner_module.load_manifest(ROOT / "tests/test-impact.json")
     receipt = "skills/ceratops-repo-lifecycle/scripts/sdlc_results.py"
-    contract = "skills/ceratops-repo-lifecycle/scripts/github_contract_engine/github_api.py"
+    contract = "skills/ceratops-repo-lifecycle/scripts/github_contract_engine/consistency.py"
     artifact_case = "tests/repository_lifecycle/test_artifact_retention.py::test_retention"
     contract_case = "tests/repository_lifecycle/test_contract_engine.py::test_contract"
     assert group_inputs(manifest, artifact_case, (receipt, contract))[1] == (receipt,)
@@ -128,6 +130,111 @@ def test_added_lifecycle_source_requires_an_explicit_owner(test_runner_module):
     selection = runner.selection_from_changes(manifest, (runner.ChangedFile("A", (source,)),))
     assert selection.mapping_gaps == ({"path": source, "reason": "unmapped repository path"},)
     assert not selection.pytest_targets
+
+
+@pytest.mark.parametrize("source,owners", [
+    (REPOSITORY_SKILL + "references/contracts/github-contract-source-docs.json", {"github-contracts"}),
+    (REPOSITORY_SKILL + "references/contracts/code-comment-nondeterministic-contract.json", {"github-contracts"}),
+    (REPOSITORY_SKILL + "references/contracts/artifact-deterministic-contract.json",
+     {"github-contracts", "repository-checks"}),
+    (LIFECYCLE_SKILL + "references/contracts/skill-contract-source-docs.json", {"skill-source-contracts"}),
+    (LIFECYCLE_SKILL + "references/contracts/skill-deterministic-contract.json", {"skill-source-contracts"}),
+    (REPOSITORY_SKILL + "scripts/github_contract_engine/collectors/local_repository.py",
+     {"github-contracts", "repository-checks", "dependabot-coverage", "repository-operations"}),
+    (REPOSITORY_SKILL + "scripts/github_contract_engine/consistency.py", {"github-contracts"}),
+    (REPOSITORY_SKILL + "scripts/github_contract_engine/source_documents.py", {"github-contracts"}),
+    (REPOSITORY_SKILL + "scripts/github_contract_engine/compose_desired_state.py",
+     {"github-contracts", "github-workflows"}),
+    (REPOSITORY_SKILL + "scripts/github_contract_engine/repository_artifact_contracts.py",
+     {"github-contracts", "repository-operations"}),
+    (REPOSITORY_SKILL + "references/templates/run-tests.py.tmpl",
+     {"repository-compatibility", "repository-checks", "skill-installation"}),
+    (REPOSITORY_SKILL + "scripts/ceratops_repo_compatibility_engine/generate_test_script.py",
+     {"repository-compatibility", "repository-checks", "skill-installation", "dependabot-coverage"}),
+    (REPOSITORY_SKILL + "scripts/collect_repository_targets.py",
+     {"repository-health", "repository-operations", "mcp-identities", "sdlc-handoffs"}),
+    (LIFECYCLE_SKILL + "scripts/skill-update-workflow.py", {"skill-update"}),
+    (LIFECYCLE_SKILL + "scripts/fast-change.py", {"skill-fast-change", "release-locking"}),
+    (LIFECYCLE_SKILL + "scripts/manage_checkpoints.py", {"skill-checkpoints", "skill-update"}),
+    (LIFECYCLE_SKILL + "SKILL.md", {"skill-source-contracts"}),
+    ("skills/ceratops-automation-run/SKILL.md", {"skill-source-contracts"}),
+    ("skills/codex-desktop-upgrade/SKILL.md", {"skill-source-contracts"}),
+    ("AGENTS.history.json", {"governance-lifecycle", "skill-source-contracts"}),
+    ("AGENTS.md", {"governance-lifecycle", "skill-source-contracts"}),
+    ("scripts/package.json", {"repository-lint"}),
+    ("scripts/package-lock.json", {"repository-lint"}),
+    ("scripts/.markdownlint.json", {"repository-lint"}),
+    (".github/workflows/validate.yml", {"repository-lint", "repository-checks", "dependabot-coverage"}),
+    (".github/workflows/codeql.yml", {"repository-lint", "repository-checks", "dependabot-coverage"}),
+    (".github/dependabot.yml", {"repository-lint", "repository-checks", "dependabot-coverage"}),
+    (".gitignore", {"test-runner", "test-impact", "pytest-reuse", "check-records"}),
+])
+def test_repository_changes_select_only_their_actual_check_owners(test_runner_module, source, owners):
+    """Source catalogs, code, configuration and templates have different consumers."""
+    manifest = test_runner_module.load_manifest(ROOT / "tests/test-impact.json")
+    for status in ("A", "M", "D"):
+        selection = test_runner_module.selection_from_changes(
+            manifest, (test_runner_module.ChangedFile(status, (source,)),),
+        )
+        assert set(selection.suites) == owners
+        assert not selection.mapping_gaps
+        assert not selection.full_suite
+
+
+@pytest.mark.parametrize("source,consumer,unrelated", [
+    (REPOSITORY_SKILL + "references/contracts/github-contract-source-docs.json",
+     "tests/repository_lifecycle/test_contract_engine.py",
+     "tests/repository_lifecycle/test_promotion.py"),
+    (LIFECYCLE_SKILL + "references/contracts/skill-contract-source-docs.json",
+     "tests/skill_lifecycle/test_source_validation.py",
+     "tests/skill_lifecycle/test_runtime_transactions.py"),
+    (LIFECYCLE_SKILL + "scripts/skill-update-workflow.py",
+     "tests/skill_lifecycle/test_update_workflow.py",
+     "tests/skill_lifecycle/test_fast_change.py"),
+    (REPOSITORY_SKILL + "scripts/github_contract_engine/collectors/local_repository.py",
+     "tests/repository_lifecycle/test_operations.py",
+     "tests/repository_lifecycle/test_sdlc_handoffs.py"),
+    (".github/workflows/codeql.yml", "tests/test_infrastructure/test_repository_validator.py",
+     "tests/credit_analysis/test_batch.py"),
+    ("scripts/uv.lock", "tests/test_infrastructure/test_repository_validator.py",
+     "tests/credit_analysis/test_batch.py"),
+    ("scripts/pyproject.toml", "tests/skill_lifecycle/test_source_validation.py",
+     "tests/repository_lifecycle/test_artifact_retention.py"),
+])
+def test_narrowed_rules_keep_unrelated_files_out_of_saved_pass_inputs(
+    test_runner_module, source, consumer, unrelated,
+):
+    from select_test_groups import group_inputs
+
+    manifest = test_runner_module.load_manifest(ROOT / "tests/test-impact.json")
+    for _ in range(2):
+        assert group_inputs(manifest, consumer + "::case", (source,))[1] == (source,)
+        assert group_inputs(manifest, unrelated + "::case", (source,))[1] == ()
+
+
+@pytest.mark.parametrize("source,affected,unaffected", [
+    ("tests/test_infrastructure/conftest.py", "test-impact", "credit-analysis"),
+    ("tests/skill_lifecycle/support.py", "skill-update", "repository-health"),
+    ("tests/repository_lifecycle/support.py", "repository-promotion", "source-search"),
+    ("tests/support/repositories.py", "skill-installation", "repository-profile"),
+    ("tests/support/processes.py", "repository-compatibility", "write-locks"),
+    ("tests/skill_lifecycle/__init__.py", "write-locks", "repository-health"),
+])
+def test_shared_fixtures_select_consumers_without_selecting_all_domains(
+    test_runner_module, source, affected, unaffected,
+):
+    manifest = test_runner_module.load_manifest(ROOT / "tests/test-impact.json")
+    selection = test_runner_module.selection_from_changes(
+        manifest, (test_runner_module.ChangedFile("M", (source,)),),
+    )
+    assert affected in selection.suites
+    assert unaffected not in selection.suites
+    assert not selection.full_suite
+    assert not selection.mapping_gaps
+    unknown = test_runner_module.selection_from_changes(
+        manifest, (test_runner_module.ChangedFile("A", ("tests/support/unmapped.py",)),),
+    )
+    assert unknown.mapping_gaps == ({"path": "tests/support/unmapped.py", "reason": "unmapped test path"},)
 
 
 def test_multiple_domains_produce_sorted_deterministic_union(
@@ -183,11 +290,8 @@ def test_selection_infrastructure_and_shared_support_select_full_suite(
     assert {reason.path for reason in selection.reasons} == {path}
 
 
-@pytest.mark.parametrize("changed_path", [
-    "AGENTS.history.json", "scripts/package.json", "scripts/package-lock.json",
-    "scripts/pyproject.toml", "scripts/uv.lock",
-])
-def test_agents_history_selects_full_suite_from_repository_manifest(
+@pytest.mark.parametrize("changed_path", ["scripts/pyproject.toml", "scripts/uv.lock"])
+def test_shared_python_environment_selects_full_suite_from_repository_manifest(
     test_runner_module: Any,
     changed_path: str,
 ) -> None:

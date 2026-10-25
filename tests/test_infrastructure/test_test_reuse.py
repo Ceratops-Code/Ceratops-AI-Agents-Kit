@@ -548,12 +548,15 @@ def test_only_declared_dependency_tool_and_environment_affect_group(tmp_path, mo
         return json.loads(module.result_environment([sys.executable, "-m", "pytest", "tests"], root,
                                                   {"INPUT": "one", "OTHER": "one"})[module.RESULT_CONTEXT_ENV])
     monkeypatch.setattr(module.importlib.metadata, "distributions", lambda: [
-        types.SimpleNamespace(metadata={"Name": "example-library"}, version="1", requires=["transitive-lib"]),
+        types.SimpleNamespace(metadata={"Name": "example-library"}, version="1", requires=[
+            "transitive-lib", "unrelated; extra == 'dev'", "legacy-only; python_version < '0'",
+        ]),
         types.SimpleNamespace(metadata={"Name": "transitive-lib"}, version="1", requires=[]),
         types.SimpleNamespace(metadata={"Name": "unrelated"}, version="1", requires=[]),
     ])
     monkeypatch.setattr(module, "_tool_versions", lambda root: {"git": "one", "uv": "one"})
     first = module.ResultStore(root, context()).inputs(node)
+    assert not {"unrelated", "legacy-only"}.intersection(dict(first["dependencies"]))
     current = module.ResultStore(root, context())
     if kind == "package":
         current.context["dependencies"] = [[name, "2" if name == ("transitive-lib" if relevant else "unrelated") else value]
@@ -666,7 +669,7 @@ def _result_store(root):
     return module.ResultStore(root, context)
 
 
-@pytest.mark.parametrize("change", ["none", "first", "new-input"])
+@pytest.mark.parametrize("change", ["none", "first", "new-input", "runtime-scope", "new-runtime-input"])
 def test_split_dependency_groups_reuse_original_passes_and_rerun_only_changed_work(
     test_runner_module, tmp_path, change,
 ):
@@ -688,6 +691,11 @@ def test_split_dependency_groups_reuse_original_passes_and_rerun_only_changed_wo
         name: {"pytest": [f"tests/test_{name}.py"], "depends_on": []}
         for name in ("first", "second")
     }
+    if change in {"runtime-scope", "new-runtime-input"}:
+        for suite in manifest["suites"].values():
+            suite.update(packages=[], tools=[], environment=(
+                ["ADDED_REQUIRED_TEST_INPUT"] if change == "new-runtime-input" else []
+            ))
     manifest["rules"] = [
         {"id": name, "paths": [f"{name}.*"], "suites": [name]}
         for name in ("first", "second")
@@ -697,10 +705,12 @@ def test_split_dependency_groups_reuse_original_passes_and_rerun_only_changed_wo
         (root / "first.py").write_text("VALUE = 2\n")
     elif change == "new-input":
         (root / "first.json").write_text("{}")
-    affected = int(change != "none")
+    affected = 2 if change == "new-runtime-input" else int(change not in {"none", "runtime-scope"})
     changed = _acceptance_run(test_runner_module, root)
     assert changed.returncode == 0, changed.stdout + changed.stderr
-    assert changed.accepted_checks == {"collected": 2, "executed": affected, "reused": 2 - affected}
+    assert changed.accepted_checks == {
+        "collected": 2, "executed": affected, "reused": 2 - affected,
+    }, changed.check_decisions
     for reference in changed.accepted_result_references:
         if reference["reused"]:
             original = originals[reference["id"]]
@@ -711,7 +721,9 @@ def test_split_dependency_groups_reuse_original_passes_and_rerun_only_changed_wo
     repeated = _acceptance_run(test_runner_module, root)
     assert repeated.returncode == 0, repeated.stdout + repeated.stderr
     assert repeated.accepted_checks == {"collected": 2, "executed": 0, "reused": 2}
-    assert counter.read_text().splitlines() == ["first", "second"] + (["first"] if affected else [])
+    assert counter.read_text().splitlines() == ["first", "second"] + (
+        ["first", "second"] if affected == 2 else ["first"] if affected else []
+    )
 
 
 @pytest.mark.parametrize("rotate", [False, True])
