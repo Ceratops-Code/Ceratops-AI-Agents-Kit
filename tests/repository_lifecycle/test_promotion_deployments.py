@@ -119,7 +119,9 @@ def test_promote_repository_requires_an_explicit_deployment_choice(
 
     if declared_handoff is not None:
         assert promoted.returncode == 1
-        failure = json.loads(promoted.stderr)
+        summary = json.loads(promoted.stderr)
+        failure = json.loads(result_file.read_text(encoding="utf-8"))
+        assert summary["status"] == failure["status"]
         assert failure["status"] == "handoff_required"
         assert failure["phase"] == "deployment"
         assert failure["completed_operations"] == []
@@ -132,7 +134,9 @@ def test_promote_repository_requires_an_explicit_deployment_choice(
         result = failure["promotion"]
     else:
         assert promoted.returncode == 0, promoted.stderr
-        result = json.loads(promoted.stdout)
+        summary = json.loads(promoted.stdout)
+        result = json.loads(result_file.read_text(encoding="utf-8"))
+        assert summary["status"] == result["status"]
     assert result["status"] == "ready"
     assert result["release_branch"] == "release/local"
     assert result["merged_branches"] == ["approved"]
@@ -227,6 +231,83 @@ def test_promote_repository_requires_an_explicit_deployment_choice(
         assert log.read_text(encoding="utf-8") == "no-base\n"
     assert scope_path.read_bytes() == scope_before
     assert run_git(repo, "rev-parse", "HEAD").stdout.strip() == approved_head
+
+
+@pytest.mark.parametrize("status", ["ready", "tests_failed", "pending_work"])
+@pytest.mark.parametrize("boundary", [
+    "uninterrupted", "record-before", "record-after", "output-before", "output-after", "no-report",
+])
+def test_promotion_output_keeps_full_report_across_interruption(
+    tmp_path, monkeypatch, capsys, status, boundary,
+):
+    module = runpy.run_path(str(PROMOTE_REPOSITORY))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    task = tmp_path / "tmp" / repo.name / "summary"
+    report = task / "result.json"
+    payload = {
+        "status": status, "head": "a" * 40, "release_branch": "release/local",
+        "phase": "promotion_validation", "message": "Repository test step failed.\n" + "details\n" * 10000,
+        "check_summary": {"checks": [{"evidence": "complete-record" * 20000}]},
+        "operations": {"status": "completed", "step_results": [{"result": "complete-receipt"}]},
+    }
+
+    def promote(_args, **_kwargs):
+        if status == "tests_failed":
+            raise module["PromotionError"]("Repository test step failed.", dict(payload))
+        return dict(payload)
+
+    monkeypatch.setitem(module["main"].__globals__, "promote", promote)
+    arguments = ["--repo-root", str(repo), "--source-branch", "approved", "--no-run-operation"]
+    if boundary != "no-report":
+        arguments += ["--result-file", str(report)]
+    original_replace, original_print = pathlib.Path.replace, print
+
+    def interrupted_replace(source, target):
+        assert pathlib.Path(target) == report
+        if boundary == "record-after":
+            original_replace(source, target)
+        raise OSError("interrupted report publication")
+
+    def interrupted_print(*args, **kwargs):
+        if boundary == "output-after":
+            original_print(*args, **kwargs)
+        raise BrokenPipeError("interrupted result output")
+
+    if boundary.startswith("record-"):
+        with monkeypatch.context() as patch:
+            patch.setattr(pathlib.Path, "replace", interrupted_replace)
+            assert module["main"](arguments) == 1
+        failure = json.loads(capsys.readouterr().err)
+        assert failure["status"] == "result_recording_failed"
+        assert failure["operation_result"]["check_summary"] == payload["check_summary"]
+        assert failure["replay_required"] is False
+        assert report.exists() == boundary.endswith("after")
+    elif boundary.startswith("output-"):
+        with monkeypatch.context() as patch:
+            patch.setattr("builtins.print", interrupted_print)
+            with pytest.raises(BrokenPipeError, match="result output"):
+                module["main"](arguments)
+        assert json.loads(report.read_text(encoding="utf-8"))["operations"] == payload["operations"]
+        capsys.readouterr()
+    for _ in range(2):
+        assert module["main"](arguments) == {"ready": 0, "tests_failed": 1, "pending_work": 2}[status]
+        observed = capsys.readouterr()
+        output = observed.err if status == "tests_failed" else observed.out
+        summary = json.loads(output)
+        assert summary["status"] == status
+        if boundary == "no-report":
+            assert summary["check_summary"] == payload["check_summary"]
+            assert not report.exists()
+        else:
+            assert len(output.encode("utf-8")) < 4096
+            assert summary["result_file"] == str(report)
+            assert summary["result_sha256"] == hashlib.sha256(report.read_bytes()).hexdigest()
+            recorded = json.loads(report.read_text(encoding="utf-8"))
+            assert recorded["check_summary"] == payload["check_summary"]
+            assert recorded["operations"] == payload["operations"]
+            assert recorded["message"] == payload["message"]
+    assert not list(task.glob("*.tmp"))
 
 
 def test_promote_and_deploy_does_not_inject_base_revision(
@@ -448,6 +529,11 @@ def test_repo_owns_installation_result_recording_and_cleanup(
     assert len(installed_calls.splitlines()) == 1
 
     module = runpy.run_path(str(PROMOTE_REPOSITORY))
+    workspace = tmp_path / "worktrees" / repo.name / "completion"
+    assert run_git(repo, "worktree", "add", "-b", "completion", str(workspace)).returncode == 0
+    nested = workspace / "nested"
+    nested.mkdir()
+    requested = workspace if entrypoint == "callable" else nested
     task = repo.parent / "tmp" / repo.name / "completion"
     task.mkdir(parents=True)
     report, unrelated = task / "promotion.json", task / "keep.json"
@@ -512,7 +598,7 @@ def test_repo_owns_installation_result_recording_and_cleanup(
     # The actual result is still in the caller, not reconstructed by reinstalling.
     module["_save_result"](report, result)
     digest = hashlib.sha256(report.read_bytes()).hexdigest()
-    arguments = ["--repo-root", str(repo), "--finalize-result", "--result-file", str(report),
+    arguments = ["--repo-root", str(requested), "--finalize-result", "--result-file", str(report),
                  "--task-temp-root", str(task), "--expected-commit", prepared.commit,
                  "--verified-result-sha256", digest]
 

@@ -192,8 +192,11 @@ def test_promote_repository_runs_explicit_operation_ids_in_order(
         assert not log.exists()
         return
     assert promoted.returncode == 0, promoted.stderr
-    result = json.loads(promoted.stdout)
-    assert json.loads(result_file.read_text(encoding="utf-8")) == result
+    summary = json.loads(promoted.stdout)
+    result = json.loads(result_file.read_text(encoding="utf-8"))
+    assert summary["status"] == result["status"]
+    assert summary["result_file"] == str(result_file)
+    assert summary["result_sha256"] == hashlib.sha256(result_file.read_bytes()).hexdigest()
     assert set(result["timings_seconds"]) == {"validation", "deployment", "total"}
     assert all(
         0 <= value <= result["timings_seconds"]["total"]

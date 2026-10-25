@@ -253,6 +253,14 @@ Lifecycle helpers suppress successful subcommand output and return `OK` or
 compact structured results. This repo keeps scripts only where they add
 reusable safety logic or bundle nontrivial evidence collection.
 
+With promotion's `--result-file`, the complete outcome stays in the selected
+task-temp report; command output contains its status, target, report path and
+SHA-256. If recording fails, command output preserves the complete outcome.
+Per-check test-selection records stay in captured diagnostics while live
+progress remains visible. Result cleanup accepts primary checkout, linked
+worktree and source subdirectory paths, checks receipt ownership against the
+primary checkout, and removes only the selected report without replaying work.
+
 New shipping PRs use non-merge commit subjects from the base-to-head range for
 their title, shortened to 120 characters, and all those commit messages for
 their description. Both direct shipping and promotion with
