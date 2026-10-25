@@ -25,6 +25,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
+import retain_artifact_versions
 import sdlc_results
 from sdlc_results import StepResultError
 
@@ -1208,7 +1209,7 @@ def _completed_artifact_outputs(
 ) -> list[_CompletedArtifactOutput]:
     outputs: list[_CompletedArtifactOutput] = []
     for unit_path in store.iterdir():
-        if unit_path.name.startswith("."):
+        if unit_path.name.startswith(".") or unit_path.name == "beta-stable":
             continue
         if not unit_path.is_dir() or unit_path.is_symlink():
             raise OperationError("Artifact store contains an invalid release unit.")
@@ -1216,12 +1217,16 @@ def _completed_artifact_outputs(
             unit_path.name, label="stored release unit", pattern=RELEASE_UNIT_RE
         )
         for version_path in unit_path.iterdir():
+            if version_path.name.startswith("."):
+                continue
             if not version_path.is_dir() or version_path.is_symlink():
                 raise OperationError("Artifact store contains an invalid version.")
             version, _version_class = _version_classification(version_path.name)
             # Requests and missing tags protect unfinished and uncertain bytes.
             # A tag is permanent even when retention removes the package bytes.
             if (version_path / "build_request.json").exists() or not _artifact_tag_exists(repo_root, unit, version):
+                continue
+            if (version_path / retain_artifact_versions.OWNER_FILE).exists():
                 continue
             direct_receipt = version_path / "artifact-receipt.json"
             if direct_receipt.exists() or direct_receipt.is_symlink():
@@ -1252,6 +1257,8 @@ def _completed_artifact_outputs(
                 target = _require_identifier(
                     target_path.name, label="stored target", pattern=LOGICAL_ID_RE
                 )
+                if (target_path / retain_artifact_versions.OWNER_FILE).exists():
+                    continue
                 receipt_path = target_path / "artifact-receipt.json"
                 if not receipt_path.exists() or receipt_path.is_symlink():
                     raise OperationError("Targeted artifact output has no receipt.")
@@ -1353,3 +1360,36 @@ def measure_versioned_artifact(
         raise OperationError("Artifact filename must contain the full version.")
     measured["root"] = "store"
     return measured
+
+
+def retain_completed_artifacts(
+    repo_root: pathlib.Path,
+    *,
+    unit: str,
+    target: str,
+    pool: str,
+    worktree: str = "",
+    approved: retain_artifact_versions.RetentionVersion | None = None,
+    deployments: Sequence[retain_artifact_versions.RetentionVersion] = (),
+    file_use: retain_artifact_versions.FileUse | None = None,
+    release_replacement: retain_artifact_versions.RetentionVersion | None = None,
+) -> retain_artifact_versions.RetentionResult:
+    """Apply 4F to the named store group, never discover other owners/results.
+
+    Build/install/promotion callers connect their authoritative records in their
+    adoption steps. The directory allocation and existing unconnected v2 route
+    are unchanged. Only selection/deletion holds the store's cleanup lock.
+    """
+    if pool not in {"worktree", "beta-stable"}:
+        raise OperationError("Installation destinations belong to their installer.")
+    store, lock_path = _artifact_infrastructure(repo_root)
+    scope = retain_artifact_versions.RetentionScope(store, unit, target, pool, worktree)
+    if release_replacement is not None:
+        current = _git_text(repo_root, ["rev-parse", "refs/heads/release/local"], label="release branch")
+        if current != release_replacement.build.final_commit:
+            raise OperationError("Release does not select the retained replacement commit.")
+    return retain_artifact_versions.retain_artifact_versions(
+        scope, approved=approved, deployments=deployments, file_use=file_use,
+        protection=lambda: _locked_artifact_store(lock_path),
+        release_replacement=release_replacement,
+    )

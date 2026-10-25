@@ -230,8 +230,8 @@ def test_promote_repository_runs_explicit_operation_ids_in_order(
             }
         ]
 
-    # Above, the caller checked the producer schema, success status and all
-    # required fields. Finalization binds that validation to these saved bytes.
+    # The digest selects the saved bytes for cleanup. The cleanup command
+    # checks their completion fields without replaying deployment.
     data = result_file.read_bytes()
     digest = hashlib.sha256(data).hexdigest()
     assert digest.upper() != digest
@@ -274,8 +274,8 @@ def test_promote_repository_runs_explicit_operation_ids_in_order(
 
     rejected(["--expected-commit", "0" * 40], "expected-commit")
     rejected(["--expected-commit", "HEAD"], "full expected-commit")
-    rejected(["--verified-result-sha256", "0" * 64], "changed since")
-    rejected(["--verified-result-sha256", ""], "validating every producer receipt")
+    rejected(["--verified-result-sha256", "0" * 64], "does not match the supplied digest")
+    rejected(["--verified-result-sha256", ""], "exact completed report")
     rejected(["--promotion-only"], "Promotion-only result is incomplete")
     rejected(
         ["--run-operation", "deliverables.apps.sample.actions.install"],
@@ -286,7 +286,7 @@ def test_promote_repository_runs_explicit_operation_ids_in_order(
     # Even an acknowledged file must describe a complete deployment. These
     # variations supply its new digest, so rejection exercises result semantics.
     variations: list[tuple[list[str | int], object, str]] = [
-        (["status"], "error", "successful promote-and-deploy"),
+        (["status"], "error", "missing or incomplete"),
         (["operations"], None, "missing or incomplete"),
         (["operations", "status"], "operation_failed", "missing or incomplete"),
         (["operations", "pending_operations"], ["pending"], "missing or incomplete"),
@@ -406,7 +406,7 @@ def test_promote_repository_runs_explicit_operation_ids_in_order(
     )
     changed = task_temp / "changed-result.json"
     changed.write_bytes(data + b"\n")
-    rejected(["--result-file", str(changed)], "changed since", changed)
+    rejected(["--result-file", str(changed)], "does not match the supplied digest", changed)
     outside = tmp_path / "outside-result.json"
     outside.write_bytes(data)
     rejected(["--result-file", str(outside)], "inside task-temp-root", outside)

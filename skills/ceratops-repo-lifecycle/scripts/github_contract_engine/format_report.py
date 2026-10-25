@@ -150,9 +150,39 @@ def write_json(payload: dict[str, Any], *, compact: bool = False) -> None:
     sys.stdout.write("\n")
 
 
+def _compact_codeql_alert(value: Any) -> Any:
+    """Keep an alert actionable without copying rule help or entire API objects.
+
+    The full report retains the original evidence. This projection belongs only
+    to summary samples and must not change alert counts or contract decisions.
+    """
+    if not isinstance(value, dict) or not isinstance(value.get("rule"), dict):
+        return value
+    instance = value.get("most_recent_instance")
+    if not isinstance(instance, dict):
+        return value
+    rule = value["rule"]
+    location = instance.get("location") or {}
+    message = instance.get("message") or {}
+    return {
+        "number": value.get("number"),
+        "rule": rule.get("id"),
+        "severity": rule.get("security_severity_level") or rule.get("severity"),
+        "state": value.get("state"),
+        "path": location.get("path"),
+        "line": location.get("start_line"),
+        "message": str(message.get("text", ""))[:300],
+        "commit": instance.get("commit_sha"),
+        "url": value.get("html_url"),
+    }
+
+
 def _compact(value: Any, limit: int = 5) -> Any:
     if isinstance(value, list):
-        return {"count": len(value), "sample": value[:limit]}
+        return {
+            "count": len(value),
+            "sample": [_compact_codeql_alert(item) for item in value[:limit]],
+        }
     if isinstance(value, dict) and len(json.dumps(value, default=str)) > 1000:
         keys = sorted(value)
         return {"keys": keys, "sample": {key: value[key] for key in keys[:limit]}}

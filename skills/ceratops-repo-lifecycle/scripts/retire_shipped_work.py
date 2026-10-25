@@ -210,6 +210,36 @@ def _record_selects_worktree(record: Any, selected: pathlib.Path | None) -> bool
     return isinstance(path, str) and _path_key(path) == _path_key(str(selected))
 
 
+def select_preserved_worktrees(
+    repo_root: pathlib.Path, paths: tuple[pathlib.Path, ...],
+) -> list[dict[str, str]]:
+    """Bind explicit retention to registered task worktrees in this repository.
+
+    No thread catalog is changed. This invocation's paths protect the worktree,
+    branch and matching task files; callers repeat them on fresh invocations.
+    """
+    if not paths:
+        return []
+    repo = _primary(repo_root)
+    root = (repo.parent / "worktrees" / repo.name).absolute()
+    if root != root.resolve():
+        raise CleanupError("Worktree cleanup root contains a link or redirected path.")
+    records = {_path_key(item["worktree"]): item for item in _worktrees(repo)}
+    result: dict[str, dict[str, str]] = {}
+    for requested in paths:
+        path = _selected_worktree_path(root, requested)
+        assert path is not None
+        key = _path_key(str(path))
+        record = records.get(key)
+        if record is None:
+            raise CleanupError(f"Preserved worktree is not registered in this repository: {path}")
+        result[key] = {
+            "branch": record.get("branch", "").removeprefix("refs/heads/") or "(detached)",
+            "path": str(path), "reason": "explicitly_preserved_worktree",
+        }
+    return list(result.values())
+
+
 def plan_cleanup(
     repo_root: pathlib.Path,
     shipped_ref: str,
@@ -219,6 +249,7 @@ def plan_cleanup(
     codex_home: pathlib.Path | None = None,
     include_branch_only: bool = True,
     selected_worktree: pathlib.Path | None = None,
+    preserve_worktrees: tuple[pathlib.Path, ...] = (),
 ) -> dict[str, Any]:
     """Discover candidates from Git, independently of promotion scope records."""
     repo = _primary(repo_root.resolve(strict=True))
@@ -226,6 +257,9 @@ def plan_cleanup(
     if root != root.resolve():
         raise CleanupError("Worktree cleanup root contains a link or redirected path.")
     selected = _selected_worktree_path(root, selected_worktree)
+    preserved = {
+        _path_key(str(_selected_worktree_path(root, path))) for path in preserve_worktrees
+    }
     shipped = _git(repo, "rev-parse", "--verify", f"{shipped_ref}^{{commit}}")
     if not SHA.fullmatch(shipped):
         raise CleanupError("Shipped ref did not resolve to one full commit ID.")
@@ -254,6 +288,8 @@ def plan_cleanup(
         try:
             if branch in protected or path == repo:
                 reason = "protected_checkout_or_branch"
+            elif path is not None and _path_key(str(path)) in preserved:
+                reason = "explicitly_preserved_worktree"
             elif locked:
                 reason = "locked_worktree"
             elif path is not None:
@@ -624,6 +660,7 @@ def retire_shipped_work(
     codex_home: pathlib.Path | None = None,
     include_branch_only: bool = True,
     selected_worktree: pathlib.Path | None = None,
+    preserve_worktrees: tuple[pathlib.Path, ...] = (),
 ) -> dict[str, Any]:
     """Preview or remove eligible work, preserving unfinished removal evidence."""
     options: dict[str, Any] = {
@@ -632,6 +669,7 @@ def retire_shipped_work(
         "codex_home": codex_home,
         "include_branch_only": include_branch_only,
         "selected_worktree": selected_worktree,
+        "preserve_worktrees": preserve_worktrees,
     }
     plan = plan_cleanup(repo_root, shipped_ref, **options)
     if not apply:
@@ -670,6 +708,10 @@ def retire_shipped_work(
                 try:
                     record = json.loads(record_path.read_text(encoding="utf-8"))
                     if not _record_selects_worktree(record, selected):
+                        continue
+                    # Protection also applies to unfinished removal records.
+                    # Their debt remains until a later call releases the path.
+                    if any(_record_selects_worktree(record, path) for path in preserve_worktrees):
                         continue
                     if record_path.is_symlink() or not record_path.is_file():
                         raise CleanupError("Cleanup record is not a regular file.")
@@ -744,6 +786,7 @@ def finalize_shipping(
     current_branch: str,
     current_commit: str,
     codex_home: pathlib.Path | None = None,
+    preserve_worktrees: tuple[pathlib.Path, ...] = (),
 ) -> dict[str, Any]:
     """Consume selected-scope checks and then sweep all eligible shipped work."""
     repo = _primary(repo_root)
@@ -757,8 +800,16 @@ def finalize_shipping(
     if _git(repo, "status", "--porcelain=v1", "--untracked-files=all"):
         raise CleanupError("Primary checkout is dirty after synchronization.")
     manager = _scope_manager()
+    root = (repo.parent / "worktrees" / repo.name).absolute()
+    if root != root.resolve():
+        raise CleanupError("Worktree cleanup root contains a link or redirected path.")
+    preserved = {
+        _path_key(str(_selected_worktree_path(root, path))) for path in preserve_worktrees
+    }
 
     def retention_reason(branch: str, worktree: pathlib.Path | None) -> str | None:
+        if worktree is not None and _path_key(str(worktree)) in preserved:
+            return "explicitly_preserved_worktree"
         if branch in {"main", "master", "release/local", target_branch, current_branch}:
             return "protected_checkout_or_branch"
         if worktree is not None and any(
@@ -802,6 +853,7 @@ def finalize_shipping(
         apply=True,
         protected_branches=(target_branch, current_branch),
         codex_home=codex_home,
+        preserve_worktrees=preserve_worktrees,
     )
     return {
         **selected,
@@ -841,6 +893,10 @@ def main(argv: list[str] | None = None) -> int:
     for name in ("target-branch", "target-commit", "current-branch", "current-commit"):
         finalize.add_argument(f"--{name}", required=True)
     for command in (cleanup, finalize):
+        command.add_argument(
+            "--preserve-worktree", type=pathlib.Path, action="append", default=[],
+            help="Keep this canonical task worktree, its branch and matching task files; repeat as needed.",
+        )
         command.add_argument("--codex-home", type=pathlib.Path)
         command.add_argument("--report", type=pathlib.Path)
     args = parser.parse_args(argv)
@@ -854,6 +910,7 @@ def main(argv: list[str] | None = None) -> int:
                 current_branch=args.current_branch,
                 current_commit=args.current_commit,
                 codex_home=args.codex_home,
+                preserve_worktrees=tuple(args.preserve_worktree),
             )
         else:
             result = retire_shipped_work(
@@ -865,6 +922,7 @@ def main(argv: list[str] | None = None) -> int:
                 codex_home=args.codex_home,
                 include_branch_only=not args.worktrees_only,
                 selected_worktree=args.worktree,
+                preserve_worktrees=tuple(args.preserve_worktree),
             )
         if args.report:
             args.report.write_text(

@@ -14,10 +14,10 @@ import pathlib
 import re
 import shutil
 import sys
+import tomllib
 from collections.abc import Callable, Mapping
 from typing import Any
 
-import tomllib
 from ceratops_repo_compatibility_engine.sdlc_contract_validation import MCP_NAME
 from github_pr_workflow.command import (
     release_lock_module,
@@ -454,8 +454,7 @@ def execute_handoff(
                 if outcome == "OK":
                     code, stdout, stderr = 0, "OK", ""
                 elif isinstance(outcome, dict):
-                    failed_cleanup = outcome.get("promotion_cleanup", {}).get("status") == "failed"
-                    code = 0 if outcome.get("status") in {"completed", "no_op"} and not failed_cleanup else 1
+                    code = 0 if outcome.get("status") in {"completed", "no_op"} else 1
                     stdout, stderr = json.dumps(outcome), ""
                     captured = {"result": outcome} if "schema" in outcome else {}
                 else:
