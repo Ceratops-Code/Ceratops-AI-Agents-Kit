@@ -31,6 +31,8 @@ from tests.support.repositories import run_ci_action
     ("conditional", False), ("matrix", True), ("unknown-matrix", False),
     ("malformed", False), ("range", False), ("other-publisher", False),
     ("guarded-install", False), ("same-line", True), ("malformed-job", False),
+    ("shell-conditional-downgrade", False), ("shell-multiline-upgrade", False),
+    ("shell-conditional-restored", True),
     ("interrupted-read", True),
 ])
 def test_npm_runtime_contract_uses_each_publishing_environment(
@@ -75,6 +77,12 @@ def test_npm_runtime_contract_uses_each_publishing_environment(
         steps[1]["run"] = "false && npm install -g npm@11.5.1; npm publish"
     elif scenario == "same-line":
         steps[1]["run"] = "npm install -g npm@11.5.1 && npm publish"
+    elif scenario in ("shell-conditional-downgrade", "shell-conditional-restored"):
+        steps.insert(2, {"run": "if true; then npm install -g npm@9; fi"})
+        if scenario == "shell-conditional-restored":
+            steps.insert(3, {"run": "npm install -g npm@11.5.1"})
+    elif scenario == "shell-multiline-upgrade":
+        steps[1]["run"] = "if false; then\n  npm install -g npm@11.5.1\nfi"
     elif scenario == "malformed-job":
         jobs["unresolved"] = {"steps": {"run": "npm publish"}}
     workflows = tmp_path / ".github/workflows"

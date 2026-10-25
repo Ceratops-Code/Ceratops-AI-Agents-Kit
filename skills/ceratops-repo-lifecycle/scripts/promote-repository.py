@@ -986,13 +986,17 @@ def _completed_shipping(
         git_branches._git(repo_root, "remote", "get-url", "origin"), cwd=repo_root,
     ).strip())
     synchronized = result.get("synchronized_head")
+    merged = result.get("merge_commit")
+    # Synchronization may include another PR merged after this one. Each identity
+    # retains its producer meaning; operation receipts bind to synchronized_head.
     if (
         result.get("commit") != commit
         or not isinstance(result.get("repository"), str)
         or remote is None or result["repository"].lower() != remote.lower()
         or not isinstance(synchronized, str)
         or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", synchronized)
-        or result.get("merge_commit") != synchronized
+        or not isinstance(merged, str)
+        or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", merged)
         or type(result.get("pr")) is not int or result["pr"] <= 0
     ):
         raise PromotionError("Shipping result identity does not match finalization inputs.")
@@ -1128,7 +1132,7 @@ def finalize_result(args: argparse.Namespace) -> None:
     result = json.loads(data, object_pairs_hook=_unique_result_object)
     if args.promotion_only:
         _completed_promotion_only(result, args.expected_commit, args.release_branch)
-    elif isinstance(result, dict) and result.get("status") == "shipped":
+    elif isinstance(result, dict) and result.get("status") in {"shipped", "already_shipped"}:
         _completed_shipping(result, args.expected_commit, repo_root, args.release_branch)
     else:
         _completed_deployment(

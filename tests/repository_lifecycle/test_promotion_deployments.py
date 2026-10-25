@@ -426,7 +426,8 @@ def test_promote_and_deploy_rejects_operation_created_repository_work(
 @pytest.mark.parametrize("entrypoint", ["callable", "cli"])
 @pytest.mark.parametrize("effect", ["record", "delete"])
 @pytest.mark.parametrize("after", [False, True])
-@pytest.mark.parametrize("result_kind", ["deployment", "shipping-empty", "shipping-install", "shipping-no-op", "shipping-publication"])
+@pytest.mark.parametrize("result_kind", ["deployment", "shipping-empty", "shipping-install", "shipping-no-op",
+                                       "shipping-publication", "shipping-recovered", "shipping-advanced"])
 def test_repo_owns_installation_result_recording_and_cleanup(
     tmp_path, monkeypatch, capsys, entrypoint, effect, after, result_kind,
 ):
@@ -459,10 +460,17 @@ def test_repo_owns_installation_result_recording_and_cleanup(
     if result_kind.startswith("shipping"):
         assert run_git(repo, "remote", "add", "origin", "https://github.com/owner/repo.git").returncode == 0
         empty = {"status": "completed", "completed_operations": [], "pending_operations": [], "results": []}
+        synchronized = prepared.commit
+        if result_kind == "shipping-advanced":
+            assert run_git(repo, "commit", "--allow-empty", "-m", "Concurrent merge").returncode == 0
+            synchronized = run_git(repo, "rev-parse", "HEAD").stdout.strip()
+            assert synchronized != prepared.commit
         result = {
-            "status": "shipped", "repository": "owner/repo", "commit": prepared.commit,
-            "pr": 1, "merge_commit": prepared.commit, "synchronized_head": prepared.commit,
-            "release_publication": empty, "deployment": result["operations"] if result_kind == "shipping-install" else empty,
+            "status": "already_shipped" if result_kind == "shipping-recovered" else "shipped",
+            "repository": "owner/repo", "commit": prepared.commit,
+            "pr": 1, "merge_commit": prepared.commit, "synchronized_head": synchronized,
+            "release_publication": empty,
+            "deployment": result["operations"] if result_kind in ("shipping-install", "shipping-recovered") else empty,
             "finalization": {"status": "finalized"},
         }
         if result_kind == "shipping-no-op":
@@ -583,7 +591,7 @@ def test_repo_cleanup_keeps_unfinished_installation_report(tmp_path, monkeypatch
     assert len((repo / "calls.jsonl").read_text().splitlines()) == 1
 
 
-@pytest.mark.parametrize("fault", ["wrong-repo", "wrong-commit", "missing-merge", "pending-publication",
+@pytest.mark.parametrize("fault", ["wrong-repo", "wrong-commit", "missing-merge", "invalid-merge", "pending-publication",
                                   "pending-deployment", "unfinished-finalization", "cleanup-error",
                                   "wrong-operation", "invalid-noop"])
 def test_repo_cleanup_retains_mismatched_or_incomplete_shipping_results(tmp_path, monkeypatch, fault):
@@ -604,6 +612,8 @@ def test_repo_cleanup_retains_mismatched_or_incomplete_shipping_results(tmp_path
         result["commit"] = "b" * 40
     elif fault == "missing-merge":
         result["merge_commit"] = None
+    elif fault == "invalid-merge":
+        result["merge_commit"] = "not-a-commit"
     elif fault.startswith("pending-"):
         result["release_publication" if fault.endswith("publication") else "deployment"]["pending_operations"] = ["pending"]
     elif fault == "unfinished-finalization":

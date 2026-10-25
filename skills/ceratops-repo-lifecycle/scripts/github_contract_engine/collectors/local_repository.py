@@ -745,6 +745,9 @@ def _npm_publishing_runtimes(workflows: dict[str, str]) -> dict[str, Any]:
                 script = step.get("run", "")
                 if not isinstance(script, str):
                     continue
+                shell_controlled = bool(re.search(
+                    r"(?:^|[;\n])\s*(?:if|then|elif|else|case|for|while|until)\b", script,
+                ))
                 for line in script.splitlines():
                     if not line.strip() or line.lstrip().startswith("#"):
                         continue
@@ -757,13 +760,19 @@ def _npm_publishing_runtimes(workflows: dict[str, str]) -> dict[str, Any]:
                             continue
                         if not tokens:
                             continue
-                        if (len(tokens) > 2 and tokens[0] in ("npm", "npm.cmd")
-                                and tokens[1] in ("install", "i", "add")
-                                and any(flag in tokens[2:] for flag in ("-g", "--global"))):
-                            package = next((item for item in tokens[2:]
+                        install_index = next((position for position, token in enumerate(tokens)
+                                              if token in ("npm", "npm.cmd")
+                                              and tokens[position + 1:position + 2] in (["install"], ["i"], ["add"])), None)
+                        if (install_index is not None
+                                and any(flag in tokens[install_index + 2:] for flag in ("-g", "--global"))):
+                            package = next((item for item in tokens[install_index + 2:]
                                             if item == "npm" or item.startswith("npm@")), None)
                             if package is not None:
-                                selected = declared_versions(package.partition("@")[2] or None, job)
+                                # shlex does not execute shell control flow or wrappers.
+                                # An unresolved installation must clear earlier evidence;
+                                # a later direct run step can establish it again.
+                                selected = (["unknown"] if install_index or shell_controlled else
+                                            declared_versions(package.partition("@")[2] or None, job))
                                 uncertain = conditional or "|" in line or (command_index > 0 and "&&" in line)
                                 npm = list(dict.fromkeys([*npm, *selected])) if uncertain else selected
                         if not publish.search(" ".join(tokens)):
