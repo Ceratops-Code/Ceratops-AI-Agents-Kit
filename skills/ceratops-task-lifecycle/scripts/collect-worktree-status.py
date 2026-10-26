@@ -726,6 +726,7 @@ def active_task(worktree: str, evidence: dict[str, Any]) -> dict[str, Any]:
         return {"status": "Unverified", "candidates": [], "reason": "branch_has_no_worktree"}
     candidates = [task for task in evidence["tasks"] if task["cwd"] == path_key(worktree)]
     active = [task for task in candidates if not task["archived"]]
+    reason: str | None
     if any(task["id"] in evidence.get("conflicting_ids", []) for task in active):
         status, reason = "Unverified", "conflicting_task_identity"
     elif active:

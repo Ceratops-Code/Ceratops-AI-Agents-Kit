@@ -6,6 +6,7 @@ import os
 import pathlib
 import subprocess
 import sys
+from typing import Any
 
 import pytest
 
@@ -226,7 +227,7 @@ def test_closure_snapshot_composes_only_named_local_state(
     assert "must be provided together" in invalid.stderr
 
 
-def codex_task_pages_fixture(tasks: dict[str, object]) -> dict[str, object]:
+def codex_task_pages_fixture(tasks: dict[str, Any]) -> dict[str, Any]:
     """Build explicit Codex API page evidence for offline report fixtures."""
 
     return {
