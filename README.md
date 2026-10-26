@@ -1561,18 +1561,39 @@ uses complete-tree staging and rollback. Metadata-only staging folders use the
 same ownership and crash recovery as payload stages; their pending manifest file
 is removed with the stage after success or on the next matching fresh call.
 
+Both installers freeze source before rendering. Runtime manifests record the
+repository identity, primary checkout path, full Git commit when present, and
+relative skill path. Each skill owns a compressed `.source-<sha256>.zip` with
+the exact source inputs, including dirty or unpacked sources. Git supplies clean
+commits directly; dirty snapshots include tracked and nonignored working files.
+The manifest records the archive digest and whether local changes were present.
+Source history changes publish the immutable archive before switching the
+manifest, preserving open skill directories and the previous source identity
+if publication is interrupted. Startup and successful activation retain the
+current archive and at most two predecessors per installed skill.
+
+`retain_skill_sources.py` owns managed source snapshots. Disposable views live
+under `<repo-parent>/tmp/<repo-name>/<task>`; OS locks protect active workers,
+and fresh calls remove inactive views in that task group. Bootstrap views stay
+inside its reserved staging tree. Review packets own a source view beside the
+packet, `.<packet-name>.source`, until their `--cleanup-output <packet>` call.
+Audits use retained bytes even after a checkout disappears; a missing clean
+archive can be reconstructed from its exact commit in the explicitly selected
+checkout. Dirty source needs its archive. Earlier installations without source
+evidence need redeployment if their recorded checkout is gone.
+
 For another Ceratops-compatible repo, run its versioned repository installer:
 
 ```powershell
 uv run --locked <target-repo>/scripts/deploy-skills.py --repo-root <target-repo>
 ```
 
-An external repository's standalone installer is independent: it uses only the
-Python standard library, reads declared skills, resolves shared sections and
-payloads, and overlays the requested output under the install root. It retains
-destination-only files and other skills. It does not locate or run Ceratops,
-validate skill or repository content, negotiate compatibility, or fall back
-after an error.
+An external repository's standalone installer is independent: it uses the
+repository's locked scripts environment, reads declared skills, resolves shared
+sections and payloads, and overlays the requested output under the install root.
+It retains destination-only files and other skills. It does not locate or run
+Ceratops, validate skill or repository content, negotiate compatibility, or fall
+back after an error.
 
 For report-only global routing, the runtime installer can write direct managed
 manifest entries and malformed-entry blockers without comparing runtime files

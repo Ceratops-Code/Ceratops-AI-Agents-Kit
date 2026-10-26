@@ -83,6 +83,23 @@ policy: the environment owner keeps the selected version and two predecessors,
 preserving versions referenced by installed manifests or running interpreters.
 Its foreground commands use the same command-stop tracking as the installer.
 
+`retain_skill_sources.py` owns the source evidence coupled to each installed
+skill. A manifest names the primary repository, exact commit when available,
+relative skill path, dirty flag and digest-addressed source ZIP. Installation
+checks and rendering consume one frozen view. Clean commits come from Git;
+dirty and unpacked inputs retain their actual bytes. A source-only change
+publishes the immutable ZIP before atomically changing the manifest, leaving
+the watched skill directory in place and preserving the previous identity on
+interruption. Each installed skill retains its current archive and at most two
+predecessors; startup and successful activation prune older owned archives.
+
+Managed source views belong to the task's repository temp group and use OS
+locks for live ownership. Fresh calls remove abandoned views only in that
+group. Independent bootstraps retain their views inside reserved staging.
+Review views belong to one caller-selected packet and survive until its public
+cleanup call. Review resolves the retained ZIP, or an exact clean commit when
+the ZIP is missing, without substituting the selected branch's current tip.
+
 One environment does not need both requirements files and a pyproject dependency
 list. The thread selected pyproject plus its lockfile and removal of the root
 requirements files. In Ceratops-AI-Agents-Kit, `scripts/pyproject.toml` owns both

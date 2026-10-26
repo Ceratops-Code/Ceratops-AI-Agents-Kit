@@ -117,7 +117,8 @@
     },
     "skill-lifecycle": {
       "pytest": [
-        "tests/skill_lifecycle/test_runtime_transactions.py"
+        "tests/skill_lifecycle/test_runtime_transactions.py",
+        "tests/skill_lifecycle/test_source_provenance.py"
       ],
       "depends_on": [],
       "packages": [
