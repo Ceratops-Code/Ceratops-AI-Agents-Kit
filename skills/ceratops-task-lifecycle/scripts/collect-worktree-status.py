@@ -2,11 +2,12 @@
 """Collect a batch of worktree tables using Git and supported task-list evidence.
 
 The request selects roots, comparison refs, and each repository's fetch gate.
-Task evidence is one fresh list_threads response, optionally in its MCP content
-envelope. Only exact local cwd matches prove ownership; incomplete sources and
-ambiguous matches remain explicit. No private app storage is read.
+Task evidence comes from the local Codex app-server's paginated, unarchived
+thread listing. Runtime status never changes membership. Exact local cwd matches
+bind every existing chat; source failures stay explicit. No private app storage
+is read. An optional evidence file supplies the same protocol pages offline.
 
-The caller owns both inputs. This producer owns the selected output and fixed
+The caller owns its inputs. This producer owns the selected output and fixed
 .pending/.lock companions: one current report, no history or recovery progress.
 An output lock protects orphan cleanup and atomic replacement. A fresh run always
 collects current inputs, never resumes an interrupted collection. Fetch is the
@@ -21,8 +22,14 @@ import html
 import json
 import os
 import pathlib
+import queue
+import re
+import shutil
 import subprocess
 import sys
+import threading
+import time
+from collections import deque
 from typing import Any
 
 from filelock import FileLock, Timeout
@@ -31,7 +38,10 @@ SCHEMA = "ceratops-worktree-status-report.v1"
 REQUEST_SCHEMA = "ceratops-worktree-status-request.v1"
 LIST_LIMIT = 20
 PATCH_LIMIT = 16000
-TASK_LIMIT = 50
+TASK_SCHEMA = "ceratops-unarchived-codex-tasks.v1"
+# Include user chats from the desktop, CLI, and app-server clients, excluding
+# internal command/guardian/subagent runs. Runtime status is never a filter.
+CODEX_THREAD_SOURCES = ("cli", "vscode", "appServer")
 # Remove inherited checkout/object redirects, not remote authentication or
 # transport configuration required by an explicitly authorized fetch.
 GIT_REPOSITORY_ENV = frozenset({
@@ -507,47 +517,181 @@ def read_request(path: pathlib.Path) -> list[Any]:
     return selections
 
 
-def task_evidence(path: pathlib.Path) -> dict[str, Any]:
-    """Retain task-source failures and coverage gaps instead of inventing owners."""
+def redact_diagnostic(value: str) -> str:
+    """Keep process failure context without common credential values."""
 
-    result: dict[str, Any] = {"source": str(path), "tasks": [], "gaps": []}
+    value = re.sub(r"(?i)(bearer\s+)[^\s\"'\\]+", r"\1<redacted>", value)
+    return re.sub(
+        r"(?i)((?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password)"
+        r"[\"']?\s*[:=]\s*[\"']?)[^\s\"'\\,;}]+",
+        r"\1<redacted>", value,
+    )
+
+
+def collect_codex_task_pages() -> dict[str, Any]:
+    """Read all unarchived local chats through the supported JSON-RPC API.
+
+    The short-lived child is a read-only metadata client, not the running
+    desktop process. Pipe readers bound retained diagnostics and let requests
+    time out on Windows. Every call starts at the first page; no cursor or
+    execution checkpoint survives. Only this invocation's child is stopped.
+    """
+
+    command = [shutil.which("codex") or "codex", "app-server", "--stdio"]
+    payload: dict[str, Any] = {"schema": TASK_SCHEMA, "archived": False, "pages": [], "errors": []}
+    process = None
+    messages: queue.Queue[str | None] = queue.Queue()
+    stdout_tail: deque[str] = deque(maxlen=8)
+    stderr_tail: deque[str] = deque(maxlen=32)
+    request_id = 0
+    operation = "initialize"
+
+    def read_stdout(stream) -> None:
+        for line in stream:
+            stdout_tail.append(line[-1000:])
+            messages.put(line)
+        messages.put(None)
+
+    def read_stderr(stream) -> None:
+        for line in stream:
+            stderr_tail.append(line[-1000:])
+
+    def send(value: dict[str, Any]) -> None:
+        assert process is not None and process.stdin is not None
+        process.stdin.write(json.dumps(value) + "\n")
+        process.stdin.flush()
+
+    def request(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        nonlocal request_id, operation
+        request_id += 1
+        operation = method
+        send({"id": request_id, "method": method, "params": params})
+        # Notifications cannot indefinitely extend the response deadline.
+        deadline = time.monotonic() + 30
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise SnapshotError(f"Codex {method} response timed out")
+            try:
+                line = messages.get(timeout=remaining)
+            except queue.Empty as exc:
+                raise SnapshotError(f"Codex {method} response timed out") from exc
+            if line is None:
+                raise SnapshotError(f"Codex exited during {method}")
+            message = json.loads(line)
+            if not isinstance(message, dict):
+                raise SnapshotError(f"Codex {method} returned an invalid message")
+            if message.get("id") != request_id:
+                continue
+            if "error" in message:
+                raise SnapshotError(f"Codex {method}: {json.dumps(message['error'])}")
+            result = message.get("result")
+            if not isinstance(result, dict):
+                raise SnapshotError(f"Codex {method} returned an invalid result")
+            return result
+
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(payload, dict) and "content" in payload:
-            if payload.get("isError"):
-                raise SnapshotError("task tool reported an error")
-            blocks = [
-                block["text"] for block in payload["content"]
-                if isinstance(block, dict) and block.get("type") == "text"
-            ]
-            if len(blocks) != 1:
-                raise SnapshotError("task tool must contain one JSON text response")
-            payload = json.loads(blocks[0])
-        if not isinstance(payload, dict) or not all(
-            isinstance(payload.get(key), list) for key in ("threads", "pinnedThreads")
-        ):
-            raise SnapshotError("task response requires threads and pinnedThreads arrays")
-        if len(payload["threads"]) >= TASK_LIMIT:
-            result["gaps"].append("task_list_may_be_truncated")
-        for key in ("unavailableHosts", "unavailableSources"):
-            unavailable = payload.get(key, [])
-            if not isinstance(unavailable, list):
-                raise SnapshotError(f"invalid task response field: {key}")
-            if unavailable:
-                result["gaps"].append(f"{key}: {json.dumps(unavailable, ensure_ascii=False)}")
+        process = subprocess.Popen(
+            command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        threading.Thread(target=read_stdout, args=(process.stdout,), daemon=True).start()
+        threading.Thread(target=read_stderr, args=(process.stderr,), daemon=True).start()
+        request("initialize", {"clientInfo": {"name": "ceratops_worktree_status", "version": "1.0.0"}})
+        send({"method": "initialized", "params": {}})
+        cursor = None
+        cursors: set[str] = set()
+        while True:
+            page = request("thread/list", {
+                "archived": False, "useStateDbOnly": True, "limit": 100,
+                "sourceKinds": list(CODEX_THREAD_SOURCES), "cursor": cursor,
+            })
+            if not isinstance(page.get("data"), list) or "nextCursor" not in page:
+                raise SnapshotError("Codex thread/list returned an invalid page")
+            payload["pages"].append(page)
+            cursor = page["nextCursor"]
+            if cursor is None:
+                break
+            if not isinstance(cursor, str) or not cursor or cursor in cursors:
+                raise SnapshotError("Codex thread/list returned a repeated or invalid cursor")
+            cursors.add(cursor)
+    except (OSError, ValueError, TypeError, SnapshotError) as exc:
+        payload["errors"].append({
+            "operation": operation, "target": "unarchived local Codex chats",
+            "command": command, "exit_code": process.poll() if process else None,
+            "error": redact_diagnostic(str(exc)),
+            "stdout": redact_diagnostic("".join(stdout_tail)) or "<absent>",
+            "stderr": redact_diagnostic("".join(stderr_tail)) or "<absent>",
+        })
+    finally:
+        if process is not None:
+            if process.stdin is not None:
+                try:
+                    process.stdin.close()
+                except OSError:
+                    pass  # Preserve the original protocol/process failure.
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.terminate()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=3)
+    return payload
+
+
+def task_evidence(path: pathlib.Path | None = None) -> dict[str, Any]:
+    """Keep unarchived Codex identities and explicit pagination/source gaps."""
+
+    result: dict[str, Any] = {
+        "source": str(path) if path else "local Codex app-server thread/list",
+        "tasks": [], "gaps": [], "conflicting_ids": [],
+    }
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8")) if path else collect_codex_task_pages()
+        if not isinstance(payload, dict) or payload.get("schema") != TASK_SCHEMA or payload.get("archived") is not False:
+            raise SnapshotError("task evidence requires unarchived Codex app-server pages")
+        result["diagnostics"] = payload.get("errors", [])
+        pages = payload.get("pages")
+        if not isinstance(pages, list) or not pages:
+            raise SnapshotError("Codex task pages are unavailable")
+        if result["diagnostics"]:
+            result["gaps"].append("codex_task_source_failed")
+        items = []
+        cursors: set[str] = set()
+        for index, page in enumerate(pages):
+            if not isinstance(page, dict) or not isinstance(page.get("data"), list) or "nextCursor" not in page:
+                raise SnapshotError("invalid Codex task page")
+            items.extend(page["data"])
+            cursor = page["nextCursor"]
+            if cursor is None and index != len(pages) - 1:
+                raise SnapshotError("Codex pages continue after the final page")
+            if cursor is not None:
+                if not isinstance(cursor, str) or not cursor or cursor in cursors:
+                    raise SnapshotError("invalid or repeated Codex task cursor")
+                cursors.add(cursor)
+        if pages[-1]["nextCursor"] is not None:
+            result["gaps"].append("codex_task_pages_incomplete")
         seen: dict[str, dict[str, Any]] = {}
-        for index, item in enumerate(payload["pinnedThreads"] + payload["threads"]):
+        for index, item in enumerate(items):
             if not isinstance(item, dict):
                 result["gaps"].append(f"invalid_task_record: {index}")
                 continue
             if item.get("kind") == "chatgpt":
                 continue
-            if item.get("kind") != "codex" or not isinstance(item.get("hostId"), str):
+            if item.get("kind", "codex") != "codex":
                 result["gaps"].append(f"task_kind_or_host_unavailable: {item.get('id', index)}")
                 continue
-            if item["hostId"] != "local":
+            if item.get("hostId", "local") != "local":
                 continue
-            if not all(isinstance(item.get(key), str) and item[key] for key in ("id", "title", "cwd")):
+            if item.get("source", "vscode") not in CODEX_THREAD_SOURCES:
+                continue
+            if item.get("archived") is True:
+                continue
+            if not all(isinstance(item.get(key), str) and item[key] for key in ("id", "cwd")):
                 result["gaps"].append(f"task_identity_or_cwd_unavailable: {item.get('id', index)}")
                 continue
             if not isinstance(item.get("archived", False), bool):
@@ -555,7 +699,8 @@ def task_evidence(path: pathlib.Path) -> dict[str, Any]:
                 continue
             try:
                 candidate = {
-                    "id": item["id"], "title": item["title"],
+                    "id": item["id"], "title": (item["name"] if isinstance(item.get("name"), str)
+                                                and item["name"] else "(title unavailable)"),
                     "cwd": path_key(item["cwd"]), "archived": item.get("archived", False),
                 }
             except (SnapshotError, OSError, RuntimeError) as exc:
@@ -565,6 +710,7 @@ def task_evidence(path: pathlib.Path) -> dict[str, Any]:
                 continue
             if candidate["id"] in seen:
                 result["gaps"].append(f"conflicting_task_identity: {candidate['id']}")
+                result["conflicting_ids"].append(candidate["id"])
             seen[candidate["id"]] = candidate
             result["tasks"].append(candidate)
     except (OSError, ValueError, TypeError, KeyError, SnapshotError) as exc:
@@ -580,12 +726,12 @@ def active_task(worktree: str, evidence: dict[str, Any]) -> dict[str, Any]:
         return {"status": "Unverified", "candidates": [], "reason": "branch_has_no_worktree"}
     candidates = [task for task in evidence["tasks"] if task["cwd"] == path_key(worktree)]
     active = [task for task in candidates if not task["archived"]]
-    if not evidence["complete"]:
+    if any(task["id"] in evidence.get("conflicting_ids", []) for task in active):
+        status, reason = "Unverified", "conflicting_task_identity"
+    elif active:
+        status, reason = "Active", None if evidence["complete"] else "task_source_incomplete"
+    elif not evidence["complete"]:
         status, reason = "Unverified", "task_source_incomplete"
-    elif len(active) > 1:
-        status, reason = "Unverified", "competing_active_tasks"
-    elif len(active) == 1:
-        status, reason = "Active", None
     else:
         status, reason = "None", None
     return {"status": status, "candidates": candidates, "reason": reason}
@@ -738,7 +884,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--request", required=True, type=pathlib.Path)
-    parser.add_argument("--task-evidence", required=True, type=pathlib.Path)
+    parser.add_argument("--task-evidence", type=pathlib.Path,
+                        help="Optional captured unarchived Codex API pages; otherwise collect live")
     parser.add_argument("--output", required=True, type=pathlib.Path)
     return parser
 
@@ -749,7 +896,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         selections = read_request(args.request)
-        inputs = (args.request, args.task_evidence)
+        inputs = (args.request,) + ((args.task_evidence,) if args.task_evidence else ())
         target = output_path(args.output, inputs)
         with FileLock(str(target) + ".lock", timeout=0):
             # Inspect again under the lock: an earlier writer may have finished.
