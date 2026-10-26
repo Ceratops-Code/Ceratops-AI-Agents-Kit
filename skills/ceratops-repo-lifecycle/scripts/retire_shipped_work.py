@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Retire clean shipped task work whose Codex threads are archived or absent.
+"""Retire clean shipped task work regardless of its threads' archive status.
 
 Git owns worktree registration and ref changes. Codex's existing state database
-is opened read-only; an unavailable database never establishes thread absence.
+is optional read-only metadata for exact task-temp ownership, never a removal
+gate. Missing thread metadata cannot prevent retirement of clean shipped work.
 The cleanup owner keeps one unfinished JSON record per exact path/ref below
 ``<git-common-dir>/codex/repository-lifecycle/shipped-cleanup``. Records disappear
 after removal; a reusable native lock serializes this owner's cleanup calls.
@@ -67,7 +68,7 @@ def _slug(value: str) -> str:
 
 
 class ThreadCatalog:
-    """Read current thread ownership; conservative hints also preserve old paths."""
+    """Read thread metadata without treating archive status as a cleanup gate."""
 
     def __init__(self, codex_home: pathlib.Path | None = None) -> None:
         home = (
@@ -102,11 +103,11 @@ class ThreadCatalog:
     def state(
         self, branch: str | None, worktree: pathlib.Path | None
     ) -> dict[str, Any]:
-        """Require every associated or potentially associated thread to be archived.
+        """Report archive metadata and capture exact owners for task-temp cleanup.
 
-        A matching directory leaf, branch, short UUID or task name is a retention
-        hint across moves/renames. It can retain extra work, never hide an active
-        thread behind a missing exact cwd. Multiple matching threads are all read.
+        Name, branch and short-ID hints describe possible associations only.
+        For worktrees, destructive temp ownership requires the marker ID or an
+        exact working-directory match; a similarly named chat owns no files here.
         """
         marker_id = (
             _paths["_worktree_thread_id"](worktree)
@@ -122,12 +123,17 @@ class ThreadCatalog:
         slugs = {_slug(name) for name in names}
         cwd = _path_key(str(worktree)) if worktree else None
         matched: list[tuple[Any, ...]] = []
+        owner_ids = {marker_id} if marker_id else set()
         for row in self.rows:
             thread_id, raw_cwd, _, recorded_branch, name = row
             recorded_cwd = _path_key(raw_cwd or "")
-            # Leaf-name ownership is a conservative retention hint, unlike the
-            # exact platform-aware path comparison used to select cleanup.
+            # Broad associations are observational, never deletion authority.
             leaf = recorded_cwd.rsplit("/", 1)[-1].casefold()
+            exact_owner = thread_id == marker_id or (
+                cwd is not None and recorded_cwd == cwd
+            )
+            if exact_owner:
+                owner_ids.add(thread_id)
             if (
                 thread_id == marker_id
                 or (cwd is not None and recorded_cwd == cwd)
@@ -144,7 +150,10 @@ class ThreadCatalog:
             if matched
             else "missing"
         )
-        return {"status": status, "ids": sorted(row[0] for row in matched)}
+        return {
+            "status": status,
+            "ids": sorted(owner_ids) if worktree else sorted(row[0] for row in matched),
+        }
 
 
 def _worktrees(repo: pathlib.Path) -> list[dict[str, str]]:
@@ -306,11 +315,10 @@ def plan_cleanup(
                 reason = "head_not_shipped"
             if reason is None:
                 if catalog is None:
-                    reason = "thread_state_unavailable"
+                    marker_id = _paths["_worktree_thread_id"](path) if path else None
+                    thread["ids"] = [marker_id] if marker_id else []
                 else:
                     thread = catalog.state(branch, path)
-                    if thread["status"] == "active":
-                        reason = "active_thread"
         except (OSError, CleanupError) as exc:
             reason = str(exc)
         candidates.append(
@@ -501,14 +509,13 @@ def _finish_record(
     repo: pathlib.Path,
     record_path: pathlib.Path,
     record: dict[str, Any],
-    codex_home: pathlib.Path | None,
     root: pathlib.Path,
     shipped: str,
     protected_branches: tuple[str, ...] = (),
     include_branch_only: bool = True,
     selected_worktree: pathlib.Path | None = None,
 ) -> None:
-    """Resume only an exact, still-inactive retirement recorded by this owner."""
+    """Finish an exact shipped target using current Git and directory identity."""
     required = {
         "version",
         "repo_root",
@@ -540,7 +547,7 @@ def _finish_record(
         or item["reason"] is not None
         or not isinstance(item["thread"], dict)
         or set(item["thread"]) != {"status", "ids"}
-        or item["thread"]["status"] not in {"archived", "missing"}
+        or item["thread"]["status"] not in {"active", "archived", "missing", "unavailable"}
         or not isinstance(item["thread"].get("ids"), list)
         or any(not isinstance(value, str) for value in item["thread"]["ids"])
         or (item["branch"] is not None and not isinstance(item["branch"], str))
@@ -581,13 +588,7 @@ def _finish_record(
         repo, item["head"], shipped
     ):
         raise CleanupError("Recorded head is outside its shipped commit.")
-    catalog = ThreadCatalog(codex_home)
     original_ids = set(item.get("thread", {}).get("ids", []))
-    if any(row[0] in original_ids and not row[2] for row in catalog.rows):
-        raise CleanupError("A recorded cleanup owner now has an active thread.")
-    thread = catalog.state(item["branch"], path)
-    if thread["status"] == "active":
-        raise CleanupError("A recorded cleanup target has an active thread.")
     registered = next(
         (
             value
@@ -636,7 +637,7 @@ def _finish_record(
         _paths["_remove_tree"](path)
     if path is not None:
         # Keep the existing removal record through temp failures. Its captured
-        # archived owners still identify UUID-named scratch after Git removal.
+        # exact owners still identify UUID-named scratch after Git removal.
         for thread_id in sorted(original_ids) or [None]:
             _paths["_remove_matching_task_temp_directories"](
                 repo,
@@ -719,7 +720,6 @@ def retire_shipped_work(
                         repo,
                         record_path,
                         record,
-                        codex_home,
                         pathlib.Path(plan["worktree_root"]),
                         plan["shipped_commit"],
                         protected_branches,
@@ -752,7 +752,6 @@ def retire_shipped_work(
                             repo,
                             record_path,
                             record,
-                            codex_home,
                             pathlib.Path(plan["worktree_root"]),
                             plan["shipped_commit"],
                             protected_branches,
@@ -823,11 +822,7 @@ def finalize_shipping(
             and worktree.parent != (repo.parent / "worktrees" / repo.name).resolve()
         ):
             return "outside_repository_worktree_root"
-        try:
-            state = ThreadCatalog(codex_home).state(branch, worktree)
-        except (OSError, CleanupError) as exc:
-            return str(exc)
-        return "active_thread" if state["status"] == "active" else None
+        return None
 
     selected: dict[str, Any] = {
         "status": "finalized",

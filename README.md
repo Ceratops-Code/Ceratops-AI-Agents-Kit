@@ -956,9 +956,10 @@ behavior remains unchanged.
 
 Ship cleanup discovers task worktrees and local `codex/` task branches across
 the repository, including older batches absent from the pending-work scope.
-Removal requires clean Git state including untracked files, the exact head
-included in the synchronized shipped commit, and associated Codex threads that
-are archived or absent. Active or uncertain owners and protected checkouts stay.
+Removal requires clean Git state including untracked files and the exact head
+included in the synchronized shipped commit. Thread archive status and catalog
+availability do not block removal. Dirty or unshipped work, locked or explicitly
+retained worktrees, and protected checkouts stay.
 Direct Ship and `--ship-after-promotion` accept repeatable
 `--preserve-worktree <absolute-task-worktree>` arguments for active manual
 worktrees missing from Codex's ownership catalog. Each path must be a registered
@@ -966,15 +967,18 @@ worktree in the selected repository's task root. This retains its branch and
 matching task files without changing thread records or weakening release checks.
 The same arguments are included in the returned rerun command; omit them when
 the task is finished and its shipped work can be retired.
-The repository lifecycle helper `retire_shipped_work.py` reads the existing Codex
-thread catalog without writing it, rechecks current removal conditions, and
-retains only unfinished removal records under
+The repository lifecycle helper `retire_shipped_work.py` optionally reads the
+existing Codex thread catalog without writing it, rechecks current Git and path
+conditions, and retains only unfinished removal records under
 `<common-git-dir>/codex/repository-lifecycle/shipped-cleanup/`. A persistent native
 lock serializes cleanup; successful removal deletes its record and atomic-write
 sibling. Recovery never repeats completed publication or deployment.
 Worktree removal also clears matching task directories under
-`<repo-parent>/tmp/<repo-name>` by exact worktree name or captured thread UUID.
-Unrelated task directories remain; a temp-removal failure keeps its removal
+`<repo-parent>/tmp/<repo-name>` by exact worktree name or a thread UUID proven by
+its worktree marker or exact recorded working directory. Broad name/branch hints
+never authorize deleting another thread's files. Missing metadata leaves
+unidentified thread-temp directories untouched. Unrelated task directories
+remain; a temp-removal failure keeps its removal
 record for the next cleanup attempt.
 Standalone `cleanup` accepts `--worktree <absolute-path>` to select one canonical
 task worktree and its associated branch. Preview, removal, unfinished-record

@@ -110,14 +110,14 @@ def threads(
     [
         ("archived", True),
         ("missing", True),
-        ("active", False),
+        ("active", True),
         ("tracked-edit", False),
         ("untracked", False),
         ("unshipped", False),
         ("locked", False),
         ("protected", False),
-        ("active-fork", False),
-        ("old-repository-path", False),
+        ("active-fork", True),
+        ("old-repository-path", True),
     ],
 )
 def test_repository_wide_cleanup_conditions(
@@ -181,7 +181,9 @@ def test_repository_wide_cleanup_conditions(
     assert worktree.exists() is not removed
     assert owned_temp[0].exists() is not removed
     for directory in owned_temp[1:]:
-        assert directory.exists() is not (removed and condition == "archived")
+        assert directory.exists() is not (
+            removed and condition in {"archived", "active", "active-fork"}
+        )
     assert other_temp.is_dir()
     assert (
         run_git(
@@ -194,6 +196,8 @@ def test_repository_wide_cleanup_conditions(
     assert not (
         repository / ".git" / "codex" / "repository-lifecycle" / "shipped-cleanup"
     ).exists()
+    repeated = cleanup.retire_shipped_work(repository, "main", apply=True, **options)
+    assert repeated["status"] == "completed" and not repeated["removed"]
 
 
 def test_detached_worktree_and_unchecked_task_branch(
@@ -350,16 +354,18 @@ def test_selected_worktree_preserves_unrelated_unfinished_removal(
         "record-retirement",
     ],
 )
+@pytest.mark.parametrize("archived", [0, 1])
 def test_selected_cleanup_converges_after_each_effect_interruption(
     cleanup: ModuleType,
     repository: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
     effect: str,
     when: str,
+    archived: int,
 ) -> None:
     selected = task(repository, "selected")
     other = task(repository, "other")
-    threads(cleanup, monkeypatch, [])
+    threads(cleanup, monkeypatch, [(THREAD, str(selected), archived, "codex/selected", "Selected")])
     git(repository, "branch", "codex/no-checkout")
     git(repository, "config", "branch.codex/selected.description", "completed task")
     temp = repository.parent / "tmp" / repository.name / selected.name
@@ -453,19 +459,29 @@ def test_selected_cleanup_converges_after_each_effect_interruption(
     )
 
 
-def test_missing_thread_database_preserves_work(
+@pytest.mark.parametrize("marker", [False, True])
+def test_missing_thread_database_does_not_block_shipped_work(
     cleanup: ModuleType,
     repository: pathlib.Path,
     tmp_path: pathlib.Path,
+    marker: bool,
 ) -> None:
     worktree = task(repository)
+    if marker:
+        (worktree / ".codex-thread").write_text(json.dumps({"id": THREAD}), encoding="utf-8")
+    temp = repository.parent / "tmp" / repository.name / THREAD
+    temp.mkdir(parents=True)
+    (temp / "scratch.txt").write_text("thread scratch\n", encoding="utf-8")
     home = tmp_path / "no-thread-database"
     result = cleanup.retire_shipped_work(
         repository, "main", apply=True, codex_home=home
     )
-    assert worktree.exists()
-    assert result["candidates"][0]["reason"] == "thread_state_unavailable"
+    assert result["status"] == "completed" and not worktree.exists()
+    assert temp.exists() is not marker
+    assert result["candidates"][0]["reason"] is None
     assert result["thread_state_error"]
+    repeated = cleanup.retire_shipped_work(repository, "main", apply=True, codex_home=home)
+    assert repeated["status"] == "completed" and not repeated["removed"]
 
 
 def test_thread_reader_opens_only_the_existing_database_read_only(
@@ -548,7 +564,7 @@ def test_cleanup_resumes_after_worktree_removal_without_repeating_it(
 
 
 @pytest.mark.parametrize("change", ["dirty", "active", "advanced"])
-def test_conditions_changed_after_recording_stop_deletion(
+def test_changed_git_state_blocks_cleanup_but_unarchiving_does_not(
     cleanup: ModuleType,
     repository: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -570,14 +586,15 @@ def test_conditions_changed_after_recording_stop_deletion(
 
     monkeypatch.setattr(cleanup, "_save_record", save_then_change)
     result = cleanup.retire_shipped_work(repository, "main", apply=True)
-    assert result["status"] == "blocked"
-    assert worktree.exists()
+    removed = change == "active"
+    assert result["status"] == ("completed" if removed else "blocked")
+    assert worktree.exists() is not removed
     assert (
         run_git(
             repository, "show-ref", "--verify", "--quiet", "refs/heads/codex/candidate"
         ).returncode
         == 0
-    )
+    ) is not removed
 
 
 def test_task_temp_failure_keeps_removal_record_for_resume(
@@ -838,6 +855,9 @@ def test_repository_cleanup_retires_only_its_exact_promotion_source(
     )
     scope = pathlib.Path(recorded["pending_work_scope"])
     before = json.loads(scope.read_text(encoding="utf-8"))
+    if other is not None:
+        # Unshipped work, rather than an unarchived chat, retains this source.
+        (other / "README.md").write_text("unfinished work\n", encoding="utf-8")
     if condition == "changed-head":
         (repository / "README.md").write_text(
             "later shipped commit\n", encoding="utf-8"
@@ -895,14 +915,17 @@ def test_repository_cleanup_retires_only_its_exact_promotion_source(
     [
         (False, "archived"),
         (True, "archived"),
+        (False, "active"),
         (True, "active"),
+        (False, "unavailable"),
+        (True, "unavailable"),
         (True, "locked"),
         (True, "stale-upstream"),
         (False, "explicit"),
         (True, "explicit"),
     ],
 )
-def test_ship_finalization_sweeps_older_batches_and_preserves_active_sources(
+def test_ship_finalization_removes_shipped_unarchived_worktrees(
     cleanup: ModuleType,
     repository: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -921,6 +944,10 @@ def test_ship_finalization_sweeps_older_batches_and_preserves_active_sources(
         )
     ]
     threads(cleanup, monkeypatch, rows)
+    if condition == "unavailable":
+        def unavailable(*args: Any, **kwargs: Any) -> Any:
+            raise cleanup.CleanupError("thread catalog unavailable")
+        monkeypatch.setattr(cleanup, "ThreadCatalog", unavailable)
     if condition == "explicit":
         threads(cleanup, monkeypatch, [])
     temp = repository.parent / "tmp" / repository.name / selected.name
@@ -965,7 +992,7 @@ def test_ship_finalization_sweeps_older_batches_and_preserves_active_sources(
     )
     assert result["status"] == "finalized"
     assert not older.exists()
-    assert selected.exists() is (condition in {"active", "locked", "explicit"})
+    assert selected.exists() is (condition in {"locked", "explicit"})
     assert temp.exists() is selected.exists()
     assert scope is None or not scope.exists()
     assert git(repository, "rev-parse", "release/local") == head
