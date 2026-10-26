@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib
 import json
 import pathlib
@@ -725,8 +726,12 @@ def test_promote_forwards_path_and_preserves_result_file(report_repo, monkeypatc
         "--repo-root", str(repo), "--source-branch", "feature", "--no-run-operation",
         "--diagnostic-output", str(path), "--result-file", str(result_path),
     ]) == 1
-    result = json.loads(capsys.readouterr().err)
-    assert json.loads(result_path.read_text()) == result
+    summary = json.loads(capsys.readouterr().err)
+    result = json.loads(result_path.read_text())
+    assert summary["status"] == result["status"] == "tests_failed"
+    assert summary["result_file"] == str(result_path)
+    assert summary["result_sha256"] == hashlib.sha256(result_path.read_bytes()).hexdigest()
+    assert result["diagnostic_output"] == str(path)
     assert result_path != path
 
 

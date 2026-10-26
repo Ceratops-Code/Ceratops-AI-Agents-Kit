@@ -3580,7 +3580,7 @@ def test_completed_handoff_record_survives_removed_result_directory(
         == 0
     )
     assert calls == ["completed"]
-    assert json.loads(result_file.read_text()) == json.loads(capsys.readouterr().out)
+    assert json.loads(result_file.read_text()) == result
     assert not list(result_file.parent.glob("*.tmp"))
 
 
