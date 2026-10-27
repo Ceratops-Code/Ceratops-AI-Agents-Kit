@@ -729,7 +729,7 @@ def test_repo_cleanup_retains_mismatched_or_incomplete_shipping_results(tmp_path
 
 @pytest.mark.parametrize("caller", ["primary", "worktree", "subdirectory"])
 @pytest.mark.parametrize("outcome", ["shipped", "failed", "interrupted"])
-def test_composed_shipping_preserves_its_live_workspace_and_task_files(tmp_path, monkeypatch, caller, outcome):
+def test_composed_shipping_preserves_caller_identity_at_delegation(tmp_path, monkeypatch, caller, outcome):
     repo, _head, _log, _environment = prepare_repository_lifecycle_repo(tmp_path)
     workspace = tmp_path / "worktrees" / repo.name / "active-task"
     assert run_git(repo, "worktree", "add", "-b", "active-task", str(workspace), "approved").returncode == 0
@@ -754,7 +754,7 @@ def test_composed_shipping_preserves_its_live_workspace_and_task_files(tmp_path,
         assert request.repo_root == repo
         assert request.commit == commit
         assert request.diagnostic_owner == (requested, "promote")
-        assert request.preserve_worktree == (None if caller == "primary" else [workspace])
+        assert not hasattr(request, "preserve_worktree")
         if outcome == "failed":
             raise owner.RepositoryShipError("remote gate refused")
         if outcome == "interrupted":

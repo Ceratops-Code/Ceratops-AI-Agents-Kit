@@ -921,8 +921,6 @@ def test_repository_cleanup_retires_only_its_exact_promotion_source(
         (True, "unavailable"),
         (True, "locked"),
         (True, "stale-upstream"),
-        (False, "explicit"),
-        (True, "explicit"),
     ],
 )
 def test_ship_finalization_removes_shipped_unarchived_worktrees(
@@ -948,8 +946,6 @@ def test_ship_finalization_removes_shipped_unarchived_worktrees(
         def unavailable(*args: Any, **kwargs: Any) -> Any:
             raise cleanup.CleanupError("thread catalog unavailable")
         monkeypatch.setattr(cleanup, "ThreadCatalog", unavailable)
-    if condition == "explicit":
-        threads(cleanup, monkeypatch, [])
     temp = repository.parent / "tmp" / repository.name / selected.name
     temp.mkdir(parents=True)
     (temp / "accepted-package.exe").write_bytes(b"accepted installer")
@@ -988,22 +984,13 @@ def test_ship_finalization_removes_shipped_unarchived_worktrees(
         target_commit=head,
         current_branch="main",
         current_commit=head,
-        preserve_worktrees=(selected,) if condition == "explicit" else (),
     )
     assert result["status"] == "finalized"
     assert not older.exists()
-    assert selected.exists() is (condition in {"locked", "explicit"})
+    assert selected.exists() is (condition == "locked")
     assert temp.exists() is selected.exists()
     assert scope is None or not scope.exists()
     assert git(repository, "rev-parse", "release/local") == head
-    if condition == "explicit":
-        repeated = cleanup.finalize_shipping(
-            repository, None, target_branch="release/local", target_commit=head,
-            current_branch="main", current_commit=head, preserve_worktrees=(selected,),
-        )
-        assert repeated["status"] == "finalized" and repeated["removed"] == []
-        assert git(selected, "branch", "--show-current") == "codex/selected"
-        assert (temp / "accepted-package.exe").read_bytes() == b"accepted installer"
 
 
 def test_ship_finalization_command_without_scope_calls_repository_cleanup(
@@ -1031,7 +1018,7 @@ def test_ship_finalization_command_without_scope_calls_repository_cleanup(
 
 
 @pytest.mark.parametrize("when", ["before", "after"])
-def test_explicit_retention_preserves_interrupted_cleanup_and_accepted_files(
+def test_cleanup_finishes_interrupted_removal_without_caller_exemptions(
     cleanup: ModuleType, repository: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
     when: str,
 ) -> None:
@@ -1054,39 +1041,44 @@ def test_explicit_retention_preserves_interrupted_cleanup_and_accepted_files(
         repository, "main", apply=True, selected_worktree=selected,
     )
     assert failed["status"] == "blocked"
+    assert selected.exists() and package.read_bytes() == b"accepted installer"
     monkeypatch.setattr(cleanup, "_save_record", original)
     for _ in range(2):
         result = cleanup.retire_shipped_work(
-            repository, "main", apply=True, preserve_worktrees=(selected,),
+            repository, "main", apply=True,
         )
         assert result["status"] == "completed"
-        candidate = next(item for item in result["candidates"] if item["path"] == str(selected))
-        assert candidate["reason"] == "explicitly_preserved_worktree"
-        assert git(selected, "branch", "--show-current") == "codex/selected"
-        assert package.read_bytes() == b"accepted installer"
-        assert not other.exists()
-    released = cleanup.retire_shipped_work(repository, "main", apply=True)
-    assert released["status"] == "completed"
-    assert not selected.exists() and not temp.exists()
+        assert not selected.exists() and not temp.exists() and not other.exists()
+        assert run_git(repository, "show-ref", "--verify", "refs/heads/codex/selected").returncode != 0
 
 
-@pytest.mark.parametrize("invalid", ["relative", "primary", "missing", "sibling"])
-def test_ship_explicit_retention_rejects_unbound_paths_before_remote_effects(
-    tmp_path: pathlib.Path, invalid: str,
+@pytest.mark.parametrize("entrypoint", ["ship", "promote", "cleanup", "finalize"])
+def test_cli_rejects_removed_worktree_retention_option_before_effects(
+    repository: pathlib.Path, entrypoint: str,
 ) -> None:
-    repo, loaded, args, log, state, _ = shipping_cases._setup(tmp_path)
-    path = {
-        "relative": pathlib.Path("selected"), "primary": repo,
-        "missing": repo.parent / "worktrees" / repo.name / "missing",
-        "sibling": repo.parent / "worktrees" / "other-repo" / "selected",
-    }[invalid]
-    args.preserve_worktree = [path]
-    with pytest.raises(loaded["RepositoryShipError"]):
-        loaded["ship_repository"](args)
-    assert state["calls"] == 0 and not log.exists()
+    script, arguments = {
+        "ship": (SHIP_REPOSITORY, ["--head-branch", "release/local"]),
+        "promote": (PROMOTE_REPOSITORY, ["--source-branch", "codex/selected", "--ship-after-promotion"]),
+        "cleanup": (SCRIPTS / "retire_shipped_work.py", ["cleanup", "--shipped-ref", "main", "--apply"]),
+        "finalize": (SCRIPTS / "retire_shipped_work.py", [
+            "finalize", "--target-branch", "release/local", "--target-commit", git(repository, "rev-parse", "HEAD"),
+            "--current-branch", "main", "--current-commit", git(repository, "rev-parse", "HEAD"),
+        ]),
+    }[entrypoint]
+    before = git(repository, "worktree", "list", "--porcelain")
+    for _ in range(2):
+        result = subprocess.run(
+            [sys.executable, str(script), "--repo-root", str(repository), *arguments,
+             "--preserve-worktree", str(repository)],
+            cwd=repository, capture_output=True, text=True, check=False,
+        )
+        assert result.returncode == 2, result.stderr
+        assert "unrecognized arguments: --preserve-worktree" in result.stderr
+        assert git(repository, "worktree", "list", "--porcelain") == before
+        assert not (repository / ".git" / "codex" / "repository-lifecycle").exists()
 
 
-def test_ship_cli_caller_finalization_and_rerun_carry_explicit_retention(
+def test_shipping_requires_caller_outside_selected_worktree(
     cleanup: ModuleType, repository: pathlib.Path, tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1098,38 +1090,45 @@ def test_ship_cli_caller_finalization_and_rerun_carry_explicit_retention(
         source_branches=["codex/selected"],
     )["pending_work_scope"])
     wrapper = shipping_cases._load_ship()
-    retained = cleanup.select_preserved_worktrees(repository, (selected, selected))
-    assert retained == [{"branch": "codex/selected", "path": str(selected),
-                         "reason": "explicitly_preserved_worktree"}]
     monkeypatch.chdir(selected)
-    with pytest.raises(wrapper["RepositoryShipError"], match="outside selected worktree"):
-        wrapper["_require_cleanup_safe_caller"](repository, scope, [])
     for _ in range(2):
-        wrapper["_require_cleanup_safe_caller"](repository, scope, retained)
+        with pytest.raises(wrapper["RepositoryShipError"], match="outside selected worktree"):
+            wrapper["_require_cleanup_safe_caller"](repository, scope, [])
     monkeypatch.chdir(tmp_path)
-    args = wrapper["build_parser"]().parse_args([
-        "--repo-root", str(repository), "--head-branch", "release/local",
-        "--preserve-worktree", str(selected),
-    ])
-    rerun = wrapper["_resume_ship_command"](args, repo_root=repository, target_commit=head)
-    assert rerun[rerun.index("--preserve-worktree") + 1] == str(selected)
+    wrapper["_require_cleanup_safe_caller"](repository, scope, [])
     command = wrapper["_pending_command"](
         "finalize", repo_root=repository, scope=scope, target_branch="release/local",
         target_commit=head, current_branch="main", current_commit=head,
-        preserve_worktrees=args.preserve_worktree,
     )
-    assert command[command.index("--preserve-worktree") + 1] == str(selected)
-    # The callable workflow must forward the explicit paths to terminal cleanup.
-    (tmp_path / "shipping").mkdir()
-    repo, loaded, request, _, _, commands = shipping_cases._setup(tmp_path / "shipping")
-    active = repo.parent / "worktrees" / repo.name / "active"
-    git(repo, "worktree", "add", "-b", "codex/active", str(active), "release/local")
-    request.preserve_worktree = [active]
-    result = loaded["ship_repository"](request)
-    assert result["status"] == "shipped"
-    assert result["preserved_worktrees"][0]["path"] == str(active)
-    terminal = next(item for item in commands if "finalize" in item)
-    assert terminal[terminal.index("--preserve-worktree") + 1] == str(active)
+    result = subprocess.run(command, cwd=repository, capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["status"] == "finalized"
+    assert not selected.exists()
+
+
+@pytest.mark.parametrize("operation", ["request", "plan", "cleanup", "finalize"])
+def test_callable_interfaces_reject_removed_worktree_retention_parameter(
+    cleanup: ModuleType, repository: pathlib.Path, operation: str,
+) -> None:
+    wrapper = shipping_cases._load_ship()
+    head = git(repository, "rev-parse", "HEAD")
+    for _ in range(2):
+        with pytest.raises(TypeError, match="unexpected keyword argument"):
+            if operation == "request":
+                wrapper["ShipOptions"](
+                    repo_root=repository, head_branch="release/local", preserve_worktree=[repository],
+                )
+            elif operation == "plan":
+                cleanup.plan_cleanup(repository, "main", preserve_worktrees=(repository,))
+            elif operation == "cleanup":
+                cleanup.retire_shipped_work(repository, "main", apply=True, preserve_worktrees=(repository,))
+            else:
+                cleanup.finalize_shipping(
+                    repository, None, target_branch="release/local", target_commit=head,
+                    current_branch="main", current_commit=head, preserve_worktrees=(repository,),
+                )
+        assert git(repository, "rev-parse", "HEAD") == head
+        assert not (repository / ".git" / "codex" / "repository-lifecycle").exists()
 
 
 @pytest.mark.parametrize("scope_present", [False, True])
@@ -1305,7 +1304,6 @@ def test_composed_promotion_and_shipping_each_run_their_validation_boundary(
         raise AssertionError(command)
 
     def github_ship(_args, repo_root, _scope, _commit):
-        assert _args.preserve_worktree == [active]
         assert repo_root == repo
         assert log.read_text().splitlines() == ["checked", "checked"]
         assert run_git(repo, "switch", "main").returncode == 0
@@ -1322,10 +1320,9 @@ def test_composed_promotion_and_shipping_each_run_their_validation_boundary(
             "--source-branch",
             "approved",
             "--ship-after-promotion",
-            "--preserve-worktree", str(active),
         ]
     )
     result = promotion["promote"](args)
     assert result["status"] == "shipped"
     assert log.read_text().splitlines() == ["checked", "checked"]
-    assert active.exists()
+    assert not active.exists()

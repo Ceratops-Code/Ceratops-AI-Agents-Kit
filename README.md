@@ -958,15 +958,9 @@ Ship cleanup discovers task worktrees and local `codex/` task branches across
 the repository, including older batches absent from the pending-work scope.
 Removal requires clean Git state including untracked files and the exact head
 included in the synchronized shipped commit. Thread archive status and catalog
-availability do not block removal. Dirty or unshipped work, locked or explicitly
-retained worktrees, and protected checkouts stay.
-Direct Ship and `--ship-after-promotion` accept repeatable
-`--preserve-worktree <absolute-task-worktree>` arguments for active manual
-worktrees missing from Codex's ownership catalog. Each path must be a registered
-worktree in the selected repository's task root. This retains its branch and
-matching task files without changing thread records or weakening release checks.
-The same arguments are included in the returned rerun command; omit them when
-the task is finished and its shipped work can be retired.
+availability do not block removal. Dirty or unshipped work, locked worktrees,
+and protected checkouts stay. Run shipping from outside the task worktrees
+selected for cleanup so the parent shell does not keep a worktree open.
 The repository lifecycle helper `retire_shipped_work.py` optionally reads the
 existing Codex thread catalog without writing it, rechecks current Git and path
 conditions, and retains only unfinished removal records under

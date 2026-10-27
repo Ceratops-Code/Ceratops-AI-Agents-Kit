@@ -307,18 +307,6 @@ def _ship_after_promotion(
     scope = pathlib.Path(pending_work_scope)
     if not scope.is_absolute() or not scope.resolve(strict=True).is_file():
         raise PromotionError("Recorded pending-work scope is unavailable for shipping.")
-    preserved = list(getattr(args, "preserve_worktree", None) or [])
-    requested_root = args.repo_root.expanduser().resolve(strict=True)
-    if requested_root != repo_root:
-        # Promotion routes release effects to the primary checkout, but its
-        # requesting workspace is still live. Protect that registered worktree
-        # (and its task outputs) before Ship evaluates destructive finalization.
-        workspace = pathlib.Path(require_output(
-            git_branches._git(requested_root, "rev-parse", "--show-toplevel"),
-            cwd=requested_root,
-        )).resolve(strict=True)
-        if workspace != repo_root and workspace not in {path.resolve() for path in preserved}:
-            preserved.append(workspace)
     request = repository_ship.ShipOptions(
         repo_root=repo_root,
         head_branch=args.release_branch,
@@ -326,7 +314,6 @@ def _ship_after_promotion(
         remote_name=args.remote_name,
         commit=target_commit,
         reusable_head=True,
-        preserve_worktree=preserved or None,
         sdlc_contract=args.sdlc_contract,
         title=getattr(args, "title", None),
         body=getattr(args, "body", None),
@@ -365,8 +352,6 @@ def _promotion_inputs(args: argparse.Namespace) -> tuple[pathlib.Path, list[str]
         raise PromotionError(f"release_branch must be {RELEASE_BRANCH}.")
     branches = list(dict.fromkeys(args.source_branch or []))
     ship_after_promotion = bool(getattr(args, "ship_after_promotion", False))
-    if not ship_after_promotion and getattr(args, "preserve_worktree", None):
-        raise PromotionError("Worktree preservation requires --ship-after-promotion.")
     if not ship_after_promotion and any(
         getattr(args, field, None) is not None for field in ("title", "body")
     ):
@@ -1267,10 +1252,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--sdlc-contract",
         type=pathlib.Path,
         default=DEFAULT_SDLC_CONTRACT,
-    )
-    parser.add_argument(
-        "--preserve-worktree", type=pathlib.Path, action="append",
-        help="Keep this active task worktree and its files after composed shipping; repeat as needed.",
     )
     parser.add_argument(
         "--validation-operation",

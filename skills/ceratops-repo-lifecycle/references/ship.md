@@ -217,8 +217,8 @@ failed receipt is added.
    Remove work only when Git state is clean including untracked files and its
    exact head is an ancestor of the synchronized shipped commit. Thread archive
    status and thread-catalog availability do not determine cleanup eligibility.
-   Preserve the primary checkout, main/master, reusable `release/local`, locked
-   worktrees and explicitly retained worktrees. Thread metadata may identify
+   Preserve the primary checkout, main/master, reusable `release/local` and
+   locked worktrees. Thread metadata may identify
    task-temp owners only through an exact worktree marker or working-directory
    match; missing metadata leaves unidentified thread-temp directories untouched.
    Before each deletion, recheck worktree registration, exact head, cleanliness,
@@ -263,8 +263,8 @@ failed receipt is added.
   repository-wide cleanup ran even when that scope was absent or empty.
 - Only an evidence-proven interrupted `deleting` record was recovered
   automatically; every missing `retained` source remained blocking.
-- Dirty, unavailable, or advanced work, locked or explicitly retained worktrees,
-  and protected checkouts or branches were retained with reasons.
+- Dirty, unavailable, or advanced work, locked worktrees, and protected checkouts
+  or branches were retained with reasons.
 - Every removed task worktree or branch was clean and had its exact head included
   in the shipped commit; thread archive status did not prevent removal.
 
