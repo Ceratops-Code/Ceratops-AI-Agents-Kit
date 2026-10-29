@@ -1468,6 +1468,20 @@ and bounded retention under
 pytest caches and basetemp directories remain scratch, not acceptance. Cheap
 diagnostics/collection snapshots may be regenerated at their own final paths.
 
+Pytest now saves every completed pass, failure or skip in the worktree's one
+`<git-common-dir>/ceratops/results/repository-checks/<worktree-id>/check_results.json`.
+The ID is SHA-256 of its resolved path with OS case handling. Each test/target has
+one latest outcome; partial runs preserve other tests. Reused passes keep their
+original result IDs and alpha/beta/rc/final level. `release/local` requests beta
+or higher. Previous builds still come from this worktree's `.build` records and
+their tagged summaries, and a newer applicable failure blocks an older pass.
+The fixed `.check_results.in_process.json` sibling protects the last saved file
+during a write; startup removes an unfinished sibling. No timestamped files or
+worktree lock are used. Completed builds keep this working file, while Git keeps
+their historical summaries independently. Complete collection may remove deleted
+tests, not unselected tests; worktree retirement owns eventual file deletion.
+6C connects remaining check producers and explicitly combines older result files.
+
 Repository scripts own their output paths and Git ignore rules. Saved results
 are local working data and do not authorize deployment. Deployment retains its
 immediate destination checks and producer-specific completion result.

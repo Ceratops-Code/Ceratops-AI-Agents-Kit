@@ -413,31 +413,33 @@ reasons with every affected test ID, alongside the bounded decision sample.
 This is observational output in the existing runner response, not new persistent
 state or a new acceptance rule; original result IDs and retention stay unchanged.
 
-The owner writes canonical `ceratops-pytest-attempt.v1` JSON directly to unique
-`<git-common-dir>/ceratops/results/repository-checks/pytest-attempt-<result-id>.json`
-paths. Records preserve actual passed, failed and interrupted outcomes, phase
-results, exact inputs and original qualification. Existing `pytest-pass-*`
-records remain unchanged; a missing historical level is eligible only for the
-legacy unqualified runner. Qualified calls use the shared level matrix, and a
-newer applicable failed or interrupted attempt blocks older passes for that
-individual test. A later matching pass resolves only its covered failure.
-When a failure would expire, retention also considers the selected build at
-each qualification level, at most four per unit/target. Newer alpha work cannot
-erase a failure still blocking an older beta build. These are compact tagged
-summaries; retention does not open packages or another worktree's build history.
+The pytest owner saves each completed test immediately in
+`<git-common-dir>/ceratops/results/repository-checks/<worktree-id>/check_results.json`.
+`worktree-id` is SHA-256 of the resolved worktree path with OS case handling;
+the file records that ID and path. Its `ceratops-current-check-results.v1`
+envelope contains one latest entry per check kind, check ID and OS/architecture
+target, with shared input inventories stored once. Original outcomes retain
+their result IDs, phase results, exact inputs and actual qualification levels.
+A corrected pass replaces a failure; a beta result replaces an alpha result.
+Partial runs keep unselected entries. Complete collection of a selected group
+can remove its deleted tests; filtered collection cannot do so.
 
-`.pytest-pass.lock` serializes reads, final writes and pruning; a busy writer
-leaves another invocation free to execute its checks normally. Startup and each
-completed write retain current plus two predecessors per checkout, test and
-qualification level, protecting original results referenced by retained aggregate
-records and failures that can still block a retained pass. Other producers'
-files are untouched. Startup inventories filenames once and opens only collected
-checkout/test groups; each save
-refreshes, matches and prunes only its affected group through an in-memory index.
-No persistent index or additional storage is introduced. Failure precedence and
-retained references stay within that group, so unrelated histories need no
-per-save traversal. Results survive task-temp and worktree deletion. The
-caller-owned `pytest-results.json` lives inside pytest's isolated temp directory,
+One thread owns a worktree, and its commands save serially without a worktree
+lock. The writer flushes/fsyncs the fixed sibling
+`.check_results.in_process.json`, then replaces `check_results.json`.
+An interrupted write leaves earlier saved outcomes intact; the next call removes
+the unfinished sibling. There are no timestamped generations or per-test files.
+Git build summaries remain immutable and independent of this working file.
+Completing a build never clears it. Normal calls touch only their worktree;
+dedicated worktree retirement removes it in step 20C. Explicit old-file conversion
+belongs to 6C, not startup discovery.
+
+Previous-build selection still reads this worktree's `.build` records and the
+eligible tag's `check_summary.json`, never another worktree or artifact storage.
+An applicable current failure blocks an older tagged pass. Local calls record
+alpha unless a declared level applies; `release/local` requests at least beta.
+Reusing a pass keeps its actual level and original result ID. The caller-owned
+`pytest-results.json` lives inside pytest's isolated temp directory,
 carries returned counts and original result references, and is removed by that
 directory's existing owner. Aggregate records retain those child identities,
 check versions and levels. Stdout adds at most 32 per-check decisions and an
@@ -1227,14 +1229,12 @@ New or changed tests, affected source/dependencies and newer applicable failures
 still require execution. The import neither creates a build tag nor accepts a
 new artifact, and ordinary runs do not search other worktrees for old results.
 
-The pytest result owner keeps one
-`<git-common-dir>/ceratops/results/repository-checks/pytest-baseline-<checkout-hash>.json`
-per explicitly selected checkout. Repeating the same import does not rewrite it;
-an interrupted import can be repeated, while an incomplete file blocks its use.
-Future build summaries carry the original outcomes and their comparison facts.
-The runner removes the local import when selected Git summaries contain all its
-pass identities. Until then it is bounded accepted-result input, not a checkpoint
-or failure log; deleting it before that transfer would discard reusable passes.
+Explicitly imported outcomes join that worktree's `check_results.json` without
+replacing newer local results. Repeating the import keeps original IDs and inputs;
+an interrupted replacement preserves the earlier complete file. Future build
+summaries carry the original outcomes and their comparison facts. Creating those
+summaries does not delete current results. No separate imported-baseline history
+is maintained.
 
 Select the most recent eligible completed baseline for the same release unit and
 target on the candidate's relevant history, recording its exact tag, commit and
