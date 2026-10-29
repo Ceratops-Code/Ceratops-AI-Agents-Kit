@@ -1079,7 +1079,7 @@ def run_recorded_check(
         if current is not None and path != current.path:
             current = None  # Explicit caller-selected output keeps the public probe contract.
         target = {key: value for key, value in context["scope"].items()
-                  if key not in {"worktree", "inputRules"}} if current is not None else {}
+                  if key not in {"worktree", "inputRules"}} if current is not None and context is not None else {}
         saved = next((item for item in current.records("repository-check", target=target)
                       if item["result_id"] == args.result_id), None) if current is not None else None
         if saved is not None:

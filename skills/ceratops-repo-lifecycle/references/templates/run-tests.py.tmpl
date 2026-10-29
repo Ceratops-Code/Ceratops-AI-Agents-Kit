@@ -2,11 +2,11 @@
 """Run repository Python tests, optionally retaining an exact reusable result.
 
 Use the locked scripts environment: uv run --locked scripts/run-tests.py.
-The caller owns result identities, serialization, storage and retention. Without
-result arguments this remains a disposable test invocation. With them, the runner
-writes only the chosen final file, never a sibling staging file. The running
-record is completed only by its owning invocation; a fresh invocation never
-overwrites a valid failed or interrupted attempt. Pytest scratch is disposable.
+The caller supplies result identities and exact inputs. Current worktree results
+share one file, replaced through a fixed .check_results.in_process.json sibling
+after each completed write. Explicit standalone result files keep their original
+contract. Without result arguments this remains a disposable test invocation.
+Pytest scratch is disposable.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-DEFAULT_TARGETS = __TEST_TARGETS__
+DEFAULT_TARGETS: list[str] = __TEST_TARGETS__
 def without_basetemp(arguments: list[str]) -> list[str]:
     """Remove inherited locations before pytest validates every occurrence."""
     options = iter(arguments)
@@ -747,7 +747,7 @@ def run_recorded_check(
         if current is not None and path != current.path:
             current = None  # Explicit caller-selected output keeps the public probe contract.
         target = {key: value for key, value in context["scope"].items()
-                  if key not in {"worktree", "inputRules"}} if current is not None else {}
+                  if key not in {"worktree", "inputRules"}} if current is not None and context is not None else {}
         saved = next((item for item in current.records("repository-check", target=target)
                       if item["result_id"] == args.result_id), None) if current is not None else None
         if saved is not None:
