@@ -1019,6 +1019,57 @@ def test_terminal_workflow_cleans_only_its_matching_failure(report_repo, monkeyp
     assert set(json.loads(path.read_text())["failures"]) == {"other-check"}
 
 
+@pytest.mark.parametrize("report_state", ["never_created", "removed", "retained"])
+def test_ship_report_cleanup_after_worktree_removal(report_repo, monkeypatch, report_state):
+    repo, path = report_repo
+    primary = report_primary_checkout(repo)
+    if report_state != "never_created":
+        command.write_failure_report(path, repo_root=primary, action="ship",
+                                     failures={"ship_repository": "earlier shipping failure"})
+    original = path.read_bytes() if path.exists() else None
+
+    def finalize(_args):
+        if repo.exists():
+            assert run_git(primary, "worktree", "remove", str(repo)).returncode == 0
+        if report_state == "removed" and path.parent.exists():
+            shutil.rmtree(path.parent)
+        return {"status": "shipped", "report_cleanup_error": "previous cleanup warning"}
+
+    monkeypatch.setattr(ship_repository, "release_write_context", lambda *_args, **_kwargs: nullcontext())
+    monkeypatch.setattr(ship_repository, "_ship_repository", finalize)
+    args = ship_repository.ShipOptions(repo_root=primary, head_branch="release/local", diagnostic_output=path)
+    for _ in range(2):
+        result = ship_repository.ship_repository(args)
+        assert result["status"] == "shipped" and not repo.exists()
+        if report_state == "retained":
+            assert "existing registered worktree" in result["report_cleanup_error"]
+            assert path.read_bytes() == original
+        else:
+            assert "report_cleanup_error" not in result and not path.exists()
+
+
+def test_report_metadata_error_preserves_success_and_report(report_repo, monkeypatch):
+    repo, path = report_repo
+    save(repo, path, {"tests.unit:1": "earlier failure"})
+    original = path.read_bytes()
+    original_lstat = pathlib.Path.lstat
+    result = {"status": "completed", "operation": "tests.unit", "steps": [1]}
+
+    def unreadable(selected, *args, **kwargs):
+        if selected == path:
+            raise PermissionError("report metadata is unreadable")
+        return original_lstat(selected, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(pathlib.Path, "lstat", unreadable)
+        runner.remove_operation_failures(result, diagnostic_output=path, diagnostic_owner=(repo, "promote"))
+    assert result["status"] == "completed" and path.read_bytes() == original
+    assert "metadata is unreadable" in result["report_cleanup_error"]
+    for _ in range(2):
+        runner.remove_operation_failures(result, diagnostic_output=path, diagnostic_owner=(repo, "promote"))
+    assert "report_cleanup_error" not in result and not path.exists()
+
+
 @pytest.mark.parametrize("partial", [False, True])
 @pytest.mark.parametrize("interrupt_after", [False, True])
 def test_success_cleanup_repeats_after_interrupted_replacement_or_deletion(

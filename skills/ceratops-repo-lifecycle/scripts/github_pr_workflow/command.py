@@ -502,6 +502,12 @@ def remove_resolved_failures(
     ):
         return
     try:
+        # Finalization may already have removed the report's task directory.
+        try:
+            diagnostic_output.lstat()
+        except FileNotFoundError:
+            result.pop("report_cleanup_error", None)
+            return
         selected, owner = _report_scope(diagnostic_output, repo_root, action)
         previous = _read_failure_report(selected, owner)
         if not previous or not set(previous["failures"]).intersection(resolved_failures):
