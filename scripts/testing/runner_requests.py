@@ -37,12 +37,14 @@ def parse_request(argv: Sequence[str] | None) -> tuple[argparse.Namespace, str |
     parser.add_argument("--reconcile-collection", type=pathlib.Path)
     parser.add_argument("--validate-manifest", action="store_true")
     parser.add_argument("--worktree", action="store_true")
+    parser.add_argument("--consolidate-results", nargs="?", const=pathlib.Path("."), type=pathlib.Path,
+                        metavar="WORKTREE", help="Convert old results for this or the named worktree, without running tests.")
     parser.add_argument("--write-collection", type=pathlib.Path)
     _result_writer["add_result_arguments"](parser)
     args = parser.parse_args(list(argv) if argv is not None else None)
     args.context = None
     args.build_history = False
-    modes = sum((bool(args.targets), args.all, args.auto, args.validate_manifest,
+    modes = sum((bool(args.targets), args.all, args.auto, args.validate_manifest, args.consolidate_results is not None,
                  args.worktree, args.write_collection is not None,
                  args.reconcile_collection is not None,
                  args.base is not None or args.head is not None))
@@ -51,12 +53,17 @@ def parse_request(argv: Sequence[str] | None) -> tuple[argparse.Namespace, str |
             or (args.select_only and not (args.worktree or args.base is not None))):
         return args, (
             "choose exactly one of test targets, --all, --auto, --validate-manifest, --worktree, "
-            "--write-collection, --reconcile-collection, or --base with --head; "
+            "--write-collection, --reconcile-collection, --consolidate-results, or --base with --head; "
             "--node-map is valid only with --reconcile-collection; "
             "--select-only requires --worktree or --base with --head"
         )
     if any(target.startswith("-") for target in args.targets):
         return args, "test targets must be paths or node IDs, not pytest options"
+    if args.consolidate_results is not None and (
+        args.describe_test_results or args.probe_command or args.result_file
+        or any(getattr(args, name) is not None for name in _result_writer["IDENTITY_FIELDS"])
+    ):
+        return args, "--consolidate-results cannot be combined with a check execution or result request"
     if args.auto:
         try:
             supplied = os.environ.get(TEST_CONTEXT_ENV)

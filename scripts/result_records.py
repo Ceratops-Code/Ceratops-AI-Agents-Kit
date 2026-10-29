@@ -187,22 +187,27 @@ class CurrentCheckResults:
 
     def put(self, kind: str, check_id: str, target: dict[str, Any], record: Mapping[str, Any]) -> None:
         """Replace only this check after its actual outcome is known."""
+        self.put_many([(kind, check_id, target, record)])
+
+    def put_many(self, outcomes: list[tuple[str, str, dict[str, Any], Mapping[str, Any]]]) -> None:
+        """Save an explicit import together; ordinary tests still save individually."""
         self._refresh()
-        encoded = copy.deepcopy(dict(record))
         groups = dict(self.value["inputGroups"])
-        inputs = encoded.pop("inputs", None)
-        if inputs is not None:
-            inputs = dict(inputs)
-            checks = inputs.pop("check_inputs", None)
-            for field, facts in (("inputGroup", inputs), ("checkGroup", checks)):
-                if facts is not None:
-                    key = hashlib.sha256(canonical(facts)).hexdigest()
-                    groups[key] = facts
-                    encoded[field] = key
         entries = dict(self.value["entries"])
-        entries[self._key(kind, check_id, target)] = {
-            "kind": kind, "check_id": check_id, "target": dict(target), "record": encoded,
-        }
+        for kind, check_id, target, record in outcomes:
+            encoded = copy.deepcopy(dict(record))
+            inputs = encoded.pop("inputs", None)
+            if inputs is not None:
+                inputs = dict(inputs)
+                checks = inputs.pop("check_inputs", None)
+                for field, facts in (("inputGroup", inputs), ("checkGroup", checks)):
+                    if facts is not None:
+                        key = hashlib.sha256(canonical(facts)).hexdigest()
+                        groups[key] = facts
+                        encoded[field] = key
+            entries[self._key(kind, check_id, target)] = {
+                "kind": kind, "check_id": check_id, "target": dict(target), "record": encoded,
+            }
         self._save(entries, groups)
 
     def remove_deleted(self, kind: str, deleted_ids: set[str], target: dict[str, Any]) -> None:
@@ -719,7 +724,20 @@ def run_recorded_check(
         prepare: dict[str, Any] = {"repair_unaccepted": getattr(args, "repair_unaccepted_result", False)}
         if execution is not None:
             prepare["execution"] = execution
-        if prepare_result(path, expected, **prepare):
+        current = CurrentCheckResults(root) if context is not None else None
+        if current is not None and path != current.path:
+            current = None  # Explicit caller-selected output keeps the public probe contract.
+        target = {key: value for key, value in context["scope"].items()
+                  if key not in {"worktree", "inputRules"}} if current is not None else {}
+        saved = next((item for item in current.records("repository-check", target=target)
+                      if item["result_id"] == args.result_id), None) if current is not None else None
+        if saved is not None:
+            if (not all(saved.get(key) == value for key, value in expected.items())
+                    or saved.get("status") != "passed" or saved.get("exit_code") != 0):
+                raise ValueError("Saved result ID does not identify this successful check.")
+            print("OK")
+            return 0
+        if current is None and prepare_result(path, expected, **prepare):
             print("OK")
             return 0
         running = {**expected, "status": "running", "exit_code": None}
@@ -754,9 +772,12 @@ def run_recorded_check(
             completed["checks"] = checks()
         if context is not None or summary is not None:
             completed["check_summary"] = summarize_check_result(completed, summary() if summary else None)
-        if read_result(path)[1] != running:
-            raise ValueError("running result changed; refusing to overwrite it")
-        write_result(path, completed, exclusive=False)
+        if current is not None:
+            current.put("repository-check", args.check_id, target, completed)
+        else:
+            if read_result(path)[1] != running:
+                raise ValueError("running result changed; refusing to overwrite it")
+            write_result(path, completed, exclusive=False)
         if failure is not None:
             raise failure
         return code

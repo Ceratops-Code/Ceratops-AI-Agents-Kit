@@ -160,7 +160,7 @@ def test_git_baseline_never_hides_newer_repository_check_failure(tmp_path, monke
     assert (tmp_path / "source-checks.txt").read_text() == "xx"
 
 
-def test_failure_retention_covers_older_beta_build_after_newer_alpha(tmp_path, monkeypatch):
+def test_later_success_replaces_failure_without_pinning_old_local_history(tmp_path, monkeypatch):
     from tests.repository_lifecycle.test_completed_builds import _tag_summary
 
     _fixture(tmp_path)
@@ -185,8 +185,8 @@ def test_failure_retention_covers_older_beta_build_after_newer_alpha(tmp_path, m
     (tmp_path / "source.py").write_text("value = 1\n")
     fresh = reuse.plan_operation(_check(tmp_path))
     assert path.exists()
-    assert fresh.decision["decision"] == "execute"
-    assert "failed" in fresh.decision["reason"]
+    assert fresh.decision["decision"] == "reuse"
+    assert fresh.decision["build"]["tag"] == "claims/1.0.0b1"
 
 
 def test_promotion_pass_is_consumed_by_a_later_package_build(tmp_path, capsys):
@@ -323,7 +323,7 @@ def test_pass_survives_interruption_before_build_and_a_fresh_request_reuses_it(t
     original = runner.execute_prepared_operation(check)
     assert original["status"] == "completed", original
     store = reuse.CheckResultStore(tmp_path)
-    record = store.directory / (original["check_result"]["result_id"] + ".json")
+    record = store.current.path
     saved = record.read_bytes()
     build = runner.prepare_operations(tmp_path, [runner.OperationRequest("deliverables.packages.sample.actions.build")])[0]
     actual = runner.run_progress_command
@@ -356,7 +356,7 @@ def test_saved_corruption_blocks_a_fresh_call_without_repeating_the_check(tmp_pa
     _fixture(tmp_path)
     first = runner.execute_prepared_operation(_check(tmp_path))
     assert first["status"] == "completed", first
-    path = reuse.CheckResultStore(tmp_path).directory / (first["check_result"]["result_id"] + ".json")
+    path = reuse.CheckResultStore(tmp_path).current.path
     data = json.loads(path.read_text())
     data["status"] = []
     path.write_bytes(reuse.canonical(data))
@@ -421,7 +421,7 @@ def test_path_folder_change_reuses_original_pass_without_rewriting_it(tmp_path, 
     first = runner.execute_prepared_operation(operation)
     assert first["status"] == "completed", first
     reference = first["check_result"]
-    path = reuse.CheckResultStore(tmp_path).directory / (reference["result_id"] + ".json")
+    path = reuse.CheckResultStore(tmp_path).current.path
     original = path.read_bytes()
     empty = tmp_path / ".git/empty-path-folder"
     empty.mkdir()

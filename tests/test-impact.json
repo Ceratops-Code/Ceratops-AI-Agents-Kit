@@ -1323,6 +1323,17 @@
       ]
     },
     {
+      "id": "shared-current-result-source",
+      "paths": [
+        "skills/sections/scripts/store_check_results.py"
+      ],
+      "suites": [
+        "check-records",
+        "check-result-reuse",
+        "skill-update"
+      ]
+    },
+    {
       "id": "check-result-reuse-source",
       "paths": [
         "skills/ceratops-repo-lifecycle/scripts/reuse_operation_checks.py",

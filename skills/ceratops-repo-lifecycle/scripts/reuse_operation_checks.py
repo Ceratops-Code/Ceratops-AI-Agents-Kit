@@ -19,8 +19,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from read_check_environment import read_environment
-from retain_check_results import CONTEXT_ENV as CONTEXT_ENV
 from retain_check_results import (
+    CONTEXT_ENV,
     CONTEXT_SCHEMA,
     CheckResultStore,
     canonical,
@@ -30,6 +30,8 @@ from retain_check_results import (
     result_reference,
 )
 from sdlc_results import select_build_check_summaries
+
+__all__ = ["CONTEXT_ENV", "CheckPlan", "plan_operation"]
 
 
 def _digest(path: pathlib.Path) -> str | None:
@@ -180,10 +182,9 @@ class CheckPlan:
                     "check_reason": self.decision["reason"],
                     "check_baseline": {key: build[key] for key in ("tag", "commit", "receiptPath")},
                     "check_summary": selected_summary}
-        original_path = self.store.directory / (self.decision["reference"]["result_id"] + ".json")
-        if result_reference(original_path) != self.decision["reference"]:
+        original_path = self.store.current.path
+        if result_reference(original_path, self.decision["reference"]["result_id"]) != self.decision["reference"]:
             raise ValueError("Original check evidence changed after selection.")
-        bind_references(prepared.repo_root, [self.decision["reference"]])
         return {"operation": prepared.operation, "commit": prepared.commit,
                 "status": "completed", "steps": [], "check_decision": "reused",
                 "check_reason": self.decision["reason"],
@@ -195,7 +196,7 @@ class CheckPlan:
         """Require the declared producer's actual terminal result, including failure."""
         if self.path is None:
             raise ValueError("Declared check has no allocated result path.")
-        record = read_check_result(self.path)
+        record = read_check_result(self.path, self.result_id)
         if (record["result_id"] != self.result_id
                 or record["candidate_id"] != self.context["workVersion"]
                 or record["check_id"] != prepared.operation
@@ -204,10 +205,8 @@ class CheckPlan:
                 or (passed and record["status"] != "passed")
                 or (not passed and record["status"] not in {"failed", "interrupted"})):
             raise ValueError("Declared runner outcome conflicts with its requested inputs or exit status.")
-        reference = result_reference(self.path)
+        reference = result_reference(self.path, self.result_id)
         self.summary = record.get("check_summary")
-        bind_references(prepared.repo_root, [reference])
-        self.store.prune(protected_ids=[str(self.result_id)], active_inputs=[self.context])
         return reference
 
 
@@ -223,30 +222,3 @@ def plan_operation(prepared: Any) -> CheckPlan | None:
     if decision["decision"] == "blocked":
         raise ValueError("Recorded check evidence blocks reuse: " + decision["reason"])
     return CheckPlan(context, decision, store)
-
-
-def bind_references(root: pathlib.Path, references: list[dict[str, Any]]) -> None:
-    """The existing candidate owner retains passes, independently of reports."""
-    if not references:
-        return
-    from github_pr_workflow.preserve_check_references import bind_check_results
-
-    branch = _git(root, "branch", "--show-current").strip()
-    if branch:
-        bind_check_results(root, branch, _git(root, "rev-parse", "HEAD").strip(), references)
-
-
-def activate_plans(prepared: list[Any]) -> None:
-    """Protect the whole selected batch before pruning or starting callbacks."""
-    by_root: dict[pathlib.Path, list[CheckPlan]] = {}
-    for item in prepared:
-        if item.check_plan is not None:
-            by_root.setdefault(item.repo_root, []).append(item.check_plan)
-    for root, plans in by_root.items():
-        references = [plan.decision["reference"] for plan in plans if plan.decision.get("reference")]
-        bind_references(root, references)
-        identities = [reference["result_id"] for reference in references]
-        contexts = [plan.context for plan in plans]
-        for plan in plans:
-            if not plan.decision.get("build"):
-                plan.store.prune(protected_ids=identities, active_inputs=contexts)

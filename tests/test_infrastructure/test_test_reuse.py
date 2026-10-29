@@ -974,6 +974,81 @@ def test_another_test_module_used_as_helper_is_an_input(test_runner_module, tmp_
     assert changed.accepted_checks["reused"] == 0
 
 
+@pytest.mark.parametrize("unknown_skip", [False, True])
+def test_old_baseline_conversion_preserves_facts_and_reports_missing_scope(tmp_path, unknown_skip):
+    from reuse_test_results import _digest, compact_results, consolidate_result_files
+
+    root = _mapped_repository(tmp_path)
+    store = _level_store(root, "beta")
+    node = "tests/a/test_value.py::test_value"
+    original = store.save(node, store.inputs(node))
+    summary = compact_results([store.reference(original, reused=False)])
+    if unknown_skip:
+        summary["checks"].append({"kind": "pytest", "id": "unknown-scope", "status": "skipped", "reusable": False})
+    path = store.common / "ceratops/results/repository-checks/pytest-baseline-old.json"
+    path.write_text(json.dumps({"schema": "ceratops-imported-test-baseline.v1",
+                               "checkout": _digest(str(root.resolve())), "summary": summary}))
+    store.current.path.unlink()
+    for _ in range(2):
+        report = consolidate_result_files(root)
+        current = _level_store(root, "beta")
+        saved = current.matching(node, current.inputs(node))
+        assert saved["result_id"] == original["result_id"]
+        assert saved["inputs"] == original["inputs"]
+        assert path.exists() == unknown_skip
+        if unknown_skip:
+            assert report["retained"]["summary includes outcomes without reusable input facts"]["count"] == 1
+
+
+@pytest.mark.parametrize("boundary", ["none", "before-save", "after-save", "before-delete", "after-delete"])
+def test_explicit_old_file_conversion_keeps_latest_facts_and_repeats(tmp_path, monkeypatch, boundary):
+    import importlib
+
+    module = importlib.import_module("reuse_test_results")
+    root = _mapped_repository(tmp_path)
+    store = _level_store(root, "beta")
+    node = "tests/a/test_value.py::test_value"
+    first = store.save(node, store.inputs(node), outcome="failed", phases={"call": "failed"})
+    latest = store.save(node, store.inputs(node))
+    store.current.path.unlink()
+    directory = store.common / "ceratops/results/repository-checks"
+    old = [directory / f"pytest-attempt-{value['result_id']}.json" for value in (first, latest)]
+    for path, value in zip(old, (first, latest), strict=True):
+        path.write_text(json.dumps(value), encoding="utf-8")
+    unknown = directory / "pytest-pass-unknown.json"
+    unknown.write_text(json.dumps({**latest, "inputs": {"checkout": "unknown"}}))
+    replace, unlink = os.replace, pathlib.Path.unlink
+
+    def interrupted_replace(source, destination):
+        if boundary == "before-save":
+            raise KeyboardInterrupt()
+        replace(source, destination)
+        if boundary == "after-save":
+            raise KeyboardInterrupt()
+
+    def interrupted_delete(path, *args, **kwargs):
+        if path in old and boundary == "before-delete":
+            raise KeyboardInterrupt()
+        unlink(path, *args, **kwargs)
+        if path in old and boundary == "after-delete":
+            raise KeyboardInterrupt()
+
+    if boundary != "none":
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "replace", interrupted_replace)
+            patch.setattr(pathlib.Path, "unlink", interrupted_delete)
+            with pytest.raises(KeyboardInterrupt):
+                module.consolidate_result_files(root)
+    for _ in range(2):
+        report = module.consolidate_result_files(root)
+        assert report["status"] == "completed"
+        assert all(not path.exists() for path in old)
+        assert unknown.exists()
+        fresh = _level_store(root, "beta")
+        assert fresh.current.records("pytest") == [latest]
+        assert fresh.matching(node, fresh.inputs(node))["result_id"] == latest["result_id"]
+
+
 def test_linked_worktrees_have_separate_current_results(tmp_path):
     from tests.support.repositories import run_git
 
@@ -991,6 +1066,32 @@ def test_linked_worktrees_have_separate_current_results(tmp_path):
     assert first.current.path != second.current.path
     assert _level_store(root, "beta").matching(node, first.inputs(node))["result_id"] == saved["result_id"]
     assert _level_store(other, "beta").matching(node, second.inputs(node)) is None
+
+
+def test_conversion_cli_selects_worktree_without_running_tests(tmp_path):
+    import subprocess
+
+    root = _mapped_repository(tmp_path)
+    store = _level_store(root, "beta")
+    node = "tests/a/test_value.py::test_value"
+    saved = store.save(node, store.inputs(node))
+    old = store.common / "ceratops/results/repository-checks" / f"pytest-attempt-{saved['result_id']}.json"
+    old.write_text(json.dumps(saved))
+    store.current.path.unlink()
+    runner = pathlib.Path(__file__).resolve().parents[2] / "scripts/testing/run-tests.py"
+    for _ in range(2):
+        result = subprocess.run([sys.executable, str(runner), "--consolidate-results", str(root)],
+                                capture_output=True, text=True, check=False)
+        assert result.returncode == 0, result.stderr
+        report = json.loads(result.stdout)
+        assert report["worktree"] == str(root.resolve()) and report["saved_checks"] == 1
+        assert not old.exists()
+        assert _level_store(root, "beta").current.records("pytest") == [saved]
+    before = store.current.path.read_bytes()
+    result = subprocess.run([sys.executable, str(runner), "--consolidate-results", str(root),
+                             "--describe-test-results"], capture_output=True, text=True, check=False)
+    assert result.returncode != 0
+    assert store.current.path.read_bytes() == before
 
 def test_failed_collection_keeps_previous_results(test_runner_module, tmp_path):
     root = _acceptance_repository(tmp_path)

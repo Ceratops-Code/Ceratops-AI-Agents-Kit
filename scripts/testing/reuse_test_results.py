@@ -24,6 +24,7 @@ import pathlib
 import platform
 import runpy
 import shutil
+import stat
 import subprocess
 import sys
 import sysconfig
@@ -682,6 +683,160 @@ class ResultStore:
         self.records_by_check[(self.checkout, nodeid)] = [record]
         return record
 
+
+
+def consolidate_result_files(root: pathlib.Path) -> dict[str, Any]:
+    """Explicit one-time conversion for this checkout; never called at runner startup.
+
+    Inspect only the former shared result directory. Other worktrees' files and
+    incomplete records remain untouched. Save the newest real outcome for each
+    check/target before deleting any replaced file; repetition finishes deletion.
+    """
+    root = root.resolve()
+    writer = runpy.run_path(str(pathlib.Path(__file__).resolve().parents[1] / "result_records.py"))
+    current = writer["CurrentCheckResults"](root)
+    checkout = _digest(str(root))
+    operation_owner = hashlib.sha256(str(root).encode()).hexdigest()
+    old_directory = current.common / "ceratops/results/repository-checks"
+    # This explicit conversion reads direct children of one fixed directory.
+    # Check that parent chain once; inspect each file itself before both effects.
+    writer["result_path"](old_directory / ".conversion-location")
+    candidates: list[tuple[pathlib.Path, str]] = []
+    selected: dict[str, tuple[str, str, dict[str, Any], dict[str, Any]]] = {}
+    retained: dict[str, list[str]] = {}
+
+    def keep(path: pathlib.Path, reason: str) -> None:
+        retained.setdefault(reason, []).append(path.name)
+
+    def order(record: Mapping[str, Any]) -> tuple[int, str]:
+        if "completed_ns" in record:
+            return int(record["completed_ns"]), str(record["result_id"])
+        import datetime
+        stamp = datetime.datetime.fromisoformat(record["execution"]["finishedAt"])
+        return int(stamp.timestamp() * 1_000_000_000), str(record["result_id"])
+
+    def offer(kind: str, check: str, target: dict[str, Any], record: dict[str, Any]) -> None:
+        key = current._key(kind, check, target)
+        if (key not in selected or order(record) > order(selected[key][3])
+                or (order(record) == order(selected[key][3]) and "comparison_inputs" in record)):
+            selected[key] = kind, check, target, record
+
+    def pytest_target(inputs: Mapping[str, Any]) -> dict[str, Any]:
+        runtime = inputs.get("runtime", {})
+        # Historical records have no separate architecture field. Infer it only
+        # from their explicit Python build description, never from this machine.
+        if isinstance(runtime, list) and len(runtime) == 3:
+            runtime = {"version": runtime[1], "platform": runtime[2]}
+        if not isinstance(runtime, dict):
+            raise ValueError("original Python runtime is missing")
+        version = runtime.get("version", "")
+        saved_platform = runtime.get("platform", "")
+        if not isinstance(version, str) or not isinstance(saved_platform, str):
+            raise ValueError("original platform or architecture is missing")
+        architecture = next((name for name in ("AMD64", "x86_64", "arm64", "aarch64", "x86")
+                             if name in version or name in saved_platform), None)
+        os_name = next((name for name in ("Windows", "Linux", "Darwin")
+                        if saved_platform.startswith(name)), None)
+        if not architecture or not os_name:
+            raise ValueError("original platform or architecture is missing")
+        return {"platform": os_name, "architecture": architecture}
+
+    def add_pytest(record: dict[str, Any]) -> None:
+        if (record.get("inputs_digest") != _digest(record.get("inputs"))
+                or record.get("outcome") not in {"passed", "failed", "interrupted", "skipped"}
+                or not isinstance(record.get("result_id"), str)
+                or type(record.get("completed_ns")) is not int
+                or (record["outcome"] == "passed" and record.get("phases") != {
+                    "setup": "passed", "call": "passed", "teardown": "passed"})):
+            raise ValueError("original test facts are incomplete")
+        try:
+            target = pytest_target(record["inputs"])
+        except ValueError:
+            # Explicit historical imports may carry the already established
+            # input comparison separately from their untouched original facts.
+            target = pytest_target(record.get("comparison_inputs", {}))
+        offer("pytest", record["nodeid"], target, record)
+
+    def read_old(path: pathlib.Path) -> bytes:
+        info = path.lstat()
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                or getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+            raise ValueError("old result must be one regular file, not a link")
+        return path.read_bytes()
+
+    paths = sorted(old_directory.glob("*.json"))
+    progress_at = time.monotonic()
+    for index, path in enumerate(paths, 1):
+        if time.monotonic() - progress_at >= 20:
+            print(f"[results] inspected {index}/{len(paths)} old files", file=sys.stderr, flush=True)
+            progress_at = time.monotonic()
+        if not (path.name.startswith(("pytest-pass-", "pytest-attempt-", "pytest-baseline-"))
+                or len(path.stem) == 36):
+            continue
+        try:
+            raw = read_old(path)
+            value = json.loads(raw)
+            if not isinstance(value, dict):
+                raise ValueError("result is not a JSON object")
+            schema = value.get("schema")
+            inputs = value.get("inputs", {})
+            if not isinstance(inputs, dict) or not isinstance(inputs.get("scope", {}), dict):
+                raise ValueError("original check inputs are incomplete")
+            owner = value.get("checkout") if schema == "ceratops-imported-test-baseline.v1" else (
+                inputs.get("scope", {}).get("worktree") if schema == "ceratops-repository-check-result.v1"
+                else inputs.get("checkout"))
+            if owner not in {checkout, operation_owner}:
+                keep(path, "different or unknown worktree")
+                continue
+            if schema in {"ceratops-pytest-pass.v1", SCHEMA}:
+                add_pytest(value)
+            elif schema == "ceratops-imported-test-baseline.v1":
+                imported: dict[str, list[dict[str, Any]]] = {}
+                ResultStore._load_summary(value["summary"], imported, {})
+                for records in imported.values():
+                    for record in records:
+                        add_pytest(record)
+                if len(imported) != len(value["summary"]["checks"]):
+                    keep(path, "summary includes outcomes without reusable input facts")
+                    continue
+            elif schema == "ceratops-repository-check-result.v1":
+                if (value.get("status") not in {"passed", "failed", "interrupted"}
+                        or not value.get("execution", {}).get("finishedAt")
+                        or not isinstance(value.get("result_id"), str)):
+                    raise ValueError("repository check has no completed execution")
+                expected = hashlib.sha256(writer["canonical"]({
+                    key: item for key, item in inputs.items()
+                    if key not in {"fingerprint", "workVersion", "qualificationLevel"}
+                })).hexdigest()
+                if inputs.get("fingerprint") != expected:
+                    raise ValueError("repository check input facts differ from their hash")
+                target = {key: item for key, item in inputs["scope"].items()
+                          if key not in {"worktree", "inputRules"}}
+                offer("repository-check", value["check_id"], target, value)
+            else:
+                raise ValueError("unrecognized result schema")
+            candidates.append((path, hashlib.sha256(raw).hexdigest()))
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            keep(path, str(exc))
+
+    # Current entries may be newer than files left by interrupted conversion.
+    for entry in current.value["entries"].values():
+        if entry["kind"] in {"pytest", "repository-check"}:
+            record = current._expand(entry["record"], current.value["inputGroups"])
+            offer(entry["kind"], entry["check_id"], entry["target"], record)
+    if selected:
+        current.put_many(list(selected.values()))
+    removed = 0
+    for path, digest in candidates:
+        if hashlib.sha256(read_old(path)).hexdigest() != digest:
+            keep(path, "file changed during conversion")
+            continue
+        path.unlink()
+        removed += 1
+    return {"status": "completed", "worktree": str(root), "current_file": str(current.path),
+            "saved_checks": len(selected), "removed_files": removed,
+            "retained": {reason: {"count": len(paths), "examples": paths[:10]}
+                         for reason, paths in retained.items()}}
 
 
 class ReusePasses:

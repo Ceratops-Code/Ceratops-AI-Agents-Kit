@@ -197,7 +197,8 @@ without repository deduplication.
 | `scripts/testing/run-tests.py` | Public test entry point. Uses the input map to select tests, runs one pytest collection/execution for the selected targets, preserves collection-snapshot/node-mapping modes and reports missing ownership before execution. Failed streams go to `--diagnostic-output`; console output stays bounded with current test names and counts on stderr. |
 | `scripts/testing/select_test_groups.py` | Reads `tests/test-impact.json`, maps changed inputs to check groups, follows dependencies toward consumers and separates selection/reporting options from options affecting test behavior. The map selects checks, not editable files. |
 | `scripts/testing/report_test_progress.py` | Pytest hook plugin and execution transport; reports collection, rate-limited current-test/count updates, sixty-second liveness, the actual pytest exit code, and bounded executed/reused check counts without mixing progress into the final stdout JSON or saving execution state. |
-| `scripts/testing/reuse_test_results.py` | Saves immutable pytest outcomes and compact summaries under Git's shared result directory. Reuses passes on matching group inputs, imported check/fixture files and relevant tools/packages/settings. Opens and prunes only collected checkout/check groups; each save stays in that group. Explicit historical imports preserve original outcomes and identities separately from converted input-comparison facts; skips never become passes. One imported baseline per checkout is removed once selected Git build summaries carry all its passes. Incomplete evidence blocks reuse; original identities, applicable failures and current-plus-two retention remain intact. |
+| `scripts/testing/reuse_test_results.py` | Saves each finished pytest outcome in the current worktree's `check_results.json`. Reuses passes on matching inputs and eligible tagged build summaries. Explicit old-file conversion keeps original outcomes and identities, saves the latest result per test/target, then deletes superseded files. Skips never become passes. |
+| `skills/sections/scripts/store_check_results.py` | Shares the current-results reader/writer between repository and skill lifecycle. Each worktree has one file; finished checks replace only their own entries. Build summaries in Git remain independent. |
 | `scripts/testing/pytest-diagnostics.py` | Extracts bounded failure summaries using exact pytest and unittest-subtest identities and source-file evidence, including parameter names containing summary separators; reports terminal import errors, nested exception-group messages and assertion differences over source context, excluding captured output. Native stderr failures before collection use the explicit `<pytest startup>` identity. Ambiguous or missing test tracebacks use only that test's summary reason. Full diagnostic files remain owned by the runner. |
 | `scripts/run-actionlint.py` | Provisions the pinned, checksum-verified actionlint release inside the scripts environment and validates every GitHub Actions workflow. |
 | `scripts/validate-repository.py` | Local validation coordinator; checks the running Python against `scripts/pyproject.toml`, runs workflow, repository lint and type checks, and captures first-failure evidence. Tests run separately through `scripts/testing/run-tests.py`. |
@@ -1480,7 +1481,27 @@ during a write; startup removes an unfinished sibling. No timestamped files or
 worktree lock are used. Completed builds keep this working file, while Git keeps
 their historical summaries independently. Complete collection may remove deleted
 tests, not unselected tests; worktree retirement owns eventual file deletion.
-6C connects remaining check producers and explicitly combines older result files.
+Repository checks and skill-update checks use this same file. Skill-update request
+reports remain request diagnostics; closing a request keeps its saved check
+outcomes. References to current results name the original entry ID and hash,
+so another check can update the file without changing that entry's identity.
+Completed build receipts reference `.build/<unit>/<version>[/<target>]/check_summary.json`
+by Git path and hash in the tagged commit. Failed/test-only calls create no
+completed build receipt or tag. Deleting local results does not change a tag.
+
+Run `uv run --project scripts --locked python scripts/testing/run-tests.py --consolidate-results [WORKTREE]`
+once to combine the named worktree's former `pytest-pass-*.json`,
+`pytest-attempt-*.json`, imported baselines and whole-check files. It saves the
+latest actual outcomes before deleting superseded files, can finish interrupted
+deletion, and reports unknown ownership or missing facts without guessing.
+Omit `WORKTREE` for this checkout. Normal test calls do not scan those files or
+other worktrees. Retained packages and old report references do not retain local
+execution history. For an older promotion scope, explicitly run the repo-lifecycle
+entrypoint `manage-pending-work.py --repo-root <worktree> discard-check-references --target-branch <branch>`;
+it removes only the old result-reference list, keeping source cleanup records.
+After matching requested checks succeed, their failure report is removed only
+after outcomes are saved. A fresh call can finish interrupted report deletion
+using that success. Reports for different requested checks remain untouched.
 
 Repository scripts own their output paths and Git ignore rules. Saved results
 are local working data and do not authorize deployment. Deployment retains its
@@ -2047,10 +2068,10 @@ five result arguments; the declared runner writes its actual outcome before
 returning. Later promotion/build calls consume eligible original passes while
 new artifact checks still run. Corrupt evidence blocks the operation.
 
-Results live under `<git-common-dir>/ceratops/results/repository-checks/`.
-Existing pending-work scopes retain active candidate references; checkpoints
-and disposable reports are not acceptance authorities. Storage is bounded and
-protects required original passes and newer applicable failures. Checks marked
+Results live in each worktree's `results/repository-checks/<worktree-id>/check_results.json`
+under `<git-common-dir>/ceratops/`. Source cleanup scopes do not retain check
+history. Each check/target has one latest outcome; a corrected pass replaces its
+failure. Checkpoints and disposable reports are not acceptance authorities. Checks marked
 `no_result_reuse`, distributed execution and unrepresented child scope also
 prevent aggregate reuse; ordinary child passes keep their original identities.
 

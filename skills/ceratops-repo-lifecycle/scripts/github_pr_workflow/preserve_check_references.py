@@ -1,9 +1,7 @@
-"""Own branch-bound references to actual repository check outcomes.
+"""Read and write branch-bound source cleanup scopes.
 
-Candidate metadata shares the existing Git-common pending-work scope path.
-It is not another acceptance store: only immutable declared-runner records prove
-outcomes. Check-only owners expire when their exact branch tip changes or is
-deleted; mixed source-cleanup scopes keep their existing lifecycle.
+Check outcomes live in the worktree current-results file or completed Git builds.
+Source cleanup metadata never pins old local executions.
 """
 
 from __future__ import annotations
@@ -15,20 +13,13 @@ import pathlib
 import re
 import runpy
 import subprocess
-import uuid
-from collections.abc import Mapping, Sequence
-from datetime import datetime
 from typing import Any
 
-from filelock import FileLock
-from retain_check_results import read_check_result, result_reference, retention_group
-
-from .command import run_command
+from .command import release_write_context, run_command
 
 PENDING_WORK_SCOPE_VERSION = 2
 PENDING_SOURCE_STATES = {"retained", "preserved", "deleting"}
 FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
-_SCOPE_FILE = re.compile(r"^sha256-[0-9a-f]{64}\.json$")
 _cleanup = runpy.run_path(str(pathlib.Path(__file__).resolve().parents[1] / "pending-work-cleanup.py"))
 
 
@@ -79,10 +70,10 @@ def load_pending_work_scope(
         ) from exc
     expected_fields = {"version", "target_branch", "target_commit", "sources"}
     if (not isinstance(raw_scope, dict) or not expected_fields.issubset(raw_scope)
-            or set(raw_scope) - expected_fields - {"check_results"}):
+            or set(raw_scope) != expected_fields):
         raise error_type(
             "Pending-work scope must contain exactly version, target_branch, "
-            "target_commit, sources, and optional check_results."
+            "target_commit and sources."
         )
     raw_sources = raw_scope.get("sources")
     if (
@@ -90,7 +81,7 @@ def load_pending_work_scope(
         or not isinstance(raw_scope.get("target_branch"), str)
         or not isinstance(raw_scope.get("target_commit"), str)
         or not isinstance(raw_sources, list)
-        or (not raw_sources and not raw_scope.get("check_results"))
+        or not raw_sources
     ):
         raise error_type("Pending-work scope has invalid field values.")
     target_branch = str(raw_scope["target_branch"])
@@ -154,11 +145,6 @@ def load_pending_work_scope(
         "target_commit": target_commit,
         "sources": sorted(normalized_sources, key=lambda source: source["branch"]),
     }
-    if "check_results" in raw_scope:
-        try:
-            normalized_scope["check_results"] = checked_references(repo_root, raw_scope["check_results"])
-        except (OSError, ValueError) as exc:
-            raise error_type(f"Pending-work check references are invalid: {exc}") from exc
     serialized = json.dumps(
         {key: normalized_scope[key] for key in expected_fields},
         separators=(",", ":"),
@@ -197,88 +183,6 @@ def _plain(path: pathlib.Path) -> None:
         raise PendingScopeError("Candidate scope must be one regular file.")
 
 
-def _current_tip(repo_root: pathlib.Path, branch: str) -> str | None:
-    if subprocess.run(_git(repo_root, "check-ref-format", "--branch", branch),
-                      capture_output=True, check=False).returncode:
-        raise PendingScopeError("Candidate branch is invalid.")
-    result = subprocess.run(_git(repo_root, "show-ref", "--verify", "--hash", f"refs/heads/{branch}"),
-                            capture_output=True, text=True, check=False)
-    if result.returncode == 1:
-        return None
-    if result.returncode:
-        # show-ref uses 128 for an absent ref without --quiet on some Git builds.
-        absent = subprocess.run(_git(repo_root, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"),
-                                capture_output=True, check=False)
-        if absent.returncode == 1:
-            return None
-        raise PendingScopeError("Cannot inspect the candidate branch.")
-    return result.stdout.strip()
-
-
-def checked_references(repo_root: pathlib.Path, references: Any) -> list[dict[str, Any]]:
-    """Read exact immutable terminal records; metadata cannot invent outcomes."""
-    if not isinstance(references, list) or not references:
-        raise PendingScopeError("Candidate check_results must be a nonempty reference list.")
-    common = common_git_dir(repo_root)
-    output: dict[str, dict[str, Any]] = {}
-    for reference in references:
-        if not isinstance(reference, dict) or set(reference) != {
-            "result_id", "candidate_id", "check_id", "check_version",
-            "qualificationLevel", "path", "sha256",
-        }:
-            raise PendingScopeError("Candidate check reference fields are incomplete.")
-        identity = reference.get("result_id")
-        expected_path = f"ceratops/results/repository-checks/{identity}.json"
-        if not isinstance(identity, str) or reference.get("path") != expected_path:
-            raise PendingScopeError("Candidate check reference is outside the canonical store.")
-        try:
-            if str(uuid.UUID(identity)) != identity:
-                raise ValueError("noncanonical result identity")
-        except ValueError as exc:
-            raise PendingScopeError("Candidate result identity must be a canonical UUID.") from exc
-        path = common / expected_path
-        record = read_check_result(path)
-        if record["status"] not in {"passed", "failed", "interrupted"}:
-            raise PendingScopeError("Candidate check reference has no terminal outcome.")
-        actual = result_reference(path)
-        if actual != reference:
-            raise PendingScopeError("Candidate check reference conflicts with original provenance or bytes.")
-        output[identity] = dict(reference)
-    return [output[identity] for identity in sorted(output)]
-
-
-def _bounded_references(repo_root: pathlib.Path, references: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Keep three observations per scope/level and needed original acceptance."""
-    common = common_git_dir(repo_root)
-    groups: dict[bytes, list[tuple[dict[str, Any], dict[str, Any]]]] = {}
-    for reference in references:
-        record = read_check_result(common / reference["path"])
-        key = retention_group(record)
-        groups.setdefault(key, []).append((reference, record))
-    retained: dict[str, dict[str, Any]] = {}
-    for observations in groups.values():
-        observations.sort(key=lambda item: (
-            datetime.fromisoformat(item[1]["execution"]["finishedAt"]), item[1]["result_id"],
-        ), reverse=True)
-        for reference, _ in observations[:3]:
-            retained[reference["result_id"]] = reference
-        newest = observations[0][1]
-        if newest["status"] in {"failed", "interrupted"}:
-            original = next((reference for reference, record in observations
-                             if record["status"] == "passed"
-                             and record["inputs"]["fingerprint"] == newest["inputs"]["fingerprint"]), None)
-            if original is not None:
-                retained[original["result_id"]] = original
-    return [retained[identity] for identity in sorted(retained)]
-
-
-def _lock(repo_root: pathlib.Path) -> FileLock:
-    directory = common_git_dir(repo_root) / "codex/repository-lifecycle/promotions"
-    _plain(directory / ".check-references.lock")
-    directory.mkdir(parents=True, exist_ok=True)
-    return FileLock(str(directory / ".check-references.lock"), timeout=30)
-
-
 def _write_scope(path: pathlib.Path, scope: dict[str, Any]) -> None:
     _plain(path)
     _plain(path.with_suffix(".tmp"))
@@ -286,101 +190,41 @@ def _write_scope(path: pathlib.Path, scope: dict[str, Any]) -> None:
 
 
 def write_scope(path: pathlib.Path, scope: dict[str, Any]) -> None:
-    """Serialize existing manager writes with binding to prevent lost references."""
+    """Write the selected source cleanup scope under the existing release lock."""
     # Every manager scope path is <common>/codex/repository-lifecycle/promotions/file.
     if (path.parent.parts[-3:] != ("codex", "repository-lifecycle", "promotions")
             or path.name != "sha256-" + hashlib.sha256(str(scope["target_branch"]).encode()).hexdigest() + ".json"):
         raise PendingScopeError("Candidate scope changed its owner.")
     _plain(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = path.parent / ".check-references.lock"
-    _plain(lock_path)
-    with FileLock(str(lock_path), timeout=30):
-        if path.exists():
-            current = json.loads(path.read_text(encoding="utf-8"))
-            if (isinstance(current, dict) and current.get("target_commit") == scope.get("target_commit")
-                    and "check_results" in current and "check_results" not in scope):
-                scope = {**scope, "check_results": current["check_results"]}
-        _write_scope(path, scope)
+    _write_scope(path, scope)
 
 
-def _expire_stale(repo_root: pathlib.Path) -> list[str]:
-    directory = common_git_dir(repo_root) / "codex/repository-lifecycle/promotions"
-    if not directory.exists():
-        return []
-    removed = []
-    for path in sorted(directory.glob("sha256-*.json")):
-        if not _SCOPE_FILE.fullmatch(path.name):
-            continue
-        _plain(path)
-        scope = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(scope, dict) or scope.get("sources") != []:
-            continue  # Mixed source-cleanup scopes have their existing owner.
-        branch, commit = scope.get("target_branch"), scope.get("target_commit")
-        if (scope.get("version") != PENDING_WORK_SCOPE_VERSION or not isinstance(branch, str)
-                or not isinstance(commit, str) or FULL_SHA_RE.fullmatch(commit) is None
-                or path != scope_path(repo_root, branch) or not scope.get("check_results")):
-            raise PendingScopeError("Check-only candidate owner is malformed.")
-        if _current_tip(repo_root, branch) == commit:
-            checked_references(repo_root, scope["check_results"])
-            continue
-        _cleanup["_remove_completed_state_file"](path)
-        removed.append(str(path))
-    return removed
+def discard_check_references(repo_root: pathlib.Path, branch: str) -> dict[str, Any]:
+    """Explicitly remove the retired check-file list; preserve source cleanup work.
 
-
-def expire_stale_check_scopes(repo_root: pathlib.Path) -> list[str]:
-    """Retire only check-only owners whose exact local branch candidate is gone."""
-    directory = common_git_dir(repo_root) / "codex/repository-lifecycle/promotions"
-    if not directory.exists():
-        return []
-    with _lock(repo_root):
-        return _expire_stale(repo_root)
-
-
-def bind_check_results(
-    repo_root: pathlib.Path, target_branch: str, target_commit: str,
-    references: Sequence[Mapping[str, Any]],
-) -> pathlib.Path:
-    """Bind actual terminal observations before the next callback can prune them.
-
-    The current branch tip owns this metadata, including standalone v4 checks.
-    Source cleanup still releases a mixed scope when its last source retires.
-    An interrupted atomic write leaves either the prior or complete new owner;
-    a fresh call reads current state, merges immutable references and converges.
+    This is a requested conversion, never a normal-read fallback. The release
+    lock prevents promotion from rewriting the selected scope during this edit.
+    Repetition after either replacement or deletion has no further effect.
     """
-    repo_root = repo_root.resolve(strict=True)
-    if not isinstance(target_branch, str) or not target_branch:
-        raise PendingScopeError("Candidate target branch must be explicit.")
-    if not isinstance(target_commit, str) or FULL_SHA_RE.fullmatch(target_commit) is None:
-        raise PendingScopeError("Candidate target commit must be a full Git SHA.")
-    with _lock(repo_root):
-        _expire_stale(repo_root)
-        if _current_tip(repo_root, target_branch) != target_commit:
-            raise PendingScopeError("Candidate target branch no longer names the requested commit.")
-        actual = checked_references(repo_root, [dict(reference) for reference in references])
-        path = scope_path(repo_root, target_branch)
+    with release_write_context(repo_root):
+        path = scope_path(repo_root, branch)
         _plain(path)
-        if path.exists():
-            _, scope = load_pending_work_scope(argparse.Namespace(
-                pending_work_check=True, pending_work_scope=path, head_branch=target_branch,
-            ), repo_root, target_commit)
-            assert scope is not None
-        else:
-            scope = {"version": PENDING_WORK_SCOPE_VERSION, "target_branch": target_branch,
-                     "target_commit": target_commit, "sources": []}
-        combined = checked_references(repo_root, [*scope.get("check_results", []), *actual])
-        desired = {**scope, "check_results": _bounded_references(repo_root, combined)}
-        if _current_tip(repo_root, target_branch) != target_commit:
-            raise PendingScopeError("Candidate target changed before reference publication.")
-        if not path.exists() or json.loads(path.read_text(encoding="utf-8")) != desired:
-            _write_scope(path, desired)
-        else:
-            temporary = path.with_suffix(".tmp")
-            _plain(temporary)
-            temporary.unlink(missing_ok=True)
-        if _current_tip(repo_root, target_branch) != target_commit:
-            _expire_stale(repo_root)
-            raise PendingScopeError("Candidate target changed during reference publication.")
-        _expire_stale(repo_root)
-        return path
+        if not path.exists():
+            return {"status": "completed", "removed_references": 0}
+        scope = json.loads(path.read_text(encoding="utf-8"))
+        fields = {"version", "target_branch", "target_commit", "sources"}
+        if (not isinstance(scope, dict) or set(scope) not in (fields, fields | {"check_results"})
+                or scope.get("version") != PENDING_WORK_SCOPE_VERSION
+                or scope.get("target_branch") != branch
+                or not isinstance(scope.get("sources"), list)
+                or not isinstance(scope.get("check_results", []), list)):
+            raise PendingScopeError("Cannot convert the selected source cleanup scope: unexpected fields.")
+        had_references = "check_results" in scope
+        references = scope.pop("check_results", [])
+        if not scope["sources"]:
+            path.unlink()
+        elif had_references:
+            write_scope(path, scope)
+        return {"status": "completed", "removed_references": len(references),
+                "retained_sources": len(scope["sources"])}

@@ -20,6 +20,89 @@ import pytest
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 
+def test_old_whole_check_conversion_keeps_the_latest_entry_without_retesting(tmp_path, monkeypatch):
+    from reuse_test_results import consolidate_result_files
+
+    context = _context(tmp_path)
+    writer = runpy.run_path(str(ROOT / "scripts/result_records.py"))
+    context["scope"]["worktree"] = hashlib.sha256(str(tmp_path.resolve()).encode()).hexdigest()
+    context["fingerprint"] = hashlib.sha256(writer["canonical"]({key: value for key, value in context.items()
+        if key not in {"fingerprint", "workVersion", "qualificationLevel"}})).hexdigest()
+    monkeypatch.setenv("CERATOPS_REPOSITORY_CHECK_CONTEXT", json.dumps(context))
+    current = writer["CurrentCheckResults"](tmp_path)
+    calls = []
+    paths = []
+    for status in (1, 0):
+        identity = str(uuid.uuid4())
+        path = current.path.parent.parent / f"{identity}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        args = _request(path)
+        args.result_id = identity
+        assert writer["run_recorded_check"](
+            lambda status=status: calls.append(status) or status, args, {}, repo_root=tmp_path,
+        ) == status
+        paths.append(path)
+    original = json.loads(paths[-1].read_text())
+    for _ in range(2):
+        report = consolidate_result_files(tmp_path)
+        assert report["status"] == "completed" and all(not path.exists() for path in paths)
+        assert writer["CurrentCheckResults"](tmp_path).records("repository-check") == [original]
+    assert calls == [1, 0]
+
+
+@pytest.mark.parametrize("boundary", ["before-delete", "after-delete"])
+def test_saved_success_finishes_report_cleanup_without_repeating_tests(
+    test_runner_module, tmp_path, monkeypatch, capsys, boundary,
+):
+    from tests.test_infrastructure.test_test_reuse import (
+        _acceptance_repository,
+        _acceptance_test,
+    )
+
+    root = _acceptance_repository(tmp_path)
+    counter = tmp_path / "effects"
+    _acceptance_test(root, "cleanup", counter)
+    monkeypatch.chdir(root)
+    context = _context(root)
+    monkeypatch.setenv("CERATOPS_REPOSITORY_CHECK_CONTEXT", json.dumps(context))
+    writer = runpy.run_path(str(ROOT / "scripts/result_records.py"))
+    current = writer["CurrentCheckResults"](root)
+    identity = str(uuid.uuid4())
+    diagnostic = root / ".build/test-diagnostics/pytest-failure.json"
+    arguments = ["--all", "--result-file", str(current.path), "--result-id", identity,
+                 "--candidate-id", "1" * 40, "--check-id", "repository.actions.test",
+                 "--check-version", "2" * 64]
+    request = test_runner_module.diagnostic_request(test_runner_module.parse_request(arguments)[0])
+    diagnostic.parent.mkdir(parents=True)
+    diagnostic.write_text(json.dumps({"schema": test_runner_module.PYTEST_DIAGNOSTIC_SCHEMA,
+        "cwd": str(root), "request": request, "exit_code": 1, "stdout": "old failure", "stderr": ""}))
+    unlink = pathlib.Path.unlink
+
+    def interrupted(path, *args, **kwargs):
+        if path == diagnostic and boundary == "before-delete":
+            raise OSError("interrupted report cleanup")
+        unlink(path, *args, **kwargs)
+        if path == diagnostic and boundary == "after-delete":
+            raise OSError("interrupted report cleanup")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(pathlib.Path, "unlink", interrupted)
+        assert test_runner_module.execute(arguments, repo_root=root) == 2
+    capsys.readouterr()
+    saved = writer["CurrentCheckResults"](root).records("repository-check")
+    assert saved[0]["status"] == "passed" and saved[0]["result_id"] == identity
+    for _ in range(2):
+        assert test_runner_module.execute(arguments, repo_root=root) == 0
+        assert not diagnostic.exists()
+    assert counter.read_text().splitlines() == ["cleanup"]
+    # A successful collection or a different check must not erase this failure.
+    diagnostic.parent.mkdir(parents=True, exist_ok=True)
+    diagnostic.write_text(json.dumps({"schema": test_runner_module.PYTEST_DIAGNOSTIC_SCHEMA,
+        "cwd": str(root), "request": {"targets": ["unrelated"]}, "exit_code": 1}))
+    assert test_runner_module.execute(arguments, repo_root=root) == 0
+    assert diagnostic.exists()
+
+
 def _current_outcome(identity: str, status: str = "passed") -> dict[str, Any]:
     return {"result_id": identity, "status": status, "check_version": "original-check",
             "qualificationLevel": "beta", "inputs": {"source": "original",
@@ -131,6 +214,33 @@ def _request(path: pathlib.Path, result_id: str = "attempt-1") -> argparse.Names
     )
 
 
+def test_repository_checks_share_current_file_with_individual_tests(check_writer, tmp_path, monkeypatch):
+    context = _context(tmp_path)
+    reader = runpy.run_path(str(ROOT / "skills/ceratops-repo-lifecycle/scripts/retain_check_results.py"))
+    context["fingerprint"] = reader["fingerprint"](context)
+    monkeypatch.setenv(check_writer["CHECK_CONTEXT_ENV"], json.dumps(context))
+    current = check_writer["CurrentCheckResults"](tmp_path)
+    current.put("pytest", "original_test", {}, _current_outcome("original-pass"))
+    calls = []
+    args = _request(current.path)
+    for status, identity in ((1, "failed-run"), (0, "corrected-run")):
+        args.result_id = identity
+        assert check_writer["run_recorded_check"](
+            lambda identity=identity, status=status: calls.append(identity) or status, args, {}, repo_root=tmp_path,
+        ) == status
+    assert check_writer["run_recorded_check"](
+        lambda: pytest.fail("saved success must not execute again"), args, {}, repo_root=tmp_path,
+    ) == 0
+    assert calls == ["failed-run", "corrected-run"]
+    saved = reader["read_check_result"](current.path, "corrected-run")
+    assert saved["status"] == "passed"
+    assert reader["result_reference"](current.path, "corrected-run")["sha256"] == hashlib.sha256(reader["canonical"](saved)).hexdigest()
+    shared = runpy.run_path(str(ROOT / "skills/sections/scripts/store_check_results.py"))["CurrentCheckResults"](tmp_path)
+    assert shared.records("pytest")[0]["result_id"] == "original-pass"
+    assert shared.records("repository-check") == [saved]
+    assert list(current.path.parent.iterdir()) == [current.path]
+
+
 def _context(root: pathlib.Path) -> dict[str, Any]:
     (root / "source.py").write_text("source input\n")
     (root / "checks.py").write_text("check input\n")
@@ -154,7 +264,7 @@ def _context(root: pathlib.Path) -> dict[str, Any]:
 
 
 @pytest.mark.parametrize("boundary", ["before", "after"])
-def test_path_equivalent_failure_survives_interrupted_retention(
+def test_path_equivalent_outcomes_survive_interrupted_replacement(
     check_writer: dict[str, Any], tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
     boundary: str,
 ) -> None:
@@ -180,42 +290,33 @@ def test_path_equivalent_failure_survives_interrupted_retention(
         inputs["fingerprint"] = reader["fingerprint"](inputs)
         monkeypatch.setenv("CERATOPS_REPOSITORY_CHECK_CONTEXT", json.dumps(inputs))
         result_id = str(uuid.uuid4())
-        path = store.directory / (result_id + ".json")
+        path = store.current.path
         assert check_writer["run_recorded_check"](lambda: code, _request(path, result_id), {}) == code
         return path, inputs
 
     original_path, original_inputs = save_attempt(0)
-    original_bytes = original_path.read_bytes()
     monkeypatch.setenv("PATH", str(tmp_path / ".git/empty-path") + os.pathsep + os.environ["PATH"])
     failure_path, current_inputs = save_attempt(7)
-    for index in range(5):
-        tool.write_bytes(("different tool " + str(index)).encode())
-        save_attempt(0)
-    tool.write_bytes(b"original tool")
     assert original_inputs["fingerprint"] != current_inputs["fingerprint"]
+    replace = os.replace
 
-    unlink = pathlib.Path.unlink
-
-    def interrupt(path: pathlib.Path, *args: Any, **kwargs: Any) -> None:
-        if path.parent == store.directory and boundary == "before":
-            raise OSError("interrupted before expired result deletion")
-        unlink(path, *args, **kwargs)
-        if path.parent == store.directory and boundary == "after":
-            raise OSError("interrupted after expired result deletion")
+    def interrupt(source, destination):
+        if pathlib.Path(destination) != original_path:
+            return replace(source, destination)
+        if boundary == "after":
+            replace(source, destination)
+        raise OSError("interrupted replacement")
 
     with monkeypatch.context() as scoped:
-        scoped.setattr(pathlib.Path, "unlink", interrupt)
-        with pytest.raises(OSError, match="interrupted"):
-            store.prune(protected_ids=[original_path.stem], active_inputs=[current_inputs])
-
-    for _ in range(2):
-        fresh = reader["CheckResultStore"](tmp_path)
-        fresh.prune(protected_ids=[original_path.stem], active_inputs=[current_inputs])
-        result = fresh.select(current_inputs, check_id="repository.actions.test")
-        assert result["decision"] == "execute"
-        assert "newer applicable failed attempt" in result["reason"]
-        assert failure_path.exists()
-        assert original_path.read_bytes() == original_bytes
+        scoped.setattr(os, "replace", interrupt)
+        assert check_writer["run_recorded_check"](
+            lambda: 0, _request(original_path, str(uuid.uuid4())), {},
+        ) == 2
+    fresh = reader["CheckResultStore"](tmp_path)
+    result = fresh.select(current_inputs, check_id="repository.actions.test")
+    assert result["decision"] == ("reuse" if boundary == "after" else "execute")
+    assert failure_path == original_path
+    assert len(fresh.current.records("repository-check")) == 1
 
 
 @pytest.mark.parametrize("outcome", ["passed", "failed", "interrupted", "system_exit"])
@@ -648,6 +749,12 @@ def test_qualified_group_retains_the_original_inherited_child_level(
                 broken_path.write_bytes(broken)
         code = test_runner_module.execute(arguments, repo_root=root)
         assert (code == 0) == (fault in {None, "partial_write"} or not saved)
+        if saved and fault == "malformed":
+            assert not path.exists()  # The unreadable shared file blocks the command before it starts.
+            assert broken_path.read_bytes() == broken
+            assert counter.read_text().splitlines() == ["example"]
+            assert "Current" in capsys.readouterr().err
+            return
         saved.append(json.loads(path.read_text()))
     assert counter.read_text().splitlines() == ["example"]
     if fault == "partial_write":
@@ -735,18 +842,6 @@ def test_aggregate_reuse_preserves_external_input_markers_and_original_child_pas
         assert inherited["result_id"] == original["result_id"]
         assert inherited["check_version"] == original["check_version"]
         assert inherited["reused"] is True
-    # Eligible-pass protection must not pin the older pass when current child
-    # scope prohibits reuse. Ordinary retention still bounds unrelated revisions.
-    for version in range(3):
-        unrelated = json.loads(json.dumps(saved[-1]))
-        unrelated.pop("check_summary", None)
-        unrelated["result_id"] = str(uuid.uuid4())
-        unrelated["check_version"] = f"{version + 4:064x}"
-        unrelated["inputs"]["checkVersion"] = unrelated["check_version"]
-        unrelated["inputs"]["fingerprint"] = reader["fingerprint"](unrelated["inputs"])
-        (store.directory / f'{unrelated["result_id"]}.json').write_bytes(reader["canonical"](unrelated))
-    store.prune()
-    assert not historical_path.exists()
     assert store.select(context, check_id="repository.actions.test")["decision"] == "execute"
     assert "result_references" not in capsys.readouterr().out
 
@@ -762,15 +857,14 @@ def test_check_reader_rejects_nonboolean_child_reuse_constraint(
     context["fingerprint"] = reader["fingerprint"](context)
     monkeypatch.setenv("CERATOPS_REPOSITORY_CHECK_CONTEXT", json.dumps(context))
     identity = str(uuid.uuid4())
-    path = tmp_path / ".git/ceratops/results/repository-checks" / f"{identity}.json"
+    path = reader["CheckResultStore"](tmp_path).current.path
     assert check_writer["run_recorded_check"](
         lambda: 0, _request(path, identity), {}, checks=lambda: [{"id": "unknown-scope", "reusable": "false"}],
     ) == 0
     with pytest.raises(ValueError, match="Reported checks conflict"):
         reader["read_check_result"](path)
-    assert reader["CheckResultStore"](tmp_path).select(
-        context, check_id="repository.actions.test",
-    )["decision"] == "blocked"
+    with pytest.raises(ValueError, match="Reported checks conflict"):
+        reader["CheckResultStore"](tmp_path).select(context, check_id="repository.actions.test")
 
 
 @pytest.mark.parametrize("boundary", ["complete", "interrupted_teardown", "missing_teardown_report", "marked_skip", "xpass"])

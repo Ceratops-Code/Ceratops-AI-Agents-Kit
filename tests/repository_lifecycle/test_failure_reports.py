@@ -1107,9 +1107,9 @@ def test_batch_preparation_cleanup_error_reaches_caller(report_repo, monkeypatch
         raise ValueError("missing check input")
 
     with monkeypatch.context() as patch:
-        patch.setattr(runner.reuse_operation_checks, "activate_plans", cannot_prepare)
+        patch.setattr(runner.reuse_operation_checks, "plan_operation", cannot_prepare)
         assert runner.execute_prepared_operations(
-            [operation], diagnostic_output=path, diagnostic_owner=(repo, "promote"),
+            [runner.replace(operation, check_results={})], diagnostic_output=path, diagnostic_owner=(repo, "promote"),
         )["status"] == "result_invalid"
     assert set(json.loads(path.read_text())["failures"]) == {"operation_preparation:tests.unit"}
     original = pathlib.Path.unlink

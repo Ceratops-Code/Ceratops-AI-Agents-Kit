@@ -470,8 +470,30 @@ def write_failure_diagnostic(
     }
 
 
-def cleanup_pytest_diagnostic(path: pathlib.Path, *, prune_parent: bool) -> None:
-    """Remove stale pytest failure evidence after a successful pytest run."""
+def diagnostic_request(args: object) -> dict[str, object]:
+    """Name the requested work independently of its changing code or result ID."""
+    return {name: str(value) if isinstance(value, pathlib.Path) else value
+            for name in ("targets", "all", "auto", "base", "head", "worktree",
+                         "select_only", "validate_manifest", "write_collection",
+                         "reconcile_collection", "node_map", "probe_command")
+            if (value := getattr(args, name, None)) is not None}
+
+
+def cleanup_pytest_diagnostic(
+    path: pathlib.Path, *, prune_parent: bool, root: pathlib.Path,
+    request: Mapping[str, object], completed_commands: Sequence[Sequence[str]],
+) -> None:
+    """Delete only a report for the work that just succeeded; keep unrelated failures."""
+    if not path.exists():
+        return
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, UnicodeError):
+        return  # An unreadable report cannot be attributed to this successful work.
+    if (not isinstance(report, dict) or report.get("cwd") != str(root)
+            or report.get("schema") not in {PYTEST_DIAGNOSTIC_SCHEMA, RUNNER_DIAGNOSTIC_SCHEMA}
+            or not (report.get("request") == request or report.get("command") in completed_commands)):
+        return
 
     path.unlink(missing_ok=True)
     if not prune_parent:
@@ -721,10 +743,29 @@ def execute(
     args, request_error = parse_request(argv)
     root = (repo_root or pathlib.Path(__file__).resolve().parents[2]).resolve()
     observed: list[dict[str, object]] = []
+    if args.consolidate_results is not None:
+        from reuse_test_results import consolidate_result_files
+
+        selected = (root / args.consolidate_results).resolve()
+        if request_error is not None:
+            emit({"status": "failed", "operation": "consolidate-results", "worktree": str(selected),
+                  "message": request_error})
+            return 2
+        try:
+            emit(consolidate_result_files(selected))
+        except (OSError, ValueError) as exc:
+            emit({"status": "failed", "operation": "consolidate-results", "worktree": str(selected),
+                  "message": str(exc)})
+            return 2
+        return 0
     summary: dict[str, object] = {}
+    outputs: list[dict[str, object]] = []
+    completed_commands: list[list[str]] = []
 
     def observe(command: Sequence[str], cwd: pathlib.Path) -> subprocess.CompletedProcess[str]:
         result = text_runner(command, cwd)
+        if result.returncode == 0 and "--collect-only" not in command:
+            completed_commands.append(list(command))
         observed.extend(getattr(result, "accepted_result_references", None) or [])
         observed.extend(getattr(result, "nonreusable_checks", None) or [])
         observed.extend(getattr(result, "skipped_checks", None) or [])
@@ -732,18 +773,40 @@ def execute(
         summary.update(getattr(result, "check_summary", None) or {})
         return result
 
-    return run_recorded_request(args, lambda: execute_selected(
+    code = run_recorded_request(args, lambda: execute_selected(
         argv, repo_root=repo_root, text_runner=observe, bytes_runner=bytes_runner,
+        emit_result=outputs.append,
     ), repo_root=root, request_error=request_error, checks=lambda: observed,
         summary=lambda: summary)
+    # Finished outcomes are saved before disposable failure diagnostics are removed.
+    # A later call can finish deletion while reusing the already saved outcomes.
+    if code == 0 and request_error is None and not args.describe_test_results and not args.select_only:
+        try:
+            cleanup_pytest_diagnostic(
+                resolve_data_path(root, args.diagnostic_output or DEFAULT_DIAGNOSTIC_PATH),
+                prune_parent=args.diagnostic_output is None,
+                root=root, request=diagnostic_request(args), completed_commands=completed_commands,
+            )
+        except OSError as exc:
+            code = CONFIGURATION_EXIT_CODE
+            if outputs:
+                outputs[-1]["status"] = "diagnostic-cleanup-failed"
+                outputs[-1].setdefault("pytest", {})["diagnostic_error"] = f"{type(exc).__name__}: {exc}"
+            else:
+                print(f"Checks passed; diagnostic cleanup failed: {exc}", file=sys.stderr)
+    for output in outputs:
+        emit(output)
+    return code
 
 
 def execute_selected(
     argv: Sequence[str] | None = None, *, repo_root: pathlib.Path | None = None,
     text_runner: TextRunner = run_text, bytes_runner: BytesRunner = run_bytes,
+    emit_result: Callable[[dict[str, object]], None] | None = None,
 ) -> int:
     """Execute one explicit mode and emit exactly one stable JSON result."""
 
+    emit = emit_result or globals()["emit"]
     root = (repo_root or pathlib.Path(__file__).resolve().parents[2]).resolve()
     args, request_error = parse_request(argv)
     diagnostic_path = resolve_data_path(root, args.diagnostic_output or DEFAULT_DIAGNOSTIC_PATH)
@@ -768,6 +831,7 @@ def execute_selected(
         try:
             payload["diagnostic"] = write_failure_diagnostic(diagnostic_path, {
                 "schema": RUNNER_DIAGNOSTIC_SCHEMA, "cwd": str(root),
+                "request": diagnostic_request(args),
                 "exit_code": exit_code, "result": dict(payload),
                 "commands": preflight_commands,
             })
@@ -971,6 +1035,7 @@ def execute_selected(
                 diagnostic_path,
                 {
                     "schema": PYTEST_DIAGNOSTIC_SCHEMA, "command": pytest_command,
+                    "request": diagnostic_request(args),
                     "cwd": str(root), "exit_code": result.returncode,
                     "stdout": result.stdout, "stderr": result.stderr,
                 },
@@ -985,16 +1050,6 @@ def execute_selected(
         payload["status"] = "pytest-failed"
         emit(payload)
         return result.returncode if result.returncode > 0 else 1
-    try:
-        cleanup_pytest_diagnostic(
-            diagnostic_path,
-            prune_parent=args.diagnostic_output is None,
-        )
-    except OSError as exc:
-        pytest_payload["diagnostic_error"] = f"{type(exc).__name__}: {exc}"
-        payload["status"] = "diagnostic-cleanup-failed"
-        emit(payload)
-        return CONFIGURATION_EXIT_CODE
     payload["status"] = "passed"
     emit(payload)
     return 0

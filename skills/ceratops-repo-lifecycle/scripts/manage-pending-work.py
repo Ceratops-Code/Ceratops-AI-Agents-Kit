@@ -507,7 +507,6 @@ def record_scope(
 ) -> dict[str, object]:
     """Atomically advance one integration target's selected source scope."""
 
-    preserve_check_references.expire_stale_check_scopes(repo_root)
     if not source_branches:
         raise PendingWorkError("At least one source branch is required.")
     _validate_branch(repo_root, target_branch)
@@ -719,7 +718,6 @@ def record_scope(
         target_branch=target_branch,
         target_commit=target_commit,
     )
-    preserve_check_references.expire_stale_check_scopes(repo_root)
     result: dict[str, object] = {
         "status": "ready",
         "target_branch": target_branch,
@@ -741,7 +739,6 @@ def check_scope(
 ) -> dict[str, object]:
     """Recheck every branch named by one exact persisted scope."""
 
-    preserve_check_references.expire_stale_check_scopes(repo_root)
     expected_path = _scope_path(repo_root, target_branch)
     if path.resolve() != expected_path:
         raise PendingWorkError(
@@ -800,7 +797,6 @@ def prepare_scope(
 ) -> dict[str, object]:
     """Resume the recorded target identity and recheck its selected scope."""
 
-    preserve_check_references.expire_stale_check_scopes(repo_root)
     _validate_branch(repo_root, target_branch)
     path = _scope_path(repo_root, target_branch)
     if not path.exists():
@@ -869,11 +865,6 @@ def finalize_scope(
             "removed": [],
             "pending_work_scope": "",
         }
-    if not _read_scope(path)["sources"]:
-        # There is no source-cleanup batch. Its live branch still owns these
-        # observations until the candidate advances or disappears.
-        return {"status": "finalized", "removed": [], "pending_work_scope": str(path),
-                "retained_check_candidate": True}
     if require_output(
         _git(repo_root, "branch", "--show-current"), cwd=repo_root
     ).strip() != current_branch:
@@ -989,6 +980,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repo-root", type=pathlib.Path, default=pathlib.Path.cwd())
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    discard = subparsers.add_parser("discard-check-references")
+    discard.add_argument("--target-branch", required=True)
+
     prepare = subparsers.add_parser("prepare")
     prepare.add_argument("--target-branch", required=True)
     prepare.add_argument("--target-commit")
@@ -1026,7 +1020,9 @@ def main(argv: list[str] | None = None) -> int:
             else repo_root / args.scope
         ).resolve()
     try:
-        if args.command == "prepare":
+        if args.command == "discard-check-references":
+            result = preserve_check_references.discard_check_references(repo_root, args.target_branch)
+        elif args.command == "prepare":
             result = prepare_scope(
                 repo_root,
                 target_branch=args.target_branch,
