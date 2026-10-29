@@ -2210,9 +2210,9 @@ and executable tools. The shared operation executor reads these inputs before
 callbacks. It supplies the existing five result arguments to one declared runner
 command; unmarked custom operations retain their existing interface.
 
-The runner writes actual outcomes to
-`<git-common-dir>/ceratops/results/repository-checks/<worktree-id>/check_results.json`, completing
-each entry before returning success. Records preserve the original work/check
+Under `<git-common-dir>/ceratops/`, the runner writes actual outcomes to
+`results/repository-checks/<worktree-id>/check_results.json`, completing each
+entry before returning success. Records preserve the original work/check
 versions, scope, timing, qualification and executed result identity. A later
 operation consumes an eligible original pass instead of executing that check.
 Missing or changed inputs require their checks; corrupt/conflicting evidence
@@ -2224,8 +2224,8 @@ writer produces the same format. An entry reference hashes that entry's original
 facts, not the changing whole file. No checkpoint lock, branch reference list or
 per-execution history controls local retention. Each check/target retains one
 outcome. The document is bounded to 64 MiB and repository-check records to 8 MiB.
-Explicit `run-tests.py --consolidate-results [WORKTREE]` combines old files for the selected
-worktree, saves their latest actual outcomes, then deletes superseded files.
+Explicit `run-tests.py --consolidate-results [WORKTREE]` combines old files for
+the selected worktree, saves their latest outcomes, then deletes superseded files.
 Interrupted conversion can be called again. Unknown owners or missing original
 facts are reported and retained; normal calls do not perform this scan.
 Skill-update request cleanup first saves any remaining actual check observations;
@@ -2248,7 +2248,8 @@ assembly and release/receipt adoption remain later work.
 
 Promotion scope files contain source branches selected for later cleanup, not
 references that keep old local test executions. The explicit one-time
-`manage-pending-work.py --repo-root <worktree> discard-check-references --target-branch <branch>`
+`manage-pending-work.py --repo-root <worktree> discard-check-references
+--target-branch <branch>`
 command removes the former `check_results` field under the existing release lock.
 It preserves source branch records and deletes a scope containing no source work.
 Ordinary scope reads do not perform conversion. Repeating the command after an

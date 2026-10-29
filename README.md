@@ -1489,7 +1489,8 @@ Completed build receipts reference `.build/<unit>/<version>[/<target>]/check_sum
 by Git path and hash in the tagged commit. Failed/test-only calls create no
 completed build receipt or tag. Deleting local results does not change a tag.
 
-Run `uv run --project scripts --locked python scripts/testing/run-tests.py --consolidate-results [WORKTREE]`
+Run `uv run --project scripts --locked python scripts/testing/run-tests.py
+--consolidate-results [WORKTREE]`
 once to combine the named worktree's former `pytest-pass-*.json`,
 `pytest-attempt-*.json`, imported baselines and whole-check files. It saves the
 latest actual outcomes before deleting superseded files, can finish interrupted
@@ -1497,7 +1498,8 @@ deletion, and reports unknown ownership or missing facts without guessing.
 Omit `WORKTREE` for this checkout. Normal test calls do not scan those files or
 other worktrees. Retained packages and old report references do not retain local
 execution history. For an older promotion scope, explicitly run the repo-lifecycle
-entrypoint `manage-pending-work.py --repo-root <worktree> discard-check-references --target-branch <branch>`;
+entrypoint `manage-pending-work.py --repo-root <worktree> discard-check-references
+--target-branch <branch>`;
 it removes only the old result-reference list, keeping source cleanup records.
 After matching requested checks succeed, their failure report is removed only
 after outcomes are saved. A fresh call can finish interrupted report deletion
@@ -2071,9 +2073,9 @@ new artifact checks still run. Corrupt evidence blocks the operation.
 Results live in each worktree's `results/repository-checks/<worktree-id>/check_results.json`
 under `<git-common-dir>/ceratops/`. Source cleanup scopes do not retain check
 history. Each check/target has one latest outcome; a corrected pass replaces its
-failure. Checkpoints and disposable reports are not acceptance authorities. Checks marked
-`no_result_reuse`, distributed execution and unrepresented child scope also
-prevent aggregate reuse; ordinary child passes keep their original identities.
+failure. Checkpoints and disposable reports are not acceptance authorities.
+Checks marked `no_result_reuse`, distributed execution and unrepresented child
+scope also prevent aggregate reuse; ordinary child passes keep their identities.
 
 `--qualification-level` selects required alpha/beta/rc/final eligibility;
 ordinary checks default to alpha and promotion tests to beta. The portable
