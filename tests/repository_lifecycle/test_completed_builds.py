@@ -173,8 +173,7 @@ def test_completion_binds_original_summary_facts_to_current_source(tmp_path, cha
     summary["checks"] = [check]
     writer = runpy.run_path(str(pathlib.Path(__file__).resolve().parents[2] / "scripts/result_records.py"))
     current = writer["CurrentCheckResults"](repository)
-    current_record = {key: value for key, value in check.items() if key != "inputGroup"}
-    current_record["inputs"] = inputs
+    current_record = {**{key: value for key, value in check.items() if key != "inputGroup"}, "inputs": inputs}
     current.put("pytest", check["id"], {"target": target}, current_record)
     original_current = current.path.read_bytes()
     if changed:

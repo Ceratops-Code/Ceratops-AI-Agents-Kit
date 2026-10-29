@@ -38,8 +38,11 @@ def test_old_whole_check_conversion_keeps_the_latest_entry_without_retesting(tmp
         path.parent.mkdir(parents=True, exist_ok=True)
         args = _request(path)
         args.result_id = identity
+        def execute_status(status=status):
+            calls.append(status)
+            return status
         assert writer["run_recorded_check"](
-            lambda status=status: calls.append(status) or status, args, {}, repo_root=tmp_path,
+            execute_status, args, {}, repo_root=tmp_path,
         ) == status
         paths.append(path)
     original = json.loads(paths[-1].read_text())
@@ -225,8 +228,11 @@ def test_repository_checks_share_current_file_with_individual_tests(check_writer
     args = _request(current.path)
     for status, identity in ((1, "failed-run"), (0, "corrected-run")):
         args.result_id = identity
+        def execute_status(identity=identity, status=status):
+            calls.append(identity)
+            return status
         assert check_writer["run_recorded_check"](
-            lambda identity=identity, status=status: calls.append(identity) or status, args, {}, repo_root=tmp_path,
+            execute_status, args, {}, repo_root=tmp_path,
         ) == status
     assert check_writer["run_recorded_check"](
         lambda: pytest.fail("saved success must not execute again"), args, {}, repo_root=tmp_path,

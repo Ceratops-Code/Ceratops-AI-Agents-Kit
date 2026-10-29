@@ -585,7 +585,7 @@ def _preserve_request_results(state: dict[str, Any], result: dict[str, Any]) -> 
     current = CurrentCheckResults(pathlib.Path(state["repo_root"]))
     target = _check_target(state)
     saved = {record["check_id"] for record in current.records("skill-check", target=target)}
-    outcomes = []
+    outcomes: list[tuple[str, str, dict[str, Any], Mapping[str, Any]]] = []
     for index, observed in enumerate(result["checks"]):
         check = state["checks"][index]
         identity = record_hash(check)
