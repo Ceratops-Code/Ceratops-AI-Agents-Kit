@@ -79,6 +79,32 @@ def _workflow(monkeypatch):
     return runpy.run_path(str(SKILL_UPDATE_WORKFLOW))
 
 
+@pytest.mark.parametrize("after_save", [False, True])
+def test_request_results_survive_cleanup_preparation_without_inventing_check_versions(tmp_path, monkeypatch, capsys, after_save):
+    root, _, _, _, _ = _case(tmp_path)
+    workflow = _workflow(monkeypatch)
+    current_class = workflow["CurrentCheckResults"]
+    state = {"repo_root": str(root), "selected_skills": ["alpha-tool"],
+             "checks": [{"kind": "search", "paths": [SOURCE], "pattern": "VALUE", "expected_matches": 1}]}
+    result = {"checks": [{"kind": "search", "status": "passed"}], "input_sha256": "a" * 64}
+    actual = current_class.put_many
+    def interrupt(current, records):
+        if after_save:
+            actual(current, records)
+        raise OSError("interrupted save")
+    with monkeypatch.context() as patch:
+        patch.setattr(current_class, "put_many", interrupt)
+        with pytest.raises(OSError, match="interrupted save"):
+            workflow["_preserve_request_results"](state, result)
+    for _ in range(2):
+        workflow["_preserve_request_results"](state, result)
+    saved = current_class(root).records("skill-check")
+    assert len(saved) == 1 and saved[0]["status"] == "passed"
+    assert saved[0]["check_version"] is None and saved[0]["reuse_unavailable"]
+    assert saved[0]["result_id"] == f"{workflow['record_hash'](result)}:0"
+    assert "original check-code version is unavailable" in capsys.readouterr().err
+
+
 def test_init_and_run_drive_update_without_caller_request_json(tmp_path):
     root, scope, _ = prepare_skill_update_workflow_worktree(tmp_path)
     command_file = scope / "command-arguments.txt"
@@ -250,8 +276,8 @@ def test_git_supplies_current_changed_files(tmp_path, entry, kind):
 def test_new_git_path_written_by_check_is_not_silently_accepted(tmp_path):
     root, _, _, request, data = _case(tmp_path)
     data["checks"] = [{"kind": "command", "argv": [sys.executable, "-c",
-        "from pathlib import Path; p=Path('new.txt'); "
-        "p.write_text('new input\\n', encoding='utf-8') if not p.exists() else None"]}]
+        ("from pathlib import Path; p=Path('new.txt'); "
+         "p.write_text('new input\\n', encoding='utf-8') if not p.exists() else None")]}]
     _request(request, data)
     _ok(root, "open_skill_change", request)
     _edit(root)
@@ -451,6 +477,20 @@ def test_checks_preserve_initial_edits_and_record_failures(tmp_path, fault):
     assert directory.is_dir()
 
 
+def test_changed_inputs_during_a_check_cannot_be_reused_after_restoring_source(tmp_path):
+    root, scope, _, request, data = _case(tmp_path)
+    counter = scope / "runs"
+    data["checks"] = [{"kind": "command", "argv": [sys.executable, "-c",
+        (f"from pathlib import Path; p=Path({str(counter)!r}); p.write_text(p.read_text()+'x' if p.exists() else 'x'); "
+         f"Path({SOURCE!r}).write_text('VALUE = 3\\n')")]}]
+    _request(request, data)
+    _ok(root, "open_skill_change", request)
+    for _ in range(2):
+        _edit(root)
+        assert _run(root, "run_skill_checks").returncode == 2
+    assert counter.read_text() == "xx"
+
+
 def test_exact_passed_checks_are_reused_and_close_does_not_recheck_source(tmp_path):
     root, scope, _, request, data = _case(tmp_path)
     count = scope / "runs"
@@ -473,6 +513,12 @@ def test_exact_passed_checks_are_reused_and_close_does_not_recheck_source(tmp_pa
     _ok(root, "close_skill_change")
     assert not directory.exists()
     assert (root / "later-unrelated-work.txt").read_text() == "preserve"
+    common = pathlib.Path(run_git(root, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip())
+    current = list((common / "ceratops/results/repository-checks").glob("*/check_results.json"))
+    assert len(current) == 1
+    checks = [entry["record"] for entry in json.loads(current[0].read_text())["entries"].values()]
+    assert checks[0]["returncode"] == 0 and checks[0]["result_id"]
+    assert checks[0]["check_version"]
 
 
 def test_failed_checks_reuse_successful_commands_for_exact_inputs(tmp_path):

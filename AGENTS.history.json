@@ -358,6 +358,15 @@
       "decision": "Replace the blanket path prohibition from the earlier 'Replace helper-location mechanics with repository ownership of alignment between the skill-runtime execution contract, its producers and consumers, and its behavioral tests' decision with deterministic helper invocation requirements: helper-using skill and action instructions must name the exact helper command, every required argument, and each runtime value's source.",
       "reason": "Installed skill workflows need a complete portable invocation contract; forbidding path construction makes executable instructions incomplete even when runtime paths are resolved portably.",
       "regression": "Preserve producer-consumer-test alignment, portable runtime resolution, repository-owned helper behavior, and the ban on user-local absolute paths; do not permit vague, partial, or divergent helper invocations."
+    },
+    {
+      "rules": [
+        "SKILLS-GOV-01",
+        "SKILLS-PORT-01"
+      ],
+      "decision": "Use exact current evidence for local proposal scope and ownership; make local portability guidance follow the global path policy.",
+      "reason": "The user approved removing redundant proposal reads and the broader external-runtime path exception. This narrows those portions of the earlier decision beginning Repository governance uses current control sources while retaining its current-source and portability objectives.",
+      "regression": "Keep global mandatory disk reads before edits, fresh-evidence reuse, exact scope and ownership assessment, and the global automation cwds exception. Resolve only these two local list-heavy markers; retain all other local rules."
     }
   ]
 }

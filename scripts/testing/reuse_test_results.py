@@ -6,15 +6,11 @@ hashes identify those inputs, while pytest's three successful phase reports
 prove execution. Fresh calls collect the current tests and consume matching
 passes, without execution IDs, saved steps or progress-log parsing.
 
-The owning store is <git-common-dir>/ceratops/results/repository-checks/. This
-producer owns pytest-attempt-*.json, retained pytest-pass-*.json and .pytest-pass.lock there. It writes
-immutable records directly to final paths under the existing filelock library.
-Explicit imports use one pytest-baseline-<checkout-hash>.json per checkout;
-selected Git build summaries retire that local copy after carrying its passes.
-Startup opens and prunes only the collected checkout/check groups; each completed
-write prunes its affected group. Both retain at most three versions per qualification level,
-preserving referenced facts and failure precedence.
-Other producers' results and live writers are left alone.
+Each worktree has one current check_results.json under the Git common results
+directory. Each finished test replaces only its own target's entry; other checks
+and their original identities survive partial runs. Completed Git build summaries
+remain independent. A fixed in-process JSON write protects saved results without
+a worktree lock or per-execution history.
 """
 
 from __future__ import annotations
@@ -28,6 +24,7 @@ import pathlib
 import platform
 import runpy
 import shutil
+import stat
 import subprocess
 import sys
 import sysconfig
@@ -39,7 +36,6 @@ from contextvars import ContextVar
 from typing import Any
 
 import pytest
-from filelock import FileLock, Timeout
 from packaging.requirements import Requirement
 from select_test_groups import (
     ImpactError,
@@ -54,13 +50,9 @@ from select_test_groups import (
 RESULT_CONTEXT_ENV = "CERATOPS_PYTEST_RESULT_CONTEXT"
 RESULT_SUMMARY_ENV = "CERATOPS_PYTEST_RESULT_SUMMARY"
 SCHEMA = "ceratops-pytest-attempt.v1"
-LEGACY_RESULT_SCHEMA = "ceratops-pytest-pass.v1"
 LEVELS = ("alpha", "beta", "rc", "final")
-MAX_GROUP_RECORD_BYTES = 8 * 1024 * 1024
 CONTEXT_SCHEMA = "ceratops-pytest-inputs.v1"
-RETAINED_VERSIONS = 3
 SUMMARY_SCHEMA = "ceratops-check-summary.v1"
-BASELINE_SCHEMA = "ceratops-imported-test-baseline.v1"
 BUILD_REUSE_LEVEL: ContextVar[str | None] = ContextVar("build_reuse_level", default=None)
 
 
@@ -169,28 +161,20 @@ def compose_imported_test_summary(
 
 
 def write_test_baseline(root: pathlib.Path, summary: Mapping[str, Any]) -> pathlib.Path:
-    """Install one explicit baseline for this checkout, without altering evidence.
-
-    A repeated identical import has no effect. A partial direct write can be
-    replaced by repeating the explicit import; normal test runs never accept it.
-    This is an accepted-result input, not an execution checkpoint. One file per
-    checkout is retained until its results are carried by tagged build summaries.
-    """
+    """Import original outcomes into current results without replacing newer work."""
     reader = runpy.run_path(str(pathlib.Path(__file__).resolve().parents[1] / "result_records.py"))
     reader["parse_check_summary"](_json(summary))
-    common = pathlib.Path(_git(root, "rev-parse", "--path-format=absolute", "--git-common-dir").decode().strip())
-    directory = common / "ceratops/results/repository-checks"
-    directory.mkdir(parents=True, exist_ok=True)
-    checkout = _digest(str(root.resolve()))
-    destination = directory / f"pytest-baseline-{checkout}.json"
-    payload = _json({"schema": BASELINE_SCHEMA, "checkout": checkout, "summary": summary}) + b"\n"
-    with FileLock(str(directory / ".pytest-pass.lock"), timeout=0):
-        if not destination.exists() or destination.read_bytes() != payload:
-            with destination.open("wb") as stream:
-                stream.write(payload)
-                stream.flush()
-                os.fsync(stream.fileno())
-    return destination
+    current = reader["CurrentCheckResults"](root)
+    target = {"platform": platform.system(), "architecture": platform.machine()}
+    existing = {item["nodeid"]: item for item in current.records("pytest", target=target)}
+    imported: dict[str, list[dict[str, Any]]] = {}
+    ResultStore._load_summary(summary, imported, {"imported": True})
+    for nodeid, records in imported.items():
+        record = max(records, key=lambda item: (item["completed_ns"], item["result_id"]))
+        previous = existing.get(nodeid)
+        if previous is None or record["completed_ns"] > previous["completed_ns"]:
+            current.put("pytest", nodeid, target, record)
+    return current.path
 
 
 def _git(root: pathlib.Path, *arguments: str) -> bytes:
@@ -232,6 +216,9 @@ def result_environment(
         context["qualificationLevel"] = owner["qualificationLevel"]
     elif level := BUILD_REUSE_LEVEL.get():
         context["qualificationLevel"] = level
+    else:
+        branch = _git(root, "branch", "--show-current").decode().strip()
+        context["qualificationLevel"] = "beta" if branch == "release/local" else "alpha"
     return {RESULT_CONTEXT_ENV: _json(context).decode()}
 
 
@@ -304,15 +291,15 @@ class ResultStore:
         self.root = root.resolve()
         common = pathlib.Path(_git(root, "rev-parse", "--path-format=absolute", "--git-common-dir").decode().strip())
         self.common = common
-        self.directory = common / "ceratops/results/repository-checks"
-        self.directory.mkdir(parents=True, exist_ok=True)
-        self.lock = FileLock(str(self.directory / ".pytest-pass.lock"), timeout=0)
+        reader = runpy.run_path(str(pathlib.Path(__file__).resolve().parents[1] / "result_records.py"))
+        self.current = reader["CurrentCheckResults"](self.root)
+        self.directory = self.current.path.parent
+        self.target = {"platform": platform.system(), "architecture": platform.machine()}
         self.checkout = _digest(str(self.root))
         self.unsaved_reasons: dict[str, str] = {}
         self.qualification_level = context.get("qualificationLevel")
         if self.qualification_level is not None and self.qualification_level not in LEVELS:
             raise ValueError("unsupported pytest qualification level")
-        self.protected_ids = self._group_references()
         self.manifest = load_manifest(self.root / "tests/test-impact.json")
         ignored = [pattern for item in self.manifest.ignored_paths for pattern in item.paths]
         names = _git(root, "ls-files", "--cached", "--others", "--exclude-standard", "-z").decode("utf-8").split("\0")
@@ -349,10 +336,21 @@ class ResultStore:
             "producer": _digest({name: hashlib.sha256(pathlib.Path(__file__).with_name(name).read_bytes()).hexdigest()
                                  for name in ("reuse_test_results.py", "select_test_groups.py")}),
         }
-        self.records_by_check: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        self.records_by_check: dict[tuple[str, str], list[dict[str, Any]]] = {
+            (self.checkout, record["nodeid"]): [record]
+            for record in self.current.records("pytest", target=self.target)
+        }
+        for records in self.records_by_check.values():
+            record = records[0]
+            if (record.get("outcome") not in {"passed", "failed", "interrupted", "skipped"}
+                    or not isinstance(record.get("result_id"), str)
+                    or type(record.get("completed_ns")) is not int
+                    or record.get("inputs_digest") != _digest(record.get("inputs"))
+                    or (record["outcome"] == "passed" and record.get("phases") != {
+                        "setup": "passed", "call": "passed", "teardown": "passed",
+                    })):
+                raise ValueError("Current pytest result conflicts with its recorded execution facts.")
         self.tagged_by_check: dict[str, list[dict[str, Any]]] = {}
-        self.imported_by_check: dict[str, list[dict[str, Any]]] = {}
-        self.retention_passes: list[dict[str, Any]] | None = None
         self.reuse_reasons: dict[str, dict[str, Any]] = {}
         self.comparison_groups: dict[tuple[str, tuple[str, ...]], tuple[Suite, tuple[str, ...]]] = {}
         if self.qualification_level is not None:
@@ -365,33 +363,7 @@ class ResultStore:
             ):
                 self._load_summary(build["summary"], self.tagged_by_check,
                                    {"build": {key: build[key] for key in ("tag", "commit", "receiptPath")}})
-        baseline = self.directory / f"pytest-baseline-{self.checkout}.json"
-        if baseline.exists():
-            raw = baseline.read_bytes()
-            value = json.loads(raw)
-            if (raw != _json(value) + b"\n" or value.get("schema") != BASELINE_SCHEMA
-                    or value.get("checkout") != self.checkout):
-                raise ValueError("Imported test baseline is incomplete or belongs to another checkout")
-            reader = runpy.run_path(str(pathlib.Path(__file__).resolve().parents[1] / "result_records.py"))
-            summary = reader["parse_check_summary"](_json(value["summary"]))
-            self._load_summary(summary, self.imported_by_check, {"imported": True})
-            tagged_ids = {record["result_id"] for records in self.tagged_by_check.values() for record in records}
-            imported_ids = {record["result_id"] for records in self.imported_by_check.values() for record in records}
-            if imported_ids and imported_ids <= tagged_ids:
-                # The same original facts now live in selected Git builds.
-                # Losing this bounded local copy cannot cause tests to rerun.
-                with self.lock:
-                    if baseline.read_bytes() == raw:
-                        baseline.unlink()
-                self.imported_by_check.clear()
         self.inputs_by_group: dict[str, dict[str, Any]] = {}
-        # Inventory names once, then open only this invocation's collected
-        # checks. Reading every past check in every worktree dominated startup.
-        self.paths_by_group: dict[str, list[pathlib.Path]] = {}
-        for path in self.directory.iterdir():
-            if path.name.startswith(("pytest-pass-", "pytest-attempt-")):
-                group = path.name.removeprefix("pytest-pass-").removeprefix("pytest-attempt-").split("-", 1)[0]
-                self.paths_by_group.setdefault(group, []).append(path)
 
     @staticmethod
     def _load_summary(summary: Mapping[str, Any], target: dict[str, list[dict[str, Any]]],
@@ -420,15 +392,21 @@ class ResultStore:
             })
 
     def _load_check(self, nodeid: str) -> None:
-        key = (self.checkout, nodeid)
-        if key in self.records_by_check:
-            return
-        try:
-            with self.lock:
-                self.records_by_check[key] = self._read_records(_digest([self.checkout, nodeid])[:24])
-                self._prune(key)
-        except Timeout:
-            pass  # A competing writer cannot delay a fresh test invocation.
+        self.records_by_check.setdefault((self.checkout, nodeid), [])
+
+    def discard_deleted_checks(self, collected: set[str], selectors: Sequence[str]) -> None:
+        """Prune missing source files, never files omitted by collection hooks."""
+        covered = [value.replace("\\", "/").removesuffix("/") for value in selectors if "::" not in value]
+        deleted = {
+            nodeid for checkout, nodeid in self.records_by_check
+            if checkout == self.checkout and nodeid not in collected
+            and self._stat(self.root / nodeid.split("::", 1)[0]) is None
+            and any(value == "." or nodeid.split("::", 1)[0] == value
+                    or nodeid.split("::", 1)[0].startswith(value + "/") for value in covered)
+        }
+        self.current.remove_deleted("pytest", deleted, self.target)
+        for nodeid in deleted:
+            self.records_by_check.pop((self.checkout, nodeid), None)
 
     @staticmethod
     def _stat(path: pathlib.Path) -> tuple[int, int] | None:
@@ -481,7 +459,7 @@ class ResultStore:
     def matching(self, nodeid: str, inputs: Mapping[str, Any]) -> dict[str, Any] | None:
         self._load_check(nodeid)
         records = [*self.records_by_check.get((inputs["checkout"], nodeid), []),
-                   *self.tagged_by_check.get(nodeid, []), *self.imported_by_check.get(nodeid, [])]
+                   *self.tagged_by_check.get(nodeid, [])]
         candidates = sorted((record for record in records if self._same_inputs(record, inputs)),
                             key=lambda record: (record["completed_ns"], record["result_id"]), reverse=True)
         self.reuse_reasons[nodeid] = {"decision": "execute", "reason": "No recorded result for this check."}
@@ -494,10 +472,8 @@ class ResultStore:
                 return None
             changed_paths: list[str] = []
             if self._current(inputs, changed_paths=changed_paths):
-                self.protected_ids.add(record["result_id"])
                 self.reuse_reasons[nodeid] = {
                     "decision": "reuse", "reason": ("Git build summary." if "build" in record else
-                                                      "Explicitly imported test baseline." if "imported" in record else
                                                       "Current worktree result."),
                     "result_id": record["result_id"], **({"build": record["build"]} if "build" in record else {}),
                 }
@@ -645,7 +621,6 @@ class ResultStore:
             return {**record["summary_reference"], "reused": reused,
                     "inputs": record["inputs"], **applicability,
                     **{key: record[key] for key in ("build", "comparison_inputs") if key in record}}
-        path = self._record_path(record)
         return {
             "id": record["nodeid"], "status": record["outcome"], "result_id": record["result_id"],
             "qualificationLevel": record.get("qualificationLevel"), "reused": reused,
@@ -657,35 +632,9 @@ class ResultStore:
             }),
             "inputs_digest": record["inputs_digest"], "completed_ns": record["completed_ns"],
             "inputs": record["inputs"], "phases": record["phases"],
-            "path": path.relative_to(self.common).as_posix(),
-            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "path": self.current.path.relative_to(self.common).as_posix(),
+            "sha256": hashlib.sha256(_json(record) + b"\n").hexdigest(),
         }
-
-    def _record_path(self, record: Mapping[str, Any]) -> pathlib.Path:
-        prefix = "pytest-pass" if record["schema"] == LEGACY_RESULT_SCHEMA else "pytest-attempt"
-        return self.directory / f'{prefix}-{record["result_id"]}.json'
-
-    def _group_references(self) -> set[str]:
-        """Gather retained outer owners once; per-test saves never rescan them."""
-        protected: set[str] = set()
-        for path in self.directory.glob("*.json"):
-            try:
-                uuid.UUID(path.stem)
-            except ValueError:
-                continue
-            if path.is_symlink() or not path.is_file():
-                raise ValueError("pytest outcome reference owner is not a regular file")
-            with path.open("rb") as stream:
-                raw = stream.read(MAX_GROUP_RECORD_BYTES + 1)
-            if len(raw) > MAX_GROUP_RECORD_BYTES:
-                raise ValueError("pytest outcome reference owner exceeds the size limit")
-            owner = json.loads(raw)
-            if not isinstance(owner, dict) or owner.get("schema") != "ceratops-repository-check-result.v1":
-                continue
-            for check in owner.get("checks", []):
-                if isinstance(check, dict) and isinstance(check.get("result_id"), str):
-                    protected.add(check["result_id"])
-        return protected
 
     def _current(self, inputs: Mapping[str, Any], *, changed_paths: list[str] | None = None) -> bool:
         """Reject edits made after collection's snapshot without rejecting touches."""
@@ -709,201 +658,186 @@ class ResultStore:
                 changed_paths.append(name)
         return not changed_paths
 
-    def _read_records(self, group: str | None = None) -> list[dict[str, Any]]:
-        records = []
-        for paths in ([self.paths_by_group.get(group, [])] if group else self.paths_by_group.values()):
-            for path in paths:
-                prefix = "pytest-attempt" if path.name.startswith("pytest-attempt-") else "pytest-pass"
-                try:
-                    raw = path.read_bytes()
-                    record = json.loads(raw)
-                    if not isinstance(record, dict):
-                        raise ValueError("outcome must be a JSON object")
-                    legacy = record.get("schema") == LEGACY_RESULT_SCHEMA
-                    phases = record.get("phases")
-                    outcome = record.get("outcome")
-                    if not (
-                        isinstance(record, dict) and record.get("schema") in {SCHEMA, LEGACY_RESULT_SCHEMA}
-                        and path == self._record_path(record)
-                        and isinstance(record["nodeid"], str)
-                        and type(record["completed_ns"]) is int
-                        and isinstance(record["inputs"], dict)
-                        and isinstance(record["inputs"]["checkout"], str)
-                        and isinstance(phases, dict)
-                        and set(phases).issubset({"setup", "call", "teardown"})
-                        and all(value in {"passed", "failed", "skipped", "xfail"} for value in phases.values())
-                        and outcome in {"passed", "failed", "interrupted"}
-                        and (not legacy or outcome == "passed")
-                        and (outcome != "passed" or phases == {"setup": "passed", "call": "passed", "teardown": "passed"})
-                        and (outcome != "failed" or "failed" in phases.values())
-                        and ("qualificationLevel" not in record or record["qualificationLevel"] in LEVELS)
-                        and record["inputs_digest"] == _digest(record["inputs"])
-                        and (prefix != "pytest-attempt" or (
-                            raw == _json(record) + b"\n"
-                            and set(record).issubset({
-                                "schema", "result_id", "nodeid", "completed_ns", "outcome",
-                                "inputs", "inputs_digest", "phases", "qualificationLevel",
-                            })
-                        ))
-                    ):
-                        raise ValueError("terminal outcome fields or original inputs conflict")
-                    records.append(record)
-                except (ValueError, KeyError, TypeError) as exc:
-                    if prefix == "pytest-attempt":
-                        raise ValueError(
-                            "Malformed, incomplete or conflicting pytest attempt evidence "
-                            f"blocks reuse of earlier passes: {path.name}: {exc}"
-                        ) from exc
-                    path.unlink(missing_ok=True)
-        return sorted(records, key=lambda record: (record["completed_ns"], record["result_id"]))
-
-    def _prune(self, check_group: tuple[str, str] | None = None) -> None:
-        """Prune all groups at startup or only the saved checkout/test group.
-
-        Every retention and failure-precedence relationship stays within one
-        checkout/test. Indexing that boundary also avoids traversing unrelated
-        records during refresh and matching. The caller holds the writer lock;
-        each successful removal updates memory only after its file is gone.
-        """
-        selected = (check_group,) if check_group is not None else self.records_by_check
-        for key in selected:
-            records = self.records_by_check[key]
-            levels: dict[str | None, list[dict[str, Any]]] = {}
-            identities: dict[str, list[dict[str, Any]]] = {}
-            for record in records:
-                levels.setdefault(record.get("qualificationLevel"), []).append(record)
-                identities.setdefault(record["inputs_digest"], []).append(record)
-            keep: set[str] = set()
-            for group in levels.values():
-                keep.update(record["result_id"] for record in group[-RETAINED_VERSIONS:])
-            # A failure remains necessary while a retained earlier pass could
-            # otherwise be selected at a level no later pass covers.
-            for attempts in identities.values():
-                failures = [record for record in attempts if record["outcome"] != "passed"]
-                if not failures:
-                    continue
-                latest = failures[-1]
-                for earlier in attempts:
-                    if ((earlier["result_id"] not in keep and earlier["result_id"] not in self.protected_ids)
-                            or earlier["outcome"] != "passed"
-                            or earlier["completed_ns"] >= latest["completed_ns"]):
-                        continue
-                    original = earlier.get("qualificationLevel")
-                    resolved = any(
-                        later["outcome"] == "passed" and later["completed_ns"] > latest["completed_ns"]
-                        and ((original is None and later.get("qualificationLevel") is None)
-                             or (original in LEVELS and later.get("qualificationLevel") in LEVELS
-                                 and LEVELS.index(later["qualificationLevel"]) >= LEVELS.index(original)))
-                        for later in attempts
-                    )
-                    if not resolved:
-                        keep.add(latest["result_id"])
-            for record in list(records):
-                if (record["result_id"] not in keep and record["outcome"] != "passed"
-                        and self._failure_blocks_retained_pass(record, records, keep)):
-                    keep.add(record["result_id"])
-                if record["result_id"] not in keep and record["result_id"] not in self.protected_ids:
-                    self._record_path(record).unlink(missing_ok=True)
-                    records.remove(record)
-
-    def _failure_blocks_retained_pass(
-        self, failure: Mapping[str, Any], records: Sequence[Mapping[str, Any]], keep: set[str],
-    ) -> bool:
-        """Keep an expiring failure if deleting it could revive an older pass.
-
-        Current-check passes also matter after a group split changes their full
-        input digest but not their applicable inputs. Build lookup considers
-        only the selected build at each of four levels, not all history.
-        """
-        if self.retention_passes is None:
-            reader = runpy.run_path(str(pathlib.Path(__file__).resolve().parents[1] / "result_records.py"))
-            builds = {}
-            for level in LEVELS:
-                for build in reader["select_build_check_summaries"](self.root, qualification_level=level):
-                    builds[(build["tag"], build["receiptPath"])] = build
-            self.retention_passes = [
-                {**record, "id": nodeid} for nodeid, records in self.imported_by_check.items() for record in records
-            ]
-            for build in builds.values():
-                summary = build["summary"]
-                for check in summary["checks"]:
-                    if (check.get("kind") == "pytest" and check.get("status") == "passed"
-                            and check.get("qualificationLevel") in LEVELS
-                            and {"inputGroup", "checkGroup", "completed_ns"} <= check.keys()):
-                        self.retention_passes.append({**check, "build": True, "inputs": {
-                            **summary["inputGroups"][check["inputGroup"]],
-                            "check_inputs": summary["checkGroups"][check["checkGroup"]],
-                        }, **({"comparison_inputs": summary["inputGroups"][check["comparisonInputGroup"]]}
-                              if "comparisonInputGroup" in check else {})})
-        newer = [later for later in records if self._same_inputs(later, failure["inputs"])
-                 and later["completed_ns"] > failure["completed_ns"]]
-        if any(later["outcome"] != "passed" for later in newer):
-            return False  # The newer failure carries the same constraint.
-        baselines = [*self.retention_passes, *(
-            {**record, "id": record["nodeid"]} for record in records
-            if record["outcome"] == "passed"
-            and (record["result_id"] in keep or record["result_id"] in self.protected_ids)
-        )]
-        return any(
-            baseline["id"] == failure["nodeid"] and self._same_inputs(baseline, failure["inputs"])
-            and baseline["completed_ns"] <= failure["completed_ns"]
-            and not any((baseline.get("qualificationLevel") is None and later.get("qualificationLevel") is None)
-                        or (baseline.get("qualificationLevel") in LEVELS and later.get("qualificationLevel") in LEVELS
-                            and LEVELS.index(later["qualificationLevel"]) >= LEVELS.index(baseline["qualificationLevel"]))
-                        for later in newer)
-            for baseline in baselines
-        )
-
-    def _write_attempt(self, record: Mapping[str, Any]) -> None:
-        """Write directly to a non-reused final path; partial files are unaccepted."""
-        path = self._record_path(record)
-        with path.open("xb") as stream:
-            stream.write(_json(record) + b"\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-
     def save(
         self, nodeid: str, inputs: Mapping[str, Any], *,
         phases: Mapping[str, str] | None = None, outcome: str = "passed",
     ) -> dict[str, Any] | None:
-        """Persist one actual terminal outcome on unchanged original inputs."""
+        """Save this finished test before reporting it reusable."""
         self.unsaved_reasons.pop(nodeid, None)
         if not self._current(inputs):
             self.unsaved_reasons[nodeid] = "inputs-changed"
             return None
-        if outcome not in {"passed", "failed", "interrupted"}:
-            raise ValueError("pytest attempt requires a terminal outcome")
-        observed = dict(phases) if phases is not None else {"setup": "passed", "call": "passed", "teardown": "passed"}
+        if outcome not in {"passed", "failed", "interrupted", "skipped"}:
+            raise ValueError("pytest outcome must be terminal")
+        observed = dict(phases) if phases is not None else {
+            "setup": "passed", "call": "passed", "teardown": "passed",
+        }
+        record = {
+            "schema": SCHEMA, "result_id": uuid.uuid4().hex,
+            "nodeid": nodeid, "completed_ns": time.time_ns(),
+            "outcome": outcome, "inputs": dict(inputs),
+            "inputs_digest": _digest(inputs), "phases": observed,
+        }
+        if self.qualification_level is not None:
+            record["qualificationLevel"] = self.qualification_level
+        self.current.put("pytest", nodeid, self.target, record)
+        self.records_by_check[(self.checkout, nodeid)] = [record]
+        return record
+
+
+
+def consolidate_result_files(root: pathlib.Path) -> dict[str, Any]:
+    """Explicit one-time conversion for this checkout; never called at runner startup.
+
+    Inspect only the former shared result directory. Other worktrees' files and
+    incomplete records remain untouched. Save the newest real outcome for each
+    check/target before deleting any replaced file; repetition finishes deletion.
+    """
+    root = root.resolve()
+    writer = runpy.run_path(str(pathlib.Path(__file__).resolve().parents[1] / "result_records.py"))
+    current = writer["CurrentCheckResults"](root)
+    checkout = _digest(str(root))
+    operation_owner = hashlib.sha256(str(root).encode()).hexdigest()
+    old_directory = current.common / "ceratops/results/repository-checks"
+    # This explicit conversion reads direct children of one fixed directory.
+    # Check that parent chain once; inspect each file itself before both effects.
+    writer["result_path"](old_directory / ".conversion-location")
+    candidates: list[tuple[pathlib.Path, str]] = []
+    selected: dict[str, tuple[str, str, dict[str, Any], dict[str, Any]]] = {}
+    retained: dict[str, list[str]] = {}
+
+    def keep(path: pathlib.Path, reason: str) -> None:
+        retained.setdefault(reason, []).append(path.name)
+
+    def order(record: Mapping[str, Any]) -> tuple[int, str]:
+        if "completed_ns" in record:
+            return int(record["completed_ns"]), str(record["result_id"])
+        import datetime
+        stamp = datetime.datetime.fromisoformat(record["execution"]["finishedAt"])
+        return int(stamp.timestamp() * 1_000_000_000), str(record["result_id"])
+
+    def offer(kind: str, check: str, target: dict[str, Any], record: dict[str, Any]) -> None:
+        key = current._key(kind, check, target)
+        if (key not in selected or order(record) > order(selected[key][3])
+                or (order(record) == order(selected[key][3]) and "comparison_inputs" in record)):
+            selected[key] = kind, check, target, record
+
+    def pytest_target(inputs: Mapping[str, Any]) -> dict[str, Any]:
+        runtime = inputs.get("runtime", {})
+        # Historical records have no separate architecture field. Infer it only
+        # from their explicit Python build description, never from this machine.
+        if isinstance(runtime, list) and len(runtime) == 3:
+            runtime = {"version": runtime[1], "platform": runtime[2]}
+        if not isinstance(runtime, dict):
+            raise ValueError("original Python runtime is missing")
+        version = runtime.get("version", "")
+        saved_platform = runtime.get("platform", "")
+        if not isinstance(version, str) or not isinstance(saved_platform, str):
+            raise ValueError("original platform or architecture is missing")
+        architecture = next((name for name in ("AMD64", "x86_64", "arm64", "aarch64", "x86")
+                             if name in version or name in saved_platform), None)
+        os_name = next((name for name in ("Windows", "Linux", "Darwin")
+                        if saved_platform.startswith(name)), None)
+        if not architecture or not os_name:
+            raise ValueError("original platform or architecture is missing")
+        return {"platform": os_name, "architecture": architecture}
+
+    def add_pytest(record: dict[str, Any]) -> None:
+        if (record.get("inputs_digest") != _digest(record.get("inputs"))
+                or record.get("outcome") not in {"passed", "failed", "interrupted", "skipped"}
+                or not isinstance(record.get("result_id"), str)
+                or type(record.get("completed_ns")) is not int
+                or (record["outcome"] == "passed" and record.get("phases") != {
+                    "setup": "passed", "call": "passed", "teardown": "passed"})):
+            raise ValueError("original test facts are incomplete")
         try:
-            with self.lock:
-                group = _digest([self.checkout, nodeid])[:24]
-                check_group = (self.checkout, nodeid)
-                # A save refreshes just this check, including another invocation's
-                # completed file; unrelated records are neither read nor pruned.
-                self.paths_by_group[group] = [*self.directory.glob(f"pytest-attempt-{group}-*.json"),
-                                              *self.directory.glob(f"pytest-pass-{group}-*.json")]
-                self.records_by_check[check_group] = self._read_records(group)
-                record = self.matching(nodeid, inputs) if outcome == "passed" else None
-                if record is None:
-                    record = {
-                        "schema": SCHEMA, "result_id": group + "-" + uuid.uuid4().hex,
-                        "nodeid": nodeid, "completed_ns": time.time_ns(),
-                        "outcome": outcome, "inputs": dict(inputs),
-                        "inputs_digest": _digest(inputs), "phases": observed,
-                    }
-                    if self.qualification_level is not None:
-                        record["qualificationLevel"] = self.qualification_level
-                    self._write_attempt(record)
-                    self.paths_by_group[group].append(self._record_path(record))
-                    self.records_by_check[check_group].append(record)
-                self.protected_ids.add(record["result_id"])
-                self._prune(check_group)
-                return record
-        except Timeout:
-            self.unsaved_reasons[nodeid] = "store-busy"
-        return None
+            target = pytest_target(record["inputs"])
+        except ValueError:
+            # Explicit historical imports may carry the already established
+            # input comparison separately from their untouched original facts.
+            target = pytest_target(record.get("comparison_inputs", {}))
+        offer("pytest", record["nodeid"], target, record)
 
+    def read_old(path: pathlib.Path) -> bytes:
+        info = path.lstat()
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                or getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+            raise ValueError("old result must be one regular file, not a link")
+        return path.read_bytes()
 
+    paths = sorted(old_directory.glob("*.json"))
+    progress_at = time.monotonic()
+    for index, path in enumerate(paths, 1):
+        if time.monotonic() - progress_at >= 20:
+            print(f"[results] inspected {index}/{len(paths)} old files", file=sys.stderr, flush=True)
+            progress_at = time.monotonic()
+        if not (path.name.startswith(("pytest-pass-", "pytest-attempt-", "pytest-baseline-"))
+                or len(path.stem) == 36):
+            continue
+        try:
+            raw = read_old(path)
+            value = json.loads(raw)
+            if not isinstance(value, dict):
+                raise ValueError("result is not a JSON object")
+            schema = value.get("schema")
+            inputs = value.get("inputs", {})
+            if not isinstance(inputs, dict) or not isinstance(inputs.get("scope", {}), dict):
+                raise ValueError("original check inputs are incomplete")
+            owner = value.get("checkout") if schema == "ceratops-imported-test-baseline.v1" else (
+                inputs.get("scope", {}).get("worktree") if schema == "ceratops-repository-check-result.v1"
+                else inputs.get("checkout"))
+            if owner not in {checkout, operation_owner}:
+                keep(path, "different or unknown worktree")
+                continue
+            if schema in {"ceratops-pytest-pass.v1", SCHEMA}:
+                add_pytest(value)
+            elif schema == "ceratops-imported-test-baseline.v1":
+                imported: dict[str, list[dict[str, Any]]] = {}
+                ResultStore._load_summary(value["summary"], imported, {})
+                for records in imported.values():
+                    for record in records:
+                        add_pytest(record)
+                if len(imported) != len(value["summary"]["checks"]):
+                    keep(path, "summary includes outcomes without reusable input facts")
+                    continue
+            elif schema == "ceratops-repository-check-result.v1":
+                if (value.get("status") not in {"passed", "failed", "interrupted"}
+                        or not value.get("execution", {}).get("finishedAt")
+                        or not isinstance(value.get("result_id"), str)):
+                    raise ValueError("repository check has no completed execution")
+                expected = hashlib.sha256(writer["canonical"]({
+                    key: item for key, item in inputs.items()
+                    if key not in {"fingerprint", "workVersion", "qualificationLevel"}
+                })).hexdigest()
+                if inputs.get("fingerprint") != expected:
+                    raise ValueError("repository check input facts differ from their hash")
+                target = {key: item for key, item in inputs["scope"].items()
+                          if key not in {"worktree", "inputRules"}}
+                offer("repository-check", value["check_id"], target, value)
+            else:
+                raise ValueError("unrecognized result schema")
+            candidates.append((path, hashlib.sha256(raw).hexdigest()))
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            keep(path, str(exc))
+
+    # Current entries may be newer than files left by interrupted conversion.
+    for entry in current.value["entries"].values():
+        if entry["kind"] in {"pytest", "repository-check"}:
+            record = current._expand(entry["record"], current.value["inputGroups"])
+            offer(entry["kind"], entry["check_id"], entry["target"], record)
+    if selected:
+        current.put_many(list(selected.values()))
+    removed = 0
+    for path, digest in candidates:
+        if hashlib.sha256(read_old(path)).hexdigest() != digest:
+            keep(path, "file changed during conversion")
+            continue
+        path.unlink()
+        removed += 1
+    return {"status": "completed", "worktree": str(root), "current_file": str(current.path),
+            "saved_checks": len(selected), "removed_files": removed,
+            "retained": {reason: {"count": len(paths), "examples": paths[:10]}
+                         for reason, paths in retained.items()}}
 
 
 class ReusePasses:
@@ -924,7 +858,10 @@ class ReusePasses:
         self.skip_reasons: dict[str, str] = {}
         self.current_node: str | None = None
         self.collection_started = time.monotonic()
+        self.started_ns = time.time_ns()
         self.collection_finished: float | None = None
+        self.collection_filtered = False
+        self.collection_failed = False
 
     def _unrepresented(self, nodeid: str, reason: str) -> None:
         """Keep external or incomplete scope separate from original pass facts."""
@@ -933,19 +870,11 @@ class ReusePasses:
             "id": nodeid, "status": "scope-unrepresented", "reusable": False, "reason": reason,
         }
 
-    def _observe_unpersisted_pass(self, nodeid: str, phases: Mapping[str, str]) -> None:
-        """Let the durable aggregate own actual phases when optional storage is busy."""
-        if (self.store.unsaved_reasons.get(nodeid) != "store-busy"
-                or phases != {"setup": "passed", "call": "passed", "teardown": "passed"}):
-            return
-        inputs = self.inputs_by_node[nodeid]
-        self.passed_checks[nodeid] = {
-            "id": nodeid, "status": "passed", "reusable": True, "phases": dict(phases),
-            "reason": "Optional individual result storage is busy; the aggregate owns these actual phases.",
-            "qualificationLevel": self.store.qualification_level,
-            "check_version": _digest({"producer": inputs["producer"], "check_inputs": inputs["check_inputs"]}),
-            "inputs_digest": _digest(inputs),
-        }
+    def pytest_deselected(self, items: list[pytest.Item]) -> None:
+        self.collection_filtered = True
+
+    def pytest_collectreport(self, report: pytest.CollectReport) -> None:
+        self.collection_failed |= report.failed
 
     @pytest.hookimpl(trylast=True)
     def pytest_collection_modifyitems(self, config: pytest.Config, items: list[pytest.Item]) -> None:
@@ -968,6 +897,10 @@ class ReusePasses:
                         outside_configuration = True
                     else:
                         fixture_modules.append((path.parent, plugin))
+        if (not outside_configuration and not self.collection_filtered and not self.collection_failed
+                and not config.getoption("keyword") and not config.getoption("markexpr")
+                and not config.pluginmanager.hasplugin("xdist")):
+            self.store.discard_deleted_checks({item.nodeid for item in items}, config.args)
         for item in items:
             # pytest's distributed workers have different effect/teardown
             # ownership; until represented explicitly they execute normally.
@@ -1037,11 +970,11 @@ class ReusePasses:
         outcome = "passed" if phases == {
             "setup": "passed", "call": "passed", "teardown": "passed",
         } else ("failed" if "failed" in phases.values() else None)
-        if (outcome is None and self.skipped_phases.get(report.nodeid)
-                and not self.store._current(self.inputs_by_node[report.nodeid])):
-            # Save is deliberately absent for expected skips. Bind their actual
-            # phase boundary too; a later restoration cannot erase detected drift.
-            self.store.unsaved_reasons[report.nodeid] = "inputs-changed"
+        if outcome is None and self.skipped_phases.get(report.nodeid):
+            # Save expected skips at teardown too, without claiming they passed.
+            # Their existing aggregate representation remains an explicit skip.
+            self.store.save(report.nodeid, self.inputs_by_node[report.nodeid],
+                            phases=phases, outcome="skipped")
         if outcome is not None:
             record = self.store.save(report.nodeid, self.inputs_by_node[report.nodeid],
                                      phases=phases, outcome=outcome)
@@ -1051,12 +984,22 @@ class ReusePasses:
                 if outcome == "passed":
                     self.executed_passes[report.nodeid] = record["result_id"]
             elif outcome == "passed":
-                self._observe_unpersisted_pass(report.nodeid, phases)
+                self._unrepresented(report.nodeid, "Check inputs changed before its result was saved.")
 
     def pytest_keyboard_interrupt(self) -> None:
         """Keep completed phase evidence when interruption follows its write."""
         if self.current_node is not None and self.current_node in self.inputs_by_node:
             nodeid = self.current_node
+            if nodeid in self.references:
+                return
+            saved = next((record for record in self.store.current.records("pytest", target=self.store.target)
+                          if record["nodeid"] == nodeid and record["completed_ns"] >= self.started_ns
+                          and record["inputs_digest"] == _digest(self.inputs_by_node[nodeid])), None)
+            if saved is not None:
+                self.references[nodeid] = self.store.reference(saved, reused=False)
+                if saved["outcome"] == "passed":
+                    self.executed_passes[nodeid] = saved["result_id"]
+                return
             phases = self.phases.get(nodeid, {})
             outcome = "passed" if phases == {
                 "setup": "passed", "call": "passed", "teardown": "passed",
@@ -1071,7 +1014,7 @@ class ReusePasses:
                 if outcome == "passed":
                     self.executed_passes[nodeid] = record["result_id"]
             elif outcome == "passed":
-                self._observe_unpersisted_pass(nodeid, phases)
+                self._unrepresented(nodeid, "Check inputs changed before its result was saved.")
 
     def pytest_sessionfinish(self, session: pytest.Session, exitstatus: int) -> None:
         for nodeid in self.inputs_by_node.keys() - self.references.keys() - self.passed_checks.keys():

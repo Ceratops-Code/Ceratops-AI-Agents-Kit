@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Retire clean shipped task work whose Codex threads are archived or absent.
+"""Retire clean shipped task work regardless of its threads' archive status.
 
 Git owns worktree registration and ref changes. Codex's existing state database
-is opened read-only; an unavailable database never establishes thread absence.
+is optional read-only metadata for exact task-temp ownership, never a removal
+gate. Missing thread metadata cannot prevent retirement of clean shipped work.
 The cleanup owner keeps one unfinished JSON record per exact path/ref below
 ``<git-common-dir>/codex/repository-lifecycle/shipped-cleanup``. Records disappear
 after removal; a reusable native lock serializes this owner's cleanup calls.
@@ -67,7 +68,7 @@ def _slug(value: str) -> str:
 
 
 class ThreadCatalog:
-    """Read current thread ownership; conservative hints also preserve old paths."""
+    """Read thread metadata without treating archive status as a cleanup gate."""
 
     def __init__(self, codex_home: pathlib.Path | None = None) -> None:
         home = (
@@ -102,11 +103,11 @@ class ThreadCatalog:
     def state(
         self, branch: str | None, worktree: pathlib.Path | None
     ) -> dict[str, Any]:
-        """Require every associated or potentially associated thread to be archived.
+        """Report archive metadata and capture exact owners for task-temp cleanup.
 
-        A matching directory leaf, branch, short UUID or task name is a retention
-        hint across moves/renames. It can retain extra work, never hide an active
-        thread behind a missing exact cwd. Multiple matching threads are all read.
+        Name, branch and short-ID hints describe possible associations only.
+        For worktrees, destructive temp ownership requires the marker ID or an
+        exact working-directory match; a similarly named chat owns no files here.
         """
         marker_id = (
             _paths["_worktree_thread_id"](worktree)
@@ -122,12 +123,17 @@ class ThreadCatalog:
         slugs = {_slug(name) for name in names}
         cwd = _path_key(str(worktree)) if worktree else None
         matched: list[tuple[Any, ...]] = []
+        owner_ids = {marker_id} if marker_id else set()
         for row in self.rows:
             thread_id, raw_cwd, _, recorded_branch, name = row
             recorded_cwd = _path_key(raw_cwd or "")
-            # Leaf-name ownership is a conservative retention hint, unlike the
-            # exact platform-aware path comparison used to select cleanup.
+            # Broad associations are observational, never deletion authority.
             leaf = recorded_cwd.rsplit("/", 1)[-1].casefold()
+            exact_owner = thread_id == marker_id or (
+                cwd is not None and recorded_cwd == cwd
+            )
+            if exact_owner:
+                owner_ids.add(thread_id)
             if (
                 thread_id == marker_id
                 or (cwd is not None and recorded_cwd == cwd)
@@ -144,7 +150,10 @@ class ThreadCatalog:
             if matched
             else "missing"
         )
-        return {"status": status, "ids": sorted(row[0] for row in matched)}
+        return {
+            "status": status,
+            "ids": sorted(owner_ids) if worktree else sorted(row[0] for row in matched),
+        }
 
 
 def _worktrees(repo: pathlib.Path) -> list[dict[str, str]]:
@@ -210,36 +219,6 @@ def _record_selects_worktree(record: Any, selected: pathlib.Path | None) -> bool
     return isinstance(path, str) and _path_key(path) == _path_key(str(selected))
 
 
-def select_preserved_worktrees(
-    repo_root: pathlib.Path, paths: tuple[pathlib.Path, ...],
-) -> list[dict[str, str]]:
-    """Bind explicit retention to registered task worktrees in this repository.
-
-    No thread catalog is changed. This invocation's paths protect the worktree,
-    branch and matching task files; callers repeat them on fresh invocations.
-    """
-    if not paths:
-        return []
-    repo = _primary(repo_root)
-    root = (repo.parent / "worktrees" / repo.name).absolute()
-    if root != root.resolve():
-        raise CleanupError("Worktree cleanup root contains a link or redirected path.")
-    records = {_path_key(item["worktree"]): item for item in _worktrees(repo)}
-    result: dict[str, dict[str, str]] = {}
-    for requested in paths:
-        path = _selected_worktree_path(root, requested)
-        assert path is not None
-        key = _path_key(str(path))
-        record = records.get(key)
-        if record is None:
-            raise CleanupError(f"Preserved worktree is not registered in this repository: {path}")
-        result[key] = {
-            "branch": record.get("branch", "").removeprefix("refs/heads/") or "(detached)",
-            "path": str(path), "reason": "explicitly_preserved_worktree",
-        }
-    return list(result.values())
-
-
 def plan_cleanup(
     repo_root: pathlib.Path,
     shipped_ref: str,
@@ -249,7 +228,6 @@ def plan_cleanup(
     codex_home: pathlib.Path | None = None,
     include_branch_only: bool = True,
     selected_worktree: pathlib.Path | None = None,
-    preserve_worktrees: tuple[pathlib.Path, ...] = (),
 ) -> dict[str, Any]:
     """Discover candidates from Git, independently of promotion scope records."""
     repo = _primary(repo_root.resolve(strict=True))
@@ -257,9 +235,6 @@ def plan_cleanup(
     if root != root.resolve():
         raise CleanupError("Worktree cleanup root contains a link or redirected path.")
     selected = _selected_worktree_path(root, selected_worktree)
-    preserved = {
-        _path_key(str(_selected_worktree_path(root, path))) for path in preserve_worktrees
-    }
     shipped = _git(repo, "rev-parse", "--verify", f"{shipped_ref}^{{commit}}")
     if not SHA.fullmatch(shipped):
         raise CleanupError("Shipped ref did not resolve to one full commit ID.")
@@ -288,8 +263,6 @@ def plan_cleanup(
         try:
             if branch in protected or path == repo:
                 reason = "protected_checkout_or_branch"
-            elif path is not None and _path_key(str(path)) in preserved:
-                reason = "explicitly_preserved_worktree"
             elif locked:
                 reason = "locked_worktree"
             elif path is not None:
@@ -306,11 +279,10 @@ def plan_cleanup(
                 reason = "head_not_shipped"
             if reason is None:
                 if catalog is None:
-                    reason = "thread_state_unavailable"
+                    marker_id = _paths["_worktree_thread_id"](path) if path else None
+                    thread["ids"] = [marker_id] if marker_id else []
                 else:
                     thread = catalog.state(branch, path)
-                    if thread["status"] == "active":
-                        reason = "active_thread"
         except (OSError, CleanupError) as exc:
             reason = str(exc)
         candidates.append(
@@ -501,14 +473,13 @@ def _finish_record(
     repo: pathlib.Path,
     record_path: pathlib.Path,
     record: dict[str, Any],
-    codex_home: pathlib.Path | None,
     root: pathlib.Path,
     shipped: str,
     protected_branches: tuple[str, ...] = (),
     include_branch_only: bool = True,
     selected_worktree: pathlib.Path | None = None,
 ) -> None:
-    """Resume only an exact, still-inactive retirement recorded by this owner."""
+    """Finish an exact shipped target using current Git and directory identity."""
     required = {
         "version",
         "repo_root",
@@ -540,7 +511,7 @@ def _finish_record(
         or item["reason"] is not None
         or not isinstance(item["thread"], dict)
         or set(item["thread"]) != {"status", "ids"}
-        or item["thread"]["status"] not in {"archived", "missing"}
+        or item["thread"]["status"] not in {"active", "archived", "missing", "unavailable"}
         or not isinstance(item["thread"].get("ids"), list)
         or any(not isinstance(value, str) for value in item["thread"]["ids"])
         or (item["branch"] is not None and not isinstance(item["branch"], str))
@@ -581,13 +552,7 @@ def _finish_record(
         repo, item["head"], shipped
     ):
         raise CleanupError("Recorded head is outside its shipped commit.")
-    catalog = ThreadCatalog(codex_home)
     original_ids = set(item.get("thread", {}).get("ids", []))
-    if any(row[0] in original_ids and not row[2] for row in catalog.rows):
-        raise CleanupError("A recorded cleanup owner now has an active thread.")
-    thread = catalog.state(item["branch"], path)
-    if thread["status"] == "active":
-        raise CleanupError("A recorded cleanup target has an active thread.")
     registered = next(
         (
             value
@@ -635,8 +600,9 @@ def _finish_record(
             raise CleanupError("Residual path was replaced after cleanup started.")
         _paths["_remove_tree"](path)
     if path is not None:
+        _paths["_remove_retired_worktree_check_results"](repo, path)
         # Keep the existing removal record through temp failures. Its captured
-        # archived owners still identify UUID-named scratch after Git removal.
+        # exact owners still identify UUID-named scratch after Git removal.
         for thread_id in sorted(original_ids) or [None]:
             _paths["_remove_matching_task_temp_directories"](
                 repo,
@@ -660,7 +626,6 @@ def retire_shipped_work(
     codex_home: pathlib.Path | None = None,
     include_branch_only: bool = True,
     selected_worktree: pathlib.Path | None = None,
-    preserve_worktrees: tuple[pathlib.Path, ...] = (),
 ) -> dict[str, Any]:
     """Preview or remove eligible work, preserving unfinished removal evidence."""
     options: dict[str, Any] = {
@@ -669,7 +634,6 @@ def retire_shipped_work(
         "codex_home": codex_home,
         "include_branch_only": include_branch_only,
         "selected_worktree": selected_worktree,
-        "preserve_worktrees": preserve_worktrees,
     }
     plan = plan_cleanup(repo_root, shipped_ref, **options)
     if not apply:
@@ -709,17 +673,12 @@ def retire_shipped_work(
                     record = json.loads(record_path.read_text(encoding="utf-8"))
                     if not _record_selects_worktree(record, selected):
                         continue
-                    # Protection also applies to unfinished removal records.
-                    # Their debt remains until a later call releases the path.
-                    if any(_record_selects_worktree(record, path) for path in preserve_worktrees):
-                        continue
                     if record_path.is_symlink() or not record_path.is_file():
                         raise CleanupError("Cleanup record is not a regular file.")
                     _finish_record(
                         repo,
                         record_path,
                         record,
-                        codex_home,
                         pathlib.Path(plan["worktree_root"]),
                         plan["shipped_commit"],
                         protected_branches,
@@ -752,7 +711,6 @@ def retire_shipped_work(
                             repo,
                             record_path,
                             record,
-                            codex_home,
                             pathlib.Path(plan["worktree_root"]),
                             plan["shipped_commit"],
                             protected_branches,
@@ -786,7 +744,6 @@ def finalize_shipping(
     current_branch: str,
     current_commit: str,
     codex_home: pathlib.Path | None = None,
-    preserve_worktrees: tuple[pathlib.Path, ...] = (),
 ) -> dict[str, Any]:
     """Consume selected-scope checks and then sweep all eligible shipped work."""
     repo = _primary(repo_root)
@@ -803,13 +760,7 @@ def finalize_shipping(
     root = (repo.parent / "worktrees" / repo.name).absolute()
     if root != root.resolve():
         raise CleanupError("Worktree cleanup root contains a link or redirected path.")
-    preserved = {
-        _path_key(str(_selected_worktree_path(root, path))) for path in preserve_worktrees
-    }
-
     def retention_reason(branch: str, worktree: pathlib.Path | None) -> str | None:
-        if worktree is not None and _path_key(str(worktree)) in preserved:
-            return "explicitly_preserved_worktree"
         if branch in {"main", "master", "release/local", target_branch, current_branch}:
             return "protected_checkout_or_branch"
         if worktree is not None and any(
@@ -823,11 +774,7 @@ def finalize_shipping(
             and worktree.parent != (repo.parent / "worktrees" / repo.name).resolve()
         ):
             return "outside_repository_worktree_root"
-        try:
-            state = ThreadCatalog(codex_home).state(branch, worktree)
-        except (OSError, CleanupError) as exc:
-            return str(exc)
-        return "active_thread" if state["status"] == "active" else None
+        return None
 
     selected: dict[str, Any] = {
         "status": "finalized",
@@ -853,7 +800,6 @@ def finalize_shipping(
         apply=True,
         protected_branches=(target_branch, current_branch),
         codex_home=codex_home,
-        preserve_worktrees=preserve_worktrees,
     )
     return {
         **selected,
@@ -893,10 +839,6 @@ def main(argv: list[str] | None = None) -> int:
     for name in ("target-branch", "target-commit", "current-branch", "current-commit"):
         finalize.add_argument(f"--{name}", required=True)
     for command in (cleanup, finalize):
-        command.add_argument(
-            "--preserve-worktree", type=pathlib.Path, action="append", default=[],
-            help="Keep this canonical task worktree, its branch and matching task files; repeat as needed.",
-        )
         command.add_argument("--codex-home", type=pathlib.Path)
         command.add_argument("--report", type=pathlib.Path)
     args = parser.parse_args(argv)
@@ -910,7 +852,6 @@ def main(argv: list[str] | None = None) -> int:
                 current_branch=args.current_branch,
                 current_commit=args.current_commit,
                 codex_home=args.codex_home,
-                preserve_worktrees=tuple(args.preserve_worktree),
             )
         else:
             result = retire_shipped_work(
@@ -922,7 +863,6 @@ def main(argv: list[str] | None = None) -> int:
                 codex_home=args.codex_home,
                 include_branch_only=not args.worktrees_only,
                 selected_worktree=args.worktree,
-                preserve_worktrees=tuple(args.preserve_worktree),
             )
         if args.report:
             args.report.write_text(

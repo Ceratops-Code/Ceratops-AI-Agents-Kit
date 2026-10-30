@@ -197,7 +197,8 @@ without repository deduplication.
 | `scripts/testing/run-tests.py` | Public test entry point. Uses the input map to select tests, runs one pytest collection/execution for the selected targets, preserves collection-snapshot/node-mapping modes and reports missing ownership before execution. Failed streams go to `--diagnostic-output`; console output stays bounded with current test names and counts on stderr. |
 | `scripts/testing/select_test_groups.py` | Reads `tests/test-impact.json`, maps changed inputs to check groups, follows dependencies toward consumers and separates selection/reporting options from options affecting test behavior. The map selects checks, not editable files. |
 | `scripts/testing/report_test_progress.py` | Pytest hook plugin and execution transport; reports collection, rate-limited current-test/count updates, sixty-second liveness, the actual pytest exit code, and bounded executed/reused check counts without mixing progress into the final stdout JSON or saving execution state. |
-| `scripts/testing/reuse_test_results.py` | Saves immutable pytest outcomes and compact summaries under Git's shared result directory. Reuses passes on matching group inputs, imported check/fixture files and relevant tools/packages/settings. Opens and prunes only collected checkout/check groups; each save stays in that group. Explicit historical imports preserve original outcomes and identities separately from converted input-comparison facts; skips never become passes. One imported baseline per checkout is removed once selected Git build summaries carry all its passes. Incomplete evidence blocks reuse; original identities, applicable failures and current-plus-two retention remain intact. |
+| `scripts/testing/reuse_test_results.py` | Saves each finished pytest outcome in the current worktree's `check_results.json`. Reuses passes on matching inputs and eligible tagged build summaries. Explicit old-file conversion keeps original outcomes and identities, saves the latest result per test/target, then deletes superseded files. Skips never become passes. |
+| `skills/sections/scripts/store_check_results.py` | Shares the current-results reader/writer between repository and skill lifecycle. Each worktree has one file; finished checks replace only their own entries. Build summaries in Git remain independent. |
 | `scripts/testing/pytest-diagnostics.py` | Extracts bounded failure summaries using exact pytest and unittest-subtest identities and source-file evidence, including parameter names containing summary separators; reports terminal import errors, nested exception-group messages and assertion differences over source context, excluding captured output. Native stderr failures before collection use the explicit `<pytest startup>` identity. Ambiguous or missing test tracebacks use only that test's summary reason. Full diagnostic files remain owned by the runner. |
 | `scripts/run-actionlint.py` | Provisions the pinned, checksum-verified actionlint release inside the scripts environment and validates every GitHub Actions workflow. |
 | `scripts/validate-repository.py` | Local validation coordinator; checks the running Python against `scripts/pyproject.toml`, runs workflow, repository lint and type checks, and captures first-failure evidence. Tests run separately through `scripts/testing/run-tests.py`. |
@@ -223,7 +224,7 @@ without repository deduplication.
 | `skills/ceratops-credit-savings-analysis/scripts/credit_analysis/report_rendering.py` | Renders full-analysis reports as runs tables with UTC start times, combined avoidable counts, separate unassessed counts, exact omission labels, and token percentages. Direct-result delivery uses retained per-call evidence for the same table. Chat guidance comes from the parent skill Output Contract; the caller selects useful findings across the requested audit while complete findings, risks, accounting, and reviewer records stay in machine evidence. |
 | `skills/ceratops-credit-savings-analysis/scripts/credit_analysis/report_bookkeeping.py` | Owns result-shape validation, surface ordering, temporary-control links, category consolidation, and reviewer-record preservation. Final results retain complete original confirmed findings, risks, control reviews, and category assessments in controller-generated `source_findings`, `source_risks`, and `source_reviews`, checked against accepted reviewer records. Candidate links identify each finding's destination, which must cover its original calls and evidence; retained source findings do not add to savings or finding totals. The controller assembles category summaries from exact accepted checklists, including when resuming a retained older response, and aggregates applicability across reviewed portions without discarding differing assessments. Every distinct risk uncertainty remains in machine evidence. The controller revalidates saved final output before enforcing limits on new attempts and selects the highest-priority complete audit window that fits the reserved review slot. |
 | `skills/ceratops-task-lifecycle/scripts/closure_snapshot.py` | Emits one compact snapshot for explicitly named closure targets, inspects temp-root metadata without traversal unless `--count-temp-files` is requested, and optionally removes exact task-created files validated inside the task temp root. |
-| `skills/ceratops-task-lifecycle/scripts/collect-worktree-status.py` | Collects requested Git worktrees and remaining branches once per repository, joins supported task evidence by exact worktree path, retains coverage gaps, and prepares fixed Markdown tables. Owns one caller-selected report and bounded `.pending`/`.lock` companions; only an explicitly selected fetch changes remote refs. |
+| `skills/ceratops-task-lifecycle/scripts/collect-worktree-status.py` | Collects requested Git worktrees and remaining branches once per repository. Uses the installed Codex CLI app-server API to page through unarchived local Codex chats, ignores runtime status, and joins every exact worktree path match; no ChatGPT conversations or private app storage are read. Retains coverage gaps and prepares fixed Markdown tables. Owns one caller-selected report and bounded `.pending`/`.lock` companions; only an explicitly selected fetch changes remote refs. |
 | `skills/ceratops-governance-lifecycle/scripts/apply_rules_update.py` | Prepares complete rule, history and TOML outputs, embeds acceptance in one application request, and applies its saved bytes using integrity comparisons and rollback. Completed-write retries perform no writes or content checks; successful application removes only the declared disposable request. |
 | `skills/ceratops-governance-lifecycle/scripts/validate_rule_candidate.py` | Checks new candidate text once; formatting stability, protected-token preservation and untouched source slices are producer invariants covered by behavior tests. `--accept` freezes complete outputs and original check results, including history-only repairs. |
 | `skills/ceratops-governance-lifecycle/scripts/rule_candidate_source.py` | Owns exact UTF-8 source loading, encoding and line-ending preservation, shared candidate data, and input-integrity checks used by governance validation and application. |
@@ -252,6 +253,14 @@ without repository deduplication.
 Lifecycle helpers suppress successful subcommand output and return `OK` or
 compact structured results. This repo keeps scripts only where they add
 reusable safety logic or bundle nontrivial evidence collection.
+
+With promotion's `--result-file`, the complete outcome stays in the selected
+task-temp report; command output contains its status, target, report path and
+SHA-256. If recording fails, command output preserves the complete outcome.
+Per-check test-selection records stay in captured diagnostics while live
+progress remains visible. Result cleanup accepts primary checkout, linked
+worktree and source subdirectory paths, checks receipt ownership against the
+primary checkout, and removes only the selected report without replaying work.
 
 New shipping PRs use non-merge commit subjects from the base-to-head range for
 their title, shortened to 120 characters, and all those commit messages for
@@ -948,25 +957,23 @@ behavior remains unchanged.
 
 Ship cleanup discovers task worktrees and local `codex/` task branches across
 the repository, including older batches absent from the pending-work scope.
-Removal requires clean Git state including untracked files, the exact head
-included in the synchronized shipped commit, and associated Codex threads that
-are archived or absent. Active or uncertain owners and protected checkouts stay.
-Direct Ship and `--ship-after-promotion` accept repeatable
-`--preserve-worktree <absolute-task-worktree>` arguments for active manual
-worktrees missing from Codex's ownership catalog. Each path must be a registered
-worktree in the selected repository's task root. This retains its branch and
-matching task files without changing thread records or weakening release checks.
-The same arguments are included in the returned rerun command; omit them when
-the task is finished and its shipped work can be retired.
-The repository lifecycle helper `retire_shipped_work.py` reads the existing Codex
-thread catalog without writing it, rechecks current removal conditions, and
-retains only unfinished removal records under
+Removal requires clean Git state including untracked files and the exact head
+included in the synchronized shipped commit. Thread archive status and catalog
+availability do not block removal. Dirty or unshipped work, locked worktrees,
+and protected checkouts stay. Run shipping from outside the task worktrees
+selected for cleanup so the parent shell does not keep a worktree open.
+The repository lifecycle helper `retire_shipped_work.py` optionally reads the
+existing Codex thread catalog without writing it, rechecks current Git and path
+conditions, and retains only unfinished removal records under
 `<common-git-dir>/codex/repository-lifecycle/shipped-cleanup/`. A persistent native
 lock serializes cleanup; successful removal deletes its record and atomic-write
 sibling. Recovery never repeats completed publication or deployment.
 Worktree removal also clears matching task directories under
-`<repo-parent>/tmp/<repo-name>` by exact worktree name or captured thread UUID.
-Unrelated task directories remain; a temp-removal failure keeps its removal
+`<repo-parent>/tmp/<repo-name>` by exact worktree name or a thread UUID proven by
+its worktree marker or exact recorded working directory. Broad name/branch hints
+never authorize deleting another thread's files. Missing metadata leaves
+unidentified thread-temp directories untouched. Unrelated task directories
+remain; a temp-removal failure keeps its removal
 record for the next cleanup attempt.
 Standalone `cleanup` accepts `--worktree <absolute-path>` to select one canonical
 task worktree and its associated branch. Preview, removal, unfinished-record
@@ -983,7 +990,11 @@ Unrelated entries stay intact, and interrupted removal cannot leave a missing
 For an ordinary proposal, run `proposal-workflow.py init` with a verified task
 root, UTF-8 failure and regression files, repeated `--context RULES HISTORY
 RULE_IDS`, and repeated `--replacement RULES HISTORY EXPECTED_FILE
-REPLACEMENT_FILE`. Use `-` for a source without history. The helper constructs
+REPLACEMENT_FILE`. Use `-` for a source without history. For an `AGENTS.md`
+target this selects its adjacent `AGENTS.history.json`, even when absent;
+the review template requests the first decision and acceptance freezes both
+outputs. Context declarations are optional for a first-history-only proposal.
+The helper constructs
 and prepares the closed request and emits the candidate paths plus one
 `next_action`. Pending review responses also include the annotation-only
 `review_input_template` for the caller:
@@ -1458,6 +1469,42 @@ and bounded retention under
 pytest caches and basetemp directories remain scratch, not acceptance. Cheap
 diagnostics/collection snapshots may be regenerated at their own final paths.
 
+Pytest now saves every completed pass, failure or skip in the worktree's one
+`<git-common-dir>/ceratops/results/repository-checks/<worktree-id>/check_results.json`.
+The ID is SHA-256 of its resolved path with OS case handling. Each test/target has
+one latest outcome; partial runs preserve other tests. Reused passes keep their
+original result IDs and alpha/beta/rc/final level. `release/local` requests beta
+or higher. Previous builds still come from this worktree's `.build` records and
+their tagged summaries, and a newer applicable failure blocks an older pass.
+The fixed `.check_results.in_process.json` sibling protects the last saved file
+during a write; startup removes an unfinished sibling. No timestamped files or
+worktree lock are used. Completed builds keep this working file, while Git keeps
+their historical summaries independently. Complete collection may remove deleted
+tests, not unselected tests; worktree retirement owns eventual file deletion.
+Repository checks and skill-update checks use this same file. Skill-update request
+reports remain request diagnostics; closing a request keeps its saved check
+outcomes. References to current results name the original entry ID and hash,
+so another check can update the file without changing that entry's identity.
+Completed build receipts reference `.build/<unit>/<version>[/<target>]/check_summary.json`
+by Git path and hash in the tagged commit. Failed/test-only calls create no
+completed build receipt or tag. Deleting local results does not change a tag.
+
+Run `uv run --project scripts --locked python scripts/testing/run-tests.py
+--consolidate-results [WORKTREE]`
+once to combine the named worktree's former `pytest-pass-*.json`,
+`pytest-attempt-*.json`, imported baselines and whole-check files. It saves the
+latest actual outcomes before deleting superseded files, can finish interrupted
+deletion, and reports unknown ownership or missing facts without guessing.
+Omit `WORKTREE` for this checkout. Normal test calls do not scan those files or
+other worktrees. Retained packages and old report references do not retain local
+execution history. For an older promotion scope, explicitly run the repo-lifecycle
+entrypoint `manage-pending-work.py --repo-root <worktree> discard-check-references
+--target-branch <branch>`;
+it removes only the old result-reference list, keeping source cleanup records.
+After matching requested checks succeed, their failure report is removed only
+after outcomes are saved. A fresh call can finish interrupted report deletion
+using that success. Reports for different requested checks remain untouched.
+
 Repository scripts own their output paths and Git ignore rules. Saved results
 are local working data and do not authorize deployment. Deployment retains its
 immediate destination checks and producer-specific completion result.
@@ -1549,18 +1596,39 @@ uses complete-tree staging and rollback. Metadata-only staging folders use the
 same ownership and crash recovery as payload stages; their pending manifest file
 is removed with the stage after success or on the next matching fresh call.
 
+Both installers freeze source before rendering. Runtime manifests record the
+repository identity, primary checkout path, full Git commit when present, and
+relative skill path. Each skill owns a compressed `.source-<sha256>.zip` with
+the exact source inputs, including dirty or unpacked sources. Git supplies clean
+commits directly; dirty snapshots include tracked and nonignored working files.
+The manifest records the archive digest and whether local changes were present.
+Source history changes publish the immutable archive before switching the
+manifest, preserving open skill directories and the previous source identity
+if publication is interrupted. Startup and successful activation retain the
+current archive and at most two predecessors per installed skill.
+
+`retain_skill_sources.py` owns managed source snapshots. Disposable views live
+under `<repo-parent>/tmp/<repo-name>/<task>`; OS locks protect active workers,
+and fresh calls remove inactive views in that task group. Bootstrap views stay
+inside its reserved staging tree. Review packets own a source view beside the
+packet, `.<packet-name>.source`, until their `--cleanup-output <packet>` call.
+Audits use retained bytes even after a checkout disappears; a missing clean
+archive can be reconstructed from its exact commit in the explicitly selected
+checkout. Dirty source needs its archive. Earlier installations without source
+evidence need redeployment if their recorded checkout is gone.
+
 For another Ceratops-compatible repo, run its versioned repository installer:
 
 ```powershell
 uv run --locked <target-repo>/scripts/deploy-skills.py --repo-root <target-repo>
 ```
 
-An external repository's standalone installer is independent: it uses only the
-Python standard library, reads declared skills, resolves shared sections and
-payloads, and overlays the requested output under the install root. It retains
-destination-only files and other skills. It does not locate or run Ceratops,
-validate skill or repository content, negotiate compatibility, or fall back
-after an error.
+An external repository's standalone installer is independent: it uses the
+repository's locked scripts environment, reads declared skills, resolves shared
+sections and payloads, and overlays the requested output under the install root.
+It retains destination-only files and other skills. It does not locate or run
+Ceratops, validate skill or repository content, negotiate compatibility, or fall
+back after an error.
 
 For report-only global routing, the runtime installer can write direct managed
 manifest entries and malformed-entry blockers without comparing runtime files
@@ -2002,12 +2070,12 @@ five result arguments; the declared runner writes its actual outcome before
 returning. Later promotion/build calls consume eligible original passes while
 new artifact checks still run. Corrupt evidence blocks the operation.
 
-Results live under `<git-common-dir>/ceratops/results/repository-checks/`.
-Existing pending-work scopes retain active candidate references; checkpoints
-and disposable reports are not acceptance authorities. Storage is bounded and
-protects required original passes and newer applicable failures. Checks marked
-`no_result_reuse`, distributed execution and unrepresented child scope also
-prevent aggregate reuse; ordinary child passes keep their original identities.
+Results live in each worktree's `results/repository-checks/<worktree-id>/check_results.json`
+under `<git-common-dir>/ceratops/`. Source cleanup scopes do not retain check
+history. Each check/target has one latest outcome; a corrected pass replaces its
+failure. Checkpoints and disposable reports are not acceptance authorities.
+Checks marked `no_result_reuse`, distributed execution and unrepresented child
+scope also prevent aggregate reuse; ordinary child passes keep their identities.
 
 `--qualification-level` selects required alpha/beta/rc/final eligibility;
 ordinary checks default to alpha and promotion tests to beta. The portable

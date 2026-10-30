@@ -211,16 +211,18 @@ failed receipt is added.
    only normal exit codes and diagnostics, not special JSON.
    Then the wrapper invokes `retire_shipped_work.py finalize` with the optional
    scope and synchronized branch/commit identities. It first finalizes the
-   selected scope, preserving active threads and worktrees outside the canonical
-   repository worktree root, then discovers registered task worktrees and
+   selected scope, preserving worktrees outside the canonical repository
+   worktree root, then discovers registered task worktrees and
    unchecked-out local `codex/` task branches throughout the repository.
-   Remove work only when Git state is clean including untracked files, its exact
-   head is an ancestor of the synchronized shipped commit, and its associated
-   Codex threads are archived or absent. An unreadable or missing existing thread
-   catalog cannot establish absence. Preserve possible active owners under moved
-   paths, the primary checkout, main/master and reusable `release/local`.
-   Before each deletion, recheck thread state, worktree registration, exact head,
-   cleanliness, ancestry and the canonical path boundary. Branch deletion uses
+   Remove work only when Git state is clean including untracked files and its
+   exact head is an ancestor of the synchronized shipped commit. Thread archive
+   status and thread-catalog availability do not determine cleanup eligibility.
+   Preserve the primary checkout, main/master, reusable `release/local` and
+   locked worktrees. Thread metadata may identify
+   task-temp owners only through an exact worktree marker or working-directory
+   match; missing metadata leaves unidentified thread-temp directories untouched.
+   Before each deletion, recheck worktree registration, exact head, cleanliness,
+   ancestry and the canonical path boundary. Branch deletion uses
    the expected head atomically; native Git worktree removal never uses force.
    Repository-wide unfinished removals belong to
    `<common-git-dir>/codex/repository-lifecycle/shipped-cleanup/`, with one
@@ -261,10 +263,10 @@ failed receipt is added.
   repository-wide cleanup ran even when that scope was absent or empty.
 - Only an evidence-proven interrupted `deleting` record was recovered
   automatically; every missing `retained` source remained blocking.
-- Dirty, unavailable, or advanced work, active threads and protected checkouts
+- Dirty, unavailable, or advanced work, locked worktrees, and protected checkouts
   or branches were retained with reasons.
-- Every removed task worktree or branch was clean, had its exact head included
-  in the shipped commit, and had only archived or absent associated threads.
+- Every removed task worktree or branch was clean and had its exact head included
+  in the shipped commit; thread archive status did not prevent removal.
 
 ### Output Contract
 

@@ -99,7 +99,7 @@ class PreparedUpdate:
     """Prepared bytes and immutable input identities for one write transaction."""
 
     stack_paths: list[Path]
-    originals: dict[Path, bytes]
+    originals: dict[Path, bytes | None]
     candidates: dict[Path, bytes]
     toml_paths: set[Path]
     baseline_reviews: set[str]
@@ -113,7 +113,7 @@ class PreparedUpdate:
     validation_evidence_sha256: str
     validation_evidence_disposable: bool
     policy_hashes: dict[Path, str]
-    rule_stack_sha256: dict[Path, str]
+    rule_stack_sha256: Mapping[Path, str | None]
     already_applied: bool = False
 
 
@@ -131,13 +131,30 @@ def require_fields(value: object, fields: set[str], label: str) -> dict[str, Any
 
 
 def require_path(value: object, label: str) -> Path:
-    """Resolve one required path from the caller's working directory."""
+    """Keep a lexical absolute path so link checks run before following links."""
     if not isinstance(value, str) or not value:
         raise ApplicationError(f"{label} must be a non-empty path")
     path = Path(value)
     if not path.is_absolute():
         path = Path.cwd() / path
-    return path.resolve()
+    return Path(os.path.abspath(path))
+
+
+def destination_bytes(path: Path) -> bytes | None:
+    """Use absence as a distinct destination identity, never as an empty file."""
+    reject_link_chain(path, "destination")
+    try:
+        return path.read_bytes()
+    except FileNotFoundError:
+        if not path.parent.is_dir():
+            raise ApplicationError(f"destination directory does not exist: {path.parent}") from None
+        return None
+
+
+def destination_identity(path: Path) -> str | None:
+    """Bind new histories to absence and existing files to their exact bytes."""
+    raw = destination_bytes(path)
+    return None if raw is None else hashlib.sha256(raw).hexdigest()
 
 
 def absolute_path(path: Path) -> Path:
@@ -748,6 +765,7 @@ def prepare(
         for path, source in originals.items()
     }
     expected_history_entries: dict[Path, list[dict[str, object]]] = {}
+    missing_histories: set[Path] = set()
     governed_histories = set(changed_by_history).union(rename_by_history)
     for history in sorted(governed_histories, key=lambda path: str(path).lower()):
         changed = changed_by_history.get(history, set())
@@ -756,9 +774,17 @@ def prepare(
             raise ApplicationError(
                 f"changed rules lack approved history append: {history}"
             )
-        source = read_source(history, "history source")
+        reject_link_chain(history, "history source")
+        if history.exists():
+            source = read_source(history, "history source")
+            existing = load_history_source(history)
+        else:
+            if history in rename_by_history:
+                raise ApplicationError(f"cannot rename absent history: {history}")
+            source = TextSource(history, b"", "", False, "\n", True)
+            existing = []
+            missing_histories.add(history)
         originals[history] = source
-        existing = load_history_source(history)
         candidate_entries = copy.deepcopy([*existing, *appends])
         rename = rename_by_history.get(history)
         renamed_old: set[str] = set()
@@ -853,7 +879,8 @@ def prepare(
 
     return PreparedUpdate(
         stack_paths=stack_paths,
-        originals={path: source.raw for path, source in originals.items()},
+        originals={path: None if path in missing_histories else source.raw
+                   for path, source in originals.items()},
         candidates=candidates,
         toml_paths=set(toml_sources),
         baseline_reviews=baseline_reviews,
@@ -898,10 +925,10 @@ def accept_candidate(
         candidate["acceptance"] = None
         _write_json_atomic(candidate_path, candidate)
     sources = [require_path(value, "rule_stack") for value in candidate["rule_stack"]]
-    bases = {str(path): file_hash(path) for path in sources}
+    bases: dict[str, str | None] = {str(path): file_hash(path) for path in sources}
     histories = {target["history"] for target in candidate["targets"] if target["history"]}
     histories.update(operation["history"] for operation in candidate["history_operations"])
-    bases.update({str(require_path(path, "history")): file_hash(require_path(path, "history"))
+    bases.update({str(require_path(path, "history")): destination_identity(require_path(path, "history"))
                   for path in histories})
     history_only = not candidate["targets"]
     validation = None if history_only else validate_rule_candidate(
@@ -923,10 +950,10 @@ def accept_candidate(
     # Bind every output (including history) to the exact source snapshot used
     # by the producer. An intervening edit is different work, not a new check.
     for path, raw in update.originals.items():
-        if bases[str(path)] != hashlib.sha256(raw).hexdigest():
+        if bases[str(path)] != (None if raw is None else hashlib.sha256(raw).hexdigest()):
             raise ApplicationError(f"source changed during candidate production: {path}")
     for source_name, digest in bases.items():
-        if file_hash(Path(source_name)) != digest:
+        if destination_identity(Path(source_name)) != digest:
             raise ApplicationError(f"source changed during candidate production: {source_name}")
     evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
     candidate["acceptance"] = {
@@ -1038,18 +1065,20 @@ def load_accepted_update(request: dict[str, Any]) -> PreparedUpdate:
         reject_link_chain(destination, "destination")
         if destination == root or root in destination.parents:
             raise ApplicationError("task_temp_root must not contain a governed target")
-        raw = destination.read_bytes()
-        current_hashes[destination] = hashlib.sha256(raw).hexdigest()
+        raw = destination_bytes(destination)
+        current_hashes[destination] = None if raw is None else hashlib.sha256(raw).hexdigest()
         if destination not in outputs and current_hashes[destination] != expected:
             raise ApplicationError(f"source changed since acceptance: {destination}")
         if destination in outputs:
             originals[destination] = raw
-    # A retry after successful writes or interrupted cleanup consumes the same
-    # accepted result. Mixed/foreign destination contents must never be replayed.
+    # Fresh calls consume current contents: each output must still be at its
+    # accepted base or already contain its accepted result. Foreign edits stop it.
     already_applied = originals == outputs
     if not already_applied:
         for destination in outputs:
-            if current_hashes[destination] != bases[destination]:
+            if current_hashes[destination] not in (
+                bases[destination], hashlib.sha256(outputs[destination]).hexdigest(),
+            ):
                 raise ApplicationError(f"source changed since acceptance: {destination}")
     return PreparedUpdate(
         stack_paths=list(bases), originals=originals, candidates=outputs,
@@ -1069,7 +1098,8 @@ def staged_copy(path: Path, payload: bytes, suffix: str) -> Path:
     )
     os.close(descriptor)
     temporary = Path(name)
-    shutil.copy2(path, temporary)
+    if path.exists():
+        shutil.copy2(path, temporary)
     with temporary.open("wb") as handle:
         handle.write(payload)
         handle.flush()
@@ -1080,20 +1110,25 @@ def staged_copy(path: Path, payload: bytes, suffix: str) -> Path:
 def rollback(
     applied: list[Path],
     backups: dict[Path, Path],
-    originals: dict[Path, bytes],
+    originals: dict[Path, bytes | None],
+    staged: dict[Path, Path],
 ) -> list[str]:
     """Restore every replaced target and verify its exact original bytes."""
     failures: list[str] = []
     for path in reversed(applied):
         try:
-            os.replace(backups[path], path)
+            if originals[path] is None:
+                if path.exists() and os.path.samefile(path, staged[path]):
+                    path.unlink()
+            else:
+                os.replace(backups[path], path)
         except OSError:
             failures.append(str(path))
     # Untouched targets may contain a concurrent edit that caused rejection;
     # rollback owns only writes attempted by this transaction.
     for path in applied:
         try:
-            if path.read_bytes() != originals[path] and str(path) not in failures:
+            if destination_bytes(path) != originals[path] and str(path) not in failures:
                 failures.append(str(path))
         except OSError:
             if str(path) not in failures:
@@ -1111,7 +1146,7 @@ def verify_application_inputs(update: PreparedUpdate) -> None:
 def verify_rule_stack_inputs(update: PreparedUpdate) -> None:
     """Prevent an accepted proposal from overwriting a different destination base."""
     for path, expected_hash in update.rule_stack_sha256.items():
-        if file_hash(path) != expected_hash:
+        if destination_identity(path) != expected_hash:
             raise ApplicationError(f"rule source changed before application: {path}")
 
 
@@ -1129,7 +1164,10 @@ def commit(update: PreparedUpdate) -> None:
         verify_rule_stack_inputs(update)
         verify_written_identity(update)
         return
-    targets = sorted(update.candidates, key=lambda path: str(path).lower())
+    targets = sorted(
+        (path for path, raw in update.candidates.items() if update.originals[path] != raw),
+        key=lambda path: str(path).lower(),
+    )
     backups: dict[Path, Path] = {}
     staged: dict[Path, Path] = {}
     applied: list[Path] = []
@@ -1137,24 +1175,31 @@ def commit(update: PreparedUpdate) -> None:
         verify_application_inputs(update)
         verify_rule_stack_inputs(update)
         for path in targets:
-            backups[path] = staged_copy(path, update.originals[path], ".bak")
+            original = update.originals[path]
+            if original is not None:
+                backups[path] = staged_copy(path, original, ".bak")
             staged[path] = staged_copy(path, update.candidates[path], ".new")
         for path in targets:
             verify_application_inputs(update)
-            if path.read_bytes() != update.originals[path]:
+            if destination_bytes(path) != update.originals[path]:
                 raise ApplicationError(f"source changed before commit: {path}")
         for path in targets:
             verify_application_inputs(update)
-            if path.read_bytes() != update.originals[path]:
+            if destination_bytes(path) != update.originals[path]:
                 raise ApplicationError(f"source changed during commit: {path}")
             applied.append(path)
-            os.replace(staged[path], path)
+            if update.originals[path] is None:
+                # A same-directory hard link publishes complete bytes atomically
+                # and fails if another writer creates the new history first.
+                os.link(staged[path], path)
+            else:
+                os.replace(staged[path], path)
         verify_written_identity(update)
     except (Exception, KeyboardInterrupt) as error:
-        failures = rollback(applied, backups, update.originals)
+        failures = rollback(applied, backups, update.originals, staged)
         if failures:
             raise ApplicationError(
-                f"rollback incomplete for {failures[0]}"
+                f"rollback incomplete for {failures[0]}; original error: {error}"
             ) from error
         raise ApplicationError(f"update rolled back: {error}") from error
     finally:

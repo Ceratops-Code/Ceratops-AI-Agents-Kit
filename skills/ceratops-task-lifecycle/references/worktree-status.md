@@ -14,18 +14,19 @@ implementation evidence.
 
 ## Rules
 
-- Capture one fresh `list_threads(limit: 50)` response and save its JSON as the
-  task-evidence file. Use the supported response, not private app storage.
+- The helper collects unarchived local Codex chats through the supported
+  app-server API, following every page; ChatGPT conversations and runtime
+  status do not affect membership. Do not read private app storage.
 - Write a request file with schema `ceratops-worktree-status-request.v1` and a
   nonempty `repositories` array. Each entry has an absolute worktree-root
   `path`, `release_ref`, `remote_base_ref`, and boolean `fetch`.
   Set `fetch` only when refreshing that repository's remote is authorized.
 - (D) Run `uv run --no-project --python <python_runtime> python
   <skill_root>/scripts/collect-worktree-status.py --request <request_file>
-  --task-evidence <task_file> --output <report_file>`.
+  --output <report_file>`.
 - Read `python_runtime` from this skill's `.runtime-manifest.json`;
-  `skill_root` is this installed skill directory. Choose the three file paths
-  inside the current task temp root; keep the output distinct from both inputs.
+  `skill_root` is this installed skill directory. Choose both file paths inside
+  the current task temp root; keep the output distinct from the request.
 - Use the report's table-ready rows and evidence, retaining each unavailable
   repository, incomplete task source, ambiguous match, and other coverage gap.
   Exact worktree paths bind task candidates; branch names, folder names,
@@ -57,11 +58,12 @@ worktree and remaining local or remote branch appears once. Detached or absent
 worktrees use `-`; shipping remains `Unavailable` without a successful
 authorized fetch. Ignored files do not make a worktree dirty.
 
-A unique active task match includes its full ID and title. Ambiguous matches
-retain every candidate's full ID, title, and archived state. `None` requires
-complete task evidence and no active match; an incomplete source, branch without
-a worktree, or uncertain binding stays `Unverified`. Keep exact branch and
-worktree identifiers and all uncertainty when shortening cells.
+An active task is any existing, unarchived local Codex chat, regardless of
+runtime status. List every exact worktree match with its full ID and title;
+multiple matches remain active. Exclude archived chats. `None` requires complete
+task evidence and no match. Retain source gaps; no match with incomplete
+evidence, a branch without a worktree, or conflicting identity stays
+`Unverified`. Keep exact branch and worktree identifiers when shortening cells.
 
 The helper owns only the caller-selected report and its fixed `.pending` and
 `.lock` companions. It retains one current report, replaces it atomically only

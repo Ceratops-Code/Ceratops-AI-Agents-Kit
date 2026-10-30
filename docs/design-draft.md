@@ -83,6 +83,23 @@ policy: the environment owner keeps the selected version and two predecessors,
 preserving versions referenced by installed manifests or running interpreters.
 Its foreground commands use the same command-stop tracking as the installer.
 
+`retain_skill_sources.py` owns the source evidence coupled to each installed
+skill. A manifest names the primary repository, exact commit when available,
+relative skill path, dirty flag and digest-addressed source ZIP. Installation
+checks and rendering consume one frozen view. Clean commits come from Git;
+dirty and unpacked inputs retain their actual bytes. A source-only change
+publishes the immutable ZIP before atomically changing the manifest, leaving
+the watched skill directory in place and preserving the previous identity on
+interruption. Each installed skill retains its current archive and at most two
+predecessors; startup and successful activation prune older owned archives.
+
+Managed source views belong to the task's repository temp group and use OS
+locks for live ownership. Fresh calls remove abandoned views only in that
+group. Independent bootstraps retain their views inside reserved staging.
+Review views belong to one caller-selected packet and survive until its public
+cleanup call. Review resolves the retained ZIP, or an exact clean commit when
+the ZIP is missing, without substituting the selected branch's current tip.
+
 One environment does not need both requirements files and a pyproject dependency
 list. The thread selected pyproject plus its lockfile and removal of the root
 requirements files. In Ceratops-AI-Agents-Kit, `scripts/pyproject.toml` owns both
@@ -396,31 +413,33 @@ reasons with every affected test ID, alongside the bounded decision sample.
 This is observational output in the existing runner response, not new persistent
 state or a new acceptance rule; original result IDs and retention stay unchanged.
 
-The owner writes canonical `ceratops-pytest-attempt.v1` JSON directly to unique
-`<git-common-dir>/ceratops/results/repository-checks/pytest-attempt-<result-id>.json`
-paths. Records preserve actual passed, failed and interrupted outcomes, phase
-results, exact inputs and original qualification. Existing `pytest-pass-*`
-records remain unchanged; a missing historical level is eligible only for the
-legacy unqualified runner. Qualified calls use the shared level matrix, and a
-newer applicable failed or interrupted attempt blocks older passes for that
-individual test. A later matching pass resolves only its covered failure.
-When a failure would expire, retention also considers the selected build at
-each qualification level, at most four per unit/target. Newer alpha work cannot
-erase a failure still blocking an older beta build. These are compact tagged
-summaries; retention does not open packages or another worktree's build history.
+The pytest owner saves each completed test immediately in
+`<git-common-dir>/ceratops/results/repository-checks/<worktree-id>/check_results.json`.
+`worktree-id` is SHA-256 of the resolved worktree path with OS case handling;
+the file records that ID and path. Its `ceratops-current-check-results.v1`
+envelope contains one latest entry per check kind, check ID and OS/architecture
+target, with shared input inventories stored once. Original outcomes retain
+their result IDs, phase results, exact inputs and actual qualification levels.
+A corrected pass replaces a failure; a beta result replaces an alpha result.
+Partial runs keep unselected entries. Complete collection of a selected group
+can remove its deleted tests; filtered collection cannot do so.
 
-`.pytest-pass.lock` serializes reads, final writes and pruning; a busy writer
-leaves another invocation free to execute its checks normally. Startup and each
-completed write retain current plus two predecessors per checkout, test and
-qualification level, protecting original results referenced by retained aggregate
-records and failures that can still block a retained pass. Other producers'
-files are untouched. Startup inventories filenames once and opens only collected
-checkout/test groups; each save
-refreshes, matches and prunes only its affected group through an in-memory index.
-No persistent index or additional storage is introduced. Failure precedence and
-retained references stay within that group, so unrelated histories need no
-per-save traversal. Results survive task-temp and worktree deletion. The
-caller-owned `pytest-results.json` lives inside pytest's isolated temp directory,
+One thread owns a worktree, and its commands save serially without a worktree
+lock. The writer flushes/fsyncs the fixed sibling
+`.check_results.in_process.json`, then replaces `check_results.json`.
+An interrupted write leaves earlier saved outcomes intact; the next call removes
+the unfinished sibling. There are no timestamped generations or per-test files.
+Git build summaries remain immutable and independent of this working file.
+Completing a build never clears it. Normal calls touch only their worktree;
+dedicated worktree retirement removes it in step 20C. Old-file conversion is an
+explicit `run-tests.py --consolidate-results` call, not startup discovery.
+
+Previous-build selection still reads this worktree's `.build` records and the
+eligible tag's `check_summary.json`, never another worktree or artifact storage.
+An applicable current failure blocks an older tagged pass. Local calls record
+alpha unless a declared level applies; `release/local` requests at least beta.
+Reusing a pass keeps its actual level and original result ID. The caller-owned
+`pytest-results.json` lives inside pytest's isolated temp directory,
 carries returned counts and original result references, and is removed by that
 directory's existing owner. Aggregate records retain those child identities,
 check versions and levels. Stdout adds at most 32 per-check decisions and an
@@ -638,12 +657,14 @@ claims to detect every transient internal file in a custom runner. The structura
 validator can receive `runner_command` and `result_directory` to include this
 gate; without them its structural status says nothing about result reuse.
 
-Persistent result files are outside disposable skill-update or operation
-checkpoints. Implemented plan 6A binds production identities and bounded result
-retention to
-`<git-common-dir>/ceratops/results/repository-checks/<result-id>.json`.
-The operation/result owner now supplies grouping and lifetime; affected-check
-selection remains later work. Probe records are always discarded after the probe.
+Persistent check outcomes are outside disposable skill-update or operation
+checkpoints. Steps 6B/6C keep one
+`<git-common-dir>/ceratops/results/repository-checks/<worktree-id>/check_results.json`.
+The operation supplies its check identity, exact inputs and target. The runner
+saves its actual outcome; repository and skill lifecycle read/write through
+their declared shared `store_check_results.py` payload. Repository scripts keep
+the same standalone writer contract without importing skill source.
+Probe records are always discarded after the probe.
 Pytest basetemp/cache directories are disposable
 execution scratch and never copied or moved into results. Collection snapshots
 and failure diagnostics remain regenerable reports, not acceptance records.
@@ -1210,14 +1231,12 @@ New or changed tests, affected source/dependencies and newer applicable failures
 still require execution. The import neither creates a build tag nor accepts a
 new artifact, and ordinary runs do not search other worktrees for old results.
 
-The pytest result owner keeps one
-`<git-common-dir>/ceratops/results/repository-checks/pytest-baseline-<checkout-hash>.json`
-per explicitly selected checkout. Repeating the same import does not rewrite it;
-an interrupted import can be repeated, while an incomplete file blocks its use.
-Future build summaries carry the original outcomes and their comparison facts.
-The runner removes the local import when selected Git summaries contain all its
-pass identities. Until then it is bounded accepted-result input, not a checkpoint
-or failure log; deleting it before that transfer would discard reusable passes.
+Explicitly imported outcomes join that worktree's `check_results.json` without
+replacing newer local results. Repeating the import keeps original IDs and inputs;
+an interrupted replacement preserves the earlier complete file. Future build
+summaries carry the original outcomes and their comparison facts. Creating those
+summaries does not delete current results. No separate imported-baseline history
+is maintained.
 
 Select the most recent eligible completed baseline for the same release unit and
 target on the candidate's relevant history, recording its exact tag, commit and
@@ -1258,18 +1277,16 @@ Failed/missing required checks still prevent first acceptance of a new candidate
 An explicit request for additional checks is a distinct operation, not a
 retroactive rewrite of the earlier receipt.
 
-Only declared repository runners/validators produce executed outcomes. The
-operation owner supplies their final result paths under
-`<git-common-dir>/ceratops/results/repository-checks/<result-id>.json`; results
-are saved before success is returned. They outlive checkpoints and worktrees.
-Implemented plan 6A adds qualification levels and original/reused references to
-the existing schemas, writers and readers together. Historical evidence is not
-rewritten or
-assigned an invented level. Retain evidence referenced by active candidates,
-retained receipts or selected unit/target/level baselines; prune unreferenced
-results to current plus two predecessors per check scope/level at startup and
-completion. Artifact retention must protect final baselines from alpha churn
-and gain a separate rc group if rc production is supported.
+Only declared repository runners produce executed outcomes. Each saves finished
+outcomes in its worktree's single current-results file before reporting success.
+The latest outcome replaces the previous one for that check/target; partial runs
+preserve all other entries. Older references do not keep local executions alive.
+Current entries retain their original inputs, IDs, check versions and levels.
+Completed builds store independent summaries in Git; their receipts point to the
+summary's Git path/hash in the tagged commit. Neither build completion nor
+request cleanup clears current results. Worktree retirement removes them.
+Artifact retention separately protects final baselines from alpha churn and
+gains a separate rc group if rc production is supported.
 
 The portable result-record template remains a reference, not an implicitly copied
 runtime. Existing runner modes stay usable until callers adopt this policy;
@@ -1761,22 +1778,15 @@ or whole-system recovery.
 
 ### Shipped task work and planned abandoned-work cleanup
 
-Implemented Ship cleanup is owned by `retire_shipped_work.py`. Explicit
-`--preserve-worktree` paths protect active manual
-worktrees, their branches and task files even without a catalog ownership record.
-Ship checks that requested paths are canonical registered task worktrees in the
-selected repository before remote effects; the terminal cleanup and returned
-rerun command carry the same protection. Unfinished removal records for these
-paths remain untouched until a later invocation releases the paths. This
-retention does not bypass source, pending-work, review or CI checks. After selected
+Implemented Ship cleanup is owned by `retire_shipped_work.py`. After selected
 operations succeed, the helper finalizes the optional promotion scope and
 discovers task worktrees and unchecked-out local `codex/` task branches throughout
 the repository.
 An absent scope does not suppress discovery. Removal requires clean Git state
-including untracked files, exact head ancestry in the synchronized shipped commit,
-and archived or absent associated Codex threads. The existing thread catalog is
-read-only; unavailable evidence and possible active owners under moved paths
-preserve work. The primary checkout, main/master and reusable `release/local`
+including untracked files and exact head ancestry in the synchronized shipped
+commit. Thread archive status and catalog availability do not prevent removal.
+The existing thread catalog is read-only and identifies exact task-temp owners.
+The primary checkout, main/master, reusable `release/local` and locked worktrees
 remain protected. Current state is checked before removal, and expected-head Git
 transactions protect branch deletion.
 
@@ -2200,23 +2210,30 @@ and executable tools. The shared operation executor reads these inputs before
 callbacks. It supplies the existing five result arguments to one declared runner
 command; unmarked custom operations retain their existing interface.
 
-The runner writes actual outcomes directly to
-`<git-common-dir>/ceratops/results/repository-checks/<result-id>.json`, completing
-the record before returning success. Records preserve the original work/check
+Under `<git-common-dir>/ceratops/`, the runner writes actual outcomes to
+`results/repository-checks/<worktree-id>/check_results.json`, completing each
+entry before returning success. Records preserve the original work/check
 versions, scope, timing, qualification and executed result identity. A later
 operation consumes an eligible original pass instead of executing that check.
 Missing or changed inputs require their checks; corrupt/conflicting evidence
 blocks the operation. A newer applicable failure blocks an older pass. Source
 passes do not replace checks requiring newly built artifact bytes.
 
-The operation-side result owner runs bounded retention at startup/completion:
-current plus two unreferenced predecessors per semantic check scope, arguments
-and level,
-with active applicable evidence, live writers and retained receipt/candidate/
-baseline references protected. Check records outlive disposable reports,
-checkpoints and worktrees. This is the canonical result store, not a second
-cache or an execution journal. Aggregate records are bounded to 8 MB so they
-can retain original references for large suites. Environment values are hashed,
+Repository and skill checks share the current-results writer; pytest's portable
+writer produces the same format. An entry reference hashes that entry's original
+facts, not the changing whole file. No checkpoint lock, branch reference list or
+per-execution history controls local retention. Each check/target retains one
+outcome. The document is bounded to 64 MiB and repository-check records to 8 MiB.
+Explicit `run-tests.py --consolidate-results [WORKTREE]` combines old files for
+the selected worktree, saves their latest outcomes, then deletes superseded files.
+Interrupted conversion can be called again. Unknown owners or missing original
+facts are reported and retained; normal calls do not perform this scan.
+Skill-update request cleanup first saves any remaining actual check observations;
+missing original check-code versions are stated and never treated as reusable passes.
+Failure reports are deleted only after the matching work's success is saved;
+repeating the call finishes missed deletion without repeating accepted checks.
+Unrelated reports remain. Git build summaries stay usable without local files.
+Environment values are hashed,
 not copied into records. `--qualification-level` selects alpha/beta/rc/final eligibility;
 ordinary checks default to alpha and promotion tests to beta. Check-only changes
 never rewrite historical artifact acceptance.
@@ -2229,16 +2246,15 @@ replacement schema. Shared unchanged-input reuse and the scoped Docs-and-Claims
 runner adoption implement plan 6A; affected-check planning, broader history
 assembly and release/receipt adoption remain later work.
 
-The existing pending-work owner also retains `check_results` references in its
-branch/commit-bound scope. A check-only candidate has no source-cleanup tasks
-and must contain actual terminal outcome references. It is not an aggregate
-acceptance receipt or an execution checkpoint. Binding is idempotent, protected
-by the same owner lock as source-scope writes, and bounded per check scope/level.
-Known failed/interrupted outcomes remain observations and cannot satisfy gates.
-Startup/completion removes only check-only scopes whose branch disappeared or
-whose target commit advanced; mixed source scopes retain their existing cleanup
-authority. Finalization can release those references without deleting the
-canonical check records; retained artifact/receipt references remain independent.
+Promotion scope files contain source branches selected for later cleanup, not
+references that keep old local test executions. The explicit one-time
+`manage-pending-work.py --repo-root <worktree> discard-check-references
+--target-branch <branch>`
+command removes the former `check_results` field under the existing release lock.
+It preserves source branch records and deletes a scope containing no source work.
+Ordinary scope reads do not perform conversion. Repeating the command after an
+interruption finishes the edit without touching test results or source branches.
+Local results use the worktree's current file; completed builds use their Git summary.
 
 `read_check_environment.py` observes the declared locked child interpreter,
 including uv's PATH activation, package identities and resolved tool bytes.

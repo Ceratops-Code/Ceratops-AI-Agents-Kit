@@ -35,11 +35,12 @@ from collections.abc import Mapping, Sequence
 from apply_rules_update import export_update_request, generate_candidate_update_request
 from read_proposal_requests import (
     DISPOSABLE_ROLES,
-    ProposalWorkflowError,
     REQUEST_SCHEMA,
+    ProposalWorkflowError,
     _absolute,
     _closed_fields,
     _construction_sources,
+    _history_path,
     _input_path,
     _is_link,
     _read_json,
@@ -53,7 +54,6 @@ from validate_rule_candidate import CONTEXT_SCHEMA as CANDIDATE_CONTEXT_SCHEMA
 from validate_rule_candidate import (
     RuleCandidateValidationError,
     preflight_unchanged_markdown,
-    resolve_target_policy,
 )
 
 CONTEXT_SCHEMA = "ceratops-governance-proposal-context.v3"
@@ -304,7 +304,7 @@ def _review_input_template(
             },
             "preserve_other_fields": True,
             "history_operations_usage": (
-                "Append decisions only for changed rules with a companion history. "
+                "Append decisions for changed rules; the accepted update also creates an absent companion history. "
                 "Keep the existing candidate intact when reusing accepted work."
             ),
         },
@@ -384,11 +384,11 @@ def command_init(
 
     def source_for(rules_value: str, history_value: str) -> dict[str, object]:
         rules = str(_input_path(rules_value, "declared rules source"))
-        history = (
-            None
-            if history_value == "-"
-            else str(_input_path(history_value, "declared history source"))
+        history_path = _history_path(
+            None if history_value == "-" else history_value,
+            pathlib.Path(rules), "declared history source",
         )
+        history = str(history_path) if history_path is not None else None
         prior_history = history_by_rules.setdefault(rules, history)
         if prior_history != history:
             raise ProposalWorkflowError(
@@ -432,9 +432,9 @@ def command_init(
             }
         )
 
-    if not contexts or not replacements:
+    if not replacements:
         raise ProposalWorkflowError(
-            "init requires at least one context and one replacement declaration"
+            "init requires at least one replacement declaration"
         )
     spec = {
         "schema": SPEC_SCHEMA,
@@ -475,7 +475,7 @@ def command_prepare(request_path: pathlib.Path) -> str:
     rule_ids: list[str] = []
     for source in sources:
         assert isinstance(source, Mapping)
-        if source["history"] is None:
+        if source["history"] is None or not pathlib.Path(str(source["history"])).is_file():
             continue
         lookup_arguments.extend(("--history", str(source["history"])))
         lookup_arguments.extend(("--rules", str(source["rules"])))
@@ -483,7 +483,12 @@ def command_prepare(request_path: pathlib.Path) -> str:
         assert isinstance(source_ids, list)
         rule_ids.extend(source_ids)
     lookup_arguments.extend(dict.fromkeys(rule_ids))
-    lookup_raw = _run_helper("rule_history.py", lookup_arguments)
+    lookup_raw = (
+        _run_helper("rule_history.py", lookup_arguments)
+        if len(lookup_arguments) > 1
+        else json.dumps({"detail": "compact", "requested": [], "unknown": [],
+                         "neighbors": [], "consulted": [], "entries": []})
+    )
     try:
         lookup = json.loads(lookup_raw)
     except json.JSONDecodeError as exc:
@@ -995,7 +1000,7 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--failure-file", required=True, type=pathlib.Path)
     init.add_argument("--regressions-file", required=True, type=pathlib.Path)
     init.add_argument(
-        "--context", action="append", nargs=3, required=True,
+        "--context", action="append", nargs=3, default=[],
         metavar=("RULES", "HISTORY", "RULE_IDS"),
     )
     init.add_argument(

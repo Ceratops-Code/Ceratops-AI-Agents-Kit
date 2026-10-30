@@ -126,6 +126,8 @@ installed-runtime surface.
   actions, metadata, payloads, helpers and callers, installer, validator,
   documentation, and explicit automation consumers; it builds the identity map
   and runs the source or installed validator in skill-scoped mode.
+- Read source surfaces from `identity.source_repository_root` in the packet.
+  This may be its retained source view rather than the caller's checkout.
 
 ### 2. Review nondeterministic consistency
 
@@ -181,6 +183,9 @@ installed-runtime surface.
   surfaces.
 - Account for every deterministic and non-deterministic contract check for the
   selected skill before completion.
+- (D) After review, run `python scripts/skills-consistency-review-packet.py
+  --cleanup-output <evidence-file>` through the skill's required `uv`
+  invocation; `<evidence-file>` is the packet path from step 1.
 
 ## Done When
 

@@ -31,6 +31,10 @@
   "runtime_payloads": {
     "ceratops-repo-lifecycle": [
       {
+        "source": "skills/sections/scripts/store_check_results.py",
+        "target": "scripts/store_check_results.py"
+      },
+      {
         "source": "skills/sections/core.md",
         "target": "references/templates/sections/core.md"
       },
@@ -44,6 +48,10 @@
       }
     ],
     "ceratops-skill-lifecycle": [
+      {
+        "source": "skills/sections/scripts/store_check_results.py",
+        "target": "scripts/store_check_results.py"
+      },
       {
         "source": "skills/sections/core.md",
         "target": "references/templates/sections/core.md"

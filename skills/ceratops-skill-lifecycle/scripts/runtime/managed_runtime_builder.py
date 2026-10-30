@@ -39,6 +39,7 @@ scripts_root = str(pathlib.Path(__file__).resolve().parents[1])
 sys.path.insert(0, scripts_root)
 try:
     from runtime import prepare_python_runtime as python_environments
+    from runtime import retain_skill_sources as source_provenance
 finally:
     sys.path.remove(scripts_root)
 
@@ -644,6 +645,7 @@ def expected_skill_content(
     *,
     source_repository_root: pathlib.Path | None = None,
     python_runtime: pathlib.Path | None = None,
+    source_snapshot: source_provenance.SourceSnapshot | None = None,
 ) -> ExpectedSkillContent:
     """Render desired bytes in memory before deciding which target effects remain."""
 
@@ -711,6 +713,14 @@ def expected_skill_content(
     }
     if python_runtime is not None:
         runtime_manifest["python_runtime"] = str(python_runtime)
+    if source_snapshot is not None:
+        if any(source_provenance.is_source_archive(name) for name in (*files, *directories)):
+            raise ValueError("source payload uses the installer's reserved source archive name")
+        archive_path = pathlib.PurePosixPath(source_snapshot.metadata["source_snapshot"]["archive"])
+        if archive_path in files or archive_path in directories:
+            raise ValueError("source payload collides with the retained source archive")
+        files[archive_path] = source_snapshot.archive
+        runtime_manifest.update(source_snapshot.metadata)
     relative = pathlib.PurePosixPath(MANIFEST_NAME)
     files[relative] = (json.dumps(runtime_manifest, indent=2, sort_keys=True) + "\n").encode("utf-8")
     copied_sources.pop(relative, None)
@@ -768,15 +778,19 @@ def required_skill_change(target: pathlib.Path, desired: ExpectedSkillContent) -
             directories.add(relative)
         else:
             files[relative] = path
-    if files.keys() != desired.files.keys() or directories != desired.directories:
+    payload_files = {name: path for name, path in files.items() if not source_provenance.is_source_archive(name)}
+    desired_payloads = {name: data for name, data in desired.files.items() if not source_provenance.is_source_archive(name)}
+    if payload_files.keys() != desired_payloads.keys() or directories != desired.directories:
         return "replace"
     manifest_path = pathlib.PurePosixPath(MANIFEST_NAME)
-    for relative, path in files.items():
+    for relative, path in payload_files.items():
         if relative != manifest_path and path.read_bytes() != desired.files[relative]:
             return "replace"
     actual_manifest = files[manifest_path].read_bytes()
     expected_manifest = desired.files[manifest_path]
-    if actual_manifest == expected_manifest:
+    archives_current = all(name in files and files[name].read_bytes() == data
+                           for name, data in desired.files.items() if source_provenance.is_source_archive(name))
+    if actual_manifest == expected_manifest and archives_current:
         return "current"
     return "metadata"
 
@@ -1103,8 +1117,45 @@ def install_transaction(
     remove: Sequence[str] = (),
     all_managed: bool = False,
     previous_runtime_source_id: str | None = None,
+    source_snapshot: source_provenance.SourceSnapshot | None = None,
 ) -> TransactionResult:
-    """Install one batch, accepting one explicit prior owner only for migration."""
+    """Freeze exact inputs before rendering; retain their archive in the batch.
+
+    The deployment entrypoint supplies its already checked snapshot. Direct
+    builder callers receive the same source identity without checking source
+    acceptance a second time. Source-view cleanup uses its own owner locks.
+    """
+
+    if source_snapshot is not None:
+        return _install_snapshot_transaction(source_snapshot.root, install_root,
+                                             source_snapshot=source_snapshot, selected=selected,
+                                             remove=remove, all_managed=all_managed,
+                                             previous_runtime_source_id=previous_runtime_source_id)
+    try:
+        with source_provenance.capture_source(repo_root, install_root) as captured:
+            result = _install_snapshot_transaction(captured.root, install_root,
+                                                   source_snapshot=captured, selected=selected,
+                                                   remove=remove, all_managed=all_managed,
+                                                   previous_runtime_source_id=previous_runtime_source_id)
+        if captured.cleanup_debt:
+            return TransactionResult("cleanup_blocked", result.deployed, result.removed,
+                                     result.transaction_id,
+                                     (*result.retained_retired, *captured.cleanup_debt))
+        return result
+    except source_provenance.SourceError as error:
+        raise TransactionError(json.dumps({"message": str(error), **error.details}),
+                               phase="source_capture") from error
+    finally:
+        configure_repo(repo_root)
+
+
+def _install_snapshot_transaction(
+    repo_root: pathlib.Path, install_root: pathlib.Path, *,
+    selected: Sequence[str], remove: Sequence[str], all_managed: bool,
+    previous_runtime_source_id: str | None,
+    source_snapshot: source_provenance.SourceSnapshot,
+) -> TransactionResult:
+    """Install one frozen batch, accepting one explicit prior owner for migration."""
 
     configure_repo(repo_root)
     manifest = load_manifest()
@@ -1205,6 +1256,8 @@ def install_transaction(
                 raise TransactionError(
                     error, phase="preflight", skill=skill
                 )
+            if (install_root / skill).is_dir():
+                source_provenance.prune_source_archives(install_root / skill)
 
         try:
             python_skills = selected_python_skills(manifest, deploy_names)
@@ -1231,6 +1284,7 @@ def install_transaction(
                 desired[skill] = expected_skill_content(
                     skill, manifest,
                     python_runtime=python_runtime if skill in python_skills else None,
+                    source_snapshot=source_snapshot,
                 )
                 changes[skill] = required_skill_change(install_root / skill, desired[skill])
             deploy_names = {skill for skill, change in changes.items() if change != "current"}
@@ -1246,9 +1300,9 @@ def install_transaction(
                 deployed_paths[skill] = staged
                 if skill in metadata_names:
                     staged.mkdir()
-                    (staged / MANIFEST_NAME).write_bytes(
-                        desired[skill].files[pathlib.PurePosixPath(MANIFEST_NAME)]
-                    )
+                    for name, data in desired[skill].files.items():
+                        if name.as_posix() == MANIFEST_NAME or source_provenance.is_source_archive(name):
+                            (staged / name).write_bytes(data)
                 else:
                     write_expected_skill(skill, staged, manifest, content=desired[skill])
                 enable_windows_acl_inheritance(staged)
@@ -1279,6 +1333,10 @@ def install_transaction(
                 current_skill = skill
                 canonical = install_root / skill
                 metadata_backups[skill] = (canonical / MANIFEST_NAME).read_bytes()
+                source_provenance.publish_source_archive(
+                    deployed_paths[skill], canonical,
+                    json.loads(desired[skill].files[pathlib.PurePosixPath(MANIFEST_NAME)]),
+                )
                 replace_runtime_manifest(
                     deployed_paths[skill], canonical,
                     desired[skill].files[pathlib.PurePosixPath(MANIFEST_NAME)],
@@ -1287,6 +1345,11 @@ def install_transaction(
 
             phase = "cleanup"
             retained: list[str] = []
+            for skill in sorted(deploy_names):
+                try:
+                    source_provenance.prune_source_archives(install_root / skill)
+                except (OSError, RuntimeError, ValueError) as exc:
+                    retained.append(f"{skill}: source archive cleanup: {exc}")
             for skill, retired in {**retired_paths, **{
                 skill: deployed_paths[skill] for skill in metadata_names
             }}.items():

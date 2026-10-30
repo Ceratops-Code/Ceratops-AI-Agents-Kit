@@ -171,6 +171,11 @@ def test_completion_binds_original_summary_facts_to_current_source(tmp_path, cha
     check = {"kind": "pytest", "id": "original-test", "status": "passed", "result_id": "original-result",
              "check_version": "original-check-version", "qualificationLevel": "beta", "inputGroup": group}
     summary["checks"] = [check]
+    writer = runpy.run_path(str(pathlib.Path(__file__).resolve().parents[2] / "scripts/result_records.py"))
+    current = writer["CurrentCheckResults"](repository)
+    current_record = {**{key: value for key, value in check.items() if key != "inputGroup"}, "inputs": inputs}
+    current.put("pytest", check["id"], {"target": target}, current_record)
+    original_current = current.path.read_bytes()
     if changed:
         (repository / "src/claims.py").write_text("changed source\n")
         with pytest.raises(storage.OperationError, match="different source bytes"):
@@ -182,6 +187,11 @@ def test_completion_binds_original_summary_facts_to_current_source(tmp_path, cha
         completed = runner.complete_versioned_build(transaction, [prepared])
         saved = results.read_build_check_summary(repository, completed.tag, prepared.receipt_path)["summary"]
         assert check in saved["checks"] and saved["inputGroups"][group] == inputs
+        assert current.path.read_bytes() == original_current
+        current.put("pytest", check["id"], {"target": target}, {**current_record, "status": "failed", "result_id": "later-failure"})
+        assert results.read_build_check_summary(repository, completed.tag, prepared.receipt_path)["summary"] == saved
+        current.path.unlink()
+        assert results.read_build_check_summary(repository, completed.tag, prepared.receipt_path)["summary"] == saved
 
 
 def test_versioned_receipts_persist_exact_multi_target_direct_state(tmp_path) -> None:

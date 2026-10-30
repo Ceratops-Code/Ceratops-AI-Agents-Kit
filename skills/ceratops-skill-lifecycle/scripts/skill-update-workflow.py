@@ -18,8 +18,11 @@ import argparse
 import hashlib
 import json
 import pathlib
+import platform
 import re
 import sys
+import time
+import uuid
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -62,6 +65,12 @@ from skill_update_state import (
     update_context,
     write_record,
 )
+
+# Both installed lifecycle skills receive this declared shared payload.
+_shared = pathlib.Path(__file__).resolve().parents[2] / "sections" / "scripts"
+if _shared.is_dir() and str(_shared) not in sys.path:
+    sys.path.insert(0, str(_shared))
+from store_check_results import CurrentCheckResults
 
 
 def _validate_checks(
@@ -327,7 +336,8 @@ def _result_matches_check(
     """Match successful evidence to the exact structured check that produced it."""
 
     kind = check.get("kind")
-    if result.get("kind") != kind or result.get("returncode") != 0:
+    if (result.get("kind") != kind or result.get("returncode") != 0
+            or result.get("reuse_unavailable")):
         return False
     if kind == "command":
         return result.get("argv") == check.get("argv")
@@ -526,33 +536,81 @@ def command_replace_failed_request(repo_root: pathlib.Path, request_path: pathli
         _append_check_request(context, old, candidate, replace_failed=True)
 
 
-def _reusable_results(state: dict[str, Any], prior: dict[str, Any] | None, input_hash: str) -> dict[int, dict[str, Any]]:
+def _reusable_results(state: dict[str, Any], input_hash: str) -> dict[int, dict[str, Any]]:
     """Commands need the same complete inputs; searches declare narrower inputs."""
-    if prior is None:
-        return {}
+    current = CurrentCheckResults(pathlib.Path(state["repo_root"]))
+    saved = current.records("skill-check", target=_check_target(state))
     reusable = {}
     for index, check in enumerate(state["checks"]):
-        for result in prior["checks"]:
+        for result in saved:
             if not isinstance(result, dict) or not _result_matches_check(check, result):
                 continue
             if check["kind"] == "search":
                 matches = result["applicability_sha256"] == _search_applicability_sha256(pathlib.Path(state["repo_root"]), check)
             else:
-                matches = prior["input_sha256"] == input_hash
+                matches = result["input_sha256"] == input_hash
             if matches:
                 reusable[index] = {**result, "reused": True}
                 break
     return reusable
 
 
+def _check_target(state: Mapping[str, Any]) -> dict[str, Any]:
+    return {"skills": sorted(state["selected_skills"]),
+            "platform": platform.system(), "architecture": platform.machine()}
+
+
+def _save_check_result(state: dict[str, Any], check: dict[str, Any],
+                       result: dict[str, Any], input_hash: str) -> dict[str, Any]:
+    """Save each actual outcome before another check or request-file cleanup."""
+    identity = record_hash(check)
+    recorded = {**result, "result_id": uuid.uuid4().hex, "completed_ns": time.time_ns(),
+                "input_sha256": input_hash, "check_id": identity,
+                "check_version": hashlib.sha256(pathlib.Path(__file__).with_name("skill_update_checks.py").read_bytes()).hexdigest()}
+    if _verification_surface_sha256(state) != input_hash:
+        recorded["reuse_unavailable"] = "source inputs changed while this command ran"
+    CurrentCheckResults(pathlib.Path(state["repo_root"])).put(
+        "skill-check", identity, _check_target(state), recorded,
+    )
+    return recorded
+
+
+def _preserve_request_results(state: dict[str, Any], result: dict[str, Any]) -> None:
+    """Keep actual request outcomes before deleting the request's diagnostic files.
+
+    Older requests did not record each command's identity or check-code version.
+    Retain their original report hash and index, explicitly without reuse, rather
+    than inventing those missing facts. Never replace a newer current outcome.
+    """
+    current = CurrentCheckResults(pathlib.Path(state["repo_root"]))
+    target = _check_target(state)
+    saved = {record["check_id"] for record in current.records("skill-check", target=target)}
+    outcomes: list[tuple[str, str, dict[str, Any], Mapping[str, Any]]] = []
+    for index, observed in enumerate(result["checks"]):
+        check = state["checks"][index]
+        identity = record_hash(check)
+        if identity in saved:
+            continue
+        recorded = dict(observed)
+        if "result_id" not in recorded:
+            recorded.update(result_id=f"{record_hash(result)}:{index}",
+                            check_id=identity, check_version=None,
+                            input_sha256=result["input_sha256"],
+                            reuse_unavailable="original request lacks the command's check-code version")
+            print(f"Kept check {index + 1} as an observation; its original check-code version is unavailable.",
+                  file=sys.stderr)
+        outcomes.append(("skill-check", identity, target, recorded))
+    if outcomes:
+        current.put_many(outcomes)
+
+
 def command_run_skill_checks(repo_root: pathlib.Path) -> None:
     with update_context(repo_root) as context:
         state = _validated_state(_recover_result(context, load_update(context)))
         input_hash = _verification_surface_sha256(state)
-        prior = read_result(context, state)
         if state["status"] == "passed" and state["input_sha256"] == input_hash:
             return
-        reusable = _reusable_results(state, prior, input_hash)
+        reusable = _reusable_results(state, input_hash)
         if state["status"] != "checking" or state["input_sha256"] != input_hash:
             state = append_state(context, {**state, "status": "checking", "input_sha256": input_hash}, state)
         changed: list[str] = []
@@ -571,12 +629,13 @@ def command_run_skill_checks(repo_root: pathlib.Path) -> None:
                         results.append(reusable[index])
                         continue
                     try:
-                        results.append(_run_check(
+                        observed = _run_check(
                             repo_root, check, environment, resolve_target=_target,
                             search_applicability=lambda value: _search_applicability_sha256(repo_root, value),
-                        ))
+                        )
+                        results.append(_save_check_result(state, check, observed, input_hash))
                     except CheckFailure as exc:
-                        results.append(exc.evidence)
+                        results.append(_save_check_result(state, check, exc.evidence, input_hash))
                         failures.append(str(exc))
                         break
             final_input, final_changed = _verification_input(state)
@@ -666,6 +725,7 @@ def command_close_skill_change(repo_root: pathlib.Path) -> None:
             result = read_result(context, state)
             if state["status"] != "passed" or result is None or result["status"] != "passed":
                 raise UpdateExecutionError("cannot close before successful skill checks")
+            _preserve_request_results(state, result)
             receipt = {
                 "schema": COMPLETION_SCHEMA, "worktree_id": context.worktree_id,
                 "state_sha256": record_hash(state), "check_result": state["last_result"],

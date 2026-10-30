@@ -647,7 +647,6 @@ def execute_prepared_operation(
         check_plan = prepared.check_plan
         if prepared.check_results is not None and check_plan is None:
             check_plan = reuse_operation_checks.plan_operation(prepared)
-            reuse_operation_checks.activate_plans([replace(prepared, check_plan=check_plan)])
         if check_plan is not None:
             if prepared.check_results is None:
                 raise ValueError("Check plan has no current owned input declaration.")
@@ -997,7 +996,6 @@ def execute_prepared_operations(
         prepared = [replace(item, check_plan=reuse_operation_checks.plan_operation(item))
                     if item.check_results is not None and item.check_plan is None else item
                     for item in prepared]
-        reuse_operation_checks.activate_plans(list(prepared))
     except (OSError, ValueError) as exc:
         failure = {"status": "result_invalid", "message": str(exc)}
         owner_root, action = diagnostic_owner or (prepared[0].repo_root, "operation")

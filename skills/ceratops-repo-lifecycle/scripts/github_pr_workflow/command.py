@@ -502,6 +502,12 @@ def remove_resolved_failures(
     ):
         return
     try:
+        # Finalization may already have removed the report's task directory.
+        try:
+            diagnostic_output.lstat()
+        except FileNotFoundError:
+            result.pop("report_cleanup_error", None)
+            return
         selected, owner = _report_scope(diagnostic_output, repo_root, action)
         previous = _read_failure_report(selected, owner)
         if not previous or not set(previous["failures"]).intersection(resolved_failures):
@@ -703,8 +709,9 @@ def run_progress_command(
     """Capture command results and immediately forward declared test-status lines.
 
     stdout remains exclusively the child's result. stderr is drained concurrently
-    and retained in full for diagnostics; only the runner's ``[tests] `` lines
-    reach the live display. No status controls execution, acceptance or repetition.
+    and retained in full for diagnostics. Runner status lines reach the live
+    display; per-check selection records stay captured with the result instead
+    of flooding the observer. No status controls execution or acceptance.
     """
     stderr: list[str] = []
     read_errors: list[OSError] = []
@@ -719,7 +726,7 @@ def run_progress_command(
             try:
                 for line in process.stderr:
                     stderr.append(line)
-                    if line.startswith("[tests] "):
+                    if line.startswith("[tests] ") and not line.startswith("[tests] selection "):
                         try:
                             sys.stderr.write(line)
                             sys.stderr.flush()

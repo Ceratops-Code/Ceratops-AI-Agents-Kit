@@ -13,6 +13,7 @@ import os
 import pathlib
 import subprocess
 from collections.abc import Mapping, Sequence
+
 from iteration_controller import validate_max_iterations
 from rule_graph import parse_rule_source
 from validate_rule_candidate import resolve_target_policy
@@ -259,6 +260,25 @@ def _hash_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _history_path(value: object, rules: pathlib.Path, label: str) -> pathlib.Path | None:
+    """Name an AGENTS companion before it exists; never create proposal inputs."""
+    if value is None and rules.name.casefold() != "agents.md":
+        return None
+    companion = rules.with_name("AGENTS.history.json")
+    if value is None:
+        path = companion
+    elif isinstance(value, str) and value:
+        path = _absolute(pathlib.Path(value))
+    else:
+        raise ProposalWorkflowError(f"{label} must be nonempty text")
+    _reject_link_chain(path, label)
+    if path.exists():
+        return _input_path(str(path), label)
+    if rules.name.casefold() != "agents.md" or path != companion:
+        raise ProposalWorkflowError(f"{label} must name the AGENTS companion: {companion}")
+    return path
+
+
 def _validated_request(path: pathlib.Path) -> dict[str, object]:
     request_path = _input_path(str(path), "request")
     request = _read_json(request_path, "request")
@@ -370,8 +390,8 @@ def _validated_request(path: pathlib.Path) -> dict[str, object]:
             raise ProposalWorkflowError(f"source {index} must be an object")
         _closed_fields(raw, SOURCE_FIELDS, f"source {index}")
         rules = _input_path(raw["rules"], f"source {index} rules")
-        history_value = raw["history"]
-        if history_value is None:
+        history = _history_path(raw["history"], rules, f"source {index} history")
+        if history is None:
             history = None
             rule_ids = _strings(
                 raw["rule_ids"],
@@ -383,8 +403,7 @@ def _validated_request(path: pathlib.Path) -> dict[str, object]:
                     f"source {index} without history must not declare rule_ids"
                 )
         else:
-            history = _input_path(history_value, f"source {index} history")
-            rule_ids = _strings(raw["rule_ids"], f"source {index} rule_ids")
+            rule_ids = _strings(raw["rule_ids"], f"source {index} rule_ids", allow_empty=not history.exists())
             history_backed += 1
         if rules in seen_rules:
             raise ProposalWorkflowError(f"duplicate rules source: {rules}")
@@ -525,10 +544,7 @@ def _construction_sources(
             raise ProposalWorkflowError(f"spec source {index} must be an object")
         _closed_fields(raw, SPEC_SOURCE_FIELDS, f"spec source {index}")
         rules = _input_path(raw["rules"], f"spec source {index} rules")
-        history = (
-            None if raw["history"] is None
-            else _input_path(raw["history"], f"spec source {index} history")
-        )
+        history = _history_path(raw["history"], rules, f"spec source {index} history")
         ids = _strings(raw["rule_ids"], f"spec source {index} rule_ids", allow_empty=True)
         edits = raw["replacements"]
         if not isinstance(edits, list):
@@ -545,7 +561,7 @@ def _construction_sources(
                 raise ProposalWorkflowError("spec replacement must be text without NUL")
             new.append(replacement)
         if not edits:
-            if history is None or not ids:
+            if history is None or not history.is_file() or not ids:
                 raise ProposalWorkflowError("context sources require history and rule IDs")
             parsed = parse_rule_source(rules)
             if parsed.findings:

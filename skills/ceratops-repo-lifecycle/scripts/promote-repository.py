@@ -307,18 +307,6 @@ def _ship_after_promotion(
     scope = pathlib.Path(pending_work_scope)
     if not scope.is_absolute() or not scope.resolve(strict=True).is_file():
         raise PromotionError("Recorded pending-work scope is unavailable for shipping.")
-    preserved = list(getattr(args, "preserve_worktree", None) or [])
-    requested_root = args.repo_root.expanduser().resolve(strict=True)
-    if requested_root != repo_root:
-        # Promotion routes release effects to the primary checkout, but its
-        # requesting workspace is still live. Protect that registered worktree
-        # (and its task outputs) before Ship evaluates destructive finalization.
-        workspace = pathlib.Path(require_output(
-            git_branches._git(requested_root, "rev-parse", "--show-toplevel"),
-            cwd=requested_root,
-        )).resolve(strict=True)
-        if workspace != repo_root and workspace not in {path.resolve() for path in preserved}:
-            preserved.append(workspace)
     request = repository_ship.ShipOptions(
         repo_root=repo_root,
         head_branch=args.release_branch,
@@ -326,7 +314,6 @@ def _ship_after_promotion(
         remote_name=args.remote_name,
         commit=target_commit,
         reusable_head=True,
-        preserve_worktree=preserved or None,
         sdlc_contract=args.sdlc_contract,
         title=getattr(args, "title", None),
         body=getattr(args, "body", None),
@@ -365,8 +352,6 @@ def _promotion_inputs(args: argparse.Namespace) -> tuple[pathlib.Path, list[str]
         raise PromotionError(f"release_branch must be {RELEASE_BRANCH}.")
     branches = list(dict.fromkeys(args.source_branch or []))
     ship_after_promotion = bool(getattr(args, "ship_after_promotion", False))
-    if not ship_after_promotion and getattr(args, "preserve_worktree", None):
-        raise PromotionError("Worktree preservation requires --ship-after-promotion.")
     if not ship_after_promotion and any(
         getattr(args, field, None) is not None for field in ("title", "body")
     ):
@@ -786,8 +771,12 @@ def _timed_phase(timings: dict[str, float], phase: str, *, diagnostic_output=Non
         timings[phase] = round(time.monotonic() - started, 6)
 
 
-def _save_result(path: pathlib.Path, result: dict[str, object]) -> None:
-    """Atomically retain the exact outcome; own and always clean its staging file."""
+def _save_result(path: pathlib.Path, result: dict[str, object]) -> str:
+    """Publish the complete report and return its exact-byte cleanup digest.
+
+    The caller can print only a summary after publication succeeds. The report
+    is observational; neither it nor its digest can resume lifecycle effects.
+    """
     # A long operation may outlive cleanup of its initially empty result
     # directory. Recreate that directory without replaying the operation.
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -804,10 +793,30 @@ def _save_result(path: pathlib.Path, result: dict[str, object]) -> None:
             staging = pathlib.Path(stream.name)
             json.dump(result, stream, indent=2)
             stream.write("\n")
+        digest = hashlib.sha256(staging.read_bytes()).hexdigest()
         staging.replace(path)
+        return digest
     finally:
         if staging is not None:
             staging.unlink(missing_ok=True)
+
+
+def _result_summary(
+    result: dict[str, object], path: pathlib.Path, digest: str,
+) -> dict[str, object]:
+    """Point to a published outcome without duplicating checks or receipts."""
+    summary: dict[str, object] = {
+        key: result[key] for key in (
+            "status", "phase", "operation", "release_branch", "head", "commit",
+            "replay_required", "remote_mutation", "timings_seconds",
+        ) if key in result
+    }
+    if result.get("message"):
+        # The first line names the failed operation; complete causes and child
+        # streams remain in the exact report rather than spilling into stdout.
+        summary["message"] = str(result["message"]).partition("\n")[0][:2000]
+    summary.update(result_file=str(path), result_sha256=digest)
+    return summary
 
 
 def _cleanup_path(path: pathlib.Path) -> pathlib.Path:
@@ -1083,7 +1092,9 @@ def finalize_result(args: argparse.Namespace) -> None:
         raise PromotionError(
             "Supply verified-result-sha256 for the exact completed report."
         )
-    repo_root = args.repo_root.expanduser().resolve(strict=True)
+    repo_root = git_branches._primary_checkout(
+        args.repo_root.expanduser().resolve(strict=True)
+    )
     common_dir = pathlib.Path(
         require_output(
             git_branches._git(repo_root, "rev-parse", "--path-format=absolute", "--git-common-dir"),
@@ -1243,10 +1254,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_SDLC_CONTRACT,
     )
     parser.add_argument(
-        "--preserve-worktree", type=pathlib.Path, action="append",
-        help="Keep this active task worktree and its files after composed shipping; repeat as needed.",
-    )
-    parser.add_argument(
         "--validation-operation",
         action="append",
         help="Validate YAML location; repeats replace repository check discovery.",
@@ -1299,6 +1306,7 @@ def main(argv: list[str] | None = None) -> int:
     started = time.monotonic()
     timings: dict[str, float] = {}
     result_file = None
+    result_digest = None
     failed = False
     try:
         if (args.result_file is not None and args.diagnostic_output is not None
@@ -1332,7 +1340,7 @@ def main(argv: list[str] | None = None) -> int:
     result["timings_seconds"] = timings
     if result_file is not None:
         try:
-            _save_result(result_file, result)
+            result_digest = _save_result(result_file, result)
         except OSError as exc:
             # Side effects may already be complete. Retain their exact outcome
             # in the error instead of suggesting a replay to recover a record.
@@ -1343,8 +1351,12 @@ def main(argv: list[str] | None = None) -> int:
                 "replay_required": False,
             }
             failed = True
+    public_result = (
+        _result_summary(result, result_file, result_digest)
+        if result_file is not None and result_digest is not None else result
+    )
     print(
-        json.dumps(result, separators=(",", ":")),
+        json.dumps(public_result, separators=(",", ":")),
         file=sys.stderr if failed else sys.stdout,
     )
     return 1 if failed else (2 if result.get("status") == "pending_work" else 0)

@@ -145,6 +145,7 @@ def test_command_transport_drains_both_large_streams_and_retains_failure_details
             "import sys; "
             "sys.stdout.write('output-marker' * 20000); sys.stdout.flush(); "
             "sys.stderr.write('diagnostic-marker' * 20000 + '\\n'); sys.stderr.flush(); "
+            "print('[tests] selection ' + 'selected-case-record' * 20000, file=sys.stderr, flush=True); "
             "print('[tests] 0/1 completed; running probe', file=sys.stderr, flush=True); "
             "sys.exit(9)"
         )],
@@ -152,7 +153,10 @@ def test_command_transport_drains_both_large_streams_and_retains_failure_details
     )
     assert result.returncode == 9
     assert result.stdout == "output-marker" * 20000
-    assert result.stderr == "diagnostic-marker" * 20000 + "\n[tests] 0/1 completed; running probe\n"
+    assert result.stderr == (
+        "diagnostic-marker" * 20000 + "\n[tests] selection "
+        + "selected-case-record" * 20000 + "\n[tests] 0/1 completed; running probe\n"
+    )
     observed = capsys.readouterr()
     assert observed.out == "" and observed.err == "[tests] 0/1 completed; running probe\n"
     with pytest.raises(commands.CommandError, match="invalid JSON") as captured:
@@ -241,6 +245,7 @@ def test_promotion_streams_real_pytest_progress_through_every_parent(
     assert observations == [True], result.stdout + result.stderr
     assert "2/2 completed" in sink.getvalue()
     assert "[tests] pytest exit " + str(int(failure)) in sink.getvalue()
+    assert "[tests] selection " not in sink.getvalue()
     assert result.returncode == int(failure), payload
     assert payload["status"] == ("tests_failed" if failure else "ready"), payload
     if failure:

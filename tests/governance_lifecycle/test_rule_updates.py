@@ -585,6 +585,172 @@ def test_approved_rename_carries_existing_markers_through_application(
     assert not list(rules.parent.glob("*.rules-update.*"))
 
 
+def write_history_update_candidate(tmp_path: pathlib.Path, has_history: bool):
+    """Describe one ordinary edit whose decision creates or appends its history."""
+    rules = tmp_path / "AGENTS.md"
+    before = "- [DEMO-01] Preserve original scope."
+    after = "- [DEMO-01] Preserve declared scope."
+    rules.write_bytes(("# Rules\r\n\r\n" + before + "\r\n").encode())
+    history = tmp_path / "AGENTS.history.json"
+    if has_history:
+        history.write_text(json.dumps({"version": 2, "entries": [{
+            "rules": ["DEMO-01"], "decision": "Preserve original scope.",
+            "reason": "Keep the original boundary.", "regression": "Scope stays explicit.",
+        }]}), encoding="utf-8")
+    candidate = tmp_path / "candidate.json"
+    write_rule_candidate(candidate, rule_stack=[rules], targets=[{
+        "rules": str(rules), "history": str(history),
+        "source_sha256": hashlib.sha256(rules.read_bytes()).hexdigest(),
+        "markdown_policy": None,
+        "replacements": [{"expected_old": before, "replacement": after}],
+    }])
+    value = json.loads(candidate.read_bytes())
+    value["history_operations"] = [{"history": str(history), "operation": "append", "entry": {
+        "rules": ["DEMO-01"], "decision": "Preserve declared scope.",
+        "reason": "Follow the declared boundary.", "regression": "Scope stays explicit.",
+    }}]
+    candidate.write_text(json.dumps(value), encoding="utf-8")
+    root = tmp_path / "task-temp"
+    root.mkdir()
+    return candidate, rules, history, root
+
+
+@pytest.mark.parametrize("has_history", [False, True])
+@pytest.mark.parametrize("effect", ["rules", "history"])
+@pytest.mark.parametrize("timing", ["before", "after"])
+def test_history_update_handles_interruption_at_each_write(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+    has_history: bool, effect: str, timing: str,
+) -> None:
+    monkeypatch.syspath_prepend(str(RULE_CANDIDATE_VALIDATOR.parent))
+    import apply_rules_update as application
+
+    candidate, rules, history, root = write_history_update_candidate(tmp_path, has_history)
+    originals = {p: p.read_bytes() if p.exists() else None for p in (rules, history)}
+    request = application.generate_candidate_update_request(candidate, root)
+    destination = rules if effect == "rules" else history
+    replace = application.os.replace
+    link = application.os.link
+
+    def interrupted(source, target, operation=replace):
+        if pathlib.Path(target) == destination and pathlib.Path(source).suffix == ".new":
+            if timing == "after":
+                operation(source, target)
+            raise KeyboardInterrupt("injected governing write interruption")
+        return operation(source, target)
+
+    with (
+        mock.patch.object(application.os, "replace", side_effect=interrupted),
+        mock.patch.object(application.os, "link", side_effect=lambda source, target: interrupted(source, target, link)),
+    ):
+        with pytest.raises(application.ApplicationError, match="update rolled back"):
+            application.apply_update_request(request)
+    assert {p: p.read_bytes() if p.exists() else None for p in originals} == originals
+    assert not list(tmp_path.glob("*.rules-update.*"))
+    application.apply_update_request(request)
+    assert b"Preserve declared scope." in rules.read_bytes()
+    assert len(json.loads(history.read_bytes())["entries"]) == (2 if has_history else 1)
+    assert not list(root.iterdir())
+
+
+@pytest.mark.parametrize("has_history", [False, True])
+@pytest.mark.parametrize("completed", ["rules", "history"])
+def test_history_update_finishes_partial_current_outputs_without_rewriting_them(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+    has_history: bool, completed: str,
+) -> None:
+    monkeypatch.syspath_prepend(str(RULE_CANDIDATE_VALIDATOR.parent))
+    import apply_rules_update as application
+
+    candidate, rules, history, root = write_history_update_candidate(tmp_path, has_history)
+    request = application.generate_candidate_update_request(candidate, root)
+    update = application.load_accepted_update(application.load_request(request))
+    destination = rules if completed == "rules" else history
+    destination.write_bytes(update.candidates[destination])
+    replace = application.os.replace
+
+    def reject_completed_write(source, target):
+        assert pathlib.Path(target) != destination, "rewrote an accepted current output"
+        return replace(source, target)
+
+    with mock.patch.object(application.os, "replace", side_effect=reject_completed_write):
+        application.apply_update_request(request)
+    assert {p: p.read_bytes() for p in update.candidates} == update.candidates
+    assert len(json.loads(history.read_bytes())["entries"]) == (2 if has_history else 1)
+
+
+def test_first_history_rejects_another_writer_without_overwriting_it(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.syspath_prepend(str(RULE_CANDIDATE_VALIDATOR.parent))
+    import apply_rules_update as application
+
+    candidate, rules, history, root = write_history_update_candidate(tmp_path, False)
+    original = rules.read_bytes()
+    request = application.generate_candidate_update_request(candidate, root)
+    history.write_bytes(b"Another writer owns this history.\n")
+    with pytest.raises(application.ApplicationError, match="source changed since acceptance"):
+        application.apply_update_request(request)
+    assert rules.read_bytes() == original
+    assert history.read_bytes() == b"Another writer owns this history.\n"
+    assert request.exists()
+
+
+def test_first_history_atomic_creation_preserves_a_competing_writer(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.syspath_prepend(str(RULE_CANDIDATE_VALIDATOR.parent))
+    import apply_rules_update as application
+
+    candidate, rules, history, root = write_history_update_candidate(tmp_path, False)
+    original = rules.read_bytes()
+    request = application.generate_candidate_update_request(candidate, root)
+    link = application.os.link
+
+    def competing_creation(source, target):
+        if pathlib.Path(target) == history:
+            history.write_bytes(b"Concurrent history must survive.\n")
+        return link(source, target)
+
+    with mock.patch.object(application.os, "link", side_effect=competing_creation):
+        with pytest.raises(application.ApplicationError, match="original error"):
+            application.apply_update_request(request)
+    assert rules.read_bytes() == original
+    assert history.read_bytes() == b"Concurrent history must survive.\n"
+    assert request.exists()
+    assert not list(tmp_path.glob("*.rules-update.*"))
+
+
+@pytest.mark.parametrize("timing", ["before", "after"])
+def test_first_history_repeats_after_interrupted_request_cleanup(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, timing: str,
+) -> None:
+    monkeypatch.syspath_prepend(str(RULE_CANDIDATE_VALIDATOR.parent))
+    import apply_rules_update as application
+
+    candidate, rules, history, root = write_history_update_candidate(tmp_path, False)
+    request = application.generate_candidate_update_request(candidate, root)
+    unlink = pathlib.Path.unlink
+
+    def interrupted(path, *args, **kwargs):
+        if path == request:
+            if timing == "after":
+                unlink(path, *args, **kwargs)
+            raise OSError("injected request cleanup interruption")
+        return unlink(path, *args, **kwargs)
+
+    with mock.patch.object(pathlib.Path, "unlink", interrupted):
+        with pytest.raises(OSError, match="request cleanup interruption"):
+            application.apply_update_request(request)
+    completed = {p: p.read_bytes() for p in (rules, history)}
+    with mock.patch.object(application, "validate_rule_candidate", side_effect=AssertionError("rechecked accepted work")):
+        request = application.generate_candidate_update_request(candidate, root)
+        application.apply_update_request(request)
+    assert {p: p.read_bytes() for p in completed} == completed
+    assert len(json.loads(history.read_bytes())["entries"]) == 1
+    assert not list(root.iterdir())
+
+
 @pytest.mark.parametrize("change", [
     "undeclared", "wrong-history", "wrong-source", "old-still-present",
     "duplicate-new", "cascade", "invalid-id", "new-self", "new-rule",

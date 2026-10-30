@@ -881,7 +881,7 @@ def test_pytest_failure_writes_full_diagnostic_and_emits_bounded_summary(
     captured = capsys.readouterr().out
     result = json.loads(captured)
 
-    assert exit_code == 1
+    assert exit_code == 1, captured
     assert result["status"] == "pytest-failed"
     assert result["pytest"]["failed_tests"] == [
         "tests/test_example.py::test_contract",

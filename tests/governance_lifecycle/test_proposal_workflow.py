@@ -103,8 +103,8 @@ def test_init_and_run_drive_utf8_proposal_without_caller_json(
     for after_output in (False, True):
         output = io.StringIO()
 
-        def interrupted_print(*args: object, **kwargs: Any) -> None:
-            if after_output:
+        def interrupted_print(*args: object, emit_output: bool = after_output, **kwargs: Any) -> None:
+            if emit_output:
                 original_print(*args, **kwargs)
             raise BrokenPipeError("interrupted review response")
 
@@ -200,7 +200,10 @@ def test_init_and_run_drive_utf8_proposal_without_caller_json(
     assert not list(task_temp_root.iterdir())
 
 
-def test_review_template_history_example_can_be_submitted(tmp_path: pathlib.Path) -> None:
+@pytest.mark.parametrize("has_history", [False, True])
+def test_review_template_history_example_can_be_submitted(
+    tmp_path: pathlib.Path, has_history: bool,
+) -> None:
     task_temp_root = tmp_path / "task-temp"
     task_temp_root.mkdir()
     target_dir = tmp_path / "governed"
@@ -210,10 +213,11 @@ def test_review_template_history_example_can_be_submitted(tmp_path: pathlib.Path
     old_rule = "- [DEMO-01] Preserve original scope."
     target.write_text(f"# Rules\n\n{old_rule}\n", encoding="utf-8")
     history = target_dir / "AGENTS.history.json"
-    history.write_text(json.dumps({"version": 2, "entries": [{
-        "rules": ["DEMO-01"], "decision": "Preserve original scope.",
-        "reason": "Keep the initial boundary.", "regression": "Scope must remain explicit.",
-    }]}), encoding="utf-8")
+    if has_history:
+        history.write_text(json.dumps({"version": 2, "entries": [{
+            "rules": ["DEMO-01"], "decision": "Preserve original scope.",
+            "reason": "Keep the initial boundary.", "regression": "Scope must remain explicit.",
+        }]}), encoding="utf-8")
     paths = {}
     for name, value in {
         "failure": "The scope should follow the declaration.\n",
@@ -228,8 +232,8 @@ def test_review_template_history_example_can_be_submitted(tmp_path: pathlib.Path
          "--task-temp-root", str(task_temp_root),
          "--failure-file", str(paths["failure"]),
          "--regressions-file", str(paths["regressions"]),
-         "--context", str(target), str(history), "DEMO-01",
-         "--replacement", str(target), str(history),
+         *(["--context", str(target), str(history), "DEMO-01"] if has_history else []),
+         "--replacement", str(target), str(history) if has_history else "-",
          str(paths["expected"]), str(paths["replacement"])],
         capture_output=True, text=True, check=False,
     )
@@ -262,6 +266,28 @@ def test_review_template_history_example_can_be_submitted(tmp_path: pathlib.Path
     assert json.loads(submitted.stdout)["next_action"] == "assess_candidate_then_run"
     assert json.loads(candidate_path.read_bytes())["acceptance"]["regressions"] == "passed"
     assert old_rule in target.read_text(encoding="utf-8")
+    assert history.exists() is has_history
+    progress = json.loads(submitted.stdout)
+    for _ in range(3):
+        pending = progress["pending"]
+        continued = subprocess.run(
+            [sys.executable, str(PROPOSAL_WORKFLOW), "run", "--state", progress["state"],
+             "--assessment-file", str(template["assessment"]["path"]),
+             "--outcome", "no-improvement", "--regressions", "passed"],
+            capture_output=True, text=True, check=False,
+        )
+        assert continued.returncode == 0, continued.stderr
+        progress = json.loads(continued.stdout)
+    assert progress["status"] == "awaiting_approval"
+    applied = subprocess.run(
+        [sys.executable, str(PROPOSAL_WORKFLOW.with_name("apply_rules_update.py")),
+         "--request", progress["request"]], capture_output=True, text=True, check=False,
+    )
+    assert applied.returncode == 0, applied.stderr
+    assert "- [DEMO-01] Preserve declared scope." in target.read_text(encoding="utf-8")
+    entries = json.loads(history.read_bytes())["entries"]
+    assert len(entries) == (2 if has_history else 1)
+    assert entries[-1] == operations[0]["entry"]
 
 
 @pytest.mark.parametrize("context_record", [None, {"value": {"targets": [{"history": []}]}}])
@@ -391,18 +417,24 @@ def test_proposal_workflow_validates_context_and_owns_iteration_transition(
         newline="\n",
     )
     target_repository_markdown_policy(target_dir)
-    current_text = (
-        "- [SKILLS-GOV-01] Before proposing or editing a repository control surface,\n"
-        "  including `AGENTS.md`, `automation.toml`, `SKILL.md`, skill manifests, shared\n"
-        "  sections, or helper contracts, re-open the relevant files from disk and use\n"
-        "  the current contents as the source of truth.\n"
-        "  - self: list-heavy"
-    )
-    assert current_text in (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    # Context lookup needs stable test-owned rules and decisions, independent
+    # of instruction edits in the repository running this behavior test.
+    context_dir = tmp_path / "context-source"
+    context_dir.mkdir()
+    context_rules = context_dir / "AGENTS.md"
+    context_history = context_dir / "AGENTS.history.json"
+    current_text = "- [CONTEXT-01] Read the current source before proposing changes."
+    context_rules.write_text("# Context\n\n" + current_text + "\n", encoding="utf-8")
+    context_history.write_text(json.dumps({"version": 2, "entries": [{
+        "rules": ["CONTEXT-01"],
+        "decision": "Use current source evidence.",
+        "reason": "Proposals must describe the actual governed text.",
+        "regression": "Preserve exact source matching.",
+    }]}) + "\n", encoding="utf-8")
     history_source: dict[str, object] = {
-        "rules": str(ROOT / "AGENTS.md"),
-        "history": str(ROOT / "AGENTS.history.json"),
-        "rule_ids": ["SKILLS-GOV-01"],
+        "rules": str(context_rules),
+        "history": str(context_history),
+        "rule_ids": ["CONTEXT-01"],
         "expected_text": [current_text],
         "candidate_target": False,
         "markdown_policy": None,
@@ -522,7 +554,7 @@ def test_proposal_workflow_validates_context_and_owns_iteration_transition(
         assert original_spec == json.loads(spec_path.read_text(encoding="utf-8"))
         generated_request = json.loads(request_path.read_text(encoding="utf-8"))
         assert generated_request["mutation_authorized"] is False
-        assert "Before proposing or editing" in generated_request["sources"][0]["expected_text"][0]
+        assert generated_request["sources"][0]["expected_text"] == [current_text]
     context = json.loads(evidence.read_text(encoding="utf-8"))
     assert context["schema"] == "ceratops-governance-proposal-context.v3"
     assert context["history_lookup"]["unknown"] == []

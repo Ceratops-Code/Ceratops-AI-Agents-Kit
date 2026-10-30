@@ -6,6 +6,7 @@ import os
 import pathlib
 import subprocess
 import sys
+from typing import Any
 
 import pytest
 
@@ -226,6 +227,18 @@ def test_closure_snapshot_composes_only_named_local_state(
     assert "must be provided together" in invalid.stderr
 
 
+def codex_task_pages_fixture(tasks: dict[str, Any]) -> dict[str, Any]:
+    """Build explicit Codex API page evidence for offline report fixtures."""
+
+    return {
+        "schema": "ceratops-unarchived-codex-tasks.v1", "archived": False,
+        "pages": [{"data": [{**item, "name": item.get("title")} for item in
+                              [*tasks.get("pinnedThreads", []), *tasks.get("threads", [])]],
+                   "nextCursor": tasks.get("nextCursor")}],
+        "errors": tasks.get("unavailableHosts", []) + tasks.get("unavailableSources", []),
+    }
+
+
 def write_worktree_status_inputs(
     tmp_path: pathlib.Path,
     repositories: list[dict[str, object]],
@@ -235,9 +248,9 @@ def write_worktree_status_inputs(
     request.write_text(json.dumps({
         "schema": "ceratops-worktree-status-request.v1", "repositories": repositories,
     }), encoding="utf-8")
-    evidence.write_text(json.dumps(tasks if tasks is not None else {
+    evidence.write_text(json.dumps(codex_task_pages_fixture(tasks if tasks is not None else {
         "threads": [], "pinnedThreads": [], "unavailableHosts": [], "unavailableSources": [],
-    }), encoding="utf-8")
+    })), encoding="utf-8")
     return request, evidence, output
 
 
@@ -453,7 +466,7 @@ def test_worktree_status_assessment_skips_integrated_and_bot_refs_and_bounds_rea
 
 @pytest.mark.parametrize("case, expected", [
     ("none", "None"), ("active", "Active"), ("archived", "None"),
-    ("ambiguous", "Unverified"), ("truncated", "Unverified"),
+    ("ambiguous", "Active"), ("truncated", "Active"),
     ("missing_cwd", "Unverified"), ("unavailable_host", "Unverified"),
     ("conflicting_id", "Unverified"), ("failed_source", "Unverified"),
 ])
@@ -468,6 +481,7 @@ def test_worktree_status_retains_task_ownership_uncertainty(tmp_path: pathlib.Pa
         tasks["threads"] = [task, {**task, "id": "task-b", "title": "Other full title"}]
     elif case == "truncated":
         tasks["threads"] = [task, *[{"kind": "chatgpt"} for _ in range(49)]]
+        tasks["nextCursor"] = "more-codex-chats"
     elif case == "missing_cwd":
         tasks["threads"] = [{"id": "task-a", "title": "No binding", "kind": "codex"}]
     elif case == "unavailable_host":
@@ -475,7 +489,7 @@ def test_worktree_status_retains_task_ownership_uncertainty(tmp_path: pathlib.Pa
     elif case == "conflicting_id":
         tasks["threads"] = [task, {**task, "title": "Conflicting title"}]
     evidence = tmp_path / "tasks.json"
-    evidence.write_text(json.dumps({"content": [{"type": "text", "text": json.dumps(tasks)}]}), encoding="utf-8")
+    evidence.write_text(json.dumps(codex_task_pages_fixture(tasks)), encoding="utf-8")
     if case == "failed_source":
         evidence.write_text("not JSON", encoding="utf-8")
     source = helper.task_evidence(evidence)
@@ -489,6 +503,136 @@ def test_worktree_status_retains_task_ownership_uncertainty(tmp_path: pathlib.Pa
     if expected == "Unverified":
         assert owner["reason"]
     assert helper.active_task("-", source)["status"] == "Unverified"
+
+
+def test_worktree_status_codex_membership_ignores_runtime_state_and_mixed_rows(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    helper = load_worktree_status_helper()
+    states = ("active", "idle", "notLoaded", "systemError")
+    tasks = [{"id": state, "name": state, "cwd": str(tmp_path), "status": {"type": state}}
+             for state in states]
+    payload = {
+        "schema": helper.TASK_SCHEMA, "archived": False, "errors": [],
+        "pages": [{"data": [*tasks, {"id": "archived", "archived": True},
+                            {"source": "exec"}, {"source": {"subAgent": {"other": "guardian"}}},
+                            *[{"kind": "chatgpt"} for _ in range(100)]], "nextCursor": None}],
+    }
+    monkeypatch.setattr(helper, "collect_codex_task_pages", lambda: payload)
+    for _ in range(2):
+        evidence = helper.task_evidence()
+        assert evidence["complete"] and not evidence["gaps"]
+        owner = helper.active_task(str(tmp_path), evidence)
+        assert owner["status"] == "Active"
+        assert [task["id"] for task in owner["candidates"]] == list(states)
+        assert helper.active_task(str(tmp_path / "other"), evidence)["status"] == "None"
+    extra = [{"id": f"chat-{index}", "name": f"Chat {index}", "cwd": str(tmp_path)}
+             for index in range(100)]
+    payload["pages"][0]["nextCursor"] = "more"
+    payload["pages"].append({"data": extra, "nextCursor": None})
+    evidence = helper.task_evidence()
+    assert evidence["complete"]
+    assert len(helper.active_task(str(tmp_path), evidence)["candidates"]) == 104
+    payload["pages"].pop()
+    payload["pages"][0]["nextCursor"] = "remaining"
+    evidence = helper.task_evidence()
+    assert helper.active_task(str(tmp_path), evidence)["status"] == "Active"
+    assert helper.active_task(str(tmp_path / "other"), evidence)["status"] == "Unverified"
+    payload["archived"] = True
+    assert not helper.task_evidence()["complete"]
+
+
+@pytest.mark.parametrize("interruption", [
+    "none", "before_initialize", "after_initialize", "after_first_page", "server_error",
+    "repeated_cursor", "invalid_page", "invalid_message", "launch_failure",
+])
+def test_worktree_status_codex_client_paginates_and_restarts_after_failures(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, interruption: str,
+) -> None:
+    import io
+
+    helper = load_worktree_status_helper()
+    pages = [
+        {"id": 1, "result": {"userAgent": "fixture"}},
+        {"id": 2, "result": {"data": [{"id": "one", "name": "First chat", "cwd": str(tmp_path)}],
+                              "nextCursor": "next"}},
+        {"id": 3, "result": {"data": [{"id": "two", "name": "Second chat", "cwd": str(tmp_path)}],
+                              "nextCursor": None}},
+    ]
+    interrupted = json.loads(json.dumps(pages))
+    if interruption == "before_initialize":
+        interrupted = []
+    elif interruption == "after_initialize":
+        interrupted = interrupted[:1]
+    elif interruption == "after_first_page":
+        interrupted = interrupted[:2]
+    elif interruption == "server_error":
+        interrupted[1] = {"id": 2, "error": {"code": -32000,
+                                             "message": "source unavailable; Authorization: Bearer fixture-secret"}}
+    elif interruption == "repeated_cursor":
+        interrupted[2]["result"]["nextCursor"] = "next"
+    elif interruption == "invalid_page":
+        interrupted[1]["result"] = {"data": []}
+    elif interruption == "invalid_message":
+        interrupted = [["invalid JSON-RPC object"]]
+    processes = []
+    launches = 0
+
+    class Input(io.StringIO):
+        def __init__(self):
+            super().__init__()
+            self.requests = []
+
+        def write(self, value):
+            self.requests.append(json.loads(value))
+            return super().write(value)
+
+    class Process:
+        def __init__(self, replies):
+            self.stdin = Input()
+            self.stdout = io.StringIO("".join(json.dumps(reply) + "\n" for reply in replies))
+            self.stderr = io.StringIO("fixture diagnostics api_key=fixture-key\n")
+            self.waited = False
+
+        def poll(self):
+            return 0
+
+        def wait(self, timeout):
+            self.waited = True
+            return 0
+
+    def launch(command, **kwargs):
+        nonlocal launches
+        launches += 1
+        assert command[-2:] == ["app-server", "--stdio"]
+        assert kwargs["encoding"] == "utf-8"
+        if interruption == "launch_failure" and launches == 1:
+            raise OSError("fixture executable unavailable")
+        process = Process(interrupted if launches == 1 else pages)
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(helper.subprocess, "Popen", launch)
+    first = helper.collect_codex_task_pages()
+    assert bool(first["errors"]) == (interruption != "none")
+    if first["errors"]:
+        failure = first["errors"][0]
+        assert failure["operation"] in {"initialize", "thread/list"}
+        assert failure["target"] == "unarchived local Codex chats"
+        assert all(key in failure for key in ("command", "exit_code", "stdout", "stderr", "error"))
+        assert "fixture-secret" not in json.dumps(failure)
+        assert "fixture-key" not in json.dumps(failure)
+    for _ in range(2):
+        result = helper.collect_codex_task_pages()
+        assert not result["errors"] and len(result["pages"]) == 2
+        assert result["pages"][-1]["nextCursor"] is None
+        requests = [r for r in processes[-1].stdin.requests if r["method"] == "thread/list"]
+        assert [r["params"]["cursor"] for r in requests] == [None, "next"]
+        assert all(r["params"]["archived"] is False and r["params"]["useStateDbOnly"] is True for r in requests)
+        assert all("status" not in r["params"] for r in requests)
+        assert requests[0]["params"]["sourceKinds"] == list(helper.CODEX_THREAD_SOURCES)
+        assert set(requests[0]["params"]["sourceKinds"]) == {"cli", "vscode", "appServer"}
+    assert all(process.stdin.closed and process.waited for process in processes)
 
 
 def test_worktree_status_stops_before_unrelated_output_or_invalid_scope(tmp_path: pathlib.Path) -> None:

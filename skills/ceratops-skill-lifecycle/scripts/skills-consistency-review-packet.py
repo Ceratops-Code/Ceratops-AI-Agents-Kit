@@ -21,6 +21,8 @@ import tomllib
 from collections.abc import Iterable, Mapping
 from typing import Any
 
+from runtime import retain_skill_sources as source_provenance
+
 SCHEMA = "ceratops-skills-consistency-review-packet.v1"
 RUNTIME_SCHEMA = "ceratops-runtime-skill.v3"
 SKILL_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -105,7 +107,8 @@ def source_resources(source_skill: pathlib.Path) -> list[str]:
     return sorted(values)
 
 
-def tracked_files(repo: pathlib.Path, source_root: pathlib.Path) -> list[pathlib.Path]:
+def tracked_files(repo: pathlib.Path, source_root: pathlib.Path,
+                  retained_paths: list[str] | None = None) -> list[pathlib.Path]:
     """Return existing Git-tracked files below one contained source root.
 
     Generated caches and other untracked files must never become review surfaces.
@@ -113,6 +116,10 @@ def tracked_files(repo: pathlib.Path, source_root: pathlib.Path) -> list[pathlib
     the meaning of the Git query.
     """
 
+    if retained_paths is not None:
+        return sorted(path for name in retained_paths
+                      if (path := repo.joinpath(*pathlib.PurePosixPath(name).parts)).is_relative_to(source_root)
+                      and path.is_file())
     try:
         source_relative = source_root.relative_to(repo).as_posix()
     except ValueError as exc:
@@ -305,7 +312,6 @@ def packet(args: argparse.Namespace) -> dict[str, Any]:
     skill = args.skill.strip()
     if SKILL_RE.fullmatch(skill) is None:
         raise PacketError("--skill must be a safe lowercase hyphenated name")
-    repo = resolve_directory(args.repo_root, "source repository")
     installed_skill = resolve_directory(args.installed_skill, "installed skill")
     if installed_skill.name != skill:
         raise PacketError("installed skill directory does not match --skill")
@@ -324,16 +330,13 @@ def packet(args: argparse.Namespace) -> dict[str, Any]:
         raise PacketError(f"direct runtime manifest is missing: {missing[0]}")
     if runtime["schema"] != RUNTIME_SCHEMA or runtime["skill"] != skill:
         raise PacketError("direct runtime manifest identity is unsupported")
-    try:
-        declared_root = pathlib.Path(str(runtime["source_repository_root"])).resolve(strict=True)
-    except OSError as exc:
-        raise PacketError("runtime source repository is unavailable") from exc
-    if declared_root != repo:
-        raise PacketError("runtime source repository does not match --repo-root")
+    repo, retained_paths, source_origin = source_provenance.resolve_review_source(
+        runtime, installed_skill, args.repo_root, args.output.resolve())
 
     source_value = str(runtime["source_path"])
     source_pure = pathlib.PurePosixPath(source_value)
-    if source_pure.is_absolute() or ".." in source_pure.parts:
+    if (source_pure.is_absolute() or pathlib.PureWindowsPath(source_value).drive
+            or ".." in source_pure.parts or "\\" in source_value):
         raise PacketError("runtime source_path is unsafe")
     source_skill = (repo / pathlib.Path(*source_pure.parts)).resolve(strict=True)
     if not source_skill.is_dir() or not source_skill.is_relative_to(repo):
@@ -384,7 +387,7 @@ def packet(args: argparse.Namespace) -> dict[str, Any]:
             raise PacketError(f"runtime_payloads.{owner} must be a list")
         payloads.extend(declared)
 
-    source_files = tracked_files(repo, source_skill)
+    source_files = tracked_files(repo, source_skill, retained_paths)
     scripts_root = source_skill / "scripts"
     helpers = [
         path
@@ -437,6 +440,9 @@ def packet(args: argparse.Namespace) -> dict[str, Any]:
             "runtime_source_id": runtime["runtime_source_id"],
             "validation_profile": runtime["validation_profile"],
             "source_repository_root": str(repo),
+            "recorded_repository_root": runtime["source_repository_root"],
+            "source_commit": runtime.get("source_commit"),
+            "source_resolution": source_origin,
             "source_path": source_value,
             "installed_path": str(installed_skill),
             "runtime_manifest": str(runtime_path),
@@ -476,10 +482,12 @@ def build_parser() -> argparse.ArgumentParser:
     """Create the one-skill packet command line."""
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--skill", required=True)
-    parser.add_argument("--repo-root", required=True, type=pathlib.Path)
-    parser.add_argument("--installed-skill", required=True, type=pathlib.Path)
-    parser.add_argument("--output", required=True, type=pathlib.Path)
+    parser.add_argument("--skill")
+    parser.add_argument("--repo-root", type=pathlib.Path)
+    parser.add_argument("--installed-skill", type=pathlib.Path)
+    parser.add_argument("--output", type=pathlib.Path)
+    parser.add_argument("--cleanup-output", type=pathlib.Path,
+                        help="remove one completed packet and its owned source view")
     parser.add_argument(
         "--automation-root",
         action="append",
@@ -493,18 +501,44 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     """Write one packet and return payload-free success."""
 
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    building = (args.skill, args.repo_root, args.installed_skill, args.output)
+    if args.cleanup_output is not None:
+        if any(value is not None for value in building) or args.automation_root:
+            parser.error("--cleanup-output cannot be combined with packet inputs")
+    elif any(value is None for value in building):
+        parser.error("--skill, --repo-root, --installed-skill and --output are required")
+    supplied = (args.cleanup_output or args.output).expanduser()
+    if supplied.is_symlink() or getattr(supplied, "is_junction", lambda: False)():
+        parser.error("packet output cannot be a link")
+    target = supplied.resolve()
     try:
-        target = output_path(args.output)
-        target.write_text(
-            json.dumps(packet(args), indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-            newline="\n",
-        )
+        if not target.parent.is_dir():
+            raise PacketError(f"output parent is unavailable: {target.parent}")
+        # A single parent lock protects packet creation and cleanup, without
+        # leaving one lock file per report. Fresh calls discard only owned views.
+        with source_provenance.source_lock(target.parent / "._skill-source-reports.lock"):
+            if args.cleanup_output is not None:
+                if target.exists() and read_json(target, "review packet").get("schema") != SCHEMA:
+                    raise PacketError("cleanup target is not a skill review packet")
+                source_provenance.remove_review_source(target)
+                target.unlink(missing_ok=True)
+            else:
+                output_path(target)
+                try:
+                    result = packet(args)
+                    target.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n",
+                                      encoding="utf-8", newline="\n")
+                except BaseException:
+                    source_provenance.remove_review_source(target)
+                    target.unlink(missing_ok=True)
+                    raise
         print("OK")
         return 0
-    except (PacketError, OSError, ValueError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
+    except (PacketError, source_provenance.SourceError, OSError, ValueError) as exc:
+        details = getattr(exc, "details", {})
+        print(f"error: {exc}" + (f"; {json.dumps(details)}" if details else ""), file=sys.stderr)
         return 2
 
 
