@@ -395,11 +395,12 @@ class ResultStore:
         self.records_by_check.setdefault((self.checkout, nodeid), [])
 
     def discard_deleted_checks(self, collected: set[str], selectors: Sequence[str]) -> None:
-        """Only complete collection of an explicit file/directory can prove deletion."""
+        """Prune missing source files, never files omitted by collection hooks."""
         covered = [value.replace("\\", "/").removesuffix("/") for value in selectors if "::" not in value]
         deleted = {
             nodeid for checkout, nodeid in self.records_by_check
             if checkout == self.checkout and nodeid not in collected
+            and self._stat(self.root / nodeid.split("::", 1)[0]) is None
             and any(value == "." or nodeid.split("::", 1)[0] == value
                     or nodeid.split("::", 1)[0].startswith(value + "/") for value in covered)
         }

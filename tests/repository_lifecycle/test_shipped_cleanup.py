@@ -92,6 +92,13 @@ def task(
     return path
 
 
+def current_results(worktree: pathlib.Path) -> pathlib.Path:
+    storage = runpy.run_path(str(SCRIPTS.parents[1] / "sections/scripts/store_check_results.py"))
+    store = storage["CurrentCheckResults"](worktree)
+    store.put("pytest", "test_owner", {}, {"result_id": worktree.name})
+    return store.path
+
+
 def threads(
     cleanup: ModuleType, monkeypatch: pytest.MonkeyPatch, rows: list[tuple[Any, ...]]
 ) -> None:
@@ -347,6 +354,9 @@ def test_selected_worktree_preserves_unrelated_unfinished_removal(
         "record",
         "promotion-state",
         "worktree",
+        "check-results",
+        "check-results-pending",
+        "check-results-directory",
         "task-temp",
         "ref",
         "branch-config",
@@ -365,6 +375,12 @@ def test_selected_cleanup_converges_after_each_effect_interruption(
 ) -> None:
     selected = task(repository, "selected")
     other = task(repository, "other")
+    results = current_results(selected)
+    pending = results.with_name(".check_results.in_process.json")
+    pending.write_bytes(b'{"incomplete":')
+    preserved_results = {path: path.read_bytes() for path in (
+        current_results(repository), current_results(other),
+    )}
     threads(cleanup, monkeypatch, [(THREAD, str(selected), archived, "codex/selected", "Selected")])
     git(repository, "branch", "codex/no-checkout")
     git(repository, "config", "branch.codex/selected.description", "completed task")
@@ -413,6 +429,18 @@ def test_selected_cleanup_converges_after_each_effect_interruption(
         return at_boundary(perform) if kind == effect else perform()
 
     monkeypatch.setattr(cleanup, "_git", native_git)
+    if effect in {"check-results", "check-results-pending", "check-results-directory"}:
+        target = {"check-results": results, "check-results-pending": pending,
+                  "check-results-directory": results.parent}[effect]
+        method = "rmdir" if effect == "check-results-directory" else "unlink"
+        original_path_effect = getattr(pathlib.Path, method)
+
+        def result_effect(path: pathlib.Path, *args: Any, **kwargs: Any) -> Any:
+            if path == target:
+                return at_boundary(original_path_effect, path, *args, **kwargs)
+            return original_path_effect(path, *args, **kwargs)
+
+        monkeypatch.setattr(pathlib.Path, method, result_effect)
     functions = {
         "record": (cleanup, "_save_record"),
         "promotion-state": (cleanup, "_prepare_promotion_source_retirement"),
@@ -445,6 +473,8 @@ def test_selected_cleanup_converges_after_each_effect_interruption(
     third = cleanup.retire_shipped_work(repository, "main", **options)
     assert third["status"] == "completed" and third["removed"] == []
     assert not selected.exists() and not temp.exists() and not scope.exists()
+    assert not results.parent.exists()
+    assert all(path.read_bytes() == original for path, original in preserved_results.items())
     assert native_effects.count("worktree") == 1
     assert native_effects.count("ref") == 1
     assert native_effects.count("branch-config") == 1
@@ -457,6 +487,27 @@ def test_selected_cleanup_converges_after_each_effect_interruption(
         ).returncode
         == 1
     )
+
+
+def test_current_result_cleanup_preserves_live_owners_and_unknown_files(
+    cleanup: ModuleType, repository: pathlib.Path,
+) -> None:
+    selected = task(repository, "selected")
+    results = current_results(selected)
+    original = results.read_bytes()
+    remove = cleanup._paths["_remove_retired_worktree_check_results"]
+    with pytest.raises(cleanup.CleanupError, match="live owner"):
+        remove(repository, selected)
+    assert results.read_bytes() == original
+    extra = results.parent / "unrelated.json"
+    extra.write_bytes(b"preserve")
+    first = cleanup.retire_shipped_work(repository, "main", apply=True)
+    assert first["status"] == "blocked" and "owned regular file" in first["errors"][0]["reason"]
+    assert results.read_bytes() == original and extra.read_bytes() == b"preserve"
+    extra.unlink()
+    for _ in range(2):
+        assert cleanup.retire_shipped_work(repository, "main", apply=True)["status"] == "completed"
+    assert not results.parent.exists()
 
 
 @pytest.mark.parametrize("marker", [False, True])
@@ -932,6 +983,10 @@ def test_ship_finalization_removes_shipped_unarchived_worktrees(
 ) -> None:
     selected = task(repository, "selected")
     older = task(repository, "older")
+    selected_results = current_results(selected)
+    older_results = current_results(older)
+    primary_results = current_results(repository)
+    primary_original = primary_results.read_bytes()
     rows = [
         (
             THREAD,
@@ -988,6 +1043,9 @@ def test_ship_finalization_removes_shipped_unarchived_worktrees(
     assert result["status"] == "finalized"
     assert not older.exists()
     assert selected.exists() is (condition == "locked")
+    assert selected_results.exists() is selected.exists()
+    assert not older_results.parent.exists()
+    assert primary_results.read_bytes() == primary_original
     assert temp.exists() is selected.exists()
     assert scope is None or not scope.exists()
     assert git(repository, "rev-parse", "release/local") == head

@@ -600,6 +600,7 @@ def _finish_record(
             raise CleanupError("Residual path was replaced after cleanup started.")
         _paths["_remove_tree"](path)
     if path is not None:
+        _paths["_remove_retired_worktree_check_results"](repo, path)
         # Keep the existing removal record through temp failures. Its captured
         # exact owners still identify UUID-named scratch after Git removal.
         for thread_id in sorted(original_ids) or [None]:

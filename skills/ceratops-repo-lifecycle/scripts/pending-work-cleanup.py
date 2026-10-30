@@ -53,6 +53,49 @@ def _is_reparse(path: pathlib.Path, attributes: os.stat_result) -> bool:
     )
 
 
+def _remove_retired_worktree_check_results(
+    repo_root: pathlib.Path, worktree: pathlib.Path,
+) -> None:
+    """Delete only current outcomes for this absent, unregistered worktree.
+
+    CurrentCheckResults owns the path hash and two filenames below the shared
+    Git directory. Both selected-scope and repository-wide retirement call
+    this boundary before discarding their exact removal record. Git build
+    summaries and other worktrees' results remain independent.
+    """
+    common = _common_git_dir(repo_root)
+    identity = hashlib.sha256(os.path.normcase(str(worktree)).encode()).hexdigest()
+    directory = common / "ceratops/results/repository-checks" / identity
+    for parent in (directory, *directory.parents):
+        attributes = _lstat(parent)
+        if attributes is not None and (
+            not stat.S_ISDIR(attributes.st_mode) or _is_reparse(parent, attributes)
+        ):
+            raise PendingWorkError(f"Worktree check-result directory is redirected: {parent}")
+        if parent == common:
+            break
+    if _lstat(directory) is None:
+        return
+    files = sorted(directory.iterdir())
+    for path in files:
+        attributes = _lstat(path)
+        if attributes is None:
+            continue
+        if (path.name not in {"check_results.json", ".check_results.in_process.json"}
+                or not stat.S_ISREG(attributes.st_mode)
+                or _is_reparse(path, attributes) or attributes.st_nlink != 1):
+            raise PendingWorkError(f"Worktree check-result path is not an owned regular file: {path}")
+    for path in [*files, directory]:
+        # A fresh checkout at this path invalidates retirement authority, even
+        # when a previous attempt already removed one of the result files.
+        if _lstat(worktree) is not None or worktree in _registered_worktree_paths(repo_root):
+            raise PendingWorkError(f"Worktree check results still have a live owner: {worktree}")
+        if path == directory:
+            path.rmdir()
+        else:
+            path.unlink(missing_ok=True)
+
+
 def _cleanup_boundary(
     path: pathlib.Path,
     boundary_names: set[str],
@@ -659,6 +702,7 @@ def _finish_recorded_residual_cleanup(
         thread_id=thread_id,
     )
     if preserved_worktree is None:
+        _remove_retired_worktree_check_results(repo_root, worktree)
         _remove_completed_state_file(record_path)
         _remove_empty_parents(expected_root, boundary_names={"worktrees"})
     return preserved_worktree

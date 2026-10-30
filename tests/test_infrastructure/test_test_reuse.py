@@ -900,9 +900,45 @@ def test_partial_selection_preserves_unselected_and_removes_deleted_tests(tmp_pa
     store.discard_deleted_checks({a}, ["tests/a/test_value.py::test_value"])
     assert store.matching(b, store.inputs(b))["result_id"] == b_pass["result_id"]
     store.discard_deleted_checks(set(), ["tests/b"])
+    assert store.matching(b, store.inputs(b))["result_id"] == b_pass["result_id"]
+    (root / "tests/b/test_value.py").unlink()
+    store.discard_deleted_checks(set(), ["tests/b"])
     fresh = _level_store(root, "alpha")
     assert fresh.matching(a, fresh.inputs(a))["result_id"] == a_pass["result_id"]
-    assert fresh.matching(b, fresh.inputs(b)) is None
+    assert b not in {record["nodeid"] for record in fresh.current.records("pytest")}
+
+
+@pytest.mark.parametrize("exclusion", ["argument", "collect_ignore", "pytest_ignore_collect"])
+@pytest.mark.parametrize("outcome", ["passed", "failed"])
+def test_collection_exclusions_preserve_current_passes_and_failures(
+    test_runner_module, tmp_path, exclusion, outcome,
+):
+    root = _acceptance_repository(tmp_path)
+    counter = tmp_path / "effects.log"
+    for name in ("first", "second"):
+        _acceptance_test(root, name, counter)
+    options = []
+    if exclusion == "argument":
+        options = ["--ignore=tests/test_second.py"]
+    elif exclusion == "collect_ignore":
+        (root / "conftest.py").write_text("collect_ignore = ['tests/test_second.py']\n")
+    else:
+        (root / "conftest.py").write_text(
+            "def pytest_ignore_collect(collection_path, config):\n"
+            "    return collection_path.name == 'test_second.py'\n"
+        )
+    store = _result_store(root)
+    node = "tests/test_second.py::test_second"
+    saved = store.save(node, store.inputs(node), outcome=outcome,
+                       phases={"setup": "passed", "call": outcome, "teardown": "passed"})
+    for _ in range(2):
+        result = test_runner_module.run_text(
+            [sys.executable, "-m", "pytest", "-q", "-o", "addopts=", "tests", *options], root,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        records = {record["nodeid"]: record for record in store.current.records("pytest")}
+        assert records[node] == saved
+    assert counter.read_text().splitlines() == ["first"]
 
 
 def test_current_results_keep_only_latest_execution_and_other_checks(tmp_path):
