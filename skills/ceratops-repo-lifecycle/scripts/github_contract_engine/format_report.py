@@ -91,7 +91,7 @@ def sanitize_for_output(
 
     if isinstance(value, str):
         return _sanitize_text(value)
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple)):
         return [
             REDACTED
             if (index and isinstance(value[index - 1], str)
@@ -101,8 +101,12 @@ def sanitize_for_output(
             else sanitize_for_output(item, path, retain_diagnostics=retain_diagnostics)
             for index, item in enumerate(value)
         ]
-    if not isinstance(value, dict):
+    if value is None or isinstance(value, (bool, int, float)):
         return value
+    if not isinstance(value, dict):
+        # JSON serializes tuples as arrays, so every supported container must
+        # be traversed above. Unknown objects must never bypass redaction.
+        raise TypeError("Report output contains an unsupported JSON value.")
 
     finding_path = str(value.get("path", ""))
     sensitive_finding = bool(SENSITIVE_PATH_RE.search(finding_path))

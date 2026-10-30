@@ -75,3 +75,53 @@ def test_compact_alert_messages_still_pass_through_secret_redaction(formatter, c
     assert "should-never-appear" not in output
     assert "<redacted>" in output
     assert json.loads(output)["actual"]["sample"][0]["number"] == 1
+
+
+@pytest.mark.parametrize("compact", [False, True])
+@pytest.mark.parametrize("container", [list, tuple])
+def test_report_containers_redact_both_codeql_sources_before_stdout(
+    formatter, capsys, compact, container,
+):
+    billing = "CODEQL_SENTINEL_BILLING_credential"
+    secret = "CODEQL_SENTINEL_SECRET_credential"
+    payload = {
+        "observed_states": {
+            "parameters": {"billing_email": billing},
+            "repository": {"security": {"secret_scanning_alerts": container([
+                {"number": 17, "state": "open", "secret": secret},
+            ])}},
+        },
+        "findings": container([{"actual": container([
+            {"billing_email": billing, "token": secret},
+        ])}]),
+        "private": True,
+        "count": 17,
+        "ratio": 0.5,
+        "missing": None,
+    }
+    original = copy.deepcopy(payload)
+    formatter.write_json(payload, compact=compact)
+    output = capsys.readouterr().out
+    assert billing not in output and secret not in output
+    saved = json.loads(output)
+    assert saved["observed_states"]["parameters"]["billing_email"] == "<redacted>"
+    assert saved["observed_states"]["repository"]["security"]["secret_scanning_alerts"] == [
+        {"number": 17, "state": "open", "secret": "<redacted>"},
+    ]
+    assert saved["findings"][0]["actual"] == [
+        {"billing_email": "<redacted>", "token": "<redacted>"},
+    ]
+    assert {key: saved[key] for key in ("private", "count", "ratio", "missing")} == {
+        "private": True, "count": 17, "ratio": 0.5, "missing": None,
+    }
+    assert payload == original
+
+
+@pytest.mark.parametrize("compact", [False, True])
+@pytest.mark.parametrize("unsupported", [object, set])
+def test_unknown_report_objects_stop_before_any_stdout(
+    formatter, capsys, compact, unsupported,
+):
+    with pytest.raises(TypeError, match="unsupported JSON value"):
+        formatter.write_json({"unsupported": unsupported()}, compact=compact)
+    assert capsys.readouterr().out == ""
