@@ -1001,11 +1001,11 @@ def build_review_clusters(snapshot: dict[str, Any]) -> dict[str, object]:
         rules[entry["path"]] = row
     for stack in evidence_rows(graph["stacks"], "agents_rule_graph.stacks"):
         row = rules[stack["path"]]
-        for source, target in (
+        for source_field, target_field in (
             ("semantic_reviews", "relation_reviews"),
             ("findings", "stack_findings"), ("cycles", "cycles"),
         ):
-            row[target] = evidence_rows(stack[source], f"stack {source}")
+            row[target_field] = evidence_rows(stack[source_field], f"stack {source_field}")
     flagged_rules = [
         row for row in rules.values()
         if any(row[key] for key in (
