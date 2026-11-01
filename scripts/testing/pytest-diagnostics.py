@@ -332,12 +332,18 @@ def pytest_failure_summary(stdout: str, stderr: str) -> dict[str, object]:
         )
     if not summaries and not sections:
         startup = [line.strip() for line in stderr.splitlines() if line.strip()]
-        # Only a native process traceback can supply this synthetic identity.
+        # Pytest 9.2 formats plugin imports without a native traceback header.
+        # Require its loader header and an exception, not an arbitrary E line.
         # Never turn arbitrary stdout or captured test output into a test failure.
+        plugin_load_error = bool(startup and re.fullmatch(
+            r'Error while loading plugin "[^\"]+"\.', startup[0],
+        ))
         if (
-            "Traceback (most recent call last):" in startup
+            ("Traceback (most recent call last):" in startup or plugin_load_error)
             and not any(PYTEST_CAPTURE_HEADER.fullmatch(line) for line in startup)
-            and any(PYTHON_EXCEPTION_MESSAGE.match(line) for line in startup)
+            and any(PYTHON_EXCEPTION_MESSAGE.match(
+                line[1:].lstrip() if line.startswith("E ") else line,
+            ) for line in startup)
         ):
             identity = "<pytest startup>"
             summaries.append((identity, ""))
