@@ -375,6 +375,100 @@ def test_gradle_registry_checks_exact_release_and_repeats_after_interruption(
 
 
 @pytest.mark.parametrize(
+    "fault", ["none", "wrong_version", "wrong_group", "duplicate_version", "malformed_xml",
+              "oversized", "document_type", "before_response", "during_read", "after_read"],
+)
+def test_android_gradle_registry_keeps_exact_coordinates_and_interruption_causes(
+    monkeypatch: pytest.MonkeyPatch, fault: str,
+) -> None:
+    evidence = load_pr_workflow_module(monkeypatch, "dependency_evidence")
+    xml = (
+        '<project xmlns="http://maven.apache.org/POM/4.0.0">'
+        '<groupId>com.android.tools.build</groupId><artifactId>gradle</artifactId>'
+        '<version>9.5.0</version></project>'
+    )
+    if fault == "wrong_version":
+        xml = xml.replace("9.5.0", "9.4.1")
+    elif fault == "wrong_group":
+        xml = xml.replace("com.android.tools.build", "unrelated.group")
+    elif fault == "duplicate_version":
+        xml = xml.replace("</project>", "<version>9.5.0</version></project>")
+    elif fault == "malformed_xml":
+        xml = "<project>"
+    elif fault == "document_type":
+        xml = '<!DOCTYPE project [<!ENTITY text "unwanted">]>' + xml
+    attempts = 0
+
+    class Response:
+        def __init__(self, attempt: int) -> None:
+            self.attempt = attempt
+
+        def __enter__(self) -> Self:
+            return self
+
+        def read(self, limit: int) -> bytes:
+            assert limit == 1024 * 1024 + 1
+            if self.attempt == 1 and fault == "during_read":
+                raise OSError("interrupted during POM read")
+            return b"x" * limit if fault == "oversized" else xml.encode("utf-8")
+
+        def __exit__(self, *_: object) -> None:
+            if self.attempt == 1 and fault == "after_read":
+                raise OSError("interrupted after POM read")
+
+    def open_metadata(request: Any, *, timeout: int) -> Response:
+        nonlocal attempts
+        attempts += 1
+        assert request.full_url == (
+            "https://dl.google.com/dl/android/maven2/com/android/tools/build/gradle/9.5.0/gradle-9.5.0.pom"
+        )
+        assert timeout == 20
+        if attempts == 1 and fault == "before_response":
+            raise OSError("interrupted before POM read")
+        return Response(attempts)
+
+    monkeypatch.setattr(evidence.urllib.request, "urlopen", open_metadata)
+    update = {"package": "com.android.application", "ecosystem": "gradle", "target_version": "9.5.0"}
+    for attempt in range(2):
+        result = evidence.registry_evidence(update)
+        expected_ok = fault == "none" or (fault.endswith(("response", "read")) and attempt == 1)
+        assert result["status"] == ("ok" if expected_ok else "blocked"), result
+        if expected_ok:
+            assert (result["version"], result["group_id"], result["artifact_id"]) == (
+                "9.5.0", "com.android.tools.build", "gradle",
+            )
+        else:
+            assert "registry_evidence com.android.application@9.5.0:" in result["error"]
+    assert attempts == 2
+
+
+@pytest.mark.parametrize("syntax", ["literal", "duplicate", "dynamic", "commented", "block_comment"])
+def test_android_gradle_plugin_context_requires_one_literal_declaration(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, syntax: str,
+) -> None:
+    evidence = load_pr_workflow_module(monkeypatch, "dependency_evidence")
+    declaration = '    id("com.android.application") version "9.5.0" apply false\n'
+    text = "plugins {\n" + declaration + "}\n"
+    if syntax == "duplicate":
+        text = "plugins {\n" + declaration * 2 + "}\n"
+    elif syntax == "dynamic":
+        text = text.replace('"9.5.0"', "androidPluginVersion")
+    elif syntax == "commented":
+        text = "// " + declaration.strip() + "\n"
+    elif syntax == "block_comment":
+        text = "/*\n" + text + "*/\n"
+    path = tmp_path / "build.gradle.kts"
+    path.write_text(text, encoding="utf-8")
+    update = {"package": "com.android.application", "ecosystem": "gradle", "target_version": "9.5.0"}
+    for _ in range(2):
+        result = evidence.dependency_tree_evidence(tmp_path, update, [{"path": path.name}], [])
+        assert result["status"] == {
+            "literal": "ok", "duplicate": "blocked", "dynamic": "unavailable",
+            "commented": "unavailable", "block_comment": "blocked",
+        }[syntax]
+
+
+@pytest.mark.parametrize(
     "fault", ["none", "duplicate_url", "missing_checksum", "wrong_url", "missing_jar",
               "checkout_escape", "noncanonical_property"],
 )
@@ -452,7 +546,7 @@ def _checkout_state(repo: pathlib.Path) -> tuple[Any, ...]:
     )
 
 
-@pytest.mark.parametrize("ecosystem", ["npm", "pip", "github-actions", "gradle"])
+@pytest.mark.parametrize("ecosystem", ["npm", "pip", "github-actions", "gradle", "android-gradle"])
 @pytest.mark.parametrize("local_state", ["changed", "moved", "deleted", "directory"])
 def test_dependency_commit_reader_ignores_local_file_layout(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, ecosystem: str, local_state: str,
@@ -477,6 +571,9 @@ def test_dependency_commit_reader_ignores_local_file_layout(
             ),
             "gradle/wrapper/gradle-wrapper.jar": b"\x00committed wrapper\xff",
         },
+        "android-gradle": {
+            "build.gradle.kts": b'plugins {\n    id("com.android.application") version "9.5.0" apply false\n}\n',
+        },
     }
     files = fixtures[ecosystem]
     checkout = tmp_path / "checkout"
@@ -494,8 +591,11 @@ def test_dependency_commit_reader_ignores_local_file_layout(
             if local_state == "directory":
                 path.mkdir()
     before = _checkout_state(checkout)
-    package = {"github-actions": "actions/checkout", "gradle": "gradle-wrapper"}.get(ecosystem, "demo")
-    update = {"package": package, "ecosystem": ecosystem}
+    package = {
+        "github-actions": "actions/checkout", "gradle": "gradle-wrapper",
+        "android-gradle": "com.android.application",
+    }.get(ecosystem, "demo")
+    update = {"package": package, "ecosystem": "gradle" if ecosystem == "android-gradle" else ecosystem}
     first = evidence.dependency_tree_evidence(checkout, update, [{"path": name} for name in files], [], head)
     assert first["status"] == "ok", first
     assert first["commit"] == head
@@ -512,9 +612,11 @@ def test_dependency_commit_reader_ignores_local_file_layout(
         assert any(source.get("project_requires_python") == ">=3.14" for source in sources)
     elif ecosystem == "github-actions":
         assert sources == [{"file": ".github/workflows/ci.yml", "line": 2, "source": package, "ref": "v4"}]
-    else:
+    elif ecosystem == "gradle":
         assert sources[0]["version"] == "9.8.1"
         assert sources[0]["wrapper_sha256"] == hashlib.sha256(files["gradle/wrapper/gradle-wrapper.jar"]).hexdigest()
+    else:
+        assert sources == [{"file": "build.gradle.kts", "plugin": package, "version": "9.5.0"}]
 
 
 def _cold_dependency_checkout(tmp_path: pathlib.Path) -> tuple[pathlib.Path, str]:

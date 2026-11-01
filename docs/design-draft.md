@@ -131,6 +131,15 @@ retain the command, target, exit status and both output streams. Alerts without
 a PR keep their local context. These facts feed the existing compatibility
 review and promotion through `release/local`; they do not grant merge approval.
 
+Android application-plugin updates resolve their exact release coordinates in
+Google Maven and collect literal Kotlin plugin declarations from that selected
+commit. Dynamic or ambiguous declarations remain unavailable or blocked; actual
+candidate builds retain ownership of Gradle and Android compatibility.
+Dependency finalization overlaps source-review windows in a bounded pool of up
+to 32 read-only workers. Each source retains its complete configured window and
+exact-head readiness checks. All workers stop before publication starts, and
+source failures remain scoped to their own PRs.
+
 Repository examples use `uv run --locked scripts/<entrypoint>.py`; source
 helpers outside `scripts` use `uv run --project scripts --locked python ...`.
 The caller and uv prepare the environment. Individual scripts do not contain

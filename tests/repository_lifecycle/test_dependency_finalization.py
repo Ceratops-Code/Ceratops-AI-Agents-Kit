@@ -7,6 +7,7 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from typing import Any
 from unittest import mock
@@ -49,6 +50,7 @@ class DependencyFinalizationTests(unittest.TestCase):
         self, approved: list[tuple[str, int]], *, failed: set[int] | None = None,
         moved: set[int] | None = None, preflight_blockers: list[dict[str, Any]] | None = None,
         publication_failure: str | None = None, rebase_timeout: bool = False,
+        review_failed: set[int] | None = None,
     ) -> tuple[dict[str, Any], list[tuple[str, list[int]]]]:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
@@ -94,6 +96,10 @@ class DependencyFinalizationTests(unittest.TestCase):
             )
             calls = []
 
+            def review(repo, number, *_args, **_kwargs):
+                if number in (review_failed or set()):
+                    raise flow.WorkflowError("source review unavailable")
+
             def publish(repo, items, checkout, options):
                 calls.append((repo, [item["pr"] for item in items]))
                 if publication_failure == repo:
@@ -113,7 +119,7 @@ class DependencyFinalizationTests(unittest.TestCase):
             with (
                 mock.patch.object(flow, "fetch_repo_policy", return_value=(policy, None)),
                 mock.patch.object(flow, "fresh_live", side_effect=lambda repo, n: (states[(repo, n)], None)),
-                mock.patch.object(flow, "review_dependency_source"),
+                mock.patch.object(flow, "review_dependency_source", side_effect=review),
                 mock.patch.object(flow, "publish_dependency_batch", side_effect=publish),
                 mock.patch.object(flow, "refresh_snapshot", return_value=(
                     final_snapshot, argparse.Namespace(returncode=0, stdout="", stderr=""),
@@ -162,6 +168,38 @@ class DependencyFinalizationTests(unittest.TestCase):
         self.assertEqual(payload["summary"]["merged"], 1)
         self.assertEqual(payload["summary"]["blocked_prs"], 2)
         self.assertTrue(all("release checks failed" in b["message"] for b in payload["blockers"]))
+
+    def test_source_review_failure_preserves_independent_publication(self):
+        for _ in range(2):
+            payload, calls = self.finalize_case(
+                [("owner/one", 1), ("owner/one", 2)], review_failed={1},
+            )
+            self.assertEqual(calls, [("owner/one", [2])])
+            self.assertEqual(payload["summary"]["merged"], 1)
+            self.assertEqual(payload["blockers"][0]["check"], "source_review")
+            self.assertEqual(payload["blockers"][0]["message"], "source review unavailable")
+
+    def test_source_review_windows_overlap_without_shortening_or_losing_head_checks(self):
+        items = [
+            {"repo": "owner/repo", "pr": n, "checkout": str(ROOT), "approved_head": str(n) * 40}
+            for n in (1, 2)
+        ]
+        options = argparse.Namespace(admin=False, wait_seconds=600, interval_seconds=15)
+        for _ in range(2):
+            entered = threading.Barrier(2, timeout=5)
+
+            def review(repo, number, checkout, expected_head, **kwargs):
+                self.assertEqual((repo, checkout, expected_head),
+                                 ("owner/repo", ROOT, str(number) * 40))
+                self.assertEqual(kwargs, {"admin": False, "wait_seconds": 600, "interval_seconds": 15})
+                # A serial caller cannot reach the second source before timeout.
+                entered.wait()
+                return {"head_oid": expected_head}
+
+            with mock.patch.object(flow, "review_dependency_source", side_effect=review):
+                reviewed, blockers = flow.review_dependency_batches({"owner/repo": items}, options)
+            self.assertEqual(reviewed, {"owner/repo": items})
+            self.assertEqual(blockers, [])
 
     def test_source_review_delegates_admin_policy_without_merging(self):
         head = "a" * 40

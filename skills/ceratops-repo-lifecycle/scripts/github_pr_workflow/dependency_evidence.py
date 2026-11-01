@@ -13,6 +13,7 @@ import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from typing import Any
 
 from github_contract_engine.format_report import sanitize_for_output
@@ -623,6 +624,46 @@ def fetch_url_json(url: str, *, release_version: str | None = None) -> dict[str,
     return value
 
 
+def android_gradle_plugin_registry_evidence(target: str) -> dict[str, Any]:
+    """Read the exact Android application plugin release from Google Maven.
+
+    The plugin ID resolves to com.android.tools.build:gradle. Require those
+    coordinates in bounded official POM data; other Gradle plugins keep their
+    existing unsupported result instead of guessing a registry or coordinate.
+    """
+    version = target.removeprefix("v")
+    if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+        raise WorkflowError("Android Gradle target must name a stable exact release")
+    url = (
+        "https://dl.google.com/dl/android/maven2/com/android/tools/build/gradle/"
+        f"{version}/gradle-{version}.pom"
+    )
+    request = urllib.request.Request(url, headers={
+        "Accept": "application/xml", "User-Agent": "codex-dependabot-preflight/1",
+    })
+    with urllib.request.urlopen(request, timeout=20) as response:
+        data = response.read(1024 * 1024 + 1)
+    if len(data) > 1024 * 1024 or b"<!DOCTYPE" in data.upper():
+        raise WorkflowError("Android Gradle POM is oversized or declares a document type")
+    root = ET.fromstring(data.decode("utf-8"))
+    namespace = {"m": "http://maven.apache.org/POM/4.0.0"}
+    expected = {"groupId": "com.android.tools.build", "artifactId": "gradle", "version": version}
+    if root.tag != "{http://maven.apache.org/POM/4.0.0}project" or any(
+        len(root.findall(f"m:{name}", namespace)) != 1
+        or root.findtext(f"m:{name}", namespaces=namespace) != value
+        for name, value in expected.items()
+    ):
+        raise WorkflowError("Android Gradle POM does not identify the exact requested coordinates")
+    return {
+        "status": "ok", "source": "dl.google.com", "version": version,
+        "group_id": expected["groupId"], "artifact_id": "gradle", "pom_url": url,
+        "dependencies": bounded_json([{
+            name: item.findtext(f"m:{name}", namespaces=namespace)
+            for name in ("groupId", "artifactId", "version", "scope")
+        } for item in root.findall("m:dependencies/m:dependency", namespace)]),
+    }
+
+
 def registry_evidence(update: dict[str, Any]) -> dict[str, Any]:
     package = update.get("package")
     target = update.get("target_version")
@@ -681,6 +722,8 @@ def registry_evidence(update: dict[str, Any]) -> dict[str, Any]:
             if completed.returncode != 0:
                 return {"status": "blocked", "source": "api.github.com", "error": compact_error(completed)}
             return {"status": "ok", "source": "api.github.com", **json.loads(completed.stdout or "{}")}
+        if ecosystem == "gradle" and package == "com.android.application":
+            return android_gradle_plugin_registry_evidence(str(target))
         if ecosystem == "gradle" and package == "gradle-wrapper":
             target_version = str(target).removeprefix("v")
             raw = fetch_url_json(
@@ -704,8 +747,8 @@ def registry_evidence(update: dict[str, Any]) -> dict[str, Any]:
                 "distribution_url": expected_url, "distribution_sha256": raw["checksum"],
                 "wrapper_sha256": raw["wrapperChecksum"],
             }
-    except (OSError, ValueError, json.JSONDecodeError, urllib.error.URLError, WorkflowError) as exc:
-        return {"status": "blocked", "error": str(exc)[:360]}
+    except (OSError, ValueError, ET.ParseError, json.JSONDecodeError, urllib.error.URLError, WorkflowError) as exc:
+        return {"status": "blocked", "error": f"registry_evidence {package}@{target}: {exc}"[:360]}
     return {"status": "unavailable", "reason": f"unsupported_ecosystem:{ecosystem or 'unknown'}"}
 
 
@@ -1047,6 +1090,51 @@ def gradle_wrapper_tree_evidence(
     }
 
 
+def android_gradle_plugin_tree_evidence(
+    checkout: pathlib.Path, relative_paths: set[str], reader: _DependencyFileReader,
+) -> dict[str, Any]:
+    """Collect literal Kotlin plugin context without evaluating Gradle code.
+
+    Dynamic declarations and ambiguous multiline syntax remain unavailable;
+    candidate build checks still own actual Gradle and Android compatibility.
+    """
+    sources: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    declaration = re.compile(
+        r'''(?m)^\s*id\(\s*["']com\.android\.application["']\s*\)'''
+        r'''\s+version\s+["'](?P<version>\d+\.\d+\.\d+)["']'''
+        r'''(?:[ \t]+apply[ \t]+(?:true|false))?[ \t]*$'''
+    )
+    for relative in sorted(relative_paths):
+        if pathlib.PurePosixPath(relative).name != "build.gradle.kts":
+            continue
+        try:
+            path = reader.path(relative)
+            if not reader.is_file(path):
+                continue
+            text = reader.read_text(path)
+            if "com.android.application" not in text:
+                continue
+            if any(marker in text for marker in ("/*", "*/", '\"\"\"')):
+                raise WorkflowError("Android Gradle plugin context has unsupported multiline syntax")
+            matches = list(declaration.finditer(text))
+            if len(matches) > 1:
+                raise WorkflowError("Android Gradle plugin context has duplicate declarations")
+            if matches:
+                sources.append({
+                    "file": relative, "plugin": "com.android.application",
+                    "version": matches[0].group("version"),
+                })
+        except (OSError, ValueError, WorkflowError) as exc:
+            errors.append(_dependency_read_error(relative, exc))
+    if len(sources) > 1:
+        errors.append({"file": str(checkout), "error": "Android Gradle plugin declaration is ambiguous"})
+    return {
+        "status": "ok" if sources and not errors else ("blocked" if errors else "unavailable"),
+        "sources": sources, "errors": errors,
+    }
+
+
 def dependency_tree_evidence(
     checkout: pathlib.Path,
     update: dict[str, Any],
@@ -1092,6 +1180,9 @@ def dependency_tree_evidence(
         return {**result, **({"commit": commit} if commit is not None else {})}
     if str(update.get("ecosystem") or "").lower() == "gradle" and package == "gradle-wrapper":
         result = gradle_wrapper_tree_evidence(checkout, relative_paths, reader)
+        return {**result, **({"commit": commit} if commit is not None else {})}
+    if str(update.get("ecosystem") or "").lower() == "gradle" and package == "com.android.application":
+        result = android_gradle_plugin_tree_evidence(checkout, relative_paths, reader)
         return {**result, **({"commit": commit} if commit is not None else {})}
     sources: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []

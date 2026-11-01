@@ -9,6 +9,7 @@ import pathlib
 import runpy
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from .dependency_common import (
@@ -252,6 +253,41 @@ def review_dependency_source(
         if not isinstance(base, str) or readiness.review_thread_resolution_required(base, checkout):
             raise WorkflowError("dependency PR has unresolved required review threads")
     return final
+
+
+def review_dependency_batches(
+    batches: dict[str, list[dict[str, Any]]], args: argparse.Namespace,
+) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
+    """Overlap read-only review windows, retaining every exact-head gate.
+
+    No publication starts until every worker stops. Each source keeps the full
+    configured wait and its before/after readiness checks; a failed source does
+    not consume independent approvals. Bound network concurrency for large queues.
+    """
+    candidates = [item for items in batches.values() for item in items]
+    reviewed: dict[str, list[dict[str, Any]]] = {}
+    blockers: list[dict[str, Any]] = []
+    if not candidates:
+        return reviewed, blockers
+    with ThreadPoolExecutor(max_workers=min(32, len(candidates))) as executor:
+        pending = [executor.submit(
+            review_dependency_source, item["repo"], item["pr"],
+            pathlib.Path(item["checkout"]), item["approved_head"],
+            admin=args.admin, wait_seconds=args.wait_seconds,
+            interval_seconds=args.interval_seconds,
+        ) for item in candidates]
+        # Keep output ordering stable while the independent reads run together.
+        for item, future in zip(candidates, pending, strict=True):
+            try:
+                future.result()
+            except (OSError, RuntimeError, ValueError) as exc:
+                blockers.append({
+                    "repo": item["repo"], "pr": item["pr"],
+                    "check": "source_review", "message": str(exc),
+                })
+            else:
+                reviewed.setdefault(item["repo"], []).append(item)
+    return reviewed, blockers
 
 
 def dependency_command(root: pathlib.Path, *command: str) -> str:
@@ -840,22 +876,14 @@ def finalize(args: argparse.Namespace) -> int:
             blockers.append(blocker)
             results.append({**blocker, "status": "blocked", "fingerprint": current_fingerprint})
             continue
-        try:
-            review_dependency_source(
-                repo, number, pathlib.Path(str(checkout_path)), approved_head,
-                admin=args.admin, wait_seconds=args.wait_seconds,
-                interval_seconds=args.interval_seconds,
-            )
-        except (OSError, RuntimeError, ValueError) as exc:
-            blocker = {"repo": repo, "pr": number, "check": "source_review", "message": str(exc)}
-            blockers.append(blocker)
-            results.append({**blocker, "status": "blocked"})
-            continue
         ready_batches.setdefault(repo, []).append({
             "repo": repo, "pr": number, "approved_head": approved_head,
             "live": live, "checkout": str(checkout_path),
         })
 
+    ready_batches, review_blockers = review_dependency_batches(ready_batches, args)
+    blockers.extend(review_blockers)
+    results.extend({**item, "status": "blocked"} for item in review_blockers)
     for repo, items in ready_batches.items():
         batch, error = publish_dependency_batch(repo, items, pathlib.Path(items[0]["checkout"]), args)
         batch_results.append(batch)
