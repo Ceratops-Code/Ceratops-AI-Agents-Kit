@@ -234,8 +234,8 @@ explicit CLI capability, not an MCP operation or public-repository upload.
 The source installer uses this same implementation for first installation and
 manager updates, including upgrades from an older CLI. A package-backed MCP
 server uses the paired package flags and still builds its own small MCP server
-wheel from source. Other repository MCP servers use CLI install. Reconnect
-after selecting a new manager version.
+wheel from source. Other repository MCP servers use CLI install. Connections
+already using the current gateway adopt new selected versions as described below.
 
 Persistent records and the readiness response retain the schema-1
 `mcp_server_id` field required by launchers and installed MCP servers. Its
@@ -279,14 +279,49 @@ without dispatch to another version. An incompatible replacement reports an
 error without silently
 using an older version or replaying a request.
 Every successful activation installs or refreshes that MCP server's stable launcher.
-The gateway also notices selection changes while its chat is idle. Once a
+The gateway advertises `capabilities.tools.listChanged = true`, including when
+the initial version has no tools. Its existing one-second idle poll reads
+`current.json` and sends `notifications/tools/list_changed` once per observed
+selection change, without waiting for a tool call. Rewriting the same selection
+does not send another notice. A later `tools/list` request starts or reuses the
+newly selected server and returns its definitions; a version with no tools
+returns an empty list. Child startup notices are suppressed until its first
+list has completed, and notices from superseded children are ignored.
+
+Replacement startup and definition errors include the selected version,
+invocation, Python runtime, working directory, exit status, response evidence
+and available stderr, with secrets redacted. A bad replacement does not trigger
+a notification loop or silently supply an older version's definitions. It does
+not interrupt calls or background tasks already running on older servers.
+
+Codex's `[features]` setting `mcp_tool_list_changed = true` enables its existing
+handling of these notifications. In an isolated test of `codex-cli 0.166.0`,
+Codex recorded the change while idle and fetched `tools/list` on the next catalog
+read. The next model request included the new definitions. With the flag false,
+that request still contained the old definitions. These are separate checks:
+seeing new server definitions alone does not prove what a model receives.
+The test launches the installed backend directly, uses an isolated `CODEX_HOME`
+and a local Responses endpoint, and exercises repeated selections during an
+active tool call. It uses no desktop code or `EnableMcpServerRefresh` patch.
+`tests/mcp_server_manager/test_server.py` contains this test; it skips when no
+installed backend is available. `CERATOPS_TEST_CODEX_BINARY` can select its
+executable explicitly.
+
+Saving this setting or editing launcher source does not update a live chat.
+The changed launcher must first be installed through the manager's existing
+deployment/launcher-refresh operation, and the client must create an MCP
+connection running that launcher with the setting loaded. No automatic desktop
+restart, configuration reload or desktop patch is part of this launcher.
+
+Once a
 superseded backend has no pending requests, callbacks or unread tasks, it closes
 that child's
 input and lets it exit naturally. This preserves background work that continues
 after returning a job ID. Each child's instance lease remains held until the
 process actually exits; the gateway itself runs in global Python and pins no
-versioned environment. Existing pre-gateway connections need one MCP refresh;
-subsequent selections require no connection refresh. CLI commands keep their
+versioned environment. Existing connections must reconnect once to load a
+changed launcher; subsequent selections need no reconnect with a client that
+handles tool-list notifications. CLI commands keep their
 existing argument, stream and exit-code behavior.
 
 Failed replacement handshakes accept no application requests and are stopped

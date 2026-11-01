@@ -892,7 +892,8 @@ def emit(message):
     with lock:
         print(json.dumps({"jsonrpc":"2.0", **message}), flush=True)
 def result(identifier, **values):
-    emit({"id":identifier,"result":{"version":version,"pid":os.getpid(),**values}})
+    emit({"id":identifier,"result":{"content":[{"type":"text","text":version}],
+                                    "version":version,"pid":os.getpid(),**values}})
 def hold(identifier, arguments, background=False):
     cancel = cancellations.setdefault(identifier, threading.Event())
     Path(arguments["started"]).write_text("started")
@@ -918,15 +919,47 @@ for line in sys.stdin:
     message = json.loads(line)
     method = message.get("method")
     identifier = message.get("id")
+    with (Path(__file__).parent / "requests.jsonl").open("a", encoding="utf-8") as log:
+        log.write(json.dumps({"method":method,"pid":os.getpid()}) + "\n")
     if method == "initialize":
         protocol = "2025-11-25" if version == "1.0.0" else message["params"]["protocolVersion"]
         if (Path(__file__).parent / "bad-protocol").exists():
             protocol = "incompatible"
             threading.Thread(target=time.sleep, args=(300,)).start()
-        emit({"id":identifier,"result":{"protocolVersion":protocol,"capabilities":{"tools":{}},
+        capabilities = {} if (Path(__file__).parent / "no-tools").exists() else {"tools":{}}
+        if (Path(__file__).parent / "bad-capabilities").exists():
+            capabilities = ["malformed"]
+        emit({"id":identifier,"result":{"protocolVersion":protocol,"capabilities":capabilities,
                                      "serverInfo":{"name":"fixture","version":version}}})
     elif method == "notifications/initialized":
         initialized = True
+        emit({"method":"notifications/tools/list_changed"})
+    elif method == "tools/list":
+        failure = Path(__file__).parent / "list-failure"
+        if failure.exists():
+            mode = failure.read_text()
+            print("definition failure evidence", file=sys.stderr, flush=True)
+            if mode == "error":
+                emit({"id":identifier,"error":{"code":-32603,"message":"catalog unavailable",
+                                              "data":{"cause":"fixture API_KEY=fixture-secret",
+                                                      "password":"private-value"}}})
+            elif mode == "malformed":
+                emit({"id":identifier,"result":{"tools":[{"name":"broken"}]}})
+            elif mode == "invalid-json":
+                print("broken catalog frame", flush=True)
+            elif mode == "malformed-error":
+                emit({"id":identifier,"error":"broken error response"})
+            else:
+                os._exit(19)
+        else:
+            tools = [{"name":"version_" + version.replace(".", "_"),
+                      "description":"Selected installed version " + version,
+                      "inputSchema":{"type":"object","properties":{}}},
+                     {"name":"hold","description":"Wait for the fixture release file",
+                      "inputSchema":{"type":"object","properties":{
+                          "started":{"type":"string"},"release":{"type":"string"}},
+                          "required":["started","release"]}}]
+            emit({"id":identifier,"result":{"tools":tools}})
     elif method == "notifications/cancelled":
         cancellations.setdefault(message["params"]["requestId"],threading.Event()).set()
     elif method is None and "id" in message:

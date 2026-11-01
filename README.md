@@ -67,6 +67,15 @@ one engine. The MCP server lifecycle skill supplies its action instructions and
 `scripts/install-mcp-server.py`, which calls that manager and reports completion;
 the existing skill installer continues to own `.codex` skill deployment.
 
+The manager's shared MCP launcher announces selected-version changes to connected
+clients without waiting for a tool call. Codex uses its existing
+`[features] mcp_tool_list_changed = true` setting to fetch the new definitions
+when it next needs the catalog. Active calls and background work finish on their
+original server. This requires the changed launcher to be installed and a
+connection with the setting loaded; saving source or config does not refresh a
+live chat. No desktop patch is required. See the manager's
+[activation details](mcp-servers/ceratops_mcp_server_manager/README.md#activation-and-self-update).
+
 The MCP installation callable returns failure JSON; its CLI writes the same JSON
 to stderr and exits 1. `diagnostics` names the selected server, command arguments,
 Python runtime, working directory, exit status, causes and separate stdout/stderr.

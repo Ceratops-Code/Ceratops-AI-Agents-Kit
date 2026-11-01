@@ -323,6 +323,25 @@ logs are persisted: active protocol queues and request counts are bounded at
 128, and each backend retains at most 64 KiB of stderr in memory. The existing
 manager continues to own version directories, release packages and retention;
 old pre-gateway connections need one client refresh to adopt this boundary.
+The same one-second idle poll sends `notifications/tools/list_changed` once
+per observed `current.json` selection change. Initialization always advertises
+`tools.listChanged`, including when the initial child has no tools. A subsequent
+`tools/list` reads the selected child; failed startup or malformed definitions
+return their available causes with runtime, invocation, working directory,
+exit status and redacted response/stderr details. They do not cause repeated
+notifications, old-definition fallback or cancellation of older active work.
+The gateway stores only its last announced selection in memory and suppresses
+startup notices already covered by that selection and notices from old children.
+
+The installed Codex backend's `mcp_tool_list_changed` feature controls the client
+half. Tests run it directly with isolated configuration and a local Responses
+endpoint, independently of desktop patches. On 0.166.0 the notification marks
+the catalog changed; the next model turn fetches the new definitions and includes
+them in its request. With the feature disabled, the next model request retains
+the old definitions. Tests check both the server's `tools/list` traffic and the
+actual outgoing model tool definitions while an earlier call remains running.
+Installing the launcher and establishing a connection with the setting loaded
+are separate activation steps; source/config edits do not change live chats.
 Protocol tasks keep connection-local IDs mapped to their original backend,
 including progress and task-related metadata. Queries, cancellation and serial
 listing reads use that owner. Results remain retrievable after terminal status;
