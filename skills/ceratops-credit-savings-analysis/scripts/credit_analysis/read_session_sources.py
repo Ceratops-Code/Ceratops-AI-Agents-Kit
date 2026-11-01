@@ -1,6 +1,6 @@
 """Read Codex chat identity and session sources without model calls or writes.
 
-This module owns raw JSONL reads, chat lookup and project metadata. The evidence
+This module owns JSONL decoding, chat lookup and project metadata. The evidence
 collector owns extraction and classification. Source failures carry their cause
 and never turn unavailable evidence into an empty reviewed window.
 """
@@ -33,10 +33,17 @@ def load_rows_with_fingerprint(
     records must have a timestamp for a bounded read. Stop at the first record
     after the cutoff so a delayed, old-dated usage event cannot attach itself to
     an earlier turn after its newer turn_context was omitted.
+
+    Repeated cumulative usage notifications retain their metadata but cannot
+    create another response. The raw-byte fingerprint still covers every source
+    record. Without cumulative evidence, or after a new response item, preserve
+    the usage event rather than guessing that two equal-sized calls are one.
     """
 
     rows: list[dict[str, Any]] = []
     digest = hashlib.sha256()
+    previous_usage: tuple[dict[str, Any], dict[str, Any]] | None = None
+    response_since_usage = False
     if as_of is not None and as_of.tzinfo is None:
         raise EvidenceCollectionError("bounded session read requires a timezone-aware as_of")
     try:
@@ -63,6 +70,34 @@ def load_rows_with_fingerprint(
                     if timestamp > as_of:
                         break
                 digest.update(raw_line)
+                payload = row.get("payload")
+                if isinstance(payload, dict):
+                    item_type = str(payload.get("type", ""))
+                    if row.get("type") == "response_item" and (
+                        not item_type.endswith("_output")
+                        and not (item_type == "message" and payload.get("role") == "user")
+                    ):
+                        response_since_usage = True
+                    if row.get("type") == "event_msg" and item_type == "token_count":
+                        info = payload.get("info")
+                        total = info.get("total_token_usage") if isinstance(info, dict) else None
+                        last = info.get("last_token_usage") if isinstance(info, dict) else None
+                        signature = (
+                            (total, last)
+                            if isinstance(total, dict) and total and isinstance(last, dict) and last
+                            else None
+                        )
+                        if signature is not None and signature == previous_usage and not response_since_usage:
+                            # Keep rate-limit/context updates without replaying last usage.
+                            row = {**row, "payload": {
+                                **payload, "info": {
+                                    key: value for key, value in info.items()
+                                    if key != "last_token_usage"
+                                },
+                            }}
+                        else:
+                            previous_usage = signature
+                        response_since_usage = False
                 rows.append(row)
     except OSError as exc:
         raise EvidenceCollectionError(f"could not read session: {exc}") from exc

@@ -231,7 +231,7 @@ supports ledger analysis without model orchestration.
 | Stable executable entry point | Keeps one script path while forwarding to modular implementation | [credit-analysis-workflow.py](scripts/credit-analysis-workflow.py) |
 | CLI dispatcher | Parses analysis commands and composes quick batch collection and validation | [command_line_interface.py](scripts/credit_analysis/command_line_interface.py) |
 | Surface contract and request core | Validates the contract, one root thread request, and shared artifact paths | [single_surface_analysis.py](scripts/credit_analysis/single_surface_analysis.py) |
-| Session sources | Reads current app activity, log identity and bounded JSONL prefixes without writes | [read_session_sources.py](scripts/credit_analysis/read_session_sources.py) |
+| Session sources | Reads current app activity, log identity and bounded JSONL prefixes without writes; repeated cumulative usage notifications do not create duplicate responses | [read_session_sources.py](scripts/credit_analysis/read_session_sources.py) |
 | Session collector | Extracts completed runs, model calls, token usage, and evidence references | [session_evidence_collector.py](scripts/credit_analysis/session_evidence_collector.py) |
 | Source execution context | Resolves run working directories, recovers identity-matched deleted worktrees, and snapshots effective `AGENTS.md` text and hashes once | [source_execution_context.py](scripts/credit_analysis/source_execution_context.py) |
 | Capacity planner | Partitions oversized runs, admits Luna tasks, assigns byte and candidate budgets to Sol reviewer bins, and enforces attempt capacity | [model_capacity_planning.py](scripts/credit_analysis/model_capacity_planning.py) |
