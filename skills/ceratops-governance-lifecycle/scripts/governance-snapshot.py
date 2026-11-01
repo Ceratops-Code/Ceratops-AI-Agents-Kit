@@ -15,6 +15,7 @@ import os
 import pathlib
 import re
 import subprocess
+import sys
 import tempfile
 import tomllib
 from collections import Counter
@@ -908,7 +909,7 @@ def build_decision_payload(
     snapshot: dict[str, object],
     evidence_path: pathlib.Path,
 ) -> dict[str, object]:
-    """Reduce full evidence to the counts needed to select later deep reads."""
+    """Return counts and review targets without reopening inventoried files."""
     automations = cast(dict[str, Any], snapshot["automations"])
     automation_source = cast(dict[str, Any], snapshot["automation_source"])
     reasoning_effort = cast(
@@ -928,6 +929,7 @@ def build_decision_payload(
         "evidence_path": str(evidence_path),
         "evidence_schema": snapshot["schema"],
         "state_sha256": snapshot_state_sha256(snapshot),
+        "review_clusters": build_review_clusters(snapshot),
         "counts": {
             "automations": automations["count"],
             "source_automations": automation_source["count"],
@@ -950,6 +952,141 @@ def build_decision_payload(
     }
 
 
+def evidence_rows(value: object, field: str) -> list[dict[str, Any]]:
+    """Reject malformed saved rows instead of silently dropping audit coverage."""
+    if not isinstance(value, list) or any(not isinstance(row, dict) for row in value):
+        raise ValueError(f"{field} must be an array of objects")
+    return value
+
+
+def control_file_path(root: object, reference: object) -> str:
+    """Join recorded paths lexically, including Windows evidence read elsewhere.
+
+    No filesystem resolution is allowed here: saved evidence remains useful
+    after its original checkout is unavailable. Inventory-relative paths never
+    contain parent traversal.
+    """
+    if not isinstance(root, str) or not isinstance(reference, str) or not reference:
+        raise ValueError("control paths require a root and nonempty reference")
+    flavour = (
+        pathlib.PureWindowsPath
+        if pathlib.PureWindowsPath(root).is_absolute()
+        else pathlib.PurePosixPath
+    )
+    base, relative = flavour(root), flavour(reference)
+    if not base.is_absolute() or ".." in relative.parts:
+        raise ValueError(f"invalid recorded control path: {root!r}, {reference!r}")
+    return str(base / relative)
+
+
+def build_review_clusters(snapshot: dict[str, Any]) -> dict[str, object]:
+    """Project recorded review facts; preserve findings, IDs and approved debt.
+
+    These are review candidates, not newly confirmed contradictions. Approval
+    status stays separate from unresolved reviews, and automation controls are
+    paired by their recorded relative path so a stale ID cannot hide a file.
+    """
+    graph = snapshot["agents_rule_graph"]
+    rules: dict[str, dict[str, Any]] = {}
+    for entry in evidence_rows(graph["files"], "agents_rule_graph.files"):
+        history = entry["history"]
+        row = {
+            "path": entry["path"], "history_path": history["path"],
+            "findings": evidence_rows(entry["findings"]["items"], "rule findings"),
+            "history_findings": evidence_rows(history["findings"], "history findings"),
+            "reviews": evidence_rows(entry["semantic_reviews"]["items"], "rule reviews"),
+            "approved_debt": evidence_rows(entry["approved_debt"]["items"], "approved debt"),
+            "relation_reviews": [], "stack_findings": [], "cycles": [],
+        }
+        rules[entry["path"]] = row
+    for stack in evidence_rows(graph["stacks"], "agents_rule_graph.stacks"):
+        row = rules[stack["path"]]
+        for source, target in (
+            ("semantic_reviews", "relation_reviews"),
+            ("findings", "stack_findings"), ("cycles", "cycles"),
+        ):
+            row[target] = evidence_rows(stack[source], f"stack {source}")
+    flagged_rules = [
+        row for row in rules.values()
+        if any(row[key] for key in (
+            "findings", "history_findings", "reviews", "approved_debt",
+            "relation_reviews", "stack_findings", "cycles",
+        ))
+    ]
+    sections = {"source": snapshot["automation_source"], "runtime": snapshot["automations"]}
+    controls: dict[str, dict[str, dict[str, Any] | None]] = {}
+    fields = (
+        "id", "name", "status", "schedule", "model", "reasoning_effort",
+        "cwds", "helper_refs", "control_refs", "artifact_refs",
+        "memory_contract", "inbox_contract",
+    )
+    for scope, section in sections.items():
+        by_path = {}
+        for entry in evidence_rows(section["items"], f"{scope} automations"):
+            path = entry["path"]
+            if path in by_path:
+                raise ValueError(f"duplicate {scope} automation path: {path}")
+            by_path[path] = entry
+            row = controls.setdefault(path, {"source": None, "runtime": None})
+            row[scope] = entry
+    pairs = []
+    for path, entries in sorted(controls.items()):
+        source, runtime = entries["source"], entries["runtime"]
+        present = source or runtime
+        assert present is not None  # Each pair originates from an inventory row.
+        row = {
+            "id": present["id"],
+            "source_path": control_file_path(sections["source"]["root"], path) if source else None,
+            "runtime_path": control_file_path(sections["runtime"]["root"], path) if runtime else None,
+            "differences": {
+                field: {"source": source.get(field) if source else None,
+                        "runtime": runtime.get(field) if runtime else None}
+                for field in fields
+                if source is None or runtime is None or source.get(field) != runtime.get(field)
+            },
+        }
+        pairs.append(row)
+    mismatches = []
+    for entry in evidence_rows(snapshot["automation_reasoning_effort"]["mismatches"], "effort mismatches"):
+        section = sections[entry["scope"]]
+        mismatches.append({**entry, "path": control_file_path(section["root"], entry["path"])})
+    return {
+        "rules": flagged_rules,
+        "automation_controls": pairs,
+        "models": {scope: section["models"] for scope, section in sections.items()},
+        "effort_mismatches": mismatches,
+        "duplicate_schedules": {
+            scope: {schedule: [entry["id"] for entry in section["items"]
+                               if entry["schedule"] == schedule]
+                    for schedule in section["duplicate_schedules"]}
+            for scope, section in sections.items()
+        },
+        "automation_gitignore": snapshot["automation_gitignore"],
+        "d_rule_brevity": snapshot["d_rule_brevity"]["candidates"],
+        "repeated_rule_lines": snapshot["agents"]["repeated_rule_lines"],
+        "classification_reviews": [entry for entry in snapshot["agents"]["items"]
+                                   if entry["classification_review_required"]],
+        "git": [entry for entry in snapshot["git"]["items"]
+                if not entry["is_git_repo"] or entry.get("dirty")
+                or entry.get("errors") or entry.get("active_release_branch")],
+    }
+
+
+def summarize_evidence(path: pathlib.Path) -> dict[str, object]:
+    """Read one caller-owned snapshot; never scan projects or write artifacts."""
+    snapshot = json.loads(read_text(path))
+    if not isinstance(snapshot, dict) or snapshot.get("schema") != "global-governance-consistency-audit/snapshot.v4":
+        raise ValueError("expected global-governance-consistency-audit/snapshot.v4 object")
+    for field in ("automations", "automation_source"):
+        if not isinstance(snapshot[field]["duplicate_schedules"], dict):
+            raise ValueError(f"{field}.duplicate_schedules must be an object")
+    payload = build_decision_payload(snapshot, path.absolute())
+    counts = cast(dict[str, int], payload["counts"])
+    if any(type(count) is not int or count < 0 for count in counts.values()):
+        raise ValueError("snapshot counts must be nonnegative integers")
+    return payload
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--codex-home", type=pathlib.Path, default=default_codex_home())
@@ -959,7 +1096,12 @@ def parse_args() -> argparse.Namespace:
         type=pathlib.Path,
         help="Automation source repository; defaults to <projects-root>/Codex-Automations.",
     )
-    parser.add_argument("--projects-root", type=pathlib.Path, required=True)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--projects-root", type=pathlib.Path)
+    mode.add_argument(
+        "--summarize-evidence", type=pathlib.Path,
+        help="Return counts, flagged rules and absolute control paths from saved evidence without scanning.",
+    )
     parser.add_argument(
         "--evidence-output",
         type=pathlib.Path,
@@ -969,11 +1111,22 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--pretty", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.summarize_evidence is not None and args.evidence_output is not None:
+        parser.error("--summarize-evidence cannot be combined with --evidence-output")
+    return args
 
 
 def main() -> int:
     args = parse_args()
+    if args.summarize_evidence is not None:
+        try:
+            payload = summarize_evidence(args.summarize_evidence)
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+            print(f"summarize-evidence failed for {args.summarize_evidence}: {exc}", file=sys.stderr)
+            return 1
+        print(render_json(payload, pretty=args.pretty))
+        return 0
     snapshot = build_snapshot(args)
     if args.evidence_output is None:
         payload = snapshot
