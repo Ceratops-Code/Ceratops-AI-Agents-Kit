@@ -15,6 +15,7 @@ a worktree lock or per-execution history.
 
 from __future__ import annotations
 
+import datetime
 import hashlib
 import importlib.metadata
 import inspect
@@ -22,6 +23,7 @@ import json
 import os
 import pathlib
 import platform
+import re
 import runpy
 import shutil
 import stat
@@ -54,6 +56,152 @@ LEVELS = ("alpha", "beta", "rc", "final")
 CONTEXT_SCHEMA = "ceratops-pytest-inputs.v1"
 SUMMARY_SCHEMA = "ceratops-check-summary.v1"
 BUILD_REUSE_LEVEL: ContextVar[str | None] = ContextVar("build_reuse_level", default=None)
+CHECK_REQUEST_INPUTS: ContextVar[dict[str, Any] | None] = ContextVar("check_request_inputs", default=None)
+
+
+def redact_test_diagnostic(value: Any) -> Any:
+    """Preserve full diagnostic streams while removing supplied credential values."""
+    if isinstance(value, dict):
+        return {key: redact_test_diagnostic(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [redact_test_diagnostic(item) for item in value]
+    if not isinstance(value, str):
+        return value
+    for key, secret in os.environ.items():
+        if len(secret) >= 4 and re.search(r"TOKEN|PASSWORD|SECRET|API_KEY|CREDENTIAL", key, re.I):
+            value = value.replace(secret, "[REDACTED]")
+    value = re.sub(r"(?i)(https?://)[^\s/@:]+:[^\s/@]+@", r"\1[REDACTED]@", value)
+    return re.sub(r"(?i)((?:token|password|secret|api[_-]?key|authorization)[\s:=]+)(?:bearer\s+)?[^\s,;]+",
+                  r"\1[REDACTED]", value)
+
+
+def _failure_scope(record: Mapping[str, Any]) -> dict[str, Any]:
+    inputs = record.get("inputs", {})
+    return {"arguments": inputs.get("arguments"), "checkGroup": inputs.get("checkGroup"),
+            "artifacts": sorted(inputs.get("artifacts", {}))}
+
+
+def _read_test_diagnostic(path: pathlib.Path, root: pathlib.Path) -> dict[str, Any] | None:
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, ValueError, UnicodeError):
+        return None
+    return report if isinstance(report, dict) and report.get("cwd") == str(root) else None
+
+
+def _unresolved_test_failures(report: Mapping[str, Any], current: Any) -> dict[str, Any]:
+    target = {"platform": platform.system(), "architecture": platform.machine()}
+    records = {item["nodeid"]: item for item in current.records("pytest", target=target)} if current else {}
+    remaining = {}
+    for nodeid, failure in report.get("saved_failures", {}).items():
+        passed = records.get(nodeid, {})
+        if not (passed.get("outcome") == "passed" and passed.get("completed_ns", 0) > failure["completed_ns"]
+                and _failure_scope(passed) == failure["scope"]):
+            remaining[nodeid] = failure
+    return remaining
+
+
+def save_test_diagnostic(path: pathlib.Path, payload: Mapping[str, Any], *,
+                         root: pathlib.Path, current: Any = None, summary: Any = None) -> bytes:
+    """Keep one report, with at most one unresolved diagnostic per failed test.
+
+    The caller supplies the outcome already saved by pytest. Older diagnostics
+    survive partial runs only while the same worktree's current outcomes still
+    need them. Git summaries and artifact retention do not control this report.
+    """
+    previous = _read_test_diagnostic(path, root) or {}
+    pending = _unresolved_test_failures(previous, current)
+    diagnostics = dict(previous.get("diagnostics", {}))
+    for failure in pending.values():
+        if "diagnostic" in failure:
+            previous_detail = failure.pop("diagnostic")
+            identity = _digest(previous_detail)
+            diagnostics[identity] = previous_detail
+            failure["diagnostic_id"] = identity
+    detail = redact_test_diagnostic(dict(payload))
+    detail.pop("check_summary", None)
+    if isinstance(summary, dict):
+        detail["successful_results"] = [{key: item[key] for key in ("id", "result_id", "path") if key in item}
+                                         for item in summary.get("checks", []) if item.get("status") == "passed"]
+    detail.setdefault("runtime", sys.executable)
+    for stream in ("stdout", "stderr"):
+        if stream in detail:
+            detail[stream] = detail[stream] or f"[no {stream}]"
+    checks = summary.get("checks", []) if isinstance(summary, dict) else []
+    saved = {row["result_id"]: row for row in current.records("pytest")} if current else {}
+    failures = [item for item in checks if item.get("status") in {"failed", "interrupted"}]
+    diagnostic_id = _digest(detail)
+    diagnostics[diagnostic_id] = detail
+    for failure in failures:
+        record = saved.get(failure.get("result_id"))
+        if record is not None:
+            pending[record["nodeid"]] = {"result_id": record["result_id"], "completed_ns": record["completed_ns"],
+                                         "scope": _failure_scope(record), "diagnostic_id": diagnostic_id}
+    report = {**detail, "saved_failures": pending, "recorded_ns": time.time_ns(),
+              "diagnostics": {key: diagnostics[key] for key in {item["diagnostic_id"] for item in pending.values()}},
+              "unrepresented_failure": not failures or any(item.get("result_id") not in saved for item in failures)}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    raw = _json(report) + b"\n"
+    with path.open("wb") as handle:
+        handle.write(raw)
+        handle.flush()
+        os.fsync(handle.fileno())
+    return raw
+
+
+def remove_test_diagnostic(path: pathlib.Path, *, root: pathlib.Path, current: Any = None,
+                           successful_request: Mapping[str, Any] | None = None) -> None:
+    """Remove a managed report after its own failures have newer saved passes.
+
+    Caller-selected reports outside .build/test-diagnostics are user-retained.
+    Startup uses only current local results; an old tagged pass never clears a
+    later failure. A complete successful command can clear an earlier launch or
+    collection error for that same request, which has no individual test result.
+    """
+    if not path.resolve().is_relative_to((root / ".build/test-diagnostics").resolve()):
+        return
+    report = _read_test_diagnostic(path, root)
+    if report is None or _unresolved_test_failures(report, current):
+        return
+    unknown = report.get("unrepresented_failure", not report.get("saved_failures"))
+    if unknown and current is not None and report.get("result_request") is not None:
+        for record in current.records("repository-check"):
+            finished = record.get("execution", {}).get("finishedAt")
+            if (record.get("status") == "passed" and record.get("invocation") == report["result_request"]
+                    and finished and int(datetime.datetime.fromisoformat(finished).timestamp() * 1_000_000_000)
+                    > report.get("recorded_ns", 0)):
+                unknown = False
+                break
+    if unknown and not (successful_request is not None and report.get("request") == successful_request):
+        return
+    path.unlink(missing_ok=True)
+    try:
+        path.parent.rmdir()
+    except OSError:
+        if path.parent.exists() and not any(path.parent.iterdir()):
+            raise
+
+
+def measure_selected_artifacts(root: pathlib.Path, selected: Mapping[str, Any]) -> dict[str, Any]:
+    """Name the exact built files supplied by the caller, including their bytes."""
+    if not isinstance(selected, dict):
+        raise ValueError("artifacts must map deliverable references to file-path arrays")
+    measured = {}
+    for reference, names in sorted(selected.items()):
+        if (not isinstance(reference, str) or not reference.startswith("deliverables.")
+                or len(reference.split(".")) != 3 or not isinstance(names, list) or not names):
+            raise ValueError("artifacts must map deliverable references to nonempty file-path arrays")
+        files = []
+        for name in names:
+            if not isinstance(name, str) or not name:
+                raise ValueError("artifact paths must be nonempty strings")
+            path = pathlib.Path(name)
+            path = path if path.is_absolute() else root / path
+            if path.is_symlink() or not path.is_file():
+                raise ValueError(f"Selected artifact is not an available regular file: {path}")
+            files.append({"path": str(path.resolve()), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
+        measured[reference] = files
+    return measured
 
 
 def _digest(value: object) -> str:
@@ -188,6 +336,7 @@ def _git(root: pathlib.Path, *arguments: str) -> bytes:
 
 def result_environment(
     command: Sequence[str], root: pathlib.Path, environ: Mapping[str, str],
+    *, result_writer: pathlib.Path | None = None,
 ) -> dict[str, str]:
     """Describe original caller inputs before pytest adds temporary paths.
 
@@ -201,6 +350,7 @@ def result_environment(
         RESULT_CONTEXT_ENV, RESULT_SUMMARY_ENV, "CERATOPS_SDLC_TEST_CONTEXT",
         "CERATOPS_REPOSITORY_CHECK_CONTEXT", "PYTEST_CURRENT_TEST",
         "CODEX_SESSION_ID", "CODEX_THREAD_ID", "CODEX_TASK_WORKSPACE_VERIFYING_IDENTITY",
+        "CERATOPS_TEST_ARTIFACTS",
     }
     context = {
         "schema": CONTEXT_SCHEMA,
@@ -208,6 +358,11 @@ def result_environment(
         "arguments": check_arguments(command[3:], root),
         "environment": {k: _digest(v) for k, v in environ.items() if k not in ignored},
     }
+    if result_writer is not None:
+        context["resultWriter"] = str(result_writer.resolve())
+    if request := CHECK_REQUEST_INPUTS.get():
+        context["checkGroup"] = request.get("checkGroup")
+        context["artifacts"] = measure_selected_artifacts(root, request.get("artifacts", {}))
     if raw := environ.get("CERATOPS_REPOSITORY_CHECK_CONTEXT"):
         owner = json.loads(raw)
         if (not isinstance(owner, dict) or owner.get("schema") != "ceratops-repository-check-inputs.v1"
@@ -291,7 +446,8 @@ class ResultStore:
         self.root = root.resolve()
         common = pathlib.Path(_git(root, "rev-parse", "--path-format=absolute", "--git-common-dir").decode().strip())
         self.common = common
-        reader = runpy.run_path(str(pathlib.Path(__file__).resolve().parents[1] / "result_records.py"))
+        reader = runpy.run_path(str(context.get("resultWriter") or
+                                   pathlib.Path(__file__).resolve().parents[1] / "result_records.py"))
         self.current = reader["CurrentCheckResults"](self.root)
         self.directory = self.current.path.parent
         self.target = {"platform": platform.system(), "architecture": platform.machine()}
@@ -336,6 +492,10 @@ class ResultStore:
             "producer": _digest({name: hashlib.sha256(pathlib.Path(__file__).with_name(name).read_bytes()).hexdigest()
                                  for name in ("reuse_test_results.py", "select_test_groups.py")}),
         }
+        if context.get("artifacts"):
+            self.context["artifacts"] = context["artifacts"]
+        if context.get("checkGroup"):
+            self.context["checkGroup"] = context["checkGroup"]
         self.records_by_check: dict[tuple[str, str], list[dict[str, Any]]] = {
             (self.checkout, record["nodeid"]): [record]
             for record in self.current.records("pytest", target=self.target)
@@ -357,7 +517,6 @@ class ResultStore:
             # This repository-owned reader is also the generated runner's
             # public result contract. No installed skill or artifact store is
             # imported or searched to discover the previous built version.
-            reader = runpy.run_path(str(pathlib.Path(__file__).resolve().parents[1] / "result_records.py"))
             for build in reader["select_build_check_summaries"](
                 self.root, qualification_level=self.qualification_level,
             ):
@@ -638,6 +797,13 @@ class ResultStore:
 
     def _current(self, inputs: Mapping[str, Any], *, changed_paths: list[str] | None = None) -> bool:
         """Reject edits made after collection's snapshot without rejecting touches."""
+        for files in inputs.get("artifacts", {}).values():
+            for item in files:
+                path = pathlib.Path(item["path"])
+                if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != item["sha256"]:
+                    if changed_paths is None:
+                        return False
+                    changed_paths.append(str(path))
         for name, digest in inputs["product_inputs"].items():
             path = self.root / name
             current_stat = self._stat(path)
@@ -812,7 +978,7 @@ def consolidate_result_files(root: pathlib.Path) -> dict[str, Any]:
                 if inputs.get("fingerprint") != expected:
                     raise ValueError("repository check input facts differ from their hash")
                 target = {key: item for key, item in inputs["scope"].items()
-                          if key not in {"worktree", "inputRules"}}
+                          if key not in {"worktree", "inputRules", "artifacts"}}
                 offer("repository-check", value["check_id"], target, value)
             else:
                 raise ValueError("unrecognized result schema")
@@ -1095,3 +1261,11 @@ def pytest_configure(config: pytest.Config) -> None:
         # The controller may never receive collection items from its workers.
         plugin._unrepresented("pytest-execution-scope", "Distributed pytest worker scope is not represented.")
     config.pluginmanager.register(plugin, "executed-pass-reuse")
+
+
+@pytest.fixture
+def ceratops_artifacts() -> dict[str, list[pathlib.Path]]:
+    """Expose explicitly selected build files to tests without installation lookup."""
+    selected = json.loads(os.environ.get("CERATOPS_TEST_ARTIFACTS", "{}"))
+    measured = measure_selected_artifacts(pathlib.Path.cwd(), selected)
+    return {name: [pathlib.Path(item["path"]) for item in files] for name, files in measured.items()}

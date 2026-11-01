@@ -15,6 +15,7 @@ dependencies = [
   "tzdata==2026.5",
   "yamllint==1.38.0",
   "tomlkit==0.15.2",
+  "psutil==7.2.2",
 ]
 
 [tool.uv]
@@ -22,6 +23,9 @@ package = false
 
 [tool.uv.workspace]
 members = []
+
+[tool.ceratops.test-support]
+managed = true
 
 [tool.ruff]
 target-version = "py314"

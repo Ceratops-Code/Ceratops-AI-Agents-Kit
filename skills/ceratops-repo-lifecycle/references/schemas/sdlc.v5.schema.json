@@ -236,6 +236,35 @@
           "minLength": 1,
           "pattern": "\\S"
         },
+        "check-groups": {
+          "description": "Named test groups, their build phase and the exact deliverable artifacts required before they run.",
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": {"$ref": "#/$defs/identifier"},
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["phase", "requires-artifacts"],
+            "properties": {
+              "phase": {"enum": ["before-build", "during-build", "after-build"]},
+              "requires-artifacts": {
+                "type": "array",
+                "uniqueItems": true,
+                "items": {"$ref": "#/$defs/deliverableReference"}
+              }
+            },
+            "allOf": [
+              {
+                "if": {"properties": {"phase": {"const": "before-build"}}},
+                "then": {"properties": {"requires-artifacts": {"maxItems": 0}}}
+              },
+              {
+                "if": {"properties": {"phase": {"const": "after-build"}}},
+                "then": {"properties": {"requires-artifacts": {"minItems": 1}}}
+              }
+            ]
+          }
+        },
         "check-results": {
           "description": "Declared relevant inputs and execution scope for one durable check runner command.",
           "type": "object",

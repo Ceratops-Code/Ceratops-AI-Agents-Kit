@@ -98,7 +98,7 @@ def runtime_files(
     # Preserved runners own their framework dependencies. Only the runner this
     # transaction generates has a known pytest dependency.
     if generate_python_test_runner:
-        dependencies.add("pytest")
+        dependencies.update({"pytest", "packaging"})
     for check in checks:
         command = check["command"]
         if len(command) >= 3 and command[:2] == ["{python}", "-m"]:

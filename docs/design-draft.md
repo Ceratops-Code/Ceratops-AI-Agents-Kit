@@ -468,6 +468,52 @@ They preserve actual execution facts without inventing individual result IDs.
 Changed input bytes remain a reuse constraint; a busy optimization is distinct
 from incomplete execution evidence.
 
+The generated runner imports local `scripts/testing/select_test_groups.py` and
+`reuse_test_results.py`; their repo-lifecycle templates also produce Ceratops's
+own support modules. The repository's existing test-impact map remains the one
+dependency declaration. Missing maps allow execution but no individual-test reuse.
+Custom runners are preserved; their support files are managed only when the
+scripts project declares `tool.ceratops.test-support.managed = true`.
+
+`repository_operation.prepare_operations()` reads v5 `check-groups` with required
+`phase` and `requires-artifacts` fields. `execute_check_phases()` completes
+independent source checks, orders selected package builds by their prerequisites,
+and starts after-build checks only with every required artifact available.
+During-build groups execute inside the build process and must return their real
+passing records. The executor never creates a pass for a named but absent check.
+Test commands receive `--check-group` and `--artifacts`; their child processes
+receive the same mapping in `CERATOPS_TEST_ARTIFACTS`. Paths and measured hashes
+enter both whole-check and individual-test inputs. Changes during execution
+prevent saving a reusable pass. Existing `build_bundle()` callbacks already
+receive the exact measured artifact inventory; no second selection is added.
+
+The test runner owns `.build/test-diagnostics/pytest-failure.json`. Its shared
+support module stores current failure IDs and deduplicated full, redacted command
+details. Newer local outcomes resolve individual failures; both A and B must
+pass before a report for A and B is deleted. Startup finishes interrupted deletion
+from those outcomes without tests. A lifecycle caller consumes the runner result
+and retires its separate operation report. Each report owner handles its own
+file; user-retained external reports and current result files are preserved.
+
+`execute_worktree_build.py` owns the internal source-commit-to-completion flow,
+exposed by a thin `repository_operation.execute_worktree_build()` callable. Its
+caller declares relevant source paths, preparation commands, target operations
+and the product-specific receipt description. Only selected changed paths enter
+the source commit. That commit carries the allocated build identity, allowing a
+fresh call interrupted before input binding to recognize the exact direct child
+commit and unchanged declared inputs. This uses current Git data, not a saved
+execution phase. The executor then calls the existing per-target receipt and
+completion functions. Existing receipts skip producer work; an existing tag lets
+the same call finish scoped retention and failure-report deletion. The returned
+commit and tag come from the completer, not a later read of HEAD. Standalone
+builds take no worktree/release lock. Public Build adoption remains a later step.
+
+`ND.COMPATIBILITY.TEST_RESULT_REUSE` reviews independently reusable units using
+saved outcomes and behavior evidence, including interruption and partial fixes.
+It does not require Ceratops's JSON format or separate files per test. Whole-run
+reuse needs an evidence-backed explanation of lost work. Governance candidate
+checks parse JSON and TOML without Markdown reflow, preserving their string bytes.
+
 The compact `ceratops-check-summary.v1` export contains `inputGroups` and
 `checkGroups` tables plus `checks`. Each outcome references its inlined facts and
 keeps the original result ID, check version, qualification level, required scope,
@@ -875,8 +921,11 @@ functions never acquire or release locks. This split changes no Git policy.
 The helper uses the already pinned library's public
 [`lock_descriptor`](https://py-filelock.readthedocs.io/en/stable/api.html#filelock.lock_descriptor)
 and `unlock_descriptor` functions. It opens its file without truncation and
-calls `lock_descriptor(fd, blocking=False)` once. A busy lock returns
-`WriteLockBusy` before protected work starts.
+calls `lock_descriptor(fd, blocking=False)`. Promotion and Ship opt into a
+60-second monotonic deadline, retrying inside Python until acquired or timed
+out. Unrelated consumers retain a single immediate attempt. A timeout returns
+`WriteLockBusy` before protected work starts; acquisition continues through
+the existing recovery and repository preconditions.
 This is an acquisition rule, not an operation time limit. An owner may retain
 the lock through long automatic tests and CI monitoring, not model corrections.
 It does not require Job Objects,
@@ -901,15 +950,29 @@ operation did not record a clean end; `0` means it did. An empty unused slot
 starts false. The helper owns the open native descriptor, writes in place only
 while its lock is held and calls `fsync`; release unlocks and closes that handle.
 It never truncates, replaces, renames or deletes the file, and creates no
-temporary flag file, history, PID record or second lock. Only this flag is
+temporary flag file, history or second lock. Only this flag is
 stored here; producers continue to own their checkpoints and acceptance.
+
+The sibling `release-local.owner.json` is one current diagnostic, containing
+the operation, PID, process creation time, UTC operation start and optional chat
+ID. `psutil` compares the PID's creation time and liveness, preventing PID reuse
+from naming an unrelated process. A lock-file identity/modification stamp binds
+the record to its holding interval; the helper changes that stamp before release
+so failed deletion cannot identify the next holder. The stamp is never an age
+limit, heartbeat or recovery signal. Missing, malformed, changing or inaccessible
+information gives `owner unknown`. The owner file is written through one fixed
+`.release-local.owner.json.in_process` sibling and atomically replaced, then
+removed before unlock. The next native holder removes interrupted leftovers.
+The permanent lock inode and its flag remain unchanged by owner-file replacement.
+Timeout causes retain owner details and elapsed waiting in the existing command
+result; there is no notification service or AI polling loop.
 
 The internal interface is:
 
 | Call | Responsibility |
 | --- | --- |
 | `release_lock_path(repo_root)` | Discover the shared repository release-lock path without mutating Git or contacting a remote. |
-| `hold_write_lock(path, ...)` | Acquire once, resolve saved uncertainty, durably set the flag, then yield ownership. |
+| `hold_write_lock(path, ...)` | Acquire with the caller's waiting policy, resolve saved uncertainty, durably set the flag, publish owner diagnostics, then yield ownership. |
 | `hold_write_attempt(path, ...)` | Wrap one synchronous operation; clear the flag after stopped failures as well as success, preserving uncertain launcher exits. |
 | `run_protected_command(...)` | Run a foreground command and retain an uncertain stop through caught or wrapped exceptions; attach the invocation and both output streams to launch errors. |
 | `context.complete(commands_stopped=True)` | Outermost caller reports that its writing commands stopped, independently of success. Clear the flag before native unlock on normal or exceptional exit. |
@@ -1089,8 +1152,9 @@ The later receipt-driven Ship flow will additionally retain it through
 automatic receipt fetch/fast-forward and protected PR merge. Model corrections
 run after the local attempt ends and unlocks. Remote
 CI writers do not share this machine-local lock; conditional remote branch updates
-and GitHub protection guard their changes. A second local promotion or Ship fails
-immediately, before candidate work starts. No background lock-holder or incoming
+and GitHub protection guard their changes. A second local promotion or Ship waits
+up to 60 seconds before returning a busy result; candidate work starts only after
+acquisition and normal preconditions. No background lock-holder or incoming
 correction-command listener is introduced. Local exit does not cancel remote CI.
 
 Each task worktree belongs to one thread. Ordinary editing, checks, builds and
@@ -1116,9 +1180,12 @@ ordinary use does not depend on it.
 `uv run --locked` controls dependency resolution against `uv.lock`. It is not
 this mutual-exclusion lock and does not serialize commands.
 
-Focused behavior tests in `tests/skill_lifecycle/test_runtime_transactions.py`
-cover common-directory identity without remotes, process/thread exclusion,
-immediate busy refusal, nested ownership, stable file identity, durable flags,
+Focused behavior tests in `tests/skill_lifecycle/test_write_locks.py`,
+`tests/repository_lifecycle/test_release_locking.py` and
+`tests/skill_lifecycle/test_runtime_transactions.py` cover common-directory
+identity without remotes, process/thread exclusion,
+immediate refusal for unchanged callers, timed promotion/Ship acquisition and
+owner reporting, nested ownership, stable file identity, durable flags,
 interrupted writes, explicit recovery, known-running-command refusal, clean
 cancellation and installed copies. Windows tests pass locally; POSIX fork
 coverage is present but Linux execution has not been exercised here.

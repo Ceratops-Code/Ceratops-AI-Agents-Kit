@@ -949,7 +949,8 @@ def test_pytest_failure_writes_full_diagnostic_and_emits_bounded_summary(
         == 0
     )
     payload(capsys)
-    assert not diagnostic.exists()
+    # A caller-selected report outside managed storage belongs to the caller.
+    assert diagnostic.read_bytes() == content
 
 
 def test_committed_diff_maps_test_rename_source_through_destination(

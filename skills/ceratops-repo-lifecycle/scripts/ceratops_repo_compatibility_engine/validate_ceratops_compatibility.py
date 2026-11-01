@@ -413,6 +413,8 @@ def validate_ceratops_compatibility(
 
     errors: list[str] = []
     python_tests = discover_python_tests(root, contract["python_test_detection"])
+    from .generate_test_script import generated_support_errors
+    errors.extend(generated_support_errors(root, contract))
     errors.extend(repository_configuration_errors(root, contract))
     sdlc: Mapping[str, Any] | None = None
     sdlc_errors: list[str] = []

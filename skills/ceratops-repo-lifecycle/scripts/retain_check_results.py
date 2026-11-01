@@ -243,7 +243,7 @@ def _load(path: pathlib.Path, result_id: str | None = None) -> tuple[dict[str, A
                 raise ValueError("Compact outcome conflicts with its executed repository check.")
     if (inputs["checkVersion"] != value["check_version"]
             or inputs["workVersion"] != value["candidate_id"]
-            or ("operation" in inputs["scope"] and inputs["scope"]["operation"] != value["check_id"])):
+            or inputs["group"] != value["check_id"]):
         raise ValueError("Original check versions conflict.")
     status, code = value.get("status"), value.get("exit_code")
     if (not isinstance(status, str)

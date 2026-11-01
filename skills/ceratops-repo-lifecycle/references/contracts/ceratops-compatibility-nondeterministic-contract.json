@@ -29,6 +29,18 @@
       ]
     },
     {
+      "id": "ND.COMPATIBILITY.TEST_RESULT_REUSE",
+      "applies_when": "The repository has an SDLC test operation that executes tests.",
+      "review_required": "Determine the smallest independently reusable test unit from the repository-owned runner and its relevant-input mapping. Using behavior tests and saved results, assess whether a completed unit is durable before its pass is acknowledged and a fresh call reuses it only for matching relevant inputs, check version and execution scope. Current results belong to the executing worktree: a corrected pass replaces that check's failure, partial runs leave other outcomes intact, and an older pass cannot replace a current failure. Completed-build summaries preserve original acceptance facts independently of local files; do not retain local attempt histories because a package or historical report still exists. Distinguish reuse granularity from file count: independently reusable entries can share one file. If only an entire run can be reused, record why finer reuse is unsafe or unavailable and what completed work interruption loses; classify avoidable loss as a failure. Do not infer a pass from declarations or source text alone.",
+      "evidence_keys": [
+        "repository.test_configuration",
+        "sdlc.tests",
+        "tests.execution_results",
+        "tests.retained_results",
+        "tests.interruption_results"
+      ]
+    },
+    {
       "id": "ND.COMPATIBILITY.LIFECYCLE",
       "applies_when": "The repository declares lifecycle operations or deliverables.",
       "review_required": "Owning helpers select and execute validation and tests from SDLC before the selected mutation, stop on failure, and clean their owned temporary artifacts. CI never dispatches skill handoffs and reports deferred routes separately. Skill callers may execute registered deterministic handoffs; unresolved routes remain pending and cannot authorize later mutation. Generic lifecycle helpers do not hardcode skill implementations. SDLC execution and schemas stay in the lifecycle skill. CI obtains that implementation through its pinned GitHub action without installed Codex skills or generated engine copies. Confirm the pinned revision is published and custom CI conditions and inputs cover the intended repository and required gates.",

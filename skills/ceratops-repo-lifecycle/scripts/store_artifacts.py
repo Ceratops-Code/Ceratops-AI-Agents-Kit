@@ -822,7 +822,7 @@ def _require_transaction_target(
 
 
 def _git_text(
-    repo_root: pathlib.Path, arguments: Sequence[str], *, label: str
+    repo_root: pathlib.Path, arguments: Sequence[str], *, label: str, single_line: bool = True
 ) -> str:
     completed = subprocess.run(
         ["git", "-C", str(repo_root), *arguments],
@@ -835,7 +835,7 @@ def _git_text(
         suffix = f": {detail}" if detail else ""
         raise OperationError(f"Git could not resolve {label}{suffix}"[:1024])
     value = completed.stdout.strip()
-    if not value or "\n" in value or "\r" in value:
+    if single_line and (not value or "\n" in value or "\r" in value):
         raise OperationError(f"Git returned an invalid {label}.")
     return value
 
@@ -1047,7 +1047,18 @@ def _read_reusable_allocation(
     checkpoint = record.get("preTestCommit")
     if checkpoint is None:
         if allocation.allocation_commit != allocated_at:
-            return None
+            # Source preparation can commit successfully before input binding is
+            # interrupted. Recognize that exact direct child, not an arbitrary
+            # later commit or a saved execution step.
+            head = allocation.allocation_commit
+            parents = _git_text(allocation.repo_root, ["rev-list", "--parents", "-n", "1", head], label="prepared source parents").split()
+            message = _git_text(allocation.repo_root, ["show", "-s", "--format=%B", head], label="prepared source identity", single_line=False)
+            trailer = f"Ceratops-Source-Build: {allocation.release_unit}/{allocation.version} {attempt}"
+            changed = _git_text(allocation.repo_root, ["diff-tree", "--no-commit-id", "--name-only", "-r", allocated_at, head], label="prepared source paths", single_line=False).splitlines()
+            if (parents != [head, allocated_at] or trailer not in message.splitlines()
+                    or not set(changed).issubset(allocation.declared_input_paths)
+                    or not _inputs_match_commit(allocation.repo_root, head, allocation.declared_input_paths)):
+                return None
         reused: ArtifactVersionAllocation = ArtifactVersionAllocation(**values)
     else:
         checkpoint = _validated_commit(allocation.repo_root, checkpoint)

@@ -67,7 +67,10 @@ def release_lock_module() -> Any:
 
 
 @contextmanager
-def release_write_context(repo_root, *, required=True, confirm_stopped=False, affected_worktrees=()):
+def release_write_context(
+    repo_root, *, required=True, confirm_stopped=False, affected_worktrees=(),
+    operation="release update", wait_seconds=0,
+):
     """Let the workflow own release exclusion; never pass ownership to a child.
 
     Foreground launchers finish their synchronous waits before this context
@@ -88,6 +91,7 @@ def release_write_context(repo_root, *, required=True, confirm_stopped=False, af
             return
         with locks.hold_write_attempt(
             lock_path, confirm_previous_commands_stopped=confirm_stopped,
+            operation=operation, wait_seconds=wait_seconds,
         ) as owned:
             yield owned
     except locks.WriteLockError as exc:
@@ -98,7 +102,12 @@ def release_write_context(repo_root, *, required=True, confirm_stopped=False, af
             exc, (locks.WriteLockBusy, locks.WriteLockRecoveryRequired),
         )
         if isinstance(exc, locks.WriteLockBusy):
-            error.args = ("Another promotion or Ship owns release/local; lock is busy; operation did not start.",)
+            error.args = (str(exc).replace("Write lock busy:", "Release busy:", 1),)
+            error.payload = {
+                "status": "error", "message": str(error),
+                "release_not_started": True, "waited_seconds": exc.waited_seconds,
+                "lock_owner": exc.owner if exc.owner is not None else "owner unknown",
+            }
         raise error from exc
 
 

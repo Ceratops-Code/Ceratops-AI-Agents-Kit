@@ -268,6 +268,24 @@ def _typed_semantic_errors(value: Mapping[str, Any]) -> list[str]:
                     f"handoff must be the single final step at {owner}.actions.{action_name}"
                 )
             check_results = action.get("check-results")
+            groups = action.get("check-groups", {})
+            for group_name, group in groups.items():
+                location = f"{owner}.actions.{action_name}.check-groups.{group_name}"
+                steps = action.get("steps", [])
+                if not steps or any("run" not in step for step in steps):
+                    errors.append(f"{location} requires executable commands, not a no-op or skill handoff")
+                phase = group["phase"]
+                if phase == "during-build" and action_name != "build":
+                    errors.append(f"{location}: during-build checks must belong to a build action")
+                if phase != "during-build" and action_name not in {"validate", "test", "tests"}:
+                    errors.append(f"{location}: before/after-build groups must belong to a check action")
+                if phase != "during-build" and len(steps) != 1:
+                    errors.append(f"{location} requires one test command accepting --check-group and --artifacts")
+                for reference in group["requires-artifacts"]:
+                    _, kind, name = reference.split(".")
+                    artifact_owner = deliverables.get(kind, {}).get(name)
+                    if artifact_owner is None or not artifact_owner.get("artifact"):
+                        errors.append(f"{location} requires an unknown or undeclared artifact: {reference}")
             if check_results is not None:
                 steps = action.get("steps", [])
                 if action_name not in {"validate", "test", "tests"} or len(steps) != 1 or "run" not in steps[0]:

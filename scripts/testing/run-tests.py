@@ -26,10 +26,20 @@ import sys
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import nullcontext
 
-from reuse_test_results import BUILD_REUSE_LEVEL, result_environment
+from reuse_test_results import (
+    BUILD_REUSE_LEVEL,
+    CHECK_REQUEST_INPUTS,
+    measure_selected_artifacts,
+    redact_test_diagnostic,
+    remove_test_diagnostic,
+    result_environment,
+    save_test_diagnostic,
+)
 from runner_requests import (
     TEST_CONTEXT_ENV,
+    current_check_results,
     parse_request,
+    request_invocation,
     run_recorded_request,
     validate_execution_context,
 )
@@ -98,6 +108,8 @@ def run_text(
             ):
                 assert environ is not None
                 environ.update(result_environment(command, cwd, os.environ))
+                if request := CHECK_REQUEST_INPUTS.get():
+                    environ["CERATOPS_TEST_ARTIFACTS"] = json.dumps(request.get("artifacts", {}))
                 result = pytest_progress.run_pytest(command, cwd, environ)
             else:
                 result = subprocess.run(
@@ -462,7 +474,12 @@ def write_failure_diagnostic(
         path.parent.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         raise ImpactError(f"cannot create diagnostic output parent: {exc}") from exc
-    content = write_json(path, payload)
+    root = pathlib.Path(str(payload.get("cwd", pathlib.Path.cwd())))
+    try:
+        content = save_test_diagnostic(path, payload, root=root, current=current_check_results(root),
+                                       summary=payload.get("check_summary"))
+    except ValueError as exc:
+        raise ImpactError(str(exc)) from exc
     return {
         "bytes": len(content),
         "path": str(path),
@@ -483,29 +500,10 @@ def cleanup_pytest_diagnostic(
     path: pathlib.Path, *, prune_parent: bool, root: pathlib.Path,
     request: Mapping[str, object], completed_commands: Sequence[Sequence[str]],
 ) -> None:
-    """Delete only a report for the work that just succeeded; keep unrelated failures."""
-    if not path.exists():
-        return
-    try:
-        report = json.loads(path.read_text(encoding="utf-8"))
-    except (ValueError, UnicodeError):
-        return  # An unreadable report cannot be attributed to this successful work.
-    if (not isinstance(report, dict) or report.get("cwd") != str(root)
-            or report.get("schema") not in {PYTEST_DIAGNOSTIC_SCHEMA, RUNNER_DIAGNOSTIC_SCHEMA}
-            or not (report.get("request") == request or report.get("command") in completed_commands)):
-        return
-
-    path.unlink(missing_ok=True)
-    if not prune_parent:
-        return
-    try:
-        path.parent.rmdir()
-    except FileNotFoundError:
-        pass
-    except OSError:
-        if not path.parent.is_dir() or any(path.parent.iterdir()):
-            return
-        raise
+    """Use saved corrected passes; caller-selected reports outside managed storage stay."""
+    if path.exists():
+        remove_test_diagnostic(path, root=root, current=current_check_results(root),
+                               successful_request=request if completed_commands else None)
 
 
 def node_identity(nodeid: str) -> str:
@@ -761,6 +759,13 @@ def execute(
     summary: dict[str, object] = {}
     outputs: list[dict[str, object]] = []
     completed_commands: list[list[str]] = []
+    diagnostic = resolve_data_path(root, args.diagnostic_output or DEFAULT_DIAGNOSTIC_PATH)
+    if diagnostic.exists():
+        try:
+            remove_test_diagnostic(diagnostic, root=root, current=current_check_results(root))
+        except (OSError, ValueError) as exc:
+            emit({"status": "diagnostic-cleanup-failed", "path": str(diagnostic), "message": str(exc)})
+            return CONFIGURATION_EXIT_CODE
 
     def observe(command: Sequence[str], cwd: pathlib.Path) -> subprocess.CompletedProcess[str]:
         result = text_runner(command, cwd)
@@ -780,12 +785,12 @@ def execute(
         summary=lambda: summary)
     # Finished outcomes are saved before disposable failure diagnostics are removed.
     # A later call can finish deletion while reusing the already saved outcomes.
-    if code == 0 and request_error is None and not args.describe_test_results and not args.select_only:
+    if request_error is None and not args.describe_test_results and not args.select_only:
         try:
             cleanup_pytest_diagnostic(
                 resolve_data_path(root, args.diagnostic_output or DEFAULT_DIAGNOSTIC_PATH),
                 prune_parent=args.diagnostic_output is None,
-                root=root, request=diagnostic_request(args), completed_commands=completed_commands,
+                root=root, request=diagnostic_request(args), completed_commands=completed_commands if code == 0 else (),
             )
         except OSError as exc:
             code = CONFIGURATION_EXIT_CODE
@@ -832,6 +837,7 @@ def execute_selected(
             payload["diagnostic"] = write_failure_diagnostic(diagnostic_path, {
                 "schema": RUNNER_DIAGNOSTIC_SCHEMA, "cwd": str(root),
                 "request": diagnostic_request(args),
+                "result_request": request_invocation(args),
                 "exit_code": exit_code, "result": dict(payload),
                 "commands": preflight_commands,
             })
@@ -933,7 +939,13 @@ def execute_selected(
         payload["status"] = "collection-mismatch"
         return fail_before_tests(COLLECTION_MISMATCH_EXIT_CODE)
     changes: tuple[ChangedFile, ...] = ()
-    if args.targets:
+    if args.check_group:
+        if args.check_group not in manifest.suites:
+            payload["manifest_errors"] = [f"Unknown test check-group: {args.check_group}"]
+            payload["status"] = "configuration-error"
+            return fail_before_tests(CONFIGURATION_EXIT_CODE)
+        selection = Selection((args.check_group,), manifest.suites[args.check_group].pytest, (), (), (), False, False)
+    elif args.targets:
         selection = Selection((), tuple(dict.fromkeys(args.targets)), (), (), (), False, False)
     elif args.all or args.build_history:
         # Discover every required current case once, then compare its exact
@@ -1002,14 +1014,23 @@ def execute_selected(
         *selection.pytest_targets,
     ]
     token = BUILD_REUSE_LEVEL.set("alpha" if args.build_history else None)
+    inputs_token = CHECK_REQUEST_INPUTS.set({"checkGroup": args.check_group, "artifacts": args.artifacts})
     try:
+        measure_selected_artifacts(root, args.artifacts)
         result = text_runner(pytest_command, root)
+    except (ValueError, OSError) as exc:
+        payload["manifest_errors"] = [str(exc)]
+        payload["status"] = "configuration-error"
+        return fail_before_tests(CONFIGURATION_EXIT_CODE)
     finally:
         BUILD_REUSE_LEVEL.reset(token)
+        CHECK_REQUEST_INPUTS.reset(inputs_token)
     pytest_payload: dict[str, object] = {
         "exit_code": result.returncode,
         "outcome": outcome_name(result.returncode),
     }
+    result.stdout = redact_test_diagnostic(result.stdout)
+    result.stderr = redact_test_diagnostic(result.stderr)
     if accepted_checks := getattr(result, "accepted_checks", None):
         pytest_payload["checks"] = accepted_checks
     if timings := getattr(result, "check_timings", None):
@@ -1036,6 +1057,8 @@ def execute_selected(
                 {
                     "schema": PYTEST_DIAGNOSTIC_SCHEMA, "command": pytest_command,
                     "request": diagnostic_request(args),
+                    "result_request": request_invocation(args),
+                    "check_summary": getattr(result, "check_summary", None),
                     "cwd": str(root), "exit_code": result.returncode,
                     "stdout": result.stdout, "stderr": result.stderr,
                 },

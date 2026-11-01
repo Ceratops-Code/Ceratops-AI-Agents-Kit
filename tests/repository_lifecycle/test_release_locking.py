@@ -471,7 +471,7 @@ def test_installer_launch_failures_keep_unfinished_flag(tmp_path, monkeypatch, l
             pass
 
 
-@pytest.mark.parametrize("command", ["promote", "prepare", "ship", "github-ship", "sync", "sync-main", "pr", "pr-primary", "fast-change"])
+@pytest.mark.parametrize("command", ["sync", "sync-main", "pr", "pr-primary", "fast-change"])
 def test_release_commands_refuse_busy_before_candidate_work(tmp_path, command):
     repo, _, log, environment = prepare_repository_lifecycle_repo(tmp_path)
     assert run_git(repo, "switch", "main").returncode == 0
@@ -513,6 +513,58 @@ def test_release_commands_refuse_busy_before_candidate_work(tmp_path, command):
         assert not (repo / ".git/codex/repository-lifecycle").exists()
         owned.complete(commands_stopped=True)
     assert lock_path.read_bytes() == b"0"
+
+
+@pytest.mark.parametrize("command", ["promote", "prepare", "ship", "github-ship"])
+def test_release_cli_waits_sixty_seconds_and_reports_owner(tmp_path, command):
+    repo, _, log, environment = prepare_repository_lifecycle_repo(tmp_path)
+    commands = {
+        "promote": [str(PROMOTE_REPOSITORY), "--source-branch", "approved", "--no-run-operation"],
+        "prepare": [str(PROMOTE_REPOSITORY), "--prepare-release-only"],
+        "ship": [str(SHIP_REPOSITORY), "--head-branch", "release/local"],
+        "github-ship": [str(PR_WORKFLOW_ENTRYPOINT), "ship", "--head-branch", "release/local", "--no-pending-work-check"],
+    }
+    # Accelerate only Python's waiting clock. The actual public CLI and real
+    # interprocess native contention still choose the full 60-second policy.
+    launcher = (
+        "import pathlib,runpy,sys,types; sys.path.insert(0,sys.argv.pop(1)); import hold_write_lock as locks; "
+        "clock=[0.0]; locks.time=types.SimpleNamespace(monotonic=lambda:clock[0], "
+        "sleep=lambda delay:clock.__setitem__(0,clock[0]+delay)); "
+        "sys.argv=sys.argv[1:]; sys.path.insert(0,str(pathlib.Path(sys.argv[0]).parent)); "
+        "runpy.run_path(sys.argv[0],run_name='__main__')"
+    )
+    locks = workflow_command.release_lock_module()
+    before = run_git(repo, "show-ref").stdout
+    with locks.hold_write_attempt(locks.release_lock_path(repo), operation="promotion"):
+        result = subprocess.run(
+            [sys.executable, "-c", launcher, str(PROMOTE_REPOSITORY.parents[2] / "sections/scripts"),
+             *commands[command], "--repo-root", str(repo)],
+            cwd=repo, env=environment, capture_output=True, text=True, timeout=15, check=False,
+        )
+        assert result.returncode == 1, result.stdout + result.stderr
+        payload = json.loads(result.stderr.strip() or result.stdout.strip())
+        assert "waited 60.00 seconds" in payload["message"], payload
+        assert f"PID {os.getpid()}" in payload["message"]
+        assert "promotion" in payload["message"]
+        assert run_git(repo, "show-ref").stdout == before
+        assert not log.exists()
+
+
+def test_release_timeout_result_preserves_owner_and_wait(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    repo, _, _, _ = prepare_repository_lifecycle_repo(tmp_path)
+    with workflow_command.release_write_context(repo, operation="promotion"):
+        def waiting_call():
+            with pytest.raises(workflow_command.CommandError) as caught:
+                with workflow_command.release_write_context(repo, operation="Ship", wait_seconds=0.05):
+                    pytest.fail("busy release entered")
+            return caught.value
+        with ThreadPoolExecutor(max_workers=1) as workers:
+            error = workers.submit(waiting_call).result(timeout=5)
+        assert error.release_not_started
+        assert error.payload["lock_owner"]["pid"] == os.getpid()
+        assert error.payload["waited_seconds"] >= 0.05
+        assert error.payload["message"].startswith("Release busy: promotion")
 
 
 @pytest.mark.parametrize("owner", ["promotion", "ship", "github-ship", "sync", "pr", "fast-change"])

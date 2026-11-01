@@ -230,7 +230,8 @@
     },
     "repository-compatibility": {
       "pytest": [
-        "tests/repository_lifecycle/test_compatibility.py"
+        "tests/repository_lifecycle/test_compatibility.py",
+        "tests/repository_lifecycle/test_generated_test_scripts.py"
       ],
       "depends_on": [],
       "packages": [
@@ -1301,6 +1302,7 @@
         "skills/ceratops-repo-lifecycle/scripts/sdlc_results.py",
         "skills/ceratops-repo-lifecycle/scripts/store_artifacts.py",
         "skills/ceratops-repo-lifecycle/scripts/complete_artifact_builds.py",
+        "skills/ceratops-repo-lifecycle/scripts/execute_worktree_build.py",
         "skills/ceratops-repo-lifecycle/scripts/retain_artifact_versions.py",
         "skills/ceratops-repo-lifecycle/references/schemas/operation-result.v1.schema.json"
       ],
@@ -1544,7 +1546,9 @@
     {
       "id": "generated-test-script",
       "paths": [
-        "skills/ceratops-repo-lifecycle/references/templates/run-tests.py.tmpl"
+        "skills/ceratops-repo-lifecycle/references/templates/run-tests.py.tmpl",
+        "skills/ceratops-repo-lifecycle/references/templates/select_test_groups.py.tmpl",
+        "skills/ceratops-repo-lifecycle/references/templates/reuse_test_results.py.tmpl"
       ],
       "suites": [
         "repository-compatibility",

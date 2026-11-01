@@ -679,8 +679,10 @@ into repository and skill lifecycle runtimes. It finds one shared lock at
 `<git-common-dir>/ceratops/locks/release-local` from any repository worktree,
 without requiring a remote. The pinned library's `lock_descriptor` function uses
 native Windows/Linux locking without truncating the file or falling back to a
-file-existence lock. A competing caller gets an
-immediate busy result; the owning operation has no 30-second time limit.
+file-existence lock. Promotion and Ship wait up to 60 seconds for another holder,
+using a monotonic deadline inside Python. After acquisition they run their normal
+preconditions against the current repository. Other callers still try once.
+The waiting limit does not limit the duration of the operation holding the lock.
 
 The retained lock file stores one Boolean, `unfinished_run`: its first byte
 is `1` during work and `0` after explicit clean completion. Before allowing
@@ -692,8 +694,15 @@ or unknown command shutdown leaves uncertainty. A later caller must acquire
 the native
 lock and explicitly confirm that the previous commands stopped before retrying.
 Confirmation cannot bypass a busy lock or a caller-known running command.
-The helper neither launches nor discovers processes. It creates no temporary
-flag file, operation record, PID registry, background service or OS process group.
+The helper does not manage processes or infer recovery from a process exit.
+Its sibling `release-local.owner.json` reports the current operation, PID and
+process creation time, operation start time and optional `CODEX_THREAD_ID`.
+The helper atomically replaces that one diagnostic using
+`.release-local.owner.json.in_process`, then removes both before unlocking.
+Startup under the native lock removes leftovers. Timeout results include the
+elapsed wait and owner only when the process identity and lock holding interval
+still match; otherwise they say `owner unknown`. These details never clear the
+unfinished flag or permit skipping work. No background service is involved.
 Keep this one fixed-size lock file outside checkpoint cleanup.
 
 2B connects promotion, Ship, release synchronization, release PR preparation and
@@ -709,8 +718,9 @@ Synchronization and PR preparation also take it when they can change the primary
 checkout, even while it is on `main`: promotion may switch that checkout to
 `release/local`. Commands confined to other non-release worktrees stay unlocked.
 
-A competing release command fails immediately without merging, testing or saving
-promotion checkpoints. An uncertain exit leaves the flag set. After establishing
+A waiting promotion or Ship performs no candidate work. On timeout its existing
+command result reports `Release busy`, owner details and elapsed seconds.
+An uncertain exit leaves the flag set. After establishing
 that the previous commands stopped, repeat the same command with
 `--confirm-previous-commands-stopped`; this cannot override a busy lock.
 Commands must remain foreground commands, including their workers: a command
@@ -832,7 +842,7 @@ serialize commands.
 | 1e.2 skill-change generations | Implemented immutable approvals, states and check results, five descriptive commands, interrupted-write recovery and completion cleanup; new committed receipts use `build_receipt.json` | 2B protects direct-release changes; historical committed receipts retain their recorded names |
 | 1e.3/6A test-result contract | Implemented generated-runner contract, compatibility probe and standalone repository-runner adoption | 6B–6E connect result ownership, retention and affected-check orchestration |
 | Completed-build consumption | Implemented internal v2 reader; recorded acceptance and exact stored paths survive current test/input changes | Connect public receipt-based Deploy in later steps |
-| 2A release-lock helper | Implemented internally in `fb6863c`: canonical release lock, immediate busy refusal, nested ownership and durable unfinished-run flag; Windows checks passed, Linux execution unverified | 3A/3B/4A–4E are implemented; optional automatic process cleanup remains deferred |
+| 2A release-lock helper | Native release lock, nested ownership and durable unfinished-run flag; promotion/Ship now wait up to 60 seconds and report the current owner, while other callers retain immediate refusal | Windows checks passed; Linux execution and optional automatic process cleanup remain separate |
 | 2B Git separation and release writers | Shared `git_branch_operations.py`; promotion, Ship, release sync, PR preparation and fast-change use the native release lock | Implemented, locally promoted and deployed with 3A–3C/4A–4E |
 | 3A direct Ship calls and stopped-attempt release | One callable Ship implementation, external-command-only JSON helper and exception-safe clean lock exits; model corrections run unlocked | Standalone installers and fast-change share command-stop tracking; optional process supervision remains deferred |
 | 3B/4B failure reports and cleanup | Caller-selected paths, complete redacted diagnostics and successful-result references; actual command/check/delivery successes remove matching failures without repeating accepted work | 6E/20C/21 connect child-report and abandonment/removal cleanup |
@@ -1050,7 +1060,7 @@ source when applicable. Paths to sources resolve from the working directory.
 Context sources require history and selected rule IDs; the helper captures their
 current rule text. Targets require exact replacements, with null history only
 when none exists. The existing preparation checks validate histories, exact
-matches, source integrity and skill-owned Markdown policy; TOML is parsed
+matches, source integrity and skill-owned Markdown policy; JSON and TOML are parsed
 without reformatting. The constructor never changes governed sources, including
 when mutation is authorized.
 
@@ -1507,6 +1517,47 @@ it removes only the old result-reference list, keeping source cleanup records.
 After matching requested checks succeed, their failure report is removed only
 after outcomes are saved. A fresh call can finish interrupted report deletion
 using that success. Reports for different requested checks remain untouched.
+
+Generated Python runners receive `scripts/testing/select_test_groups.py` and
+`scripts/testing/reuse_test_results.py` from the corresponding repo-lifecycle
+templates. Ceratops uses those same support files. A repository's existing
+`tests/test-impact.json` supplies test dependencies; without that map the generated
+runner executes tests but cannot reuse individual passes. A custom runner stays
+custom; `[tool.ceratops.test-support] managed = true` opts its support files into
+generation. Compatibility checks require the declared support to be present.
+
+SDLC v5 actions may declare `check-groups`, keyed by the repository runner's group
+names. Every group has `phase` (`before-build`, `during-build` or `after-build`)
+and `requires-artifacts` (deliverable references). Before-build groups have no
+artifact requirements; after-build groups name at least one. During-build groups
+belong to the build command, which returns their actual successful check records.
+Independent source checks finish before builds. Selected build prerequisites run
+first, failed prerequisites block their dependents, and joint tests wait for all
+their selected files. The executor supplies `--check-group` and `--artifacts`
+JSON to test commands and `CERATOPS_TEST_ARTIFACTS` to their children. File paths
+and byte hashes become reuse inputs; no installed version is selected implicitly.
+
+Test errors are saved in `.build/test-diagnostics/pytest-failure.json` or the
+caller-selected diagnostic path. Repeated errors replace that request's current
+details; shared output is stored once per diagnostic, rather than copied into
+every failed test entry. The runner deletes its managed report after newer
+passes resolve every reported failure. Fixing only A keeps a report that still
+contains B. At startup it finishes missed deletion from saved outcomes, without
+rerunning tests. Caller-retained reports outside managed storage stay untouched.
+Lifecycle commands separately retire their own operation reports after consuming
+successful command results. Neither cleanup deletes `check_results.json`.
+
+The compatibility review `ND.COMPATIBILITY.TEST_RESULT_REUSE` checks observed
+reuse and interruption behavior. It accepts different storage formats and asks
+what completed work a repository loses if it can reuse only a whole run.
+
+The internal `repository_operation.execute_worktree_build()` prepares and commits
+selected source paths, binds that source commit, runs declared checks/build/tests,
+and calls the existing receipt writer. It returns the completed receipt commit
+and tag. Unrelated staged or unstaged changes stay untouched. A fresh call can
+finish a missing receipt commit, tag or scoped cleanup without rebuilding ready
+targets; failed checks create no completed receipt or tag. The public Build
+command's later adoption remains separate.
 
 Repository scripts own their output paths and Git ignore rules. Saved results
 are local working data and do not authorize deployment. Deployment retains its

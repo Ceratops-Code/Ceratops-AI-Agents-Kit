@@ -470,6 +470,28 @@ def test_rule_candidate_failures_are_atomic_and_actionable(
         assert (safe.read_bytes(), toml.read_bytes()) == original_sources
 
 
+def test_json_contract_preserves_string_bytes_and_rejects_broken_json(tmp_path):
+    target = tmp_path / "contract.json"
+    target.write_text('{"review_required":"Original"}\n', encoding="utf-8")
+    candidate = tmp_path / "candidate.json"
+    prose = "Check independently reusable tests and preserve their original successful results. " * 8
+    for replacement, succeeds in ((prose, True), ('broken"quote', False)):
+        write_rule_candidate(candidate, rule_stack=[target], targets=[{
+            "rules": str(target.resolve()), "history": None,
+            "source_sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
+            "markdown_policy": None,
+            "replacements": [{"expected_old": "Original", "replacement": replacement}],
+        }])
+        result = run_rule_candidate_validator(candidate, tmp_path / "evidence.json")
+        assert (result.returncode == 0) == succeeds, result.stderr
+        if succeeds:
+            accepted = json.loads(candidate.read_text())
+            assert accepted["targets"][0]["replacements"][0]["replacement"] == prose
+        else:
+            assert "json-syntax invalid JSON" in result.stderr
+        assert json.loads(target.read_text())["review_required"] == "Original"
+
+
 def test_rule_candidate_rejects_stale_and_duplicate_expected_old(
     tmp_path: pathlib.Path,
 ) -> None:

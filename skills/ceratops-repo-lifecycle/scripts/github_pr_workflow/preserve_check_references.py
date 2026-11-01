@@ -207,7 +207,7 @@ def discard_check_references(repo_root: pathlib.Path, branch: str) -> dict[str, 
     lock prevents promotion from rewriting the selected scope during this edit.
     Repetition after either replacement or deletion has no further effect.
     """
-    with release_write_context(repo_root):
+    with release_write_context(repo_root, operation="check-reference cleanup"):
         path = scope_path(repo_root, branch)
         _plain(path)
         if not path.exists():

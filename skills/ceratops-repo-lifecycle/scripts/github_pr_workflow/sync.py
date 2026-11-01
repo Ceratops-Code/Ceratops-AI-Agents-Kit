@@ -38,7 +38,7 @@ def sync_main(args: argparse.Namespace) -> dict[str, Any]:
         for branch in (args.main_branch, *args.align_branch)
     ]
     with release_write_context(
-        args.repo_root, required=required,
+        args.repo_root, required=required, operation="branch synchronization",
         affected_worktrees=affected_worktrees,
         confirm_stopped=getattr(args, "confirm_previous_commands_stopped", False),
     ) as owned:

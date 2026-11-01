@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import errno
 import importlib
+import json
 import os
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 
 import pytest
 
@@ -273,7 +275,7 @@ def test_write_lock_failed_clear_retains_uncertainty(tmp_path, write_locks, monk
     def flush(fd):
         nonlocal calls
         calls += 1
-        if calls == 2:
+        if calls == 3:  # Flag, atomic owner publication, then clearing the flag.
             raise OSError("clear not durable")
         real_flush(fd)
 
@@ -285,7 +287,173 @@ def test_write_lock_failed_clear_retains_uncertainty(tmp_path, write_locks, monk
         ):
             owned.complete(commands_stopped=True)
     assert path.read_bytes() == b"1"
-    assert calls == 3
+    assert calls == 4
+
+
+@contextmanager
+def _holding_lock_process(path, *, release_after=None):
+    script = (
+        "import os,pathlib,sys,time; sys.path.insert(0,sys.argv[1]); import hold_write_lock as locks;\n"
+        "with locks.hold_write_attempt(pathlib.Path(sys.argv[2]),operation='promotion'):\n"
+        " print(os.getpid(),flush=True)\n"
+        + (" sys.stdin.readline()\n" if release_after is None else f" time.sleep({release_after})\n")
+    )
+    child = subprocess.Popen(
+        [sys.executable, "-c", script, str(ROOT / "skills/sections/scripts"), str(path)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        env={**os.environ, "CODEX_THREAD_ID": "owner-chat"},
+    )
+    try:
+        assert child.stdout is not None
+        worker_pid = int(child.stdout.readline().strip())
+        yield worker_pid
+    finally:
+        output, errors = child.communicate("stop\n" if release_after is None else None, timeout=10)
+        assert child.returncode == 0, output + errors
+
+
+def test_write_lock_waits_for_handoff_and_keeps_file(tmp_path, write_locks):
+    path = tmp_path / "release-local"
+    for _ in range(2):
+        with _holding_lock_process(path, release_after=0.25):
+            identity = path.stat().st_ino
+            with write_locks.hold_write_attempt(path, operation="Ship", wait_seconds=3):
+                owner = write_locks._read_current_owner(path)
+                assert owner["operation"] == "Ship"
+                assert owner["pid"] == os.getpid()
+        assert path.stat().st_ino == identity
+        assert path.read_bytes() == b"0"
+        assert list(tmp_path.iterdir()) == [path]
+
+
+def test_write_lock_timeout_reports_process_identity(tmp_path, write_locks):
+    path = tmp_path / "release-local"
+    with _holding_lock_process(path) as worker_pid:
+        for _ in range(2):
+            with pytest.raises(write_locks.WriteLockBusy) as caught:
+                with write_locks.hold_write_attempt(path, operation="Ship", wait_seconds=0.1):
+                    pytest.fail("contending writer started")
+            error = caught.value
+            assert error.waited_seconds >= 0.1
+            assert error.waited_seconds < 2
+            assert error.owner["pid"] == worker_pid
+            assert error.owner["thread_id"] == "owner-chat"
+            assert error.owner["process_started"] > 0
+            assert "promotion in chat owner-chat" in str(error)
+
+
+@pytest.mark.parametrize("record", ["missing", "malformed", "reused-pid", "previous-holder", "unreadable-process"])
+def test_write_lock_uncertain_owner_is_unknown(tmp_path, write_locks, monkeypatch, record):
+    path = tmp_path / "release-local"
+    with _holding_lock_process(path):
+        owner, _ = write_locks._owner_paths(path)
+        data = json.loads(owner.read_text())
+        if record == "missing":
+            owner.unlink()
+        elif record == "malformed":
+            owner.write_text("{")
+        elif record == "reused-pid":
+            data["process_started"] -= 100
+            owner.write_text(json.dumps(data))
+        elif record == "previous-holder":
+            data["lock_stamp"][2] -= 100
+            owner.write_text(json.dumps(data))
+        else:
+            def denied(*_args):
+                raise write_locks.ProcessError("process cannot be inspected")
+            monkeypatch.setattr(write_locks, "Process", denied)
+        with pytest.raises(write_locks.WriteLockBusy, match="owner unknown") as caught:
+            with write_locks.hold_write_attempt(path, wait_seconds=0.01):
+                pytest.fail("diagnostic information authorized entry")
+        assert caught.value.owner is None
+
+
+def test_write_lock_handoff_during_timeout_does_not_report_previous_holder(tmp_path, write_locks, monkeypatch):
+    path = tmp_path / "release-local"
+    with _holding_lock_process(path):
+        original = write_locks._read_current_owner
+
+        def inspect_then_handoff(selected):
+            owner = original(selected)
+            assert owner is not None
+            write_locks._advance_owner_stamp(selected)
+            return owner
+
+        monkeypatch.setattr(write_locks, "_read_current_owner", inspect_then_handoff)
+        with pytest.raises(write_locks.WriteLockBusy, match="owner unknown"):
+            with write_locks.hold_write_attempt(path):
+                pytest.fail("contending operation started")
+
+
+def test_write_lock_old_diagnostic_stays_stale_after_clock_rollback(tmp_path, write_locks, monkeypatch):
+    path = tmp_path / "release-local"
+    path.write_bytes(b"0")
+    write_locks._publish_owner_record(path, "previous promotion")
+    assert write_locks._read_current_owner(path) is not None
+    earlier = path.stat().st_mtime_ns - 1_000_000_000
+    monkeypatch.setattr(write_locks.time, "time_ns", lambda: earlier)
+
+    for _ in range(3):
+        write_locks._advance_owner_stamp(path)
+        assert write_locks._read_current_owner(path) is None
+
+
+@pytest.mark.parametrize("effect", ["publish", "remove"])
+@pytest.mark.parametrize("when", ["before", "after"])
+def test_write_lock_owner_interruption_releases_native_lock(tmp_path, write_locks, monkeypatch, effect, when):
+    path = tmp_path / "release-local"
+    function = "_publish_owner_record" if effect == "publish" else "_remove_owner_record"
+    original = getattr(write_locks, function)
+    calls = 0
+
+    def interrupted(*args):
+        nonlocal calls
+        calls += 1
+        selected = effect == "publish" or calls == 2  # Remove at exit, not startup.
+        if selected and when == "before":
+            raise KeyboardInterrupt("owner update interrupted")
+        result = original(*args)
+        if selected and when == "after":
+            raise KeyboardInterrupt("owner update interrupted")
+        return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(write_locks, function, interrupted)
+        with pytest.raises(KeyboardInterrupt, match="owner update interrupted"):
+            with write_locks.hold_write_attempt(path, operation="promotion"):
+                pass
+    # Even if deletion failed while this PID remains alive, the old diagnostic
+    # cannot identify a future holder. Recovery still depends only on the flag.
+    assert write_locks._read_current_owner(path) is None
+    if effect == "publish":
+        with pytest.raises(write_locks.WriteLockRecoveryRequired):
+            with write_locks.hold_write_attempt(path):
+                pytest.fail("interruption bypassed recovery")
+    with write_locks.hold_write_attempt(path, confirm_previous_commands_stopped=True):
+        pass
+    assert path.read_bytes() == b"0"
+    assert list(tmp_path.iterdir()) == [path]
+
+
+@pytest.mark.parametrize("when", ["before", "after"])
+def test_write_lock_crash_leaves_only_diagnostics_until_normal_recovery(tmp_path, write_locks, when):
+    path = tmp_path / "release-local"
+    body = (
+        "publish=locks._publish_owner_record\n"
+        "def crash(*args):\n"
+        + (" publish(*args)\n" if when == "after" else "")
+        + " os._exit(73)\n"
+        "locks._publish_owner_record=crash\n"
+        "with locks.hold_write_attempt(path,operation='promotion'): pass\n"
+    )
+    assert _lock_child(path, body).returncode == 73
+    assert write_locks._read_current_owner(path) is None
+    with pytest.raises(write_locks.WriteLockRecoveryRequired):
+        with write_locks.hold_write_attempt(path, wait_seconds=1):
+            pytest.fail("dead owner authorized recovery")
+    with write_locks.hold_write_attempt(path, confirm_previous_commands_stopped=True):
+        pass
+    assert list(tmp_path.iterdir()) == [path]
 
 
 def test_write_lock_requires_native_backend(tmp_path, write_locks, monkeypatch):

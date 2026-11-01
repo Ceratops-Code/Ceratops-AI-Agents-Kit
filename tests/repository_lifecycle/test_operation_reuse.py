@@ -75,6 +75,145 @@ def _check(root: pathlib.Path, level="beta"):
     return runner.replace(operation, qualification_level=level)
 
 
+def _phased_repository(root, *, fail_before=False, fail_build_check=False):
+    """Real commands log their order and test only explicitly passed build files."""
+    _fixture(root)
+    contract = root / runner.DEFAULT_CONTRACT
+    document = json.loads(contract.read_text())
+    document["version"] = 5
+    reference = "deliverables.packages.sample"
+    source = '''import argparse, hashlib, json, os, pathlib, sys
+p = argparse.ArgumentParser()
+p.add_argument('--build', action='store_true')
+p.add_argument('--check-group')
+p.add_argument('--artifacts')
+a = p.parse_args()
+with pathlib.Path('order.log').open('a') as f: f.write(('build' if a.build else a.check_group) + '\\n')
+if a.build:
+    path = pathlib.Path('wheel.bin'); path.write_bytes(b'current build')
+    check = {'id': 'compiler-check', 'status': BUILD_STATUS, 'result_id': 'compiler-result', 'check_version': 'compiler-v1'}
+    print(json.dumps({'schema': 'ceratops-build-result.v1', 'status': 'passed',
+        'artifact': {'type': 'python-wheel', 'path': 'wheel.bin', 'size': path.stat().st_size,
+                     'sha256': hashlib.sha256(path.read_bytes()).hexdigest()},
+        'check_summary': {'schema': 'ceratops-check-summary.v1', 'inputGroups': {}, 'checkGroups': {}, 'checks': [check]}}))
+elif a.check_group == 'unit-tests':
+    paths = json.loads(a.artifacts)['deliverables.packages.sample']
+    assert len(paths) == 1 and pathlib.Path(paths[0]).read_bytes() == b'current build'
+    assert json.loads(os.environ['CERATOPS_TEST_ARTIFACTS']) == json.loads(a.artifacts)
+elif a.check_group == 'scan-a' and FAIL_BEFORE:
+    print('source scan failed', file=sys.stderr); sys.exit(3)
+'''.replace('BUILD_STATUS', repr('failed' if fail_build_check else 'passed')).replace('FAIL_BEFORE', repr(fail_before))
+    (root / "scripts/phases.py").write_text(source)
+    (root / "older-installed.bin").write_bytes(b'old installation')
+    with (root / ".gitignore").open("a") as output:
+        output.write("order.log\nolder-installed.bin\n.build/\n")
+    document["repository"]["actions"]["test"] = {
+        "requires": {"capabilities": []},
+        "steps": [{"run": [sys.executable, "scripts/phases.py"]}],
+        "check-groups": {
+            "scan-a": {"phase": "before-build", "requires-artifacts": []},
+            "scan-b": {"phase": "before-build", "requires-artifacts": []},
+            "unit-tests": {"phase": "after-build", "requires-artifacts": [reference]},
+        },
+    }
+    document["deliverables"]["packages"]["sample"]["actions"]["build"] = {
+        "requires": {"capabilities": []}, "result-schema": "ceratops-build-result.v1",
+        "steps": [{"run": [sys.executable, "scripts/phases.py", "--build"]}],
+        "check-groups": {"compiler-check": {"phase": "during-build", "requires-artifacts": []}},
+    }
+    contract.write_text(json.dumps(document))
+    assert run_git(root, "add", ".").returncode == 0
+    assert run_git(root, "commit", "-m", "phases").returncode == 0
+    return [runner.OperationRequest("repository.actions.test"),
+            runner.OperationRequest(reference + ".actions.build")]
+
+
+def test_check_phases_use_current_artifact_and_build_checks_once(tmp_path):
+    requests = _phased_repository(tmp_path)
+    prepared = runner.prepare_operations(tmp_path, requests)
+    result = runner.execute_prepared_operations(prepared)
+    assert result["status"] == "completed", result
+    assert (tmp_path / "order.log").read_text().splitlines() == ["scan-a", "scan-b", "build", "unit-tests"]
+    build = next(item for item in result["results"] if item["operation"].endswith(".build"))
+    assert build["check_summary"]["checks"][0]["result_id"] == "compiler-result"
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_check_phases_public_cli_preserves_all_independent_results(tmp_path, failure):
+    _phased_repository(tmp_path, fail_before=failure)
+    process = subprocess.run([
+        sys.executable, str(ROOT / "skills/ceratops-repo-lifecycle/scripts/repository_operation.py"),
+        "--repo-root", str(tmp_path), "--operation", "deliverables.packages.sample.actions.build",
+    ], capture_output=True, text=True, check=False)
+    output = json.loads(process.stderr if process.returncode else process.stdout)
+    assert process.returncode == (1 if failure else 0), output
+    groups = [item.get("check_group") for item in output["results"]]
+    assert "scan-a" in groups and "scan-b" in groups
+    assert (tmp_path / "order.log").read_text().splitlines() == (
+        ["scan-a", "scan-b"] if failure else ["scan-a", "scan-b", "build", "unit-tests"])
+
+
+@pytest.mark.parametrize("failed_dependency", [False, True])
+def test_check_phases_orders_selected_build_dependencies_and_joint_tests(tmp_path, failed_dependency):
+    requests = _phased_repository(tmp_path)
+    path = tmp_path / runner.DEFAULT_CONTRACT
+    data = json.loads(path.read_text())
+    sample = data["deliverables"]["packages"]["sample"]
+    dependency = json.loads(json.dumps(sample))
+    dependency["artifact"]["distribution"] = "dependency"
+    dependency["actions"]["build"]["steps"][0]["run"][1] = "scripts/dependency.py"
+    program = (tmp_path / "scripts/phases.py").read_text().replace("wheel.bin", "dependency.bin").replace("'build' if a.build", "'dependency' if a.build")
+    if failed_dependency:
+        program = program.replace("if a.build:\n", "if a.build:\n    sys.exit(5)\n")
+    (tmp_path / "scripts/dependency.py").write_text(program)
+    (tmp_path / ".gitignore").write_text((tmp_path / ".gitignore").read_text() + "dependency.bin\n")
+    data["deliverables"]["packages"]["dependency"] = dependency
+    sample["prerequisites"] = ["dependency"]
+    groups = data["repository"]["actions"]["test"]["check-groups"]
+    groups["unit-tests"]["requires-artifacts"].append("deliverables.packages.dependency")
+    program = (tmp_path / "scripts/phases.py").read_text().replace(
+        "paths = json.loads(a.artifacts)",
+        "assert pathlib.Path(json.loads(a.artifacts)['deliverables.packages.dependency'][0]).read_bytes() == b'current build'\n    paths = json.loads(a.artifacts)")
+    (tmp_path / "scripts/phases.py").write_text(program)
+    path.write_text(json.dumps(data))
+    assert run_git(tmp_path, "add", ".").returncode == 0
+    assert run_git(tmp_path, "commit", "-m", "dependent builds").returncode == 0
+    requests.append(runner.OperationRequest("deliverables.packages.dependency.actions.build"))
+    result = runner.execute_prepared_operations(runner.prepare_operations(tmp_path, requests))
+    assert (result["status"] in runner.FAILED_STATUSES) is failed_dependency, result
+    assert (tmp_path / "order.log").read_text().splitlines() == (
+        ["scan-a", "scan-b", "dependency"] if failed_dependency else
+        ["scan-a", "scan-b", "dependency", "build", "unit-tests"])
+
+
+@pytest.mark.parametrize("failure", ["source", "compiler"])
+def test_check_phases_finish_independent_checks_and_block_dependents(tmp_path, failure):
+    requests = _phased_repository(tmp_path, fail_before=failure == "source", fail_build_check=failure == "compiler")
+    result = runner.execute_prepared_operations(runner.prepare_operations(tmp_path, requests))
+    assert result["status"] in runner.FAILED_STATUSES
+    assert (tmp_path / "order.log").read_text().splitlines() == (
+        ["scan-a", "scan-b"] if failure == "source" else ["scan-a", "scan-b", "build"])
+    assert not any(item.get("check_group") == "unit-tests" and item["status"] == "completed" for item in result["results"])
+
+
+@pytest.mark.parametrize("problem", ["before-needs-artifact", "unknown-artifact", "during-test"])
+def test_check_phase_conflicts_name_the_group(tmp_path, problem):
+    requests = _phased_repository(tmp_path)
+    path = tmp_path / runner.DEFAULT_CONTRACT
+    document = json.loads(path.read_text())
+    group = document["repository"]["actions"]["test"]["check-groups"]["scan-a"]
+    if problem == "before-needs-artifact":
+        group["requires-artifacts"] = ["deliverables.packages.sample"]
+    elif problem == "unknown-artifact":
+        group.update(phase="after-build", **{"requires-artifacts": ["deliverables.packages.missing"]})
+    else:
+        group["phase"] = "during-build"
+    path.write_text(json.dumps(document))
+    with pytest.raises(runner.OperationError, match="scan-a"):
+        runner.prepare_operations(tmp_path, requests)
+    assert not (tmp_path / "order.log").exists()
+
+
 def test_git_build_summary_supplies_public_cli_check_without_original_log(tmp_path):
     from tests.repository_lifecycle.test_completed_builds import _tag_summary
 

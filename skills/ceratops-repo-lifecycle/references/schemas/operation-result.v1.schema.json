@@ -389,6 +389,9 @@
               "type": "null"
             }
           ]
+        },
+        "check_summary": {
+          "type": "object"
         }
       },
       "allOf": [
@@ -1073,8 +1076,12 @@
       "type": "object",
       "additionalProperties": false,
       "dependentRequired": {
-        "tag": ["checkSummary"],
-        "checkSummary": ["tag"]
+        "tag": [
+          "checkSummary"
+        ],
+        "checkSummary": [
+          "tag"
+        ]
       },
       "required": [
         "schema",

@@ -124,6 +124,11 @@ failed receipt is added.
 
 ### Inputs To Capture
 
+Ship waits inside Python for up to 60 seconds for the release lock, then runs
+normal preconditions after acquisition. A timeout returns elapsed waiting and
+the current operation/chat/PID, or `owner unknown`, in the existing command result.
+Owner diagnostics do not replace interrupted-operation recovery requirements.
+
 - Repository checkout, staged promotion branch, base branch, remote, merge
   method,
   and optional PR `--title`/`--body` overrides.

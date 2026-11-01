@@ -751,7 +751,7 @@ def _release_write_context(repo_root, *, confirm_stopped=False):
     locks = _release_lock_module()
     try:
         with locks.hold_write_attempt(
-            locks.release_lock_path(repo_root),
+            locks.release_lock_path(repo_root), operation="skill fast-change",
             confirm_previous_commands_stopped=confirm_stopped,
         ) as owned:
             yield owned

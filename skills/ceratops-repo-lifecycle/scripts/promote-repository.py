@@ -611,6 +611,7 @@ def promote(
     inputs = _promotion_inputs(args)
     with release_write_context(
         args.repo_root,
+        operation="promotion", wait_seconds=60,
         confirm_stopped=getattr(args, "confirm_previous_commands_stopped", False),
     ), capture_failure_report(
         getattr(args, "diagnostic_output", None), repo_root=args.repo_root, action="promote",
