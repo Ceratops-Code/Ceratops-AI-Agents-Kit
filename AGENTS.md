@@ -79,9 +79,8 @@ Project-specific rules for this skills repository.
 
 - [SKILLS-GOV-01] Before proposing a repository control change, determine
   its scope and ownership from the exact current governing text.
-- [SKILLS-GOV-02] Treat recommendations about instruction, automation, skill,
-  and helper-contract changes as advisory.
-  - self: gate
+- [SKILLS-GOV-02] Treat recommendations about governing instructions or their
+  helper contracts as advisory.
 - [SKILLS-PORT-01] In repo-tracked files intended for public sharing or GitHub,
   use repo-relative paths or portable variables under the global path policy.
 - [SKILLS-RUNTIME-01] Keep every producer and consumer of the repository's
