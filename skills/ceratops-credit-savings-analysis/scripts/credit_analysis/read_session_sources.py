@@ -87,7 +87,10 @@ def load_rows_with_fingerprint(
                             if isinstance(total, dict) and total and isinstance(last, dict) and last
                             else None
                         )
-                        if signature is not None and signature == previous_usage and not response_since_usage:
+                        if (
+                            isinstance(info, dict) and signature is not None
+                            and signature == previous_usage and not response_since_usage
+                        ):
                             # Keep rate-limit/context updates without replaying last usage.
                             row = {**row, "payload": {
                                 **payload, "info": {
