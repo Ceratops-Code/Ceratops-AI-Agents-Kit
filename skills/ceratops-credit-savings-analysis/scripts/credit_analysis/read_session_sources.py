@@ -36,14 +36,14 @@ def load_rows_with_fingerprint(
 
     Repeated cumulative usage notifications retain their metadata but cannot
     create another response. The raw-byte fingerprint still covers every source
-    record. Without cumulative evidence, or after a new response item, preserve
-    the usage event rather than guessing that two equal-sized calls are one.
+    record. Without cumulative evidence, preserve the usage event rather than
+    guessing that two equal-sized calls are one. Response items may arrive before
+    an unchanged notification; only fresh usage closes their response boundary.
     """
 
     rows: list[dict[str, Any]] = []
     digest = hashlib.sha256()
     previous_usage: tuple[dict[str, Any], dict[str, Any]] | None = None
-    response_since_usage = False
     if as_of is not None and as_of.tzinfo is None:
         raise EvidenceCollectionError("bounded session read requires a timezone-aware as_of")
     try:
@@ -73,11 +73,6 @@ def load_rows_with_fingerprint(
                 payload = row.get("payload")
                 if isinstance(payload, dict):
                     item_type = str(payload.get("type", ""))
-                    if row.get("type") == "response_item" and (
-                        not item_type.endswith("_output")
-                        and not (item_type == "message" and payload.get("role") == "user")
-                    ):
-                        response_since_usage = True
                     if row.get("type") == "event_msg" and item_type == "token_count":
                         info = payload.get("info")
                         total = info.get("total_token_usage") if isinstance(info, dict) else None
@@ -89,7 +84,7 @@ def load_rows_with_fingerprint(
                         )
                         if (
                             isinstance(info, dict) and signature is not None
-                            and signature == previous_usage and not response_since_usage
+                            and signature == previous_usage
                         ):
                             # Keep rate-limit/context updates without replaying last usage.
                             row = {**row, "payload": {
@@ -98,9 +93,8 @@ def load_rows_with_fingerprint(
                                     if key != "last_token_usage"
                                 },
                             }}
-                        else:
+                        elif last:
                             previous_usage = signature
-                        response_since_usage = False
                 rows.append(row)
     except OSError as exc:
         raise EvidenceCollectionError(f"could not read session: {exc}") from exc

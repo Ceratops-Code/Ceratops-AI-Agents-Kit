@@ -19,7 +19,8 @@ from tests.credit_analysis.paths import (
 
 @pytest.mark.parametrize(
     ("notification", "expected_calls"),
-    [("exact", 2), ("rate-limits", 2), ("no-total", 3), ("advanced-total", 3), ("new-response", 3)],
+    [("exact", 2), ("rate-limits", 2), ("no-total", 3),
+     ("advanced-total", 3), ("new-response", 2), ("total-only", 2)],
 )
 def test_repeated_usage_notifications_preserve_real_response_boundaries(
     tmp_path: pathlib.Path, notification: str, expected_calls: int,
@@ -35,6 +36,8 @@ def test_repeated_usage_notifications_preserve_real_response_boundaries(
         duplicate_info.pop("total_token_usage")
     elif notification == "advanced-total":
         duplicate_info["total_token_usage"] = {key: value * 2 for key, value in usage.items()}
+    elif notification == "total-only":
+        duplicate_info.pop("last_token_usage")
     rows = [
         {"type": "turn_context", "payload": {"turn_id": "turn-1"}},
         {"type": "response_item", "payload": {
@@ -42,8 +45,10 @@ def test_repeated_usage_notifications_preserve_real_response_boundaries(
         }},
         {"type": "event_msg", "payload": {"type": "token_count", "info": first_info}},
     ]
-    if notification == "new-response":
-        rows.append({"type": "response_item", "payload": {"type": "reasoning"}})
+    if notification in {"new-response", "total-only"}:
+        rows.append({"type": "response_item", "payload": {
+            "type": "function_call", "name": "inspect_pending", "arguments": "{}",
+        }})
     rows.extend([
         {"type": "event_msg", "payload": {
             "type": "token_count", "info": duplicate_info,
@@ -60,6 +65,10 @@ def test_repeated_usage_notifications_preserve_real_response_boundaries(
         }},
         {"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "turn-1"}},
     ])
+    if notification == "total-only":
+        rows.insert(-3, {"type": "event_msg", "payload": {
+            "type": "token_count", "info": first_info,
+        }})
     for index, row in enumerate(rows):
         row["timestamp"] = f"2026-08-01T00:00:{index:02d}Z"
     original = "".join(json.dumps(row) + "\n" for row in rows)
@@ -77,6 +86,9 @@ def test_repeated_usage_notifications_preserve_real_response_boundaries(
         semantic = json.loads(semantic_path.read_text(encoding="utf-8"))
         assert ledger["totals"]["model_calls"] == expected_calls
         assert len(semantic["selected_runs"][0]["calls"]) == expected_calls
+        if notification in {"new-response", "total-only"}:
+            assert ledger["runs"][0]["calls"][1]["actions"][0]["name"] == "inspect_pending"
+            assert semantic["selected_runs"][0]["calls"][1]["semantic_actions"][0]["name"] == "inspect_pending"
     result = subprocess.run(
         [sys.executable, str(SESSION_EVIDENCE_COLLECTOR), "--session", str(session),
          "--summary", "--evidence-output", str(usage_path)],
@@ -86,6 +98,11 @@ def test_repeated_usage_notifications_preserve_real_response_boundaries(
     detailed = json.loads(usage_path.read_text(encoding="utf-8"))
     assert detailed["totals"]["model_calls"] == expected_calls
     assert detailed["totals"]["total_tokens"] == expected_calls * 11
+    if notification in {"new-response", "total-only"}:
+        assert any(
+            action["name"] == "inspect_pending" and action["model_call_index"] == 2
+            for action in detailed["runs"][0]["tool_action_results"]
+        )
     assert session.read_text(encoding="utf-8") == original
 
 

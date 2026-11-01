@@ -979,7 +979,6 @@ def build_session_evidence(
             usage.get(field, 0) > 0
             for field in ("input_tokens", "output_tokens", "reasoning_output_tokens")
         ):
-            pending_actions = []
             continue
         calls = runs[active_turn]["calls"]
         calls.append(
@@ -1177,7 +1176,6 @@ def build_semantic_runs(
             usage.get(field, 0) > 0
             for field in ("input_tokens", "output_tokens", "reasoning_output_tokens")
         ):
-            pending_actions = []
             continue
         calls = calls_by_id[active_turn]
         call_index = len(calls) + 1
@@ -2109,7 +2107,6 @@ def build_usage_evidence(
             usage.get(field, 0) > 0
             for field in ("input_tokens", "output_tokens", "reasoning_output_tokens")
         ):
-            pending_tool_actions = []
             continue
         state["next_model_call"] += 1
         for pending_action in pending_tool_actions:
