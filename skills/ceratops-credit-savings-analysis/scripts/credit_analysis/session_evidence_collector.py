@@ -17,27 +17,24 @@ per-turn usage and structured result evidence while emitting only compact
 totals and top-turn rankings. The
 same helper validates a caller-owned classification file before reporting,
 while the model remains responsible for deciding whether a call was necessary
-or avoidable. Reusable source primitives resolve the explicit current thread,
-one exact indexed name, recent thread-index records, and session project
-identity without moving semantic analysis into the collector.
+or avoidable. Source reading and identity checks belong to
+read_session_sources; the collector remains judgment-free.
 """
 
 from __future__ import annotations
 
 import argparse
-import datetime as dt
 import hashlib
 import json
 import math
-import os
 import pathlib
 import re
 import sys
-import uuid
 from collections import Counter
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING or __package__:
+    from . import read_session_sources
     from .execution_outcomes import (
         empty_outcomes,
         failure_details,
@@ -46,6 +43,8 @@ if TYPE_CHECKING or __package__:
         response_outcomes,
     )
 else:
+    import read_session_sources
+
     # Preserve the collector CLI as well as package imports.
     from execution_outcomes import (
         empty_outcomes,
@@ -160,10 +159,6 @@ NESTED_COMMAND_LABEL_LIMIT = 500
 FAILURE_REASON_LABEL_LIMIT = 420
 
 
-class EvidenceCollectionError(RuntimeError):
-    """Report invalid session evidence without exposing raw record contents."""
-
-
 def positive_int(value: str) -> int:
     """Parse a positive count for the optional completed-run window."""
 
@@ -177,11 +172,11 @@ def safe_rate(value: Any, field: str, *, positive: bool = False) -> float:
     """Validate one finite pricing rate without accepting booleans or strings."""
 
     if not isinstance(value, (int, float)) or isinstance(value, bool):
-        raise EvidenceCollectionError(f"pricing field {field} must be a number")
+        raise read_session_sources.EvidenceCollectionError(f"pricing field {field} must be a number")
     parsed = float(value)
     if not math.isfinite(parsed) or parsed < 0 or (positive and parsed == 0):
         qualifier = "positive finite" if positive else "non-negative finite"
-        raise EvidenceCollectionError(f"pricing field {field} must be {qualifier}")
+        raise read_session_sources.EvidenceCollectionError(f"pricing field {field} must be {qualifier}")
     return parsed
 
 
@@ -191,20 +186,20 @@ def load_pricing_profile(path: pathlib.Path) -> dict[str, float | str]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except OSError as exc:
-        raise EvidenceCollectionError(f"could not read pricing profile: {exc}") from exc
+        raise read_session_sources.EvidenceCollectionError(f"could not read pricing profile: {exc}") from exc
     except json.JSONDecodeError as exc:
-        raise EvidenceCollectionError("pricing profile is not valid JSON") from exc
+        raise read_session_sources.EvidenceCollectionError("pricing profile is not valid JSON") from exc
     if not isinstance(value, dict):
-        raise EvidenceCollectionError("pricing profile must be a JSON object")
+        raise read_session_sources.EvidenceCollectionError("pricing profile must be a JSON object")
     expected = {"schema", *PRICING_FIELDS}
     missing = sorted(expected - value.keys())
     extra = sorted(value.keys() - expected)
     if missing:
-        raise EvidenceCollectionError(f"pricing profile is missing field: {missing[0]}")
+        raise read_session_sources.EvidenceCollectionError(f"pricing profile is missing field: {missing[0]}")
     if extra:
-        raise EvidenceCollectionError(f"pricing profile has unsupported field: {extra[0]}")
+        raise read_session_sources.EvidenceCollectionError(f"pricing profile has unsupported field: {extra[0]}")
     if value.get("schema") != PRICING_PROFILE_SCHEMA:
-        raise EvidenceCollectionError(f"pricing profile schema must be {PRICING_PROFILE_SCHEMA}")
+        raise read_session_sources.EvidenceCollectionError(f"pricing profile schema must be {PRICING_PROFILE_SCHEMA}")
     return {
         "schema": PRICING_PROFILE_SCHEMA,
         "input_per_million_tokens": safe_rate(
@@ -233,300 +228,6 @@ def percentage(numerator: int, denominator: int) -> float | None:
     if denominator <= 0:
         return None
     return round(numerator * 100 / denominator, 2)
-
-
-def load_rows_with_fingerprint(
-    path: pathlib.Path,
-) -> tuple[list[dict[str, Any]], str]:
-    """Read and hash one JSONL session in a single filesystem traversal."""
-
-    rows: list[dict[str, Any]] = []
-    digest = hashlib.sha256()
-    try:
-        with path.open("rb") as session:
-            for line_number, raw_line in enumerate(session, start=1):
-                digest.update(raw_line)
-                if not raw_line.strip():
-                    continue
-                try:
-                    line = raw_line.decode("utf-8")
-                    row = json.loads(line)
-                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                    raise EvidenceCollectionError(
-                        f"invalid JSON on session line {line_number}"
-                    ) from exc
-                if not isinstance(row, dict):
-                    raise EvidenceCollectionError(
-                        f"session line {line_number} is not a JSON object"
-                    )
-                rows.append(row)
-    except OSError as exc:
-        raise EvidenceCollectionError(f"could not read session: {exc}") from exc
-    return rows, digest.hexdigest()
-
-
-def load_rows(path: pathlib.Path) -> list[dict[str, Any]]:
-    """Load JSONL records while identifying malformed line numbers."""
-
-    rows, _ = load_rows_with_fingerprint(path)
-    return rows
-
-
-def canonical_thread_id(value: str) -> str:
-    """Validate a thread ID before using it in a bounded filename lookup."""
-
-    try:
-        return str(uuid.UUID(value))
-    except ValueError as exc:
-        raise EvidenceCollectionError("thread ID must be a UUID") from exc
-
-
-def codex_home() -> pathlib.Path:
-    """Return the configured Codex data root used by session resolvers."""
-
-    configured_home = os.environ.get("CODEX_HOME")
-    return (
-        pathlib.Path(configured_home).expanduser()
-        if configured_home
-        else pathlib.Path.home() / ".codex"
-    )
-
-
-def resolve_thread_session(thread_id: str) -> pathlib.Path:
-    """Resolve one exact active or archived session below the Codex home."""
-
-    home = codex_home()
-    canonical_id = canonical_thread_id(thread_id)
-    matches: set[pathlib.Path] = set()
-    for root_name in ("sessions", "archived_sessions"):
-        root = home / root_name
-        if not root.is_dir():
-            continue
-        matches.update(
-            candidate.resolve()
-            for candidate in root.rglob(f"*{canonical_id}.jsonl")
-            if candidate.is_file()
-        )
-    if not matches:
-        raise EvidenceCollectionError(f"session not found for thread ID: {canonical_id}")
-    if len(matches) > 1:
-        raise EvidenceCollectionError(f"multiple sessions found for thread ID: {canonical_id}")
-    return matches.pop()
-
-
-def parse_utc_timestamp(value: object, label: str) -> dt.datetime:
-    """Parse one timezone-aware timestamp and normalize it to UTC."""
-
-    if not isinstance(value, str) or not value.strip():
-        raise EvidenceCollectionError(f"{label} must be a nonempty timestamp")
-    text = value.strip()
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    try:
-        parsed = dt.datetime.fromisoformat(text)
-    except ValueError as exc:
-        raise EvidenceCollectionError(f"{label} is not a valid ISO-8601 timestamp") from exc
-    if parsed.tzinfo is None:
-        raise EvidenceCollectionError(f"{label} must include a timezone")
-    return parsed.astimezone(dt.timezone.utc)
-
-
-def load_thread_index() -> dict[str, Any]:
-    """Load the latest valid record per thread from the Codex thread index once."""
-
-    path = codex_home() / "session_index.jsonl"
-    if not path.is_file() or path.is_symlink():
-        raise EvidenceCollectionError(f"Codex thread index is unavailable: {path}")
-    digest = hashlib.sha256()
-    latest: dict[str, tuple[dt.datetime, int, dict[str, str]]] = {}
-    try:
-        with path.open("rb") as handle:
-            for line_number, raw_line in enumerate(handle, start=1):
-                digest.update(raw_line)
-                if not raw_line.strip():
-                    raise EvidenceCollectionError(
-                        f"Codex thread index has a blank record at line {line_number}"
-                    )
-                try:
-                    raw = json.loads(raw_line)
-                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                    raise EvidenceCollectionError(
-                        f"Codex thread index has invalid JSON at line {line_number}"
-                    ) from exc
-                if not isinstance(raw, dict):
-                    raise EvidenceCollectionError(
-                        f"Codex thread index record {line_number} is not an object"
-                    )
-                try:
-                    thread_id = canonical_thread_id(str(raw.get("id") or ""))
-                except EvidenceCollectionError as exc:
-                    raise EvidenceCollectionError(
-                        f"Codex thread index record {line_number} has an invalid ID"
-                    ) from exc
-                thread_name = raw.get("thread_name")
-                if not isinstance(thread_name, str) or not thread_name.strip():
-                    raise EvidenceCollectionError(
-                        f"Codex thread index record {line_number} has no thread name"
-                    )
-                updated_at = parse_utc_timestamp(
-                    raw.get("updated_at"),
-                    f"Codex thread index record {line_number} updated_at",
-                )
-                record = {
-                    "thread_id": thread_id,
-                    "thread_name": thread_name.strip(),
-                    "updated_at": updated_at.isoformat().replace("+00:00", "Z"),
-                }
-                previous = latest.get(thread_id)
-                if previous is None or (updated_at, line_number) > (
-                    previous[0],
-                    previous[1],
-                ):
-                    latest[thread_id] = (updated_at, line_number, record)
-    except OSError as exc:
-        raise EvidenceCollectionError(f"could not read Codex thread index: {exc}") from exc
-    entries = [record for _, _, record in latest.values()]
-    entries.sort(
-        key=lambda item: (
-            -parse_utc_timestamp(item["updated_at"], "thread updated_at").timestamp(),
-            item["thread_id"],
-        )
-    )
-    return {
-        "path": str(path.resolve()),
-        "fingerprint": digest.hexdigest(),
-        "entries": entries,
-    }
-
-
-def resolve_current_thread_source() -> tuple[str, pathlib.Path]:
-    """Resolve this Codex thread only from its explicit runtime identity."""
-
-    thread_id = os.environ.get("CODEX_THREAD_ID")
-    if not thread_id:
-        raise EvidenceCollectionError(
-            "current thread is unavailable because CODEX_THREAD_ID is not set"
-        )
-    canonical_id = canonical_thread_id(thread_id)
-    return canonical_id, resolve_thread_session(canonical_id)
-
-
-def resolve_named_thread_source(
-    thread_name: str,
-) -> tuple[str, pathlib.Path, str]:
-    """Resolve one case-insensitive exact name from the latest thread index."""
-
-    normalized = thread_name.strip().casefold()
-    if not normalized:
-        raise EvidenceCollectionError("thread name must be nonempty")
-    index = load_thread_index()
-    matches = [
-        entry
-        for entry in index["entries"]
-        if entry["thread_name"].casefold() == normalized
-    ]
-    if not matches:
-        raise EvidenceCollectionError(f"thread name was not found: {thread_name.strip()}")
-    if len(matches) > 1:
-        ids = ", ".join(entry["thread_id"] for entry in matches[:3])
-        raise EvidenceCollectionError(f"thread name is ambiguous; matching IDs: {ids}")
-    thread_id = matches[0]["thread_id"]
-    return thread_id, resolve_thread_session(thread_id), str(index["fingerprint"])
-
-
-def session_source_metadata(
-    rows: list[dict[str, Any]],
-    *,
-    expected_thread_id: str,
-) -> dict[str, Any]:
-    """Return deterministic thread and project identity from session metadata."""
-
-    metadata = next((row for row in rows if row.get("type") == "session_meta"), None)
-    if not isinstance(metadata, dict) or not isinstance(metadata.get("payload"), dict):
-        raise EvidenceCollectionError("session lacks a valid session_meta record")
-    payload = metadata["payload"]
-    raw_id = payload.get("id") or payload.get("session_id")
-    thread_id = canonical_thread_id(str(raw_id or ""))
-    if thread_id != canonical_thread_id(expected_thread_id):
-        raise EvidenceCollectionError("session metadata thread ID does not match the index")
-    cwd = payload.get("cwd")
-    if cwd is not None and (not isinstance(cwd, str) or not cwd.strip()):
-        raise EvidenceCollectionError("session metadata cwd is invalid")
-    git = payload.get("git")
-    if git is not None and not isinstance(git, dict):
-        raise EvidenceCollectionError("session metadata git value is invalid")
-    repository_url = git.get("repository_url") if isinstance(git, dict) else None
-    if repository_url is not None and (
-        not isinstance(repository_url, str) or not repository_url.strip()
-    ):
-        raise EvidenceCollectionError("session metadata repository URL is invalid")
-    normalized_repository = (
-        repository_url.strip().rstrip("/").removesuffix(".git").casefold()
-        if isinstance(repository_url, str)
-        else None
-    )
-    normalized_cwd = (
-        os.path.normcase(os.path.normpath(os.path.abspath(os.path.expanduser(cwd))))
-        if isinstance(cwd, str)
-        else None
-    )
-    project_key = (
-        f"repository:{normalized_repository}"
-        if normalized_repository is not None
-        else f"path:{normalized_cwd}" if normalized_cwd is not None else None
-    )
-    aliases: list[str] = []
-    if normalized_repository is not None:
-        repository_name = normalized_repository.rsplit("/", 1)[-1]
-        if ":" in repository_name:
-            repository_name = repository_name.rsplit(":", 1)[-1]
-        aliases.append(repository_name.casefold())
-    if isinstance(cwd, str):
-        aliases.append(pathlib.PurePath(cwd).name.casefold())
-    return {
-        "thread_id": thread_id,
-        "cwd": cwd.strip() if isinstance(cwd, str) else None,
-        "repository_url": (
-            repository_url.strip() if isinstance(repository_url, str) else None
-        ),
-        "normalized_cwd": normalized_cwd,
-        "normalized_repository_url": normalized_repository,
-        "project_key": project_key,
-        "project_aliases": list(dict.fromkeys(aliases)),
-    }
-
-
-def read_session_source_metadata(
-    session: pathlib.Path,
-    *,
-    expected_thread_id: str,
-) -> dict[str, Any]:
-    """Read only the session metadata prefix needed for source selection."""
-
-    resolved = session.expanduser().resolve(strict=True)
-    try:
-        with resolved.open(encoding="utf-8") as handle:
-            for line_number, line in enumerate(handle, start=1):
-                if not line.strip():
-                    continue
-                try:
-                    row = json.loads(line)
-                except json.JSONDecodeError as exc:
-                    raise EvidenceCollectionError(
-                        f"invalid JSON on session line {line_number}"
-                    ) from exc
-                if not isinstance(row, dict):
-                    raise EvidenceCollectionError(
-                        f"session line {line_number} is not a JSON object"
-                    )
-                if row.get("type") == "session_meta":
-                    return session_source_metadata(
-                        [row], expected_thread_id=expected_thread_id
-                    )
-                raise EvidenceCollectionError("session metadata must be the first JSON record")
-    except OSError as exc:
-        raise EvidenceCollectionError(f"could not read session metadata: {exc}") from exc
-    raise EvidenceCollectionError("session lacks a session_meta record")
 
 
 def stable_payload(value: Any) -> str:
@@ -864,7 +565,7 @@ def model_review_preparation_contract() -> dict[str, Any]:
 def review_path_roots(rows: list[dict[str, Any]]) -> list[tuple[str, str]]:
     """Resolve workspace and Codex roots for meaning-preserving path labels."""
 
-    codex_roots: list[str] = [str(codex_home())]
+    codex_roots: list[str] = [str(read_session_sources.codex_home())]
     workspace_roots: list[str] = []
     for row in rows:
         payload = row.get("payload")
@@ -1307,22 +1008,22 @@ def build_session_evidence(
                 }
             )
     if last_runs is not None and completed_turn_ids is not None:
-        raise EvidenceCollectionError("completed turn IDs do not accept a last-runs window")
+        raise read_session_sources.EvidenceCollectionError("completed turn IDs do not accept a last-runs window")
     if completed_turn_ids is not None:
         if not completed_turn_ids or len(completed_turn_ids) != len(
             set(completed_turn_ids)
         ):
-            raise EvidenceCollectionError("completed turn IDs must be a nonempty unique list")
+            raise read_session_sources.EvidenceCollectionError("completed turn IDs must be a nonempty unique list")
         completed_ids = [run["turn_id"] for run in completed]
         requested = set(completed_turn_ids)
         unknown = [turn_id for turn_id in completed_turn_ids if turn_id not in completed_ids]
         if unknown:
-            raise EvidenceCollectionError(
+            raise read_session_sources.EvidenceCollectionError(
                 f"requested run is not completed in the session: {unknown[0]}"
             )
         ordered_requested = [turn_id for turn_id in completed_ids if turn_id in requested]
         if ordered_requested != completed_turn_ids:
-            raise EvidenceCollectionError("completed turn IDs are not in session order")
+            raise read_session_sources.EvidenceCollectionError("completed turn IDs are not in session order")
         completed_by_id = {run["turn_id"]: run for run in completed}
         selected = [completed_by_id[turn_id] for turn_id in completed_turn_ids]
     elif last_runs is not None:
@@ -1396,7 +1097,7 @@ def build_semantic_runs(
     requested = list(dict.fromkeys(include_runs))
     unknown = sorted(set(requested) - runs_by_id.keys())
     if unknown:
-        raise EvidenceCollectionError(f"requested run is outside the completed window: {unknown[0]}")
+        raise read_session_sources.EvidenceCollectionError(f"requested run is outside the completed window: {unknown[0]}")
 
     requested_set = set(requested)
     call_limits = {
@@ -1501,7 +1202,7 @@ def build_semantic_runs(
         run = runs_by_id[turn_id]
         calls = calls_by_id[turn_id]
         if len(calls) != run["model_calls"]:
-            raise EvidenceCollectionError(
+            raise read_session_sources.EvidenceCollectionError(
                 f"semantic call count does not match session evidence: {turn_id}"
             )
         result.append(
@@ -2161,7 +1862,7 @@ def estimated_credit_cost(
     ) / 1_000_000
     result = raw_cost * float(pricing["mode_multiplier"])
     if not math.isfinite(result):
-        raise EvidenceCollectionError("pricing profile produces a non-finite credit cost")
+        raise read_session_sources.EvidenceCollectionError("pricing profile produces a non-finite credit cost")
     return round(result, 12)
 
 
@@ -2612,7 +2313,7 @@ def collect_session_evidence_from_rows(
 
     resolved_session = session.expanduser().resolve(strict=True)
     if not re.fullmatch(r"[0-9a-f]{64}", source_fingerprint):
-        raise EvidenceCollectionError("source fingerprint must be a SHA-256 digest")
+        raise read_session_sources.EvidenceCollectionError("source fingerprint must be a SHA-256 digest")
     pricing = (
         load_pricing_profile(pricing_profile.expanduser().resolve(strict=True))
         if pricing_profile is not None
@@ -2741,7 +2442,7 @@ def collect_session_evidence(
     """
 
     resolved_session = session.expanduser().resolve(strict=True)
-    rows, source_fingerprint = load_rows_with_fingerprint(resolved_session)
+    rows, source_fingerprint = read_session_sources.load_rows_with_fingerprint(resolved_session)
     return collect_session_evidence_from_rows(
         rows,
         session=resolved_session,
@@ -2872,11 +2573,11 @@ def load_classifications(path: pathlib.Path) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except OSError as exc:
-        raise EvidenceCollectionError(f"could not read classifications: {exc}") from exc
+        raise read_session_sources.EvidenceCollectionError(f"could not read classifications: {exc}") from exc
     except json.JSONDecodeError as exc:
-        raise EvidenceCollectionError("classifications are not valid JSON") from exc
+        raise read_session_sources.EvidenceCollectionError("classifications are not valid JSON") from exc
     if not isinstance(value, dict):
-        raise EvidenceCollectionError("classifications must be a JSON object")
+        raise read_session_sources.EvidenceCollectionError("classifications must be a JSON object")
     return value
 
 
@@ -2887,7 +2588,7 @@ def build_classified_summary(
     """Require every selected call to have exactly one supported classification."""
 
     if classifications.get("schema") != CLASSIFICATIONS_SCHEMA:
-        raise EvidenceCollectionError(
+        raise read_session_sources.EvidenceCollectionError(
             f"classifications schema must be {CLASSIFICATIONS_SCHEMA}"
         )
     try:
@@ -2896,33 +2597,33 @@ def build_classified_summary(
         ).expanduser().resolve(strict=True)
         session_evidence_session = pathlib.Path(session_evidence["session"]).resolve(strict=True)
     except OSError as exc:
-        raise EvidenceCollectionError(f"could not resolve classified session: {exc}") from exc
+        raise read_session_sources.EvidenceCollectionError(f"could not resolve classified session: {exc}") from exc
     if classified_session != session_evidence_session:
-        raise EvidenceCollectionError(
+        raise read_session_sources.EvidenceCollectionError(
             "classifications session does not match the collected evidence"
         )
 
     raw_runs = classifications.get("runs")
     if not isinstance(raw_runs, list):
-        raise EvidenceCollectionError("classifications must contain a runs list")
+        raise read_session_sources.EvidenceCollectionError("classifications must contain a runs list")
     classified_runs: dict[str, dict[str, Any]] = {}
     for raw_run in raw_runs:
         if not isinstance(raw_run, dict):
-            raise EvidenceCollectionError("each classified run must be an object")
+            raise read_session_sources.EvidenceCollectionError("each classified run must be an object")
         turn_id = raw_run.get("turn_id")
         if not isinstance(turn_id, str) or not turn_id:
-            raise EvidenceCollectionError("each classified run needs a turn_id")
+            raise read_session_sources.EvidenceCollectionError("each classified run needs a turn_id")
         if turn_id in classified_runs:
-            raise EvidenceCollectionError(f"duplicate classified run: {turn_id}")
+            raise read_session_sources.EvidenceCollectionError(f"duplicate classified run: {turn_id}")
         classified_runs[turn_id] = raw_run
 
     session_evidence_runs = {run["turn_id"]: run for run in session_evidence["runs"]}
     missing_runs = sorted(session_evidence_runs.keys() - classified_runs.keys())
     extra_runs = sorted(classified_runs.keys() - session_evidence_runs.keys())
     if missing_runs:
-        raise EvidenceCollectionError(f"missing classified run: {missing_runs[0]}")
+        raise read_session_sources.EvidenceCollectionError(f"missing classified run: {missing_runs[0]}")
     if extra_runs:
-        raise EvidenceCollectionError(f"classified run is outside the window: {extra_runs[0]}")
+        raise read_session_sources.EvidenceCollectionError(f"classified run is outside the window: {extra_runs[0]}")
 
     totals: Counter[str] = Counter()
     control_totals: Counter[tuple[str, str]] = Counter()
@@ -2930,33 +2631,33 @@ def build_classified_summary(
     for turn_id, session_evidence_run in session_evidence_runs.items():
         raw_groups = classified_runs[turn_id].get("groups")
         if not isinstance(raw_groups, list) or not raw_groups:
-            raise EvidenceCollectionError(f"classified run has no groups: {turn_id}")
+            raise read_session_sources.EvidenceCollectionError(f"classified run has no groups: {turn_id}")
         assigned: dict[int, str] = {}
         category_counts: Counter[str] = Counter()
         for group in raw_groups:
             if not isinstance(group, dict):
-                raise EvidenceCollectionError(f"classification group is not an object: {turn_id}")
+                raise read_session_sources.EvidenceCollectionError(f"classification group is not an object: {turn_id}")
             category = group.get("category")
             if category not in CLASSIFICATION_CATEGORIES:
-                raise EvidenceCollectionError(
+                raise read_session_sources.EvidenceCollectionError(
                     f"unsupported classification category in run: {turn_id}"
                 )
             control = group.get("control")
             control_name: str | None = None
             if category == "necessary":
                 if control not in (None, ""):
-                    raise EvidenceCollectionError(
+                    raise read_session_sources.EvidenceCollectionError(
                         f"necessary calls must not name a control: {turn_id}"
                     )
             elif not isinstance(control, str) or not control.strip():
-                raise EvidenceCollectionError(
+                raise read_session_sources.EvidenceCollectionError(
                     f"avoidable calls must name their controlling fix: {turn_id}"
                 )
             else:
                 control_name = control.strip()
             raw_indices = group.get("indices")
             if not isinstance(raw_indices, list) or not raw_indices:
-                raise EvidenceCollectionError(
+                raise read_session_sources.EvidenceCollectionError(
                     f"classification group has no call indices: {turn_id}"
                 )
             for index in raw_indices:
@@ -2966,11 +2667,11 @@ def build_classified_summary(
                     or index < 1
                     or index > session_evidence_run["model_calls"]
                 ):
-                    raise EvidenceCollectionError(
+                    raise read_session_sources.EvidenceCollectionError(
                         f"classified call index is outside run {turn_id}"
                     )
                 if index in assigned:
-                    raise EvidenceCollectionError(
+                    raise read_session_sources.EvidenceCollectionError(
                         f"call {index} is classified more than once in run {turn_id}"
                     )
                 assigned[index] = category
@@ -2983,7 +2684,7 @@ def build_classified_summary(
         expected = set(range(1, session_evidence_run["model_calls"] + 1))
         missing_calls = sorted(expected - assigned.keys())
         if missing_calls:
-            raise EvidenceCollectionError(
+            raise read_session_sources.EvidenceCollectionError(
                 f"call {missing_calls[0]} is unclassified in run {turn_id}"
             )
         summarized_runs.append(
@@ -3004,7 +2705,7 @@ def build_classified_summary(
     model_calls = session_evidence["totals"]["model_calls"]
     classified_calls = sum(totals.values())
     if classified_calls != model_calls:
-        raise EvidenceCollectionError(
+        raise read_session_sources.EvidenceCollectionError(
             f"classified call total {classified_calls} does not match {model_calls}"
         )
     return {
@@ -3039,7 +2740,7 @@ def write_evidence(path: pathlib.Path, session_evidence: dict[str, Any]) -> None
     """Write redacted call evidence only to the caller-authorized path."""
 
     if not path.parent.is_dir():
-        raise EvidenceCollectionError(f"evidence output directory does not exist: {path.parent}")
+        raise read_session_sources.EvidenceCollectionError(f"evidence output directory does not exist: {path.parent}")
     try:
         path.write_text(
             json.dumps(session_evidence, separators=(",", ":")) + "\n",
@@ -3047,7 +2748,7 @@ def write_evidence(path: pathlib.Path, session_evidence: dict[str, Any]) -> None
             newline="\n",
         )
     except OSError as exc:
-        raise EvidenceCollectionError(f"could not write evidence output: {exc}") from exc
+        raise read_session_sources.EvidenceCollectionError(f"could not write evidence output: {exc}") from exc
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -3127,62 +2828,62 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.summary and args.closure:
-            raise EvidenceCollectionError("--summary does not accept --closure")
+            raise read_session_sources.EvidenceCollectionError("--summary does not accept --closure")
         if args.summary:
             if args.classifications is not None:
-                raise EvidenceCollectionError("--summary does not accept --classifications")
+                raise read_session_sources.EvidenceCollectionError("--summary does not accept --classifications")
             if args.include_run:
-                raise EvidenceCollectionError("--summary does not accept --include-run")
+                raise read_session_sources.EvidenceCollectionError("--summary does not accept --include-run")
             if args.semantic_evidence_output is not None:
-                raise EvidenceCollectionError(
+                raise read_session_sources.EvidenceCollectionError(
                     "--summary does not accept --semantic-evidence-output"
                 )
             if args.evidence_output is None:
-                raise EvidenceCollectionError("--summary requires --evidence-output")
+                raise read_session_sources.EvidenceCollectionError("--summary requires --evidence-output")
         elif args.classifications is not None:
             if args.evidence_output is not None:
-                raise EvidenceCollectionError(
+                raise read_session_sources.EvidenceCollectionError(
                     "--classifications does not accept --evidence-output"
                 )
             if args.include_run:
-                raise EvidenceCollectionError(
+                raise read_session_sources.EvidenceCollectionError(
                     "--classifications validates every completed run"
                 )
             if args.semantic_evidence_output is not None:
-                raise EvidenceCollectionError(
+                raise read_session_sources.EvidenceCollectionError(
                     "--classifications does not accept --semantic-evidence-output"
                 )
         elif args.closure:
             if args.evidence_output is not None:
-                raise EvidenceCollectionError("--closure does not accept --evidence-output")
+                raise read_session_sources.EvidenceCollectionError("--closure does not accept --evidence-output")
             if args.semantic_evidence_output is not None:
-                raise EvidenceCollectionError(
+                raise read_session_sources.EvidenceCollectionError(
                     "--closure does not accept --semantic-evidence-output"
                 )
         else:
             if args.evidence_output is None:
-                raise EvidenceCollectionError("ordinary mode requires --evidence-output")
+                raise read_session_sources.EvidenceCollectionError("ordinary mode requires --evidence-output")
             if args.semantic_evidence_output is not None and not args.include_run:
-                raise EvidenceCollectionError(
+                raise read_session_sources.EvidenceCollectionError(
                     "--semantic-evidence-output requires --include-run"
                 )
             if args.include_run and args.semantic_evidence_output is None:
-                raise EvidenceCollectionError(
+                raise read_session_sources.EvidenceCollectionError(
                     "--include-run requires --semantic-evidence-output"
                 )
 
         if not args.summary and args.top is not None:
-            raise EvidenceCollectionError("--top requires --summary")
+            raise read_session_sources.EvidenceCollectionError("--top requires --summary")
         if not args.summary and args.pricing_profile is not None:
-            raise EvidenceCollectionError("--pricing-profile requires --summary")
+            raise read_session_sources.EvidenceCollectionError("--pricing-profile requires --summary")
 
         if args.thread_id is not None:
-            session = resolve_thread_session(args.thread_id)
+            session = read_session_sources.resolve_thread_session(args.thread_id)
         else:
             if args.session is None:
-                raise EvidenceCollectionError("session path is required")
+                raise read_session_sources.EvidenceCollectionError("session path is required")
             session = args.session.expanduser().resolve(strict=True)
-        rows = load_rows(session)
+        rows = read_session_sources.load_rows(session)
         session_evidence = build_session_evidence(
             rows,
             session=session,
@@ -3201,15 +2902,15 @@ def main(argv: list[str] | None = None) -> int:
             result = build_closure_summary(session_evidence, semantic_runs)
         elif args.summary:
             if args.evidence_output is None:
-                raise EvidenceCollectionError("--summary requires --evidence-output")
+                raise read_session_sources.EvidenceCollectionError("--summary requires --evidence-output")
             evidence_output = args.evidence_output.expanduser().resolve()
             if evidence_output == session:
-                raise EvidenceCollectionError("evidence output must not overwrite the session")
+                raise read_session_sources.EvidenceCollectionError("evidence output must not overwrite the session")
             pricing: dict[str, float | str] | None = None
             if args.pricing_profile is not None:
                 pricing_path = args.pricing_profile.expanduser().resolve(strict=True)
                 if evidence_output == pricing_path:
-                    raise EvidenceCollectionError(
+                    raise read_session_sources.EvidenceCollectionError(
                         "evidence output must not overwrite the pricing profile"
                     )
                 pricing = load_pricing_profile(pricing_path)
@@ -3221,10 +2922,10 @@ def main(argv: list[str] | None = None) -> int:
             write_evidence(evidence_output, evidence)
         else:
             if args.evidence_output is None:
-                raise EvidenceCollectionError("ordinary mode requires --evidence-output")
+                raise read_session_sources.EvidenceCollectionError("ordinary mode requires --evidence-output")
             evidence_output = args.evidence_output.expanduser().resolve()
             if evidence_output == session:
-                raise EvidenceCollectionError("evidence output must not overwrite the session")
+                raise read_session_sources.EvidenceCollectionError("evidence output must not overwrite the session")
             if args.semantic_evidence_output is None:
                 result = build_summary(
                     session_evidence,
@@ -3236,20 +2937,20 @@ def main(argv: list[str] | None = None) -> int:
                     args.semantic_evidence_output.expanduser().resolve()
                 )
                 if semantic_output == session:
-                    raise EvidenceCollectionError(
+                    raise read_session_sources.EvidenceCollectionError(
                         "semantic evidence output must not overwrite the session"
                     )
                 if semantic_output == evidence_output:
-                    raise EvidenceCollectionError(
+                    raise read_session_sources.EvidenceCollectionError(
                         "semantic evidence output must differ from evidence output"
                     )
                 if not evidence_output.parent.is_dir():
-                    raise EvidenceCollectionError(
+                    raise read_session_sources.EvidenceCollectionError(
                         "evidence output directory does not exist: "
                         f"{evidence_output.parent}"
                     )
                 if not semantic_output.parent.is_dir():
-                    raise EvidenceCollectionError(
+                    raise read_session_sources.EvidenceCollectionError(
                         "semantic evidence output directory does not exist: "
                         f"{semantic_output.parent}"
                     )
@@ -3261,7 +2962,7 @@ def main(argv: list[str] | None = None) -> int:
                 result = build_semantic_summary(session_evidence, semantic_evidence)
                 write_evidence(evidence_output, session_evidence)
                 write_evidence(semantic_output, semantic_evidence)
-    except (EvidenceCollectionError, OSError) as exc:
+    except (read_session_sources.EvidenceCollectionError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     print(json.dumps(result, separators=(",", ":")))

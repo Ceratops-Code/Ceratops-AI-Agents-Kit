@@ -589,25 +589,25 @@ def _request_source(
         )
     try:
         if isinstance(thread_id, str) and thread_id:
-            canonical_id = collector.canonical_thread_id(thread_id)
-            resolved = collector.resolve_thread_session(canonical_id)
+            canonical_id = collector.read_session_sources.canonical_thread_id(thread_id)
+            resolved = collector.read_session_sources.resolve_thread_session(canonical_id)
             descriptor = {"kind": "thread_id", "value": canonical_id}
         elif isinstance(session, str) and session:
             resolved = pathlib.Path(str(session)).expanduser().resolve(strict=True)
             descriptor = {"kind": "session", "value": str(resolved)}
         elif current_thread is True:
-            canonical_id, resolved = collector.resolve_current_thread_source()
+            canonical_id, resolved = collector.read_session_sources.resolve_current_thread_source()
             descriptor = {"kind": "current_thread", "value": canonical_id}
         else:
             assert isinstance(thread_name, str)
-            canonical_id, resolved, index_fingerprint = (
-                collector.resolve_named_thread_source(thread_name)
+            canonical_id, resolved, registry_fingerprint = (
+                collector.read_session_sources.resolve_named_thread_source(thread_name)
             )
             descriptor = {
                 "kind": "thread_name",
                 "value": thread_name.strip(),
                 "thread_id": canonical_id,
-                "thread_index_fingerprint": index_fingerprint,
+                "thread_registry_fingerprint": registry_fingerprint,
             }
     except (OSError, ValueError, RuntimeError) as exc:
         raise CreditAnalysisError(f"could not resolve selected session: {exc}") from exc

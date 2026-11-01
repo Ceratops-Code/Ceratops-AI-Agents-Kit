@@ -313,7 +313,7 @@ def test_credit_analysis_workflow_resolves_current_and_named_threads(
     )
     assert named_state["source"]["kind"] == "thread_name"
     assert named_state["source"]["thread_id"] == named_id
-    assert len(named_state["source"]["thread_index_fingerprint"]) == 64
+    assert len(named_state["source"]["thread_registry_fingerprint"]) == 64
 
     duplicate_id = "00000000-0000-4000-8000-000000000003"
     indexed_credit_analysis_session(
@@ -373,19 +373,11 @@ def test_quick_selector_freezes_recent_threads_without_deep_batch(
         updated_at="2026-08-04T18:00:00Z",
         project_name="alpha",
     )
-    with (codex_home / "session_index.jsonl").open(
-        "a", encoding="utf-8", newline="\n"
-    ) as index:
-        index.write(
-            json.dumps(
-                {
-                    "id": missing_id,
-                    "thread_name": "Missing session",
-                    "updated_at": "2026-08-06T18:00:00Z",
-                }
-            )
-            + "\n"
-        )
+    missing = indexed_credit_analysis_session(
+        codex_home, thread_id=missing_id, thread_name="Missing session",
+        updated_at="2026-08-06T18:00:00Z", project_name="alpha",
+    )
+    missing.unlink()
     output = tmp_path / "selection.json"
     result = run_credit_analysis_workflow(
         "select-recent",
@@ -835,7 +827,7 @@ def test_quick_batch_collects_and_validates_without_model_processes(tmp_path, mo
     batch = json.loads(batch_path.read_text())
     for item in batch["threads"]:
         assert item["ledger"]["totals"]["model_calls"] == 6
-        assert item["ledger"]["window"]["requested_runs"] == 3
+        assert item["ledger"]["window"]["requested_turn_ids"] == ["turn-1", "turn-2", "turn-3"]
         assert [run["turn_id"] for run in item["semantic"]["selected_runs"]] == ["turn-1", "turn-2", "turn-3"]
         assert item["usage"]["pricing"] == {"provided": False}
     assert "synthetic-user-secret" not in batch_path.read_text()
@@ -867,6 +859,7 @@ def test_quick_batch_collects_and_validates_without_model_processes(tmp_path, mo
     "missing-thread", "missing-call", "duplicate-call", "missing-control",
     "wrong-session", "source-missing", "source-malformed", "new-completed-run",
     "semantic-drift", "duplicate-thread", "foreign-thread", "malformed-classification", "active-tail",
+    "archive-relocation", "current-continuation",
 ])
 def test_quick_batch_validation_keeps_failures_out_of_totals(tmp_path, monkeypatch, defect):
     selection, sessions = _quick_batch_case(tmp_path, monkeypatch)
@@ -904,6 +897,21 @@ def test_quick_batch_validation_keeps_failures_out_of_totals(tmp_path, monkeypat
     elif defect == "active-tail":
         with sessions[0].open("a") as handle:
             handle.write(json.dumps({"timestamp": "2026-08-03T00:00:00Z", "type": "turn_context", "payload": {"turn_id": "still-running"}}) + "\n")
+    elif defect == "archive-relocation":
+        archive = sessions[0].parents[4] / "archived_sessions"
+        archive.mkdir()
+        sessions[0].rename(archive / sessions[0].name)
+    elif defect == "current-continuation":
+        import sqlite3
+
+        continued = sessions[0].with_name(sessions[0].stem + "_continued.jsonl")
+        continued.write_bytes(sessions[0].read_bytes())
+        records = [json.loads(line) for line in sessions[0].read_text().splitlines()]
+        sessions[0].write_text(json.dumps(records[0]) + "\n", encoding="utf-8")
+        with contextlib.closing(sqlite3.connect(sessions[0].parents[4] / "state_5.sqlite")) as connection:
+            connection.execute("UPDATE threads SET rollout_path = ? WHERE id = ?",
+                               (str(continued), batch["threads"][0]["thread_id"]))
+            connection.commit()
     elif defect == "semantic-drift":
         sessions[0].write_text(sessions[0].read_text().replace("Fix the failed read", "Changed selected user goal"))
     elif defect == "duplicate-thread":
@@ -914,7 +922,7 @@ def test_quick_batch_validation_keeps_failures_out_of_totals(tmp_path, monkeypat
         decisions["threads"][0]["classification"] = []
     write_json_file(decisions_path, decisions)
     validated = run_credit_analysis_workflow("quick-validate", "--batch", str(batch_path), "--classifications", str(decisions_path), "--output", str(result_path))
-    if defect == "active-tail":
+    if defect in {"active-tail", "new-completed-run", "archive-relocation", "current-continuation"}:
         assert validated.returncode == 0, validated.stderr
         result = json.loads(result_path.read_text())
         assert [item["status"] for item in result["threads"]] == ["validated", "validated"]
@@ -968,7 +976,7 @@ def test_quick_batch_collection_preserves_window_and_exclusions(tmp_path, monkey
     expected = {
         "self": ["excluded-current", "ready"], "include-self": ["ready", "ready"],
         "empty": ["no-completed-runs", "no-completed-runs"],
-        "broken": ["unassessed", "ready"], "non-suffix": ["unassessed", "unassessed"],
+        "broken": ["unassessed", "ready"], "non-suffix": ["ready", "ready"],
         "lower-edge": ["ready", "ready"], "pricing": ["ready", "ready"],
     }
     assert [item["status"] for item in batch["threads"]] == expected[mode]
@@ -977,9 +985,70 @@ def test_quick_batch_collection_preserves_window_and_exclusions(tmp_path, monkey
         assert batch["threads"][0]["usage"]["pricing"]["input_per_million_tokens"] == 2
     if mode == "lower-edge":
         assert [run["turn_id"] for run in batch["threads"][0]["ledger"]["runs"]] == ["turn-2", "turn-3"]
+    if mode == "non-suffix":
+        assert [run["turn_id"] for run in batch["threads"][0]["ledger"]["runs"]] == ["turn-1", "turn-2"]
 
 
-def test_quick_window_cli_preserves_suffix_and_input_validation(tmp_path):
+def test_quick_registry_activity_and_current_log_ignore_stale_display_cache(tmp_path, monkeypatch):
+    """Real app metadata wins over old dates, missing labels, and an aborted log."""
+    import datetime as dt
+    import sqlite3
+
+    selection, sessions = _quick_batch_case(tmp_path, monkeypatch)
+    frozen = json.loads(selection.read_text())
+    home = sessions[0].parents[4]
+    continued = sessions[0].with_name(sessions[0].stem + "_resumed.jsonl")
+    continued.write_bytes(sessions[0].read_bytes())
+    records = [json.loads(line) for line in sessions[0].read_text().splitlines()]
+    sessions[0].write_text(json.dumps(records[0]) + "\n", encoding="utf-8")
+    labels = [json.loads(line) for line in (home / "session_index.jsonl").read_text().splitlines()]
+    labels[0]["updated_at"] = "2000-01-01T00:00:00Z"
+    # The second chat has no cached label at all; its actual app record remains.
+    (home / "session_index.jsonl").write_text(json.dumps(labels[0]) + "\n", encoding="utf-8")
+    database = home / "state_5.sqlite"
+    with contextlib.closing(sqlite3.connect(database)) as connection:
+        connection.execute("UPDATE threads SET rollout_path = ?, updated_at = ? WHERE id = ?",
+                           (str(continued), int(dt.datetime(2026, 8, 3, tzinfo=dt.UTC).timestamp()),
+                            frozen["threads"][0]["thread_id"]))
+        connection.commit()
+    original_database = database.read_bytes()
+    original_index = (home / "session_index.jsonl").read_bytes()
+    new_selection, batch_path = tmp_path / "current-selection.json", tmp_path / "current-batch.json"
+    selected = run_credit_analysis_workflow(
+        "select-recent", "--days", "3", "--as-of", "2026-08-02T00:00:00Z",
+        "--output", str(new_selection),
+    )
+    assert selected.returncode == 0, selected.stderr
+    chosen = json.loads(new_selection.read_text())
+    assert [item["thread_id"] for item in chosen["threads"]] == [
+        item["thread_id"] for item in frozen["threads"]
+    ]
+    assert chosen["threads"][0]["session"] == str(continued.resolve())
+    collected = run_credit_analysis_workflow(
+        "quick-collect", "--selection", str(new_selection), "--output", str(batch_path),
+    )
+    assert collected.returncode == 0, collected.stderr
+    batch = json.loads(batch_path.read_text())
+    assert [item["status"] for item in batch["threads"]] == ["ready", "ready"]
+    assert sum(item["ledger"]["totals"]["model_calls"] for item in batch["threads"]) == 12
+    assert database.read_bytes() == original_database
+    assert (home / "session_index.jsonl").read_bytes() == original_index
+
+
+def test_quick_registry_absence_is_not_reported_as_an_empty_scan(tmp_path, monkeypatch):
+    _selection, sessions = _quick_batch_case(tmp_path, monkeypatch)
+    (sessions[0].parents[4] / "state_5.sqlite").unlink()
+    output = tmp_path / "missing-registry-selection.json"
+    result = run_credit_analysis_workflow(
+        "select-recent", "--days", "3", "--as-of", "2026-08-02T00:00:00Z",
+        "--output", str(output),
+    )
+    assert result.returncode == 2
+    assert "app thread registry is unavailable" in result.stderr
+    assert not output.exists()
+
+
+def test_quick_window_cli_preserves_exact_run_ids_and_input_validation(tmp_path):
     usage = tmp_path / "usage.json"
     value: dict[str, Any] = {"schema": "ceratops-model-call-usage-evidence.v1", "window": {"mode": "full_thread"}, "runs": [
         {"turn_id": "old", "started_at": "2026-07-01T00:00:00Z"},
@@ -988,11 +1057,14 @@ def test_quick_window_cli_preserves_suffix_and_input_validation(tmp_path):
     write_json_file(usage, value)
     result = run_credit_analysis_workflow("quick-window", "--days", "3", "--as-of", "2026-08-02T00:00:00Z", "--usage-evidence", str(usage))
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout) == {"last_runs": 1, "first_run": "recent", "last_run": "recent"}
+    assert json.loads(result.stdout) == {
+        "run_count": 1, "run_ids": ["recent"], "first_run": "recent", "last_run": "recent",
+    }
     value["runs"].reverse()
     write_json_file(usage, value)
     result = run_credit_analysis_workflow("quick-window", "--days", "3", "--as-of", "2026-08-02T00:00:00Z", "--usage-evidence", str(usage))
-    assert result.returncode == 2 and "completed-run suffix" in result.stderr
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["run_ids"] == ["recent"]
 
 
 def _quick_command_case(tmp_path, monkeypatch):

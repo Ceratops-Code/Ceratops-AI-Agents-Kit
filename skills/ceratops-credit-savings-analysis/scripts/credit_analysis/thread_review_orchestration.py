@@ -1555,7 +1555,7 @@ def _collect_holistic_evidence(
 
     cutoff = dt.datetime.now(dt.timezone.utc).isoformat(timespec="microseconds")
     try:
-        rows, source_fingerprint = collector.load_rows_with_fingerprint(request["session"])
+        rows, source_fingerprint = collector.read_session_sources.load_rows_with_fingerprint(request["session"])
         execution_context = _source_execution_context(rows)
         path_roots = collector.review_path_roots(rows)
         collected = collector.collect_session_evidence_from_rows(
@@ -1588,7 +1588,7 @@ def _collect_holistic_evidence(
     root_session = pathlib.Path(request["session"]).resolve()
     root_session_id = _session_identity(rows, fallback=str(root_session))
     try:
-        seen_sessions.add(collector.canonical_thread_id(root_session_id))
+        seen_sessions.add(collector.read_session_sources.canonical_thread_id(root_session_id))
     except (RuntimeError, ValueError):
         pass
     pending = _persistent_descendant_references(
@@ -1603,7 +1603,7 @@ def _collect_holistic_evidence(
         pending_index += 1
         raw_session_id = str(descendant["session_id"])
         try:
-            session_id = collector.canonical_thread_id(raw_session_id)
+            session_id = collector.read_session_sources.canonical_thread_id(raw_session_id)
         except (RuntimeError, ValueError) as exc:
             invalid_key = f"invalid:{raw_session_id}"
             if invalid_key in seen_sessions:
@@ -1622,7 +1622,7 @@ def _collect_holistic_evidence(
         seen_sessions.add(session_id)
         descendant = {**descendant, "session_id": session_id}
         try:
-            child_session = collector.resolve_thread_session(session_id).resolve(
+            child_session = collector.read_session_sources.resolve_thread_session(session_id).resolve(
                 strict=True
             )
             if child_session == root_session:
@@ -1630,14 +1630,14 @@ def _collect_holistic_evidence(
                     {**descendant, "reason": "source-cycle"}
                 )
                 continue
-            child_rows, child_fingerprint = collector.load_rows_with_fingerprint(
+            child_rows, child_fingerprint = collector.read_session_sources.load_rows_with_fingerprint(
                 child_session
             )
             retained_child_id = _session_identity(
                 child_rows,
                 fallback=session_id,
             )
-            if collector.canonical_thread_id(retained_child_id) != session_id:
+            if collector.read_session_sources.canonical_thread_id(retained_child_id) != session_id:
                 raise CreditAnalysisError(
                     "descendant session metadata does not match its reference"
                 )
