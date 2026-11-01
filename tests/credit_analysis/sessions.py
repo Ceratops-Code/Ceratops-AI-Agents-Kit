@@ -296,7 +296,9 @@ def credit_analysis_session(
     for index in range(extra_completed_turns):
         minute = 3 + index
         turn_id = f"turn-extra-{index + 1}"
-        prefix = f"2026-08-01T00:{minute:02d}"
+        prefix = (
+            dt.datetime(2026, 8, 1, tzinfo=dt.UTC) + dt.timedelta(minutes=minute)
+        ).strftime("%Y-%m-%dT%H:%M")
         rows.append(
             {
                 "timestamp": f"{prefix}:00Z",
@@ -320,7 +322,9 @@ def credit_analysis_session(
             )
         add_call(f"{prefix}:02Z", turn_id, final=True)
     active_minute = 3 + extra_completed_turns
-    active_prefix = f"2026-08-01T00:{active_minute:02d}"
+    active_prefix = (
+        dt.datetime(2026, 8, 1, tzinfo=dt.UTC) + dt.timedelta(minutes=active_minute)
+    ).strftime("%Y-%m-%dT%H:%M")
     rows.append(
         {
             "timestamp": f"{active_prefix}:00Z",

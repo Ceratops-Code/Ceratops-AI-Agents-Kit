@@ -1004,6 +1004,11 @@ def test_model_call_ledger_closure_mode_is_artifact_free(
     rows = [
         {
             "timestamp": "2026-07-25T00:00:00Z",
+            "type": "session_meta",
+            "payload": {"id": thread_id, "cwd": str(tmp_path)},
+        },
+        {
+            "timestamp": "2026-07-25T00:00:00Z",
             "type": "turn_context",
             "payload": {"turn_id": "turn-1"},
         },
