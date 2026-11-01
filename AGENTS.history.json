@@ -367,6 +367,14 @@
       "decision": "Use exact current evidence for local proposal scope and ownership; make local portability guidance follow the global path policy.",
       "reason": "The user approved removing redundant proposal reads and the broader external-runtime path exception. This narrows those portions of the earlier decision beginning Repository governance uses current control sources while retaining its current-source and portability objectives.",
       "regression": "Keep global mandatory disk reads before edits, fresh-evidence reuse, exact scope and ownership assessment, and the global automation cwds exception. Resolve only these two local list-heavy markers; retain all other local rules."
+    },
+    {
+      "rules": [
+        "SKILLS-GOV-02"
+      ],
+      "decision": "Remove the obsolete gate classification from SKILLS-GOV-02 and express its unchanged advisory scope through governing instructions and their helper contracts. This narrows only gate inventory metadata from the earlier decision moving live approval-gate classification into AGENTS.md; preserve the decision Keep governance recommendations advisory without a rule-local user-authorization clause.",
+      "reason": "The local rule classifies recommendations and does not itself request approval. Global authorization rules own permission decisions. Their defined instruction category preserves the original scope without a four-member enumeration.",
+      "regression": "Keep recommendations advisory for instruction, automation, skill, and helper-contract changes. Advice alone must not mutate state. Preserve all actual global and local approval gates and every unrelated rule and relation."
     }
   ]
 }
