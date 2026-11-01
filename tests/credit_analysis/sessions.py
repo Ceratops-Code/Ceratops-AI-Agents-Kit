@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import contextlib
+import datetime as dt
 import json
 import pathlib
-from typing import Any, Mapping
+import sqlite3
+from collections.abc import Mapping
+from typing import Any
 
 
 def write_json_file(path: pathlib.Path, value: Any) -> None:
@@ -116,7 +120,10 @@ def credit_analysis_session(
             if output is not None:
                 rows.append(
                     {
-                        "timestamp": timestamp + ".100",
+                        "timestamp": (
+                            dt.datetime.fromisoformat(timestamp)
+                            + dt.timedelta(milliseconds=100)
+                        ).isoformat().replace("+00:00", "Z"),
                         "type": "response_item",
                         "payload": {
                             "type": "function_call_output",
@@ -148,7 +155,10 @@ def credit_analysis_session(
             )
         rows.append(
             {
-                "timestamp": timestamp + ".900",
+                "timestamp": (
+                    dt.datetime.fromisoformat(timestamp)
+                    + dt.timedelta(milliseconds=900)
+                ).isoformat().replace("+00:00", "Z"),
                 "type": "event_msg",
                 "payload": {
                     "type": "token_count",
@@ -286,7 +296,9 @@ def credit_analysis_session(
     for index in range(extra_completed_turns):
         minute = 3 + index
         turn_id = f"turn-extra-{index + 1}"
-        prefix = f"2026-08-01T00:{minute:02d}"
+        prefix = (
+            dt.datetime(2026, 8, 1, tzinfo=dt.UTC) + dt.timedelta(minutes=minute)
+        ).strftime("%Y-%m-%dT%H:%M")
         rows.append(
             {
                 "timestamp": f"{prefix}:00Z",
@@ -310,7 +322,9 @@ def credit_analysis_session(
             )
         add_call(f"{prefix}:02Z", turn_id, final=True)
     active_minute = 3 + extra_completed_turns
-    active_prefix = f"2026-08-01T00:{active_minute:02d}"
+    active_prefix = (
+        dt.datetime(2026, 8, 1, tzinfo=dt.UTC) + dt.timedelta(minutes=active_minute)
+    ).strftime("%Y-%m-%dT%H:%M")
     rows.append(
         {
             "timestamp": f"{active_prefix}:00Z",
@@ -382,8 +396,9 @@ def indexed_credit_analysis_session(
     updated_at: str,
     project_name: str,
     repository_owner: str = "example",
+    created_at: str = "2026-08-01T00:00:00Z",
 ) -> pathlib.Path:
-    """Create one indexed Codex session with deterministic project metadata."""
+    """Emulate existing app metadata and its optional display-name cache."""
 
     session_root = codex_home / "sessions" / "2026" / "08" / "01"
     session_root.mkdir(parents=True, exist_ok=True)
@@ -410,6 +425,22 @@ def indexed_credit_analysis_session(
             )
             + "\n"
         )
+    # The production reader opens the vendor database in mode=ro. This database
+    # is a pytest-owned fixture of that existing schema, never an app data store.
+    with contextlib.closing(sqlite3.connect(codex_home / "state_5.sqlite")) as connection:
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS threads (id TEXT PRIMARY KEY, title TEXT, "
+            "rollout_path TEXT, updated_at INTEGER, created_at INTEGER, "
+            "updated_at_ms INTEGER, created_at_ms INTEGER)"
+        )
+        connection.execute(
+            "INSERT OR REPLACE INTO threads (id,title,rollout_path,updated_at,created_at) "
+            "VALUES (?,?,?,?,?)",
+            (thread_id, thread_name, str(session),
+             int(dt.datetime.fromisoformat(updated_at).timestamp()),
+             int(dt.datetime.fromisoformat(created_at).timestamp())),
+        )
+        connection.commit()
     return session
 
 

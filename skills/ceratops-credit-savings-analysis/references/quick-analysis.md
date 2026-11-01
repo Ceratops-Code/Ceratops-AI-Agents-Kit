@@ -17,19 +17,24 @@ Sol analysis children.
 - For a recent scan, use the requested positive day count, or seven days when
   the user gives no count. Freeze one UTC `as_of` boundary. Run `python
   scripts/credit-analysis-workflow.py select-recent --days DAYS --as-of UTC
-  --output SELECTION` in the installed skill folder. The selector lists
-  resolvable threads by index `updated_at`; it does not decide which runs
-  belong to the window. Keep its exclusions in scan evidence and never describe
+  --output SELECTION` in the installed skill folder. The selector freezes
+  candidates from the app registry's activity dates and
+  current log paths; cached display-name dates do not determine recency.
+  Missing app metadata blocks selection. Run collection decides which completed
+  turns belong to the window. Keep its exclusions in scan evidence and never
+  describe
   an excluded thread as reviewed. Exclude this scan's own thread unless the
   user explicitly includes it.
 - For a recent selection, run `python
   scripts/credit-analysis-workflow.py quick-collect --selection SELECTION
   --output BATCH`, adding `--pricing-profile` only for valid caller-supplied
   rates and `--include-current` only when explicitly requested. The helper
-  retains one batch containing each thread's completed-run suffix in
-  `(as_of - DAYS, as_of]`, usage, ledger, and redacted semantics. It records
-  self-exclusion, empty windows, non-suffix windows, and source failures
-  explicitly. For Ledger Review step 2, run `python
+  retains one batch containing each thread's completed runs started in
+  `(as_of - DAYS, as_of]` and completed by `as_of`, with usage, ledger, and
+  redacted semantics. It resolves each chat's current log before reading its
+  bounded prefix, so archive moves and later appended turns preserve the
+  selected window. It records self-exclusion, empty windows, and source
+  failures explicitly. For Ledger Review step 2, run `python
   scripts/credit-analysis-workflow.py inspect-quick-calls --batch BATCH
   --thread THREAD_ID --turn TURN_ID --first-call FIRST --call-count COUNT`.
   Take thread and turn IDs from the batch, FIRST from the next unread call
@@ -49,7 +54,8 @@ Sol analysis children.
 - For an exact source without a recent-days window, omit `--last-runs` for a
   full thread or set it to the completed-run suffix required by the stated
   last-runs or closure boundary. If the boundary cannot be resolved exactly,
-  stop for that source. Use only the selected session record as evidence; visible
+  stop for that source. Use only the selected session record as evidence;
+  visible
   conversation context may identify scope but cannot replace the record.
 
 ## Ledger Review
