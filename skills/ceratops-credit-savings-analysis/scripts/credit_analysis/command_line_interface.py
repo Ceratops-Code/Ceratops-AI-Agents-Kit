@@ -18,7 +18,7 @@ def command_select_recent(
     collector = _load_evidence_collector()
     try:
         as_of = (
-            collector.parse_utc_timestamp(as_of_text, "as_of")
+            collector.read_session_sources.parse_utc_timestamp(as_of_text, "as_of")
             if as_of_text is not None
             else dt.datetime.now(dt.timezone.utc)
         )
@@ -26,20 +26,26 @@ def command_select_recent(
         raise CreditAnalysisError(str(exc)) from exc
     if as_of > dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=5):
         raise CreditAnalysisError("as_of cannot be in the future")
-    index = collector.load_thread_index()
+    registry = collector.read_session_sources.read_thread_registry()
     start = as_of - dt.timedelta(days=days)
     candidates: list[dict[str, Any]] = []
     exclusions: list[dict[str, str]] = []
-    for entry in index["entries"]:
-        updated_at = collector.parse_utc_timestamp(
-            entry["updated_at"], "thread index updated_at"
+    for entry in registry["entries"]:
+        updated_at = collector.read_session_sources.parse_utc_timestamp(
+            entry["updated_at"], "thread activity updated_at"
         )
-        if updated_at < start or updated_at > as_of:
+        created_at = entry.get("created_at")
+        if updated_at < start or (
+            created_at is not None
+            and collector.read_session_sources.parse_utc_timestamp(created_at, "thread created_at") > as_of
+        ):
             continue
         thread_id = entry["thread_id"]
         try:
-            session = collector.resolve_thread_session(thread_id)
-            metadata = collector.read_session_source_metadata(
+            session = collector.read_session_sources.resolve_thread_session(
+                thread_id, registry_entry=entry,
+            )
+            metadata = collector.read_session_sources.read_session_source_metadata(
                 session, expected_thread_id=thread_id
             )
         except (OSError, RuntimeError, ValueError):
@@ -71,7 +77,7 @@ def command_select_recent(
             "schema": "ceratops-credit-quick-selection.v1",
             "as_of": as_of.isoformat().replace("+00:00", "Z"),
             "days": days,
-            "thread_index_fingerprint": index["fingerprint"],
+            "thread_registry_fingerprint": registry["fingerprint"],
             "threads": candidates,
             "exclusions": exclusions,
         },
@@ -87,7 +93,7 @@ def command_select_recent(
 def command_quick_window(
     days: int, as_of_text: str, usage_path: pathlib.Path
 ) -> dict[str, Any]:
-    """Count the completed-run suffix inside a frozen recent-days window."""
+    """Return exact completed-run identities inside a frozen recent-days window."""
 
     collector = _load_evidence_collector()
     evidence = json.loads(usage_path.expanduser().read_text(encoding="utf-8"))
@@ -108,7 +114,7 @@ def _quick_window(days: int, as_of_text: object, runs: Any) -> dict[str, Any]:
         raise CreditAnalysisError("days must be positive")
     collector = _load_evidence_collector()
     try:
-        as_of = collector.parse_utc_timestamp(as_of_text, "as_of")
+        as_of = collector.read_session_sources.parse_utc_timestamp(as_of_text, "as_of")
     except RuntimeError as exc:
         raise CreditAnalysisError(str(exc)) from exc
     if as_of > dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=5):
@@ -125,18 +131,16 @@ def _quick_window(days: int, as_of_text: object, runs: Any) -> dict[str, Any]:
         ):
             raise CreditAnalysisError(f"usage evidence run {index + 1} is invalid")
         try:
-            started_at = collector.parse_utc_timestamp(
+            started_at = collector.read_session_sources.parse_utc_timestamp(
                 run.get("started_at"), f"usage evidence run {index + 1} started_at"
             )
         except RuntimeError as exc:
             raise CreditAnalysisError(str(exc)) from exc
         if start < started_at <= as_of:
             selected.append(run["turn_id"])
-    suffix = [run["turn_id"] for run in runs[-len(selected):]] if selected else []
-    if selected != suffix:
-        raise CreditAnalysisError("quick window runs are not a completed-run suffix")
     return {
-        "last_runs": len(selected),
+        "run_count": len(selected),
+        "run_ids": selected,
         "first_run": selected[0] if selected else None,
         "last_run": selected[-1] if selected else None,
     }
@@ -158,7 +162,7 @@ def _quick_threads(value: Any) -> dict[str, dict[str, Any]]:
     for item in value:
         if not isinstance(item, dict):
             raise CreditAnalysisError("each quick thread must be an object")
-        identity = collector.canonical_thread_id(item.get("thread_id"))
+        identity = collector.read_session_sources.canonical_thread_id(item.get("thread_id"))
         if identity != item["thread_id"] or identity in result:
             raise CreditAnalysisError("duplicate or noncanonical quick thread ID")
         result[identity] = item
@@ -204,7 +208,7 @@ def _write_quick_output(path: pathlib.Path, value: Any) -> None:
 
 
 def _quick_selection(value: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    """Validate operational scope; index and project fields are annotations."""
+    """Bind operational scope; registry and project fields are annotations."""
     if value.get("schema") != "ceratops-credit-quick-selection.v1":
         raise CreditAnalysisError("batch requires a quick selection")
     days = value.get("days")
@@ -232,21 +236,20 @@ def _quick_selection(value: dict[str, Any]) -> dict[str, dict[str, Any]]:
 def _quick_snapshot(
     item: dict[str, Any], days: int, as_of: str,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
-    """Read once and bind the recent suffix to the exact selected session."""
+    """Resolve the chat's current log and read only its frozen source prefix."""
     collector = _load_evidence_collector()
-    session = pathlib.Path(item["session"]).expanduser().resolve(strict=True)
-    rows, fingerprint = collector.load_rows_with_fingerprint(session)
-    collector.session_source_metadata(rows, expected_thread_id=item["thread_id"])
+    session = collector.read_session_sources.resolve_thread_session(item["thread_id"])
+    boundary = collector.read_session_sources.parse_utc_timestamp(as_of, "as_of")
+    rows, fingerprint = collector.read_session_sources.load_rows_with_fingerprint(session, as_of=boundary)
+    collector.read_session_sources.session_source_metadata(rows, expected_thread_id=item["thread_id"])
     full = collector.build_session_evidence(rows, session=session, last_runs=None)
     window = _quick_window(days, as_of, full["runs"])
-    if not window["last_runs"]:
+    if not window["run_ids"]:
         return {}, rows, fingerprint
     ledger = collector.build_session_evidence(
-        rows, session=session, last_runs=window["last_runs"],
+        rows, session=session, last_runs=None, completed_turn_ids=window["run_ids"],
     )
-    if (ledger["runs"][0]["turn_id"], ledger["runs"][-1]["turn_id"]) != (
-        window["first_run"], window["last_run"],
-    ):
+    if [run["turn_id"] for run in ledger["runs"]] != window["run_ids"]:
         raise CreditAnalysisError("quick window changed during collection")
     return ledger, rows, fingerprint
 
@@ -283,7 +286,7 @@ def command_quick_collect(
     collector = _load_evidence_collector()
     pricing = collector.load_pricing_profile(pricing_profile) if pricing_profile else None
     current = os.environ.get("CODEX_THREAD_ID")
-    current = collector.canonical_thread_id(current) if current else None
+    current = collector.read_session_sources.canonical_thread_id(current) if current else None
     records = []
     for identity, item in threads.items():
         record: dict[str, Any] = {"thread_id": identity, "status": "unassessed"}
@@ -296,6 +299,7 @@ def command_quick_collect(
                 )
                 if not ledger:
                     record["status"] = "no-completed-runs"
+                    record["reason"] = "no completed runs started inside the window and completed by as_of"
                 else:
                     usage = collector.build_usage_evidence(rows, ledger, pricing)
                     record.update(
@@ -529,15 +533,24 @@ def command_quick_validate(
                 decision = classified.get(identity, {}).get("classification")
                 if not isinstance(decision, dict):
                     raise CreditAnalysisError("missing or invalid thread classification")
+                original_ledger = item.get("ledger")
+                if not isinstance(original_ledger, dict) or decision.get("session") != original_ledger.get("session"):
+                    raise CreditAnalysisError("classification session does not match the collected source")
                 ledger, rows, _ = _quick_snapshot(
                     sources[identity], selection["days"], selection["as_of"],
                 )
-                if ledger != item.get("ledger") or not ledger:
+                # A path move changes provenance, not chat identity. The resolver
+                # checked the current session_meta ID; all selected calls and
+                # semantics must still match before rebinding the caller input.
+                comparable = {**ledger, "session": original_ledger["session"]}
+                if comparable != original_ledger or not ledger:
                     raise CreditAnalysisError("selected source or completed-run window changed")
                 if _quick_semantics(collector, rows, ledger) != item.get("semantic"):
                     raise CreditAnalysisError("selected semantic evidence changed")
-                accepted = collector.build_classified_summary(ledger, decision)
-                record.update(status="validated", classification=decision, summary=accepted)
+                current_decision = {**decision, "session": ledger["session"]}
+                accepted = collector.build_classified_summary(ledger, current_decision)
+                record.update(status="validated", classification=current_decision,
+                              source_session=ledger["session"], summary=accepted)
                 totals["threads"] += 1
                 totals["runs"] += len(accepted["runs"])
                 for key, value in accepted["totals"].items():

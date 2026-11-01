@@ -36,6 +36,10 @@ respective executable behavior; this document explains how they work together.
       "role": "Quick batch collection, classification validation, and command dispatch"
     },
     {
+      "path": "skills/ceratops-credit-savings-analysis/scripts/credit_analysis/read_session_sources.py",
+      "role": "Read-only app registry, current log identity, and bounded session reads"
+    },
+    {
       "path": "skills/ceratops-credit-savings-analysis/SKILL.md",
       "role": "Public action routing and cross-action analysis boundaries"
     },
@@ -140,7 +144,7 @@ the collector and its own action reference without Luna or Sol children.
 - All mutable state and retained evidence live below a caller-selected task
   temporary root. Requests bind the expected contract versions.
 - The host must provide a working Codex executable, the declared models, Python,
-  access to the local Codex thread index and session files, and the source
+  read-only access to app metadata and session files, and the source
   working directories recorded by those sessions.
 
 Capacity estimates assume the byte-to-token and reserve values in
@@ -168,7 +172,7 @@ Credit-analysis controller ----------------------+
         |                                         |
         | read                                    | launch with no-tools prompt,
         v                                         | read-only sandbox, explicit model
-Codex thread index and session files              v
+Codex app registry and session files              v
                                                   Luna and Sol Codex children
         ^                                         |
         | read effective rules and source cwd     | structured result/events/usage
@@ -227,7 +231,8 @@ supports ledger analysis without model orchestration.
 | Stable executable entry point | Keeps one script path while forwarding to modular implementation | [credit-analysis-workflow.py](scripts/credit-analysis-workflow.py) |
 | CLI dispatcher | Parses analysis commands and composes quick batch collection and validation | [command_line_interface.py](scripts/credit_analysis/command_line_interface.py) |
 | Surface contract and request core | Validates the contract, one root thread request, and shared artifact paths | [single_surface_analysis.py](scripts/credit_analysis/single_surface_analysis.py) |
-| Session collector | Resolves active or archived sessions, descendant lineage, completed runs, model calls, token usage, and evidence references | [session_evidence_collector.py](scripts/credit_analysis/session_evidence_collector.py) |
+| Session sources | Reads current app activity, log identity and bounded JSONL prefixes without writes; repeated cumulative usage notifications do not create duplicate responses | [read_session_sources.py](scripts/credit_analysis/read_session_sources.py) |
+| Session collector | Extracts completed runs, model calls, token usage, and evidence references | [session_evidence_collector.py](scripts/credit_analysis/session_evidence_collector.py) |
 | Source execution context | Resolves run working directories, recovers identity-matched deleted worktrees, and snapshots effective `AGENTS.md` text and hashes once | [source_execution_context.py](scripts/credit_analysis/source_execution_context.py) |
 | Capacity planner | Partitions oversized runs, admits Luna tasks, assigns byte and candidate budgets to Sol reviewer bins, and enforces attempt capacity | [model_capacity_planning.py](scripts/credit_analysis/model_capacity_planning.py) |
 | Model input preparation | Builds bounded evidence packets and compact final-review transport | [model_input_preparation.py](scripts/credit_analysis/model_input_preparation.py) |
@@ -258,15 +263,21 @@ that design; it does not override the executable sources.
 
 ### Quick ledger analysis
 
-`quick-analysis` uses `select-recent` when choosing threads by a recent day
-interval. `quick-collect` reads each selected session once and derives its
-completed-run suffix, usage, ledger, and redacted semantics from those same
-rows. It uses the same frozen-window calculation as `quick-window`, excludes
+`quick-analysis` selects candidates from current app activity and log paths;
+`session_index.jsonl` supplies optional display labels only. The source reader
+opens the existing versioned app database in read-only mode, requires its known
+identity/path/activity fields, and closes the connection after each snapshot.
+`quick-collect` resolves each chat's current log and reads its prefix through
+`as_of`. Existing exact completed-turn selection then derives usage, ledger,
+and redacted semantics from those same rows. It excludes
 the current scan unless explicitly included, and retains empty windows and
 source failures. No full-thread intermediate files or analysis children are
 created. The caller reviews the evidence and supplies classifications;
-`quick-validate` rereads each ready source, requires the exact selected ledger
-and semantics to remain unchanged, and reuses the collector's validation of
+`quick-validate` resolves each ready chat again and requires its selected ledger
+and semantics to remain unchanged. A move preserves acceptance only when the
+chat ID and selected content match; the result reports the current path while
+the immutable batch retains its collection-time path. It reuses the collector's
+coverage checks for
 every call exactly once. Only accepted threads enter aggregate call and token
 totals. The quick action retains findings and coverage gaps in caller-owned
 evidence and presents at most three recommendations.
@@ -382,19 +393,21 @@ without launching models.
 ### 6.4 Quick recent-thread selection
 
 `select-recent --days DAYS --output OUTPUT` writes
-recent thread identities, sessions, index fingerprint, and exclusions to a
+recent chat identities, log paths, registry fingerprint, and exclusions to a
 caller-owned file. It does not prepare controller tasks or launch models.
 `--as-of` can freeze an exact UTC boundary; otherwise selection uses the
 invocation time. The action using the selection owns the output file's cleanup.
-`quick-window` reads collector usage evidence and returns a compact completed
-run count for the same boundary and day interval. It rejects a noncontiguous
-run window instead of widening the scan.
+`quick-window` reads collector usage evidence and returns exact completed-turn
+IDs in source order, their `run_count`, and the first/last selected ID. Recent
+collection reads the source prefix through the cutoff, then selects completed
+turns started within the requested interval. Later appended turns do not widen
+or reject that frozen window.
 
 `quick-collect --selection SELECTION --output BATCH` writes
 `ceratops-credit-quick-batch.v1` with the original selection and one record per
 thread. Each record is `ready`, `excluded-current`, `no-completed-runs`, or
 `unassessed`. Ready records contain `ledger`, `semantic`, `usage`, `summary`,
-and the collected source fingerprint. The original index fingerprint, project
+and the collected source fingerprint. The registry fingerprint, project
 metadata, and source fingerprint are provenance annotations; live validation
 compares the selected ledger and semantics instead of rejecting irrelevant
 changes outside the selected window. `--include-current` is an explicit caller
@@ -589,9 +602,9 @@ needed to claim a measured result.
 
 | Scenario | Stimulus and condition | Expected response and threshold | Verification |
 | --- | --- | --- | --- |
-| Deterministic recent-days selection | The same index and UTC `as_of` are selected twice | The frozen selected thread IDs and order are identical; active and archived session locations are eligible | Quick selector behavior test |
+| Deterministic recent-days selection | The same app metadata snapshot and UTC `as_of` are selected twice | The frozen selected thread IDs and order are identical; active and archived session locations are eligible | Quick selector behavior test |
 | Quick batch validation | Some sources fail, change, or have incomplete classifications | Preserve per-source gaps and count only unchanged, fully classified threads without child model calls | Quick batch CLI behavior tests |
-| Bounded quick window | A selected thread has older and recent completed runs | The quick path returns only the recent completed-run suffix for `--last-runs` and rejects a noncontiguous window | Quick-window CLI behavior test |
+| Bounded quick window | A selected thread has older and recent completed runs | The quick path selects exact completed-turn IDs and ignores later appended turns while preserving changed-window gaps | Quick-window CLI behavior test |
 | Unfinished-thread coverage | A selected active thread contains completed runs and one running run | All completed runs enter evidence; the running run is reported unassessed | Session collector and thread tests |
 | Bounded discovery | Prepared evidence exceeds one Luna input but fits the global budget | The minimum ordered parts are admitted, no more than 15 run concurrently, and attempts never exceed 70 | Capacity and orchestration tests plus state totals |
 | Invalid Luna output | A Luna result violates schema or its byte allowance | The exact task is retried at most once with a smaller allowance, then omitted with identity, bytes, and reason | Response and retry tests |
@@ -609,7 +622,7 @@ needed to claim a measured result.
 - **Capacity can force omissions.** The controller records them, but a report
   with omissions is not semantically complete. Larger source histories may
   require a narrower selection or later continuation.
-- **Local session availability is required.** Missing or malformed thread-index
+- **Local session availability is required.** Missing or malformed app-registry
   records, session files, source directories, or instruction chains can exclude
   or block planning. Identity-matched worktree recovery covers only canonical
   deleted-worktree cases. After planning, retained instruction text is the

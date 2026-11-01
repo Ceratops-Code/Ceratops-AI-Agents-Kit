@@ -17,6 +17,95 @@ from tests.credit_analysis.paths import (
 )
 
 
+@pytest.mark.parametrize(
+    ("notification", "expected_calls"),
+    [("exact", 2), ("rate-limits", 2), ("no-total", 3),
+     ("advanced-total", 3), ("new-response", 2), ("total-only", 2)],
+)
+def test_repeated_usage_notifications_preserve_real_response_boundaries(
+    tmp_path: pathlib.Path, notification: str, expected_calls: int,
+) -> None:
+    session = tmp_path / "session.jsonl"
+    ledger_path = tmp_path / "ledger.json"
+    semantic_path = tmp_path / "semantic.json"
+    usage_path = tmp_path / "usage.json"
+    usage = {"input_tokens": 10, "output_tokens": 1, "total_tokens": 11}
+    first_info = {"last_token_usage": usage, "total_token_usage": usage}
+    duplicate_info = dict(first_info)
+    if notification == "no-total":
+        duplicate_info.pop("total_token_usage")
+    elif notification == "advanced-total":
+        duplicate_info["total_token_usage"] = {key: value * 2 for key, value in usage.items()}
+    elif notification == "total-only":
+        duplicate_info.pop("last_token_usage")
+    rows = [
+        {"type": "turn_context", "payload": {"turn_id": "turn-1"}},
+        {"type": "response_item", "payload": {
+            "type": "function_call", "name": "inspect", "arguments": "{}",
+        }},
+        {"type": "event_msg", "payload": {"type": "token_count", "info": first_info}},
+    ]
+    if notification in {"new-response", "total-only"}:
+        rows.append({"type": "response_item", "payload": {
+            "type": "function_call", "name": "inspect_pending", "arguments": "{}",
+        }})
+    rows.extend([
+        {"type": "event_msg", "payload": {
+            "type": "token_count", "info": duplicate_info,
+            "rate_limits": {"primary": {"used_percent": 12}} if notification == "rate-limits" else None,
+        }},
+        {"type": "response_item", "payload": {
+            "type": "message", "role": "assistant", "phase": "final_answer",
+        }},
+        {"type": "event_msg", "payload": {
+            "type": "token_count", "info": {
+                "last_token_usage": usage,
+                "total_token_usage": {key: value * 3 for key, value in usage.items()},
+            },
+        }},
+        {"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "turn-1"}},
+    ])
+    if notification == "total-only":
+        rows.insert(-3, {"type": "event_msg", "payload": {
+            "type": "token_count", "info": first_info,
+        }})
+    for index, row in enumerate(rows):
+        row["timestamp"] = f"2026-08-01T00:00:{index:02d}Z"
+    original = "".join(json.dumps(row) + "\n" for row in rows)
+    session.write_text(original, encoding="utf-8", newline="\n")
+    command = [
+        sys.executable, str(SESSION_EVIDENCE_COLLECTOR), "--session", str(session),
+        "--evidence-output", str(ledger_path), "--semantic-evidence-output", str(semantic_path),
+        "--include-run", "turn-1",
+    ]
+    # Fresh repeats use the source again; no caller progress or saved steps.
+    for _ in range(2):
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        assert result.returncode == 0, result.stderr
+        ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+        semantic = json.loads(semantic_path.read_text(encoding="utf-8"))
+        assert ledger["totals"]["model_calls"] == expected_calls
+        assert len(semantic["selected_runs"][0]["calls"]) == expected_calls
+        if notification in {"new-response", "total-only"}:
+            assert ledger["runs"][0]["calls"][1]["actions"][0]["name"] == "inspect_pending"
+            assert semantic["selected_runs"][0]["calls"][1]["semantic_actions"][0]["name"] == "inspect_pending"
+    result = subprocess.run(
+        [sys.executable, str(SESSION_EVIDENCE_COLLECTOR), "--session", str(session),
+         "--summary", "--evidence-output", str(usage_path)],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    detailed = json.loads(usage_path.read_text(encoding="utf-8"))
+    assert detailed["totals"]["model_calls"] == expected_calls
+    assert detailed["totals"]["total_tokens"] == expected_calls * 11
+    if notification in {"new-response", "total-only"}:
+        assert any(
+            action["name"] == "inspect_pending" and action["model_call_index"] == 2
+            for action in detailed["runs"][0]["tool_action_results"]
+        )
+    assert session.read_text(encoding="utf-8") == original
+
+
 def test_model_call_ledger_keeps_full_evidence_out_of_stdout(
     tmp_path: pathlib.Path,
 ) -> None:
@@ -1002,6 +1091,11 @@ def test_model_call_ledger_closure_mode_is_artifact_free(
     private_tool = pathlib.Path.home() / "private" / "tool.py"
     search_secret = "search-secret"
     rows = [
+        {
+            "timestamp": "2026-07-25T00:00:00Z",
+            "type": "session_meta",
+            "payload": {"id": thread_id, "cwd": str(tmp_path)},
+        },
         {
             "timestamp": "2026-07-25T00:00:00Z",
             "type": "turn_context",

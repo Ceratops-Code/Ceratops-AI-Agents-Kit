@@ -1,6 +1,8 @@
 import argparse
+import contextlib
 import copy
 import hashlib
+import io
 import json
 import pathlib
 import runpy
@@ -99,6 +101,12 @@ class RuleGraphTests(unittest.TestCase):
             runtime_root = root / "runtime" / "automations"
             codex_home = root / "codex-home"
             codex_home.mkdir(parents=True)
+            (codex_home / "AGENTS.md").write_text(
+                "- [AUDIT-01] Retain the review marker.\n  - self: list-heavy\n"
+                "- [AUDIT-02] Keep the other behavior.\n  - overlaps: AUDIT-01\n"
+                "- [AUDIT-03] " + "Preserve this duty. " * 40
+                + "\n  - self: exceeds-limit\n", encoding="utf-8",
+            )
 
             self.write_automation(source_root, "diskfinventorycheck", "max")
             self.write_automation(source_root, "routine-audit", "max")
@@ -142,7 +150,7 @@ class RuleGraphTests(unittest.TestCase):
             )
             self.assertEqual(
                 snapshot["d_rule_brevity"]["sources_checked"],
-                2,
+                3,
             )
             self.assertEqual(
                 snapshot["schema"],
@@ -155,6 +163,62 @@ class RuleGraphTests(unittest.TestCase):
                 "global-governance-consistency-audit/decision.v2",
             )
             self.assertNotIn("misplaced_worktrees", decision["counts"])
+            clusters = decision["review_clusters"]
+            self.assertEqual(clusters["rules"][0]["path"], str(codex_home / "AGENTS.md"))
+            self.assertEqual(clusters["rules"][0]["reviews"][0]["rule_ids"], ["AUDIT-01"])
+            self.assertEqual(clusters["rules"][0]["relation_reviews"][0]["rules"], ["AUDIT-01", "AUDIT-02"])
+            self.assertEqual(clusters["rules"][0]["approved_debt"][0]["rule_ids"], ["AUDIT-03"])
+            self.assertEqual(clusters["automation_controls"][0]["source_path"], str(source_root / "diskfinventorycheck/automation.toml"))
+            self.assertEqual(clusters["automation_controls"][0]["differences"]["reasoning_effort"], {"source": "max", "runtime": "medium"})
+            self.assertTrue(all(pathlib.Path(row["path"]).is_absolute() for row in clusters["effort_mismatches"]))
+            evidence = root / "evidence.json"
+            GOVERNANCE_SNAPSHOT["write_evidence"](evidence, snapshot, False)
+            original = evidence.read_bytes()
+            main = GOVERNANCE_SNAPSHOT["main"]
+
+            def invoke():
+                output, errors = io.StringIO(), io.StringIO()
+                with mock.patch.object(sys, "argv", ["snapshot", "--summarize-evidence", str(evidence)]), contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                    status = main()
+                return status, output.getvalue(), errors.getvalue()
+
+            # Reading saved evidence must never re-enter project discovery.
+            with mock.patch.dict(main.__globals__, {"build_snapshot": mock.Mock(side_effect=AssertionError("unexpected rescan"))}):
+                for _ in range(2):
+                    status, output, errors = invoke()
+                    self.assertEqual((status, errors), (0, ""))
+                    self.assertEqual(json.loads(output), decision)
+                    self.assertEqual(evidence.read_bytes(), original)
+                for boundary in ("before", "after"):
+                    def interrupted_print(*args, **kwargs):
+                        if boundary == "after":
+                            print(*args, **kwargs)
+                        raise KeyboardInterrupt(boundary)
+                    with mock.patch.dict(main.__globals__, {"print": interrupted_print}):
+                        with self.assertRaises(KeyboardInterrupt):
+                            invoke()
+                    self.assertEqual(evidence.read_bytes(), original)
+                    self.assertEqual(json.loads(invoke()[1]), decision)
+                for invalid in ("{", "[]", '{"schema":"wrong"}', json.dumps({"schema": snapshot["schema"]}), json.dumps({**snapshot, "automations": {}})):
+                    evidence.write_text(invalid, encoding="utf-8")
+                    status, output, errors = invoke()
+                    self.assertEqual((status, output), (1, ""))
+                    self.assertIn(str(evidence), errors)
+                    self.assertEqual(evidence.read_text(encoding="utf-8"), invalid)
+                evidence.unlink()
+                self.assertEqual(invoke()[0], 1)
+            prohibited = root / "should-not-exist.json"
+            result = subprocess.run(
+                [sys.executable, str(SCRIPTS / "governance-snapshot.py"), "--summarize-evidence", str(evidence), "--evidence-output", str(prohibited)],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertFalse(prohibited.exists())
+            path_join = GOVERNANCE_SNAPSHOT["control_file_path"]
+            self.assertEqual(path_join("C:/Saved/automations", "audit/automation.toml"), "C:\\Saved\\automations\\audit\\automation.toml")
+            for invalid_path in ("../escape.toml", ""):
+                with self.assertRaises(ValueError):
+                    path_join(str(root), invalid_path)
 
     def test_reference_inventory_classifies_supported_helper_suffixes(self):
         helper_names = [

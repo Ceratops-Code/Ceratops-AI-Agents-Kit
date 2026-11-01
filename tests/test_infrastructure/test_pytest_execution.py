@@ -639,7 +639,7 @@ def test_import_failure_summary_keeps_terminal_plugin_error(
         capture_output=True, text=True, check=False, timeout=30,
     )
     assert startup.returncode != 0
-    terminal = 'ImportError: Error importing plugin "report_test_progress": No module named \'ceratops_missing_report_dependency\''
+    terminal = "ModuleNotFoundError: No module named 'ceratops_missing_report_dependency'"
     assert terminal in startup.stderr
     stdout, stderr = startup.stdout, startup.stderr
     if wrapped:
@@ -685,11 +685,16 @@ def test_import_failure_summary_keeps_terminal_plugin_error(
 
 
 @pytest.mark.parametrize("stream", ["stdout", "stderr", "captured"])
-def test_startup_summary_requires_uncaptured_native_stderr(test_runner_module, stream):
-    traceback = "Traceback (most recent call last):\nImportError: actual import failure\n"
+@pytest.mark.parametrize("style", ["traceback", "plugin"])
+def test_startup_summary_requires_uncaptured_native_stderr(test_runner_module, stream, style):
+    traceback = (
+        "Traceback (most recent call last):\nImportError: actual import failure\n"
+        if style == "traceback" else
+        'Error while loading plugin "broken_plugin".\nE   ImportError: actual import failure\n'
+    )
     stdout, stderr = (traceback, "") if stream == "stdout" else ("", traceback)
     if stream == "stderr":
-        stderr = "ImportError: not a native traceback\n"
+        stderr = "E   ImportError: not a native traceback\n"
     elif stream == "captured":
         stderr = "----- Captured stderr call -----\n" + stderr
     summary = test_runner_module.pytest_diagnostics.pytest_failure_summary(stdout, stderr)

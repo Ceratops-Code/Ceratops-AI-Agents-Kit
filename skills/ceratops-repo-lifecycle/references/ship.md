@@ -132,7 +132,7 @@ failed receipt is added.
 - Whether the head is reusable after merge.
 - Optional SDLC path and ordered complete YAML locations for requested work.
   Run repository and selected-deliverable validation and tests in declaration
-  order. Version-3 explicit selections retain every applicable gate.
+  order. SDLC v4/v5 explicit selections retain every applicable gate.
 
 ## Constraints
 
@@ -172,9 +172,10 @@ failed receipt is added.
    exact version-1 record, then the helper checks the canonical version-2 scope.
    Prevalidate all selected entries, parameters, exact argv and
    repository-bounded working directories from `sdlc/sdlc.yml`, then run
-   applicable validation and tests. Historical contracts retain their no-op
-   behavior; version-3 deliverables explicitly declare tests. Only `validate`
-   and `tests` entries may be selected as checks; missing locations are errors.
+   applicable validation and tests. Reject SDLC v1-v3 before executing any
+   operation; v4/v5 preserve declared commands, handoffs, and reasoned no-ops.
+   Only `validate` and `test` entries may be selected as checks; missing
+   locations are errors.
    Registered skill actions execute through the SDLC engine. An unresolved
    handoff blocks dependent mutation; CI never executes skill handoffs.
    Before the first push, run declared `repository.test-selection` operations

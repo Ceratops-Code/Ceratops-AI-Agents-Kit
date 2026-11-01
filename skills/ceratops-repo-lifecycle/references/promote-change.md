@@ -145,8 +145,8 @@ abandonment/replacement and worktree removal rather than matching-work success.
   operations; the helper forwards them to the declared operation and applies
   them only when declared by a validation or test check.
 - Optional ordered `--validation-operation LOCATION` flags select checks.
-  SDLC versions 3 and 4 retain repository and selected-deliverable validation
-  and tests; earlier formats preserve their original selection behavior.
+  SDLC v4/v5 retain repository and selected-deliverable validation and tests;
+  v1-v3 contracts are rejected before any operation executes.
 
 ## Constraints
 
