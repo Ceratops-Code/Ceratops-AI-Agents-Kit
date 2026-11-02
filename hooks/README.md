@@ -99,7 +99,7 @@ For example, discover all rename candidates, then inspect selected files:
 ### Managed installation and registration
 
 The `ceratops-mcp-server-lifecycle` skill owns release packaging and installation.
-`tools/pyproject.toml` declares `source_search_mcp` version `1.0.1` with the
+`tools/pyproject.toml` declares `source_search_mcp` and its release version with the
 repository's pinned MCP dependency and wheel backend. `tools/mcp-server.json`
 selects the readiness module, and the common `scripts/uv.lock` locks the
 release's
