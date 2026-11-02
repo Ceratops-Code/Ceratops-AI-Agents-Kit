@@ -410,6 +410,62 @@ def test_pytest_setup_failure_returns_diagnostic_before_launch(
     assert ordinary.returncode == 0 and ordinary.stdout.strip() == "ordinary command"
 
 
+def test_nested_pytest_does_not_read_or_overwrite_parent_summary(test_runner_module, tmp_path, monkeypatch):
+    summary = tmp_path / "parent-results.json"
+    summary.write_text("parent write is incomplete", encoding="utf-8")
+    monkeypatch.setenv("CERATOPS_PYTEST_RESULT_SUMMARY", str(summary))
+    monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
+    (tmp_path / "test_child.py").write_text("def test_child(): pass\n", encoding="utf-8")
+    for _ in range(2):
+        result = test_runner_module.run_text(
+            [sys.executable, "-m", "pytest", "-q", "-o", "addopts=", "test_child.py"], tmp_path,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert summary.read_text(encoding="utf-8") == "parent write is incomplete"
+
+
+@pytest.mark.parametrize("saved", [None, "", "{", "[]", "{}", '{"collected":-1,"executed":0,"reused":0}'])
+@pytest.mark.parametrize("exit_code", [0, 7])
+def test_missing_or_broken_pytest_summary_preserves_child_failure(
+    test_runner_module, tmp_path, monkeypatch, saved, exit_code,
+):
+    """Report interruption before/after summary creation without losing test output."""
+    progress = test_runner_module.pytest_progress
+    launches = []
+
+    class Child:
+        def __init__(self, command, **kwargs):
+            launches.append(command)
+            destination = pathlib.Path(kwargs["env"][progress.RESULT_SUMMARY_ENV])
+            destination.unlink(missing_ok=True)
+            if saved is not None:
+                destination.write_text(saved, encoding="utf-8")
+            self.stdout = io.StringIO("original test failure on stdout\n")
+            self.stderr = io.StringIO("original child stderr\n")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def wait(self):
+            return exit_code
+
+    monkeypatch.setattr(progress.subprocess, "Popen", Child)
+    environment = {"TMP": str(tmp_path), progress.RESULT_CONTEXT_ENV: "{}"}
+    for _ in range(2):
+        result = progress.run_pytest([sys.executable, "-m", "pytest", "-q"], tmp_path, environment)
+        assert result.returncode == (exit_code or 2)
+        assert result.stdout == "original test failure on stdout\n"
+        assert "original child stderr" in result.stderr
+        assert "pytest result summary unavailable" in result.stderr
+        assert f"pytest exit={exit_code}" in result.stderr
+        assert repr(launches[-1]) in result.stderr
+        assert str(tmp_path) in result.stderr and sys.executable in result.stderr
+        assert result.accepted_checks is None and result.check_summary is None
+
+
 def test_live_progress_precedes_completion_and_fresh_execution_needs_no_history(
     test_runner_module: Any,
     tmp_path: pathlib.Path,

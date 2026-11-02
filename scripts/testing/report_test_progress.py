@@ -226,6 +226,9 @@ def run_pytest(
     reader drains stderr concurrently with stdout so either pipe can fill safely.
     """
     child = dict(environ)
+    # Nested test commands must never read their parent's result destination.
+    # Only a new result context below selects a summary for this child.
+    child.pop(RESULT_SUMMARY_ENV, None)
     plugin_root = str(pathlib.Path(__file__).resolve().parent)
     child["PYTHONPATH"] = os.pathsep.join(
         value for value in (plugin_root, child.get("PYTHONPATH")) if value
@@ -284,9 +287,21 @@ def run_pytest(
     result = PytestProcess(command, code, stdout, "".join(errors) + final_status)
     if destination := child.get(RESULT_SUMMARY_ENV):
         summary_path = pathlib.Path(destination)
-        if summary_path.is_file():
+        try:
             summary = json.loads(summary_path.read_text(encoding="utf-8"))
-            result.accepted_checks = {key: summary[key] for key in ("collected", "executed", "reused")}
+            counts = {key: summary[key] for key in ("collected", "executed", "reused")}
+            if any(type(value) is not int or value < 0 for value in counts.values()):
+                raise ValueError("pytest result counts must be nonnegative integers")
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            # A reporting failure after pytest exits must not erase the original
+            # command failure or its streams, nor turn missing acceptance into success.
+            result.returncode = code or 2
+            result.stderr += (
+                f"\npytest result summary unavailable: {summary_path}; {type(exc).__name__}: {exc}; "
+                f"command={argv!r}; runtime={sys.executable}; cwd={cwd}; pytest exit={code}\n"
+            )
+        else:
+            result.accepted_checks = counts
             result.accepted_result_references = summary.get("result_references", [])
             result.nonreusable_checks = summary.get("nonreusable_checks", [])
             result.skipped_checks = summary.get("skipped_checks", [])

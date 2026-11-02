@@ -392,6 +392,11 @@ readable after progress lines are excluded. A closed display does not stop pipe
 drainage or change the command result; interruption stops the owned child and
 joins its reader before propagating.
 
+If pytest's result summary is missing, incomplete or unreadable, the transport
+keeps pytest's exit status and both output streams and adds the summary error.
+A zero pytest exit with an unusable summary returns a reporting failure instead
+of accepting unrecorded results. Scratch still leaves with its execution scope.
+
 These status messages are in-memory observations, with no execution identifier,
 checkpoint, file, or selection/recovery role. The tool caller can display them
 inside one active tool execution without a model turn per update. The runner's
