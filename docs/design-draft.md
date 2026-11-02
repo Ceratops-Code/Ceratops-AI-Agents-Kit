@@ -1122,7 +1122,9 @@ one passing check cannot clear a report containing another unfixed failure.
 Unlock, restart, exception and phase advancement confer no deletion authority.
 Successful/mixed test results, build results, receipts, required acceptance logs,
 other worktrees/actions and unmanaged user-retained files are excluded.
-No retention sweep, process discovery or repeat acceptance checks are added.
+Lookup of owned temporary reports stays inside the caller's repository/task
+tree, without following redirected directories. No process discovery or repeat
+acceptance checks are added.
 
 4B connects success at the code that consumes each result. Promote and
 `ship_repository.py` pass successful SDLC results to
@@ -1134,9 +1136,12 @@ step identity, so completing one selected skill cannot clear another's report.
 Ship's retained delivery results use this same path without repeating effects.
 
 `command.py::remove_resolved_failures()` compares the supplied command/check IDs
-with the report's keys, not its diagnostic prose. Partial success writes the
-remaining failures and accepted-result references directly to the same path;
-complete resolution calls the writing helper's `remove_failure_report()`.
+with owned reports' keys, not their diagnostic prose. It handles earlier files
+in the same task tree as well as the currently selected path. Partial success
+keeps remaining failures and accepted-result references; complete resolution
+removes the obsolete managed report. Full-operation success covers all that
+operation's failed step IDs, including steps absent from the current contract;
+partial command success still resolves only its exact completed positions.
 It retains uncertain writers and files with different ownership or format.
 An I/O error is returned as `report_cleanup_error` on the successful result;
 it does not revoke that success or schedule another check/build/delivery.
@@ -2085,12 +2090,59 @@ removed names, destination, source commit, transaction ID and runtime-cleanup de
 The MCP installer follows the same separation and also returns the manager's
 complete `maintenance` object (`removed`, `deferred`, `errors`).
 
+`command.py::write_operation_report()` owns caller-selected temporary attempt
+snapshots under the caller's repository/task temp namespace. They retain that
+identity even after shipping removes the task worktree. Promotion's result
+writer and the operation CLI's failure-evidence writer use this same code.
+Explicit caller-retained promotion exports outside that namespace preserve the
+original payload and are never claimed for automatic temporary-report deletion.
+The original outcome fields remain intact, with `temporary_operation_report`
+metadata naming the owner, original requested operations and unresolved IDs.
+A newly published failure replaces older snapshots of the same owner and
+original requested-operation set,
+retaining one current snapshot in that group. Publication is atomic and removes
+its reserved `.<report-name>.operation-report.tmp` staging file after success or
+interruption. A fresh stopped-writer cleanup also removes such unpublished
+staging files; they are neither acceptance nor service-progress records.
+Startup retains at most two interrupted predecessors per group; publication
+makes room for the next snapshot before writing it. Incomplete retention blocks
+another snapshot while preserving the actual operation outcome in the response.
+Normal operation completion
+retires matching unsuccessful snapshots, including an earlier promotion handoff
+after the selected installation genuinely completes through an operation call.
+Partial completion changes only cleanup metadata, preserving the original error.
+The lookup does not cross task boundaries, follow links or use reports to resume
+effects. Successful reports and acceptance records remain outside automatic
+retirement. Cleanup errors preserve completed work and report the affected path.
+Path-scoped `report_cleanup_errors` accompany the compact `report_cleanup_error`
+message, so a successful unrelated suboperation cannot erase outstanding cleanup
+debt from an earlier phase.
+
+Single-step MCP installation and skill deployment handoffs expose a
+`report_completion` call descriptor with an `actual_completion_file` answer.
+Compact promotion/shipping responses expose these descriptors as
+`report_completions`, including calls nested in deployment/publication results.
+`repository_operation.py --retire-handoff-reports PATH` consumes that actual
+installer result under the release-source lock, using the current registered
+operation and clean source commit. The shared deployment-receipt checker also
+checks producer, destination, selected target and absence of cleanup debt.
+Only matching owned reports in the input's task temp tree are retired; accepted
+results and unrelated operations remain intact. The input is removed after its
+contents and file identity remain unchanged across consumption. A missing input
+with remaining pending reports fails; a repeated completed return succeeds.
+This mode never dispatches the operation or reads old reports as progress.
+Its own failed return reports are retired after a successful return as well.
+Other handoff types and multi-step operations do not advertise this receiver,
+because a child installer's receipt cannot prove the whole operation completed.
+
 Repo lifecycle records the result of its own requested installation, then removes
-only its completed caller-selected promotion report through the existing
+its completed caller-selected promotion report through the existing
 `--finalize-result` command. The report's digest selects the exact file to remove;
 it is not passed to installers or attached to installation results. Pending,
-failed or cleanup-blocked installations keep the report. No external receipt can
-turn a saved pending handoff into completion. Cleanup never runs installation or
+failed or cleanup-blocked installations keep needed evidence until the matching
+operations complete. Automatic retirement of an obsolete unsuccessful snapshot
+does not turn that saved attempt into completion. No external receipt can turn
+a saved pending handoff into completion. Cleanup never runs installation or
 replays promotion; repeating it after the exact report is absent succeeds.
 Build receipts, successful results and unrelated files are excluded. An optional
 MCP `--evidence-output` is a caller-owned installation result, not a promotion

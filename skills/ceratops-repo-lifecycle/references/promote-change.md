@@ -230,9 +230,31 @@ Preparation-only requires a clean `main` checkout and exits immediately after
 the selected local promotion branch is ready, before source preflight,
 promotion, scope records, or deployment.
 
-Use `--result-file PATH` outside the repository to atomically retain the exact
-JSON outcome, including operation receipts and phase durations in seconds. The
+Use `--result-file PATH` outside the repository to atomically retain the
+JSON outcome, operation receipts and phase durations. The
 helper records successful and failed attempts without replaying operations.
+
+Inside the caller's task temp tree, the shared operation-report writer adds
+`temporary_operation_report` ownership metadata. Reports explicitly retained
+outside that namespace keep their original payload and are not automatically
+deleted.
+Normal successful SDLC operations automatically remove obsolete unsuccessful
+reports with matching operation IDs in that task tree, including reports saved
+under earlier filenames. Partial completion preserves unresolved operations and
+the original error. A newly published failure keeps only its current snapshot
+for the same owner and original requested-operation set. Accepted results and successful
+reports remain outside this automatic retirement; their explicit finalization
+is unchanged. Cleanup never substitutes a model judgment or replays an effect.
+
+When a single-step installation is handed back to the caller, the result's
+`report_completion` descriptor supplies its normal return command and answer
+schema; compact promotion/shipping responses include these in
+`report_completions`. `repository_operation.py --repo-root REPO --operation OPERATION
+--retire-handoff-reports PATH` consumes the actual installer's completion JSON
+inside this task's temp tree. It checks the current operation, source commit,
+producer and selected target before retiring obsolete unsuccessful reports and
+the consumed temporary input. It never installs again; an interrupted return
+can use the same call. Other handoff types do not advertise this receiver.
 
 Validate completed operations and their recorded steps. Steps without structured
 output use the recorded command completion evidence.

@@ -1561,6 +1561,33 @@ rerunning tests. Caller-retained reports outside managed storage stay untouched.
 Lifecycle commands separately retire their own operation reports after consuming
 successful command results. Neither cleanup deletes `check_results.json`.
 
+`github_pr_workflow.command` also owns temporary operation-attempt snapshots in
+the repository's caller-selected task temp tree. Promotion results and operation
+`--evidence-file` outputs include `temporary_operation_report` ownership and
+unresolved-operation metadata. Normal successful SDLC operations remove matching
+obsolete diagnostics and attempt snapshots throughout that same task tree, even
+when the next call selects another filename. Partial success retains remaining
+failures; a whole-operation success also retires failed steps removed from the
+current contract. New failure publication keeps one current snapshot per owner
+and original requested-operation set. Startup bounds interrupted predecessors
+to two in that group. Successful snapshots, accepted results,
+foreign files, redirected paths and other tasks remain outside automatic
+deletion. Cleanup errors remain observational and do not replay work.
+Each report reserves `.<report-name>.operation-report.tmp` for atomic writes;
+stopped-writer startup and completion discard unpublished staging bytes.
+Cleanup errors retain their affected paths across independent suboperations.
+Caller-selected promotion exports outside the task temp namespace retain their
+original payload and remain outside automatic deletion.
+For a single-step installation handed back to the caller, `report_completion`
+provides the normal helper call and answer schema. Compact promotion/shipping
+responses keep these calls in `report_completions`, including nested deployment
+and publication results. Its
+`--retire-handoff-reports PATH` mode consumes the actual installer's completion
+JSON from the same task temp tree. It checks the current registered operation,
+source commit, producer and selected target, retires obsolete unsuccessful
+reports and removes the consumed temporary input without installing again.
+An interrupted return call can be repeated through the same public entry point.
+
 The compatibility review `ND.COMPATIBILITY.TEST_RESULT_REUSE` checks observed
 reuse and interruption behavior. It accepts different storage formats and asks
 what completed work a repository loses if it can reuse only a whole run.

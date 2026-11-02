@@ -19,7 +19,6 @@ import re
 import stat
 import subprocess
 import sys
-import tempfile
 import time
 from contextlib import contextmanager
 from typing import Any, NamedTuple
@@ -32,6 +31,8 @@ from github_pr_workflow.command import (
     CommandError,
     capture_failure_report,
     describe_command_failure,
+    handoff_report_completions,
+    operation_report_root,
     project_task_temp_root,
     release_write_context,
     remove_resolved_failures,
@@ -40,6 +41,7 @@ from github_pr_workflow.command import (
     require_success,
     run_command,
     run_command_for_json,
+    write_operation_report,
 )
 from github_pr_workflow.dependency_common import normalize_github_repo
 from repository_operation import (
@@ -753,7 +755,8 @@ def _promote_with_rollback(
                     rollback["release_branch"],
                     rollback["state"],
                 )
-            except Exception as restore_exc:  # Preserve both promotion and restoration failures.
+            # Retain both failures even when restoration raises an unforeseen error.
+            except Exception as restore_exc:  # noqa: BLE001
                 raise PromotionError(
                     f"Promotion failed: {exc}; restoring the original checkout "
                     f"also failed: {restore_exc}"
@@ -772,34 +775,13 @@ def _timed_phase(timings: dict[str, float], phase: str, *, diagnostic_output=Non
         timings[phase] = round(time.monotonic() - started, 6)
 
 
-def _save_result(path: pathlib.Path, result: dict[str, object]) -> str:
+def _save_result(path: pathlib.Path, result: dict[str, object], repo_root: pathlib.Path) -> str:
     """Publish the complete report and return its exact-byte cleanup digest.
 
     The caller can print only a summary after publication succeeds. The report
     is observational; neither it nor its digest can resume lifecycle effects.
     """
-    # A long operation may outlive cleanup of its initially empty result
-    # directory. Recreate that directory without replaying the operation.
-    path.parent.mkdir(parents=True, exist_ok=True)
-    staging = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=path.parent,
-            prefix="." + path.name,
-            suffix=".tmp",
-            delete=False,
-        ) as stream:
-            staging = pathlib.Path(stream.name)
-            json.dump(result, stream, indent=2)
-            stream.write("\n")
-        digest = hashlib.sha256(staging.read_bytes()).hexdigest()
-        staging.replace(path)
-        return digest
-    finally:
-        if staging is not None:
-            staging.unlink(missing_ok=True)
+    return write_operation_report(path, result, repo_root=repo_root, action="promote", retain_external_output=True)
 
 
 def _result_summary(
@@ -810,8 +792,12 @@ def _result_summary(
         key: result[key] for key in (
             "status", "phase", "operation", "release_branch", "head", "commit",
             "replay_required", "remote_mutation", "timings_seconds",
+            "report_cleanup_error",
         ) if key in result
     }
+    completions = handoff_report_completions(result)
+    if completions:
+        summary["report_completions"] = completions
     if result.get("message"):
         # The first line names the failed operation; complete causes and child
         # streams remain in the exact report rather than spilling into stdout.
@@ -1307,6 +1293,7 @@ def main(argv: list[str] | None = None) -> int:
     started = time.monotonic()
     timings: dict[str, float] = {}
     result_file = None
+    report_repo_root = args.repo_root
     result_digest = None
     failed = False
     try:
@@ -1320,6 +1307,7 @@ def main(argv: list[str] | None = None) -> int:
             if requested.exists() and not requested.is_file():
                 raise PromotionError("result-file must name a file")
             result_file = requested
+            report_repo_root = operation_report_root(args.repo_root)
         result = promote(args, timings=timings)
     except (
         CommandError,
@@ -1341,8 +1329,8 @@ def main(argv: list[str] | None = None) -> int:
     result["timings_seconds"] = timings
     if result_file is not None:
         try:
-            result_digest = _save_result(result_file, result)
-        except OSError as exc:
+            result_digest = _save_result(result_file, result, report_repo_root)
+        except (OSError, ValueError, CommandError) as exc:
             # Side effects may already be complete. Retain their exact outcome
             # in the error instead of suggesting a replay to recover a record.
             result = {

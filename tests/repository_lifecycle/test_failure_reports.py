@@ -1220,3 +1220,264 @@ def test_review_cleanup_error_reaches_gate_caller(report_repo, monkeypatch):
                                      ci_wait_seconds=0, review_wait_seconds=0)
     assert result["disposition"] == "passed"
     assert "cannot remove review report" in result["codex"]["report_cleanup_error"]
+
+
+@pytest.mark.parametrize("operation,category", [
+    ("repository.actions.validate", "validate"),
+    ("repository.actions.test", "tests"),
+    ("deliverables.packages.example.actions.build", "build"),
+    ("deliverables.packages.example.actions.publish", "publish"),
+    ("deliverables.mcp-servers.example.actions.install", "deploy-local"),
+])
+def test_each_operation_cleans_prior_attempts_at_other_paths(report_repo, operation, category):
+    repo, diagnostic = report_repo
+    failed = runner.execute_prepared_operation(
+        replace(prepared(repo, operation, "raise RuntimeError('original failure')"), category=category),
+        diagnostic_output=diagnostic, diagnostic_owner=(repo, "promote"),
+    )
+    attempt = diagnostic.with_name("_earlier_result.json")
+    command.write_operation_report(attempt, failed, repo_root=repo, action="promote")
+    accepted = diagnostic.with_name("accepted.json")
+    accepted.write_text('{"status":"passed","result_id":"accepted-original"}')
+    unrelated = diagnostic.with_name("_other_failure.json")
+    save(repo, unrelated, {"different.operation": "still unresolved"})
+    original = unrelated.read_bytes(), accepted.read_bytes()
+    latest = diagnostic.with_name("_latest_failure.json")
+    for _ in range(2):
+        result = runner.execute_prepared_operation(
+            replace(prepared(repo, operation, "print('done')"), category=category),
+            diagnostic_output=latest, diagnostic_owner=(repo, "promote"),
+        )
+        assert result["status"] == "completed", result
+        assert not diagnostic.exists() and not attempt.exists()
+        assert (unrelated.read_bytes(), accepted.read_bytes()) == original
+
+
+def test_pending_attempt_is_cleaned_by_later_normal_operation_not_promotion(report_repo):
+    repo, anchor = report_repo
+    operation = "deliverables.mcp-servers.example.actions.install"
+    pending = {"status": "handoff_required", "operation": operation,
+               "pending_operations": [operation], "message": "different Python runtime"}
+    old = anchor.with_name("_earlier_promotion.json")
+    command.write_operation_report(old, pending, repo_root=repo, action="promote")
+    result = runner.execute_prepared_operation(
+        prepared(repo, operation, "print('installed')"),
+        diagnostic_output=anchor, diagnostic_owner=(repo, "operation"),
+    )
+    assert result["status"] == "completed" and not old.exists()
+
+
+def test_attempt_keeps_unresolved_operations_and_original_failure_until_all_finish(report_repo):
+    repo, anchor = report_repo
+    path = anchor.with_name("_earlier_result.json")
+    failure = {"status": "tests_failed", "pending_operations": ["checks.first", "checks.second"],
+               "message": "the original cause"}
+    command.write_operation_report(path, failure, repo_root=repo, action="operation")
+    for operation in ("checks.first", "checks.first", "checks.second"):
+        result = runner.execute_prepared_operation(
+            prepared(repo, operation, "print('done')"), diagnostic_output=anchor,
+            diagnostic_owner=(repo, "operation"),
+        )
+        assert result["status"] == "completed"
+        if operation == "checks.first":
+            document = json.loads(path.read_bytes())
+            assert document["message"] == "the original cause"
+            assert document["status"] == "tests_failed"
+            assert document["temporary_operation_report"]["unresolved"] == ["checks.second"]
+    assert not path.exists()
+
+
+def test_completed_operation_retires_failed_steps_removed_from_current_contract(report_repo):
+    repo, path = report_repo
+    save(repo, path, {"checks.unit:77": "obsolete step", "checks.unit-other:77": "unrelated"})
+    result = runner.execute_prepared_operation(
+        prepared(repo, "checks.unit", "print('done')"), diagnostic_output=path,
+        diagnostic_owner=(repo, "promote"),
+    )
+    assert result["status"] == "completed"
+    assert set(json.loads(path.read_bytes())["failures"]) == {"checks.unit-other:77"}
+
+
+@pytest.mark.parametrize("after", [False, True])
+@pytest.mark.parametrize("effect", ["publication", "cleanup"])
+def test_attempt_report_repeats_after_interruption_around_each_effect(report_repo, monkeypatch, effect, after):
+    repo, anchor = report_repo
+    old, current = anchor.with_name("_old.json"), anchor.with_name("_current.json")
+    failed = {"status": "tests_failed", "operation": "checks.unit", "message": "current cause"}
+    command.write_operation_report(old, failed, repo_root=repo, action="promote")
+    accepted = anchor.with_name("accepted.json")
+    accepted.write_text('{"status":"passed","result_id":"preserved"}')
+    before = accepted.read_bytes()
+    if effect == "cleanup":
+        # Model a stopped publisher that died before retiring prior snapshots.
+        for index in range(4):
+            old.with_name(f"_prior_{index}.json").write_bytes(old.read_bytes())
+    method = "replace" if effect == "publication" else "unlink"
+    original = getattr(pathlib.Path, method)
+
+    def interrupted(selected, *args, **kwargs):
+        target = pathlib.Path(args[0]) if effect == "publication" else selected
+        if target != (current if effect == "publication" else old):
+            return original(selected, *args, **kwargs)
+        if after:
+            original(selected, *args, **kwargs)
+        raise KeyboardInterrupt("report effect interrupted")
+
+    def fresh_call():
+        if effect == "publication":
+            command.write_operation_report(current, failed.copy(), repo_root=repo, action="promote")
+        else:
+            result = runner.execute_prepared_operation(
+                prepared(repo, "checks.unit", "print('done')"), diagnostic_output=anchor,
+                diagnostic_owner=(repo, "promote"),
+            )
+            assert result["status"] == "completed"
+
+    with monkeypatch.context() as patch:
+        patch.setattr(pathlib.Path, method, interrupted)
+        with pytest.raises(KeyboardInterrupt):
+            fresh_call()
+    for _ in range(2):
+        fresh_call()
+    assert not old.exists() and accepted.read_bytes() == before
+    assert not list(anchor.parent.glob(".*.tmp"))
+    if effect == "publication":
+        assert json.loads(current.read_bytes())["message"] == "current cause"
+
+
+@pytest.mark.parametrize("active,uncertain", [(1, False), (0, True)])
+def test_attempt_report_keeps_failure_while_writers_are_active_or_unknown(report_repo, active, uncertain):
+    repo, anchor = report_repo
+    old = anchor.with_name("_earlier.json")
+    command.write_operation_report(old, {"status": "tests_failed", "operation": "checks.unit"},
+                                   repo_root=repo, action="promote")
+    original = old.read_bytes()
+    locks = command.release_lock_module()
+    token = locks._COMMAND_COMPLETION.set(locks._CommandCompletion(active=active, uncertain=uncertain))
+    try:
+        runner.remove_operation_failures({"status": "completed", "operation": "checks.unit"},
+                                        diagnostic_output=anchor, diagnostic_owner=(repo, "promote"))
+        assert old.read_bytes() == original
+    finally:
+        locks._COMMAND_COMPLETION.reset(token)
+    runner.remove_operation_failures({"status": "completed", "operation": "checks.unit"},
+                                    diagnostic_output=anchor, diagnostic_owner=(repo, "promote"))
+    assert not old.exists()
+
+
+def test_successful_shipping_report_with_noop_is_never_an_unsuccessful_attempt(report_repo):
+    repo, anchor = report_repo
+    path = anchor.with_name("_successful_shipping.json")
+    operation = "deliverables.apps.example.actions.install"
+    command.write_operation_report(path, {
+        "status": "shipped", "operations": {"status": "completed", "pending_operations": [],
+        "completed_operations": [operation], "results": [{"operation": operation, "status": "no_op"}]},
+    }, repo_root=repo, action="promote")
+    original = path.read_bytes()
+    result = runner.execute_prepared_operation(prepared(repo, operation, "print('done')"),
+                                              diagnostic_output=anchor, diagnostic_owner=(repo, "promote"))
+    assert result["status"] == "completed" and path.read_bytes() == original
+
+
+def test_grouped_operation_completion_removes_its_whole_pending_attempt(report_repo):
+    repo, anchor = report_repo
+    path = anchor.with_name("_earlier_checks.json")
+    operation = "repository.actions.test"
+    command.write_operation_report(path, {"status": "tests_failed", "pending_operations": [operation]},
+                                   repo_root=repo, action="operation")
+    operations = [replace(prepared(repo, operation, "print('done')"), check_group=group)
+                  for group in ("first", "second")]
+    result = runner.execute_prepared_operations(operations, diagnostic_output=anchor,
+                                               diagnostic_owner=(repo, "operation"))
+    assert result["status"] == "completed" and not path.exists()
+
+
+@pytest.mark.parametrize("after", [False, True])
+def test_partial_attempt_cleanup_repeats_after_atomic_update_interruption(report_repo, monkeypatch, after):
+    repo, anchor = report_repo
+    path = anchor.with_name("_earlier_result.json")
+    command.write_operation_report(path, {"status": "tests_failed", "message": "keep this cause",
+        "pending_operations": ["checks.first", "checks.second"]}, repo_root=repo, action="promote")
+    original = pathlib.Path.replace
+
+    def interrupted(selected, target):
+        if pathlib.Path(target) != path:
+            return original(selected, target)
+        if after:
+            original(selected, target)
+        raise KeyboardInterrupt("partial cleanup interrupted")
+
+    def execute(operation):
+        return runner.execute_prepared_operation(prepared(repo, operation, "print('done')"),
+                                                 diagnostic_output=anchor, diagnostic_owner=(repo, "promote"))
+
+    with monkeypatch.context() as patch:
+        patch.setattr(pathlib.Path, "replace", interrupted)
+        with pytest.raises(KeyboardInterrupt):
+            execute("checks.first")
+    for _ in range(2):
+        assert execute("checks.first")["status"] == "completed"
+    document = json.loads(path.read_bytes())
+    assert document["temporary_operation_report"]["unresolved"] == ["checks.second"]
+    assert document["message"] == "keep this cause"
+    assert execute("checks.second")["status"] == "completed" and not path.exists()
+
+
+def test_attempt_lookup_preserves_accepted_peer_task_and_hard_linked_reports(report_repo, tmp_path):
+    repo, anchor = report_repo
+    operation = "checks.unit"
+    linked = anchor.with_name("_linked.json")
+    command.write_operation_report(linked, {"status": "tests_failed", "operation": operation},
+                                   repo_root=repo, action="promote")
+    external = tmp_path / "retained.json"
+    external.hardlink_to(linked)
+    accepted = anchor.with_name("_accepted.json")
+    command.write_operation_report(accepted, {"status": "completed", "operation": operation},
+                                   repo_root=repo, action="promote")
+    peer = anchor.parent.with_name("another-task") / "_pending.json"
+    command.write_operation_report(peer, {"status": "tests_failed", "operation": operation},
+                                   repo_root=report_primary_checkout(repo), action="promote")
+    original = {path: path.read_bytes() for path in (linked, external, accepted, peer)}
+    for _ in range(2):
+        result = runner.execute_prepared_operation(prepared(repo, operation, "print('done')"),
+                                                  diagnostic_output=anchor, diagnostic_owner=(repo, "promote"))
+        assert result["status"] == "completed"
+        assert all(path.read_bytes() == data for path, data in original.items())
+
+
+@pytest.mark.parametrize("busy", [False, True])
+def test_stopped_writer_cleanup_removes_only_reserved_unpublished_staging(report_repo, busy):
+    repo, anchor = report_repo
+    command.write_operation_report(anchor, {"status": "tests_failed", "operation": "checks.unit"},
+                                   repo_root=repo, action="promote")
+    orphan = anchor.with_name("._unpublished.json.operation-report.tmp")
+    orphan.write_bytes(b"incomplete JSON from a stopped worker")
+    duplicates = [anchor.with_name(f"_prior_{index}.json") for index in range(4)]
+    for path in duplicates:
+        path.write_bytes(anchor.read_bytes())
+    foreign = anchor.with_name("unrelated.tmp")
+    foreign.write_bytes(b"keep unrelated work")
+    locks = command.release_lock_module()
+    token = locks._COMMAND_COMPLETION.set(locks._CommandCompletion(active=int(busy), uncertain=False))
+    try:
+        runner.remove_operation_failures({"status": "completed", "operation": "checks.other"},
+                                        diagnostic_output=anchor, diagnostic_owner=(repo, "promote"))
+        assert sum(path.exists() for path in [anchor, *duplicates]) == (5 if busy else 3)
+        runner.remove_operation_failures({"status": "completed", "operation": "checks.unit"},
+                                        diagnostic_output=anchor, diagnostic_owner=(repo, "promote"))
+        assert orphan.exists() == busy and anchor.exists() == busy
+        assert foreign.read_bytes() == b"keep unrelated work"
+    finally:
+        locks._COMMAND_COMPLETION.reset(token)
+    runner.remove_operation_failures({"status": "completed", "operation": "checks.unit"},
+                                    diagnostic_output=anchor, diagnostic_owner=(repo, "promote"))
+    assert not orphan.exists() and not anchor.exists()
+
+
+def test_normal_worktree_operation_cleans_its_attempt_without_an_output_argument(report_repo):
+    repo, path = report_repo
+    command.write_operation_report(path, {"status": "tests_failed", "operation": "checks.unit"},
+                                   repo_root=repo, action="operation")
+    for _ in range(2):
+        result = runner.execute_prepared_operation(prepared(repo, "checks.unit", "print('done')"))
+        assert result["status"] == "completed" and not path.exists()

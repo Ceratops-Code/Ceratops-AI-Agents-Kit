@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import json
 import os
@@ -177,7 +178,7 @@ def _json_error_lines(value: str, depth: int = 0) -> list[str]:
         output = data.get(key)
         if isinstance(output, str) and output:
             lines, decisive = _failure_lines(output, depth + 1)
-            selected = sorted(set([*decisive[:6], *decisive[-6:], *range(max(0, len(lines) - 4), len(lines))]))
+            selected = sorted({*decisive[:6], *decisive[-6:], *range(max(0, len(lines) - 4), len(lines))})
             causes.extend(lines[index] for index in selected)
     return [*causes, *[
         f"{key}: {json.dumps(_detail_value(data[key]), ensure_ascii=False)}"
@@ -387,7 +388,7 @@ def _report_scope(
     if (not action or selected.resolve() != selected
             or not selected.is_relative_to(task_root)
             or selected == task_root or selected.is_symlink()
-            or (selected.exists() and selected.stat().st_nlink != 1)):
+            or (selected.exists() and (not selected.is_file() or selected.stat().st_nlink != 1))):
         raise ValueError(f"Failure report must be a file inside {task_root}.")
     return selected, {
         "writer": "github_pr_workflow.command",
@@ -494,9 +495,266 @@ def successful_result_paths(value: Any) -> tuple[str, ...]:
     return tuple(sorted(paths))
 
 
+_TEMPORARY_REPORT = "temporary_operation_report"
+_TEMPORARY_REPORT_SCHEMA = "ceratops-temporary-operation-report.v1"
+_FINISHED_REPORT_STATES = {"completed", "passed", "ok", "success", "reused", "ready", "shipped", "already_shipped", "no_op"}
+_OPERATION_REPORT_CONTAINERS = ("results", "operations", "promotion", "deployment", "release_publication", "deferred_handoffs")
+
+
+def _operation_report_work(value: Any, *, pending: bool) -> set[str]:
+    """Read operation identities, never infer completion from a nested receipt."""
+    found: set[str] = set()
+    if not isinstance(value, dict):
+        return found
+    if pending:
+        found.update(item for item in value.get("pending_operations", [])
+                     if isinstance(item, str) and item)
+    operation = value.get("operation")
+    finished = value.get("status") in _FINISHED_REPORT_STATES
+    if value.get("handoff") and not value.get("handoff_completed"):
+        finished = False
+    if (isinstance(operation, str) and operation and finished != pending
+            and value.get("status") != "no_op"):
+        found.add(operation + ("#" + value["check_group"] if value.get("check_group") else ""))
+    for key in _OPERATION_REPORT_CONTAINERS:
+        child = value.get(key)
+        for item in child if isinstance(child, list) else [child]:
+            found.update(_operation_report_work(item, pending=pending))
+    if not pending and finished and not value.get("deferred_handoffs"):
+        for operation in value.get("completed_operations", []):
+            matching = [item for item in value.get("results", [])
+                        if isinstance(item, dict) and item.get("operation") == operation]
+            if matching and all(item.get("status") == "completed" and not (
+                item.get("handoff") and not item.get("handoff_completed")
+            ) for item in matching):
+                found.add(operation)
+    return found
+
+
+def completed_operation_report_ids(result: dict[str, Any]) -> tuple[str, ...]:
+    """Return actual completed work, including complete grouped-check operations."""
+    return tuple(_operation_report_work(result, pending=False))
+
+
+def handoff_report_completions(result: Any) -> list[dict[str, Any]]:
+    """Keep pending return calls visible when an outer workflow prints a summary."""
+    if not isinstance(result, dict):
+        return []
+    completion = result.get("report_completion")
+    found = [completion] if isinstance(completion, dict) else []
+    for key in _OPERATION_REPORT_CONTAINERS:
+        child = result.get(key)
+        for item in child if isinstance(child, list) else [child]:
+            for value in handoff_report_completions(item):
+                if value not in found:
+                    found.append(value)
+    return found
+
+
+def _write_report_bytes(path: pathlib.Path, data: bytes) -> None:
+    """Publish one complete snapshot; interruption leaves the previous one usable."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # The selected report owns this reserved staging name. A fresh call may
+    # discard unpublished bytes only after all local writers are known stopped.
+    staging = path.with_name("." + path.name + ".operation-report.tmp")
+    if staging.exists():
+        if (not release_lock_module().local_commands_stopped() or staging.is_symlink()
+                or staging.is_junction() or not staging.is_file() or staging.stat().st_nlink != 1):
+            raise ValueError(f"Report staging file is busy or redirected: {staging}")
+        staging.unlink()
+    created = False
+    try:
+        with staging.open("xb") as stream:
+            created = True
+            stream.write(data)
+        staging.replace(path)
+    finally:
+        if created:
+            staging.unlink(missing_ok=True)
+
+
+def operation_report_root(repo_root: pathlib.Path) -> pathlib.Path:
+    """Capture the primary checkout before a successful workflow removes sources.
+
+    Recording a preflight failure also works for an existing non-Git directory;
+    that logical repository owns only its own external task-temp namespace.
+    """
+    root = repo_root.expanduser().resolve()
+    if root.is_dir():
+        try:
+            response = run_command(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=root)
+        except OSError:
+            return root  # A missing Git executable must not hide a preflight error.
+        if response.returncode == 0:
+            common = pathlib.Path(response.stdout.strip()).resolve()
+            if common.name == ".git":
+                return common.parent
+    return root
+
+
+def _operation_report_scope(
+    path: pathlib.Path, primary_repo_root: pathlib.Path, action: str,
+) -> tuple[pathlib.Path, dict[str, str]]:
+    """Bind observational snapshots to a task, independent of worktree lifetime."""
+    if not action:
+        raise ValueError("Operation report ownership requires a named action.")
+    primary = primary_repo_root.expanduser().resolve()
+    project = project_task_temp_root(primary)
+    selected = path.expanduser().absolute()
+    if not selected.is_relative_to(project) or len(selected.relative_to(project).parts) < 2:
+        raise ValueError(f"Operation report must be inside {project}/<task>.")
+    try:
+        metadata = selected.lstat()
+    except FileNotFoundError:
+        metadata = None
+    if (selected.resolve() != selected or selected.is_symlink() or selected.is_junction()
+            or (metadata is not None and (not selected.is_file() or metadata.st_nlink != 1))):
+        raise ValueError(f"Operation report must be a regular unredirected file: {selected}")
+    return selected, {"writer": "github_pr_workflow.command", "repo_root": str(primary),
+                      "task_root": str(project / selected.relative_to(project).parts[0]), "action": action}
+
+
+def _task_report_files(selected: pathlib.Path, task_root: pathlib.Path) -> list[pathlib.Path]:
+    """Inspect only this task's JSON outputs, without following redirected folders."""
+    paths = {selected}
+    def unavailable(error: OSError) -> None:
+        raise error
+    for directory, children, files in os.walk(task_root, followlinks=False, onerror=unavailable):
+        parent = pathlib.Path(directory)
+        if ".git" in children or (parent / ".git").is_file():
+            children.clear()
+            continue
+        children[:] = [name for name in children
+                       if name not in {".git", ".venv", "node_modules", "__pycache__"}
+                       and not (parent / name).is_symlink() and not (parent / name).is_junction()]
+        paths.update(parent / name for name in files)
+    return sorted(paths)
+
+
+def _owned_operation_report(
+    document: Any, owner: dict[str, str], *, other_action: bool = False,
+) -> dict[str, Any] | None:
+    if not isinstance(document, dict):
+        return None
+    record = document.get(_TEMPORARY_REPORT)
+    if (not isinstance(record, dict) or set(record) != {"schema", "owner", "requested_operations", "unresolved"}
+            or record["schema"] != _TEMPORARY_REPORT_SCHEMA
+            or not isinstance(record["owner"], dict)
+            or not isinstance(record["owner"].get("action"), str)
+            or not record["owner"]["action"]
+            or (record["owner"] != owner and not (other_action
+                and set(record["owner"]) == set(owner)
+                and all(record["owner"][key] == owner[key] for key in owner if key != "action")))
+            or not isinstance(record["unresolved"], list)
+            or not isinstance(record["requested_operations"], list)
+            or not all(isinstance(item, str) and item for item in [*record["requested_operations"], *record["unresolved"]])):
+        return None
+    return record
+
+
+def _publish_report_cleanup_errors(result: dict[str, Any], errors: dict[str, str]) -> None:
+    """Keep path-scoped cleanup debt across independent successful suboperations."""
+    if errors:
+        result["report_cleanup_errors"] = errors
+        result["report_cleanup_error"] = "; ".join(f"{path}: {message}" for path, message in errors.items())
+    else:
+        result.pop("report_cleanup_errors", None)
+        result.pop("report_cleanup_error", None)
+
+
+def write_operation_report(
+    path: pathlib.Path, result: dict[str, Any], *, repo_root: pathlib.Path,
+    action: str, pending_operations: tuple[str, ...] = (),
+    retain_external_output: bool = False,
+) -> str:
+    """Own temporary attempt reports for every SDLC operation and workflow.
+
+    Reports live in the caller's repository/task temp tree. Each owner and exact
+    unresolved-operation set has one current snapshot; publication replaces older
+    snapshots of that group. Matching successful operations remove obsolete
+    failures even when the next call selects a different output filename.
+    Accepted reports/results, active writers and foreign files are not retired.
+    Metadata is observational and never authorizes skipping or replaying work.
+    """
+    primary = operation_report_root(repo_root)
+    selected = path.expanduser().absolute()
+    if retain_external_output and not selected.is_relative_to(project_task_temp_root(primary)):
+        # Explicit retained exports keep the original payload and never enter
+        # the temporary-report reader or its automatic deletion authority.
+        if (selected.resolve() != selected or selected.is_symlink() or selected.is_junction()
+                or (selected.exists() and (not selected.is_file() or selected.stat().st_nlink != 1))):
+            raise ValueError(f"Retained operation report is redirected or not a regular file: {selected}")
+        data = (json.dumps(result, indent=2) + "\n").encode("utf-8")
+        _write_report_bytes(selected, data)
+        return hashlib.sha256(data).hexdigest()
+    selected, owner = _operation_report_scope(path, primary, action)
+    if _TEMPORARY_REPORT in result:
+        raise ValueError("Operation output collides with temporary report ownership metadata.")
+    if selected.exists():
+        previous = json.loads(selected.read_bytes())
+        if not _owned_operation_report(previous, owner):
+            raise ValueError(f"Selected path contains an unowned operation report: {selected}")
+    unresolved = _operation_report_work(result, pending=True)
+    if not unresolved and result.get("status") not in _FINISHED_REPORT_STATES:
+        unresolved.update(pending_operations or (action,))
+    completed = set(completed_operation_report_ids(result))
+    if result.get("status") in _FINISHED_REPORT_STATES and not unresolved:
+        completed.add(action)
+    remove_resolved_failures(
+        result, diagnostic_output=selected, repo_root=repo_root, action=action,
+        resolved_failures=tuple(completed), resolved_prefixes=tuple(key + ":" for key in completed),
+        publishing_snapshot=True,
+    )
+    if result.get("report_cleanup_errors"):
+        raise OSError("Cannot publish another report until cleanup finishes: " + result["report_cleanup_error"])
+    document = {_TEMPORARY_REPORT: {"schema": _TEMPORARY_REPORT_SCHEMA,
+                "owner": owner, "requested_operations": sorted(unresolved), "unresolved": sorted(unresolved)}, **result}
+    data = (json.dumps(document, ensure_ascii=True, indent=2) + "\n").encode("utf-8")
+    _write_report_bytes(selected, data)
+    if unresolved and release_lock_module().local_commands_stopped():
+        # Keep the newly published failure before retiring older snapshots.
+        errors = dict(result.get("report_cleanup_errors", {}))
+        try:
+            candidates = _task_report_files(selected, pathlib.Path(owner["task_root"]))
+        except (OSError, ValueError, CommandError) as exc:
+            errors[str(selected)] = sanitize_for_output(str(exc))
+            candidates = []
+        for candidate in candidates:
+            if candidate == selected:
+                continue
+            try:
+                if candidate.is_symlink() or candidate.is_junction() or (candidate.exists() and candidate.stat().st_nlink != 1):
+                    continue
+                bound, _ = _operation_report_scope(candidate, primary, action)
+                if bound.name.startswith(".") and bound.name.endswith(".operation-report.tmp"):
+                    bound.unlink(missing_ok=True)
+                    errors.pop(str(candidate), None)
+                    continue
+                with bound.open("rb") as stream:
+                    header = stream.read(100)
+                if _TEMPORARY_REPORT.encode() not in header:
+                    continue
+                previous = bound.read_bytes()
+                record = _owned_operation_report(json.loads(previous), owner)
+                if record and record["unresolved"] and set(record["requested_operations"]) == unresolved:
+                    _operation_report_scope(bound, primary, action)
+                    if bound.read_bytes() != previous:
+                        raise ValueError(f"Report changed during cleanup: {bound}")
+                    bound.unlink()
+                    errors.pop(str(candidate), None)
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError, CommandError) as exc:
+                errors[str(candidate)] = sanitize_for_output(str(exc))
+        _publish_report_cleanup_errors(result, errors)
+    return hashlib.sha256(data).hexdigest()
+
+
 def remove_resolved_failures(
     result: dict[str, Any], *, diagnostic_output: pathlib.Path | None,
     repo_root: pathlib.Path, action: str, resolved_failures: tuple[str, ...],
+    resolved_prefixes: tuple[str, ...] = (),
+    publishing_snapshot: bool = False,
 ) -> None:
     """Retire only failures the requesting workflow has just resolved.
 
@@ -506,38 +764,111 @@ def remove_resolved_failures(
     references. Cleanup trouble is observational: it never turns accepted work
     into a failed check or asks the caller to repeat its effect.
     """
-    if diagnostic_output is None or not resolved_failures or (
-        not release_lock_module().local_commands_stopped()
-    ):
+    if not release_lock_module().local_commands_stopped():
         return
+    errors = dict(result.get("report_cleanup_errors", {}))
+    failed_path = diagnostic_output or repo_root
     try:
-        # Finalization may already have removed the report's task directory.
-        try:
-            diagnostic_output.lstat()
-        except FileNotFoundError:
-            result.pop("report_cleanup_error", None)
+        if diagnostic_output is None:
+            # A normal worktree call retains task identity without another file.
+            if not repo_root.is_dir():
+                return
+            root = project_task_temp_root(operation_report_root(repo_root)) / repo_root.resolve().name
+            if not root.is_dir():
+                return
+            diagnostic_output = root / "_operation_report.json"
+        # Finalization may already have removed the caller's entire task tree.
+        if not diagnostic_output.parent.exists():
+            errors.pop(str(diagnostic_output), None)
+            _publish_report_cleanup_errors(result, errors)
             return
-        selected, owner = _report_scope(diagnostic_output, repo_root, action)
-        previous = _read_failure_report(selected, owner)
-        if not previous or not set(previous["failures"]).intersection(resolved_failures):
-            result.pop("report_cleanup_error", None)
-            return
-        remaining = {key: value for key, value in previous["failures"].items()
-                     if key not in resolved_failures}
-        if remaining:
-            write_failure_report(
-                selected, repo_root=repo_root, action=action, failures=remaining,
-                resolved_failures=resolved_failures,
-                successful_result_paths=successful_result_paths(result),
-            )
-        else:
-            remove_failure_report(
-                selected, repo_root=repo_root, action=action,
-                resolved_failures=resolved_failures, commands_stopped=True,
-            )
-        result.pop("report_cleanup_error", None)
+        primary = operation_report_root(repo_root)
+        selected, owner = _operation_report_scope(diagnostic_output, primary, action)
+        errors.pop(str(repo_root), None)
+        snapshots: dict[pathlib.Path, tuple[dict[str, Any], bytes]] = {}
+        for candidate in _task_report_files(selected, pathlib.Path(owner["task_root"])):
+            failed_path = candidate
+            if candidate != selected and (candidate.is_symlink() or candidate.is_junction()
+                    or (candidate.exists() and candidate.stat().st_nlink != 1)):
+                continue
+            try:
+                bound, _ = _operation_report_scope(candidate, primary, action)
+                if bound.name.startswith(".") and bound.name.endswith(".operation-report.tmp"):
+                    bound.unlink(missing_ok=True)
+                    errors.pop(str(candidate), None)
+                    continue
+                with bound.open("rb") as stream:
+                    header = stream.read(100)
+                if not any(marker in header for marker in (
+                    _TEMPORARY_REPORT.encode(), b"ceratops-lifecycle-failure-report.v1",
+                )):
+                    continue
+                original = bound.read_bytes()
+            except FileNotFoundError:
+                errors.pop(str(candidate), None)
+                continue
+            document = json.loads(original)
+            record = _owned_operation_report(document, owner, other_action=True)
+            temporary = record is not None
+            if temporary:
+                failures = record["unresolved"]
+            elif isinstance(document, dict) and document.get("schema") == "ceratops-lifecycle-failure-report.v1":
+                _, diagnostic_owner = _report_scope(bound, repo_root, action)
+                if document.get("owner") != diagnostic_owner:
+                    continue
+                failures = _read_failure_report(bound, diagnostic_owner)["failures"]
+            else:
+                errors.pop(str(candidate), None)
+                continue
+            resolved = tuple(key for key in failures if key in resolved_failures
+                             or key.startswith(resolved_prefixes))
+            if not resolved:
+                if not failures:
+                    errors.pop(str(candidate), None)
+                elif temporary:
+                    snapshots[bound] = (record, original)
+                continue
+            # A changed snapshot or redirected path must never become our target.
+            _operation_report_scope(bound, primary, action)
+            if bound.read_bytes() != original:
+                raise ValueError(f"Report changed during cleanup: {bound}")
+            remaining = {key: failures[key] for key in failures if key not in resolved} if not temporary else [
+                key for key in failures if key not in resolved
+            ]
+            if not remaining:
+                bound.unlink(missing_ok=True)
+            elif temporary:
+                record["unresolved"] = remaining
+                current = (json.dumps(document, indent=2) + "\n").encode("utf-8")
+                _write_report_bytes(bound, current)
+                snapshots[bound] = (record, current)
+            else:
+                write_failure_report(
+                    bound, repo_root=repo_root, action=action, failures=remaining,
+                    resolved_failures=resolved, successful_result_paths=successful_result_paths(result),
+                )
+            errors.pop(str(candidate), None)
+        groups: dict[tuple[Any, ...], list[pathlib.Path]] = {}
+        for path, (record, _) in snapshots.items():
+            group = (*sorted(record["owner"].items()), tuple(sorted(record["requested_operations"])))
+            groups.setdefault(group, []).append(path)
+        for paths in groups.values():
+            paths.sort(key=lambda path: (path.stat().st_mtime_ns, str(path)), reverse=True)
+            for path in paths[2 if publishing_snapshot else 3:]:
+                failed_path = path
+                _operation_report_scope(path, primary, action)
+                if path.read_bytes() != snapshots[path][1]:
+                    raise ValueError(f"Report changed during retention: {path}")
+                path.unlink()
+                errors.pop(str(path), None)
+        for path in tuple(errors):
+            previous_path = pathlib.Path(path)
+            if previous_path.is_relative_to(pathlib.Path(owner["task_root"])) and not previous_path.exists():
+                errors.pop(path)
+        _publish_report_cleanup_errors(result, errors)
     except (OSError, ValueError, CommandError) as exc:
-        result["report_cleanup_error"] = sanitize_for_output(str(exc))
+        errors[str(failed_path)] = sanitize_for_output(str(exc))
+        _publish_report_cleanup_errors(result, errors)
 
 
 def report_phase(phase: str, *, enabled: bool) -> None:
@@ -547,6 +878,159 @@ def report_phase(phase: str, *, enabled: bool) -> None:
             "schema": "ceratops-lifecycle-progress.v1",
             "phase": _clip(sanitize_for_output(phase), 500),
         }, separators=(",", ":")), flush=True)
+
+
+def handoff_report_completion(prepared: Any) -> dict[str, Any]:
+    """Expose a receipt-return call only for the installer's whole operation."""
+    if len(prepared.steps) != 1 or not prepared.steps[0].handoff:
+        return {}
+    handoff = prepared.steps[0].handoff
+    if handoff["lifecycle"] + "/" + handoff["action"] not in {
+        "ceratops-mcp-server-lifecycle/install", "ceratops-skill-lifecycle/deploy",
+    }:
+        return {}
+    return {"report_completion": {
+            "entrypoint": str(pathlib.Path(__file__).resolve().parents[1] / "repository_operation.py"),
+            "arguments": ["--repo-root", str(prepared.repo_root), "--operation", prepared.operation,
+                          "--retire-handoff-reports", "{actual_completion_file}"],
+            "answer_schema": {"type": "object", "required": ["actual_completion_file"],
+                              "properties": {"actual_completion_file": {"type": "string",
+                                  "description": "Actual completed installer JSON in this task's temp directory."}},
+                              "additionalProperties": False}}}
+
+
+def _pending_report_actions(repo_root: pathlib.Path, selected: pathlib.Path, operation: str) -> set[str]:
+    """Find only this task's owned reports containing the selected operation."""
+    primary = operation_report_root(repo_root)
+    _, owner = _operation_report_scope(selected, primary, "operation")
+    actions: set[str] = set()
+    for path in _task_report_files(selected, pathlib.Path(owner["task_root"])):
+        if not path.is_file() or path.is_symlink() or path.is_junction() or path.stat().st_nlink != 1:
+            continue
+        _operation_report_scope(path, primary, "operation")
+        with path.open("rb") as stream:
+            header = stream.read(100)
+        if not any(marker in header for marker in (
+            _TEMPORARY_REPORT.encode(), b"ceratops-lifecycle-failure-report.v1",
+        )):
+            continue
+        document = json.loads(path.read_bytes())
+        record = _owned_operation_report(document, owner, other_action=True)
+        if record:
+            keys, action = record["unresolved"], record["owner"]["action"]
+        elif document.get("schema") == "ceratops-lifecycle-failure-report.v1":
+            keys, action = document.get("failures", {}), document.get("owner", {}).get("action")
+            if not isinstance(keys, dict) or not isinstance(action, str):
+                continue
+            if not any(key == operation or key.startswith(operation + ":") for key in keys):
+                continue
+            _, expected = _report_scope(path, repo_root, action)
+            if document.get("owner") != expected:
+                continue
+        else:
+            continue
+        if any(key == operation or key.startswith(operation + ":") for key in keys):
+            actions.add(action)
+    return actions
+
+
+def _retire_handoff_reports(args: Any) -> None:
+    """Consume actual standalone completion; this never executes an operation.
+
+    Only a single-step registered install handoff can be completed from its
+    installer's receipt. Current source/SDLC identity, producer and selected
+    target are checked before deleting reports. The receipt is a temporary input;
+    removal follows successful consumption. Interrupted calls inspect current
+    files again, without reinstalling or restoring progress from an old report.
+    """
+    import repository_operation as runner
+    from check_deployment_receipts import check_deployment_receipt
+    from sdlc_results import StepResultError, _unique_result_object
+
+    if len(args.operation) != 1 or args.validate or args.tests or args.prepare_only or args.ci:
+        raise runner.OperationError("Report retirement requires one operation and cannot execute other work.")
+    primary = operation_report_root(args.repo_root)
+    selected, _ = _operation_report_scope(args.retire_handoff_reports, primary, "operation")
+    with release_lock_module().hold_release_source(primary):
+        if not release_lock_module().local_commands_stopped():
+            raise runner.OperationError("Report retirement requires stopped writers.")
+        prepared = runner.prepare_operations(primary, [runner.OperationRequest(
+            args.operation[0], runner.parse_parameters(args.parameter),
+        )], args.sdlc_contract, context="return")[0]
+        if len(prepared.steps) != 1 or not prepared.steps[0].handoff:
+            raise runner.OperationError("A standalone receipt requires a single registered handoff step.")
+        handoff = prepared.steps[0].handoff
+        route = handoff["lifecycle"] + "/" + handoff["action"]
+        if route not in {"ceratops-mcp-server-lifecycle/install", "ceratops-skill-lifecycle/deploy"}:
+            raise runner.OperationError("This handoff has no deployment completion receipt contract.")
+        actions = _pending_report_actions(primary, selected, args.operation[0])
+        if not selected.exists():
+            if actions:
+                raise runner.OperationError("An actual installer result is required while reports remain.")
+            return
+        identity = selected.stat()
+        if identity.st_size > 1_048_576:
+            raise runner.OperationError("Installer completion result exceeds 1 MiB.")
+        data = selected.read_bytes()
+        try:
+            receipt = json.loads(data, object_pairs_hook=_unique_result_object)
+        except (ValueError, StepResultError) as exc:
+            raise runner.OperationError(f"Cannot read installer completion result: {exc}") from exc
+
+        def destination(path: pathlib.Path) -> pathlib.Path:
+            if path.resolve() != path or any(item.is_symlink() or item.is_junction() for item in (path, *path.parents)):
+                raise runner.OperationError("Installation destination is redirected.")
+            return path
+
+        check_deployment_receipt(receipt, repo_root=primary, commit=prepared.commit,
+                                 outcome={"handoff": route}, error_type=runner.OperationError,
+                                 check_destination_path=destination)
+        selector = handoff.get("inputs", {}).get("mcp-server", handoff.get("inputs", {}).get("skill"))
+        if selector not in [*receipt["deployed"], *receipt["removed"]]:
+            raise runner.OperationError("Installer result identifies another selected target.")
+        for action in actions:
+            result: dict[str, Any] = {}
+            remove_resolved_failures(result, diagnostic_output=selected, repo_root=primary,
+                                     action=action, resolved_failures=tuple(args.operation),
+                                     resolved_prefixes=(args.operation[0] + ":",))
+            if result.get("report_cleanup_error"):
+                raise runner.OperationError(result["report_cleanup_error"])
+        _operation_report_scope(selected, primary, "operation")
+        current = selected.stat()
+        if any(getattr(current, field) != getattr(identity, field) for field in (
+            "st_dev", "st_ino", "st_mtime_ns", "st_size", "st_nlink",
+        )) or selected.read_bytes() != data:
+            raise runner.OperationError("Installer result changed during report retirement.")
+        selected.unlink()
+
+
+def retire_handoff_reports_cli(args: Any) -> int:
+    """Run the cleanup-only public mode, including its own failure-report lifecycle."""
+    import repository_operation as runner
+
+    work = "retire-handoff-reports:" + ",".join(args.operation)
+    anchor = args.diagnostic_output or args.evidence_file or args.retire_handoff_reports
+    try:
+        _retire_handoff_reports(args)
+        result: dict[str, Any] = {"status": "completed", "operation": work}
+        remove_resolved_failures(result, diagnostic_output=anchor, repo_root=args.repo_root,
+                                 action=args.diagnostic_action, resolved_failures=(work,))
+        if result.get("report_cleanup_error"):
+            raise runner.OperationError(result["report_cleanup_error"])
+    except (runner.OperationError, OSError, ValueError, CommandError, release_lock_module().WriteLockError) as exc:
+        result = report_failure({"status": "error", "operation": work,
+            "target": str(args.retire_handoff_reports), "message": str(exc)},
+            diagnostic_output=args.diagnostic_output, repo_root=args.repo_root,
+            action=args.diagnostic_action, failure_id=work)
+        if args.evidence_file:
+            try:
+                write_operation_report(args.evidence_file, result, repo_root=args.repo_root, action=args.diagnostic_action)
+            except (OSError, ValueError, CommandError) as output_error:
+                result["report_write_error"] = str(output_error)
+        print(json.dumps(result, separators=(",", ":")), file=sys.stderr)
+        return 1
+    print("OK")
+    return 0
 
 
 def _child_report_paths(value: Any, repo_root: pathlib.Path) -> list[str]:
