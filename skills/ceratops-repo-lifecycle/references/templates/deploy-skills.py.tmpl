@@ -31,7 +31,7 @@ from typing import Any, cast
 import tomlkit
 from tomlkit.exceptions import ParseError
 
-INSTALLER_VERSION = 21
+INSTALLER_VERSION = 22
 MANIFEST_NAME = ".runtime-manifest.json"
 RUNTIME_MANIFEST_SCHEMA = "ceratops-runtime-skill.v3"
 START = "<!-- CERATOPS_SHARED_SECTIONS_START -->"
@@ -420,8 +420,10 @@ def prepare_python_runtime(repo_root: pathlib.Path, install_root: pathlib.Path) 
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
     # uv selects the runtime dependency graph from the common lock. Development
     # tools and other workspace products cannot change this environment's identity.
+    # Local path dependencies must be copied into the installed environment;
+    # an editable link would outlive neither a source view nor its checkout.
     command = [uv, "export", "--project", str(project), "--locked", "--no-dev",
-               "--no-default-groups", "--no-emit-workspace", "--no-header", "--no-annotate"]
+               "--no-default-groups", "--no-emit-workspace", "--no-editable", "--no-header", "--no-annotate"]
     try:
         exported = subprocess.run(command, cwd=repo_root, env=environment,
                           capture_output=True, text=True, check=False)
@@ -465,7 +467,7 @@ def prepare_python_runtime(repo_root: pathlib.Path, install_root: pathlib.Path) 
         if unsafe_link(selected):
             raise ValueError("shared skill runtime version cannot be a link")
         checked = subprocess.run(
-            [uv, "sync", "--quiet", "--project", str(project), "--locked", "--no-dev", "--no-default-groups", "--no-install-workspace", "--check", "--no-active"],
+            [uv, "sync", "--quiet", "--project", str(project), "--locked", "--no-dev", "--no-default-groups", "--no-install-workspace", "--no-editable", "--check", "--no-active"],
             env=environment, capture_output=True, text=True, check=False,
         )
         if checked.returncode or not interpreter(version).is_file() or unsafe_link(interpreter(version)):
@@ -475,7 +477,7 @@ def prepare_python_runtime(repo_root: pathlib.Path, install_root: pathlib.Path) 
     created = not selected.exists()
     if created:
         result = subprocess.run(
-            [uv, "sync", "--quiet", "--project", str(project), "--locked", "--no-dev", "--no-default-groups", "--no-install-workspace", "--no-active"],
+            [uv, "sync", "--quiet", "--project", str(project), "--locked", "--no-dev", "--no-default-groups", "--no-install-workspace", "--no-editable", "--no-active"],
             env=environment, capture_output=True, text=True, check=False,
         )
         if result.returncode or not interpreter(version).is_file():
@@ -486,7 +488,7 @@ def prepare_python_runtime(repo_root: pathlib.Path, install_root: pathlib.Path) 
             try:
                 materialize_python_interpreters(interpreter(version))
                 checked = subprocess.run(
-                    [uv, "sync", "--quiet", "--project", str(project), "--locked", "--no-dev", "--no-default-groups", "--no-install-workspace", "--check", "--no-active"],
+                    [uv, "sync", "--quiet", "--project", str(project), "--locked", "--no-dev", "--no-default-groups", "--no-install-workspace", "--no-editable", "--check", "--no-active"],
                     env=environment, capture_output=True, text=True, check=False,
                 )
                 if checked.returncode:

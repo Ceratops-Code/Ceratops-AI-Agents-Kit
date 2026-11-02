@@ -108,6 +108,11 @@ and mypy settings. Native product pyprojects remain uv workspace members with
 their independent distribution metadata; the workspace uses one `scripts/uv.lock`.
 Managed runtime identity hashes only the exported runtime dependency graph and
 Python requirement, excluding development groups and unrelated workspace packages.
+Runtime export and synchronization explicitly disable editable installation.
+Local path packages become installed wheels, so deleting a source checkout or
+disposable source view cannot remove the code used by installed helpers.
+Existing editable environments are replaced at new version paths; running
+helpers retain their previous environments until the owner can retire them.
 Thus adding a tool does not replace an unchanged installed skill environment.
 Node tooling manifests
 and Markdown/YAML lint settings also live under `scripts`; generated diagnostic

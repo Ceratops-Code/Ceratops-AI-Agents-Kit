@@ -163,6 +163,20 @@ def test_bootstrap_full_install_materializes_lifecycle_bundle_with_source_runtim
     assert "skill-sections.json" in rejected.stderr
     assert not (tmp_path / "rejected-install").exists()
 
+    # The managed public CLI must also install the complete candidate batch.
+    managed_root = tmp_path / "managed-installed"
+    managed = subprocess.run(
+        [sys.executable, str(LIFECYCLE_SOURCE / "scripts/runtime/install-managed-skills.py"),
+         "--repo-root", str(ROOT), "--install-root", str(managed_root)],
+        env=env, capture_output=True, text=True, check=False,
+    )
+    assert managed.returncode == 0, managed.stderr or managed.stdout
+    receipt = json.loads(managed.stdout)
+    assert receipt["status"] == "completed"
+    expected = json.loads((ROOT / "skills/skill-sections.json").read_text())["skills"]
+    assert set(receipt["deployed"]) == set(expected)
+    assert not receipt["cleanup_debt"]
+
 def test_lifecycle_only_installed_bundle_materializes_compatible_repo(
     tmp_path: pathlib.Path,
 ) -> None:
@@ -275,10 +289,12 @@ def test_bootstrap_ignores_stale_broken_installed_bundle(
     assert runtime_owner(install_root, "alpha-tool") == "example/external"
 
 @pytest.mark.skipif(shutil.which("uv") is None, reason="uv is required for the deployed runtime integration")
-def test_shared_skill_python_environment_reuses_lock_and_repairs_missing_package(tmp_path: pathlib.Path) -> None:
+def test_shared_skill_python_environment_reuses_lock_and_repairs_missing_package(tmp_path_factory: pytest.TempPathFactory) -> None:
     """Install once per lock, invoke directly, and repair at a new path."""
     from concurrent.futures import ThreadPoolExecutor
 
+    # Windows DLL loading needs a compact prefix even when the task root is long.
+    tmp_path = tmp_path_factory.mktemp("_rt")
     codex_home = tmp_path / "codex home"
     destination = codex_home / "skills"
     names = ["ceratops-repo-lifecycle", "ceratops-skill-lifecycle"]
@@ -538,9 +554,81 @@ def test_shared_project_selects_runtime_dependencies_without_development_tools(t
     assert prepare(repo, destination) == second
 
 
+@pytest.mark.parametrize("owner", ["repository", "template", "managed"])
+@pytest.mark.parametrize("legacy_editable", [False, True])
+def test_installed_runtime_keeps_local_package_after_source_cleanup(tmp_path, owner, legacy_editable):
+    """Local development links never become installed runtime dependencies."""
+    from tests.skill_lifecycle.support import INSTALLER_TEMPLATE
+
+    entry = {"repository": BOOTSTRAP, "template": INSTALLER_TEMPLATE,
+             "managed": LIFECYCLE_SOURCE / "scripts/runtime/prepare_python_runtime.py"}[owner]
+    prepare = runpy.run_path(str(entry))["prepare_python_runtime"]
+    repo = tmp_path / "source"
+    project = repo / "scripts"
+    package = repo / "packages/local-probe"
+    module = package / "src/installed_probe/__init__.py"
+    project.mkdir(parents=True)
+    module.parent.mkdir(parents=True)
+    module.write_text("VALUE = 'installed'\n", encoding="utf-8")
+    (package / "pyproject.toml").write_text(
+        '[build-system]\nrequires=["hatchling==1.32.4"]\nbuild-backend="hatchling.build"\n'
+        '[project]\nname="local-runtime-probe"\nversion="1.0.0"\n'
+        'requires-python=">=3.14,<3.15"\n'
+        '[tool.hatch.build.targets.wheel]\npackages=["src/installed_probe"]\n',
+        encoding="utf-8",
+    )
+    (project / "pyproject.toml").write_text(
+        '[project]\nname="runtime-local-package"\nversion="0.0.0"\n'
+        'requires-python=">=3.14,<3.15"\ndependencies=["local-runtime-probe==1.0.0"]\n'
+        '[tool.uv]\npackage=false\n'
+        '[tool.uv.sources]\nlocal-runtime-probe={path="../packages/local-probe",editable=true}\n',
+        encoding="utf-8",
+    )
+    locked = subprocess.run(["uv", "lock", "--project", str(project)], capture_output=True, text=True)
+    assert locked.returncode == 0, locked.stderr
+    destination = tmp_path / "profile/skills"
+    first = prepare(repo, destination)
+    assert first is not None and prepare(repo, destination) == first
+    selected = first
+    if legacy_editable:
+        # Reproduce an older installer's wrong mode in this disposable runtime.
+        # The fresh public preparation must replace it, leaving that version intact.
+        environment = {key: value for key, value in os.environ.items() if key != "UV_NO_EDITABLE"}
+        seeded = subprocess.run(
+            ["uv", "pip", "install", "--python", str(first), "--no-deps", "--reinstall", "--editable", str(package)],
+            env=environment, capture_output=True, text=True,
+        )
+        assert seeded.returncode == 0, seeded.stderr
+        probe = [str(first), "-I", "-c", "import installed_probe; print(installed_probe.__file__)"]
+        before = subprocess.run(probe, cwd=tmp_path, capture_output=True, text=True)
+        assert before.returncode == 0, before.stderr
+        assert pathlib.Path(before.stdout.strip()).resolve() == module.resolve()
+        selected = prepare(repo, destination)
+        assert selected is not None and selected != first and first.is_file()
+        after = subprocess.run(probe, cwd=tmp_path, capture_output=True, text=True)
+        assert after.returncode == 0 and after.stdout == before.stdout, after.stderr
+    assert prepare(repo, destination) == selected
+    module.write_text("VALUE = 'changed in source'\n", encoding="utf-8")
+    assert repo.resolve().parent == tmp_path.resolve()
+    shutil.rmtree(repo)
+    result = subprocess.run(
+        [str(selected), "-I", "-c", "import installed_probe; print(installed_probe.VALUE)"],
+        cwd=tmp_path, capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "installed"
+
+
+@pytest.mark.parametrize("owner", ["repository", "template", "managed"])
+@pytest.mark.parametrize("effect", ["directory", "installation", "index"])
 @pytest.mark.parametrize("timing", ["before", "after"])
-def test_runtime_selection_finishes_after_interrupted_index_update(tmp_path, monkeypatch, timing):
-    prepare = runpy.run_path(str(BOOTSTRAP))["prepare_python_runtime"]
+def test_runtime_preparation_finishes_after_each_interrupted_effect(tmp_path, monkeypatch, owner, effect, timing):
+    from tests.skill_lifecycle.support import INSTALLER_TEMPLATE
+
+    entry = {"repository": BOOTSTRAP, "template": INSTALLER_TEMPLATE,
+             "managed": LIFECYCLE_SOURCE / "scripts/runtime/prepare_python_runtime.py"}[owner]
+    namespace = runpy.run_path(str(entry))
+    prepare = namespace["prepare_python_runtime"]
     repo = tmp_path / "repository"
     project = repo / "scripts"
     project.mkdir(parents=True)
@@ -551,19 +639,44 @@ def test_runtime_selection_finishes_after_interrupted_index_update(tmp_path, mon
     )
     assert subprocess.run(["uv", "lock", "--project", str(project)], capture_output=True).returncode == 0
     destination = tmp_path / "profile/skills"
-    replace = os.replace
+    versions = destination.parent / "runtimes/ceratops/versions"
+    replace, mkdir = os.replace, pathlib.Path.mkdir
+    run_command = (namespace["write_locks"].run_protected_command if owner == "managed" else subprocess.run)
     interrupted = False
-    def replace_index(source, target):
+
+    def interrupt_at(boundary, action):
         nonlocal interrupted
-        if pathlib.Path(target).name != "current.json" or interrupted:
-            return replace(source, target)
+        if boundary != effect or interrupted:
+            return action()
         interrupted = True
         if timing == "after":
-            replace(source, target)
+            action()
         raise KeyboardInterrupt
+
+    def replace_index(source, target):
+        if pathlib.Path(target).name == "current.json":
+            return interrupt_at("index", lambda: replace(source, target))
+        return replace(source, target)
+
+    def create_versions(path, *args, **kwargs):
+        if path == versions:
+            return interrupt_at("directory", lambda: mkdir(path, *args, **kwargs))
+        return mkdir(path, *args, **kwargs)
+
+    def install_dependencies(command, **kwargs):
+        if len(command) > 1 and command[1] == "sync" and "--check" not in command:
+            return interrupt_at("installation", lambda: run_command(command, **kwargs))
+        return run_command(command, **kwargs)
+
     monkeypatch.setattr(os, "replace", replace_index)
+    monkeypatch.setattr(pathlib.Path, "mkdir", create_versions)
+    if owner == "managed":
+        monkeypatch.setattr(namespace["write_locks"], "run_protected_command", install_dependencies)
+    else:
+        monkeypatch.setattr(subprocess, "run", install_dependencies)
     with pytest.raises(KeyboardInterrupt):
         prepare(repo, destination)
+    assert interrupted
     selected = prepare(repo, destination)
     assert selected is not None and selected.is_file()
     assert prepare(repo, destination) == selected

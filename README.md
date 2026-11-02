@@ -1640,6 +1640,11 @@ changing the repository and does not copy Ceratops dependencies. Deployment
 uses uv to prepare an environment under `$CODEX_HOME/runtimes/ceratops/versions/`.
 `python_runtime_skills` in the section manifest selects its users. Only their
 installed `.runtime-manifest.json` files record the exact interpreter path.
+Runtime export, installation and existing-environment checks use uv's
+`--no-editable` mode. Local path packages are installed as wheels even when the
+source project requests editable development installs. Installed imports remain
+available after the source checkout or disposable installation view is removed.
+An older editable environment is replaced at a fresh path rather than rewritten.
 After successful manifest activation, deployment retains the selected runtime
 and two predecessors. It also preserves any version still referenced by an
 installed manifest or running interpreter; a later successful deployment
