@@ -425,9 +425,9 @@ def check_current_inputs(context: Mapping[str, Any], root: pathlib.Path) -> None
     """
     for files in context["scope"].get("artifacts", {}).values():
         for item in files:
-            path = pathlib.Path(item["path"])
-            if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != item["sha256"]:
-                raise ValueError("Selected built artifact changed before check completion: " + str(path))
+            artifact_path = pathlib.Path(item["path"])
+            if not artifact_path.is_file() or hashlib.sha256(artifact_path.read_bytes()).hexdigest() != item["sha256"]:
+                raise ValueError("Selected built artifact changed before check completion: " + str(artifact_path))
     rules = context["scope"].get("inputRules")
     if (not isinstance(rules, dict)
             or not all(isinstance(rules.get(key), list) and rules[key]
@@ -903,7 +903,7 @@ def main(argv: list[str] | None = None) -> int:
         args.check_summary = None
         args.executed = False
         args.diagnostic_path = (ROOT / (args.diagnostic_output or pathlib.Path(".build/test-diagnostics/pytest-failure.json"))).resolve()
-        args.current_results = CurrentCheckResults(ROOT) if (ROOT / ".git").exists() else None
+        args.current_results = CurrentCheckResults(ROOT) if support is not None and (ROOT / ".git").exists() else None
         if support is not None and args.diagnostic_path.exists():
             support.remove_test_diagnostic(args.diagnostic_path, root=ROOT, current=args.current_results)
         if args.probe_command is not None:
@@ -915,6 +915,7 @@ def main(argv: list[str] | None = None) -> int:
         inherited = without_basetemp(shlex.split(os.environ.get("PYTEST_ADDOPTS", "")))
         targets = args.targets or DEFAULT_TARGETS
         if args.check_group:
+            assert support is not None
             manifest = support.load_manifest(ROOT / "tests/test-impact.json")
             if args.check_group not in manifest.suites:
                 raise ValueError(f"Unknown test check-group: {args.check_group}")
@@ -931,13 +932,20 @@ def main(argv: list[str] | None = None) -> int:
             invocation.update(check_group=args.check_group, artifacts=args.artifacts)
         args.invocation = invocation
         token = support.CHECK_REQUEST_INPUTS.set({"checkGroup": args.check_group, "artifacts": args.artifacts}) if support else None
+        request_executed = False
+
+        def execute_request() -> int:
+            nonlocal request_executed
+            request_executed = True
+            return execute_check(args, targets, inherited)
+
         try:
-            code = run_recorded_check(lambda: execute_check(args, targets, inherited), args, invocation, repo_root=ROOT,
+            code = run_recorded_check(execute_request, args, invocation, repo_root=ROOT,
                                      checks=(lambda: args.observed_checks) if args.probe_command is None else None,
                                      summary=(lambda: args.check_summary) if args.probe_command is None else None)
             if support is not None and args.diagnostic_path.exists():
                 support.remove_test_diagnostic(args.diagnostic_path, root=ROOT, current=args.current_results,
-                                               successful_request=invocation if code == 0 and args.executed else None)
+                                               successful_request=invocation if code == 0 and (args.executed or not request_executed) else None)
             return code
         finally:
             if support is not None:

@@ -751,7 +751,11 @@ The operation supplies its check identity, exact inputs and target. The runner
 saves its actual outcome; repository and skill lifecycle read/write through
 their declared shared `store_check_results.py` payload. Repository scripts keep
 the same standalone writer contract without importing skill source.
-Probe records are always discarded after the probe.
+Probe records are always discarded after the probe. The probe removes the outer
+operation's check-context environment values before launching its own command;
+it does not read the repository's local result store. Both the generated runner
+and Ceratops's runner finish pending report deletion when they reuse a saved
+successful command, without running that command again.
 Pytest basetemp/cache directories are disposable
 execution scratch and never copied or moved into results. Collection snapshots
 and failure diagnostics remain regenerable reports, not acceptance records.

@@ -28,7 +28,7 @@ def check_store(tmp_path: pathlib.Path) -> Any:
 
 def context(level: str = "beta", **changes: Any) -> dict[str, Any]:
     value = {
-        "schema": store.CONTEXT_SCHEMA, "group": "source", "scope": {"stage": "tests"},
+        "schema": store.CONTEXT_SCHEMA, "group": "repository.actions.test", "scope": {"stage": "tests"},
         "qualificationLevel": level, "workVersion": "1" * 40,
         "checkVersion": "2" * 64, "productInputs": {"src/product.py": "3" * 64},
         "checkInputs": {"tests/test_product.py": "4" * 64},
@@ -43,6 +43,9 @@ def context(level: str = "beta", **changes: Any) -> dict[str, Any]:
 def attempt(check_store: Any, inputs: dict[str, Any], *,
             status: str = "passed", index: int = 0, check: str = "repository.actions.test",
             result_id: str | None = None) -> tuple[pathlib.Path, dict[str, Any]]:
+    inputs = copy.deepcopy(inputs)
+    inputs["group"] = check
+    inputs["fingerprint"] = store.fingerprint(inputs)
     identity, path = check_store.new_result_path()
     if result_id is not None:
         identity = result_id
@@ -137,7 +140,7 @@ def test_malformed_or_conflicting_evidence_blocks_selection(check_store, damage)
         elif damage == "candidate":
             record["candidate_id"] = "9" * 40
         elif damage == "operation":
-            record["inputs"]["scope"]["operation"] = "another-check"
+            record["inputs"]["group"] = "another-check"
             record["inputs"]["fingerprint"] = store.fingerprint(record["inputs"])
         elif damage == "subcheck-type":
             record["checks"] = [{"id": "nested", "status": []}]

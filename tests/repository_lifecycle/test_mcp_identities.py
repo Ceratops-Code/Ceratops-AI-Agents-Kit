@@ -98,7 +98,9 @@ def _package_mcp_case(tmp_path, monkeypatch, problem=None):
         binding = base / binding_path
         binding.parent.mkdir(parents=True)
         binding.write_bytes((ROOT / binding_path).read_bytes())
-    callable_path = repo / "skills/ceratops-mcp-server-lifecycle/scripts/install-mcp-server.py"
+    installed = tmp_path / "codex/skills/ceratops-mcp-server-lifecycle"
+    (installed / ".runtime-manifest.json").write_text(json.dumps({"python_runtime": sys.executable}))
+    callable_path = installed / "scripts/install-mcp-server.py"
     callable_path.parent.mkdir()
     callable_path.write_text("# The test replaces the external installation boundary.\n", encoding="utf-8")
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
@@ -219,6 +221,8 @@ def test_malformed_mcp_names_stop_before_execution(tmp_path, monkeypatch, name):
 
 @pytest.mark.parametrize("interruption", [None, "before", "after"])
 def test_underscore_identity_reaches_the_authorized_installer(tmp_path, monkeypatch, interruption):
+    from tests.repository_lifecycle.test_execute_skill_actions import _pin_python
+
     name = "source_search_mcp"
     skill = "ceratops-mcp-server-lifecycle"
     repo = tmp_path / "repo"
@@ -235,6 +239,7 @@ def test_underscore_identity_reaches_the_authorized_installer(tmp_path, monkeypa
     for root in (installed, source):
         (root / "references").mkdir(parents=True)
         (root / "references/action-executors.json").write_text(json.dumps(binding), encoding="utf-8")
+    _pin_python(installed)
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
     calls = []
 

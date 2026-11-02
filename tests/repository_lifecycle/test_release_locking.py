@@ -272,8 +272,11 @@ def test_declared_install_call_shares_outer_release_lock(tmp_path, monkeypatch, 
         (root / "references").mkdir(parents=True)
         (root / "references/action-executors.json").write_text(json.dumps(document))
     (installed / ".runtime-manifest.json").write_text(json.dumps({"python_runtime": sys.executable}))
-    (bundle / "scripts").mkdir()
-    (bundle / call["path"]).write_text('''import argparse, pathlib
+    if source:
+        (bundle / "scripts").mkdir()
+        (bundle / call["path"]).write_text("raise AssertionError('checkout installer must not run')\n")
+    (installed / "scripts").mkdir()
+    (installed / call["path"]).write_text('''import argparse, pathlib
 from types import SimpleNamespace as InstallOptions
 from hold_write_lock import hold_release_source
 def build_parser():

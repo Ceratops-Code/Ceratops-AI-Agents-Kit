@@ -322,6 +322,15 @@ def test_generated_runner_records_real_pytest_and_reuses_exact_acceptance(tmp_pa
     assert payload["status"] == "passed" and payload["exit_code"] == 0
     assert accepted == (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
     assert count.read_text() == "x"
+    report = root / ".build/test-diagnostics/pytest-failure.json"
+    report.parent.mkdir(parents=True)
+    report.write_text(json.dumps({"schema": "ceratops-ai-agents-kit-pytest-diagnostic.v1", "cwd": str(root),
+                                 "request": payload["invocation"], "exit_code": 1}))
+    for _ in range(2):
+        resumed = _run_result_runner(root, runner, args)
+        assert resumed.returncode == 0, resumed.stdout + resumed.stderr
+        assert not report.exists()
+        assert count.read_text() == "x" and result.read_bytes() == accepted
     # The caller chooses immutable candidate/check identities. Merely changing
     # current tests cannot revoke acceptance of a previously recorded candidate.
     test.write_text("def test_changed():\n    assert False\n", encoding="utf-8")
@@ -411,8 +420,13 @@ def test_generated_runner_preserves_conflicting_and_unfinished_records(tmp_path:
     assert path.read_bytes() == before
 
 
-def test_test_result_probe_accepts_generated_and_custom_compliant_runners(tmp_path: pathlib.Path) -> None:
+@pytest.mark.parametrize("outer_request", [False, True])
+def test_test_result_probe_accepts_generated_and_custom_compliant_runners(tmp_path, monkeypatch, outer_request):
     root, runner, output = _result_runner(tmp_path)
+    if outer_request:
+        (root / ".git").write_text("gitdir: not-needed-for-a-controlled-probe\n")
+        monkeypatch.setenv("CERATOPS_REPOSITORY_CHECK_CONTEXT", '{"group":"another-operation"}')
+        monkeypatch.setenv("CERATOPS_SDLC_TEST_CONTEXT", '{"trigger":"promotion"}')
     module = importlib.import_module("ceratops_repo_compatibility_engine.validate_ceratops_compatibility")
     caller_file = output / "caller-owned.txt"
     caller_file.write_text("keep", encoding="utf-8")

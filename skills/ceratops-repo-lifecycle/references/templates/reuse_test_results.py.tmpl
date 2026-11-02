@@ -352,7 +352,7 @@ def result_environment(
         "CODEX_SESSION_ID", "CODEX_THREAD_ID", "CODEX_TASK_WORKSPACE_VERIFYING_IDENTITY",
         "CERATOPS_TEST_ARTIFACTS",
     }
-    context = {
+    context: dict[str, Any] = {
         "schema": CONTEXT_SCHEMA,
         "root": str(root.resolve()),
         "arguments": check_arguments(command[3:], root),

@@ -582,7 +582,7 @@ def _write_tooling_settings(repo: pathlib.Path, settings: str) -> None:
     """Keep fixture tooling in the same owned project used by real setup."""
     (repo / "scripts").mkdir(exist_ok=True)
     template = REPOSITORY_LIFECYCLE_SOURCE / "references/templates/validation-pyproject.toml.tmpl"
-    defaults = _ruff_tools().project_text(repo, template, ["ruff", "mypy", "pytest", "yamllint"])
+    defaults = _ruff_tools().project_text(repo, template, ["ruff", "mypy", "pytest", "yamllint", "packaging"])
     (repo / "scripts/pyproject.toml").write_text(defaults.split("[tool.ruff]", 1)[0] + settings, encoding="utf-8")
 
 
@@ -753,7 +753,7 @@ def test_compatibility_materializer_supports_repositories_without_skills(
         text=True,
         check=False,
     )
-    assert validation.returncode == 0, validation.stdout
+    assert validation.returncode == 0, validation.stdout + validation.stderr + (validation_evidence.read_text() if validation_evidence.exists() else "")
     assert validation.stdout == "OK\n"
     assert actionlint_marker.read_text(encoding="utf-8") == "OK"
     assert not validation_evidence.exists()
@@ -1188,11 +1188,16 @@ def test_generated_scripts_and_skill_owned_ci_keep_environments_and_tests_separa
         )
         assert installed.returncode == 0, installed.stdout + installed.stderr
 
+    from tests.repository_lifecycle.test_sdlc_handoffs import _repository
+
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    (primary / "README.md").write_text("# Test repository\n")
+    _repository(primary)
     repo = tmp_path / "independent"
-    repo.mkdir()
+    subprocess.run(["git", "-C", str(primary), "worktree", "add", "-b", "task", str(repo)], check=True)
     (repo / "scripts").mkdir()
     (repo / "scripts/.gitignore").write_text("/custom-output/\n")
-    (repo / ".git").write_text("gitdir: test\n")
     # A nested tooling workspace must not rewrite the application's lock or
     # adopt its incompatible Python constraint.
     application = '[project]\nname="application"\nversion="1.0"\nrequires-python=">=3.11"\n[tool.uv.workspace]\nmembers=[]\n'
@@ -1255,7 +1260,7 @@ def test_generated_scripts_and_skill_owned_ci_keep_environments_and_tests_separa
     install_npm(repo)
     prefix = ["uv", "run", "--locked"]
     validation = subprocess.run([*prefix, "scripts/validate-repository.py"], cwd=repo, capture_output=True, text=True, check=False)
-    assert validation.returncode == 0, validation.stderr
+    assert validation.returncode == 0, validation.stdout + validation.stderr + (pathlib.Path(json.loads(validation.stdout)["evidence_file"]).read_text() if validation.stdout.startswith("{") else "")
     # The generated settings must be consumed, not merely written to TOML.
     check_probe = repo / "scripts/check_probe.py"
     check_probe.write_text("import math\n")
@@ -1272,7 +1277,7 @@ def test_generated_scripts_and_skill_owned_ci_keep_environments_and_tests_separa
     result = json.loads(evidence.read_text())
     assert result["status"] == "tests_failed"
     assert result["operation"] == "repository.actions.test"
-    assert any("test-gate-evidence" in line for line in result["diagnostic"]["stdout_tail"])
+    assert any("test-gate-evidence" in line for line in result["diagnostic"]["stdout_tail"]), result["diagnostic"]
     collector = importlib.import_module("github_contract_engine.collectors.local_repository")
     facts = collector._repository_validation_facts(
         {"available": True, "root": str(repo)}, [{"id": "content.repository_validation"}], str(evidence),

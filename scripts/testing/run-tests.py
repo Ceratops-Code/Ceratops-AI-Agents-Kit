@@ -498,12 +498,12 @@ def diagnostic_request(args: object) -> dict[str, object]:
 
 def cleanup_pytest_diagnostic(
     path: pathlib.Path, *, prune_parent: bool, root: pathlib.Path,
-    request: Mapping[str, object], completed_commands: Sequence[Sequence[str]],
+    request: Mapping[str, object], completed_commands: Sequence[Sequence[str]], reused_success: bool = False,
 ) -> None:
     """Use saved corrected passes; caller-selected reports outside managed storage stay."""
     if path.exists():
         remove_test_diagnostic(path, root=root, current=current_check_results(root),
-                               successful_request=request if completed_commands else None)
+                               successful_request=request if completed_commands or reused_success else None)
 
 
 def node_identity(nodeid: str) -> str:
@@ -778,11 +778,16 @@ def execute(
         summary.update(getattr(result, "check_summary", None) or {})
         return result
 
-    code = run_recorded_request(args, lambda: execute_selected(
-        argv, repo_root=repo_root, text_runner=observe, bytes_runner=bytes_runner,
-        emit_result=outputs.append,
-    ), repo_root=root, request_error=request_error, checks=lambda: observed,
-        summary=lambda: summary)
+    request_executed = False
+
+    def execute_request() -> int:
+        nonlocal request_executed
+        request_executed = True
+        return execute_selected(argv, repo_root=repo_root, text_runner=observe,
+                                bytes_runner=bytes_runner, emit_result=outputs.append)
+
+    code = run_recorded_request(args, execute_request, repo_root=root,
+                                request_error=request_error, checks=lambda: observed, summary=lambda: summary)
     # Finished outcomes are saved before disposable failure diagnostics are removed.
     # A later call can finish deletion while reusing the already saved outcomes.
     if request_error is None and not args.describe_test_results and not args.select_only:
@@ -791,6 +796,7 @@ def execute(
                 resolve_data_path(root, args.diagnostic_output or DEFAULT_DIAGNOSTIC_PATH),
                 prune_parent=args.diagnostic_output is None,
                 root=root, request=diagnostic_request(args), completed_commands=completed_commands if code == 0 else (),
+                reused_success=code == 0 and not request_executed and args.probe_command is None,
             )
         except OSError as exc:
             code = CONFIGURATION_EXIT_CODE
