@@ -849,3 +849,49 @@ def test_collection_node_map_resolves_ambiguous_identity(
             f"{old} -> tests/beta/test_flow.py::test_case[changed]"
         )
     ]
+
+
+@pytest.mark.parametrize("generated", [False, True])
+@pytest.mark.parametrize("status", ["D", "R100", "A"])
+def test_removed_paths_keep_previous_test_owners_without_stale_current_rules(
+    test_runner_module, tmp_path, generated, status,
+):
+    from dataclasses import replace
+    from select_test_groups import ChangedFile, Rule, selection_from_changes
+    import runpy
+
+    previous = sample_manifest(test_runner_module, dependencies={"beta": ("alpha",)})
+    current = replace(previous, rules=(
+        Rule("alpha-source", ("skills/new-alpha/**",), ("alpha",)),
+        previous.rules[1],
+    ))
+    if generated:
+        from tests.repository_lifecycle.test_generated_test_scripts import _write_generated_runner
+
+        _write_generated_runner(tmp_path, ["tests"])
+        selection_from_changes = runpy.run_path(
+            str(tmp_path / "scripts/testing/select_test_groups.py")
+        )["selection_from_changes"]
+    paths: tuple[str, ...] = ("skills/alpha/dependencies.lock",)
+    if status.startswith("R"):
+        paths += ("skills/beta/dependencies.lock",)
+    for _ in range(2):
+        selected = selection_from_changes(current, (ChangedFile(status, paths),),
+                                          previous_manifest=previous)
+        if status == "A":
+            assert selected.mapping_gaps and not selected.pytest_targets
+        else:
+            assert not selected.mapping_gaps
+            assert selected.suites == ("alpha", "beta")
+            assert "tests/gamma" not in selected.pytest_targets
+            assert any(reason.rule == "previous:alpha-source" for reason in selected.reasons)
+
+
+def test_unknown_previous_ownership_still_blocks_deleted_inputs(test_runner_module):
+    manifest = sample_manifest(test_runner_module)
+    selected = test_runner_module.selection_from_changes(
+        manifest, (test_runner_module.ChangedFile("D", ("unowned.lock",)),),
+        previous_manifest=manifest,
+    )
+    assert selected.mapping_gaps == ({"path": "unowned.lock", "reason": "unmapped repository path"},)
+    assert not selected.pytest_targets

@@ -422,7 +422,14 @@ behavior-changing arguments, runtime/platform, plus the
 packages, tools, environment
 variables and production/data paths assigned to each check group. The existing
 `tests/test-impact.json` is read by `select_test_groups.py`; no second dependency
-graph is maintained. A consumer includes its prerequisites' inputs and settings,
+graph is maintained. For deleted paths and production-file rename sources,
+the runner reads the
+map from the diff's merge-base (HEAD for uncommitted changes). Previous owners
+select current check groups; they do not grant reuse. Unknown or removed owners
+remain explicit mapping errors. New paths use only the current map; moved tests
+keep their destination ownership. This avoids
+keeping obsolete dependency filenames just to pass Ship's selection check.
+A consumer includes its prerequisites' inputs and settings,
 recursively. Changes flow toward consumers, never from a consumer back to its
 unchanged prerequisites. Test bytes, imported repository helpers and ancestor
 fixtures are separate check inputs. New unignored inputs participate through the

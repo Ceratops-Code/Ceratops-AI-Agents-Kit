@@ -49,6 +49,7 @@ from select_test_groups import (
     Manifest,
     Selection,
     _string_tuple,
+    _unique_object,
     all_selection,
     dependency_errors,
     is_executable_production_path,
@@ -56,6 +57,7 @@ from select_test_groups import (
     load_manifest,
     normalize_path,
     owning_suites,
+    parse_manifest,
     path_matches,
     pattern_hits,
     selection_from_changes,
@@ -213,6 +215,35 @@ def changed_files(
         detail = result.stderr.decode("utf-8", "replace").strip()
         raise ImpactError(f"Git diff failed: {detail or result.returncode}")
     return parse_name_status_z(result.stdout)
+
+
+def previous_change_manifest(
+    root: pathlib.Path, changes: Sequence[ChangedFile], base: str, head: str | None = None,
+    *, runner: BytesRunner = run_bytes,
+) -> Manifest | None:
+    """Read ownership from the exact left side of the diff, only for removals."""
+    if not any(item.status == "D" or (item.status.startswith("R") and not item.paths[0].startswith("tests/"))
+               for item in changes):
+        return None
+    commands = [["git", "merge-base", base, head]] if head is not None else []
+    for command in commands:
+        result = runner(command, root)
+        if result.returncode or not FULL_SHA.fullmatch(result.stdout.decode().strip()):
+            raise ImpactError(f"Cannot read previous test ownership: command={command!r}; cwd={root}; "
+                              f"exit={result.returncode}; stdout={result.stdout!r}; stderr={result.stderr!r}")
+        base = result.stdout.decode().strip()
+    command = ["git", "show", f"{base}:tests/test-impact.json"]
+    result = runner(command, root)
+    if result.returncode:
+        raise ImpactError(f"Cannot read previous test ownership: command={command!r}; cwd={root}; "
+                          f"exit={result.returncode}; stdout={result.stdout!r}; stderr={result.stderr!r}")
+    try:
+        previous = parse_manifest(json.loads(result.stdout, object_pairs_hook=_unique_object))
+    except (ValueError, UnicodeError) as exc:
+        raise ImpactError(f"Previous test ownership is unreadable at {base}: {exc}") from exc
+    if errors := dependency_errors(previous):
+        raise ImpactError("; ".join(errors))
+    return previous
 
 
 def resolve_worktree_base(
@@ -961,6 +992,7 @@ def execute_selected(
         try:
             base = resolve_worktree_base(root, runner=preflight_text)
             changes = worktree_changed_files(root, base, runner=bytes_runner)
+            previous = previous_change_manifest(root, changes, base, runner=bytes_runner)
         except ImpactError as exc:
             payload["manifest_errors"] = [str(exc)]
             payload["status"] = "configuration-error"
@@ -968,12 +1000,13 @@ def execute_selected(
         payload["base"] = base
         payload["head"] = "WORKTREE"
         payload["changed"] = [item.payload() for item in changes]
-        selection = selection_from_changes(manifest, changes)
+        selection = selection_from_changes(manifest, changes, previous_manifest=previous)
     else:
         try:
             base = resolve_revision(root, args.base, runner=preflight_text)
             head = resolve_revision(root, args.head, runner=preflight_text)
             changes = changed_files(root, base, head, runner=bytes_runner)
+            previous = previous_change_manifest(root, changes, base, head, runner=bytes_runner)
         except ImpactError as exc:
             payload["manifest_errors"] = [str(exc)]
             payload["status"] = "configuration-error"
@@ -981,7 +1014,7 @@ def execute_selected(
         payload["base"] = base
         payload["head"] = head
         payload["changed"] = [item.payload() for item in changes]
-        selection = selection_from_changes(manifest, changes)
+        selection = selection_from_changes(manifest, changes, previous_manifest=previous)
     payload.update(
         {
             "full_suite": selection.full_suite,
