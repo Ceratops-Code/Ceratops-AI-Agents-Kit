@@ -551,9 +551,8 @@ def handoff_report_completions(result: Any) -> list[dict[str, Any]]:
     return found
 
 
-def _write_report_bytes(path: pathlib.Path, data: bytes) -> None:
-    """Publish one complete snapshot; interruption leaves the previous one usable."""
-    path.parent.mkdir(parents=True, exist_ok=True)
+def _remove_report_staging(path: pathlib.Path) -> None:
+    """Remove only this output's reserved staging file after writers stop."""
     # The selected report owns this reserved staging name. A fresh call may
     # discard unpublished bytes only after all local writers are known stopped.
     staging = path.with_name("." + path.name + ".operation-report.tmp")
@@ -562,6 +561,13 @@ def _write_report_bytes(path: pathlib.Path, data: bytes) -> None:
                 or staging.is_junction() or not staging.is_file() or staging.stat().st_nlink != 1):
             raise ValueError(f"Report staging file is busy or redirected: {staging}")
         staging.unlink()
+
+
+def _write_report_bytes(path: pathlib.Path, data: bytes) -> None:
+    """Publish one complete snapshot; interruption leaves the previous one usable."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _remove_report_staging(path)
+    staging = path.with_name("." + path.name + ".operation-report.tmp")
     created = False
     try:
         with staging.open("xb") as stream:
@@ -579,11 +585,14 @@ def update_ci_failure_evidence(path: pathlib.Path, result: dict[str, Any], *, fa
     Failure atomically replaces the raw result; success removes that output.
     This is a CI artifact, not a managed task-report snapshot. Its caller owns
     the path and lifetime; sibling files and unrelated reports are never scanned.
+    An interrupted save's staging is retired even when current evidence already
+    matches or the new run succeeds.
     """
     selected = path.expanduser().absolute()
     if (selected.resolve() != selected or selected.is_symlink() or selected.is_junction()
             or (selected.exists() and (not selected.is_file() or selected.stat().st_nlink != 1))):
         raise ValueError(f"CI evidence must be a regular unredirected file: {selected}")
+    _remove_report_staging(selected)
     if failed:
         data = (json.dumps(result, indent=2) + "\n").encode("utf-8")
         if selected.is_file() and selected.read_bytes() == data:

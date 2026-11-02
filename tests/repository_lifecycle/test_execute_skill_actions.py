@@ -765,6 +765,47 @@ def test_ci_failure_evidence_repeats_after_interrupted_publish_or_deletion(tmp_p
         assert not list(evidence.parent.glob("*.operation-report.tmp"))
 
 
+@pytest.mark.parametrize("failed", [False, True])
+@pytest.mark.parametrize("unchanged", [False, True])
+@pytest.mark.parametrize("after", [False, True])
+def test_ci_evidence_retires_interrupted_staging_before_current_outcome(
+    tmp_path, monkeypatch, failed, unchanged, after,
+):
+    command = importlib.import_module("github_pr_workflow.command")
+    evidence = tmp_path / "failure.json"
+    result = {"status": "operation_failed" if failed else "completed"}
+    previous = (json.dumps(result, indent=2) + "\n").encode() if unchanged else b"previous failure"
+    evidence.write_bytes(previous)
+    staging = evidence.with_name("." + evidence.name + ".operation-report.tmp")
+    staging.write_bytes(b"interrupted prior result")
+    peer = tmp_path / "accepted.json"
+    peer.write_bytes(b"accepted work")
+    original = pathlib.Path.unlink
+    interrupted = False
+
+    def unlink(path, *args, **kwargs):
+        nonlocal interrupted
+        if path == staging and not interrupted:
+            interrupted = True
+            if after:
+                original(path, *args, **kwargs)
+            raise KeyboardInterrupt("interrupted staging cleanup")
+        return original(path, *args, **kwargs)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(pathlib.Path, "unlink", unlink)
+        with pytest.raises(KeyboardInterrupt):
+            command.update_ci_failure_evidence(evidence, result, failed=failed)
+    assert interrupted
+    assert staging.exists() is not after
+    assert evidence.read_bytes() == previous
+    for _ in range(2):
+        command.update_ci_failure_evidence(evidence, result, failed=failed)
+        assert not staging.exists()
+        assert (json.loads(evidence.read_bytes()) if evidence.exists() else None) == (result if failed else None)
+        assert peer.read_bytes() == b"accepted work"
+
+
 def test_completed_handoff_record_survives_removed_result_directory(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
