@@ -336,6 +336,43 @@ def _recorded_build_path(
     return path
 
 
+def build_result_artifact_paths(
+    repo_root: pathlib.Path, receipt: Mapping[str, Any], reference: str,
+) -> dict[str, list[str]]:
+    """Return the exact files of a successful v1/v2/v3 build for phased checks.
+
+    Paths follow each receipt format's producer: v1 is repository-relative,
+    v2 uses its identity-keyed build bundle, and v3 uses its allocated version
+    and target directory. No latest-build or installed-package lookup occurs.
+    Byte checks protect integrity; recorded test acceptance is not repeated.
+    """
+    if receipt.get("status") != "passed":
+        return {}
+    schema = receipt.get("schema")
+    if schema == "ceratops-build-result.v1":
+        bundle, records = repo_root, [receipt["artifact"]]
+    elif schema == sdlc_results.BUILD_RECEIPT_SCHEMA:
+        identity = validated_build_selection(receipt["identity"])
+        bundle = _build_store_path(repo_root) / hashlib.sha256(canonical_json(identity)).hexdigest()
+        records = receipt["artifacts"]
+    elif schema == sdlc_results.COMMITTED_BUILD_RECEIPT_SCHEMA:
+        identity = receipt["identity"]
+        relative = f"{identity['releaseUnit']}/{identity['version']}"
+        if len(receipt["requiredTargets"]) > 1:
+            relative += f"/{identity['target']}"
+        bundle = _artifact_store_path(repo_root) / sdlc_results._bundle_relative_path(relative)
+        records = receipt["artifacts"]
+        if any(record["root"] != "store" for record in records):
+            raise OperationError("Built artifacts must name stored files.")
+    else:
+        return {}
+    selected: dict[str, list[str]] = {}
+    for record in records:
+        path = str(sdlc_results._verify_bundle_file(bundle, record))
+        selected.setdefault(reference, []).append(path)
+    return selected
+
+
 def read_completed_build(
     repo_root: pathlib.Path,
     *,

@@ -1172,20 +1172,20 @@ def execute_check_phases(
                 results.append({"operation": item.operation, "status": "operation_failed", "blocked": True,
                                 "message": "Required builds did not produce accepted artifacts: " + ", ".join(sorted(missing))})
                 continue
-            result = run(item)
+            result = run(replace(item, selected_artifacts={key: available[key] for key in dependencies[reference]})
+                         if dependencies[reference] else item)
             if result["status"] not in FAILED_STATUSES and item.operation.startswith("deliverables."):
                 reference = item.operation.rsplit(".actions.", 1)[0]
-                for step in result.get("step_results", []):
-                    artifact = step.get("result", {}).get("artifact")
-                    if artifact and step["result"].get("status") == "passed":
-                        paths = [str((item.repo_root / artifact["path"]).resolve())]
-                        try:
-                            facts = reuse_operation_checks.artifact_inputs(item.repo_root, {reference: paths})
-                            if facts[reference][0]["sha256"] != artifact["sha256"]:
-                                raise ValueError(f"Built file differs from reported digest: {paths[0]}")
-                            available[reference] = paths
-                        except (OSError, ValueError) as exc:
-                            result.update(status="result_invalid", message=str(exc))
+                try:
+                    produced: dict[str, list[str]] = {}
+                    for step in result.get("step_results", []):
+                        for key, paths in store_artifacts.build_result_artifact_paths(
+                            item.repo_root, step.get("result", {}), reference,
+                        ).items():
+                            produced.setdefault(key, []).extend(paths)
+                    available.update({key: list(dict.fromkeys(paths)) for key, paths in produced.items()})
+                except (OSError, ValueError, KeyError, TypeError, store_artifacts.OperationError) as exc:
+                    result.update(status="result_invalid", message=str(exc))
         for item in after:
             missing = set(item.required_artifacts) - available.keys()
             if missing:

@@ -153,6 +153,85 @@ def test_check_phases_public_cli_preserves_all_independent_results(tmp_path, fai
         ["scan-a", "scan-b"] if failure else ["scan-a", "scan-b", "build", "unit-tests"])
 
 
+@pytest.mark.parametrize("format", ["v2", "v3-single", "v3-multiple"])
+@pytest.mark.parametrize("damage", [None, "missing", "changed"])
+@pytest.mark.parametrize("public_cli", [False, True])
+def test_check_phases_pass_every_stored_artifact_and_block_partial_output(tmp_path, format, damage, public_cli):
+    from tests.repository_lifecycle.test_sdlc_handoffs import _build_receipt_fixture, _new_receipt_fixtures
+
+    requests = _phased_repository(tmp_path)
+    fixture = tmp_path / "receipt-fixture"
+    fixture.mkdir()
+    if format == "v2":
+        _, _, receipt, _ = _build_receipt_fixture(fixture)
+        bundle = runner.store_artifacts.prepare_build_storage(tmp_path, receipt["identity"]).completed
+    else:
+        targets = ["python-3.14-windows"] if format == "v3-single" else None
+        _, receipt, *_ = _new_receipt_fixtures(fixture, required_targets=targets)
+        receipt["artifacts"].append({**receipt["artifacts"][0], "path": "artifacts/second.whl"})
+        bundle = tmp_path / ".git/ceratops/artifacts/claims/1.2.3b1"
+        if format == "v3-multiple":
+            bundle /= "python-3.14-windows"
+    for artifact in receipt["artifacts"]:
+        artifact.update(size=len(b"current build"), sha256=hashlib.sha256(b"current build").hexdigest())
+    contract = tmp_path / runner.DEFAULT_CONTRACT
+    document = json.loads(contract.read_text())
+    build = document["deliverables"]["packages"]["sample"]["actions"]["build"]
+    build.pop("check-groups")
+    build["result-schema"] = receipt["schema"]
+    build["steps"] = [{"run": [sys.executable, "scripts/build.py"]}]
+    contract.write_text(json.dumps(document))
+    checks = tmp_path / "scripts/phases.py"
+    checks.write_text(checks.read_text().replace(
+        "len(paths) == 1 and pathlib.Path(paths[0]).read_bytes() == b'current build'",
+        f"len(paths) == 2 and all(pathlib.Path(p).read_bytes() == b'current build' "
+        f"and pathlib.Path(p).is_relative_to({str(bundle)!r}) for p in paths)",
+    ))
+    program = (
+        "import json, pathlib\n"
+        f"receipt = json.loads({json.dumps(receipt)!r})\n"
+        f"bundle = pathlib.Path({str(bundle)!r})\n"
+        "for item in receipt['artifacts']:\n"
+        "    path = bundle / item['path']; path.parent.mkdir(parents=True, exist_ok=True)\n"
+        "    path.write_bytes(b'current build')\n"
+        "DAMAGE\n"
+        "print(json.dumps(receipt))\n"
+    )
+    for failure in (damage, None):
+        effect = "path.unlink()" if failure == "missing" else "path.write_bytes(b'wrong build!!')" if failure else "pass"
+        (tmp_path / "scripts/build.py").write_text(program.replace("DAMAGE", effect))
+        assert run_git(tmp_path, "add", ".").returncode == 0
+        assert run_git(tmp_path, "commit", "--allow-empty", "-m", "build outputs").returncode == 0
+        (tmp_path / "order.log").unlink(missing_ok=True)
+        if public_cli:
+            process = subprocess.run([
+                sys.executable, str(ROOT / "skills/ceratops-repo-lifecycle/scripts/repository_operation.py"),
+                "--repo-root", str(tmp_path), "--operation", "deliverables.packages.sample.actions.build",
+            ], capture_output=True, text=True, check=False)
+            result = json.loads(process.stderr if process.returncode else process.stdout)
+        else:
+            result = runner.execute_prepared_operations(runner.prepare_operations(tmp_path, requests))
+        assert result["status"] == ("result_invalid" if failure else "completed"), result
+        assert (tmp_path / "order.log").read_text().splitlines() == (
+            ["scan-a", "scan-b"] if failure else ["scan-a", "scan-b", "unit-tests"])
+
+
+@pytest.mark.parametrize("contract_version", [4, 5])
+@pytest.mark.parametrize("receipt_version", [1, 2, 3])
+def test_build_action_accepts_supported_receipt_formats(tmp_path, contract_version, receipt_version):
+    _fixture(tmp_path)
+    path = tmp_path / runner.DEFAULT_CONTRACT
+    document = json.loads(path.read_text())
+    document["version"] = contract_version
+    schema = f"ceratops-build-result.v{receipt_version}"
+    document["deliverables"]["packages"]["sample"]["actions"]["build"]["result-schema"] = schema
+    path.write_text(json.dumps(document))
+    prepared = runner.prepare_operations(tmp_path, [
+        runner.OperationRequest("deliverables.packages.sample.actions.build"),
+    ])
+    assert prepared[0].result_schema == schema
+
+
 @pytest.mark.parametrize("failed_dependency", [False, True])
 def test_check_phases_orders_selected_build_dependencies_and_joint_tests(tmp_path, failed_dependency):
     requests = _phased_repository(tmp_path)
@@ -172,6 +251,9 @@ def test_check_phases_orders_selected_build_dependencies_and_joint_tests(tmp_pat
     groups = data["repository"]["actions"]["test"]["check-groups"]
     groups["unit-tests"]["requires-artifacts"].append("deliverables.packages.dependency")
     program = (tmp_path / "scripts/phases.py").read_text().replace(
+        "if a.build:\n",
+        "if a.build:\n    assert pathlib.Path(json.loads(os.environ['CERATOPS_TEST_ARTIFACTS'])"
+        "['deliverables.packages.dependency'][0]).read_bytes() == b'current build'\n").replace(
         "paths = json.loads(a.artifacts)",
         "assert pathlib.Path(json.loads(a.artifacts)['deliverables.packages.dependency'][0]).read_bytes() == b'current build'\n    paths = json.loads(a.artifacts)")
     (tmp_path / "scripts/phases.py").write_text(program)

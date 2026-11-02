@@ -1544,6 +1544,12 @@ first, failed prerequisites block their dependents, and joint tests wait for all
 their selected files. The executor supplies `--check-group` and `--artifacts`
 JSON to test commands and `CERATOPS_TEST_ARTIFACTS` to their children. File paths
 and byte hashes become reuse inputs; no installed version is selected implicitly.
+SDLC v4/v5 build actions can require a v1, v2 or v3 result. Build receipts
+supply every produced file: v1 paths are repository-relative,
+v2 paths belong to their recorded shared build bundle, and v3 paths belong to
+their allocated version/target directory. Missing or changed files block only
+dependent work; dependent builds receive their selected files in the same
+environment mapping as tests.
 
 Test errors are saved in `.build/test-diagnostics/pytest-failure.json` or the
 caller-selected diagnostic path. Repeated errors replace that request's current

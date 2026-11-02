@@ -54,10 +54,10 @@ V4_ACTION_CATEGORIES = {
     "verify-publish": "verify-publish",
 }
 V4_RESULT_SCHEMAS = {
-    "validate": "ceratops-repository-stage-result.v1",
-    "test": "ceratops-repository-stage-result.v1",
-    "build": "ceratops-build-result.v1",
-    "install": "ceratops-deployment-result.v1",
+    "validate": ("ceratops-repository-stage-result.v1",),
+    "test": ("ceratops-repository-stage-result.v1",),
+    "build": ("ceratops-build-result.v1", "ceratops-build-result.v2", "ceratops-build-result.v3"),
+    "install": ("ceratops-deployment-result.v1",),
 }
 
 
@@ -308,10 +308,10 @@ def _typed_semantic_errors(value: Mapping[str, Any]) -> list[str]:
                     errors.append(
                         f"result-schema is not supported at {owner}.actions.{action_name}"
                     )
-                elif declared_result != expected_result:
+                elif declared_result not in expected_result:
                     errors.append(
                         f"{owner}.actions.{action_name} result-schema must be "
-                        f"{expected_result}"
+                        f"{' or '.join(expected_result)}"
                     )
                 steps = action.get("steps", [])
                 if not steps or "run" not in steps[-1]:

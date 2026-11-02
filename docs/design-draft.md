@@ -530,6 +530,12 @@ receive the same mapping in `CERATOPS_TEST_ARTIFACTS`. Paths and measured hashes
 enter both whole-check and individual-test inputs. Changes during execution
 prevent saving a reusable pass. Existing `build_bundle()` callbacks already
 receive the exact measured artifact inventory; no second selection is added.
+`store_artifacts.build_result_artifact_paths()` resolves all artifacts in v1,
+v2 and v3 results using their existing repository, shared bundle and allocated
+version/target paths. SDLC v4/v5 declarations accept these same build formats.
+Integrity checks complete for the entire build output
+before it becomes available to dependent builds or checks. Multiple output
+steps accumulate their files; a missing or changed file exposes no partial set.
 
 The test runner owns `.build/test-diagnostics/pytest-failure.json`. Its shared
 support module stores current failure IDs and deduplicated full, redacted command
