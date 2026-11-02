@@ -4,7 +4,7 @@
 
 Read `python_runtime` from the installed skill's `.runtime-manifest.json` and
 run the helper with that interpreter through uv. The declarations remain in
-the skills source repository under `skills/sections/python`; deployment prepares
+the skills source repository under `scripts`; deployment prepares
 a versioned shared environment. Source development uses the repository's
 `scripts/pyproject.toml`. The validator itself makes no model or network calls
 and never edits a reviewed document.

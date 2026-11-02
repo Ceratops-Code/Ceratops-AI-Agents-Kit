@@ -105,8 +105,8 @@
     ]
   },
   "skill_python_runtime": {
-    "project": "skills/sections/python/pyproject.toml",
-    "lockfile": "skills/sections/python/uv.lock"
+    "project": "scripts/pyproject.toml",
+    "lockfile": "scripts/uv.lock"
   },
   "configuration_layout": {
     "root_file_patterns": [

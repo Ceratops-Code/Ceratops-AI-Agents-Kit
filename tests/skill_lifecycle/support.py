@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import runpy
 import shutil
@@ -25,7 +26,7 @@ FAST_CHANGE = LIFECYCLE_SOURCE / "scripts" / "fast-change.py"
 SKILL_UPDATE_WORKFLOW = LIFECYCLE_SOURCE / "scripts" / "skill-update-workflow.py"
 RUNTIME_MANIFEST = ".runtime-manifest.json"
 RUNTIME_MANIFEST_SCHEMA = "ceratops-runtime-skill.v3"
-INSTALLER_VERSION = 20
+INSTALLER_VERSION = 21
 
 
 def prepare_fast_change_repo(tmp_path: pathlib.Path) -> pathlib.Path:
@@ -60,19 +61,13 @@ def prepare_fast_change_repo(tmp_path: pathlib.Path) -> pathlib.Path:
             encoding="utf-8",
             newline="\n",
         )
-    runtime = (
-        repo
-        / "skills"
-        / "ceratops-skill-lifecycle"
-        / "scripts"
-        / "runtime"
-    )
+    runtime = tmp_path / "profile/skills/ceratops-skill-lifecycle/scripts/runtime"
     runtime.mkdir(parents=True)
     (runtime / "install-managed-skills.py").write_text(
         "import os, pathlib\n"
         "from types import SimpleNamespace as DeployOptions\n"
         "def deploy_managed_skills(options):\n"
-        "    log = pathlib.Path(__file__).resolve().parents[5] / 'install.log'\n"
+        "    log = options.repo_root.parent / 'install.log'\n"
         "    argv = ['--repo-root', str(options.repo_root)]\n"
         "    if options.install_root is not None:\n"
         "        argv.extend(['--install-root', str(options.install_root)])\n"
@@ -84,6 +79,12 @@ def prepare_fast_change_repo(tmp_path: pathlib.Path) -> pathlib.Path:
         encoding="utf-8",
         newline="\n",
     )
+    (runtime.parent.parent / ".runtime-manifest.json").write_text(
+        json.dumps({"python_runtime": sys.executable}), encoding="utf-8",
+    )
+    source_installer = repo / "skills/ceratops-skill-lifecycle/scripts/runtime/install-managed-skills.py"
+    source_installer.parent.mkdir(parents=True)
+    source_installer.write_text("raise AssertionError('checkout installer executed')\n", encoding="utf-8")
     (repo / ".gitignore").write_text(
         "__pycache__/\n.pytest_cache/\n",
         encoding="utf-8",
@@ -166,7 +167,7 @@ def run_fast_change(
         capture_output=True,
         text=True,
         check=False,
-        env=environment,
+        env={**os.environ, **(environment or {}), "CODEX_HOME": str(repo.parent / "profile")},
     )
 
 
@@ -388,3 +389,17 @@ def add_action_sections(repo: pathlib.Path) -> dict[str, Any]:
     manifest["actions"] = {"alpha-tool": {"references/review.md": ["review-policy", "review-extra"]}}
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     return manifest
+
+
+def install_packet_checker(installed: pathlib.Path) -> None:
+    """Provide an installed checker and its own imported helper in packet cases."""
+    lifecycle = installed.parent / "ceratops-skill-lifecycle"
+    scripts = lifecycle / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    (lifecycle / ".runtime-manifest.json").write_text(
+        json.dumps({"python_runtime": sys.executable}), encoding="utf-8",
+    )
+    (scripts / "skills-consistency-source-validator.py").write_text(
+        "from review_support import check\ncheck()\n", encoding="utf-8",
+    )
+    (scripts / "review_support.py").write_text("def check():\n    print('OK')\n", encoding="utf-8")

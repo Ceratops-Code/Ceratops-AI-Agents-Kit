@@ -448,7 +448,7 @@ def test_installer_launch_failures_keep_unfinished_flag(tmp_path, monkeypatch, l
         monkeypatch.setitem(call.__globals__, "_deployment_scope", lambda *a: module["AffectedSet"](("example",), ()))
         if launcher == "skill_runtime":
             monkeypatch.setitem(call.__globals__, "_check_deployment_sources", lambda *a: None)
-            project = repo / "skills/sections/python"
+            project = repo / "scripts"
             project.mkdir(parents=True)
             (project / "pyproject.toml").write_text("[project]\nname='fixture'\nversion='0.0.0'\n")
             (project / "uv.lock").write_text("fixture lock")

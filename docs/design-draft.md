@@ -72,7 +72,7 @@ test bodies and their implementation remain repository-specific.
 | Environment | Declarations | Execution and ownership |
 | --- | --- | --- |
 | Repository Python scripts and tests | `scripts/pyproject.toml` and `scripts/uv.lock` | uv selects the required Python and prepares ignored `scripts/.venv`; repository entrypoints use this project. |
-| Installed Ceratops skill helpers | Source-only declarations under `skills/sections/python` | Deployment prepares a versioned venv under `$CODEX_HOME/runtimes/ceratops/versions/`; each installed skill manifest pins its interpreter. After manifest activation, the owner retains the selected version plus two predecessors, deferring cleanup for manifest-pinned or running interpreters. Direct uv commands run helpers. |
+| Installed Ceratops skill helpers | Runtime dependencies from `scripts/pyproject.toml` and `scripts/uv.lock` | Deployment prepares a versioned venv under `$CODEX_HOME/runtimes/ceratops/versions/`; each installed skill manifest pins its interpreter. After manifest activation, the owner retains the selected version plus two predecessors, deferring cleanup for manifest-pinned or running interpreters. Direct uv commands run helpers. |
 | Installed external MCP servers | The selected server's declarations and installer | The MCP server manager owns the installed server environment, separately from the shared skill environment. |
 
 `skills/ceratops-skill-lifecycle/scripts/runtime/prepare_python_runtime.py` owns
@@ -103,7 +103,13 @@ the ZIP is missing, without substituting the selected branch's current tip.
 One environment does not need both requirements files and a pyproject dependency
 list. The thread selected pyproject plus its lockfile and removal of the root
 requirements files. In Ceratops-AI-Agents-Kit, `scripts/pyproject.toml` owns both
-Python tooling dependencies and Ruff and mypy settings. Node tooling manifests
+shared skill runtime dependencies, its development-only tool group, and Ruff
+and mypy settings. Native product pyprojects remain uv workspace members with
+their independent distribution metadata; the workspace uses one `scripts/uv.lock`.
+Managed runtime identity hashes only the exported runtime dependency graph and
+Python requirement, excluding development groups and unrelated workspace packages.
+Thus adding a tool does not replace an unchanged installed skill environment.
+Node tooling manifests
 and Markdown/YAML lint settings also live under `scripts`; generated diagnostic
 files live under the ignored `.build` directory.
 
@@ -121,7 +127,7 @@ An unsupported settings-output format or unavailable tool runtime blocks the
 check. Application Python requirements and acceptance of unchanged artifacts
 remain with their existing owners.
 Dependabot must address the directories containing the dependency projects,
-including `/scripts` and the separate shared skill project.
+with one Python project at `/scripts` and the Node project at `/scripts`.
 
 Dependabot preflight identifies updates from PR titles and collects dependency
 files from the exact PR head through Git's tree and blob readers. It fetches a
@@ -140,7 +146,8 @@ to 32 read-only workers. Each source retains its complete configured window and
 exact-head readiness checks. All workers stop before publication starts, and
 source failures remain scoped to their own PRs.
 
-Repository examples use `uv run --locked scripts/<entrypoint>.py`; source
+Repository examples use `uv run --project scripts --locked python
+scripts/<entrypoint>.py`; source
 helpers outside `scripts` use `uv run --project scripts --locked python ...`.
 The caller and uv prepare the environment. Individual scripts do not contain
 the removed `python_environment.py` self-installing bootstrap. A direct
@@ -155,6 +162,12 @@ places tests and other repository scripts under the same scripts project.
 SDLC here means the repository's lifecycle configuration in `sdlc/sdlc.yml`.
 An operation is an entry such as a deliverable's validation or local deployment
 command. A handoff names an installed skill and action that owns the next step.
+`execute_skill_actions.py` reads that installed skill's action declaration and
+uses its installed executable and pinned Python. Checkout paths supply input
+data, never a replacement skill implementation. Fast-change selects the installed
+skill installer; review packets select the installed source checker. Their
+supporting modules come from the selected installed bundle. First-install
+bootstrap remains a repository-owned workflow because no installation exists yet.
 
 Supported SDLC v4 and v5 place tests in explicit actions. A deliverable may declare
 a no-op with a reason, including coverage by repository-wide tests. Different
@@ -679,7 +692,7 @@ invocations still run disposable tests; they do not create reusable acceptance.
 The retained-result invocation is:
 
 ```text
-uv run --locked scripts/run-tests.py [TEST_TARGET ...] --result-file RESULT --result-id RESULT_ID --candidate-id CANDIDATE_ID --check-id CHECK_ID --check-version CHECK_VERSION
+uv run --project scripts --locked python scripts/run-tests.py [TEST_TARGET ...] --result-file RESULT --result-id RESULT_ID --candidate-id CANDIDATE_ID --check-id CHECK_ID --check-version CHECK_VERSION
 ```
 
 The caller supplies all identities and the final path together, serializes its

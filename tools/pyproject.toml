@@ -14,3 +14,6 @@ include = ["/source_search_mcp.py"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "../hooks/bounded-source-search.py" = "source_search_mcp_support/bounded-source-search.py"
+
+[tool.ceratops]
+dependency-project = "../scripts"

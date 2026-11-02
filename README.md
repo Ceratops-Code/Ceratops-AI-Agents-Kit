@@ -1429,12 +1429,11 @@ environment setup. Remove that declaration or set `managed = false` before
 customizing. Unmarked existing scripts remain untouched. The generated script
 uses the scripts project, owns its disposable pytest directories, and streams
 pytest's failure details directly.
-Invoke Python entrypoints with
-`uv run --locked <path-to-script.py>`; uv discovers their project from the
-script location and prepares its environment before execution. Use an
-absolute script path when calling from outside the repository. Module
-commands select the project with `--project scripts`. Repository scripts
-contain no environment bootstrap or package-installation logic. Existing
+From the repository root, invoke Python entrypoints with
+`uv run --project scripts --locked python <path-to-script.py>`. From elsewhere,
+give `--project` the repository's absolute `scripts` path. uv prepares
+`scripts/.venv`; Python subprocesses use `sys.executable` to stay in that
+environment. Repository check scripts contain no package-installation logic. Existing
 test implementations and non-Python test commands remain repository-owned.
 
 The lifecycle runner invokes the declared repository validation and test
@@ -1447,7 +1446,7 @@ The validator owns validation checks and reporting. The test runner owns test
 execution and result recording. The 1e.3 standard runner accepts:
 
 ```text
-uv run --locked scripts/run-tests.py [TEST_TARGET ...] --result-file RESULT --result-id RESULT_ID --candidate-id CANDIDATE_ID --check-id CHECK_ID --check-version CHECK_VERSION
+uv run --project scripts --locked python scripts/run-tests.py [TEST_TARGET ...] --result-file RESULT --result-id RESULT_ID --candidate-id CANDIDATE_ID --check-id CHECK_ID --check-version CHECK_VERSION
 ```
 
 The caller chooses the final `RESULT` path and binds the four nonempty identities
@@ -1576,7 +1575,8 @@ This source repository uses `scripts/pyproject.toml` and `scripts/uv.lock` for
 its maintenance scripts, Python tests, and Ruff and mypy settings. Its SDLC v4
 contract runs validation and tests separately.
 CI uses the local composite action in this checkout, preserving PR test selection;
-local and push gates run the full test suite. Other repositories use the same
+local and push gates cover the required tests while reusing applicable passes.
+Other repositories use the same
 skill-owned action pinned to a published commit.
 
 Repository-wide Markdown and YAML lint settings live in
@@ -1592,8 +1592,15 @@ explicitly.
 ## Shared Skill Python Environment
 
 The sole dependency declarations for managed skill helpers are
-`skills/sections/python/pyproject.toml` and `uv.lock` in the source repository.
-Dependabot maintains this lock independently of repository tooling.
+`scripts/pyproject.toml` and `scripts/uv.lock` in the source repository.
+Shared helper libraries belong in `project.dependencies`; repository-only tools
+belong in `dependency-groups.dev`. Add a helper library once to the former and
+run `uv lock --project scripts`: both repository commands and the next managed
+installation use that declaration. Dependabot maintains this common project.
+The independently packaged products in `tools/` and
+`mcp-servers/ceratops_mcp_server_manager/` are uv workspace members. Their native
+metadata still owns each product's name, version, requirements and entry points;
+the common lock resolves them without separate development environments.
 Compatibility setup requires repositories with Python helper skills to supply
 their own project and lock at these paths. It reports missing files before
 changing the repository and does not copy Ceratops dependencies. Deployment
@@ -1616,8 +1623,11 @@ The command preserves the caller's working directory and the helper's output
 and exit status. Repository uv commands select their own projects because the
 deployment-only `UV_PROJECT_ENVIRONMENT` override is not forwarded.
 Deployment checks an existing version without modifying it; if it is damaged
-or the source lock changes, deployment builds a new version and pins newly
-installed skills to it. Running helpers retain their original environment.
+or its resolved runtime dependencies change, deployment builds a new version and
+pins newly
+installed skills to it. A development-tool or unrelated workspace dependency
+change does not change the installed skill runtime's identity. Running helpers
+retain their original environment.
 Old versions remain until an idle cleanup. External MCP servers retain their own
 installer-managed environments.
 
@@ -1634,11 +1644,11 @@ the interpreter when needed, and prepares `scripts/.venv` from `scripts/uv.lock`
 Run the repository installer with that locked project:
 
 ```powershell
-uv run --locked scripts/deploy-skills.py
+uv run --project scripts --locked python scripts/deploy-skills.py
 ```
 
-The deployed skills' separate project includes timezone data for date-based
-helpers on Windows. The standalone installer uses the scripts environment and
+The common project includes timezone data for installed date-based helpers on
+Windows. The standalone installer uses the scripts environment and
 never calls installed lifecycle code. It
 renders the selected batch in a hidden staging directory and copies its files
 over existing installations without source or staged-content validation.
@@ -1683,7 +1693,7 @@ evidence need redeployment if their recorded checkout is gone.
 For another Ceratops-compatible repo, run its versioned repository installer:
 
 ```powershell
-uv run --locked <target-repo>/scripts/deploy-skills.py --repo-root <target-repo>
+uv run --project <target-repo>/scripts --locked python <target-repo>/scripts/deploy-skills.py --repo-root <target-repo>
 ```
 
 An external repository's standalone installer is independent: it uses the
@@ -1825,12 +1835,13 @@ explicit test runner used by CI:
 ```powershell
 npm --prefix scripts ci
 $validationEvidence = Join-Path $env:TEMP "repository-validation.log"
-uv run --locked scripts/validate-repository.py --evidence-file $validationEvidence
-uv run --locked scripts/testing/run-tests.py --all
+uv run --project scripts --locked python scripts/validate-repository.py --evidence-file $validationEvidence
+uv run --project scripts --locked python scripts/testing/run-tests.py --all
 ```
 
 CI runs `uv sync --project scripts --locked`; local commands use
-`uv run --locked <script.py>`. In both cases uv selects Python from
+`uv run --project scripts --locked python <script.py>`.
+uv selects and maintains `scripts/.venv`. In both cases uv selects Python from
 `scripts/pyproject.toml` and synchronizes its locked dependencies before
 execution. The validator checks the selected interpreter against the project's
 requirement before repository checks; mypy uses that interpreter. Ruff and mypy
@@ -1858,9 +1869,9 @@ from pytest's environment so nested runner calls cannot inherit it.
 Promotion checks the assembled release commit before requested deployment;
 shipping repeats the applicable checks before remote mutation.
 Run an individual case with
-`uv run --locked scripts/testing/run-tests.py tests/path.py::test_name`.
+`uv run --project scripts --locked python scripts/testing/run-tests.py tests/path.py::test_name`.
 Local uncommitted selection is explicit
-through `uv run --locked scripts/testing/run-tests.py --worktree`.
+through `uv run --project scripts --locked python scripts/testing/run-tests.py --worktree`.
 The runner's internal `scripts/testing/runner_requests.py` module owns argument
 validation and the explicitly requested GitHub context selection.
 Add `--select-only` to either diff or worktree mode to validate the same mapping
@@ -1877,7 +1888,7 @@ keep their existing validation discovery. A base branch that advances after
 this check is still evaluated by GitHub CI.
 Manifest validation
 is available through
-`uv run --locked scripts/testing/run-tests.py --validate-manifest`.
+`uv run --project scripts --locked python scripts/testing/run-tests.py --validate-manifest`.
 The validator does not invoke skill-local validators. Generic compatibility and
 health validate lifecycle definitions through the repository-lifecycle
 `ceratops_repo_compatibility_engine.sdlc_contract_validation` module. Runtime
@@ -1908,8 +1919,8 @@ reconcile it after moving tests:
 
 ```powershell
 $collection = Join-Path $env:TEMP "pytest-collection.json"
-uv run --locked scripts/testing/run-tests.py --write-collection $collection
-uv run --locked scripts/testing/run-tests.py --reconcile-collection $collection
+uv run --project scripts --locked python scripts/testing/run-tests.py --write-collection $collection
+uv run --project scripts --locked python scripts/testing/run-tests.py --reconcile-collection $collection
 ```
 
 Reconciliation preserves complete pytest identities, including parameter IDs,

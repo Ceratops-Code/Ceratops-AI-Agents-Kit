@@ -512,7 +512,7 @@ def test_promote_and_deploy_rejects_operation_created_repository_work(
 def test_repo_owns_installation_result_recording_and_cleanup(
     tmp_path, monkeypatch, capsys, entrypoint, effect, after, result_kind,
 ):
-    from tests.repository_lifecycle.test_sdlc_handoffs import (
+    from tests.repository_lifecycle.test_execute_skill_actions import (
         _registered_skill_fixture,
         runner,
     )
@@ -630,7 +630,7 @@ def test_repo_owns_installation_result_recording_and_cleanup(
 @pytest.mark.parametrize("fault", ["pending", "failed", "cleanup-debt", "missing-result"])
 @pytest.mark.parametrize("result_kind", ["deployment", "shipping"])
 def test_repo_cleanup_keeps_unfinished_installation_report(tmp_path, monkeypatch, fault, result_kind):
-    from tests.repository_lifecycle.test_sdlc_handoffs import (
+    from tests.repository_lifecycle.test_execute_skill_actions import (
         _registered_skill_fixture,
         runner,
     )
@@ -681,7 +681,7 @@ def test_repo_cleanup_keeps_unfinished_installation_report(tmp_path, monkeypatch
                                   "pending-deployment", "unfinished-finalization", "cleanup-error",
                                   "wrong-operation", "invalid-noop"])
 def test_repo_cleanup_retains_mismatched_or_incomplete_shipping_results(tmp_path, monkeypatch, fault):
-    from tests.repository_lifecycle.test_sdlc_handoffs import _registered_skill_fixture
+    from tests.repository_lifecycle.test_execute_skill_actions import _registered_skill_fixture
 
     repo = _registered_skill_fixture(tmp_path, monkeypatch)
     assert run_git(repo, "remote", "add", "origin", "https://github.com/owner/repo.git").returncode == 0

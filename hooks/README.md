@@ -16,7 +16,7 @@ Editing these sources does not update installed copies. From the repository,
 install or update them explicitly:
 
 ```powershell
-uv run --locked scripts/deploy-hooks.py
+uv run --project scripts --locked python scripts/deploy-hooks.py
 ```
 
 The standalone installer copies all four helpers to `$CODEX_HOME/hooks` and
@@ -101,7 +101,8 @@ For example, discover all rename candidates, then inspect selected files:
 The `ceratops-mcp-server-lifecycle` skill owns release packaging and installation.
 `tools/pyproject.toml` declares `source_search_mcp` version `1.0.1` with the
 repository's pinned MCP dependency and wheel backend. `tools/mcp-server.json`
-selects the readiness module, and `tools/uv.lock` locks the release's
+selects the readiness module, and the common `scripts/uv.lock` locks the
+release's
 dependencies, including `ripgrep-bin==15.1.0`. The wheel contains the entry point
 and the existing search helper; an installed server uses its isolated ripgrep
 binary and does not depend on a retained source checkout or ambient PATH.
@@ -405,7 +406,7 @@ Windows shell sanity hints:
 Run deterministic tests for the current worktree from the repository root:
 
 ```powershell
-uv run --locked scripts/testing/run-tests.py --worktree
+uv run --project scripts --locked python scripts/testing/run-tests.py --worktree
 ```
 
 Smoke-test the command interface with:

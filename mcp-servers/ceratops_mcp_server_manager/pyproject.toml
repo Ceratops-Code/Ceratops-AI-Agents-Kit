@@ -17,3 +17,6 @@ include = ["/*.py"]
 
 [tool.hatch.build.targets.wheel.sources]
 "" = "ceratops_mcp_server_manager"
+
+[tool.ceratops]
+dependency-project = "../../scripts"

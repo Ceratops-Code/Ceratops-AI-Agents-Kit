@@ -6,6 +6,14 @@ Repository installation selects an MCP server and reads its name and version fro
 `pyproject.toml`, then packages and installs that release through the CLI. It
 makes no model/API calls and has no UI.
 
+In this repository, `scripts/uv.lock` is the canonical dependency lock for the
+manager and `tools/`. Each native pyproject names that workspace with
+`tool.ceratops.dependency-project`. Packaging exports only the selected product's
+dependencies to a temporary PEP 751 lock, then removes that export with its build
+scratch. Standalone projects may still provide their own uv or PEP 751 lock.
+The initial repository bootstrap uses checkout code; installed skills always
+use their installed code and pinned runtime.
+
 ## Layout and supported runtime
 
 Manager source files live directly in
@@ -54,7 +62,7 @@ interpreter that will install the locked dependencies.
 From an active Ceratops-AI-Agents-Kit source checkout:
 
 ```powershell
-uv run --locked scripts/deploy-mcp-server-manager.py
+uv run --project scripts --locked python scripts/deploy-mcp-server-manager.py
 %USERPROFILE%\.codex\mcp\ceratops_mcp_server_manager\bin\ceratops_mcp_server_manager.cmd versions
 ```
 
@@ -87,7 +95,7 @@ For a one-time move from a previous manager root, name that exact source
 explicitly:
 
 ```powershell
-uv run --locked scripts/deploy-mcp-server-manager.py --import-root <legacy-root>
+uv run --project scripts --locked python scripts/deploy-mcp-server-manager.py --import-root <legacy-root>
 ```
 
 The migration validates and imports only registered immutable artifacts, then

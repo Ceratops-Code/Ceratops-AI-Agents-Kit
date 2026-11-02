@@ -22,6 +22,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import tomllib
 import uuid
 import zipfile
 from collections.abc import Mapping, MutableMapping, Sequence
@@ -30,7 +31,7 @@ from typing import Any, cast
 import tomlkit
 from tomlkit.exceptions import ParseError
 
-INSTALLER_VERSION = 20
+INSTALLER_VERSION = 21
 MANIFEST_NAME = ".runtime-manifest.json"
 RUNTIME_MANIFEST_SCHEMA = "ceratops-runtime-skill.v3"
 START = "<!-- CERATOPS_SHARED_SECTIONS_START -->"
@@ -376,6 +377,24 @@ def prune_python_runtime_versions(
             scratch.unlink(missing_ok=True)
 
 
+def runtime_command_failure(command, repo_root, result):
+    """Keep both command streams and causes without exposing credentials."""
+    detail = {"operation": "shared skill runtime dependency export", "command": command,
+              "cwd": str(repo_root), "runtime": sys.executable,
+              "exit_status": getattr(result, "returncode", "not launched"),
+              "stdout": getattr(result, "stdout", None) or "[no stdout]",
+              "stderr": getattr(result, "stderr", None) or "[no stderr]"}
+    if isinstance(result, BaseException):
+        detail["cause"] = f"{type(result).__name__}: {result}"
+    text = json.dumps(detail)
+    for key, value in os.environ.items():
+        if len(value) >= 4 and re.search(r"TOKEN|PASSWORD|SECRET|API_KEY|CREDENTIAL", key, re.I):
+            text = text.replace(value, "[REDACTED]")
+    text = re.sub(r"(?i)(https?://)[^\s/@:]+:[^\s/@]+@", r"\1[REDACTED]@", text)
+    return re.sub(r"(?i)((?:token|password|secret|api[_-]?key|authorization)[\s:=]+)(?:bearer\s+)?[^\s,;\"]+",
+                  r"\1[REDACTED]", text)
+
+
 def prepare_python_runtime(repo_root: pathlib.Path, install_root: pathlib.Path) -> pathlib.Path | None:
     """Build a new locked venv version without changing one used by a helper.
 
@@ -384,7 +403,7 @@ def prepare_python_runtime(repo_root: pathlib.Path, install_root: pathlib.Path) 
     Failed new environments and atomic-index scratch files belong to this call.
     """
 
-    project = repo_root / "skills/sections/python"
+    project = repo_root / "scripts"
     declaration = project / "pyproject.toml"
     lock = project / "uv.lock"
     if not declaration.exists() and not lock.exists():
@@ -394,7 +413,24 @@ def prepare_python_runtime(repo_root: pathlib.Path, install_root: pathlib.Path) 
     uv = shutil.which("uv")
     if uv is None:
         raise ValueError("uv is required to prepare the shared skill Python runtime")
-    digest = hashlib.sha256(declaration.read_bytes() + b"\0" + lock.read_bytes()).hexdigest()
+    environment = os.environ.copy()
+    for key in ("PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV", "UV_PROJECT", "UV_PROJECT_ENVIRONMENT", "UV_WORKING_DIRECTORY", "UV_NO_SYNC", "UV_FROZEN", "UV_PYTHON"):
+        environment.pop(key, None)
+    environment["PYTHONNOUSERSITE"] = "1"
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    # uv selects the runtime dependency graph from the common lock. Development
+    # tools and other workspace products cannot change this environment's identity.
+    command = [uv, "export", "--project", str(project), "--locked", "--no-dev",
+               "--no-default-groups", "--no-emit-workspace", "--no-header", "--no-annotate"]
+    try:
+        exported = subprocess.run(command, cwd=repo_root, env=environment,
+                          capture_output=True, text=True, check=False)
+    except OSError as exc:
+        raise ValueError(runtime_command_failure(command, repo_root, exc)) from exc
+    if exported.returncode:
+        raise ValueError(runtime_command_failure(command, repo_root, exported))
+    python_requirement = tomllib.loads(declaration.read_text(encoding="utf-8"))["project"]["requires-python"]
+    digest = hashlib.sha256((python_requirement + "\0" + exported.stdout.replace("\r\n", "\n")).encode()).hexdigest()
     root = install_root.parent / "runtimes/ceratops"
     versions = root / "versions"
     if any(path.is_symlink() or (path.exists() and unsafe_link(path)) for path in (root, versions)):
@@ -415,11 +451,6 @@ def prepare_python_runtime(repo_root: pathlib.Path, install_root: pathlib.Path) 
         recorded = current.get("version")
         if isinstance(recorded, str) and RUNTIME_VERSION_RE.fullmatch(recorded):
             version = recorded
-    environment = os.environ.copy()
-    for key in ("PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV", "UV_PROJECT", "UV_PROJECT_ENVIRONMENT", "UV_WORKING_DIRECTORY", "UV_NO_SYNC", "UV_FROZEN", "UV_PYTHON"):
-        environment.pop(key, None)
-    environment["PYTHONNOUSERSITE"] = "1"
-    environment["PYTHONDONTWRITEBYTECODE"] = "1"
     scripts = "Scripts" if os.name == "nt" else "bin"
     executable = "python.exe" if os.name == "nt" else "python"
 
@@ -434,7 +465,7 @@ def prepare_python_runtime(repo_root: pathlib.Path, install_root: pathlib.Path) 
         if unsafe_link(selected):
             raise ValueError("shared skill runtime version cannot be a link")
         checked = subprocess.run(
-            [uv, "sync", "--quiet", "--project", str(project), "--locked", "--check", "--no-active"],
+            [uv, "sync", "--quiet", "--project", str(project), "--locked", "--no-dev", "--no-default-groups", "--no-install-workspace", "--check", "--no-active"],
             env=environment, capture_output=True, text=True, check=False,
         )
         if checked.returncode or not interpreter(version).is_file() or unsafe_link(interpreter(version)):
@@ -444,7 +475,7 @@ def prepare_python_runtime(repo_root: pathlib.Path, install_root: pathlib.Path) 
     created = not selected.exists()
     if created:
         result = subprocess.run(
-            [uv, "sync", "--quiet", "--project", str(project), "--locked", "--no-active"],
+            [uv, "sync", "--quiet", "--project", str(project), "--locked", "--no-dev", "--no-default-groups", "--no-install-workspace", "--no-active"],
             env=environment, capture_output=True, text=True, check=False,
         )
         if result.returncode or not interpreter(version).is_file():
@@ -455,7 +486,7 @@ def prepare_python_runtime(repo_root: pathlib.Path, install_root: pathlib.Path) 
             try:
                 materialize_python_interpreters(interpreter(version))
                 checked = subprocess.run(
-                    [uv, "sync", "--quiet", "--project", str(project), "--locked", "--check", "--no-active"],
+                    [uv, "sync", "--quiet", "--project", str(project), "--locked", "--no-dev", "--no-default-groups", "--no-install-workspace", "--check", "--no-active"],
                     env=environment, capture_output=True, text=True, check=False,
                 )
                 if checked.returncode:
@@ -538,7 +569,7 @@ def declared_python_skills(
 
     declared = manifest.get("python_runtime_skills")
     if declared is None:
-        project = repo_root / "skills/sections/python"
+        project = repo_root / "scripts"
         return set(selected) if (project / "pyproject.toml").is_file() else set()
     assignments = cast(Mapping[str, object], manifest["skills"])
     if (

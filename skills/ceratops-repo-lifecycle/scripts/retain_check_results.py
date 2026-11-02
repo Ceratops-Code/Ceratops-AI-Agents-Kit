@@ -33,7 +33,9 @@ _FIELDS = frozenset({
 
 
 # Installed bundles carry this locally; source runs use the declared shared payload.
-_shared = pathlib.Path(__file__).resolve().parents[2] / "sections" / "scripts"
+_bundle = pathlib.Path(__file__).resolve().parents[1]
+_shared = (_bundle / "scripts" if (_bundle / ".runtime-manifest.json").is_file()
+           else _bundle.parent / "sections" / "scripts")
 if _shared.is_dir() and str(_shared) not in sys.path:
     sys.path.insert(0, str(_shared))
 from store_check_results import CurrentCheckResults

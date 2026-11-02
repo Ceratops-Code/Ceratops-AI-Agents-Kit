@@ -107,10 +107,10 @@ def test_ci_runs_repository_validator_that_owns_both_mypy_platforms() -> None:
     contract = yaml.safe_load((ROOT / "sdlc/sdlc.yml").read_text(encoding="utf-8"))
     assert contract["version"] == 4
     assert contract["repository"]["actions"]["validate"]["steps"] == [
-        {"run": ["uv", "run", "--locked", "scripts/validate-repository.py"]},
+        {"run": ["uv", "run", "--project", "scripts", "--locked", "python", "scripts/validate-repository.py"]},
     ]
     assert contract["repository"]["actions"]["test"]["steps"] == [
-        {"run": ["uv", "run", "--locked", "scripts/testing/run-tests.py", "--auto"]},
+        {"run": ["uv", "run", "--project", "scripts", "--locked", "python", "scripts/testing/run-tests.py", "--auto"]},
     ]
     upload = next(step for step in steps if step.get("name") == "Upload validation evidence")
     assert upload["with"]["include-hidden-files"] is True
@@ -501,7 +501,7 @@ def test_repository_entrypoints_run_through_uv(
 def test_runtime_dependencies_supply_timezones_without_an_os_database() -> None:
     requirements = [
         Requirement(line)
-        for line in tomllib.loads((ROOT / "skills/sections/python/pyproject.toml").read_text(encoding="utf-8"))["project"]["dependencies"]
+        for line in tomllib.loads((ROOT / "scripts/pyproject.toml").read_text(encoding="utf-8"))["project"]["dependencies"]
     ]
     timezone_requirement = next(item for item in requirements if item.name == "tzdata")
     assert version("tzdata") in timezone_requirement.specifier

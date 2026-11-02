@@ -283,11 +283,11 @@ def test_compatibility_materializer_supplies_target_identity_and_assignments(
     }
     assert manifest["runtime_payloads"] == {}
     assert not (repo / "skills/sections/scripts/run-skill.py").exists()
-    assert tomllib.loads((repo / "skills/sections/python/pyproject.toml").read_text())["project"]["name"] == "target-skill-runtime"
-    assert (repo / "skills/sections/python/uv.lock").is_file()
+    assert tomllib.loads((repo / "scripts/pyproject.toml").read_text())["project"]["name"] == "target-skill-runtime"
+    assert (repo / "scripts/uv.lock").is_file()
     updates = yaml.safe_load((repo / ".github/dependabot.yml").read_text())["updates"]
     assert {item["directory"] for item in updates if item["package-ecosystem"] == "uv"} == {
-        "/scripts", "/skills/sections/python",
+        "/scripts",
     }
     materializer = importlib.import_module(
         "ceratops_repo_compatibility_engine.apply_ceratops_compatibility"
@@ -417,8 +417,8 @@ def test_compatibility_materializer_supplies_target_identity_and_assignments(
         ".github/ISSUE_TEMPLATE/bug_report.yml",
         ".github/pull_request_template.md",
         "scripts/deploy-skills.py",
-        "skills/sections/python/pyproject.toml",
-        "skills/sections/python/uv.lock",
+        "scripts/pyproject.toml",
+        "scripts/uv.lock",
     ):
         target = repo / relative
         original = target.read_bytes()
@@ -547,9 +547,9 @@ def test_non_python_skill_needs_no_shared_skill_runtime(
     assert result.returncode == 0, result.stdout
     manifest = json.loads((repo / "skills/skill-sections.json").read_text())
     assert manifest["python_runtime_skills"] == []
-    assert not (repo / "skills/sections/python").exists()
+    assert (repo / "scripts/pyproject.toml").is_file()
     updates = yaml.safe_load((repo / ".github/dependabot.yml").read_text())["updates"]
-    assert not any(item.get("directory") == "/skills/sections/python" for item in updates)
+    assert [item["directory"] for item in updates if item["package-ecosystem"] == "uv"] == ["/scripts"]
     compatibility = importlib.import_module(
         "ceratops_repo_compatibility_engine.validate_ceratops_compatibility"
     )

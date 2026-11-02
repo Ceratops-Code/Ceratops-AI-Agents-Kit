@@ -172,11 +172,11 @@
       "deterministic_evidence": [
         "skills/skill-sections.json runtime_payloads",
         "declared payload source and target paths",
-        "source skills/sections/python/pyproject.toml and uv.lock",
+        "source scripts/pyproject.toml and uv.lock",
         "installed runtime manifest python_runtime paths",
         "versioned shared skill Python environment behavior tests"
       ],
-      "pass_condition": "Runtime payload declarations use either an existing repo-relative path or matching glob copied at its source-relative target, or an exact `source` and installed-skill-relative `target` mapping. Exact mappings select one file, all paths are portable, installed targets are collision-free, single-skill executable sources are skill-owned, and multi-skill executable sources remain under `skills/sections/scripts`. Each source repository owns its Python project and lock under `skills/sections/python`; runtime payloads never copy either into an installed skill. Deployment prepares a versioned shared environment only for declared Python skills, records its interpreter only in their installed manifests, and never modifies an environment already used by a helper."
+      "pass_condition": "Runtime payload declarations use either an existing repo-relative path or matching glob copied at its source-relative target, or an exact `source` and installed-skill-relative `target` mapping. Exact mappings select one file, all paths are portable, installed targets are collision-free, single-skill executable sources are skill-owned, and multi-skill executable sources remain under `skills/sections/scripts`. Each source repository owns its Python project and lock under `scripts`; runtime payloads never copy either into an installed skill. Deployment prepares a versioned shared environment only for declared Python skills, records its interpreter only in their installed manifests, and never modifies an environment already used by a helper."
     },
     {
       "id": "skill.runtime_source_ownership",

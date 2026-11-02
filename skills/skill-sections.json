@@ -18,11 +18,11 @@
       "python skills/ceratops-skill-lifecycle/scripts/fast-change.py --request <request>"
     ],
     "runtime_generation_changes": [
-      "uv run --locked scripts/testing/run-tests.py --worktree",
-      "uv run --locked scripts/deploy-skills.py --install-root <task-temp-root>"
+      "uv run --project scripts --locked python scripts/testing/run-tests.py --worktree",
+      "uv run --project scripts --locked python scripts/deploy-skills.py --install-root <task-temp-root>"
     ],
     "contract_checker_changes": [
-      "uv run --locked scripts/testing/run-tests.py --worktree"
+      "uv run --project scripts --locked python scripts/testing/run-tests.py --worktree"
     ],
     "new_skill_local_availability": [
       "$ceratops-skill-lifecycle"

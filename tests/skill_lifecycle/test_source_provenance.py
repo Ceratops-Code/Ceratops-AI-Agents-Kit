@@ -20,6 +20,7 @@ from tests.skill_lifecycle.support import (
     INSTALLER_TEMPLATE,
     LIFECYCLE_SOURCE,
     RUNTIME_INSTALLER,
+    install_packet_checker,
     load_runtime_builder,
     load_runtime_installer,
 )
@@ -47,6 +48,7 @@ def owner(skill):
 
 
 def packet_call(repo, installed, output, *, cleanup=False):
+    install_packet_checker(installed)
     arguments = (["--cleanup-output", str(output)] if cleanup else
                  ["--skill", "alpha-tool", "--repo-root", str(repo),
                   "--installed-skill", str(installed), "--output", str(output)])
@@ -271,6 +273,7 @@ def test_packet_and_cleanup_repeat_after_interruption(tmp_path, monkeypatch, aft
     builder = load_runtime_builder()
     destination = tmp_path / "profile/skills"
     builder["install_transaction"](repo, destination, selected=["alpha-tool"])
+    install_packet_checker(destination / "alpha-tool")
     module = runpy.run_path(str(PACKET))
     output = tmp_path / "packet.json"
     arguments = ["--skill", "alpha-tool", "--repo-root", str(repo), "--installed-skill",

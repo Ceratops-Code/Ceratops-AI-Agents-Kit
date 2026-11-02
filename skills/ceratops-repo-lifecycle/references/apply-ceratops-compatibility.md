@@ -108,7 +108,8 @@ Infer the source identity from stable repository evidence before asking.
 - Generate one uv project, lock and `.venv` under `scripts`; uv selects the
   declared Python and installs locked dependencies. Preserve compliant
   application manifests at their existing nested paths.
-- Run repository Python entrypoints through `uv run --locked <script.py>`.
+- Run repository Python entrypoints through
+  `uv run --project scripts --locked python <script.py>`.
   Keep their project and lock in `scripts`; uv owns Python selection and
   dependency synchronization. Do not inject environment bootstrap code.
 - Generate `scripts/run-tests.py` when compatibility infers repository test
@@ -184,7 +185,7 @@ Infer the source identity from stable repository evidence before asking.
   higher-version bootstrap and replace only a missing or lower version.
 - Declare skills with Python helpers in `python_runtime_skills`. For those
   skills, require the target repository's own
-  `skills/sections/python/pyproject.toml` and `uv.lock` before applying
+  `scripts/pyproject.toml` and `uv.lock` before applying
   compatibility. Report missing files without copying Ceratops dependencies.
   Bootstrap creates a versioned shared environment from that locked project.
   The installed bundle must work without its original source checkout.

@@ -49,11 +49,13 @@ def prepare_script_environment(repo: pathlib.Path) -> None:
 def prepare_skill_python_project(repo: pathlib.Path) -> None:
     """Give a compatible source fixture its own locked skill dependencies."""
 
-    project = repo / "skills/sections/python"
+    project = repo / "scripts"
+    if (project / "pyproject.toml").is_file():
+        return
     project.mkdir(parents=True, exist_ok=True)
     (project / "pyproject.toml").write_text(
         '[project]\nname = "target-skill-runtime"\nversion = "0.0.0"\n'
-        'requires-python = ">=3.14,<3.15"\ndependencies = []\n\n'
+        'requires-python = ">=3.14,<3.15"\ndependencies = ["ruff", "mypy", "tomlkit"]\n\n'
         "[tool.uv]\npackage = false\n\n[tool.uv.workspace]\nmembers = []\n",
         encoding="utf-8",
         newline="\n",
@@ -83,10 +85,15 @@ def run_ci_action(
             ignore=shutil.ignore_patterns(".venv", "__pycache__"),
         )
         # The action checkout carries its own project; target repositories own theirs separately.
-        project = bundle / "skills/sections/python"
+        project = bundle / "scripts"
         project.mkdir(parents=True)
         for name in ("pyproject.toml", "uv.lock"):
-            shutil.copy2(ROOT / "skills/sections/python" / name, project / name)
+            shutil.copy2(ROOT / "scripts" / name, project / name)
+        # uv needs each workspace member's metadata to read the shared lock.
+        for member in ("tools", "mcp-servers/ceratops_mcp_server_manager"):
+            destination = bundle / member
+            destination.mkdir(parents=True)
+            shutil.copy2(ROOT / member / "pyproject.toml", destination / "pyproject.toml")
         # Source actions import the same shared command helper as a real checkout.
         shutil.copytree(
             ROOT / "skills/sections/scripts", bundle / "skills/sections/scripts",
@@ -268,7 +275,7 @@ def create_compatible_repo(
             }
         },
     )
-    (repo / "scripts").mkdir()
+    (repo / "scripts").mkdir(exist_ok=True)
     shutil.copy2(
         INSTALLER_TEMPLATE,
         repo / "scripts" / "deploy-skills.py",

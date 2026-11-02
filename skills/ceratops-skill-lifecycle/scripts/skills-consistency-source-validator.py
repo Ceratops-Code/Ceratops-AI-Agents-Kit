@@ -399,9 +399,9 @@ def validate_workflow_target(command: str, skill_names: set[str]) -> list[str]:
     parts = normalized.split()
     if not parts:
         return ["section manifest maintenance workflow contains an empty command"]
-    # The locked uv script form selects the script's declared project.
-    if parts[:3] == ["uv", "run", "--locked"]:
-        parts = ["python", *parts[3:]]
+    # Repository commands explicitly select the one locked scripts project.
+    if parts[:6] == ["uv", "run", "--project", "scripts", "--locked", "python"]:
+        parts = parts[5:]
 
     if normalized.startswith("$"):
         target = normalized[1:]

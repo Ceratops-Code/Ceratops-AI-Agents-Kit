@@ -11,8 +11,8 @@
   --config-file scripts/.yamllint.yml .`
 - [ ] `uv run --project scripts --locked python -m mypy
   --config-file scripts/pyproject.toml`
-- [ ] `uv run --locked scripts/validate-repository.py`
-- [ ] `uv run --locked scripts/testing/run-tests.py --all`
+- [ ] `uv run --project scripts --locked python scripts/validate-repository.py`
+- [ ] `uv run --project scripts --locked python scripts/testing/run-tests.py --all`
 
 ## Release impact
 

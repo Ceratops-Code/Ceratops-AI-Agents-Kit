@@ -74,7 +74,7 @@ def require_repository_python(repo_root: pathlib.Path) -> None:
     if version not in SpecifierSet(requirement):
         raise ValueError(
             f"Python {version} does not satisfy project.requires-python={requirement!r}; "
-            "run uv run --locked scripts/validate-repository.py"
+            "run uv run --project scripts --locked python scripts/validate-repository.py"
         )
 
 

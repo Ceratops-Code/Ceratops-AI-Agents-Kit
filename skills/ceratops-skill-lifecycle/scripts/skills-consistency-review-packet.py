@@ -3,7 +3,7 @@
 
 The caller names the installed skill and every non-repository automation root.
 This helper never discovers sibling installed skills. It resolves attributable
-source surfaces and runs the owning source validator with the current Python
+source surfaces and runs the installed source checker with its pinned Python
 runtime so the subsequent semantic review can stay inside the packet.
 It also reads the two native command roots from the selected profile's
 config.toml; missing or malformed settings become packet blockers.
@@ -15,13 +15,20 @@ import argparse
 import json
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
 import tomllib
 from collections.abc import Iterable, Mapping
 from typing import Any
 
-from runtime import retain_skill_sources as source_provenance
+# Callable and CLI execution resolve supporting code beside this entrypoint.
+scripts_root = str(pathlib.Path(__file__).resolve().parent)
+sys.path.insert(0, scripts_root)
+try:
+    from runtime import retain_skill_sources as source_provenance
+finally:
+    sys.path.remove(scripts_root)
 
 SCHEMA = "ceratops-skills-consistency-review-packet.v1"
 RUNTIME_SCHEMA = "ceratops-runtime-skill.v3"
@@ -216,32 +223,38 @@ def automation_consumers(
 def choose_validator(
     repo: pathlib.Path, installed_skill: pathlib.Path
 ) -> tuple[pathlib.Path, str]:
-    """Prefer target-source validation, then the known installed lifecycle sibling."""
+    """Select the installed lifecycle checker; the target repository is input."""
 
-    relative_path = pathlib.Path(
-        "skills/ceratops-skill-lifecycle/scripts/skills-consistency-source-validator.py"
-    )
-    source = repo / relative_path
-    if source.is_file():
-        return source, "source"
     installed = (
         installed_skill.parent
         / "ceratops-skill-lifecycle"
         / "scripts"
         / "skills-consistency-source-validator.py"
     )
-    if installed.is_file():
+    if installed.is_file() and not installed.is_symlink():
         return installed, "installed"
-    raise PacketError("source and installed lifecycle validators are unavailable")
+    raise PacketError("installed lifecycle checker is unavailable")
 
 
 def run_validator(
     validator: pathlib.Path, repo: pathlib.Path, skill: str, origin: str
 ) -> dict[str, Any]:
-    """Run one skill-scoped validator without switching Python environments."""
+    """Run the installed checker with the Python named by its own manifest."""
 
+    metadata = validator.parent.parent / ".runtime-manifest.json"
+    try:
+        if metadata.is_symlink() or not metadata.is_file():
+            raise ValueError("installed runtime manifest is missing")
+        runtime = pathlib.Path(json.loads(metadata.read_text(encoding="utf-8"))["python_runtime"])
+        if not runtime.is_absolute() or not runtime.is_file():
+            raise ValueError("installed Python runtime is unavailable")
+        uv = shutil.which("uv")
+        if uv is None:
+            raise ValueError("uv is required to run the installed checker")
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise PacketError(str(exc)) from exc
     command = [
-        sys.executable,
+        uv, "run", "--no-project", "--python", str(runtime), "python",
         str(validator),
         "--repo-root",
         str(repo),

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run repository Python tests, optionally retaining an exact reusable result.
 
-Use the locked scripts environment: uv run --locked scripts/run-tests.py.
+Use the locked scripts environment: uv run --project scripts --locked python scripts/run-tests.py.
 The caller supplies result identities and exact inputs. Current worktree results
 share one file, replaced through a fixed .check_results.in_process.json sibling
 after each completed write. Explicit standalone result files keep their original
