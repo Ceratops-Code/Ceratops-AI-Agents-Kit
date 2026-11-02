@@ -7,8 +7,11 @@ validation.
 
 ## Script Bundle
 
-- Bind `<skill-root>` to the directory containing this action's parent
-  `SKILL.md`; require `<skill-root>/scripts/install-mcp-server.py` before invocation.
+- Bind `<skill-root>` to this action's installed parent skill directory;
+  require `<skill-root>/scripts/install-mcp-server.py` before invocation.
+- The installed helper and manager use their installed lifecycle code and
+  supporting modules. Source arguments select the code or packages to install,
+  not replacement helper implementations.
 - (D) Repository installation runs `python
   <skill-root>/scripts/install-mcp-server.py --repo-root <repo-root>
   [--source <mcp-server-source>] [--mcp-server-name <name>]
@@ -38,8 +41,9 @@ source-build path.
 
 1. For repository installation, use the selected checkout's `pyproject.toml`
    name and version. If it declares several MCP servers, select by MCP server
-   name. Run the action helper from that checkout and supply `--source` with
-   its repository or MCP server directory. For a package-backed MCP server,
+   name. Run the installed action helper with that checkout as its working
+   directory and supply `--source` with its repository or MCP server directory.
+   For a package-backed MCP server,
    supply its already validated wheel and package lock as well:
 
    ```powershell

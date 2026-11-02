@@ -9,6 +9,8 @@ Install the first manager using the same engine as its CLI and MCP interfaces.
 1. Require first-install authorization and an active Ceratops-AI-Agents-Kit source
    checkout. From that checkout run
    `uv run --project scripts --locked python scripts/deploy-mcp-server-manager.py`.
+   This command loads the manager implementation and its supporting modules
+   from that checkout, without falling back to installed copies.
    This validates existing global CPython 3.14 and uv 0.12.10 or newer 0.12.x,
    provisions locked libraries in disposable storage, packages the first release
    using the manager's own code, and validates its isolated installation inside
