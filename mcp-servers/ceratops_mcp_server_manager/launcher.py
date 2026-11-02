@@ -4,6 +4,7 @@ The same standalone file is installed below every MCP server's ``bin``
 directory. It derives that server's identity from the parent directory and checks
 the selected receipt before dispatch. MCP connections survive selection changes:
 new requests use the selected environment, and older children drain naturally.
+The existing idle poll announces new tool definitions even without a request.
 The standalone bootstrap cannot import a versioned SDK without pinning that
 environment itself. A small JSON-RPC relay negotiates child connections and
 gives each backend its own request, progress and callback IDs.
@@ -145,13 +146,26 @@ def redacted_detail(detail):
     return re.sub(r"(?i)((?:token|password|secret|api[_-]?key)[=:]\s*)\S+", r"\1<redacted>", detail)
 
 
+def redact_payload(value):
+    """Keep structured error causes while redacting their string values."""
+    if isinstance(value, dict):
+        return {key: "<redacted>" if re.fullmatch(r"token|password|secret|api[_-]?key|authorization", key, re.I)
+                else redact_payload(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [redact_payload(item) for item in value]
+    return redacted_detail(value) if isinstance(value, str) else value
+
+
 def read_messages(stream, events, backend):
     """One reader preserves each stream's order; queues bound pending traffic."""
     try:
         for line in stream:
-            message = json.loads(line)
-            if not isinstance(message, dict):
-                raise ValueError("JSON-RPC frame is not an object")
+            try:
+                message = json.loads(line)
+                if not isinstance(message, dict):
+                    raise ValueError("JSON-RPC frame is not an object")
+            except ValueError as exc:
+                raise ValueError(f"invalid JSON-RPC frame: {exc}; stdout={line[:2048]!r}") from exc
             events.put(("message", backend, message))
     except (OSError, ValueError) as exc:
         events.put(("read_error", backend, str(exc)))
@@ -174,6 +188,8 @@ class Backend:
         self.progress_tokens = {}
         self.retiring = False
         self.ready = initialize is None
+        self.tools_supported = False
+        self.tools_listed = False
         self.bootstrap_id = None
         self.started = time.monotonic()
         self.errors: deque[bytes] = deque(maxlen=16)
@@ -191,7 +207,7 @@ class Backend:
                 f"start {selected['mcp_server_id']}@{selected['version']}; "
                 f"runtime={self.command[0] if self.command else '<not resolved>'}; "
                 f"invocation={subprocess.list2cmdline(self.command) if self.command else '<not started>'}; "
-                f"exit=not_started; stdout=<absent>; stderr=<absent>; cause={exc}")) from exc
+                f"cwd={os.getcwd()}; exit=not_started; stdout=<absent>; stderr=<absent>; cause={exc}")) from exc
         except BaseException:
             self.lease.close()
             raise
@@ -205,12 +221,15 @@ class Backend:
 
     def read_errors(self):
         assert self.process.stderr is not None
-        while chunk := self.process.stderr.read(4096):
+        while chunk := os.read(self.process.stderr.fileno(), 4096):
             self.errors.append(chunk)
-            stream = getattr(sys.stderr, "buffer", sys.stderr)
             try:
-                stream.write(chunk if hasattr(sys.stderr, "buffer") else chunk.decode("utf-8", "replace"))
-                stream.flush()
+                if hasattr(sys.stderr, "buffer"):
+                    sys.stderr.buffer.write(chunk)
+                    sys.stderr.buffer.flush()
+                else:
+                    sys.stderr.write(chunk.decode("utf-8", "replace"))
+                    sys.stderr.flush()
             except (OSError, ValueError):
                 pass
 
@@ -257,7 +276,8 @@ class Backend:
     def diagnostic(self, cause):
         stderr = b"".join(self.errors).decode("utf-8", "replace") or "<absent>"
         detail = (f"{cause}; target={self.selected['mcp_server_id']}@{self.selected['version']}; "
-                  f"invocation={subprocess.list2cmdline(self.command)}; exit={self.process.poll()}; "
+                  f"invocation={subprocess.list2cmdline(self.command)}; runtime={self.command[0]}; "
+                  f"cwd={os.getcwd()}; exit={self.process.poll()}; "
                   f"stdout=<JSON-RPC transport>; stderr={stderr}")
         return redacted_detail(detail)
 
@@ -267,7 +287,9 @@ class McpGateway:
 
     No progress files or history are written. Only active protocol messages and
     64 KiB of child stderr are kept in memory. Idle selection polling releases
-    old environments even when a chat never makes another tool call.
+    old environments and announces changed tool lists even when a chat never
+    makes another tool call. The last announced selection is connection-local;
+    replacement startup or listing failures never generate retry notices.
     """
 
     def __init__(self, root, arguments):
@@ -283,6 +305,7 @@ class McpGateway:
         self.initialize = None
         self.protocol = None
         self.initialized = False
+        self.announced_selection = None
         self.closing = False
         self.output_closed = False
 
@@ -440,6 +463,11 @@ class McpGateway:
                 # a selection superseded while that child was starting.
                 if task_id is None and selected_environment(self.root)[0] != selected:
                     continue
+                if message["method"] == "tools/list" and not backend.tools_supported:
+                    self.emit({"jsonrpc": "2.0", "id": message["id"], "result": {"tools": []}})
+                    self.waiting.pop(key, None)
+                    self.waiting_on.pop(key, None)
+                    continue
                 wire_id = "gateway-request-" + uuid.uuid4().hex
                 payload = {**payload, "id": wire_id}
                 params = message.get("params", {})
@@ -530,16 +558,27 @@ class McpGateway:
     def backend_message(self, backend, message):
         if message.get("id") == backend.bootstrap_id and backend.bootstrap_id is not None:
             result = message.get("result", {})
-            if "error" in message or result.get("protocolVersion") != self.protocol:
+            if ("error" in message or not isinstance(result, dict)
+                    or result.get("protocolVersion") != self.protocol
+                    or not isinstance(result.get("capabilities"), dict)):
                 self.fail_backend(backend, "replacement initialization failed: " + json.dumps(message))
                 return
             backend.ready = True
+            backend.tools_supported = isinstance(result.get("capabilities", {}).get("tools"), dict)
             if self.initialized:
                 self.forward(backend, {"jsonrpc": "2.0", "method": "notifications/initialized"})
-            if self.initialized and result.get("capabilities", {}).get("tools") is not None:
-                self.emit({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
             return
         if "method" in message:
+            if message["method"] == "notifications/tools/list_changed":
+                # The selection poll already announced a replacement. Its first
+                # list includes startup changes; retired servers cannot change
+                # the current catalog, even while they finish older calls/tasks.
+                try:
+                    current = selected_environment(self.root)[0]
+                except (OSError, ValueError):
+                    return
+                if backend.selected != current or not backend.tools_listed:
+                    return
             if message["method"] == "notifications/tasks/status":
                 try:
                     raw_id = message.get("params", {}).get("taskId")
@@ -603,9 +642,26 @@ class McpGateway:
         backend.forget_request(key)
         if pending[1]["method"] == "initialize" and "result" in message:
             self.protocol = message["result"].get("protocolVersion")
-            tools = message["result"].get("capabilities", {}).get("tools")
-            if isinstance(tools, dict):
-                tools["listChanged"] = True
+            capabilities = dict(message["result"].get("capabilities", {}))
+            backend.tools_supported = isinstance(capabilities.get("tools"), dict)
+            tools = capabilities["tools"] if backend.tools_supported else {}
+            capabilities["tools"] = {**tools, "listChanged": True}
+            message = {**message, "result": {**message["result"], "capabilities": capabilities}}
+            self.announced_selection = backend.selected
+        if pending[1]["method"] == "tools/list":
+            result = message.get("result")
+            if isinstance(message.get("error"), dict):
+                error = redact_payload(message["error"])
+                message = {**message, "error": {**error, "message": backend.diagnostic(
+                    "tools/list failed: " + json.dumps(error))}}
+            elif ("error" in message or not isinstance(result, dict) or not isinstance(result.get("tools"), list)
+                  or any(not isinstance(tool, dict) or not isinstance(tool.get("name"), str)
+                         or not tool["name"] or not isinstance(tool.get("inputSchema"), dict)
+                         for tool in result["tools"])):
+                self.error(pending[1], backend.diagnostic("invalid tools/list response: " + json.dumps(message)))
+                return
+            else:
+                backend.tools_listed = True
         if key in self.task_lists:
             if "error" in message:
                 self.task_lists.pop(key)
@@ -658,6 +714,13 @@ class McpGateway:
             selected = selected_environment(self.root)[0]
         except (OSError, ValueError):
             selected = None
+        if (not self.closing and self.initialized and self.protocol is not None
+                and selected is not None and selected != self.announced_selection):
+            # Observe selection, not backend startup. An idle client receives one
+            # change notice without a tool call, and a failed replacement cannot
+            # start a notification/retry loop on every poll.
+            self.announced_selection = selected
+            self.emit({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
         for backend in list(self.backends):
             if not backend.ready and not backend.retiring and time.monotonic() - backend.started > 60:
                 self.fail_backend(backend, "replacement initialization exceeded 60 seconds")

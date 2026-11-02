@@ -645,8 +645,7 @@ def plan_ceratops_compatibility(
         compatibility_contract,
         has_python_skills=bool(python_skills),
     )
-    if test_script is not None:
-        record_generated_runner(repo_root, compatibility_contract, test_script, generated_runtime)
+    record_generated_runner(repo_root, compatibility_contract, test_script, generated_runtime)
     return CompatibilityPlan(
         manifest=manifest,
         skill_updates=skill_updates,

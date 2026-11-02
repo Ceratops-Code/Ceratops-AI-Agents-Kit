@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run repository Python tests, optionally retaining an exact reusable result.
 
-Use the locked scripts environment: uv run --locked scripts/run-tests.py.
+Use the locked scripts environment: uv run --project scripts --locked python scripts/run-tests.py.
 The caller supplies result identities and exact inputs. Current worktree results
 share one file, replaced through a fixed .check_results.in_process.json sibling
 after each completed write. Explicit standalone result files keep their original
@@ -16,6 +16,7 @@ import copy
 import datetime
 import fnmatch
 import hashlib
+import importlib
 import importlib.metadata
 import json
 import os
@@ -33,6 +34,12 @@ from typing import Any
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 DEFAULT_TARGETS: list[str] = __TEST_TARGETS__
+
+
+def test_support():
+    """Load delivered test support only when executing tests, never for result readers."""
+    sys.path.insert(0, str(ROOT / "scripts/testing"))
+    return importlib.import_module("reuse_test_results")
 def without_basetemp(arguments: list[str]) -> list[str]:
     """Remove inherited locations before pytest validates every occurrence."""
     options = iter(arguments)
@@ -416,6 +423,11 @@ def check_current_inputs(context: Mapping[str, Any], root: pathlib.Path) -> None
     checks. Both boundaries use the existing operation declaration, not another
     dependency graph. A check that changes its own declared inputs cannot pass.
     """
+    for files in context["scope"].get("artifacts", {}).values():
+        for item in files:
+            artifact_path = pathlib.Path(item["path"])
+            if not artifact_path.is_file() or hashlib.sha256(artifact_path.read_bytes()).hexdigest() != item["sha256"]:
+                raise ValueError("Selected built artifact changed before check completion: " + str(artifact_path))
     rules = context["scope"].get("inputRules")
     if (not isinstance(rules, dict)
             or not all(isinstance(rules.get(key), list) and rules[key]
@@ -747,7 +759,7 @@ def run_recorded_check(
         if current is not None and path != current.path:
             current = None  # Explicit caller-selected output keeps the public probe contract.
         target = {key: value for key, value in context["scope"].items()
-                  if key not in {"worktree", "inputRules"}} if current is not None and context is not None else {}
+                  if key not in {"worktree", "inputRules", "artifacts"}} if current is not None and context is not None else {}
         saved = next((item for item in current.records("repository-check", target=target)
                       if item["result_id"] == args.result_id), None) if current is not None else None
         if saved is not None:
@@ -818,12 +830,54 @@ def execute_check(args: argparse.Namespace, targets: list[str], inherited: list[
         environment.pop(CHECK_CONTEXT_ENV, None)
         environment["PYTHONPYCACHEPREFIX"] = str(temporary / "python-cache")
         environment["PYTEST_ADDOPTS"] = shlex.join(inherited)
-        command = args.probe_command or [
+        test_command = [
             sys.executable, "-m", "pytest", *targets, *without_basetemp(args.pytest_arg),
+        ]
+        command = args.probe_command or [
+            *test_command,
             "--basetemp", str(temporary / "pytest"),
             "-o", "cache_dir=" + str(temporary / "pytest-cache"),
         ]
-        result = subprocess.run(command, cwd=ROOT, env=environment, check=False)
+        if args.probe_command is None:
+            reuse_test_results = test_support()
+            environment.update(reuse_test_results.result_environment(
+                test_command, ROOT, os.environ, result_writer=pathlib.Path(__file__),
+            ))
+            environment["CERATOPS_TEST_ARTIFACTS"] = json.dumps(args.artifacts)
+            environment["PYTHONPATH"] = os.pathsep.join(filter(None, (
+                str(ROOT / "scripts/testing"), environment.get("PYTHONPATH"),
+            )))
+            environment[reuse_test_results.RESULT_SUMMARY_ENV] = str(temporary / "pytest-results.json")
+            command[3:3] = ["-p", "reuse_test_results"]
+        args.executed = True
+        launch_error = None
+        try:
+            result = subprocess.run(command, cwd=ROOT, env=environment, check=False,
+                                    capture_output=True, text=True, encoding="utf-8", errors="replace")
+        except OSError as exc:
+            launch_error = str(exc)
+            result = subprocess.CompletedProcess(command, 2, "", str(exc))
+        if args.probe_command is None:
+            result.stdout = reuse_test_results.redact_test_diagnostic(result.stdout)
+            result.stderr = reuse_test_results.redact_test_diagnostic(result.stderr)
+        print(result.stdout, end="")
+        print(result.stderr, end="", file=sys.stderr)
+        summary_path = temporary / "pytest-results.json"
+        if summary_path.is_file():
+            observed = json.loads(summary_path.read_text(encoding="utf-8"))
+            args.check_summary = observed["check_summary"]
+            args.observed_checks = [*observed["result_references"], *observed["nonreusable_checks"],
+                                    *observed["skipped_checks"], *observed["passed_checks"]]
+        elif args.probe_command is None:
+            args.observed_checks = [{"id": "pytest", "status": "scope-unrepresented", "reusable": False,
+                                     "reason": "Individual reuse needs declared tests/test-impact.json inputs and completed pytest outcomes."}]
+        if result.returncode and args.probe_command is None:
+            reuse_test_results.save_test_diagnostic(args.diagnostic_path, {
+                "schema": "ceratops-ai-agents-kit-pytest-diagnostic.v1", "cwd": str(ROOT),
+                "command": command, "runtime": sys.executable, "request": args.invocation,
+                "result_request": args.invocation, "exit_code": None if launch_error else result.returncode,
+                "stdout": result.stdout, "stderr": result.stderr,
+            }, root=ROOT, current=args.current_results, summary=args.check_summary)
     return result.returncode if result.returncode >= 0 else 1
 
 
@@ -831,12 +885,27 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("targets", nargs="*", help="Repository-relative test files or directories.")
     parser.add_argument("--pytest-arg", action="append", default=[], help="Repeat using --pytest-arg=VALUE.")
+    parser.add_argument("--check-group", help="One suite ID from tests/test-impact.json.")
+    parser.add_argument("--artifacts", default="{}", help="JSON mapping deliverable references to selected file-path arrays.")
+    parser.add_argument("--diagnostic-output", type=pathlib.Path,
+                        help="Full failure report; files outside .build/test-diagnostics are caller-retained.")
     add_result_arguments(parser)
     args = parser.parse_args(argv)
     if args.describe_test_results:
         describe_result_contract()
         return 0
     try:
+        args.artifacts = json.loads(args.artifacts)
+        support = test_support() if args.probe_command is None or args.artifacts or args.check_group else None
+        if support is not None:
+            support.measure_selected_artifacts(ROOT, args.artifacts)
+        args.observed_checks = []
+        args.check_summary = None
+        args.executed = False
+        args.diagnostic_path = (ROOT / (args.diagnostic_output or pathlib.Path(".build/test-diagnostics/pytest-failure.json"))).resolve()
+        args.current_results = CurrentCheckResults(ROOT) if support is not None and (ROOT / ".git").exists() else None
+        if support is not None and args.diagnostic_path.exists():
+            support.remove_test_diagnostic(args.diagnostic_path, root=ROOT, current=args.current_results)
         if args.probe_command is not None:
             args.probe_command = json.loads(args.probe_command)
             if (not isinstance(args.probe_command, list) or not args.probe_command
@@ -845,13 +914,42 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("probe-command must be a nonempty JSON argv")
         inherited = without_basetemp(shlex.split(os.environ.get("PYTEST_ADDOPTS", "")))
         targets = args.targets or DEFAULT_TARGETS
+        if args.check_group:
+            assert support is not None
+            manifest = support.load_manifest(ROOT / "tests/test-impact.json")
+            if args.check_group not in manifest.suites:
+                raise ValueError(f"Unknown test check-group: {args.check_group}")
+            if args.targets:
+                raise ValueError("Choose test targets or --check-group, not both")
+            targets = list(manifest.suites[args.check_group].pytest)
         invocation = {
             "targets": [] if args.probe_command else targets,
             "pytest_args": [] if args.probe_command else without_basetemp(args.pytest_arg),
             "pytest_addopts": [] if args.probe_command else inherited,
             "probe_command": args.probe_command,
         }
-        return run_recorded_check(lambda: execute_check(args, targets, inherited), args, invocation, repo_root=ROOT)
+        if args.check_group or args.artifacts:
+            invocation.update(check_group=args.check_group, artifacts=args.artifacts)
+        args.invocation = invocation
+        token = support.CHECK_REQUEST_INPUTS.set({"checkGroup": args.check_group, "artifacts": args.artifacts}) if support else None
+        request_executed = False
+
+        def execute_request() -> int:
+            nonlocal request_executed
+            request_executed = True
+            return execute_check(args, targets, inherited)
+
+        try:
+            code = run_recorded_check(execute_request, args, invocation, repo_root=ROOT,
+                                     checks=(lambda: args.observed_checks) if args.probe_command is None else None,
+                                     summary=(lambda: args.check_summary) if args.probe_command is None else None)
+            if support is not None and args.diagnostic_path.exists():
+                support.remove_test_diagnostic(args.diagnostic_path, root=ROOT, current=args.current_results,
+                                               successful_request=invocation if code == 0 and (args.executed or not request_executed) else None)
+            return code
+        finally:
+            if support is not None:
+                support.CHECK_REQUEST_INPUTS.reset(token)
     except (OSError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 2

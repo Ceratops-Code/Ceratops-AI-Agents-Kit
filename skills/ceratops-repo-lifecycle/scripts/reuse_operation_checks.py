@@ -15,6 +15,7 @@ import json
 import os
 import pathlib
 import subprocess
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -135,8 +136,40 @@ def check_inputs(prepared: Any, declaration: dict[str, Any]) -> dict[str, Any]:
         "productInputs": products, "checkInputs": checks, "arguments": list(argv),
         "dependencies": dependencies, "environment": environment,
     }
+    if group := getattr(prepared, "check_group", None):
+        context["group"] = prepared.operation + "#" + group
+        context["scope"]["checkGroup"] = group
+    if artifacts := getattr(prepared, "selected_artifacts", None):
+        context["scope"]["artifacts"] = artifact_inputs(root, artifacts)
     context["fingerprint"] = fingerprint(context)
     return check_context(context)
+
+
+def artifact_inputs(root: pathlib.Path, artifacts: Any) -> dict[str, list[dict[str, str]]]:
+    """Bind explicit artifact files to their bytes; never search installations.
+
+    Paths can be outside the source checkout because built packages belong to
+    artifact storage. The caller supplies every file; missing files stop the
+    dependent check before it can run against a different installation.
+    """
+    if not isinstance(artifacts, dict):
+        raise ValueError("artifacts must map deliverable references to file-path arrays")
+    output = {}
+    for reference, paths in artifacts.items():
+        if (not isinstance(reference, str) or not reference.startswith("deliverables.")
+                or len(reference.split(".")) != 3 or not isinstance(paths, list) or not paths
+                or any(not isinstance(path, str) or not path for path in paths)):
+            raise ValueError(f"Invalid artifact selection for {reference!r}")
+        files = []
+        for name in paths:
+            path = pathlib.Path(name)
+            path = path if path.is_absolute() else root / path
+            digest = _digest(path)
+            if digest is None:
+                raise ValueError(f"Required artifact is missing for {reference}: {path}")
+            files.append({"path": str(path.resolve()), "sha256": digest})
+        output[reference] = files
+    return output
 
 
 @dataclass
@@ -199,7 +232,7 @@ class CheckPlan:
         record = read_check_result(self.path, self.result_id)
         if (record["result_id"] != self.result_id
                 or record["candidate_id"] != self.context["workVersion"]
-                or record["check_id"] != prepared.operation
+                or record["check_id"] != self.context["group"]
                 or record["inputs"] != self.context
                 or record["check_version"] != self.context["checkVersion"]
                 or (passed and record["status"] != "passed")
@@ -218,7 +251,24 @@ def plan_operation(prepared: Any) -> CheckPlan | None:
     context = check_inputs(prepared, declaration)
     store = CheckResultStore(prepared.repo_root)
     builds = select_build_check_summaries(prepared.repo_root, qualification_level=prepared.qualification_level)
-    decision = store.select(context, check_id=prepared.operation, builds=builds)
+    decision = store.select(context, check_id=context["group"], builds=builds)
     if decision["decision"] == "blocked":
         raise ValueError("Recorded check evidence blocks reuse: " + decision["reason"])
     return CheckPlan(context, decision, store)
+
+
+def completed_build_checks(captured: Mapping[str, Any], groups: tuple[str, ...]) -> dict[str, Any]:
+    """Consume checks actually reported by the build; never run them a second time."""
+    from sdlc_results import StepResultError, parse_check_summary
+
+    raw = captured.get("result", {}).get("check_summary")
+    try:
+        summary = parse_check_summary(json.dumps(raw).encode())
+        for group in groups:
+            checks = [item for item in summary["checks"] if item["id"] == group]
+            if (len(checks) != 1 or checks[0].get("status") != "passed"
+                    or not checks[0].get("result_id") or not checks[0].get("check_version")):
+                raise ValueError(f"Build did not report a completed passing result for {group}")
+        return summary
+    except (KeyError, TypeError, ValueError) as exc:
+        raise StepResultError(f"Build's internal check results are missing or incomplete: {exc}") from exc

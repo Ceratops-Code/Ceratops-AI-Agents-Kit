@@ -28,6 +28,8 @@ def parse_request(argv: Sequence[str] | None) -> tuple[argparse.Namespace, str |
     parser.add_argument("targets", nargs="*", help="Repository test paths or pytest node IDs.")
     parser.add_argument("--all", action="store_true")
     parser.add_argument("--auto", action="store_true", help="PR impact checks; Git build-summary reuse locally and during promotion.")
+    parser.add_argument("--check-group", help="One declared suite from tests/test-impact.json.")
+    parser.add_argument("--artifacts", default="{}", help="JSON mapping deliverable references to exact built file-path arrays.")
     parser.add_argument("--base")
     parser.add_argument("--head")
     parser.add_argument("--diagnostic-output", type=pathlib.Path)
@@ -44,6 +46,8 @@ def parse_request(argv: Sequence[str] | None) -> tuple[argparse.Namespace, str |
     args = parser.parse_args(list(argv) if argv is not None else None)
     args.context = None
     args.build_history = False
+    if args.check_group and not (args.targets or args.all or args.auto):
+        args.auto = True
     modes = sum((bool(args.targets), args.all, args.auto, args.validate_manifest, args.consolidate_results is not None,
                  args.worktree, args.write_collection is not None,
                  args.reconcile_collection is not None,
@@ -59,6 +63,14 @@ def parse_request(argv: Sequence[str] | None) -> tuple[argparse.Namespace, str |
         )
     if any(target.startswith("-") for target in args.targets):
         return args, "test targets must be paths or node IDs, not pytest options"
+    if args.check_group and args.targets:
+        return args, "choose test targets or --check-group, not both"
+    try:
+        args.artifacts = json.loads(args.artifacts)
+        if not isinstance(args.artifacts, dict):
+            raise ValueError("artifacts must be a JSON object")
+    except ValueError as exc:
+        return args, str(exc)
     if args.consolidate_results is not None and (
         args.describe_test_results or args.probe_command or args.result_file
         or any(getattr(args, name) is not None for name in _result_writer["IDENTITY_FIELDS"])
@@ -131,6 +143,21 @@ def validate_execution_context(
     return None
 
 
+def request_invocation(args: argparse.Namespace) -> dict[str, object]:
+    """The exact invocation stored with whole-command outcomes and diagnostics."""
+    return {
+        "targets": list(args.targets), "all": args.all, "auto": args.auto,
+        "base": args.base, "head": args.head, "worktree": args.worktree,
+        "select_only": args.select_only, "probe_command": args.probe_command,
+        **({"check_group": args.check_group, "artifacts": args.artifacts} if args.check_group or args.artifacts else {}),
+    }
+
+
+def current_check_results(root: pathlib.Path):
+    """Read this checkout's saved outcomes without executing any checks."""
+    return _result_writer["CurrentCheckResults"](root) if (root / ".git").exists() else None
+
+
 def run_recorded_request(
     args: argparse.Namespace, callback: Callable[[], int], *,
     repo_root: pathlib.Path, request_error: str | None = None,
@@ -153,8 +180,5 @@ def run_recorded_request(
             return 2
         def callback() -> int:
             return subprocess.run(command, check=False).returncode
-    return _result_writer["run_recorded_check"](callback, args, {
-        "targets": list(args.targets), "all": args.all, "auto": args.auto,
-        "base": args.base, "head": args.head, "worktree": args.worktree,
-        "select_only": args.select_only, "probe_command": args.probe_command,
-    }, repo_root=repo_root, checks=checks, summary=summary)
+    return _result_writer["run_recorded_check"](callback, args, request_invocation(args),
+                                                 repo_root=repo_root, checks=checks, summary=summary)

@@ -41,8 +41,8 @@ Run before opening a pull request:
 npm --prefix scripts ci
 uv sync --project scripts --locked
 $validationEvidence = Join-Path $env:TEMP "repository-validation.log"
-uv run --locked scripts/validate-repository.py --evidence-file $validationEvidence
-uv run --locked scripts/testing/run-tests.py --all
+uv run --project scripts --locked python scripts/validate-repository.py --evidence-file $validationEvidence
+uv run --project scripts --locked python scripts/testing/run-tests.py --all
 ```
 
 These are the same validation and test entrypoints used by CI. The validator

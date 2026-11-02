@@ -397,6 +397,11 @@ def check_current_inputs(context: Mapping[str, Any], root: pathlib.Path) -> None
     checks. Both boundaries use the existing operation declaration, not another
     dependency graph. A check that changes its own declared inputs cannot pass.
     """
+    for files in context["scope"].get("artifacts", {}).values():
+        for item in files:
+            artifact_path = pathlib.Path(item["path"])
+            if not artifact_path.is_file() or hashlib.sha256(artifact_path.read_bytes()).hexdigest() != item["sha256"]:
+                raise ValueError("Selected built artifact changed before check completion: " + str(artifact_path))
     rules = context["scope"].get("inputRules")
     if (not isinstance(rules, dict)
             or not all(isinstance(rules.get(key), list) and rules[key]
@@ -728,7 +733,7 @@ def run_recorded_check(
         if current is not None and path != current.path:
             current = None  # Explicit caller-selected output keeps the public probe contract.
         target = {key: value for key, value in context["scope"].items()
-                  if key not in {"worktree", "inputRules"}} if current is not None and context is not None else {}
+                  if key not in {"worktree", "inputRules", "artifacts"}} if current is not None and context is not None else {}
         saved = next((item for item in current.records("repository-check", target=target)
                       if item["result_id"] == args.result_id), None) if current is not None else None
         if saved is not None:

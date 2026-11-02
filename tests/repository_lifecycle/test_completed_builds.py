@@ -8,6 +8,8 @@ import os
 import pathlib
 import runpy
 import shutil
+import importlib
+import sys
 
 import pytest
 
@@ -55,6 +57,118 @@ def _tag_summary(repository, version, summary, *, target="python-3.14-windows", 
 
 def _empty_summary():
     return {"schema": "ceratops-check-summary.v1", "inputGroups": {}, "checkGroups": {}, "checks": []}
+
+
+def _worktree_build_case(tmp_path):
+    repository, commit = _versioned_repository(tmp_path)
+    version, target = "1.2.20b1", "python-3.14-windows"
+    receipt = _versioned_build_receipt(tmp_path, commit=commit, version=version, target=target,
+                                       required_targets=[target], attempt_id="worktree-build")
+    files = {
+        f"artifacts/claims-{version}-py3-none-any.whl": f"claims-{version}-py3-none-any.whl",
+        "dependencies/converter-0.4.0.whl": "converter-0.4.0.whl",
+        "evidence/installed-artifact.json": '{"installed":true,"status":"passed"}\n',
+        "evidence/install.log": "sanitized fixture log\n",
+    }
+    git_results = [item["path"] for item in receipt["supportingFiles"] if item["root"] == "git"]
+    code = (
+        "import json,pathlib,sys\n"
+        "root=pathlib.Path(sys.argv[1]); version=sys.argv[2]\n"
+        "assert pathlib.Path('version.txt').read_text()==version\n"
+        "if pathlib.Path('.fail-build').exists(): print('compiler rejected source',file=sys.stderr); sys.exit(7)\n"
+        "counter=pathlib.Path('.build-count'); counter.write_text(counter.read_text()+'x' if counter.exists() else 'x')\n"
+        f"for name,content in {files!r}.items():\n"
+        " p=root/name; p.parent.mkdir(parents=True,exist_ok=True); p.write_bytes(content.encode())\n"
+        f"for name in {git_results!r}:\n"
+        " p=pathlib.Path(name); p.parent.mkdir(parents=True,exist_ok=True); p.write_bytes(b'{\"status\":\"passed\"}\\n')\n"
+    )
+    _write_fixture_bytes(repository, "scripts/build.py", code.encode())
+    _write_fixture_bytes(repository, "version.txt", b"old")
+    _write_fixture_bytes(repository, "unrelated.txt", b"original")
+    _write_fixture_bytes(repository, ".gitignore", b".build-count\n.fail-build\n")
+    no_op = {"requires": {"capabilities": []}, "no-op": "No additional checks for this fixture."}
+    contract = {"version": 5, "kind": "ceratops-sdlc", "repository": {"capabilities": {}, "actions": {"validate": no_op, "test": no_op}},
+                "deliverables": {"packages": {"claims": {
+                    "source": ".", "project": "pyproject.toml", "prerequisites": [],
+                    "artifact": {"type": "python-wheel", "distribution": "claims", "output-directory": "dist", "filename-pattern": "*.whl"},
+                    "actions": {"validate": no_op, "test": no_op, "build": {"requires": {"capabilities": []},
+                        "parameters": ["version", "artifact_directory"],
+                        "steps": [{"run": [sys.executable, "scripts/build.py", "{artifact_directory}", "{version}"]}]}}
+                }}}}
+    _write_fixture_bytes(repository, runner.DEFAULT_CONTRACT.as_posix(), json.dumps(contract).encode())
+    assert run_git(repository, "add", ".").returncode == 0
+    assert run_git(repository, "commit", "-m", "build fixture").returncode == 0
+    _write_fixture_bytes(repository, "unrelated.txt", b"keep staged change")
+    assert run_git(repository, "add", "unrelated.txt").returncode == 0
+    prepare = [sys.executable, "-c", "import pathlib,sys;pathlib.Path('version.txt').write_text(sys.argv[1])", "{version}"]
+    options = dict(repository="example/project", release_unit="claims", version=version,
+                   required_targets=[target], attempt_id="worktree-build", source_paths=["version.txt"],
+                   requests={target: [runner.OperationRequest("deliverables.packages.claims.actions.build")]},
+                   preparation_commands=[prepare], describe_receipt=lambda _transaction, _target, _batch: receipt)
+    return repository, options
+
+
+def test_worktree_build_commits_selected_source_and_finishes_once(tmp_path):
+    repository, options = _worktree_build_case(tmp_path)
+    result = runner.execute_worktree_build(repository, **options)
+    assert result["status"] == "completed", result
+    assert run_git(repository, "show", result["tag"] + ":version.txt").stdout == options["version"]
+    assert run_git(repository, "show", result["tag"] + ":unrelated.txt").stdout == "original"
+    assert run_git(repository, "diff", "--cached", "--name-only").stdout.strip() == "unrelated.txt"
+    assert (repository / ".build-count").read_text() == "x"
+    selected = results.read_build_check_summary(repository, result["tag"],
+                                                pathlib.Path(result["build_receipts"][0]).relative_to(repository).as_posix())
+    assert selected["summary"]["checks"]
+    again = runner.execute_worktree_build(repository, **options)
+    assert again["status"] == "completed" and again["final_commit"] == result["final_commit"], again
+    assert (repository / ".build-count").read_text() == "x"
+
+
+def test_worktree_build_failure_preserves_cause_without_receipt_or_tag(tmp_path):
+    repository, options = _worktree_build_case(tmp_path)
+    (repository / ".fail-build").touch()
+    result = runner.execute_worktree_build(repository, **options)
+    assert result["status"] in runner.FAILED_STATUSES, result
+    assert "compiler rejected source" in json.dumps(result)
+    assert run_git(repository, "tag", "--list").stdout == ""
+    assert not list((repository / ".build").glob("**/build_receipt.json"))
+    (repository / ".fail-build").unlink()
+    fixed = runner.execute_worktree_build(repository, **options)
+    assert fixed["status"] == "completed", fixed
+    assert (repository / ".build-count").read_text() == "x"
+
+
+@pytest.mark.parametrize("effect", ["source-commit", "completion"])
+@pytest.mark.parametrize("timing", ["before", "after"])
+def test_worktree_build_repeats_commit_and_completion_handoffs(tmp_path, monkeypatch, effect, timing):
+    repository, options = _worktree_build_case(tmp_path)
+    flow = importlib.import_module("execute_worktree_build")
+    owner = flow if effect == "source-commit" else runner
+    name = "run_protected_command" if effect == "source-commit" else "complete_versioned_build"
+    original = getattr(owner, name)
+    fired = False
+
+    def interrupted(*args, **kwargs):
+        nonlocal fired
+        match = not fired and (effect == "completion" or "commit" in args[0])
+        if match:
+            fired = True
+        if match and timing == "before":
+            raise KeyboardInterrupt("test interruption")
+        result = original(*args, **kwargs)
+        if match:
+            raise KeyboardInterrupt("test interruption")
+        return result
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(owner, name, interrupted)
+        with pytest.raises(KeyboardInterrupt, match="test interruption"):
+            runner.execute_worktree_build(repository, **options)
+    assert fired
+    result = runner.execute_worktree_build(repository, **options)
+    assert result["status"] == "completed", result
+    assert (repository / ".build-count").read_text() == "x"
+    assert run_git(repository, "log", "--format=%s").stdout.count("Prepare claims") == 1
 
 
 @pytest.fixture(params=["installed", "portable", "generated"])

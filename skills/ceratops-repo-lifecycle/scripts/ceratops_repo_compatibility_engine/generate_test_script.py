@@ -92,16 +92,59 @@ def generated_test_runner(
 
 
 def record_generated_runner(
-    root: pathlib.Path, contract: Mapping[str, Any], content: str,
+    root: pathlib.Path, contract: Mapping[str, Any], content: str | None,
     planned: dict[pathlib.Path, str],
 ) -> None:
-    """Plan runner bytes and their explicit ownership in the existing project."""
+    """Deliver local reuse modules with an owned runner or opted-in custom runner.
+
+    Custom runners and their input maps remain repository-owned. A custom
+    runner can opt into these two generated modules without transferring its
+    command implementation to the standard template.
+    """
+    from .compatibility_contract import template_path
     project = root / contract["surfaces"]["validation_project"]["path"]
     text = planned.get(project)
     if text is None:
         text = project.read_text(encoding="utf-8")
     metadata = tomllib.loads(text)
-    if "test-runner" not in metadata.get("tool", {}).get("ceratops", {}):
+    support = metadata.get("tool", {}).get("ceratops", {}).get("test-support", {})
+    if not isinstance(support, dict) or ("managed" in support and type(support["managed"]) is not bool):
+        raise RuntimeError("tool.ceratops.test-support.managed must be a boolean")
+    if content is None and support.get("managed") is not True:
+        return
+    if content is not None and "test-runner" not in metadata.get("tool", {}).get("ceratops", {}):
         text = text.rstrip() + "\n\n[tool.ceratops.test-runner]\nmanaged = true\n"
         planned[project] = text
-    planned[root / contract["surfaces"]["python_test_runner"]["path"]] = content
+    if content is not None:
+        planned[root / contract["surfaces"]["python_test_runner"]["path"]] = content
+    templates = template_path("python_test_runner").parent
+    for name in ("select_test_groups.py", "reuse_test_results.py"):
+        destination = root / "scripts/testing" / name
+        if destination.is_symlink() or destination.is_junction():
+            raise RuntimeError(f"generated test support must not be a link: {destination}")
+        planned[destination] = (templates / (name + ".tmpl")).read_text(encoding="utf-8")
+
+
+def generated_support_errors(root: pathlib.Path, contract: Mapping[str, Any]) -> list[str]:
+    """Check the local modules only for explicitly generated/opted-in scripts."""
+    project = root / contract["surfaces"]["validation_project"]["path"]
+    if not project.is_file():
+        return []  # The project checker reports its absence.
+    try:
+        options = tomllib.loads(project.read_text(encoding="utf-8")).get("tool", {}).get("ceratops", {})
+    except (OSError, ValueError) as exc:
+        return [f"Cannot read generated test support configuration: {exc}"]
+    enabled = False
+    for key in ("test-runner", "test-support"):
+        setting = options.get(key, {})
+        if not isinstance(setting, dict) or ("managed" in setting and type(setting["managed"]) is not bool):
+            return [f"tool.ceratops.{key}.managed must be a boolean"]
+        enabled |= setting.get("managed") is True
+    if not enabled:
+        return []  # Custom commands/storage retain their own executable contract.
+    errors = []
+    for name in ("select_test_groups.py", "reuse_test_results.py"):
+        path = root / "scripts/testing" / name
+        if not path.is_file() or path.is_symlink() or path.is_junction():
+            errors.append(f"Generated test support requires its own regular file: scripts/testing/{name}")
+    return errors

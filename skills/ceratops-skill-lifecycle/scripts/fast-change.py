@@ -104,29 +104,25 @@ class ChangeSpec:
 
 
 def _runtime_installer(repo_root: pathlib.Path) -> pathlib.Path:
-    """Resolve this repository's lifecycle runtime, then installed fallback."""
+    """Use the installed skill and its runtime; repo_root is source data only."""
 
     codex_home = pathlib.Path(
         os.environ.get("CODEX_HOME", pathlib.Path.home() / ".codex")
     ).expanduser()
-    candidates = (
-        repo_root
-        / "skills"
-        / "ceratops-skill-lifecycle"
-        / "scripts"
-        / "runtime"
-        / "install-managed-skills.py",
-        codex_home
-        / "skills"
-        / "ceratops-skill-lifecycle"
-        / "scripts"
-        / "runtime"
-        / "install-managed-skills.py",
-    )
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate
-    raise DecisionRequired("managed lifecycle runtime installer is missing")
+    skill = codex_home / "skills" / "ceratops-skill-lifecycle"
+    installer = skill / "scripts/runtime/install-managed-skills.py"
+    metadata = skill / ".runtime-manifest.json"
+    if skill.is_symlink() or installer.is_symlink() or not installer.is_file():
+        raise DecisionRequired("installed managed lifecycle runtime installer is missing")
+    try:
+        if metadata.is_symlink() or not metadata.is_file():
+            raise ValueError("installed runtime manifest is missing")
+        runtime = json.loads(metadata.read_text(encoding="utf-8"))["python_runtime"]
+        if pathlib.Path(runtime).resolve() != pathlib.Path(sys.executable).resolve():
+            raise ValueError("fast-change must use the installed skill's Python runtime")
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise DecisionRequired(str(exc)) from exc
+    return installer
 
 
 def _run(
@@ -751,7 +747,7 @@ def _release_write_context(repo_root, *, confirm_stopped=False):
     locks = _release_lock_module()
     try:
         with locks.hold_write_attempt(
-            locks.release_lock_path(repo_root),
+            locks.release_lock_path(repo_root), operation="skill fast-change",
             confirm_previous_commands_stopped=confirm_stopped,
         ) as owned:
             yield owned

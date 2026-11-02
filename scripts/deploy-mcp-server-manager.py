@@ -328,7 +328,12 @@ def package_manager(engine: Engine, runtime: Runtime) -> dict:
     with tempfile.TemporaryDirectory(prefix="bootstrap_", dir=engine.layout.directory("staging")) as work:
         temporary = Path(work)
         libraries = temporary / "libraries"
-        run([str(runtime.uv), "pip", "sync", str(SOURCE / "pylock.toml"), "--python", str(runtime.python),
+        lock = temporary / "pylock.toml"
+        run([str(runtime.uv), "export", "--project", str(SOURCE.parents[1] / "scripts"),
+             "--package", MCP_SERVER_NAME, "--locked", "--no-dev", "--no-default-groups",
+             "--no-emit-workspace", "--format", "pylock.toml", "--no-header", "--output-file", str(lock)],
+            cwd=SOURCE, env=child_environment(engine.layout, temporary))
+        run([str(runtime.uv), "pip", "sync", str(lock), "--python", str(runtime.python),
              "--target", str(libraries), "--require-hashes", "--only-binary", ":all:", "--no-config"],
             cwd=SOURCE, env=child_environment(engine.layout, temporary))
         sys.path.insert(0, str(libraries))

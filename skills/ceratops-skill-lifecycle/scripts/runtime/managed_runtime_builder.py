@@ -300,7 +300,7 @@ def selected_python_skills(
 
     declared = manifest.get("python_runtime_skills")
     if declared is None:
-        project = ROOT / "skills/sections/python"
+        project = ROOT / "scripts"
         return set(deploy_names) if (project / "pyproject.toml").is_file() else set()
     assert isinstance(declared, list)
     return deploy_names.intersection(declared)

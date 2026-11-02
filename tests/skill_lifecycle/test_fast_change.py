@@ -185,7 +185,8 @@ def test_fast_change_commits_cohesive_rules_only_multi_skill_scope(
     preserved_requests = list(canonical_requests.rglob("request.json"))
     assert len(preserved_requests) == 1
     repeated = subprocess.run([sys.executable, str(FAST_CHANGE), "--request", str(preserved_requests[0])],
-                              capture_output=True, text=True, check=False)
+                              capture_output=True, text=True, check=False,
+                              env={**os.environ, "CODEX_HOME": str(repo.parent / "profile")})
     assert repeated.returncode == 1
     assert json.loads(repeated.stderr)["detail"]["phase"] == "markdown_lint"
     assert (repo / ".git/ceratops/locks/release-local").read_bytes() == b"0"

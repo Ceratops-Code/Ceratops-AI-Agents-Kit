@@ -185,12 +185,12 @@ def resolve_target_policy(
     target: Path,
     label: str = "markdown_policy",
 ) -> dict[str, Any] | None:
-    """Select the target format without loading Markdown tooling for TOML."""
+    """Keep serialized JSON/TOML strings outside the Markdown formatter."""
 
-    if target.suffix.lower() == ".toml":
+    if target.suffix.lower() in {".toml", ".json"}:
         if value is not None:
             raise RuleCandidateValidationError(
-                f"{label} must be null for a TOML target"
+                f"{label} must be null for a {target.suffix[1:].upper()} target"
             )
         return None
     return resolve_markdown_policy(value, label=label)
@@ -1053,14 +1053,15 @@ def _validate_target(
         "changed_replacements": [],
     }
     if policy is None:
+        json_target = rules.suffix.lower() == ".json"
         try:
-            tomllib.loads(prospective)
-        except tomllib.TOMLDecodeError as exc:
+            (json.loads if json_target else tomllib.loads)(prospective)
+        except (tomllib.TOMLDecodeError, json.JSONDecodeError) as exc:
             raise RuleCandidateValidationError(
-                f"target={rules} rule=toml-syntax invalid TOML: {exc}"
+                f"target={rules} rule={'json' if json_target else 'toml'}-syntax invalid {'JSON' if json_target else 'TOML'}: {exc}"
             ) from exc
         target["replacements"] = fixed_replacements
-        evidence["validation"] = {"format": "toml", "parser": "tomllib", "returncode": 0}
+        evidence["validation"] = {"format": "json" if json_target else "toml", "parser": "json" if json_target else "tomllib", "returncode": 0}
         evidence["changed_replacements"] = [
             index for index, (before, after) in enumerate(
                 zip(replacements, fixed_replacements, strict=True)

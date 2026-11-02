@@ -398,7 +398,7 @@ def ensure_pr(args: argparse.Namespace) -> dict[str, object]:
     """Protect release publication and any requested local release edits."""
     current = require_output(_git(args.repo_root, "branch", "--show-current"), cwd=args.repo_root)
     with release_write_context(
-        args.repo_root, required="release/local" in {args.head_branch, current},
+        args.repo_root, required="release/local" in {args.head_branch, current}, operation="PR preparation",
         confirm_stopped=getattr(args, "confirm_previous_commands_stopped", False),
     ) as owned:
         result = _ensure_pr(args)

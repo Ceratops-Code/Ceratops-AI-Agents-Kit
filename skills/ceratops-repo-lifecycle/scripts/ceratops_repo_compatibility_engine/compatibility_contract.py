@@ -100,8 +100,8 @@ def load_compatibility_contract(bundle_root: pathlib.Path | None = None) -> dict
         raise RuntimeError("compatibility runtime paths must match the portable template layout")
     skill_runtime = contract["skill_python_runtime"]
     if skill_runtime != {
-        "project": "skills/sections/python/pyproject.toml",
-        "lockfile": "skills/sections/python/uv.lock",
+        "project": "scripts/pyproject.toml",
+        "lockfile": "scripts/uv.lock",
     }:
         raise RuntimeError("skill Python runtime paths must match the shared source layout")
     destinations = {

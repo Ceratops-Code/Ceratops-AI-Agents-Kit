@@ -33,7 +33,7 @@ runs:
             ;;
         esac
         uv run --quiet --locked \
-          --project "$CERATOPS_ACTION_ROOT/../../sections/python" \
+          --project "$CERATOPS_ACTION_ROOT/../../../scripts" \
           python "$CERATOPS_ACTION_ROOT/repository_operation.py" \
           --repo-root "${CERATOPS_REPOSITORY:?repo-root input is required}" \
           "$@" \

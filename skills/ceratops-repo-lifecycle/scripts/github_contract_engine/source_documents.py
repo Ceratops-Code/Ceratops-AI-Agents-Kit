@@ -28,40 +28,8 @@ USER_AGENT = "ceratops-contract-source-doc-check/1.0"
 def default_registry_path() -> pathlib.Path:
     """Find the bundled registry in source and installed skill layouts."""
 
-    scripts_dir = pathlib.Path(__file__).resolve().parent.parent
-    skill_dir = scripts_dir.parent
-    repo_root = skill_dir.parents[1] if skill_dir.parent.name == "skills" else skill_dir
-    candidates = [
-        pathlib.Path.cwd()
-        / "references"
-        / "contracts"
-        / "github-contract-source-docs.json",
-        pathlib.Path.cwd()
-        / "skills"
-        / "ceratops-repo-lifecycle"
-        / "references"
-        / "contracts"
-        / "github-contract-source-docs.json",
-        repo_root
-        / "skills"
-        / "ceratops-repo-lifecycle"
-        / "references"
-        / "contracts"
-        / "github-contract-source-docs.json",
-        skill_dir
-        / "references"
-        / "contracts"
-        / "github-contract-source-docs.json",
-    ]
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate
-    return (
-        skill_dir
-        / "references"
-        / "contracts"
-        / "github-contract-source-docs.json"
-    )
+    skill_dir = pathlib.Path(__file__).resolve().parents[2]
+    return skill_dir / "references/contracts/github-contract-source-docs.json"
 
 
 def load_registry(path: pathlib.Path) -> list[dict[str, Any]]:

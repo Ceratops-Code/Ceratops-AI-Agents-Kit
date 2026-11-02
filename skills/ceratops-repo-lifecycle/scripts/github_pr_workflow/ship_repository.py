@@ -1082,6 +1082,7 @@ def ship_repository(args: ShipOptions) -> dict[str, object]:
     owner_root, action = getattr(args, "diagnostic_owner", None) or (repo_root, "ship")
     with release_write_context(
         args.repo_root,
+        operation="Ship", wait_seconds=60,
         confirm_stopped=getattr(args, "confirm_previous_commands_stopped", False),
     ), capture_failure_report(
         getattr(args, "diagnostic_output", None), repo_root=owner_root, action=action,

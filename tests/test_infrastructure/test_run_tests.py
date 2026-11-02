@@ -354,6 +354,7 @@ class DeterministicExecution:
         self.final_returncode = final_returncode
         self.final_stdout = final_stdout
         self.final_stderr = final_stderr
+        self.previous_manifest = (ROOT / "tests/test-impact.json").read_bytes()
         self.commands: list[tuple[str, ...]] = []
         self.final_pytest: list[tuple[str, ...]] = []
 
@@ -381,6 +382,10 @@ class DeterministicExecution:
     ) -> subprocess.CompletedProcess[bytes]:
         argv = tuple(command)
         self.commands.append(argv)
+        if argv[:2] == ("git", "merge-base"):
+            return subprocess.CompletedProcess(command, 0, BASE.encode(), b"")
+        if argv[:2] == ("git", "show"):
+            return subprocess.CompletedProcess(command, 0, self.previous_manifest, b"")
         if argv == ("git", "ls-files", "-z"):
             return self.runner.run_bytes(command, cwd)
         if argv == ("git", "ls-files", "--others", "--exclude-standard", "-z"):
@@ -949,7 +954,8 @@ def test_pytest_failure_writes_full_diagnostic_and_emits_bounded_summary(
         == 0
     )
     payload(capsys)
-    assert not diagnostic.exists()
+    # A caller-selected report outside managed storage belongs to the caller.
+    assert diagnostic.read_bytes() == content
 
 
 def test_committed_diff_maps_test_rename_source_through_destination(
@@ -1395,3 +1401,34 @@ def test_selection_only_reuses_diff_mapping_without_starting_pytest(
         assert diagnostic.read_text(encoding="utf-8") == "retained pytest failure"
         if diff.startswith(b"R"):
             assert result["full_suite"] is True
+
+
+@pytest.mark.parametrize("worktree", [False, True])
+@pytest.mark.parametrize("malformed", [False, True])
+def test_deleted_input_uses_git_recorded_owner_before_collecting(
+    test_runner_module, capsys, tmp_path, worktree, malformed,
+):
+    execution = DeterministicExecution(test_runner_module, b"D\0skills/retired/dependencies.lock\0")
+    previous = json.loads(execution.previous_manifest)
+    previous["rules"].append({
+        "id": "retired-input", "paths": ["skills/retired/dependencies.lock"],
+        "suites": ["source-search"],
+    })
+    execution.previous_manifest = b"{" if malformed else json.dumps(previous).encode()
+    arguments = ["--worktree"] if worktree else ["--base", BASE, "--head", HEAD]
+    for _ in range(2):
+        code = test_runner_module.execute(
+            [*arguments, "--select-only", "--diagnostic-output", str(tmp_path / "report.json")],
+            repo_root=ROOT, text_runner=execution.text, bytes_runner=execution.bytes,
+        )
+        result = payload(capsys)
+        assert code == (2 if malformed else 0)
+        assert not execution.final_pytest
+        assert ("git", "show", BASE + ":tests/test-impact.json") in execution.commands
+        if not worktree:
+            assert ("git", "merge-base", BASE, HEAD) in execution.commands
+        if malformed:
+            assert result["status"] == "configuration-error"
+        else:
+            assert result["selected_suites"] == ["source-search"]
+            assert result["selections"][0]["rule"] == "previous:retired-input"

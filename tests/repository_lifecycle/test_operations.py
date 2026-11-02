@@ -153,14 +153,14 @@ def test_live_sdlc_v4_selects_validation_and_tests_for_every_install() -> None:
     operations = runner.prepare_operations(ROOT, requests, context="ci")
     assert operations[0].steps[0].argv == (
         "uv",
-        "run",
-        "--locked",
+        "run", "--project", "scripts",
+        "--locked", "python",
         "scripts/validate-repository.py",
     )
     assert operations[1].steps[0].argv == (
         "uv",
-        "run",
-        "--locked",
+        "run", "--project", "scripts",
+        "--locked", "python",
         "scripts/testing/run-tests.py",
         "--auto",
     )
@@ -231,8 +231,8 @@ def test_sdlc_template_is_a_schema_valid_empty_skeleton(tmp_path: pathlib.Path) 
     assert selection["parameters"] == ["base", "head"]
     assert selection["steps"][0]["run"] == [
         "uv",
-        "run",
-        "--locked",
+        "run", "--project", "scripts",
+        "--locked", "python",
         "scripts/testing/run-tests.py",
         "--select-only",
         "--base",
@@ -241,14 +241,14 @@ def test_sdlc_template_is_a_schema_valid_empty_skeleton(tmp_path: pathlib.Path) 
         "{head}",
     ]
     assert entries["repository.actions.validate"]["steps"] == [
-        {"run": ["uv", "run", "--locked", "scripts/validate-repository.py"]},
+        {"run": ["uv", "run", "--project", "scripts", "--locked", "python", "scripts/validate-repository.py"]},
     ]
     assert entries["repository.actions.test"]["steps"] == [
         {
             "run": [
                 "uv",
-                "run",
-                "--locked",
+                "run", "--project", "scripts",
+                "--locked", "python",
                 "scripts/testing/run-tests.py",
                 "--auto",
             ]

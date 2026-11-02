@@ -73,6 +73,25 @@ def source_metadata(source: Path) -> MCPServerSource:
     return MCPServerSource(source, token(project["name"]), token(project["version"], "version"), token(config["module"], "module"))
 
 
+
+def dependency_project(source: Path) -> Path:
+    """Use the package's declared uv workspace, or its own native project.
+
+    Only metadata is read from source. uv checks workspace membership and exports
+    the selected package's dependencies; no checkout module is imported here.
+    """
+    declaration = tomllib.loads(source_file(source, "pyproject.toml").read_text(encoding="utf-8"))
+    relative = declaration.get("tool", {}).get("ceratops", {}).get("dependency-project")
+    if relative is None:
+        return source
+    if not isinstance(relative, str) or not relative or Path(relative).is_absolute():
+        raise DeploymentError("tool.ceratops.dependency-project must be a relative project directory")
+    project = (source / relative).resolve(strict=True)
+    source_file(project, "pyproject.toml")
+    source_file(project, "uv.lock")
+    return project
+
+
 def locked_dependencies(path: Path) -> dict:
     """Read one PEP 751 dependency lock and reject lookalike lock schemas."""
     try:
@@ -149,12 +168,13 @@ def package(source: Path, *, lock_only: bool = False,
     source, identity, version = selected.path, selected.mcp_server_name, selected.version
     if (package_wheel is None) != (package_lock is None) or (lock_only and package_wheel is not None):
         raise DeploymentError("package wheel and lock must be supplied together, without --lock")
+    source_project = dependency_project(source)
     source_lock_name = "pylock.toml"
-    if package_lock is None and ((source / "uv.lock").exists() or (source / "uv.lock").is_symlink()):
+    if package_lock is None and ((source_project / "uv.lock").exists() or (source_project / "uv.lock").is_symlink()):
         if (source / "pylock.toml").exists() or (source / "pylock.toml").is_symlink():
             raise DeploymentError("MCP server source must have one canonical lockfile")
         source_lock_name = "uv.lock"
-        source_file(source, source_lock_name)
+        source_file(source_project, source_lock_name)
     required_package: tuple[str, str] | None = None
     package_lock_sha256: str | None = None
     package_project: Path | None = None
@@ -218,13 +238,13 @@ def package(source: Path, *, lock_only: bool = False,
         temporary = Path(work)
         env = {k: v for k, v in os.environ.items() if not k.upper().startswith(("UV_", "PIP_", "PYTHON"))}
         env.update({"UV_CACHE_DIR": str(temporary / "uv-cache"), "UV_NO_CONFIG": "1", "UV_PYTHON_DOWNLOADS": "never", "TEMP": work, "TMP": work})
-        lock = package_lock if package_lock is not None else source / source_lock_name
+        lock = package_lock if package_lock is not None else source_project / source_lock_name
         if package_lock is None and (lock.exists() or lock.is_symlink()):
-            source_file(source, source_lock_name)
+            source_file(source_project, source_lock_name)
         if lock_only:
             if source_lock_name == "uv.lock":
-                run([str(uv), "lock", "--project", str(source), "--python", str(python),
-                     "--no-config", "--no-sources"], cwd=source, env=env)
+                run([str(uv), "lock", "--project", str(source_project), "--python", str(python),
+                     "--no-config"], cwd=source_project, env=env)
             else:
                 run([str(uv), "pip", "compile", "pyproject.toml", "--python", str(python), "--python-version", runtime.python_version,
                      "--python-platform", "windows",
@@ -235,21 +255,23 @@ def package(source: Path, *, lock_only: bool = False,
         # or concurrent source edits before the immutable registry commit.
         uv_inputs: tuple[Path, str, Path, str] | None = None
         if lock.name == "uv.lock":
-            canonical_lock = source_file(source, source_lock_name) if package_lock is None else package_lock
-            canonical_project = source_file(source, "pyproject.toml") if package_lock is None else package_project
+            canonical_lock = source_file(source_project, source_lock_name) if package_lock is None else package_lock
+            canonical_project = source_file(source_project, "pyproject.toml") if package_lock is None else package_project
             assert canonical_project is not None
             uv_inputs = (canonical_lock, digest(canonical_lock), canonical_project, digest(canonical_project))
             lock = temporary / ("pylock.source.toml" if package_lock is None else "pylock.package.toml")
             run([
                 str(uv), "export", "--project", str(canonical_lock.parent),
                 "--locked", "--format", "pylock.toml", "--no-dev",
-                "--no-emit-project", "--output-file", str(lock),
+                "--no-emit-workspace", "--no-default-groups", "--package",
+                required_package[0] if required_package is not None else identity,
+                "--output-file", str(lock),
                 "--no-header", "--no-config",
             ], cwd=canonical_lock.parent, env=env)
             if digest(canonical_lock) != uv_inputs[1] or digest(canonical_project) != uv_inputs[3]:
                 raise DeploymentError("canonical uv.lock or pyproject.toml changed during export")
         elif package_lock is None:
-            lock = source_file(source, source_lock_name)
+            lock = source_file(source_project, source_lock_name)
         locked = locked_dependencies(lock)
         run([str(uv), "build", str(source), "--wheel", "--out-dir", str(temporary), "--python", str(python), "--no-config", "--no-sources"], cwd=source, env=env)
         wheels = list(temporary.glob("*.whl"))

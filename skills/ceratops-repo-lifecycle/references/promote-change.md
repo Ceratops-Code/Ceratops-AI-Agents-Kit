@@ -50,6 +50,11 @@ publication, deployment and repository-wide shipped-task cleanup.
 
 ### Callable implementation and lock lifetime
 
+Promotion waits inside Python for up to 60 seconds when the release lock is
+busy. Acquisition proceeds through normal preconditions; timeout returns the
+elapsed wait and current operation/chat/PID, or `owner unknown`, in the command
+result. Owner information never permits recovery or bypasses the unfinished flag.
+
 The current helper calls `github_pr_workflow.ship_repository.ship_repository()`
 directly for composed shipping, passing `ShipOptions` and the repository path.
 The standalone Ship CLI uses that same implementation. External pending-work

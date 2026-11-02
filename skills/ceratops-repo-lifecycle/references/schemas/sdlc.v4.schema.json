@@ -214,6 +214,8 @@
           "enum": [
             "ceratops-repository-stage-result.v1",
             "ceratops-build-result.v1",
+            "ceratops-build-result.v2",
+            "ceratops-build-result.v3",
             "ceratops-deployment-result.v1"
           ]
         },

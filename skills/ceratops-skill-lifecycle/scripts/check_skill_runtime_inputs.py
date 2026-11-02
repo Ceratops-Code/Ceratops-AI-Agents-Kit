@@ -37,7 +37,7 @@ def check_runtime_payloads(
     if not isinstance(payloads, dict):
         errors.append("section manifest runtime_payloads must be an object")
         return errors
-    project = repo_root / "skills/sections/python"
+    project = repo_root / "scripts"
     declaration = project / "pyproject.toml"
     lock = project / "uv.lock"
     declared_python = manifest.get("python_runtime_skills")
@@ -71,8 +71,8 @@ def check_runtime_payloads(
             errors.append(f"source skill Python runtime declaration is invalid: {exc}")
     forbidden_sources = {
         "skills/sections/scripts/run-skill.py",
-        "skills/sections/python/pyproject.toml",
-        "skills/sections/python/uv.lock",
+        "scripts/pyproject.toml",
+        "scripts/uv.lock",
     }
     retired_targets = {
         "scripts/run-skill.py",

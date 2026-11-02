@@ -67,6 +67,15 @@ one engine. The MCP server lifecycle skill supplies its action instructions and
 `scripts/install-mcp-server.py`, which calls that manager and reports completion;
 the existing skill installer continues to own `.codex` skill deployment.
 
+The manager's shared MCP launcher announces selected-version changes to connected
+clients without waiting for a tool call. Codex uses its existing
+`[features] mcp_tool_list_changed = true` setting to fetch the new definitions
+when it next needs the catalog. Active calls and background work finish on their
+original server. This requires the changed launcher to be installed and a
+connection with the setting loaded; saving source or config does not refresh a
+live chat. No desktop patch is required. See the manager's
+[activation details](mcp-servers/ceratops_mcp_server_manager/README.md#activation-and-self-update).
+
 The MCP installation callable returns failure JSON; its CLI writes the same JSON
 to stderr and exits 1. `diagnostics` names the selected server, command arguments,
 Python runtime, working directory, exit status, causes and separate stdout/stderr.
@@ -195,15 +204,15 @@ without repository deduplication.
 | `scripts/deploy-hooks.py` | Independent hook installation and updates; copies the repository hook payloads and merges their registrations while preserving unrelated files and configuration. Does not grant trust or restart Codex. |
 | `scripts/deploy-mcp-server-manager.py` | Install the checkout's declared MCP server manager version, including over an existing installation, from the scripts environment; uses the manager's global Python and uv prerequisites, temporary locked libraries, and packaging and deployment code. Never changes Codex settings. |
 | `scripts/testing/run-tests.py` | Public test entry point. Uses the input map to select tests, runs one pytest collection/execution for the selected targets, preserves collection-snapshot/node-mapping modes and reports missing ownership before execution. Failed streams go to `--diagnostic-output`; console output stays bounded with current test names and counts on stderr. |
-| `scripts/testing/select_test_groups.py` | Reads `tests/test-impact.json`, maps changed inputs to check groups, follows dependencies toward consumers and separates selection/reporting options from options affecting test behavior. The map selects checks, not editable files. |
-| `scripts/testing/report_test_progress.py` | Pytest hook plugin and execution transport; reports collection, rate-limited current-test/count updates, sixty-second liveness, the actual pytest exit code, and bounded executed/reused check counts without mixing progress into the final stdout JSON or saving execution state. |
+| `scripts/testing/select_test_groups.py` | Reads `tests/test-impact.json`, maps changed inputs to check groups, follows dependencies toward consumers and separates selection/reporting options from options affecting test behavior. For removed paths, the runner reads ownership from the diff's previous commit; current rules need no obsolete filenames. The map selects checks, not editable files. |
+| `scripts/testing/report_test_progress.py` | Pytest hook plugin and execution transport; reports collection, rate-limited current-test/count updates, sixty-second liveness, the actual pytest exit code, and bounded executed/reused check counts. Missing or malformed summaries preserve the original exit and both output streams and cannot authorize acceptance. |
 | `scripts/testing/reuse_test_results.py` | Saves each finished pytest outcome in the current worktree's `check_results.json`. Reuses passes on matching inputs and eligible tagged build summaries. Explicit old-file conversion keeps original outcomes and identities, saves the latest result per test/target, then deletes superseded files. Skips never become passes. |
 | `skills/sections/scripts/store_check_results.py` | Shares the current-results reader/writer between repository and skill lifecycle. Each worktree has one file; finished checks replace only their own entries. Build summaries in Git remain independent. |
 | `scripts/testing/pytest-diagnostics.py` | Extracts bounded failure summaries using exact pytest and unittest-subtest identities and source-file evidence, including parameter names containing summary separators; reports terminal import errors, nested exception-group messages and assertion differences over source context, excluding captured output. Native stderr failures before collection use the explicit `<pytest startup>` identity. Ambiguous or missing test tracebacks use only that test's summary reason. Full diagnostic files remain owned by the runner. |
 | `scripts/run-actionlint.py` | Provisions the pinned, checksum-verified actionlint release inside the scripts environment and validates every GitHub Actions workflow. |
 | `scripts/validate-repository.py` | Local validation coordinator; checks the running Python against `scripts/pyproject.toml`, runs workflow, repository lint and type checks, and captures first-failure evidence. Tests run separately through `scripts/testing/run-tests.py`. |
 | `skills/ceratops-repo-lifecycle/references/templates/deploy-skills.py.tmpl` | Authoritative standalone installer copied into compatible skill repositories as `scripts/deploy-skills.py`; invoke it through uv using the scripts project. |
-| `skills/ceratops-repo-lifecycle/references/templates/run-tests.py.tmpl` | Standard Python runner with a caller-selected immutable test-result interface, exact successful-result reuse and direct final writes. Its compatibility probe uses the same result lifecycle without executing the repository's tests. |
+| `skills/ceratops-repo-lifecycle/references/templates/run-tests.py.tmpl` | Standard Python runner with a caller-selected immutable test-result interface, exact successful-result reuse and direct final writes. Its compatibility probe uses its own command identity and result directory, without executing repository tests or inheriting another operation's check inputs. |
 | `skills/ceratops-repo-lifecycle/references/contracts/repository-validation-contract.json` | Schema-validated repository checks used by compatibility generation and included in repository contract review and validator discovery. |
 | `skills/ceratops-repo-lifecycle/references/contracts/ceratops-compatibility-*-contract.json` | Internal structural contract consumed by compatibility generation/checking, plus a behavioral review rubric for environment setup, tests, and lifecycle orchestration; no external source registry. |
 | `skills/ceratops-repo-lifecycle/references/templates/validate-repository.py.tmpl`, `validate.yml.tmpl`, and `run-actionlint.py.tmpl` | Repository-neutral validation templates created only when their target files are absent; new validation setups receive a pinned, checksum-verified actionlint runner, and setups without JavaScript package-manager files also receive locked Markdown dependencies and default rules. Existing tooling, Markdown settings, and exclusive validators are preserved. |
@@ -679,8 +688,10 @@ into repository and skill lifecycle runtimes. It finds one shared lock at
 `<git-common-dir>/ceratops/locks/release-local` from any repository worktree,
 without requiring a remote. The pinned library's `lock_descriptor` function uses
 native Windows/Linux locking without truncating the file or falling back to a
-file-existence lock. A competing caller gets an
-immediate busy result; the owning operation has no 30-second time limit.
+file-existence lock. Promotion and Ship wait up to 60 seconds for another holder,
+using a monotonic deadline inside Python. After acquisition they run their normal
+preconditions against the current repository. Other callers still try once.
+The waiting limit does not limit the duration of the operation holding the lock.
 
 The retained lock file stores one Boolean, `unfinished_run`: its first byte
 is `1` during work and `0` after explicit clean completion. Before allowing
@@ -692,8 +703,15 @@ or unknown command shutdown leaves uncertainty. A later caller must acquire
 the native
 lock and explicitly confirm that the previous commands stopped before retrying.
 Confirmation cannot bypass a busy lock or a caller-known running command.
-The helper neither launches nor discovers processes. It creates no temporary
-flag file, operation record, PID registry, background service or OS process group.
+The helper does not manage processes or infer recovery from a process exit.
+Its sibling `release-local.owner.json` reports the current operation, PID and
+process creation time, operation start time and optional `CODEX_THREAD_ID`.
+The helper atomically replaces that one diagnostic using
+`.release-local.owner.json.in_process`, then removes both before unlocking.
+Startup under the native lock removes leftovers. Timeout results include the
+elapsed wait and owner only when the process identity and lock holding interval
+still match; otherwise they say `owner unknown`. These details never clear the
+unfinished flag or permit skipping work. No background service is involved.
 Keep this one fixed-size lock file outside checkpoint cleanup.
 
 2B connects promotion, Ship, release synchronization, release PR preparation and
@@ -709,8 +727,9 @@ Synchronization and PR preparation also take it when they can change the primary
 checkout, even while it is on `main`: promotion may switch that checkout to
 `release/local`. Commands confined to other non-release worktrees stay unlocked.
 
-A competing release command fails immediately without merging, testing or saving
-promotion checkpoints. An uncertain exit leaves the flag set. After establishing
+A waiting promotion or Ship performs no candidate work. On timeout its existing
+command result reports `Release busy`, owner details and elapsed seconds.
+An uncertain exit leaves the flag set. After establishing
 that the previous commands stopped, repeat the same command with
 `--confirm-previous-commands-stopped`; this cannot override a busy lock.
 Commands must remain foreground commands, including their workers: a command
@@ -832,7 +851,7 @@ serialize commands.
 | 1e.2 skill-change generations | Implemented immutable approvals, states and check results, five descriptive commands, interrupted-write recovery and completion cleanup; new committed receipts use `build_receipt.json` | 2B protects direct-release changes; historical committed receipts retain their recorded names |
 | 1e.3/6A test-result contract | Implemented generated-runner contract, compatibility probe and standalone repository-runner adoption | 6B–6E connect result ownership, retention and affected-check orchestration |
 | Completed-build consumption | Implemented internal v2 reader; recorded acceptance and exact stored paths survive current test/input changes | Connect public receipt-based Deploy in later steps |
-| 2A release-lock helper | Implemented internally in `fb6863c`: canonical release lock, immediate busy refusal, nested ownership and durable unfinished-run flag; Windows checks passed, Linux execution unverified | 3A/3B/4A–4E are implemented; optional automatic process cleanup remains deferred |
+| 2A release-lock helper | Native release lock, nested ownership and durable unfinished-run flag; promotion/Ship now wait up to 60 seconds and report the current owner, while other callers retain immediate refusal | Windows checks passed; Linux execution and optional automatic process cleanup remain separate |
 | 2B Git separation and release writers | Shared `git_branch_operations.py`; promotion, Ship, release sync, PR preparation and fast-change use the native release lock | Implemented, locally promoted and deployed with 3A–3C/4A–4E |
 | 3A direct Ship calls and stopped-attempt release | One callable Ship implementation, external-command-only JSON helper and exception-safe clean lock exits; model corrections run unlocked | Standalone installers and fast-change share command-stop tracking; optional process supervision remains deferred |
 | 3B/4B failure reports and cleanup | Caller-selected paths, complete redacted diagnostics and successful-result references; actual command/check/delivery successes remove matching failures without repeating accepted work | 6E/20C/21 connect child-report and abandonment/removal cleanup |
@@ -1050,7 +1069,7 @@ source when applicable. Paths to sources resolve from the working directory.
 Context sources require history and selected rule IDs; the helper captures their
 current rule text. Targets require exact replacements, with null history only
 when none exists. The existing preparation checks validate histories, exact
-matches, source integrity and skill-owned Markdown policy; TOML is parsed
+matches, source integrity and skill-owned Markdown policy; JSON and TOML are parsed
 without reformatting. The constructor never changes governed sources, including
 when mutation is authorized.
 
@@ -1410,12 +1429,11 @@ environment setup. Remove that declaration or set `managed = false` before
 customizing. Unmarked existing scripts remain untouched. The generated script
 uses the scripts project, owns its disposable pytest directories, and streams
 pytest's failure details directly.
-Invoke Python entrypoints with
-`uv run --locked <path-to-script.py>`; uv discovers their project from the
-script location and prepares its environment before execution. Use an
-absolute script path when calling from outside the repository. Module
-commands select the project with `--project scripts`. Repository scripts
-contain no environment bootstrap or package-installation logic. Existing
+From the repository root, invoke Python entrypoints with
+`uv run --project scripts --locked python <path-to-script.py>`. From elsewhere,
+give `--project` the repository's absolute `scripts` path. uv prepares
+`scripts/.venv`; Python subprocesses use `sys.executable` to stay in that
+environment. Repository check scripts contain no package-installation logic. Existing
 test implementations and non-Python test commands remain repository-owned.
 
 The lifecycle runner invokes the declared repository validation and test
@@ -1428,7 +1446,7 @@ The validator owns validation checks and reporting. The test runner owns test
 execution and result recording. The 1e.3 standard runner accepts:
 
 ```text
-uv run --locked scripts/run-tests.py [TEST_TARGET ...] --result-file RESULT --result-id RESULT_ID --candidate-id CANDIDATE_ID --check-id CHECK_ID --check-version CHECK_VERSION
+uv run --project scripts --locked python scripts/run-tests.py [TEST_TARGET ...] --result-file RESULT --result-id RESULT_ID --candidate-id CANDIDATE_ID --check-id CHECK_ID --check-version CHECK_VERSION
 ```
 
 The caller chooses the final `RESULT` path and binds the four nonempty identities
@@ -1508,6 +1526,53 @@ After matching requested checks succeed, their failure report is removed only
 after outcomes are saved. A fresh call can finish interrupted report deletion
 using that success. Reports for different requested checks remain untouched.
 
+Generated Python runners receive `scripts/testing/select_test_groups.py` and
+`scripts/testing/reuse_test_results.py` from the corresponding repo-lifecycle
+templates. Ceratops uses those same support files. A repository's existing
+`tests/test-impact.json` supplies test dependencies; without that map the generated
+runner executes tests but cannot reuse individual passes. A custom runner stays
+custom; `[tool.ceratops.test-support] managed = true` opts its support files into
+generation. Compatibility checks require the declared support to be present.
+
+SDLC v5 actions may declare `check-groups`, keyed by the repository runner's group
+names. Every group has `phase` (`before-build`, `during-build` or `after-build`)
+and `requires-artifacts` (deliverable references). Before-build groups have no
+artifact requirements; after-build groups name at least one. During-build groups
+belong to the build command, which returns their actual successful check records.
+Independent source checks finish before builds. Selected build prerequisites run
+first, failed prerequisites block their dependents, and joint tests wait for all
+their selected files. The executor supplies `--check-group` and `--artifacts`
+JSON to test commands and `CERATOPS_TEST_ARTIFACTS` to their children. File paths
+and byte hashes become reuse inputs; no installed version is selected implicitly.
+SDLC v4/v5 build actions can require a v1, v2 or v3 result. Build receipts
+supply every produced file: v1 paths are repository-relative,
+v2 paths belong to their recorded shared build bundle, and v3 paths belong to
+their allocated version/target directory. Missing or changed files block only
+dependent work; dependent builds receive their selected files in the same
+environment mapping as tests.
+
+Test errors are saved in `.build/test-diagnostics/pytest-failure.json` or the
+caller-selected diagnostic path. Repeated errors replace that request's current
+details; shared output is stored once per diagnostic, rather than copied into
+every failed test entry. The runner deletes its managed report after newer
+passes resolve every reported failure. Fixing only A keeps a report that still
+contains B. At startup it finishes missed deletion from saved outcomes, without
+rerunning tests. Caller-retained reports outside managed storage stay untouched.
+Lifecycle commands separately retire their own operation reports after consuming
+successful command results. Neither cleanup deletes `check_results.json`.
+
+The compatibility review `ND.COMPATIBILITY.TEST_RESULT_REUSE` checks observed
+reuse and interruption behavior. It accepts different storage formats and asks
+what completed work a repository loses if it can reuse only a whole run.
+
+The internal `repository_operation.execute_worktree_build()` prepares and commits
+selected source paths, binds that source commit, runs declared checks/build/tests,
+and calls the existing receipt writer. It returns the completed receipt commit
+and tag. Unrelated staged or unstaged changes stay untouched. A fresh call can
+finish a missing receipt commit, tag or scoped cleanup without rebuilding ready
+targets; failed checks create no completed receipt or tag. The public Build
+command's later adoption remains separate.
+
 Repository scripts own their output paths and Git ignore rules. Saved results
 are local working data and do not authorize deployment. Deployment retains its
 immediate destination checks and producer-specific completion result.
@@ -1516,7 +1581,8 @@ This source repository uses `scripts/pyproject.toml` and `scripts/uv.lock` for
 its maintenance scripts, Python tests, and Ruff and mypy settings. Its SDLC v4
 contract runs validation and tests separately.
 CI uses the local composite action in this checkout, preserving PR test selection;
-local and push gates run the full test suite. Other repositories use the same
+local and push gates cover the required tests while reusing applicable passes.
+Other repositories use the same
 skill-owned action pinned to a published commit.
 
 Repository-wide Markdown and YAML lint settings live in
@@ -1532,8 +1598,15 @@ explicitly.
 ## Shared Skill Python Environment
 
 The sole dependency declarations for managed skill helpers are
-`skills/sections/python/pyproject.toml` and `uv.lock` in the source repository.
-Dependabot maintains this lock independently of repository tooling.
+`scripts/pyproject.toml` and `scripts/uv.lock` in the source repository.
+Shared helper libraries belong in `project.dependencies`; repository-only tools
+belong in `dependency-groups.dev`. Add a helper library once to the former and
+run `uv lock --project scripts`: both repository commands and the next managed
+installation use that declaration. Dependabot maintains this common project.
+The independently packaged products in `tools/` and
+`mcp-servers/ceratops_mcp_server_manager/` are uv workspace members. Their native
+metadata still owns each product's name, version, requirements and entry points;
+the common lock resolves them without separate development environments.
 Compatibility setup requires repositories with Python helper skills to supply
 their own project and lock at these paths. It reports missing files before
 changing the repository and does not copy Ceratops dependencies. Deployment
@@ -1556,8 +1629,11 @@ The command preserves the caller's working directory and the helper's output
 and exit status. Repository uv commands select their own projects because the
 deployment-only `UV_PROJECT_ENVIRONMENT` override is not forwarded.
 Deployment checks an existing version without modifying it; if it is damaged
-or the source lock changes, deployment builds a new version and pins newly
-installed skills to it. Running helpers retain their original environment.
+or its resolved runtime dependencies change, deployment builds a new version and
+pins newly
+installed skills to it. A development-tool or unrelated workspace dependency
+change does not change the installed skill runtime's identity. Running helpers
+retain their original environment.
 Old versions remain until an idle cleanup. External MCP servers retain their own
 installer-managed environments.
 
@@ -1574,11 +1650,11 @@ the interpreter when needed, and prepares `scripts/.venv` from `scripts/uv.lock`
 Run the repository installer with that locked project:
 
 ```powershell
-uv run --locked scripts/deploy-skills.py
+uv run --project scripts --locked python scripts/deploy-skills.py
 ```
 
-The deployed skills' separate project includes timezone data for date-based
-helpers on Windows. The standalone installer uses the scripts environment and
+The common project includes timezone data for installed date-based helpers on
+Windows. The standalone installer uses the scripts environment and
 never calls installed lifecycle code. It
 renders the selected batch in a hidden staging directory and copies its files
 over existing installations without source or staged-content validation.
@@ -1623,7 +1699,7 @@ evidence need redeployment if their recorded checkout is gone.
 For another Ceratops-compatible repo, run its versioned repository installer:
 
 ```powershell
-uv run --locked <target-repo>/scripts/deploy-skills.py --repo-root <target-repo>
+uv run --project <target-repo>/scripts --locked python <target-repo>/scripts/deploy-skills.py --repo-root <target-repo>
 ```
 
 An external repository's standalone installer is independent: it uses the
@@ -1765,12 +1841,13 @@ explicit test runner used by CI:
 ```powershell
 npm --prefix scripts ci
 $validationEvidence = Join-Path $env:TEMP "repository-validation.log"
-uv run --locked scripts/validate-repository.py --evidence-file $validationEvidence
-uv run --locked scripts/testing/run-tests.py --all
+uv run --project scripts --locked python scripts/validate-repository.py --evidence-file $validationEvidence
+uv run --project scripts --locked python scripts/testing/run-tests.py --all
 ```
 
 CI runs `uv sync --project scripts --locked`; local commands use
-`uv run --locked <script.py>`. In both cases uv selects Python from
+`uv run --project scripts --locked python <script.py>`.
+uv selects and maintains `scripts/.venv`. In both cases uv selects Python from
 `scripts/pyproject.toml` and synchronizes its locked dependencies before
 execution. The validator checks the selected interpreter against the project's
 requirement before repository checks; mypy uses that interpreter. Ruff and mypy
@@ -1798,9 +1875,9 @@ from pytest's environment so nested runner calls cannot inherit it.
 Promotion checks the assembled release commit before requested deployment;
 shipping repeats the applicable checks before remote mutation.
 Run an individual case with
-`uv run --locked scripts/testing/run-tests.py tests/path.py::test_name`.
+`uv run --project scripts --locked python scripts/testing/run-tests.py tests/path.py::test_name`.
 Local uncommitted selection is explicit
-through `uv run --locked scripts/testing/run-tests.py --worktree`.
+through `uv run --project scripts --locked python scripts/testing/run-tests.py --worktree`.
 The runner's internal `scripts/testing/runner_requests.py` module owns argument
 validation and the explicitly requested GitHub context selection.
 Add `--select-only` to either diff or worktree mode to validate the same mapping
@@ -1817,7 +1894,7 @@ keep their existing validation discovery. A base branch that advances after
 this check is still evaluated by GitHub CI.
 Manifest validation
 is available through
-`uv run --locked scripts/testing/run-tests.py --validate-manifest`.
+`uv run --project scripts --locked python scripts/testing/run-tests.py --validate-manifest`.
 The validator does not invoke skill-local validators. Generic compatibility and
 health validate lifecycle definitions through the repository-lifecycle
 `ceratops_repo_compatibility_engine.sdlc_contract_validation` module. Runtime
@@ -1848,8 +1925,8 @@ reconcile it after moving tests:
 
 ```powershell
 $collection = Join-Path $env:TEMP "pytest-collection.json"
-uv run --locked scripts/testing/run-tests.py --write-collection $collection
-uv run --locked scripts/testing/run-tests.py --reconcile-collection $collection
+uv run --project scripts --locked python scripts/testing/run-tests.py --write-collection $collection
+uv run --project scripts --locked python scripts/testing/run-tests.py --reconcile-collection $collection
 ```
 
 Reconciliation preserves complete pytest identities, including parameter IDs,

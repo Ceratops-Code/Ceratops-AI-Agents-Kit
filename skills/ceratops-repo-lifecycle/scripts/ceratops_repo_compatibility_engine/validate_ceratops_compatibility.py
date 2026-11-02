@@ -413,6 +413,8 @@ def validate_ceratops_compatibility(
 
     errors: list[str] = []
     python_tests = discover_python_tests(root, contract["python_test_detection"])
+    from .generate_test_script import generated_support_errors
+    errors.extend(generated_support_errors(root, contract))
     errors.extend(repository_configuration_errors(root, contract))
     sdlc: Mapping[str, Any] | None = None
     sdlc_errors: list[str] = []
@@ -512,10 +514,16 @@ def probe_test_results(root: pathlib.Path, command: list[str], result_directory:
     if not command or any(not isinstance(item, str) or not item or "\0" in item for item in command):
         return ["test-result runner must be a nonempty argv"]
 
+    # A controlled probe has its own identity and output. Outer promotion inputs
+    # describe another repository check and must not leak into this child.
+    environment = dict(os.environ)
+    for name in ("CERATOPS_REPOSITORY_CHECK_CONTEXT", "CERATOPS_SDLC_TEST_CONTEXT"):
+        environment.pop(name, None)
+
     def invoke(arguments: list[str]) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [*command, *arguments], cwd=root, capture_output=True, text=True,
-            check=False, timeout=30,
+            check=False, timeout=30, env=environment,
         )
 
     def require(condition: bool, message: str) -> None:
@@ -568,7 +576,15 @@ def probe_test_results(root: pathlib.Path, command: list[str], result_directory:
                 return int(counter.read_text()) if counter.is_file() else 0
 
             path, args, expected = request("success")
-            require(invoke(args).returncode == 0, "runner did not complete the controlled check")
+            completed = invoke(args)
+            details = json.dumps({"operation": "test-result contract probe", "target": str(root),
+                "command": completed.args, "python_runtime": sys.executable, "cwd": str(root),
+                "exit_status": completed.returncode, "stdout": completed.stdout or "<empty>",
+                "stderr": completed.stderr or "<empty>"})
+            for name, value in os.environ.items():
+                if len(value) >= 4 and any(part in name.upper() for part in ("TOKEN", "PASSWORD", "SECRET", "API_KEY")):
+                    details = details.replace(value, "<redacted>")
+            require(completed.returncode == 0, "runner did not complete the controlled check: " + details)
             accepted = path.read_bytes()
             require(accepted == encoded(expected) and count() == 1, "runner did not write canonical final acceptance")
             modified = path.stat().st_mtime_ns

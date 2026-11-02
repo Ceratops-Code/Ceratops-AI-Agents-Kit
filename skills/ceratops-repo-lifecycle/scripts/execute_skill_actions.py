@@ -31,7 +31,7 @@ from store_artifacts import OperationError
 def _call_action(root: pathlib.Path, declaration: Mapping[str, Any], arguments: list[str]) -> Any:
     """Call an explicitly declared Python entry point; never infer one from argv.
 
-    The installed action declaration authorizes this source before dispatch.
+    Only the installed action declaration selects executable code.
     Its existing CLI parser and request type retain argument handling. Keeping
     the call in this process lets an installer share its caller's release lock.
     """
@@ -129,8 +129,18 @@ def _mcp_package_arguments(
         if len(wheels) != 1:
             build = package.get("action-locations", {}).get("build", "the declared package build action")
             raise ValueError(f"Package {name} needs exactly one existing {version} wheel in {directory}; use {build}")
-        locks = [project_path.parent / filename for filename in ("uv.lock", "pylock.toml")
-                 if (project_path.parent / filename).exists()]
+        lock_root = project_path.parent
+        # Native package metadata may select the repository's shared uv project.
+        # Resolve metadata only; no executable code comes from the checkout.
+        declaration = tomllib.loads(project_path.read_text(encoding="utf-8"))
+        dependency_project = declaration.get("tool", {}).get("ceratops", {}).get("dependency-project")
+        if dependency_project is not None:
+            if not isinstance(dependency_project, str) or pathlib.Path(dependency_project).is_absolute():
+                raise ValueError(f"Package {name} needs a relative dependency-project")
+            directory = (lock_root / dependency_project).resolve()
+            lock_root = owned_path(str(directory.relative_to(root)))
+        locks = [lock_root / filename for filename in ("uv.lock", "pylock.toml")
+                 if (lock_root / filename).exists()]
         if len(locks) != 1:
             raise ValueError(f"Package {name} needs exactly one canonical uv.lock or pylock.toml")
         lock = owned_path(str(locks[0].relative_to(root)))
@@ -159,9 +169,9 @@ def execute_handoff(
 ) -> dict[str, object]:
     """Execute an installed-authorized skill action in its declared order.
 
-    SDLC names only a skill and action. The installed binding authorizes an
-    identical source binding when one exists; CI callers never invoke this
-    function. Installed Python steps use their pinned immutable runtime.
+    SDLC names only a skill and action. The installed binding selects its own
+    executable; the checkout supplies input data only. CI callers never invoke
+    this function. Python steps use the installed skill's pinned runtime.
     Skill selection chooses the binding's explicit selected-skill form; no
     script filename or argument convention determines either selected form.
     Unknown inputs and malformed selected commands
@@ -256,37 +266,6 @@ def execute_handoff(
         }
     root = installed_root
     binding = installed_binding
-    uses_source_bundle = False
-    source_root = repo_root / "skills" / skill
-    source_binding = source_root / "references" / "action-executors.json"
-    if source_binding.exists():
-        if (
-            source_root.is_symlink()
-            or source_binding.is_symlink()
-            or not source_binding.is_file()
-        ):
-            return {
-                "status": "handoff_required",
-                "handoff": route,
-                "message": "Source skill executor binding is unsafe.",
-            }
-        try:
-            declarations_match = source_binding.read_bytes() == installed_binding.read_bytes()
-        except OSError as exc:
-            return {
-                "status": "operation_failed",
-                "handoff": route,
-                "message": str(exc),
-            }
-        if not declarations_match:
-            return {
-                "status": "handoff_required",
-                "handoff": route,
-                "message": "Source skill executor binding differs from the installed authorization.",
-            }
-        root = source_root
-        binding = source_binding
-        uses_source_bundle = True
     completed: list[int] = []
     receipts: list[dict[str, object]] = []
     evidence: dict[str, object] = {"handoff": route, "steps": completed}
@@ -341,11 +320,12 @@ def execute_handoff(
                     or relative.suffix != ".py" or path.is_symlink() or not path.is_file()
                     or not path.resolve().is_relative_to(root.resolve())):
                 raise ValueError("Python action must name a file inside its skill")
-            if not uses_source_bundle:
-                metadata = installed_root / ".runtime-manifest.json"
-                manifest = json.loads(metadata.read_text(encoding="utf-8"))
-                if pathlib.Path(manifest["python_runtime"]).resolve() != pathlib.Path(sys.executable).resolve():
-                    raise ValueError("Python action requires the caller to use its pinned runtime")
+            metadata = installed_root / ".runtime-manifest.json"
+            if metadata.is_symlink() or not metadata.is_file():
+                raise ValueError("Python action requires an installed runtime manifest")
+            manifest = json.loads(metadata.read_text(encoding="utf-8"))
+            if pathlib.Path(manifest["python_runtime"]).resolve() != pathlib.Path(sys.executable).resolve():
+                raise ValueError("Python action requires the caller to use its pinned runtime")
             steps = [{"run": call["args"]}]
         else:
             steps = [{"run": entry["run"]}] if "run" in entry else entry["steps"]
@@ -386,7 +366,7 @@ def execute_handoff(
                 for token, value in values.items():
                     argument = argument.replace(token, value)
                 argv.append(argument)
-            if call is None and step["run"][0] == "{python}" and not uses_source_bundle:
+            if call is None and step["run"][0] == "{python}":
                 uv = shutil.which("uv")
                 metadata = installed_root / ".runtime-manifest.json"
                 if metadata.is_symlink() or not metadata.is_file() or uv is None:

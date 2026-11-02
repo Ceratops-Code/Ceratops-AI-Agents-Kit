@@ -11,19 +11,25 @@ Never remove, replace or truncate it, including during checkpoint cleanup.
 from __future__ import annotations
 
 import json
+import math
 import os
 import pathlib
 import re
 import stat
 import subprocess
+import sys
 import threading
+import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
 from filelock import lock_descriptor, unlock_descriptor
+from psutil import Error as ProcessError
+from psutil import Process
 
 _ACTIVE = threading.local()
 
@@ -138,7 +144,10 @@ def command_failure_details(
 
 
 @contextmanager
-def hold_write_attempt(path: pathlib.Path, *, confirm_previous_commands_stopped: bool = False):
+def hold_write_attempt(
+    path: pathlib.Path, *, confirm_previous_commands_stopped: bool = False,
+    operation: str = "write operation", wait_seconds: float = 0,
+):
     """Release a finished attempt even on failure; preserve unknown command stops.
 
     Nested Python workflows share the same in-memory command observation. This
@@ -152,6 +161,7 @@ def hold_write_attempt(path: pathlib.Path, *, confirm_previous_commands_stopped:
     with hold_write_lock(
         path, confirm_previous_commands_stopped=confirm_previous_commands_stopped,
         commands_running=None if nested else completion.unfinished,
+        operation=operation, wait_seconds=wait_seconds,
     ) as owned:
         token = _COMMAND_COMPLETION.set(completion)
         operation_error = None
@@ -180,6 +190,117 @@ class WriteLockError(RuntimeError):
 
 class WriteLockBusy(WriteLockError):
     """Another caller holds the lock; this operation did not start."""
+
+    def __init__(self, path: pathlib.Path, waited_seconds: float, owner: dict[str, Any] | None):
+        self.waited_seconds = waited_seconds
+        self.owner = owner
+        description = "owner unknown"
+        if owner is not None:
+            chat = f" in chat {owner['thread_id']}" if owner.get("thread_id") else ""
+            description = f"{owner['operation']}{chat}, PID {owner['pid']}"
+        super().__init__(f"Write lock busy: {description}; waited {waited_seconds:.2f} seconds: {path}")
+
+
+def _owner_paths(path: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
+    """One current diagnostic and one replace-in-progress file, never history."""
+    owner = path.with_name(path.name + ".owner.json")
+    return owner, owner.with_name("." + owner.name + ".in_process")
+
+
+def _lock_stamp(path: pathlib.Path) -> list[int]:
+    value = path.stat()
+    return [value.st_dev, value.st_ino, value.st_mtime_ns]
+
+
+def _advance_owner_stamp(path: pathlib.Path) -> None:
+    """Make old diagnostics inapplicable without changing the lock or flag.
+
+    The modification stamp identifies a particular holding interval; it is not
+    a heartbeat, age limit or permission to recover. Also advance it before
+    release, so a failed sidecar deletion cannot identify a later holder.
+    """
+    before = path.stat()
+    os.utime(path, ns=(before.st_atime_ns, max(time.time_ns(), before.st_mtime_ns + 1)))
+    if path.stat().st_mtime_ns <= before.st_mtime_ns:
+        # Coarse clocks and clock rollback must never revive an older diagnostic.
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
+
+
+def _remove_owner_record(path: pathlib.Path) -> None:
+    for item in _owner_paths(path):
+        item.unlink(missing_ok=True)
+
+
+def _publish_owner_record(path: pathlib.Path, operation: str) -> None:
+    owner, preparing = _owner_paths(path)
+    try:
+        created = Process().create_time()
+    except (ProcessError, OSError):
+        created = None  # Native locking works even when process inspection does not.
+    payload = {
+        "operation": operation, "pid": os.getpid(), "process_started": created,
+        "started_at": datetime.now(UTC).isoformat(),
+        "thread_id": os.environ.get("CODEX_THREAD_ID") or None,
+        "lock_stamp": _lock_stamp(path),
+    }
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    with os.fdopen(os.open(preparing, flags, 0o600), "w", encoding="utf-8") as output:
+        json.dump(payload, output, separators=(",", ":"))
+        output.flush()
+        os.fsync(output.fileno())
+    os.replace(preparing, owner)
+
+
+def _read_current_owner(path: pathlib.Path) -> dict[str, Any] | None:
+    """A stable diagnostic snapshot, never an ownership or recovery decision."""
+    owner, _ = _owner_paths(path)
+    try:
+        if owner.is_symlink() or owner.stat().st_size > 16_384:
+            return None
+        raw = owner.read_bytes()
+        record = json.loads(raw)
+        if not isinstance(record, dict) or record.get("lock_stamp") != _lock_stamp(path):
+            return None
+        if (type(record.get("pid")) is not int or record["pid"] <= 0
+                or not isinstance(record.get("process_started"), (int, float))
+                or not isinstance(record.get("operation"), str) or not record["operation"]
+                or not isinstance(record.get("started_at"), str)
+                or not (record.get("thread_id") is None or isinstance(record["thread_id"], str))):
+            return None
+        process = Process(record["pid"])
+        if process.create_time() != record["process_started"] or not process.is_running():
+            return None
+        if raw != owner.read_bytes() or record["lock_stamp"] != _lock_stamp(path):
+            return None  # A handoff happened during inspection.
+        return {key: record[key] for key in ("operation", "pid", "process_started", "started_at", "thread_id")}
+    except (OSError, ValueError, TypeError, ProcessError):
+        return None
+
+
+def _acquire_with_wait(descriptor: int, path: pathlib.Path, seconds: float) -> None:
+    """Poll only the native lock, with one monotonic deadline and no work started."""
+    started = time.monotonic()
+    deadline = started + seconds
+    while True:
+        if lock_descriptor(descriptor, blocking=False):
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            try:
+                stamp = _lock_stamp(path)
+            except OSError:
+                stamp = None
+            owner = _read_current_owner(path)
+            # Finish a handoff that occurred during the diagnostic read.
+            if lock_descriptor(descriptor, blocking=False):
+                return
+            try:
+                if stamp != _lock_stamp(path):
+                    owner = None  # A different holder won the final acquisition.
+            except OSError:
+                owner = None
+            raise WriteLockBusy(path, time.monotonic() - started, owner)
+        time.sleep(min(0.2, remaining))
 
 
 class WriteLockRecoveryRequired(WriteLockError):
@@ -266,7 +387,7 @@ def hold_release_source(repo_root: pathlib.Path) -> Iterator[WriteLockContext | 
         if branch.stdout.strip() != "release/local":
             yield None
             return
-    with hold_write_attempt(path) as owned:
+    with hold_write_attempt(path, operation="installation source") as owned:
         yield owned
 
 
@@ -339,21 +460,27 @@ def hold_write_lock(
     *,
     confirm_previous_commands_stopped: bool = False,
     commands_running: Callable[[], bool] | None = None,
+    operation: str = "write operation",
+    wait_seconds: float = 0,
 ) -> Iterator[WriteLockContext]:
-    """Try once, mark unfinished before yielding, and retain uncertainty on exit.
+    """Acquire, mark unfinished before yielding, and retain uncertainty on exit.
 
-    The caller passes ``release_lock_path(repo_root)``; future installers may
+    Waiting is opt-in; existing unrelated callers still try once. The caller
+    passes ``release_lock_path(repo_root)``; future installers may
     pass their canonical destination lock instead. Same-thread nesting reuses
     ownership. Other threads/processes must acquire the native lock themselves.
 
     Confirmation is an explicit caller decision, never inferred from lock
     availability or process/worktree disappearance. ``commands_running`` is an
     optional caller-owned query for commands it knows about; a positive result
-    blocks recovery even with confirmation. The helper discovers no processes.
+    blocks recovery even with confirmation. Process inspection supplies timeout
+    diagnostics only and never establishes that previous writing commands stopped.
     Without ``complete(commands_stopped=True)``, normal return also leaves the
     flag set. Workflows finish their local commands and report that fact before
     returning a failure or a question to the model; model edits run unlocked.
     """
+    if not math.isfinite(wait_seconds) or wait_seconds < 0:
+        raise ValueError("Lock waiting seconds must be finite and nonnegative.")
     supplied = pathlib.Path(path).absolute()
     # Resolve parent aliases, not a redirected lock file. The opened descriptor
     # must still name this exact regular file after acquisition.
@@ -374,6 +501,7 @@ def hold_write_lock(
 
     descriptor: int | None = None
     held = False
+    owned_path = False
     owner_pid = os.getpid()
     operation_error: BaseException | None = None
     try:
@@ -385,9 +513,8 @@ def hold_write_lock(
             # os.open is synchronous and non-inheritable; never request O_TRUNC.
             flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
             descriptor = os.open(canonical, flags, 0o600)
-            held = lock_descriptor(descriptor, blocking=False)
-            if not held:
-                raise WriteLockBusy(f"Write lock is busy; operation did not start: {canonical}")
+            _acquire_with_wait(descriptor, canonical, wait_seconds)
+            held = True
             opened, named = os.fstat(descriptor), canonical.lstat()
             if (
                 not stat.S_ISREG(named.st_mode)
@@ -396,6 +523,9 @@ def hold_write_lock(
                 or not os.path.samestat(opened, named)
             ):
                 raise WriteLockError(f"Lock path must name its own regular file: {canonical}")
+            owned_path = True
+            _advance_owner_stamp(canonical)
+            _remove_owner_record(canonical)
             unfinished = _read_unfinished(descriptor)
             if commands_running is not None and commands_running():
                 raise WriteLockRecoveryRequired(f"Known writing commands are still running: {canonical}")
@@ -405,6 +535,7 @@ def hold_write_lock(
                     "Confirm its commands have stopped before retrying."
                 )
             _save_unfinished(descriptor, True)
+            _publish_owner_record(canonical, operation)
         except OSError as exc:
             raise WriteLockError(f"Cannot acquire or save write lock: {canonical}: {exc}") from exc
 
@@ -441,6 +572,17 @@ def hold_write_lock(
         finally:
             active.pop(canonical, None)
             try:
+                if owned_path and os.getpid() == owner_pid:
+                    try:
+                        _advance_owner_stamp(canonical)
+                    finally:
+                        _remove_owner_record(canonical)
+            except BaseException as cleanup_error:
+                if operation_error is None:
+                    operation_error = cleanup_error
+                else:
+                    attach_cleanup_failure(operation_error, cleanup_error)
+            try:
                 # Explicit unlock in a forked child would unlock the parent's
                 # shared OS description. Close only the child's duplicate.
                 if descriptor is not None:
@@ -462,3 +604,5 @@ def hold_write_lock(
                 if operation_error is None:
                     raise
                 attach_cleanup_failure(operation_error, cleanup_error)
+            if operation_error is not None and sys.exc_info()[0] is None:
+                raise operation_error

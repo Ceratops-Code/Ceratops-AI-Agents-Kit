@@ -336,6 +336,43 @@ def _recorded_build_path(
     return path
 
 
+def build_result_artifact_paths(
+    repo_root: pathlib.Path, receipt: Mapping[str, Any], reference: str,
+) -> dict[str, list[str]]:
+    """Return the exact files of a successful v1/v2/v3 build for phased checks.
+
+    Paths follow each receipt format's producer: v1 is repository-relative,
+    v2 uses its identity-keyed build bundle, and v3 uses its allocated version
+    and target directory. No latest-build or installed-package lookup occurs.
+    Byte checks protect integrity; recorded test acceptance is not repeated.
+    """
+    if receipt.get("status") != "passed":
+        return {}
+    schema = receipt.get("schema")
+    if schema == "ceratops-build-result.v1":
+        bundle, records = repo_root, [receipt["artifact"]]
+    elif schema == sdlc_results.BUILD_RECEIPT_SCHEMA:
+        identity = validated_build_selection(receipt["identity"])
+        bundle = _build_store_path(repo_root) / hashlib.sha256(canonical_json(identity)).hexdigest()
+        records = receipt["artifacts"]
+    elif schema == sdlc_results.COMMITTED_BUILD_RECEIPT_SCHEMA:
+        identity = receipt["identity"]
+        relative = f"{identity['releaseUnit']}/{identity['version']}"
+        if len(receipt["requiredTargets"]) > 1:
+            relative += f"/{identity['target']}"
+        bundle = _artifact_store_path(repo_root) / sdlc_results._bundle_relative_path(relative)
+        records = receipt["artifacts"]
+        if any(record["root"] != "store" for record in records):
+            raise OperationError("Built artifacts must name stored files.")
+    else:
+        return {}
+    selected: dict[str, list[str]] = {}
+    for record in records:
+        path = str(sdlc_results._verify_bundle_file(bundle, record))
+        selected.setdefault(reference, []).append(path)
+    return selected
+
+
 def read_completed_build(
     repo_root: pathlib.Path,
     *,
@@ -822,7 +859,7 @@ def _require_transaction_target(
 
 
 def _git_text(
-    repo_root: pathlib.Path, arguments: Sequence[str], *, label: str
+    repo_root: pathlib.Path, arguments: Sequence[str], *, label: str, single_line: bool = True
 ) -> str:
     completed = subprocess.run(
         ["git", "-C", str(repo_root), *arguments],
@@ -835,7 +872,7 @@ def _git_text(
         suffix = f": {detail}" if detail else ""
         raise OperationError(f"Git could not resolve {label}{suffix}"[:1024])
     value = completed.stdout.strip()
-    if not value or "\n" in value or "\r" in value:
+    if single_line and (not value or "\n" in value or "\r" in value):
         raise OperationError(f"Git returned an invalid {label}.")
     return value
 
@@ -1047,7 +1084,18 @@ def _read_reusable_allocation(
     checkpoint = record.get("preTestCommit")
     if checkpoint is None:
         if allocation.allocation_commit != allocated_at:
-            return None
+            # Source preparation can commit successfully before input binding is
+            # interrupted. Recognize that exact direct child, not an arbitrary
+            # later commit or a saved execution step.
+            head = allocation.allocation_commit
+            parents = _git_text(allocation.repo_root, ["rev-list", "--parents", "-n", "1", head], label="prepared source parents").split()
+            message = _git_text(allocation.repo_root, ["show", "-s", "--format=%B", head], label="prepared source identity", single_line=False)
+            trailer = f"Ceratops-Source-Build: {allocation.release_unit}/{allocation.version} {attempt}"
+            changed = _git_text(allocation.repo_root, ["diff-tree", "--no-commit-id", "--name-only", "-r", allocated_at, head], label="prepared source paths", single_line=False).splitlines()
+            if (parents != [head, allocated_at] or trailer not in message.splitlines()
+                    or not set(changed).issubset(allocation.declared_input_paths)
+                    or not _inputs_match_commit(allocation.repo_root, head, allocation.declared_input_paths)):
+                return None
         reused: ArtifactVersionAllocation = ArtifactVersionAllocation(**values)
     else:
         checkpoint = _validated_commit(allocation.repo_root, checkpoint)

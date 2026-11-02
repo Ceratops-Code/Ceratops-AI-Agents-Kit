@@ -230,7 +230,8 @@
     },
     "repository-compatibility": {
       "pytest": [
-        "tests/repository_lifecycle/test_compatibility.py"
+        "tests/repository_lifecycle/test_compatibility.py",
+        "tests/repository_lifecycle/test_generated_test_scripts.py"
       ],
       "depends_on": [],
       "packages": [
@@ -721,7 +722,8 @@
     },
     "skill-installation": {
       "pytest": [
-        "tests/skill_lifecycle/test_installation.py"
+        "tests/skill_lifecycle/test_installation.py",
+        "tests/skill_lifecycle/test_prepare_runtime.py"
       ],
       "depends_on": [],
       "packages": [
@@ -1094,7 +1096,8 @@
     },
     "sdlc-handoffs": {
       "pytest": [
-        "tests/repository_lifecycle/test_sdlc_handoffs.py"
+        "tests/repository_lifecycle/test_sdlc_handoffs.py",
+        "tests/repository_lifecycle/test_execute_skill_actions.py"
       ],
       "depends_on": [],
       "packages": [
@@ -1228,8 +1231,7 @@
         "hooks/bounded-source-search.py",
         "tools/source_search_mcp.py",
         "tools/pyproject.toml",
-        "tools/mcp-server.json",
-        "tools/uv.lock"
+        "tools/mcp-server.json"
       ],
       "suites": [
         "source-search"
@@ -1301,6 +1303,7 @@
         "skills/ceratops-repo-lifecycle/scripts/sdlc_results.py",
         "skills/ceratops-repo-lifecycle/scripts/store_artifacts.py",
         "skills/ceratops-repo-lifecycle/scripts/complete_artifact_builds.py",
+        "skills/ceratops-repo-lifecycle/scripts/execute_worktree_build.py",
         "skills/ceratops-repo-lifecycle/scripts/retain_artifact_versions.py",
         "skills/ceratops-repo-lifecycle/references/schemas/operation-result.v1.schema.json"
       ],
@@ -1544,7 +1547,9 @@
     {
       "id": "generated-test-script",
       "paths": [
-        "skills/ceratops-repo-lifecycle/references/templates/run-tests.py.tmpl"
+        "skills/ceratops-repo-lifecycle/references/templates/run-tests.py.tmpl",
+        "skills/ceratops-repo-lifecycle/references/templates/select_test_groups.py.tmpl",
+        "skills/ceratops-repo-lifecycle/references/templates/reuse_test_results.py.tmpl"
       ],
       "suites": [
         "repository-compatibility",
@@ -1803,24 +1808,6 @@
         "skill-lifecycle",
         "repository-compatibility",
         "github-contracts",
-        "skill-fast-change"
-      ]
-    },
-    {
-      "id": "shared-skill-python",
-      "paths": [
-        "skills/sections/python/**"
-      ],
-      "suites": [
-        "skill-installation",
-        "skill-lifecycle",
-        "repository-operations",
-        "repository-promotion",
-        "release-locking",
-        "repository-shipping",
-        "github-workflows",
-        "github-dependencies",
-        "sdlc-handoffs",
         "skill-fast-change"
       ]
     },

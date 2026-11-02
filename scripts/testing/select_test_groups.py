@@ -212,7 +212,13 @@ def _string_tuple(value: Any, field: str) -> tuple[str, ...]:
 def load_manifest(path: pathlib.Path) -> Manifest:
     """Parse the versioned manifest while rejecting duplicate JSON keys."""
 
-    data = load_json_object(path, "impact manifest")
+    return parse_manifest(load_json_object(path, "impact manifest"))
+
+
+def parse_manifest(data: Any) -> Manifest:
+    """Parse current or Git-recorded ownership using the same schema."""
+    if not isinstance(data, dict):
+        raise ImpactError("impact manifest must be a JSON object")
     if data.get("version") != MANIFEST_VERSION:
         raise ImpactError(f"impact manifest version must be {MANIFEST_VERSION}")
     raw_suites = data.get("suites")
@@ -482,9 +488,13 @@ def check_arguments(arguments: Iterable[str], root: pathlib.Path) -> list[str]:
 
 
 def selection_from_changes(
-    manifest: Manifest, changes: Iterable[ChangedFile]
+    manifest: Manifest, changes: Iterable[ChangedFile], *, previous_manifest: Manifest | None = None,
 ) -> Selection:
-    """Map current paths and fully validate deletions without retaining stale globs."""
+    """Use previous ownership for removed paths; current ownership for additions.
+
+    Previous ownership selects current checks, never grants result reuse. A
+    removed group needs an explicit current owner instead of guessing one.
+    """
 
     reasons: set[SelectionReason] = set()
     gaps: list[dict[str, str]] = []
@@ -497,6 +507,17 @@ def selection_from_changes(
                 and path_index == 0
                 and len(changed.paths) == 2
             )
+            if previous_manifest is not None and (changed.status == "D" or (renamed_source and not path.startswith("tests/"))):
+                previous = selection_from_changes(previous_manifest, (ChangedFile("M", (path,)),))
+                gaps.extend(previous.mapping_gaps)
+                ignored_paths.extend(previous.ignored)
+                full_suite |= previous.full_suite
+                for reason in previous.reasons:
+                    if reason.suite in manifest.suites:
+                        reasons.add(SelectionReason(reason.suite, path, "previous:" + reason.rule))
+                    else:
+                        gaps.append({"path": path, "reason": "previous test group has no current owner: " + reason.suite})
+                continue
             renamed_test_source = path.startswith("tests/") and renamed_source
             ownership_path = changed.paths[1] if renamed_test_source else path
             full_patterns = sorted(

@@ -72,7 +72,7 @@ test bodies and their implementation remain repository-specific.
 | Environment | Declarations | Execution and ownership |
 | --- | --- | --- |
 | Repository Python scripts and tests | `scripts/pyproject.toml` and `scripts/uv.lock` | uv selects the required Python and prepares ignored `scripts/.venv`; repository entrypoints use this project. |
-| Installed Ceratops skill helpers | Source-only declarations under `skills/sections/python` | Deployment prepares a versioned venv under `$CODEX_HOME/runtimes/ceratops/versions/`; each installed skill manifest pins its interpreter. After manifest activation, the owner retains the selected version plus two predecessors, deferring cleanup for manifest-pinned or running interpreters. Direct uv commands run helpers. |
+| Installed Ceratops skill helpers | Runtime dependencies from `scripts/pyproject.toml` and `scripts/uv.lock` | Deployment prepares a versioned venv under `$CODEX_HOME/runtimes/ceratops/versions/`; each installed skill manifest pins its interpreter. After manifest activation, the owner retains the selected version plus two predecessors, deferring cleanup for manifest-pinned or running interpreters. Direct uv commands run helpers. |
 | Installed external MCP servers | The selected server's declarations and installer | The MCP server manager owns the installed server environment, separately from the shared skill environment. |
 
 `skills/ceratops-skill-lifecycle/scripts/runtime/prepare_python_runtime.py` owns
@@ -103,7 +103,13 @@ the ZIP is missing, without substituting the selected branch's current tip.
 One environment does not need both requirements files and a pyproject dependency
 list. The thread selected pyproject plus its lockfile and removal of the root
 requirements files. In Ceratops-AI-Agents-Kit, `scripts/pyproject.toml` owns both
-Python tooling dependencies and Ruff and mypy settings. Node tooling manifests
+shared skill runtime dependencies, its development-only tool group, and Ruff
+and mypy settings. Native product pyprojects remain uv workspace members with
+their independent distribution metadata; the workspace uses one `scripts/uv.lock`.
+Managed runtime identity hashes only the exported runtime dependency graph and
+Python requirement, excluding development groups and unrelated workspace packages.
+Thus adding a tool does not replace an unchanged installed skill environment.
+Node tooling manifests
 and Markdown/YAML lint settings also live under `scripts`; generated diagnostic
 files live under the ignored `.build` directory.
 
@@ -121,7 +127,7 @@ An unsupported settings-output format or unavailable tool runtime blocks the
 check. Application Python requirements and acceptance of unchanged artifacts
 remain with their existing owners.
 Dependabot must address the directories containing the dependency projects,
-including `/scripts` and the separate shared skill project.
+with one Python project at `/scripts` and the Node project at `/scripts`.
 
 Dependabot preflight identifies updates from PR titles and collects dependency
 files from the exact PR head through Git's tree and blob readers. It fetches a
@@ -140,7 +146,8 @@ to 32 read-only workers. Each source retains its complete configured window and
 exact-head readiness checks. All workers stop before publication starts, and
 source failures remain scoped to their own PRs.
 
-Repository examples use `uv run --locked scripts/<entrypoint>.py`; source
+Repository examples use `uv run --project scripts --locked python
+scripts/<entrypoint>.py`; source
 helpers outside `scripts` use `uv run --project scripts --locked python ...`.
 The caller and uv prepare the environment. Individual scripts do not contain
 the removed `python_environment.py` self-installing bootstrap. A direct
@@ -155,6 +162,12 @@ places tests and other repository scripts under the same scripts project.
 SDLC here means the repository's lifecycle configuration in `sdlc/sdlc.yml`.
 An operation is an entry such as a deliverable's validation or local deployment
 command. A handoff names an installed skill and action that owns the next step.
+`execute_skill_actions.py` reads that installed skill's action declaration and
+uses its installed executable and pinned Python. Checkout paths supply input
+data, never a replacement skill implementation. Fast-change selects the installed
+skill installer; review packets select the installed source checker. Their
+supporting modules come from the selected installed bundle. First-install
+bootstrap remains a repository-owned workflow because no installation exists yet.
 
 Supported SDLC v4 and v5 place tests in explicit actions. A deliverable may declare
 a no-op with a reason, including coverage by repository-wide tests. Different
@@ -323,6 +336,25 @@ logs are persisted: active protocol queues and request counts are bounded at
 128, and each backend retains at most 64 KiB of stderr in memory. The existing
 manager continues to own version directories, release packages and retention;
 old pre-gateway connections need one client refresh to adopt this boundary.
+The same one-second idle poll sends `notifications/tools/list_changed` once
+per observed `current.json` selection change. Initialization always advertises
+`tools.listChanged`, including when the initial child has no tools. A subsequent
+`tools/list` reads the selected child; failed startup or malformed definitions
+return their available causes with runtime, invocation, working directory,
+exit status and redacted response/stderr details. They do not cause repeated
+notifications, old-definition fallback or cancellation of older active work.
+The gateway stores only its last announced selection in memory and suppresses
+startup notices already covered by that selection and notices from old children.
+
+The installed Codex backend's `mcp_tool_list_changed` feature controls the client
+half. Tests run it directly with isolated configuration and a local Responses
+endpoint, independently of desktop patches. On 0.166.0 the notification marks
+the catalog changed; the next model turn fetches the new definitions and includes
+them in its request. With the feature disabled, the next model request retains
+the old definitions. Tests check both the server's `tools/list` traffic and the
+actual outgoing model tool definitions while an earlier call remains running.
+Installing the launcher and establishing a connection with the setting loaded
+are separate activation steps; source/config edits do not change live chats.
 Protocol tasks keep connection-local IDs mapped to their original backend,
 including progress and task-related metadata. Queries, cancellation and serial
 listing reads use that owner. Results remain retrievable after terminal status;
@@ -360,6 +392,11 @@ readable after progress lines are excluded. A closed display does not stop pipe
 drainage or change the command result; interruption stops the owned child and
 joins its reader before propagating.
 
+If pytest's result summary is missing, incomplete or unreadable, the transport
+keeps pytest's exit status and both output streams and adds the summary error.
+A zero pytest exit with an unusable summary returns a reporting failure instead
+of accepting unrecorded results. Scratch still leaves with its execution scope.
+
 These status messages are in-memory observations, with no execution identifier,
 checkpoint, file, or selection/recovery role. The tool caller can display them
 inside one active tool execution without a model turn per update. The runner's
@@ -390,7 +427,14 @@ behavior-changing arguments, runtime/platform, plus the
 packages, tools, environment
 variables and production/data paths assigned to each check group. The existing
 `tests/test-impact.json` is read by `select_test_groups.py`; no second dependency
-graph is maintained. A consumer includes its prerequisites' inputs and settings,
+graph is maintained. For deleted paths and production-file rename sources,
+the runner reads the
+map from the diff's merge-base (HEAD for uncommitted changes). Previous owners
+select current check groups; they do not grant reuse. Unknown or removed owners
+remain explicit mapping errors. New paths use only the current map; moved tests
+keep their destination ownership. This avoids
+keeping obsolete dependency filenames just to pass Ship's selection check.
+A consumer includes its prerequisites' inputs and settings,
 recursively. Changes flow toward consumers, never from a consumer back to its
 unchanged prerequisites. Test bytes, imported repository helpers and ancestor
 fixtures are separate check inputs. New unignored inputs participate through the
@@ -467,6 +511,58 @@ are carried as `passed_checks` observations owned by the durable aggregate.
 They preserve actual execution facts without inventing individual result IDs.
 Changed input bytes remain a reuse constraint; a busy optimization is distinct
 from incomplete execution evidence.
+
+The generated runner imports local `scripts/testing/select_test_groups.py` and
+`reuse_test_results.py`; their repo-lifecycle templates also produce Ceratops's
+own support modules. The repository's existing test-impact map remains the one
+dependency declaration. Missing maps allow execution but no individual-test reuse.
+Custom runners are preserved; their support files are managed only when the
+scripts project declares `tool.ceratops.test-support.managed = true`.
+
+`repository_operation.prepare_operations()` reads v5 `check-groups` with required
+`phase` and `requires-artifacts` fields. `execute_check_phases()` completes
+independent source checks, orders selected package builds by their prerequisites,
+and starts after-build checks only with every required artifact available.
+During-build groups execute inside the build process and must return their real
+passing records. The executor never creates a pass for a named but absent check.
+Test commands receive `--check-group` and `--artifacts`; their child processes
+receive the same mapping in `CERATOPS_TEST_ARTIFACTS`. Paths and measured hashes
+enter both whole-check and individual-test inputs. Changes during execution
+prevent saving a reusable pass. Existing `build_bundle()` callbacks already
+receive the exact measured artifact inventory; no second selection is added.
+`store_artifacts.build_result_artifact_paths()` resolves all artifacts in v1,
+v2 and v3 results using their existing repository, shared bundle and allocated
+version/target paths. SDLC v4/v5 declarations accept these same build formats.
+Integrity checks complete for the entire build output
+before it becomes available to dependent builds or checks. Multiple output
+steps accumulate their files; a missing or changed file exposes no partial set.
+
+The test runner owns `.build/test-diagnostics/pytest-failure.json`. Its shared
+support module stores current failure IDs and deduplicated full, redacted command
+details. Newer local outcomes resolve individual failures; both A and B must
+pass before a report for A and B is deleted. Startup finishes interrupted deletion
+from those outcomes without tests. A lifecycle caller consumes the runner result
+and retires its separate operation report. Each report owner handles its own
+file; user-retained external reports and current result files are preserved.
+
+`execute_worktree_build.py` owns the internal source-commit-to-completion flow,
+exposed by a thin `repository_operation.execute_worktree_build()` callable. Its
+caller declares relevant source paths, preparation commands, target operations
+and the product-specific receipt description. Only selected changed paths enter
+the source commit. That commit carries the allocated build identity, allowing a
+fresh call interrupted before input binding to recognize the exact direct child
+commit and unchanged declared inputs. This uses current Git data, not a saved
+execution phase. The executor then calls the existing per-target receipt and
+completion functions. Existing receipts skip producer work; an existing tag lets
+the same call finish scoped retention and failure-report deletion. The returned
+commit and tag come from the completer, not a later read of HEAD. Standalone
+builds take no worktree/release lock. Public Build adoption remains a later step.
+
+`ND.COMPATIBILITY.TEST_RESULT_REUSE` reviews independently reusable units using
+saved outcomes and behavior evidence, including interruption and partial fixes.
+It does not require Ceratops's JSON format or separate files per test. Whole-run
+reuse needs an evidence-backed explanation of lost work. Governance candidate
+checks parse JSON and TOML without Markdown reflow, preserving their string bytes.
 
 The compact `ceratops-check-summary.v1` export contains `inputGroups` and
 `checkGroups` tables plus `checks`. Each outcome references its inlined facts and
@@ -614,7 +710,7 @@ invocations still run disposable tests; they do not create reusable acceptance.
 The retained-result invocation is:
 
 ```text
-uv run --locked scripts/run-tests.py [TEST_TARGET ...] --result-file RESULT --result-id RESULT_ID --candidate-id CANDIDATE_ID --check-id CHECK_ID --check-version CHECK_VERSION
+uv run --project scripts --locked python scripts/run-tests.py [TEST_TARGET ...] --result-file RESULT --result-id RESULT_ID --candidate-id CANDIDATE_ID --check-id CHECK_ID --check-version CHECK_VERSION
 ```
 
 The caller supplies all identities and the final path together, serializes its
@@ -673,7 +769,11 @@ The operation supplies its check identity, exact inputs and target. The runner
 saves its actual outcome; repository and skill lifecycle read/write through
 their declared shared `store_check_results.py` payload. Repository scripts keep
 the same standalone writer contract without importing skill source.
-Probe records are always discarded after the probe.
+Probe records are always discarded after the probe. The probe removes the outer
+operation's check-context environment values before launching its own command;
+it does not read the repository's local result store. Both the generated runner
+and Ceratops's runner finish pending report deletion when they reuse a saved
+successful command, without running that command again.
 Pytest basetemp/cache directories are disposable
 execution scratch and never copied or moved into results. Collection snapshots
 and failure diagnostics remain regenerable reports, not acceptance records.
@@ -875,8 +975,11 @@ functions never acquire or release locks. This split changes no Git policy.
 The helper uses the already pinned library's public
 [`lock_descriptor`](https://py-filelock.readthedocs.io/en/stable/api.html#filelock.lock_descriptor)
 and `unlock_descriptor` functions. It opens its file without truncation and
-calls `lock_descriptor(fd, blocking=False)` once. A busy lock returns
-`WriteLockBusy` before protected work starts.
+calls `lock_descriptor(fd, blocking=False)`. Promotion and Ship opt into a
+60-second monotonic deadline, retrying inside Python until acquired or timed
+out. Unrelated consumers retain a single immediate attempt. A timeout returns
+`WriteLockBusy` before protected work starts; acquisition continues through
+the existing recovery and repository preconditions.
 This is an acquisition rule, not an operation time limit. An owner may retain
 the lock through long automatic tests and CI monitoring, not model corrections.
 It does not require Job Objects,
@@ -901,15 +1004,29 @@ operation did not record a clean end; `0` means it did. An empty unused slot
 starts false. The helper owns the open native descriptor, writes in place only
 while its lock is held and calls `fsync`; release unlocks and closes that handle.
 It never truncates, replaces, renames or deletes the file, and creates no
-temporary flag file, history, PID record or second lock. Only this flag is
+temporary flag file, history or second lock. Only this flag is
 stored here; producers continue to own their checkpoints and acceptance.
+
+The sibling `release-local.owner.json` is one current diagnostic, containing
+the operation, PID, process creation time, UTC operation start and optional chat
+ID. `psutil` compares the PID's creation time and liveness, preventing PID reuse
+from naming an unrelated process. A lock-file identity/modification stamp binds
+the record to its holding interval; the helper changes that stamp before release
+so failed deletion cannot identify the next holder. The stamp is never an age
+limit, heartbeat or recovery signal. Missing, malformed, changing or inaccessible
+information gives `owner unknown`. The owner file is written through one fixed
+`.release-local.owner.json.in_process` sibling and atomically replaced, then
+removed before unlock. The next native holder removes interrupted leftovers.
+The permanent lock inode and its flag remain unchanged by owner-file replacement.
+Timeout causes retain owner details and elapsed waiting in the existing command
+result; there is no notification service or AI polling loop.
 
 The internal interface is:
 
 | Call | Responsibility |
 | --- | --- |
 | `release_lock_path(repo_root)` | Discover the shared repository release-lock path without mutating Git or contacting a remote. |
-| `hold_write_lock(path, ...)` | Acquire once, resolve saved uncertainty, durably set the flag, then yield ownership. |
+| `hold_write_lock(path, ...)` | Acquire with the caller's waiting policy, resolve saved uncertainty, durably set the flag, publish owner diagnostics, then yield ownership. |
 | `hold_write_attempt(path, ...)` | Wrap one synchronous operation; clear the flag after stopped failures as well as success, preserving uncertain launcher exits. |
 | `run_protected_command(...)` | Run a foreground command and retain an uncertain stop through caught or wrapped exceptions; attach the invocation and both output streams to launch errors. |
 | `context.complete(commands_stopped=True)` | Outermost caller reports that its writing commands stopped, independently of success. Clear the flag before native unlock on normal or exceptional exit. |
@@ -1089,8 +1206,9 @@ The later receipt-driven Ship flow will additionally retain it through
 automatic receipt fetch/fast-forward and protected PR merge. Model corrections
 run after the local attempt ends and unlocks. Remote
 CI writers do not share this machine-local lock; conditional remote branch updates
-and GitHub protection guard their changes. A second local promotion or Ship fails
-immediately, before candidate work starts. No background lock-holder or incoming
+and GitHub protection guard their changes. A second local promotion or Ship waits
+up to 60 seconds before returning a busy result; candidate work starts only after
+acquisition and normal preconditions. No background lock-holder or incoming
 correction-command listener is introduced. Local exit does not cancel remote CI.
 
 Each task worktree belongs to one thread. Ordinary editing, checks, builds and
@@ -1116,9 +1234,12 @@ ordinary use does not depend on it.
 `uv run --locked` controls dependency resolution against `uv.lock`. It is not
 this mutual-exclusion lock and does not serialize commands.
 
-Focused behavior tests in `tests/skill_lifecycle/test_runtime_transactions.py`
-cover common-directory identity without remotes, process/thread exclusion,
-immediate busy refusal, nested ownership, stable file identity, durable flags,
+Focused behavior tests in `tests/skill_lifecycle/test_write_locks.py`,
+`tests/repository_lifecycle/test_release_locking.py` and
+`tests/skill_lifecycle/test_runtime_transactions.py` cover common-directory
+identity without remotes, process/thread exclusion,
+immediate refusal for unchanged callers, timed promotion/Ship acquisition and
+owner reporting, nested ownership, stable file identity, durable flags,
 interrupted writes, explicit recovery, known-running-command refusal, clean
 cancellation and installed copies. Windows tests pass locally; POSIX fork
 coverage is present but Linux execution has not been exercised here.

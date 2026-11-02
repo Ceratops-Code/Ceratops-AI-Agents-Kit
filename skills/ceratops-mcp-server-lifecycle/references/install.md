@@ -54,7 +54,8 @@ source-build path.
    `ceratops-deployment-completion.v1` receipt. It rejects ambiguous names
    before building and accepts no version override or artifact URL.
 2. In an active Ceratops-AI-Agents-Kit checkout, install its manager source with
-   `uv run --locked scripts/deploy-mcp-server-manager.py`; this supports both
+   `uv run --project scripts --locked python
+   scripts/deploy-mcp-server-manager.py`; this supports both
    first installation and an existing manager. Other MCP servers use the
    installed CLI. If the manager is absent, follow bootstrap within the
    authorized scope.

@@ -74,7 +74,7 @@ out.
 - Add the new skill to `skills/skill-sections.json`, assign the right shared
   sections, and update repo docs only when those surfaces exist.
 - Add skills with Python helpers to `python_runtime_skills` in that manifest.
-  Their locked source project stays under `skills/sections/python`.
+  Their locked source project stays under `scripts`.
 - Review the source against applicable skill-design contract checks for trigger
   fit, source structure, deterministic placement, reference discipline, safety
   and state boundaries, output and closure, metadata alignment, and runtime

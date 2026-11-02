@@ -852,11 +852,11 @@ def test_reused_check_retires_report_without_executing_command(report_repo, monk
     result = {"operation": "tests.unit", "status": "completed", "steps": [],
               "check_decision": "reused", "check_result": {"path": str(accepted)}}
     plan = SimpleNamespace(
-        context={"fingerprint": "same"},
+        context={"fingerprint": "same", "group": "tests.unit"},
         store=SimpleNamespace(select=lambda *_args, **_kwargs: {"decision": "reuse"}),
         reused_result=lambda _prepared: result,
     )
-    monkeypatch.setattr(runner.reuse_operation_checks, "check_inputs", lambda *_args: {"fingerprint": "same"})
+    monkeypatch.setattr(runner.reuse_operation_checks, "check_inputs", lambda *_args: {"fingerprint": "same", "group": "tests.unit"})
     operation = replace(operation, check_results={}, check_plan=plan)
     original_unlink = pathlib.Path.unlink
 

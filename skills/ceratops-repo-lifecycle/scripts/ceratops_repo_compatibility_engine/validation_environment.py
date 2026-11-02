@@ -98,7 +98,7 @@ def runtime_files(
     # Preserved runners own their framework dependencies. Only the runner this
     # transaction generates has a known pytest dependency.
     if generate_python_test_runner:
-        dependencies.add("pytest")
+        dependencies.update({"pytest", "packaging"})
     for check in checks:
         command = check["command"]
         if len(command) >= 3 and command[:2] == ["{python}", "-m"]:
@@ -110,8 +110,9 @@ def runtime_files(
     rendered = project_text(root, template, dependencies)
     if project.is_file():
         document = tomllib.loads(project.read_text(encoding="utf-8"))
-        declared = document.get("project", {}).get("dependencies", [])
-        names = {re.split(r"[<>=!~;\[ ]", value, maxsplit=1)[0].lower().replace("_", "-") for value in declared}
+        declared = [*document.get("project", {}).get("dependencies", []),
+                    *document.get("dependency-groups", {}).get("dev", [])]
+        names = {re.split(r"[<>=!~;\[ ]", value, maxsplit=1)[0].lower().replace("_", "-") for value in declared if isinstance(value, str)}
         missing = {name for name in dependencies if name.lower().replace("_", "-") not in names}
         if missing:
             raise RuntimeError("existing validator project must declare: " + ", ".join(sorted(missing)))

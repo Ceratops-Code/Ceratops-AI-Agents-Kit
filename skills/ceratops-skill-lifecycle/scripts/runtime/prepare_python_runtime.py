@@ -19,6 +19,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import tomllib
 import uuid
 from collections.abc import Mapping
 
@@ -334,7 +335,7 @@ def prepare_python_runtime(repo_root: pathlib.Path, install_root: pathlib.Path) 
     Failed new versions and index scratch files are removed by this call.
     """
 
-    project = repo_root / "skills/sections/python"
+    project = repo_root / "scripts"
     declaration = project / "pyproject.toml"
     lock = project / "uv.lock"
     if not declaration.exists() and not lock.exists():
@@ -344,7 +345,28 @@ def prepare_python_runtime(repo_root: pathlib.Path, install_root: pathlib.Path) 
     uv = shutil.which("uv")
     if uv is None:
         raise ValueError("uv is required to prepare the shared skill Python runtime")
-    digest = hashlib.sha256(declaration.read_bytes() + b"\0" + lock.read_bytes()).hexdigest()
+    environment = os.environ.copy()
+    for key in ("PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV", "UV_PROJECT", "UV_PROJECT_ENVIRONMENT", "UV_WORKING_DIRECTORY", "UV_NO_SYNC", "UV_FROZEN", "UV_PYTHON"):
+        environment.pop(key, None)
+    environment["PYTHONNOUSERSITE"] = "1"
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    # uv selects the runtime dependency graph from the common lock. Development
+    # tools and other workspace products cannot change this environment's identity.
+    command = [uv, "export", "--project", str(project), "--locked", "--no-dev",
+               "--no-default-groups", "--no-emit-workspace", "--no-header", "--no-annotate"]
+    try:
+        exported = write_locks.run_protected_command(command, cwd=repo_root, env=environment,
+                          capture_output=True, text=True, check=False)
+    except OSError as exc:
+        detail = write_locks.command_failure_details(exc, target="shared skill runtime dependency export",
+            command=command, context={"cwd": str(repo_root), "runtime": sys.executable, "exit_status": "not launched"})
+        raise ValueError(json.dumps(detail)) from exc
+    if exported.returncode:
+        detail = write_locks.command_failure_details(exported, target="shared skill runtime dependency export",
+            command=command, context={"cwd": str(repo_root), "runtime": sys.executable})
+        raise ValueError(json.dumps(detail))
+    python_requirement = tomllib.loads(declaration.read_text(encoding="utf-8"))["project"]["requires-python"]
+    digest = hashlib.sha256((python_requirement + "\0" + exported.stdout.replace("\r\n", "\n")).encode()).hexdigest()
     root = install_root.parent / "runtimes/ceratops"
     versions = root / "versions"
     if any(is_runtime_link(path) for path in (root, versions)):
@@ -365,11 +387,6 @@ def prepare_python_runtime(repo_root: pathlib.Path, install_root: pathlib.Path) 
         recorded = current.get("version")
         if isinstance(recorded, str) and RUNTIME_VERSION_RE.fullmatch(recorded):
             version = recorded
-    environment = os.environ.copy()
-    for key in ("PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV", "UV_PROJECT", "UV_PROJECT_ENVIRONMENT", "UV_WORKING_DIRECTORY", "UV_NO_SYNC", "UV_FROZEN", "UV_PYTHON"):
-        environment.pop(key, None)
-    environment["PYTHONNOUSERSITE"] = "1"
-    environment["PYTHONDONTWRITEBYTECODE"] = "1"
     scripts = "Scripts" if os.name == "nt" else "bin"
     executable = "python.exe" if os.name == "nt" else "python"
 
@@ -384,7 +401,7 @@ def prepare_python_runtime(repo_root: pathlib.Path, install_root: pathlib.Path) 
         if is_runtime_link(selected):
             raise ValueError("shared skill runtime version cannot be a link")
         checked = write_locks.run_protected_command(
-            [uv, "sync", "--quiet", "--project", str(project), "--locked", "--check", "--no-active"],
+            [uv, "sync", "--quiet", "--project", str(project), "--locked", "--no-dev", "--no-default-groups", "--no-install-workspace", "--check", "--no-active"],
             env=environment, capture_output=True, text=True, check=False,
         )
         if checked.returncode or not interpreter(version).is_file() or is_runtime_link(interpreter(version)):
@@ -393,7 +410,7 @@ def prepare_python_runtime(repo_root: pathlib.Path, install_root: pathlib.Path) 
             environment["UV_PROJECT_ENVIRONMENT"] = str(selected / ".venv")
     if not selected.exists():
         result = write_locks.run_protected_command(
-            [uv, "sync", "--quiet", "--project", str(project), "--locked", "--no-active"],
+            [uv, "sync", "--quiet", "--project", str(project), "--locked", "--no-dev", "--no-default-groups", "--no-install-workspace", "--no-active"],
             env=environment, capture_output=True, text=True, check=False,
         )
         if result.returncode or not interpreter(version).is_file():
@@ -406,7 +423,7 @@ def prepare_python_runtime(repo_root: pathlib.Path, install_root: pathlib.Path) 
             try:
                 _materialize_python_interpreters(interpreter(version))
                 checked = write_locks.run_protected_command(
-                    [uv, "sync", "--quiet", "--project", str(project), "--locked", "--check", "--no-active"],
+                    [uv, "sync", "--quiet", "--project", str(project), "--locked", "--no-dev", "--no-default-groups", "--no-install-workspace", "--check", "--no-active"],
                     env=environment, capture_output=True, text=True, check=False,
                 )
                 if checked.returncode:

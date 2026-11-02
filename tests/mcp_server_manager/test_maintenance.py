@@ -426,7 +426,7 @@ def test_uv_package_lock_is_exported_only_inside_disposable_staging(
     export_command, export_options = calls[0]
     assert export_command[1] == "export"
     assert export_options["cwd"] == package
-    assert {"--locked", "--no-dev", "--no-emit-project", "--no-header"} <= set(export_command)
+    assert {"--locked", "--no-dev", "--no-emit-workspace", "--no-header"} <= set(export_command)
     assert export_command[export_command.index("--format") + 1] == "pylock.toml"
     exported = Path(export_command[export_command.index("--output-file") + 1])
     assert exported.name == "pylock.package.toml" and not exported.exists()
@@ -1006,9 +1006,15 @@ def test_source_install_uses_manager_packaging_and_cleans_temporary_libraries(tm
     original_path = sys.path.copy()
 
     def provision(command, **kwargs):
+        if command[1] == "export":
+            assert command[command.index("--project") + 1] == str(module.SOURCE.parents[1] / "scripts")
+            assert command[command.index("--package") + 1] == "ceratops_mcp_server_manager"
+            assert {"--locked", "--no-dev", "--no-default-groups", "--no-emit-workspace"} <= set(command)
+            Path(command[command.index("--output-file") + 1]).write_text('lock-version="1.0"\npackages=[]\n')
+            return ""
         libraries = Path(command[command.index("--target") + 1])
         calls.append(libraries)
-        assert command[:4] == [str(runtime.uv), "pip", "sync", str(module.SOURCE / "pylock.toml")]
+        assert command[:4] == [str(runtime.uv), "pip", "sync", str(libraries.parent / "pylock.toml")]
         assert "--require-hashes" in command and "--only-binary" in command
         libraries.mkdir()
         if failure == "libraries":
@@ -1147,3 +1153,24 @@ def test_package_cache_is_removed_with_operation_scratch(source_package):
     assert all(path.is_relative_to(runtime_root / "fixture/staging") for path in caches)
     assert all(not path.exists() for path in caches)
     assert not (runtime_root / "fixture/cache").exists()
+
+
+def test_native_package_uses_declared_workspace_lock(source_package):
+    project, runtime_root, calls = source_package
+    (project / "pylock.toml").unlink()
+    common = project.parent / "scripts"
+    common.mkdir()
+    (common / "pyproject.toml").write_text('[project]\nname="workspace"\nversion="0.0.0"\n')
+    (common / "uv.lock").write_text('version=1\n')
+    metadata = project / "pyproject.toml"
+    metadata.write_text(metadata.read_text() + '\n[tool.ceratops]\ndependency-project="../scripts"\n')
+    before = metadata.read_bytes()
+    first = package_module.package(project)
+    assert package_module.package(project) == first
+    exports = [command for command, _options in calls if command[1] == "export"]
+    assert len(exports) == 2
+    assert all(command[command.index("--project") + 1] == str(common) for command in exports)
+    assert all(command[command.index("--package") + 1] == "fixture" for command in exports)
+    assert all("--no-emit-workspace" in command and "--no-dev" in command for command in exports)
+    assert metadata.read_bytes() == before and not (project / "uv.lock").exists()
+    assert not list((runtime_root / "fixture/staging").iterdir())

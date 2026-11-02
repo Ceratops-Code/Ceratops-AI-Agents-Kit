@@ -19,6 +19,7 @@ from tests.skill_lifecycle.support import (
     SECTION_MANIFEST_TEMPLATE,
     VALIDATOR,
     add_action_sections,
+    install_packet_checker,
     load_source_validator,
     write_multi_action_skill,
 )
@@ -38,6 +39,7 @@ CONSISTENCY_REVIEW_PACKET = (
 
 
 def write_profile_roots(installed: pathlib.Path) -> pathlib.Path:
+    install_packet_checker(installed)
     config = installed.parent.parent / "config.toml"
     values = {"CERATOPS_PROJECTS_ROOT": str(config.parent / "projects"),
               "CERATOPS_TASK_TEMP_ROOT": str(config.parent / "tmp")}
@@ -423,12 +425,12 @@ def test_bootstrap_native_root_failure_keeps_git_invocation_and_streams(tmp_path
 @pytest.mark.parametrize(
     ("command", "error"),
     [
-        ("uv run --locked scripts/check.py --worktree", None),
-        ("uv run --locked skills/alpha-tool/scripts/check.py", None),
+        ("uv run --project scripts --locked python scripts/check.py --worktree", None),
+        ("uv run --project scripts --locked python skills/alpha-tool/scripts/check.py", None),
         ("python scripts/check.py", None),
-        ("uv run --locked scripts/missing.py", "missing script"),
+        ("uv run --project scripts --locked python scripts/missing.py", "missing script"),
         ("uv run scripts/check.py", "unsupported command form"),
-        ("uv run --locked scripts/../outside.py", "non-portable script path"),
+        ("uv run --project scripts --locked python scripts/../outside.py", "non-portable script path"),
         ("uv run --locked /outside/check.py", "unsupported command form"),
     ],
 )
