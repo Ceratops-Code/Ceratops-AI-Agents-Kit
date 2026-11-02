@@ -8,7 +8,7 @@ dependencies = [
   "jsonschema==4.26.0",
   "markdown-it-py==4.2.0",
   "packaging==26.3",
-  "tzdata==2026.5",
+  "tzdata==2026.6",
   "tomlkit==0.15.2",
   "psutil==7.2.2",
 ]
