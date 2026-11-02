@@ -573,6 +573,26 @@ def _write_report_bytes(path: pathlib.Path, data: bytes) -> None:
             staging.unlink(missing_ok=True)
 
 
+def update_ci_failure_evidence(path: pathlib.Path, result: dict[str, Any], *, failed: bool) -> None:
+    """Maintain the CI action's one explicitly caller-owned evidence file.
+
+    Failure atomically replaces the raw result; success removes that output.
+    This is a CI artifact, not a managed task-report snapshot. Its caller owns
+    the path and lifetime; sibling files and unrelated reports are never scanned.
+    """
+    selected = path.expanduser().absolute()
+    if (selected.resolve() != selected or selected.is_symlink() or selected.is_junction()
+            or (selected.exists() and (not selected.is_file() or selected.stat().st_nlink != 1))):
+        raise ValueError(f"CI evidence must be a regular unredirected file: {selected}")
+    if failed:
+        data = (json.dumps(result, indent=2) + "\n").encode("utf-8")
+        if selected.is_file() and selected.read_bytes() == data:
+            return
+        _write_report_bytes(selected, data)
+    else:
+        selected.unlink(missing_ok=True)
+
+
 def operation_report_root(repo_root: pathlib.Path) -> pathlib.Path:
     """Capture the primary checkout before a successful workflow removes sources.
 
@@ -678,7 +698,10 @@ def write_operation_report(
     """
     primary = operation_report_root(repo_root)
     selected = path.expanduser().absolute()
-    if retain_external_output and not selected.is_relative_to(project_task_temp_root(primary)):
+    # Recording a completed effect must not depend on its checkout still existing.
+    if retain_external_output and (
+        not primary.is_dir() or not selected.is_relative_to(project_task_temp_root(primary))
+    ):
         # Explicit retained exports keep the original payload and never enter
         # the temporary-report reader or its automatic deletion authority.
         if (selected.resolve() != selected or selected.is_symlink() or selected.is_junction()

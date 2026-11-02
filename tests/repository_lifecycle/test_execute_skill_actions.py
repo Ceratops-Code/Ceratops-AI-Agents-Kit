@@ -725,6 +725,46 @@ def test_v4_skill_handoff_rejects_unsafe_or_unhandled_work_before_deployment(
             json.loads(line)["mode"] for line in calls.read_text().splitlines()
         ] == [None]
 
+@pytest.mark.parametrize("failed", [False, True])
+@pytest.mark.parametrize("after", [False, True])
+def test_ci_failure_evidence_repeats_after_interrupted_publish_or_deletion(tmp_path, monkeypatch, failed, after):
+    command = importlib.import_module("github_pr_workflow.command")
+    evidence = tmp_path / "ci" / "failure.json"
+    evidence.parent.mkdir()
+    previous = b"previous failure"
+    evidence.write_bytes(previous)
+    peer = evidence.parent / "accepted-result.json"
+    peer.write_bytes(b"accepted work")
+    result = {"status": "operation_failed" if failed else "completed", "operation": "repository.actions.test"}
+    current = (json.dumps(result, indent=2) + "\n").encode()
+    effect = pathlib.Path.replace if failed else pathlib.Path.unlink
+    target = evidence.with_name("." + evidence.name + ".operation-report.tmp") if failed else evidence
+    interrupted = False
+
+    def interrupt(path, *args, **kwargs):
+        nonlocal interrupted
+        if path == target and not interrupted:
+            interrupted = True
+            if after:
+                effect(path, *args, **kwargs)
+            raise KeyboardInterrupt("interrupted CI evidence output")
+        return effect(path, *args, **kwargs)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(pathlib.Path, "replace" if failed else "unlink", interrupt)
+        with pytest.raises(KeyboardInterrupt):
+            command.update_ci_failure_evidence(evidence, result, failed=failed)
+    assert interrupted
+    expected = (current if failed else None) if after else previous
+    assert (evidence.read_bytes() if evidence.exists() else None) == expected
+    assert peer.read_bytes() == b"accepted work"
+    for _ in range(2):
+        command.update_ci_failure_evidence(evidence, result, failed=failed)
+        assert (json.loads(evidence.read_bytes()) if evidence.exists() else None) == (result if failed else None)
+        assert peer.read_bytes() == b"accepted work"
+        assert not list(evidence.parent.glob("*.operation-report.tmp"))
+
+
 def test_completed_handoff_record_survives_removed_result_directory(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,

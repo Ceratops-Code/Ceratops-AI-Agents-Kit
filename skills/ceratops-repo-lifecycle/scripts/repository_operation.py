@@ -53,6 +53,7 @@ from github_pr_workflow.command import (
     report_phase,
     retire_handoff_reports_cli,
     run_progress_command,
+    update_ci_failure_evidence,
     write_operation_report,
 )
 from sdlc_results import StepResultError, capture_step_result
@@ -1468,15 +1469,18 @@ def main(argv: list[str] | None = None) -> int:
     failed = result.get("status") in FAILED_STATUSES
     if args.evidence_file:
         try:
-            if failed:
-                write_operation_report(
-                    args.evidence_file, result, repo_root=args.diagnostic_repo_root or args.repo_root,
-                    action=args.diagnostic_action, pending_operations=tuple(args.operation),
+            if args.ci:
+                update_ci_failure_evidence(args.evidence_file, result, failed=failed)
+            else:
+                if failed:
+                    write_operation_report(
+                        args.evidence_file, result, repo_root=args.diagnostic_repo_root or args.repo_root,
+                        action=args.diagnostic_action, pending_operations=tuple(args.operation),
+                    )
+                remove_operation_failures(
+                    result, diagnostic_output=args.evidence_file,
+                    diagnostic_owner=(args.diagnostic_repo_root or args.repo_root, args.diagnostic_action),
                 )
-            remove_operation_failures(
-                result, diagnostic_output=args.evidence_file,
-                diagnostic_owner=(args.diagnostic_repo_root or args.repo_root, args.diagnostic_action),
-            )
         except (OSError, ValueError, CommandError) as exc:
             result["report_cleanup_error"] = str(exc)
     print(
