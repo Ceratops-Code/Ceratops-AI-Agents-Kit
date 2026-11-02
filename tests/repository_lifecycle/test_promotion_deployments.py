@@ -871,7 +871,7 @@ def test_standalone_handoff_return_retires_reports_without_reinstalling(
 
 
 @pytest.mark.parametrize("problem", ["failed", "wrong-commit", "wrong-repo", "wrong-producer",
-                                     "wrong-target", "cleanup-debt", "missing-input"])
+                                     "wrong-target", "cleanup-debt", "missing-input", "missing-source-commit"])
 def test_standalone_handoff_return_preserves_reports_until_actual_completion_matches(
     tmp_path, monkeypatch, capsys, problem,
 ):
@@ -879,6 +879,7 @@ def test_standalone_handoff_return_preserves_reports_until_actual_completion_mat
         tmp_path, monkeypatch,
     )
     actual = completion.read_bytes()
+    read_source_commit = runner.repository_commit
     receipt = json.loads(actual)
     if problem == "failed":
         receipt["status"] = "failed"
@@ -892,6 +893,8 @@ def test_standalone_handoff_return_preserves_reports_until_actual_completion_mat
         receipt["deployed"] = ["another-skill"]
     elif problem == "cleanup-debt":
         receipt["cleanup_debt"] = ["busy retired directory"]
+    elif problem == "missing-source-commit":
+        monkeypatch.setattr(runner, "repository_commit", lambda _root: None)
     if problem == "missing-input":
         completion.unlink()
     else:
@@ -906,10 +909,13 @@ def test_standalone_handoff_return_preserves_reports_until_actual_completion_mat
         failure = json.loads(capsys.readouterr().err)
         assert failure["operation"].startswith("retire-handoff-reports:")
         assert failure["target"] == str(completion)
+        if problem == "missing-source-commit":
+            assert "source Git commit" in failure["message"]
         assert all(path.read_bytes() == content for path, content in retained.items())
         assert (completion.read_bytes() if completion.exists() else None) == input_bytes
         assert (repo / "calls.jsonl").read_bytes() == calls
         assert error_report.exists()
+    monkeypatch.setattr(runner, "repository_commit", read_source_commit)
     completion.write_bytes(actual)
     for _ in range(2):
         assert runner.main(arguments) == 0

@@ -808,10 +808,9 @@ def remove_resolved_failures(
                 errors.pop(str(candidate), None)
                 continue
             document = json.loads(original)
-            record = _owned_operation_report(document, owner, other_action=True)
-            temporary = record is not None
-            if temporary:
-                failures = record["unresolved"]
+            operation_report = _owned_operation_report(document, owner, other_action=True)
+            if operation_report is not None:
+                failures = operation_report["unresolved"]
             elif isinstance(document, dict) and document.get("schema") == "ceratops-lifecycle-failure-report.v1":
                 _, diagnostic_owner = _report_scope(bound, repo_root, action)
                 if document.get("owner") != diagnostic_owner:
@@ -825,28 +824,31 @@ def remove_resolved_failures(
             if not resolved:
                 if not failures:
                     errors.pop(str(candidate), None)
-                elif temporary:
-                    snapshots[bound] = (record, original)
+                elif operation_report is not None:
+                    snapshots[bound] = (operation_report, original)
                 continue
             # A changed snapshot or redirected path must never become our target.
             _operation_report_scope(bound, primary, action)
             if bound.read_bytes() != original:
                 raise ValueError(f"Report changed during cleanup: {bound}")
-            remaining = {key: failures[key] for key in failures if key not in resolved} if not temporary else [
-                key for key in failures if key not in resolved
-            ]
-            if not remaining:
-                bound.unlink(missing_ok=True)
-            elif temporary:
-                record["unresolved"] = remaining
-                current = (json.dumps(document, indent=2) + "\n").encode("utf-8")
-                _write_report_bytes(bound, current)
-                snapshots[bound] = (record, current)
+            if operation_report is not None:
+                remaining_operations = [key for key in failures if key not in resolved]
+                if not remaining_operations:
+                    bound.unlink(missing_ok=True)
+                else:
+                    operation_report["unresolved"] = remaining_operations
+                    current = (json.dumps(document, indent=2) + "\n").encode("utf-8")
+                    _write_report_bytes(bound, current)
+                    snapshots[bound] = (operation_report, current)
             else:
-                write_failure_report(
-                    bound, repo_root=repo_root, action=action, failures=remaining,
-                    resolved_failures=resolved, successful_result_paths=successful_result_paths(result),
-                )
+                remaining_failures = {key: failures[key] for key in failures if key not in resolved}
+                if not remaining_failures:
+                    bound.unlink(missing_ok=True)
+                else:
+                    write_failure_report(
+                        bound, repo_root=repo_root, action=action, failures=remaining_failures,
+                        resolved_failures=resolved, successful_result_paths=successful_result_paths(result),
+                    )
             errors.pop(str(candidate), None)
         groups: dict[tuple[Any, ...], list[pathlib.Path]] = {}
         for path, (record, _) in snapshots.items():
@@ -957,6 +959,8 @@ def _retire_handoff_reports(args: Any) -> None:
         prepared = runner.prepare_operations(primary, [runner.OperationRequest(
             args.operation[0], runner.parse_parameters(args.parameter),
         )], args.sdlc_contract, context="return")[0]
+        if prepared.commit is None:
+            raise runner.OperationError("Report retirement requires a source Git commit.")
         if len(prepared.steps) != 1 or not prepared.steps[0].handoff:
             raise runner.OperationError("A standalone receipt requires a single registered handoff step.")
         handoff = prepared.steps[0].handoff
