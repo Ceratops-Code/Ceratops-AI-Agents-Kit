@@ -853,7 +853,9 @@ def _prepare_standalone_handoff_reports(tmp_path, monkeypatch, outer_result=None
     accepted.write_bytes(actual)
     assert previous.exists()  # The standalone installer has no repository callback.
     module = runpy.run_path(str(PROMOTE_REPOSITORY))
-    summary = module["_result_summary"](pending, previous, hashlib.sha256(previous.read_bytes()).hexdigest())
+    summary = module["_result_summary"](
+        pending, previous, hashlib.sha256(previous.read_bytes()).hexdigest(), failed=False,
+    )
     assert len(summary["report_completions"]) == 1
     arguments = [value.replace("{actual_completion_file}", str(completion))
                  for value in summary["report_completions"][0]["arguments"]]
