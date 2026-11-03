@@ -1,20 +1,15 @@
 """Connect a task worktree's source commit, SDLC commands and receipt completion.
 
-The versioned callable is for the later public Build adapter. Ordinary SDLC wheel
-builds use the existing v2 store through execute_package_build. Repository-specific
-versioned receipt descriptions remain supplied by their adapter; this module owns
-ordering, version/source identities, command outcomes, completion and retention.
+This internal callable is for the later public Build adapter. Repository-specific
+receipt descriptions remain supplied by that adapter; this function owns ordering,
+version/source identities, command outcomes, completion and scoped retention.
 It takes no worktree lock. A caller-held release lock and command observation
 continue through the normal repository-operation functions.
 """
 
 from __future__ import annotations
 
-import hashlib
 import pathlib
-import re
-import shutil
-import tomllib
 from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import replace
@@ -26,174 +21,6 @@ import store_artifacts
 from hold_write_lock import command_failure_details, run_protected_command
 
 ReceiptDescription = Callable[[store_artifacts.ArtifactVersionTransaction, str, Mapping[str, Any]], Mapping[str, Any]]
-
-
-def package_build_identity(root, name, package, *, channel="alpha"):
-    """Select an exact package/source across linked worktrees, never a latest file."""
-    import repository_operation as operations
-
-    project = root / package["project"]
-    project = sdlc_results._plain_path(project)[0]
-    if not project.is_relative_to(root.resolve()):
-        raise store_artifacts.OperationError("Package project escapes the repository.")
-    metadata = tomllib.loads(project.read_text(encoding="utf-8")).get("project", {})
-    if not isinstance(metadata, Mapping) or not isinstance(metadata.get("version"), str) or not metadata["version"]:
-        raise store_artifacts.OperationError("Stored wheel builds require a declared static project version.")
-    remote = _git(root, "config", "--get", "remote.origin.url")
-    if remote.returncode not in (0, 1):
-        _require_command(remote, root=root)
-    repository = remote.stdout.strip() or store_artifacts._git_common_path(root).parent.name
-    commit = operations.repository_commit(root)
-    if commit is None:
-        raise store_artifacts.OperationError("Package storage requires an existing Git source commit.")
-    return store_artifacts.validated_build_selection({
-        "repository": repository, "sourceCommit": commit,
-        "releaseUnit": name, "channel": "release" if channel in {"rc", "final"} else channel,
-        "version": metadata["version"], "target": "any",
-    })
-
-
-def read_package_build(root, name, package, *, channels=("release", "beta", "alpha")):
-    """Read current source's accepted package, with no checkout-output fallback.
-
-    A missing identity permits the next explicitly named qualification. An
-    occupied but broken identity stops selection; it never triggers rebuilding.
-    """
-    for channel in channels:
-        identity = package_build_identity(root, name, package, channel=channel)
-        key = hashlib.sha256(store_artifacts.canonical_json(identity)).hexdigest()
-        directory = store_artifacts._build_store_path(root) / key
-        if directory.exists() or directory.is_symlink():
-            return store_artifacts.read_completed_build(root, selection=identity)
-    return None
-
-
-def _package_lock(root, package):
-    project = sdlc_results._plain_path(root / package["project"])[0]
-    declaration = tomllib.loads(project.read_text(encoding="utf-8"))
-    directory = project.parent
-    dependency_project = declaration.get("tool", {}).get("ceratops", {}).get("dependency-project")
-    if dependency_project is not None:
-        if not isinstance(dependency_project, str) or pathlib.Path(dependency_project).is_absolute():
-            raise store_artifacts.OperationError("Package dependency-project must be relative.")
-        directory = (directory / dependency_project).resolve()
-    if not directory.is_relative_to(root.resolve()):
-        raise store_artifacts.OperationError("Package lock escapes the repository.")
-    locks = [directory / name for name in ("uv.lock", "pylock.toml") if (directory / name).exists()]
-    if len(locks) != 1:
-        raise store_artifacts.OperationError("Package needs exactly one canonical uv.lock or pylock.toml.")
-    return sdlc_results._plain_path(locks[0])[0]
-
-
-def _package_output(root, package, version):
-    artifact = package["artifact"]
-    directory = sdlc_results._plain_path(root / artifact["output-directory"], directory=True)[0]
-    if not directory.is_relative_to(root.resolve()):
-        raise store_artifacts.OperationError("Package output escapes the repository.")
-    pattern = artifact["filename-pattern"]
-    if "/" in pattern or "\\" in pattern:
-        raise store_artifacts.OperationError("Package wheel pattern must contain only a filename.")
-    distribution = re.sub(r"[-_.]+", "_", artifact["distribution"]).casefold()
-    wheels = []
-    for path in directory.glob(pattern):
-        path = sdlc_results._plain_path(path)[0]
-        parts = path.name.removesuffix(".whl").split("-")
-        if len(parts) in (5, 6) and parts[0].casefold() == distribution and parts[1] == version:
-            wheels.append(path)
-    if len(wheels) != 1:
-        raise store_artifacts.OperationError(f"Package needs exactly one declared {version} wheel in {directory}.")
-    return wheels[0]
-
-
-def execute_package_build(prepared, **options):
-    """Run a legacy wheel build once and publish it through the existing v2 store.
-
-    The normal command executor supplies the actual command/check outcomes.
-    Publication binds those outcomes to the measured wheel and canonical lock.
-    Readers use only recorded acceptance and file integrity. Completed bundles
-    retain the store's bounded lifetime; checkout dist files are scratch outputs
-    owned by the repository's declared build command. No new storage format or
-    build tag is introduced. Versioned/result-producing adapters keep their own
-    route and never enter this adapter.
-    """
-    import repository_operation as operations
-
-    root = prepared.repo_root
-    raw = lambda: operations.execute_prepared_operation(prepared, retain_package=False, **options)
-    name = prepared.operation.removeprefix("deliverables.packages.").removesuffix(".actions.build")
-    if prepared.operation != f"deliverables.packages.{name}.actions.build":
-        return raw()
-    contract = operations.read_repository_contract(root, prepared.contract_path)
-    package = contract.get("deliverables", {}).get("packages", {}).get(name, {})
-    if (package.get("artifact", {}).get("type") != "python-wheel" or prepared.no_op_reason is not None
-            or prepared.result_commit_field or pathlib.PurePath(package.get("project", "")).name != "pyproject.toml"):
-        return raw()
-    outcome = None
-    try:
-        operations.require_clean_commit(root, prepared.commit)
-        selected = read_package_build(root, name, package, channels=(prepared.qualification_level,))
-        if selected is not None:
-            return {"operation": prepared.operation, "commit": prepared.commit, "status": "completed",
-                    "steps": [], "build_reused": True, "build_receipt": str(selected.receipt_path),
-                    "artifacts": [str(path) for path in selected.artifacts],
-                    "step_results": [{"step": "package-store", "result": dict(selected.receipt)}]}
-        identity = package_build_identity(root, name, package, channel=prepared.qualification_level)
-        lock = _package_lock(root, package)
-        lock_hash = hashlib.sha256(lock.read_bytes()).hexdigest()
-
-        def build(bundle, _work):
-            nonlocal outcome
-            outcome = raw()
-            if outcome.get("status") != "completed":
-                raise store_artifacts.OperationError("Declared package build did not complete.")
-            operations.require_clean_commit(root, prepared.commit)
-            wheel = _package_output(root, package, identity["version"])
-            if hashlib.sha256(lock.read_bytes()).hexdigest() != lock_hash:
-                raise store_artifacts.OperationError("Package lock changed during the build.")
-            (bundle / "artifacts").mkdir()
-            (bundle / "supporting-files").mkdir()
-            shutil.copyfile(wheel, bundle / "artifacts" / wheel.name)
-            shutil.copyfile(lock, bundle / "supporting-files" / lock.name)
-            return store_artifacts.BuildProduct(
-                artifacts=[{"deliverable": f"deliverables.packages.{name}", "type": "python-wheel",
-                            "path": "artifacts/" + wheel.name}],
-                supporting_files=[{"type": "package-lock", "path": "supporting-files/" + lock.name}],
-            )
-
-        def record_outcome(bundle, artifacts, _work):
-            # This records the declared build's intrinsic checks, not a new test.
-            # The original source-check references remain unchanged. No outcome
-            # is invented from an exit-free caller assertion or a later file scan.
-            evidence = {"build": outcome, "checks": options.get("successful_results", ())}
-            path = bundle / "supporting-files" / "command-results.json"
-            path.write_bytes(store_artifacts.canonical_json(evidence))
-            return [{"id": "declared-package-build", "status": "passed",
-                     "artifacts": [{"path": item["path"], "sha256": item["sha256"]} for item in artifacts],
-                     "evidence": {"path": path.relative_to(bundle).as_posix(),
-                                  "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}}]
-
-        receipt = operations.build_bundle(
-            root, selection=identity, inputs={"operation": prepared.operation, "lock": lock_hash,
-                "commands": [list(step.argv or ()) for step in prepared.steps]},
-            required_tests=["declared-package-build"], build=build, test=record_outcome,
-        )
-        selected = store_artifacts.read_completed_build(root, receipt_path=receipt)
-        assert outcome is not None  # Publication requires the build callback's actual result.
-        completed_outcome: dict[str, Any] = outcome
-        return {**completed_outcome, "build_receipt": str(receipt), "artifacts": [str(path) for path in selected.artifacts],
-                "step_results": [*completed_outcome.get("step_results", []),
-                                 {"step": "package-store", "result": dict(selected.receipt)}]}
-    except (OSError, ValueError, store_artifacts.OperationError) as exc:
-        # A failed command already carries its original invocation and streams.
-        if outcome is not None and outcome.get("status") in operations.FAILED_STATUSES:
-            return outcome
-        owner, action = options.get("diagnostic_owner") or (root, "operation")
-        return operations.report_failure(
-            {"status": "operation_failed", "operation": prepared.operation, "commit": prepared.commit,
-             "target": name, "message": str(exc), "completed_build": outcome},
-            diagnostic_output=options.get("diagnostic_output"), repo_root=owner, action=action,
-            failure_id=prepared.operation + ":package-store", successful_results=options.get("successful_results", ()),
-        )
 
 
 def _git(root: pathlib.Path, *arguments: str):

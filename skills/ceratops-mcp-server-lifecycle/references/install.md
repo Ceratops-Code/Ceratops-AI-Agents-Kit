@@ -29,14 +29,13 @@ validation.
 itself reads MCP server `pyproject.toml` and `mcp-server.json`, not SDLC.
 Earlier SDLC bindings use `--source` to build an MCP server directly. SDLC
 returns the selected MCP server and its package prerequisite records to this
-action. For a package-backed MCP server, use its current source commit's
-completed package build in the shared Git store. If absent, run its declared
-build through the SDLC engine. Use the returned wheel and recorded canonical
-lock without copying them into the release checkout or repeating their checks.
-The MCP server source must declare that package at the wheel's exact version.
-Pass the wheel and the package's canonical lockfile to the manager; do not
-pass package source as MCP server source. An MCP server without a package
-prerequisite keeps the source-build path.
+action. For a package-backed MCP server, run the package's declared build
+action and require its wheel validation to pass. Select exactly one wheel
+matching its artifact directory and filename pattern. The MCP server source
+must declare that package at the wheel's exact version. Pass the wheel and the
+package's canonical lockfile to the manager; do not pass package source as MCP
+server source. An MCP server without a package prerequisite keeps the
+source-build path.
 
 ## Workflow
 
