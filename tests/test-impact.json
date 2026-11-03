@@ -1843,6 +1843,16 @@
       ]
     },
     {
+      "id": "node-tooling-requirement",
+      "paths": [
+        "scripts/.nvmrc"
+      ],
+      "suites": [
+        "repository-compatibility",
+        "repository-lint"
+      ]
+    },
+    {
       "id": "repository-lint-settings",
       "paths": [
         "scripts/.markdownlint.json",
