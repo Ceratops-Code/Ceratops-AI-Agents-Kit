@@ -41,8 +41,11 @@ def package_build_identity(root, name, package, *, channel="alpha"):
     if remote.returncode not in (0, 1):
         _require_command(remote, root=root)
     repository = remote.stdout.strip() or store_artifacts._git_common_path(root).parent.name
+    commit = operations.repository_commit(root)
+    if commit is None:
+        raise store_artifacts.OperationError("Package storage requires an existing Git source commit.")
     return store_artifacts.validated_build_selection({
-        "repository": repository, "sourceCommit": operations.repository_commit(root),
+        "repository": repository, "sourceCommit": commit,
         "releaseUnit": name, "channel": "release" if channel in {"rc", "final"} else channel,
         "version": metadata["version"], "target": "any",
     })
@@ -172,8 +175,10 @@ def execute_package_build(prepared, **options):
             required_tests=["declared-package-build"], build=build, test=record_outcome,
         )
         selected = store_artifacts.read_completed_build(root, receipt_path=receipt)
-        return {**outcome, "build_receipt": str(receipt), "artifacts": [str(path) for path in selected.artifacts],
-                "step_results": [*outcome.get("step_results", []),
+        assert outcome is not None  # Publication requires the build callback's actual result.
+        completed_outcome: dict[str, Any] = outcome
+        return {**completed_outcome, "build_receipt": str(receipt), "artifacts": [str(path) for path in selected.artifacts],
+                "step_results": [*completed_outcome.get("step_results", []),
                                  {"step": "package-store", "result": dict(selected.receipt)}]}
     except (OSError, ValueError, store_artifacts.OperationError) as exc:
         # A failed command already carries its original invocation and streams.

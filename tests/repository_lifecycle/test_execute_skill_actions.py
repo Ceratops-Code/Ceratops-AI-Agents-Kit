@@ -949,7 +949,7 @@ def test_mcp_handoff_selects_shared_project_lock(tmp_path, monkeypatch, missing_
         return {"status": "completed"}
 
     monkeypatch.setattr(skill_actions, "_call_action", install)
-    context = {"source": "mcp", "packages": {"sample-package": {
+    context: dict[str, Any] = {"source": "mcp", "packages": {"sample-package": {
         "project": "package/pyproject.toml", "artifact": {
             "type": "python-wheel", "distribution": "sample-package",
             "output-directory": ".build", "filename-pattern": "*.whl",
