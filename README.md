@@ -1709,9 +1709,10 @@ is removed with the stage after success or on the next matching fresh call.
 
 Both installers build Python packages and render skills directly from the
 selected checkout. Builds and installation from the primary or release checkout
-stay inside the managed installer's existing release-source lock. Temporary source views supply
-deployment evidence; they are never build inputs. Completed files still use
-temporary deployment staging. Runtime manifests record the
+stay inside the managed installer's existing release-source lock. Temporary
+source views supply deployment evidence; they are never build inputs.
+Completed files still use temporary deployment staging. Runtime manifests record
+the
 repository identity, primary checkout path, full Git commit when present, and
 relative skill path. Each skill owns a compressed `.source-<sha256>.zip` with
 the exact source inputs, including dirty or unpacked sources. Git supplies clean
