@@ -391,12 +391,12 @@ def test_repository_ship_checkpoints_each_operation_before_the_next(
         args.publish_operation = [PUBLIC, PUBLIC]
     else:
         args.deploy_operation = [LOCAL, LOCAL]
-    original = loaded["execute_prepared_operation"]
+    original = loaded["execute_release_builds"]
     count = 0
 
-    def execute(prepared: Any, **kwargs: Any) -> dict[str, Any]:
+    def execute(root: pathlib.Path, requests: Any, contract: Any, **kwargs: Any) -> dict[str, Any]:
         nonlocal count
-        if prepared.category == category:
+        if not kwargs.get("prepare_only") and requests[0].operation == (PUBLIC if category == "publish" else LOCAL):
             count += 1
             if count == 2:
                 records = [
@@ -410,16 +410,16 @@ def test_repository_ship_checkpoints_each_operation_before_the_next(
                 assert selected[0]["position"] == 1
                 assert selected[0]["result"].get("step_results", []) == expected_results
                 raise RuntimeError("interrupted between operations")
-        return original(prepared, **kwargs)
+        return original(root, requests, contract, **kwargs)
 
     loaded["_checkpointed_operation_batch"].__globals__[
-        "execute_prepared_operation"
+        "execute_release_builds"
     ] = execute
     with pytest.raises(RuntimeError, match="interrupted"):
         loaded["ship_repository"](args)
     assert log.read_text().splitlines().count(label) == 1
     loaded["_checkpointed_operation_batch"].__globals__[
-        "execute_prepared_operation"
+        "execute_release_builds"
     ] = original
     resumed = loaded["ship_repository"](args)
     assert resumed["status"] == "already_shipped"

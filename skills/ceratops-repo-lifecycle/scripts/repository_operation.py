@@ -6,7 +6,7 @@ mutation. Lifecycle callers own timing and choose operation IDs. This runner
 prepares the whole batch, runs validation and tests as separate selected stages,
 before delivery, stopping on unsuccessful exit codes. CI never dispatches skill
 handoffs. Skill callers resolve installed action bindings, keeping implementations
-out of repository declarations. Prerequisites remain setup annotations.
+out of repository declarations. Declared build prerequisites run before dependent builds and delivery.
 Successful steps may return bounded schema-tagged JSON results; their domain
 status is preserved separately from command completion and checkpointed by callers.
 """
@@ -24,12 +24,14 @@ import sys
 from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, replace
-from graphlib import TopologicalSorter
 from typing import Any
 
 import complete_artifact_builds
 import execute_skill_actions
 import reuse_operation_checks
+from run_build_operations import (
+    build_operation_context, execute_check_phases, execute_release_builds,
+)
 import sdlc_results
 import store_artifacts
 from ceratops_repo_compatibility_engine.sdlc_contract_validation import (
@@ -343,7 +345,8 @@ def execute_worktree_build(repo_root: pathlib.Path, **kwargs: Any) -> dict[str, 
     """Run the internal source-commit, SDLC checks/build and receipt/tag sequence."""
     from execute_worktree_build import execute_worktree_build as execute
 
-    return execute(repo_root, **kwargs)
+    with build_operation_context(repo_root):
+        return execute(repo_root, **kwargs)
 
 
 def read_repository_contract(
@@ -552,7 +555,12 @@ def prepare_operations(
     for item in prepared:
         groups = entries.get(item.operation, {}).get("check-groups", {})
         if item.category == "build":
-            grouped.append(replace(item, build_check_groups=tuple(groups)))
+            grouped.append(replace(
+                item, build_check_groups=tuple(groups),
+                required_artifacts=tuple(dict.fromkeys(reference for group in groups.values()
+                                                       for reference in group["requires-artifacts"])),
+                selected_artifacts=artifacts,
+            ))
         elif groups:
             for name, group in groups.items():
                 required = tuple(group["requires-artifacts"])
@@ -562,7 +570,7 @@ def prepare_operations(
                     selected_artifacts={key: artifacts[key] for key in required if artifacts and key in artifacts},
                 ))
         else:
-            grouped.append(item)
+            grouped.append(replace(item, selected_artifacts=artifacts))
     prepared = grouped
     if any(item.result_commit_field for item in prepared[:-1]):
         raise OperationError("A build returning its final commit must be the last selected operation.")
@@ -656,6 +664,8 @@ def execute_prepared_operation(
     base: dict[str, object] = {
         "operation": prepared.operation,
         "commit": prepared.commit,
+        "qualification_level": prepared.qualification_level,
+        "parameters": dict(prepared.parameters),
         "steps": [],
     }
     if prepared.check_group is not None:
@@ -757,6 +767,7 @@ def execute_prepared_operation(
                 mcp_package_context = {
                     "source": prepared.mcp_source,
                     "packages": prepared.prerequisites["packages"],
+                    "artifacts": dict(prepared.selected_artifacts or {}),
                 }
             outcome = execute_skill_actions.execute_handoff(
                 route,
@@ -1136,107 +1147,6 @@ def execute_prepared_operations(
     return final_result
 
 
-def execute_check_phases(
-    prepared: Sequence[PreparedOperation], *, diagnostic_output: pathlib.Path | None = None,
-    diagnostic_owner: tuple[pathlib.Path, str] | None = None, successful_results: Any = (),
-) -> dict[str, Any]:
-    """Finish independent checks; start dependent work only with its exact files.
-
-    Only explicitly phased batches use this ordering. Build commands retain
-    their declared order and execute their intrinsic checks themselves. Returned
-    artifacts, or explicitly supplied existing files, are the only inputs to
-    after-build checks; this function never discovers a latest installation.
-    """
-    before = [item for item in prepared if item.category in {"validate", "tests"}
-              and item.check_phase != "after-build"]
-    builds = [item for item in prepared if item.category == "build"]
-    by_reference = {item.operation.rsplit(".actions.", 1)[0]: item for item in builds}
-    dependencies = {key: {f"deliverables.packages.{name}" for name in item.prerequisites.get("packages", {})}
-                    & by_reference.keys() for key, item in by_reference.items()}
-    builds = [by_reference[key] for key in TopologicalSorter(dependencies).static_order()]
-    after = [item for item in prepared if item.check_phase == "after-build"]
-    delivery = [item for item in prepared if item.category not in {"validate", "tests", "build"}]
-    results: list[dict[str, Any]] = []
-    available: dict[str, list[str]] = {}
-    for item in prepared:
-        for key, paths in (item.selected_artifacts or {}).items():
-            if key in available and paths != available[key]:
-                return {"status": "result_invalid", "message": f"Conflicting selected artifacts for {key}",
-                        "results": [], "completed_operations": [],
-                        "pending_operations": [item.operation for item in prepared]}
-            available[key] = list(paths)
-
-    def run(item: PreparedOperation) -> dict[str, Any]:
-        result = execute_prepared_operation(
-            item, diagnostic_output=diagnostic_output, diagnostic_owner=diagnostic_owner,
-            successful_results=(successful_results, results),
-        )
-        results.append(result)
-        return result
-
-    # Prepare every source check before any check executes. Artifact-dependent
-    # checks get their input plans after the selected build files exist.
-    try:
-        before = [replace(item, check_plan=reuse_operation_checks.plan_operation(item))
-                  if item.check_results is not None else item for item in before]
-    except (OSError, ValueError) as exc:
-        return {"status": "result_invalid", "message": str(exc), "results": [],
-                "completed_operations": [], "pending_operations": [item.operation for item in prepared]}
-    for item in before:
-        run(item)
-    before_failed = any(item["status"] in FAILED_STATUSES for item in results)
-    if not before_failed:
-        for item in builds:
-            reference = item.operation.rsplit(".actions.", 1)[0]
-            available.pop(reference, None)
-            missing = dependencies[reference] - available.keys()
-            if missing:
-                results.append({"operation": item.operation, "status": "operation_failed", "blocked": True,
-                                "message": "Required builds did not produce accepted artifacts: " + ", ".join(sorted(missing))})
-                continue
-            result = run(replace(item, selected_artifacts={key: available[key] for key in dependencies[reference]})
-                         if dependencies[reference] else item)
-            if result["status"] not in FAILED_STATUSES and item.operation.startswith("deliverables."):
-                reference = item.operation.rsplit(".actions.", 1)[0]
-                try:
-                    produced: dict[str, list[str]] = {}
-                    for step in result.get("step_results", []):
-                        for key, paths in store_artifacts.build_result_artifact_paths(
-                            item.repo_root, step.get("result", {}), reference,
-                        ).items():
-                            produced.setdefault(key, []).extend(paths)
-                    available.update({key: list(dict.fromkeys(paths)) for key, paths in produced.items()})
-                except (OSError, ValueError, KeyError, TypeError, store_artifacts.OperationError) as exc:
-                    result.update(status="result_invalid", message=str(exc))
-        for item in after:
-            missing = set(item.required_artifacts) - available.keys()
-            if missing:
-                results.append({"operation": item.operation, "check_group": item.check_group,
-                                "status": "tests_failed", "steps": [], "blocked": True,
-                                "message": "Required artifacts are not ready: " + ", ".join(sorted(missing))})
-            else:
-                run(replace(item, selected_artifacts={key: available[key] for key in item.required_artifacts},
-                            check_plan=None))
-    if not any(item["status"] in FAILED_STATUSES for item in results):
-        for item in delivery:
-            if run(item)["status"] in FAILED_STATUSES:
-                break
-    failed = [item for item in results if item["status"] in FAILED_STATUSES]
-    failed_names = {item["operation"] for item in failed}
-    completed = list(dict.fromkeys(item["operation"] for item in results
-                                   if item["status"] in {"completed", "no_op"}
-                                   and item["operation"] not in failed_names))
-    final_result = {"status": failed[0]["status"] if failed else "completed", "results": results,
-            "deferred_handoffs": [handoff for result in results for handoff in result.get("deferred_handoffs", [])],
-            "completed_operations": completed,
-            "pending_operations": list(dict.fromkeys(item.operation for item in prepared
-                                                     if item.operation not in completed))}
-    if prepared:
-        remove_operation_failures(final_result, diagnostic_output=diagnostic_output,
-                                  diagnostic_owner=diagnostic_owner or (prepared[0].repo_root, "operation"))
-    return final_result
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo-root", type=pathlib.Path, default=pathlib.Path.cwd())
@@ -1282,6 +1192,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--qualification-level", choices=["alpha", "beta", "rc", "final"],
                         help="Required qualification of newly executed or reused checks; default alpha, beta for promotion tests.")
+    parser.add_argument("--confirm-previous-commands-stopped", action="store_true")
     parser.add_argument("--evidence-file", type=pathlib.Path)
     parser.add_argument("--retire-handoff-reports", type=pathlib.Path, help="Consume completed installer JSON and retire obsolete reports without executing the operation.")
     parser.add_argument("--diagnostic-output", type=pathlib.Path)
@@ -1302,8 +1213,22 @@ def main(argv: list[str] | None = None) -> int:
         context = "ci" if args.ci else "return" if args.return_handoffs else "skill"
         parameters = parse_parameters(args.parameter)
         artifacts = json.loads(args.artifacts) if args.artifacts else {}
-        reuse_operation_checks.artifact_inputs(root, artifacts)
         conditional = parse_parameters(args.parameter_if_declared)
+        if not (args.validate or args.tests) and any(
+            operation_category(name) in MUTATION_CATEGORIES for name in args.operation
+        ):
+            result = execute_release_builds(
+                root, [OperationRequest(name, parameters, conditional, args.if_declared)
+                       for name in args.operation], args.sdlc_contract,
+                context=context, artifacts=artifacts,
+                qualification_level=args.qualification_level or "alpha",
+                expected_commit=args.commit, validation_operations=args.validation_operation,
+                diagnostic_output=args.diagnostic_output,
+                diagnostic_owner=(args.diagnostic_repo_root or root, args.diagnostic_action),
+                confirm_stopped=args.confirm_previous_commands_stopped, prepare_only=args.prepare_only,
+            )
+            return finish_operation_request(args, result)
+        reuse_operation_checks.artifact_inputs(root, artifacts)
         if args.commit:
             require_clean_commit(root, args.commit)
         test_context = None
@@ -1399,7 +1324,7 @@ def main(argv: list[str] | None = None) -> int:
         validations = [replace(item, qualification_level=level) for item in validations]
         prepared = [replace(item, qualification_level=level) for item in prepared]
         if args.prepare_only:
-            result: dict[str, Any] = {
+            result = {
                 "status": "prepared",
                 "operations": args.operation,
             }
@@ -1466,6 +1391,11 @@ def main(argv: list[str] | None = None) -> int:
             repo_root=args.diagnostic_repo_root or args.repo_root,
             action=args.diagnostic_action,
         )
+    return finish_operation_request(args, result)
+
+
+def finish_operation_request(args, result) -> int:
+    """Keep the public command response and report cleanup identical for every route."""
     failed = result.get("status") in FAILED_STATUSES
     if args.evidence_file:
         try:

@@ -10,6 +10,7 @@ import pathlib
 import runpy
 import shutil
 import sys
+from dataclasses import replace
 
 import pytest
 
@@ -116,12 +117,45 @@ def test_worktree_build_commits_selected_source_and_finishes_once(tmp_path):
     assert run_git(repository, "show", result["tag"] + ":unrelated.txt").stdout == "original"
     assert run_git(repository, "diff", "--cached", "--name-only").stdout.strip() == "unrelated.txt"
     assert (repository / ".build-count").read_text() == "x"
+
     selected = results.read_build_check_summary(repository, result["tag"],
                                                 pathlib.Path(result["build_receipts"][0]).relative_to(repository).as_posix())
     assert selected["summary"]["checks"]
     again = runner.execute_worktree_build(repository, **options)
     assert again["status"] == "completed" and again["final_commit"] == result["final_commit"], again
     assert (repository / ".build-count").read_text() == "x"
+
+
+def test_release_build_consumes_existing_tagged_receipt_without_starting_builder(tmp_path):
+    repository, options = _worktree_build_case(tmp_path)
+    contract_path = repository / runner.DEFAULT_CONTRACT
+    contract = json.loads(contract_path.read_text())
+    reference = "deliverables.packages.claims"
+    contract["repository"]["release-units"] = {"claims": {"members": [reference]}}
+    action = contract["deliverables"]["packages"]["claims"]["actions"]["build"]
+    action["parameters"].append("target")
+    action["steps"][0]["run"].append("{target}")
+    contract_path.write_text(json.dumps(contract))
+    assert run_git(repository, "add", ".").returncode == 0
+    assert run_git(repository, "commit", "-m", "single-member unit").returncode == 0
+    first = runner.execute_worktree_build(repository, **options)
+    assert first["status"] == "completed", first
+    request = runner.OperationRequest(reference + ".actions.build", {
+        "target": options["required_targets"][0], "version": first["version"],
+        "artifact_directory": str(repository / ".unused-output"),
+    })
+    for _ in range(2):
+        result = runner.execute_release_builds(repository, [request], qualification_level="beta")
+        assert result["status"] == "completed", result
+        built = next(item for item in result["results"] if item["operation"].endswith(".build"))
+        assert built["build_decision"] == "reused" and built["build_tag"] == first["tag"]
+        assert (repository / ".build-count").read_text() == "x"
+        assert not (repository / ".unused-output").exists()
+    # The saved receipt contains no custom builder options; their absence
+    # cannot stand for proof that this package was built with today's options.
+    prepared = runner.prepare_operations(repository, [request])[0]
+    builds = importlib.import_module("run_build_operations")
+    assert builds.recorded_build(replace(prepared, parameters=(*prepared.parameters, ("mode", "debug"))), {}) is None
 
 
 def test_worktree_build_failure_preserves_cause_without_receipt_or_tag(tmp_path):

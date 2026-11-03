@@ -135,6 +135,7 @@ def execute_worktree_build(
     receipts skip their commands and an existing tag skips all build work.
     """
     import repository_operation as operations
+    from run_build_operations import prepare_build_operations
 
     root = pathlib.Path(repo_root).resolve(strict=True)
     transaction = None
@@ -188,11 +189,14 @@ def execute_worktree_build(
             target_requests = [replace(item, parameters_if_declared={
                 **parameters, **(item.parameters_if_declared or {}),
             }) for item in requests[target]]
-            prepared = operations.prepare_operations(root, target_requests, contract_path)
+            prepared = prepare_build_operations(
+                root, target_requests, contract_path,
+                qualification_level=sdlc_results.build_qualification(transaction.version),
+            )
             prepared = [replace(item, source_input_paths=transaction.declared_input_paths) for item in prepared]
             if any(item.result_commit_field for item in prepared):
                 raise store_artifacts.OperationError('Internal build commands must leave receipt commits to the build completer.')
-            batch = operations.execute_prepared_operations(
+            batch = operations.execute_check_phases(
                 prepared, diagnostic_output=diagnostic_output,
                 diagnostic_owner=(root, 'build'), successful_results=results,
             )

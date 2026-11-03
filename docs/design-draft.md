@@ -545,7 +545,8 @@ scripts project declares `tool.ceratops.test-support.managed = true`.
 
 `repository_operation.prepare_operations()` reads v5 `check-groups` with required
 `phase` and `requires-artifacts` fields. `execute_check_phases()` completes
-independent source checks, orders selected package builds by their prerequisites,
+independent source checks, orders declared builds by their prerequisites and
+required artifact inputs,
 and starts after-build checks only with every required artifact available.
 During-build groups execute inside the build process and must return their real
 passing records. The executor never creates a pass for a named but absent check.
@@ -560,6 +561,32 @@ version/target paths. SDLC v4/v5 declarations accept these same build formats.
 Integrity checks complete for the entire build output
 before it becomes available to dependent builds or checks. Multiple output
 steps accumulate their files; a missing or changed file exposes no partial set.
+
+`run_build_operations.py` owns this scheduler and dependency expansion;
+`repository_operation.py` retains its public callable and individual command
+execution. `execute_release_builds()` takes the release lock before preparing
+commands or reading the source commit. Direct calls wait at most 60 seconds;
+promotion and Ship calls retain their existing ownership. The lock covers source
+checks, dependency builds, artifact tests, delivery and local command cleanup.
+Return or exception releases it only after commands stop; unknown shutdown keeps
+the existing unfinished flag. Task-worktree builds remain unlocked.
+
+The dependency graph includes declared package prerequisites at every level and
+non-package artifacts named by during-build groups. A joint after-build test
+brings in its other required members. Every action runs once per target, with
+separate artifact maps for different targets. Installers receive the requested
+build's returned files and dependency files through `selected_artifacts`. An old
+file merely present in the output directory cannot satisfy a failed build.
+The adapter translates these paths; it performs no alternate-file search.
+
+The current call consumes matching supplied build receipts before running a
+producer. It can also consume an existing tagged receipt for an explicitly named
+single-member unit and target at its recorded source/final commit. Older builders
+without stored acceptance retain their native repeat behavior. Step 8 adds finer
+input comparison and member-level bundle decisions. This call writes no new
+cache or build-history files: native build/receipt owners keep their existing
+bounded storage and cleanup. Build failure preserves completed promotion and
+accepted outputs; it blocks only dependent work and returns the original cause.
 
 The test runner owns `.build/test-diagnostics/pytest-failure.json`. Its shared
 support module stores current failure IDs and deduplicated full, redacted command
@@ -580,7 +607,8 @@ execution phase. The executor then calls the existing per-target receipt and
 completion functions. Existing receipts skip producer work; an existing tag lets
 the same call finish scoped retention and failure-report deletion. The returned
 commit and tag come from the completer, not a later read of HEAD. Standalone
-builds take no worktree/release lock. Public Build adoption remains a later step.
+builds in independent task worktrees take no lock; the same callable protects
+release source before preparation. Public Build adoption remains a later step.
 
 `ND.COMPATIBILITY.TEST_RESULT_REUSE` reviews independently reusable units using
 saved outcomes and behavior evidence, including interruption and partial fixes.

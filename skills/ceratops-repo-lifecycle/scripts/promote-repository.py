@@ -50,7 +50,7 @@ from repository_operation import (
     OperationError,
     OperationRequest,
     PreparedOperation,
-    execute_prepared_operations,
+    execute_release_builds,
     operation_category,
     parse_parameters,
     prepare_operations,
@@ -691,8 +691,11 @@ def _deploy_completed_promotion(
     with _timed_phase(timings, "deployment", diagnostic_output=getattr(args, "diagnostic_output", None)):
         try:
             require_clean_commit(repo_root, target_commit)
-            operations = execute_prepared_operations(
-                prepared_operations,
+            operations = execute_release_builds(
+                repo_root,
+                [OperationRequest(item.operation, parameters=dict(item.parameters))
+                 for item in prepared_operations], getattr(args, "sdlc_contract", DEFAULT_SDLC_CONTRACT),
+                expected_commit=target_commit, qualification_level="beta",
                 diagnostic_output=getattr(args, "diagnostic_output", None),
                 diagnostic_owner=(args.repo_root, "promote"),
                 successful_results=validation["results"],
@@ -726,6 +729,7 @@ def _deploy_completed_promotion(
     operations["completed_operations"] = [
         operation_result["operation"]
         for operation_result in operations.get("results", [])
+        if operation_result["operation"] in {item.operation for item in prepared_operations}
     ]
     operations.pop("deferred_handoffs", None)
 

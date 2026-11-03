@@ -700,10 +700,29 @@ into repository and skill lifecycle runtimes. It finds one shared lock at
 `<git-common-dir>/ceratops/locks/release-local` from any repository worktree,
 without requiring a remote. The pinned library's `lock_descriptor` function uses
 native Windows/Linux locking without truncating the file or falling back to a
-file-existence lock. Promotion and Ship wait up to 60 seconds for another holder,
+file-existence lock. Promotion, Ship and declared builds from the release checkout
+wait up to 60 seconds for another holder,
 using a monotonic deadline inside Python. After acquisition they run their normal
 preconditions against the current repository. Other callers still try once.
 The waiting limit does not limit the duration of the operation holding the lock.
+
+Declared builds now enter `repository_operation.execute_release_builds()` before
+reading the release commit or SDLC contract. Its implementation in
+`run_build_operations.py` follows declared package prerequisites and required
+artifact inputs for packages, skills, MCP servers and applications. It builds
+dependencies before consumers, runs joint tests with their exact returned files,
+then passes those files to requested delivery operations. A direct Build,
+Promote-and-deploy and Ship's local build phase use this same call. Promotion
+keeps its required source checks; applicable passing results remain reusable.
+Independent task-worktree builds take no release lock.
+
+The runner consumes matching successful build results and existing tagged
+receipts with the same recorded source, target and release level. Native builders
+retain ownership of their existing artifacts, receipts and interrupted-output
+cleanup. No new build history or checkpoint folder is created. A failed build
+starts no dependent installation and never rolls back a completed promotion.
+The MCP adapter receives the accepted wheel path and canonical native lock; it
+does not search an output folder for an alternative wheel.
 
 The retained lock file stores one Boolean, `unfinished_run`: its first byte
 is `1` during work and `0` after explicit clean completion. Before allowing

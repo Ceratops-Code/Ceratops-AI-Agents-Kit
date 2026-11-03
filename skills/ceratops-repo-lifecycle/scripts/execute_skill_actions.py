@@ -61,13 +61,11 @@ def _call_action(root: pathlib.Path, declaration: Mapping[str, Any], arguments: 
 def _mcp_package_arguments(
     repo_root: pathlib.Path, server_name: str, context: Mapping[str, Any],
 ) -> dict[str, str]:
-    """Select existing declared package outputs; never build or test them again.
+    """Translate the runner's accepted wheel and native lock into install argv.
 
-    The SDLC runner supplies authoritative source and prerequisite declarations.
-    File selection is confined to this checkout, follows the MCP's exact package
-    pin, and admits one wheel and one canonical package lock. The installer owns
-    wheel-content and deployment checks. No process or persistent output starts
-    until this complete selection succeeds.
+    The adapter neither starts builds nor searches output directories. Project
+    metadata supplies the exact native package pin and canonical lock; accepted
+    wheel paths may live in the repository's shared artifact store.
     """
     root = repo_root.resolve()
 
@@ -112,23 +110,24 @@ def _mcp_package_arguments(
                 or len(pins) != 1
                 or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*\s*==\s*" + re.escape(version), pins[0]) is None):
             raise ValueError(f"MCP package {name} must match its declared distribution and exact version pin")
-        directory = owned_path(artifact["output-directory"])
-        pattern = artifact["filename-pattern"]
-        if "/" in pattern or "\\" in pattern or not pattern.endswith(".whl"):
-            raise ValueError(f"Package {name} needs a wheel filename pattern without directories")
+        # The build runner supplies exact accepted paths. A stale second wheel
+        # in the producer's output directory must not affect this installation.
+        files = context.get("artifacts", {}).get(f"deliverables.packages.{name}", [])
         wheels = []
-        for candidate in directory.glob(pattern):
-            selected = owned_path(str(candidate.relative_to(root)))
-            # A wheel's distribution and version are its first two filename
-            # components. Content acceptance remains with the existing installer.
-            parts = selected.name.removesuffix(".whl").split("-")
+        for filename in files:
+            candidate = pathlib.Path(filename)
+            candidate = candidate if candidate.is_absolute() else root / candidate
+            if candidate.suffix != ".whl":
+                continue
+            if candidate.is_symlink() or candidate.is_junction() or not candidate.is_file():
+                raise ValueError(f"Accepted package wheel is unavailable: {candidate}")
+            parts = candidate.name.removesuffix(".whl").split("-")
             if len(parts) not in {5, 6}:
-                raise ValueError(f"Malformed package wheel filename: {selected}")
-            if selected.is_file() and distribution_key(parts[0]) == distribution and parts[1] == version:
-                wheels.append(selected)
+                raise ValueError(f"Malformed package wheel filename: {candidate}")
+            if distribution_key(parts[0]) == distribution and parts[1] == version:
+                wheels.append(candidate.resolve())
         if len(wheels) != 1:
-            build = package.get("action-locations", {}).get("build", "the declared package build action")
-            raise ValueError(f"Package {name} needs exactly one existing {version} wheel in {directory}; use {build}")
+            raise ValueError(f"Package {name} requires one exact accepted {version} wheel from its Build result")
         lock_root = project_path.parent
         # Native package metadata may select the repository's shared uv project.
         # Resolve metadata only; no executable code comes from the checkout.

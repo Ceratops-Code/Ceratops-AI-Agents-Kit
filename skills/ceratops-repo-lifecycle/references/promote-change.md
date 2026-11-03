@@ -66,7 +66,17 @@ failure or decision reaches the model. Corrections therefore run unlocked; the
 next normal call reads current inputs. Unknown shutdown retains `unfinished_run`
 and the existing explicit recovery requirement. Clearing it neither accepts
 failed work nor deletes checkpoints. Complete report forwarding is implemented;
-new phase scheduling and receipt-driven remote work remain later steps.
+receipt-driven remote work remains a later step.
+
+Declared builds and install prerequisites run through
+`repository_operation.execute_release_builds()`. It expands the requested SDLC
+actions' dependencies, runs source checks, builds dependencies before consumers,
+and runs output tests against the exact new or reused files before delivery.
+The same callable serves direct release builds and Ship's local build phase.
+It acquires the release lock before preparing commands; a promotion caller keeps
+its already-held lock. Required promotion source checks remain in place, and
+applicable successful results pass into the existing reuse code. Failed builds
+block dependent installation while preserving completed promotion and outputs.
 
 Installation runs after promotion has completed, outside the code that can
 restore the previous release commit. Plain Promote finishes local cleanup and

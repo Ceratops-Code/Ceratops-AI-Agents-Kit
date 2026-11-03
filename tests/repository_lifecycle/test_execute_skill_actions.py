@@ -931,6 +931,7 @@ def test_mcp_handoff_selects_shared_project_lock(tmp_path, monkeypatch, missing_
     )
     wheel = output / "sample_package-1.0.0-py3-none-any.whl"
     wheel.write_bytes(b"Existing accepted artifact; dispatch does not inspect its contents.")
+    (output / "sample_package-0.9.0-py3-none-any.whl").write_bytes(b"Unrelated old output")
     lock = project / "uv.lock"
     if not missing_lock:
         lock.write_text("version = 1\n")
@@ -948,7 +949,8 @@ def test_mcp_handoff_selects_shared_project_lock(tmp_path, monkeypatch, missing_
         return {"status": "completed"}
 
     monkeypatch.setattr(skill_actions, "_call_action", install)
-    context = {"source": "mcp", "packages": {"sample-package": {
+    context = {"source": "mcp", "artifacts": {"deliverables.packages.sample-package": [str(wheel)]},
+               "packages": {"sample-package": {
         "project": "package/pyproject.toml", "artifact": {
             "type": "python-wheel", "distribution": "sample-package",
             "output-directory": ".build", "filename-pattern": "*.whl",
@@ -970,3 +972,12 @@ def test_mcp_handoff_selects_shared_project_lock(tmp_path, monkeypatch, missing_
             assert root == installed
             assert argv[argv.index("--package-lock") + 1] == str(lock)
             assert argv[argv.index("--package-wheel") + 1] == str(wheel)
+        # A matching wheel on disk cannot replace a missing accepted-build input.
+        context["artifacts"] = {}
+        missing = skill_actions.execute_handoff(
+            "ceratops-mcp-server-lifecycle/install", repo,
+            inputs={"mcp-server": "sample-server", "prerequisite-packages": ["sample-package"]},
+            mcp_package_context=context,
+        )
+        assert missing["status"] == "operation_failed" and "accepted" in missing["message"]
+        assert len(calls) == 2

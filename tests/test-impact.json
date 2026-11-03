@@ -1365,6 +1365,7 @@
       "id": "repository-operation-source",
       "paths": [
         "skills/ceratops-repo-lifecycle/scripts/repository_operation.py",
+        "skills/ceratops-repo-lifecycle/scripts/run_build_operations.py",
         "skills/ceratops-repo-lifecycle/scripts/execute_skill_actions.py",
         "skills/ceratops-repo-lifecycle/scripts/check_deployment_receipts.py",
         "skills/ceratops-repo-lifecycle/references/schemas/sdlc.v*.schema.json"
