@@ -589,7 +589,10 @@ reuse needs an evidence-backed explanation of lost work. Governance candidate
 checks parse JSON and TOML without Markdown reflow, preserving their string bytes.
 
 The compact `ceratops-check-summary.v1` export contains `inputGroups` and
-`checkGroups` tables plus `checks`. Each outcome references its inlined facts and
+`checkGroups` tables plus `checks`. The exporter omits duplicated local result-file
+paths and file hashes from pytest outcomes whose input facts are embedded. The
+original local observations retain those links; existing saved results are not
+rewritten. Each outcome references its inlined facts and
 keeps the original result ID, check version, qualification level, required scope,
 phase outcomes and whether it was executed or reused. The input table keys hash
 their complete canonical contents. `docs/result_records.py.tmpl` owns repository

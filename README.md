@@ -2138,7 +2138,10 @@ arguments and runtime settings are omitted. These explanations use the same
 input comparison as reuse and do not change accepted results or run extra tests.
 
 `ceratops-check-summary.v1` carries `inputGroups`, `checkGroups` and `checks`.
-Tables store repeated input facts once. Outcomes retain original result IDs,
+Tables store repeated input facts once. Exported pytest outcomes omit local
+result-file paths and file hashes when their complete input facts are embedded;
+original local observations keep those references. This avoids repeating local
+links in full-suite result records. Outcomes retain original result IDs,
 check versions, qualification levels, required/optional scope and phase facts;
 reused passes remain distinct from execution. Skips keep their reason, not a
 fabricated pass. Repository checks export the same envelope from the canonical
