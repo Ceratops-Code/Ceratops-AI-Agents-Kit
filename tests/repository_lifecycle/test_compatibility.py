@@ -13,6 +13,7 @@ import sys
 import tomllib
 import zipfile
 
+import jsonschema
 import pytest
 import yaml
 
@@ -1136,6 +1137,7 @@ def test_unpublished_ci_action_blocks_compatibility_before_target_writes(
     assert {path.name for path in tmp_path.iterdir()} == {".git"}
 
 
+
 def _capability_contract(version, capabilities):
     """Supply ordinary actions so capability tests exercise the real SDLC reader."""
     return {
@@ -1152,6 +1154,57 @@ def _capability_contract(version, capabilities):
             },
         },
     }
+
+
+@pytest.mark.parametrize("schema_version", [4, 5])
+@pytest.mark.parametrize("tool", ["python", "node", "git", "custom-tool"])
+@pytest.mark.parametrize("inline", [{"version": ">=2"}, {"channel": "stable"}])
+@pytest.mark.parametrize("with_reference", [False, True])
+def test_sdlc_capabilities_reject_inline_requirements(
+    schema_version, tool, inline, with_reference
+):
+    reader = importlib.import_module(
+        "ceratops_repo_compatibility_engine.sdlc_contract_validation"
+    )
+    capability = {"executable": tool, **inline}
+    if with_reference:
+        capability["version-from"] = {
+            "file": "tooling/package.json", "key": "engines.node",
+        }
+    errors = reader.validation_errors(_capability_contract(schema_version, {tool: capability}))
+    assert any("repository.capabilities." + tool in error for error in errors)
+    assert any("Additional properties are not allowed" in error for error in errors)
+
+
+@pytest.mark.parametrize("schema_version", [4, 5])
+@pytest.mark.parametrize("source", [
+    None, "3.14", [], {},
+    {"file": "scripts/pyproject.toml"},
+    {"file": "tooling/package.json"},
+    {"file": "."},
+    {"file": "./"},
+    {"key": "project.requires-python"},
+    {"file": "", "key": "project.requires-python"},
+    {"file": "   ", "key": "project.requires-python"},
+    {"file": "/outside.toml", "key": "project.requires-python"},
+    {"file": "../outside.toml", "key": "project.requires-python"},
+    {"file": "C:/outside.toml", "key": "project.requires-python"},
+    {"file": "folder\\tool.toml", "key": "project.requires-python"},
+    {"file": 7, "key": "project.requires-python"},
+    {"file": "scripts/pyproject.toml", "key": ""},
+    {"file": "scripts/pyproject.toml", "key": "   "},
+    {"file": "scripts/pyproject.toml", "key": "project..requires-python"},
+    {"file": "scripts/pyproject.toml", "key": ["project", "requires-python"]},
+    {"file": "scripts/pyproject.toml", "key": "project.requires-python", "version": "3.14"},
+])
+def test_sdlc_capabilities_reject_malformed_version_references(schema_version, source):
+    reader = importlib.import_module(
+        "ceratops_repo_compatibility_engine.sdlc_contract_validation"
+    )
+    contract = _capability_contract(schema_version, {
+        "python": {"executable": "python", "version-from": source},
+    })
+    assert reader.validation_errors(contract)
 
 
 @pytest.mark.parametrize("schema_version", [4, 5])
@@ -1211,3 +1264,55 @@ def test_sdlc_capabilities_preserve_native_references_and_unversioned_tools(
         assert prepared.returncode == 0, prepared.stderr
         assert json.loads(prepared.stdout)["prerequisites"]["capabilities"] == capabilities
         assert {path: path.read_bytes() for path in original} == original
+
+
+@pytest.mark.parametrize("schema_version", [4, 5])
+def test_sdlc_invalid_capability_stops_public_runner_before_effects(tmp_path, schema_version):
+    contract = _capability_contract(schema_version, {
+        "git": {"executable": "git", "channel": "stable"},
+    })
+    contract["repository"]["actions"]["test"]["steps"] = [{"run": [
+        sys.executable, "-c", "from pathlib import Path; Path('ran').touch()",
+    ]}]
+    sdlc = tmp_path / "sdlc/sdlc.yml"
+    sdlc.parent.mkdir()
+    sdlc.write_text(yaml.safe_dump(contract), encoding="utf-8")
+    for _ in range(2):
+        blocked = run_operation_cli(tmp_path, "repository.actions.test")
+        assert blocked.returncode != 0
+        assert "repository.capabilities.git" in blocked.stderr
+        assert "channel" in blocked.stderr
+        assert not (tmp_path / "ran").exists()
+    contract["repository"]["capabilities"]["git"].pop("channel")
+    sdlc.write_text(yaml.safe_dump(contract), encoding="utf-8")
+    completed = run_operation_cli(tmp_path, "repository.actions.test")
+    assert completed.returncode == 0, completed.stderr
+    assert (tmp_path / "ran").is_file()
+
+
+def test_capability_changes_preserve_artifact_release_version_and_channel():
+    schema_path = REPOSITORY_LIFECYCLE_SOURCE / "references/schemas/operation-result.v1.schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    schema = {"$ref": "#/$defs/buildSelection", "$defs": schema["$defs"]}
+    record = {
+        "repository": "example/project", "sourceCommit": "a" * 40,
+        "releaseUnit": "example", "channel": "beta", "version": "7.2.0b1", "target": "any",
+    }
+    jsonschema.Draft202012Validator(schema).validate(record)
+    assert record["channel"] == "beta"
+    assert record["version"] == "7.2.0b1"
+
+
+def test_repository_capability_requirements_point_to_native_metadata():
+    reader = importlib.import_module(
+        "ceratops_repo_compatibility_engine.sdlc_contract_validation"
+    )
+    capabilities = reader.load_contract(ROOT / "sdlc/sdlc.yml")["repository"]["capabilities"]
+    python_reference = capabilities["python"]["version-from"]
+    python_metadata = tomllib.loads((ROOT / python_reference["file"]).read_text(encoding="utf-8"))
+    assert python_reference["key"] == "project.requires-python"
+    assert python_metadata["project"]["requires-python"]
+    node_reference = capabilities["node"]["version-from"]
+    assert set(node_reference) == {"file"}
+    assert (ROOT / node_reference["file"]).read_text(encoding="utf-8").strip() == "lts/*"
+    assert "version-from" not in capabilities["git"]

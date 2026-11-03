@@ -161,6 +161,8 @@ def operation_prerequisites(
 
     V4/v5 distinguish executable capabilities from package prerequisites and
     include transitive package metadata plus selectable action locations.
+    Version requirements stay as target-owned version-from references. This
+    reader neither rewrites them into inline values nor selects/installs tools.
     Nothing in this adapter runs a prerequisite action.
     """
 
@@ -238,12 +240,13 @@ def _typed_semantic_errors(value: Mapping[str, Any]) -> list[str]:
     capabilities = repository["capabilities"]
     for name, capability in capabilities.items():
         version_source = capability.get("version-from")
-        if version_source and not _relative_path(version_source["file"]):
+        if version_source and (
+            not _relative_path(version_source["file"])
+            or pathlib.PurePosixPath(version_source["file"]).name in {"", "."}
+        ):
             errors.append(
                 f"capability {name} version-from.file must be repository-relative"
             )
-        if sum(key in capability for key in ("version", "version-from", "channel")) > 1:
-            errors.append(f"capability {name} has multiple version authorities")
     deliverables = value.get("deliverables", {})
     packages = deliverables.get("packages", {})
     owners: list[tuple[str, Mapping[str, Any]]] = [("repository", repository)]

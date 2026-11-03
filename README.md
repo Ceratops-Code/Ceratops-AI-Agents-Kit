@@ -146,11 +146,16 @@ analysis-only child models.
 The `skills/` tree is authoritative skill source for this repository.
 `sdlc/sdlc.yml` declares repository setup and validation, plus capabilities
 of each deliverable. Lifecycle actions decide when those capabilities run.
-Executable-capability `version-from` references use repository-relative native
-metadata. Use `file` and a dotted `key` for a manifest field, such as
-`engines.node` in `package.json`; omit `key` for a single-value file such as
-`.nvmrc`. The reader passes these requirements to callers without downloading,
-installing or choosing runtimes.
+Executable capabilities in SDLC v4/v5 declare version requirements only through
+`version-from`: `file` names repository-relative native metadata, and `key`
+names its dotted field when the file is a structured manifest. A single-value
+file needs no key. Here Python references `scripts/pyproject.toml` at
+`project.requires-python`; Node references `scripts/.nvmrc`, whose `lts/*`
+keeps the existing LTS requirement. An npm requirement would reference the
+owning `package.json` field `engines.node`. Inline capability `version` and
+`channel` are rejected for every tool; omit `version-from` for an unversioned
+capability. These references report requirements without downloading, installing
+or choosing runtimes. Artifact, package and release versions are separate data.
 The repository-compatibility templates under
 `skills/ceratops-repo-lifecycle/references/templates/` are reusable skeletons
 to copy into other repositories, not live configuration.

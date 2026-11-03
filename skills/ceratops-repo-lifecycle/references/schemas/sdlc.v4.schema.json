@@ -42,7 +42,7 @@
       "pattern": "^(?![A-Za-z]:)(?![/\\\\])(?!.*(?:^|[/\\\\])\\.\\.(?:[/\\\\]|$)).+$"
     },
     "capability": {
-      "description": "Annotation-only executable metadata. Callers may report it but must not infer setup commands from it.",
+      "description": "Annotation-only executable metadata. Version requirements reference target-owned native metadata through version-from; omitted requirements leave the capability unversioned. Callers must not infer setup commands or select runtimes from it.",
       "type": "object",
       "additionalProperties": false,
       "required": [
@@ -50,10 +50,6 @@
       ],
       "properties": {
         "executable": {
-          "type": "string",
-          "minLength": 1
-        },
-        "version": {
           "type": "string",
           "minLength": 1
         },
@@ -92,10 +88,6 @@
               }
             }
           ]
-        },
-        "channel": {
-          "type": "string",
-          "minLength": 1
         },
         "includes": {
           "type": "array",
