@@ -210,9 +210,12 @@ abandonment/replacement and worktree removal rather than matching-work success.
    it leaves a worktree and branch untouched when the worktree's parent chain
    has no `worktrees` directory component and reports the exact preserved path.
 
-The helper refreshes the remote, fast-forwards main, and reuses the existing
-release batch. It checks live remote heads and tags for the branch and any task
-commit that would be rewritten; an inherited upstream alone is not publication.
+The helper reuses an existing release batch without fetching the remote,
+updating main or checking it out. When the release branch is absent, it refreshes
+the remote, fast-forwards main and creates the release branch from it. Existing
+local main history remains available for task-only rebase comparisons. It checks
+live remote heads and tags for the branch and any task commit that would be
+rewritten; an inherited upstream alone is not publication.
 The unique task boundary excludes history shared with main or release. If that
 boundary contains main history absent from release, Git merges the shared bases
 without changing either worktree before rebasing only task commits. Ambiguous

@@ -979,7 +979,16 @@ uses its checkout snapshot/restoration and existing local rebase functions;
 Ship uses its local branch-head reader. The existing caller-specific error
 classes are preserved. Branch selection, remote fetches, PR handling, tests,
 receipts, deployment and lock acquisition remain with the workflows. The Git
-functions never acquire or release locks. This split changes no Git policy.
+functions never acquire or release locks.
+
+Promotion uses an existing `release/local` as its starting commit. That route
+skips the preparatory remote fetch and leaves `main` and its worktree untouched;
+it also works with no local `main` or configured remote for ordinary fast-forward
+promotion. An available local `main` commit is read only to separate shared
+history during an automatic rebase. Live publication checks before rewriting
+task commits remain unchanged. Only a missing `release/local` causes promotion
+to fetch the remote, fast-forward local `main` and create the release branch.
+Failure restoration writes only the branches this preparation could change.
 
 The helper uses the already pinned library's public
 [`lock_descriptor`](https://py-filelock.readthedocs.io/en/stable/api.html#filelock.lock_descriptor)

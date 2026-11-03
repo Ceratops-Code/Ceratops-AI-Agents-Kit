@@ -445,8 +445,6 @@ def _promote(
             "refs/heads/release blocks the required release/local branch namespace."
         )
     git_branches._clean(repo_root, "before promotion")
-    if not git_branches._ref_exists(repo_root, f"refs/heads/{args.main_branch}"):
-        raise PromotionError(f"Local main branch does not exist: {args.main_branch}")
     checkout_state = git_branches._preflight_release_checkout(
         repo_root,
         args.main_branch,
@@ -455,20 +453,23 @@ def _promote(
     source_states: dict[str, SourceState] = {}
     if not args.prepare_release_only:
         source_states = git_branches._preflight_sources(repo_root, branches)
-    require_success(
-        git_branches._git(repo_root, "remote", "get-url", args.remote_name),
-        cwd=repo_root,
-    )
-    require_success(
-        git_branches._git(repo_root, "fetch", "--prune", args.remote_name),
-        cwd=repo_root,
-    )
     remote_main = f"{args.remote_name}/{args.main_branch}"
-    if not git_branches._ref_exists(
-        repo_root,
-        f"refs/remotes/{args.remote_name}/{args.main_branch}",
-    ):
-        raise PromotionError(f"Remote main branch does not exist: {remote_main}")
+    if checkout_state.release_head is None:
+        # Only a new batch starts from current remote main. An existing
+        # release is the selected baseline and needs no preparatory fetch.
+        require_success(
+            git_branches._git(repo_root, "remote", "get-url", args.remote_name),
+            cwd=repo_root,
+        )
+        require_success(
+            git_branches._git(repo_root, "fetch", "--prune", args.remote_name),
+            cwd=repo_root,
+        )
+        if not git_branches._ref_exists(
+            repo_root,
+            f"refs/remotes/{args.remote_name}/{args.main_branch}",
+        ):
+            raise PromotionError(f"Remote main branch does not exist: {remote_main}")
     git_branches._prepare_release_checkout(
         repo_root,
         args.main_branch,
@@ -492,6 +493,13 @@ def _promote(
             "head": release_start,
         }
 
+    # Rebase isolation may read existing local main history. It never
+    # refreshes main for an existing batch, and main is optional there.
+    main_head = (
+        git_branches._branch_head(repo_root, args.main_branch)
+        if checkout_state.release_head is None
+        else checkout_state.main_head or release_start
+    )
     merged: list[str] = []
     rebased: list[dict[str, str]] = []
     for branch in branches:
@@ -501,7 +509,7 @@ def _promote(
             release_head,
             branch,
             source_states[branch],
-            git_branches._branch_head(repo_root, args.main_branch),
+            main_head,
         )
         if rebase_result is not None:
             rebased.append(rebase_result)

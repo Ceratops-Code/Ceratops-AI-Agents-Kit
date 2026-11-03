@@ -18,6 +18,121 @@ from tests.repository_lifecycle.support import (
 from tests.support.repositories import run_git
 
 
+@pytest.mark.parametrize("main_state", ["remote-advanced", "missing", "other-worktree", "offline"])
+@pytest.mark.parametrize("initial_branch", ["approved", "release/local"])
+def test_existing_release_promotes_without_refreshing_main(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+    main_state: str, initial_branch: str,
+) -> None:
+    repo, approved_head, _log, _environment = prepare_repository_lifecycle_repo(tmp_path)
+    main_head = run_git(repo, "rev-parse", "main").stdout.strip()
+    assert run_git(repo, "branch", "release/local", "main").returncode == 0
+    main_worktree = tmp_path / "main-worktree"
+    if main_state == "remote-advanced":
+        assert run_git(repo, "push", "origin", "approved:main").returncode == 0
+    elif main_state == "missing":
+        assert run_git(repo, "branch", "-D", "main").returncode == 0
+        assert run_git(repo, "remote", "remove", "origin").returncode == 0
+    elif main_state == "other-worktree":
+        assert run_git(repo, "worktree", "add", str(main_worktree), "main").returncode == 0
+        (main_worktree / "README.md").write_text("unrelated main edits", encoding="utf-8")
+    else:
+        assert run_git(repo, "remote", "set-url", "origin", str(tmp_path / "offline.git")).returncode == 0
+    assert run_git(repo, "switch", initial_branch).returncode == 0
+    loaded = runpy.run_path(str(PROMOTE_REPOSITORY))
+    branches = loaded["git_branches"]
+    original_git = branches._git
+    calls: list[tuple[str, ...]] = []
+
+    def track_git(repo_root: pathlib.Path, *arguments: str) -> list[str]:
+        calls.append(arguments)
+        return original_git(repo_root, *arguments)
+
+    monkeypatch.setattr(branches, "_git", track_git)
+    args = loaded["build_parser"]().parse_args([
+        "--repo-root", str(repo), "--source-branch", "approved", "--no-run-operation",
+    ])
+    for _ in range(2):
+        result = loaded["promote"](args)
+        assert result["status"] == "ready"
+        assert result["head"] == approved_head
+        assert result["rebased_branches"] == []
+        assert run_git(repo, "branch", "--show-current").stdout.strip() == "release/local"
+        assert run_git(repo, "status", "--porcelain").stdout == ""
+        if main_state == "missing":
+            assert run_git(repo, "show-ref", "--verify", "refs/heads/main").returncode != 0
+        else:
+            assert run_git(repo, "rev-parse", "main").stdout.strip() == main_head
+    assert not any(call[0] == "fetch" or call == ("switch", "main") for call in calls)
+    assert not any(call[:3] == ("branch", "--force", "main") for call in calls)
+    if main_state == "other-worktree":
+        assert (main_worktree / "README.md").read_text(encoding="utf-8") == "unrelated main edits"
+
+
+@pytest.mark.parametrize("effect", [
+    "existing-switch", "existing-merge", "existing-missing-main",
+    "new-fetch", "new-switch", "new-main-merge", "new-release",
+])
+@pytest.mark.parametrize("after", [False, True])
+def test_release_preparation_retries_interrupted_effects(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, effect: str, after: bool,
+) -> None:
+    repo, approved_head, _log, _environment = prepare_repository_lifecycle_repo(tmp_path)
+    main_head = run_git(repo, "rev-parse", "main").stdout.strip()
+    existing = effect.startswith("existing-")
+    if existing:
+        assert run_git(repo, "branch", "release/local", "main").returncode == 0
+    if effect == "existing-missing-main":
+        assert run_git(repo, "branch", "-D", "main").returncode == 0
+    commands = {
+        "existing-switch": ("switch", "release/local"),
+        "existing-merge": ("merge", "--ff-only", "approved"),
+        "existing-missing-main": ("merge", "--ff-only", "approved"),
+        "new-fetch": ("fetch", "--prune", "origin"),
+        "new-switch": ("switch", "main"),
+        "new-main-merge": ("merge", "--ff-only", "origin/main"),
+        "new-release": ("switch", "-c", "release/local", "main"),
+    }
+    loaded = runpy.run_path(str(PROMOTE_REPOSITORY))
+    branches = loaded["git_branches"]
+    armed = True
+    original_run = branches.require_success
+
+    def interrupt(command: list[str], **kwargs: Any) -> Any:
+        nonlocal armed
+        if armed and tuple(command[3:]) == commands[effect]:
+            armed = False
+            if after:
+                original_run(command, **kwargs)
+            raise loaded["PromotionError"]("interrupted Git effect")
+        return original_run(command, **kwargs)
+
+    monkeypatch.setattr(branches, "require_success", interrupt)
+    # Fetch is owned by the promotion workflow; branch effects by its Git adapter.
+    monkeypatch.setitem(loaded["promote"].__globals__, "require_success", interrupt)
+    args = loaded["build_parser"]().parse_args([
+        "--repo-root", str(repo), "--source-branch", "approved", "--no-run-operation",
+    ])
+    with pytest.raises(loaded["PromotionError"], match="interrupted Git effect"):
+        loaded["promote"](args)
+    assert not armed
+    assert run_git(repo, "branch", "--show-current").stdout.strip() == "approved"
+    assert run_git(repo, "rev-parse", "HEAD").stdout.strip() == approved_head
+    assert run_git(repo, "status", "--porcelain").stdout == ""
+    if effect == "existing-missing-main":
+        assert run_git(repo, "show-ref", "--verify", "refs/heads/main").returncode != 0
+    else:
+        assert run_git(repo, "rev-parse", "main").stdout.strip() == main_head
+    release = run_git(repo, "rev-parse", "--verify", "refs/heads/release/local")
+    assert release.stdout.strip() == main_head if existing else release.returncode != 0
+    for _ in range(2):
+        result = loaded["promote"](args)
+        assert result["status"] == "ready"
+        assert result["head"] == approved_head
+        assert run_git(repo, "branch", "--show-current").stdout.strip() == "release/local"
+        assert run_git(repo, "status", "--porcelain").stdout == ""
+
+
 @pytest.mark.parametrize(
     (
         "operation_arguments",
