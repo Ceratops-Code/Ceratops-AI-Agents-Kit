@@ -11,6 +11,7 @@ import runpy
 import subprocess
 import sys
 import zipfile
+from contextlib import contextmanager
 
 import pytest
 
@@ -95,6 +96,50 @@ def test_public_installers_retain_exact_source_after_checkout_disappears(tmp_pat
         assert packet_call(repo, installed, output, cleanup=True).returncode == 0
     assert not output.exists()
     assert not selected.exists()
+
+
+@pytest.mark.parametrize("entrypoint", [BOOTSTRAP, INSTALLER_TEMPLATE, BUILDER, RUNTIME_INSTALLER],
+                         ids=["repository-bootstrap", "compatible-bootstrap", "builder", "managed"])
+def test_public_installers_render_checkout_instead_of_deployment_copy(tmp_path, monkeypatch, entrypoint):
+    """A deployment-only source copy cannot become a skill build input."""
+    repo = source_repo(tmp_path, committed=False)
+    destination = tmp_path / "profile/skills"
+    module = (load_runtime_installer() if entrypoint == RUNTIME_INSTALLER else
+              load_runtime_builder() if entrypoint == BUILDER else runpy.run_path(str(entrypoint)))
+    marker = "This content exists only in the deployment source copy."
+
+    def change_copy(root):
+        source = root / "skills/alpha-tool/SKILL.md"
+        source.write_text(source.read_text(encoding="utf-8") + "\n" + marker + "\n", encoding="utf-8")
+
+    if entrypoint in {BOOTSTRAP, INSTALLER_TEMPLATE}:
+        namespace = module["main"].__globals__
+        freeze = namespace["freeze_bootstrap_source"]
+
+        def capture(*args, **kwargs):
+            result = freeze(*args, **kwargs)
+            change_copy(result[0])
+            return result
+
+        monkeypatch.setitem(namespace, "freeze_bootstrap_source", capture)
+    else:
+        provenance = module["source_provenance"]
+        freeze = provenance.capture_source
+
+        @contextmanager
+        def capture(*args, **kwargs):
+            with freeze(*args, **kwargs) as snapshot:
+                change_copy(snapshot.root)
+                yield snapshot
+
+        monkeypatch.setattr(provenance, "capture_source", capture)
+    monkeypatch.setattr(sys, "argv", [str(entrypoint), "--repo-root", str(repo),
+                                    "--install-root", str(destination), "--skill", "alpha-tool"])
+    for _ in range(2):
+        assert module["main"]() == 0
+        installed = destination / "alpha-tool/SKILL.md"
+        assert installed.is_file()
+        assert marker not in installed.read_text(encoding="utf-8")
 
 
 def test_worktree_install_records_primary_and_reads_exact_old_commit(tmp_path):
@@ -396,9 +441,9 @@ def test_managed_deploy_callable_and_cli_share_exact_source_scope(tmp_path, monk
         events.append("source")
         commands.append(command)
         assert command[:2] == [sys.executable, str(installer["BUNDLE_ROOT"] / "scripts/skills-consistency-source-validator.py")]
-        frozen = pathlib.Path(command[3])
-        assert frozen != repo and (frozen / "skills/skill-sections.json").is_file()
-        assert kwargs["cwd"] == frozen
+        checkout = pathlib.Path(command[3])
+        assert checkout == repo and (checkout / "skills/skill-sections.json").is_file()
+        assert kwargs["cwd"] == checkout
         assert kwargs["env"]["CERATOPS_TEST_INHERITED"] == "keep this environment"
         assert kwargs["env"]["PYTHONIOENCODING"] == "utf-8"
         assert os.environ["PYTHONIOENCODING"] == "ascii"
@@ -407,7 +452,7 @@ def test_managed_deploy_callable_and_cli_share_exact_source_scope(tmp_path, monk
 
     def install(source, target, **kwargs):
         events.append("install")
-        assert source == kwargs["source_snapshot"].root and source != repo and target == destination
+        assert source == repo and source != kwargs["source_snapshot"].root and target == destination
         assert (source / "skills/skill-sections.json").is_file()
         assert kwargs["previous_runtime_source_id"] is None
         assert kwargs["all_managed"] == (mode in {"all", "base-global", "all-empty"})
@@ -497,9 +542,8 @@ def test_managed_deploy_source_gate_failure_keeps_full_cause_and_stops_effects(t
         if "target" in expected:
             for result in (expected, actual):
                 target = result.pop("target")
-                assert target == result["command"][3] and target != str(repo)
-                assert not pathlib.Path(target).exists()
-                result["command"][3] = "<frozen-source>"
+                assert target == result["command"][3] == str(repo)
+                assert pathlib.Path(target).is_dir()
         assert actual == expected
     assert len(commands) == 4
     assert not destination.exists()

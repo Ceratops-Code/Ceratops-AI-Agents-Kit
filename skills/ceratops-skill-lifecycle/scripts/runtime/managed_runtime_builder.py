@@ -1119,21 +1119,22 @@ def install_transaction(
     previous_runtime_source_id: str | None = None,
     source_snapshot: source_provenance.SourceSnapshot | None = None,
 ) -> TransactionResult:
-    """Freeze exact inputs before rendering; retain their archive in the batch.
+    """Build from the selected checkout and retain its deployment source archive.
 
-    The deployment entrypoint supplies its already checked snapshot. Direct
-    builder callers receive the same source identity without checking source
-    acceptance a second time. Source-view cleanup uses its own owner locks.
+    A frozen source view belongs to deployment evidence, never build input.
+    The deployment entrypoint owns release-source locking and supplies
+    its source snapshot. Direct callers retain the same archive without
+    checking source acceptance a second time.
     """
 
     if source_snapshot is not None:
-        return _install_snapshot_transaction(source_snapshot.root, install_root,
+        return _install_snapshot_transaction(repo_root, install_root,
                                              source_snapshot=source_snapshot, selected=selected,
                                              remove=remove, all_managed=all_managed,
                                              previous_runtime_source_id=previous_runtime_source_id)
     try:
         with source_provenance.capture_source(repo_root, install_root) as captured:
-            result = _install_snapshot_transaction(captured.root, install_root,
+            result = _install_snapshot_transaction(repo_root, install_root,
                                                    source_snapshot=captured, selected=selected,
                                                    remove=remove, all_managed=all_managed,
                                                    previous_runtime_source_id=previous_runtime_source_id)
@@ -1155,7 +1156,7 @@ def _install_snapshot_transaction(
     previous_runtime_source_id: str | None,
     source_snapshot: source_provenance.SourceSnapshot,
 ) -> TransactionResult:
-    """Install one frozen batch, accepting one explicit prior owner for migration."""
+    """Build one checkout batch and install it with its retained source identity."""
 
     configure_repo(repo_root)
     manifest = load_manifest()

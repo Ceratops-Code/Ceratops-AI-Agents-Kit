@@ -250,7 +250,7 @@ def _extract_source_archive(archive: pathlib.Path, target: pathlib.Path) -> list
 
 @contextlib.contextmanager
 def capture_source(repo: pathlib.Path, install_root: pathlib.Path) -> Iterator[SourceSnapshot]:
-    """Freeze once, then let both source checks and rendering use those bytes."""
+    """Retain frozen deployment evidence without selecting the build source."""
 
     repo, install_root = repo.resolve(), install_root.resolve()
     git = git_command(repo, "rev-parse", "--git-dir", optional=True) is not None

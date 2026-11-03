@@ -85,8 +85,12 @@ Its foreground commands use the same command-stop tracking as the installer.
 
 `retain_skill_sources.py` owns the source evidence coupled to each installed
 skill. A manifest names the primary repository, exact commit when available,
-relative skill path, dirty flag and digest-addressed source ZIP. Installation
-checks and rendering consume one frozen view. Clean commits come from Git;
+relative skill path, dirty flag and digest-addressed source ZIP. Source checks,
+Python package builds and skill rendering read the selected checkout directly;
+the managed installer holds its release-source lock throughout primary or release
+checkout builds and installation. Temporary source
+views supply deployment evidence only, and completed files still use deployment
+staging. Clean commits come from Git;
 dirty and unpacked inputs retain their actual bytes. A source-only change
 publishes the immutable ZIP before atomically changing the manifest, leaving
 the watched skill directory in place and preserving the previous identity on

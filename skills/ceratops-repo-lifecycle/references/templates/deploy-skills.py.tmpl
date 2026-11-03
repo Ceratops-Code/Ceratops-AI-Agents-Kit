@@ -1056,8 +1056,9 @@ def freeze_bootstrap_source(repo: pathlib.Path, install_root: pathlib.Path, stag
 
     Clean Git inputs come from HEAD, dirty inputs from tracked and nonignored
     files, and unpacked sources exclude build/cache and destination directories.
-    Rendering and runtime preparation read the extracted bytes. The bootstrap
-    remains self-contained; it never loads installed lifecycle implementation.
+    The extracted view is deployment evidence only. Rendering and runtime
+    preparation read the selected checkout. The bootstrap remains independent
+    and never loads installed lifecycle implementation.
     """
 
     archive, frozen = staging / "_source.zip", staging / "_source"
@@ -1156,16 +1157,16 @@ def install_batch(
             if (install_root / skill).is_dir():
                 prune_bootstrap_sources(install_root / skill)
         staging.mkdir()
-        frozen, source_archive, source_record = freeze_bootstrap_source(repo_root, install_root, staging)
-        manifest = read_manifest(frozen)
-        python_skills = declared_python_skills(frozen, manifest, skills)
+        _, source_archive, source_record = freeze_bootstrap_source(repo_root, install_root, staging)
+        manifest = read_manifest(repo_root)
+        python_skills = declared_python_skills(repo_root, manifest, skills)
         if python_skills and python_runtime is None:
-            python_runtime = prepare_python_runtime(frozen, install_root)
+            python_runtime = prepare_python_runtime(repo_root, install_root)
             if python_runtime is None:
                 raise ValueError("declared Python skills require the source locked project")
         for skill in skills:
             build_skill(
-                frozen, staging, manifest, skill,
+                repo_root, staging, manifest, skill,
                 python_runtime if skill in python_skills else None,
                 source_record, source_archive,
             )

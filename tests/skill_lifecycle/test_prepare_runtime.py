@@ -13,9 +13,12 @@ import pytest
 
 from tests.skill_lifecycle.support import (
     BOOTSTRAP,
+    BUILDER,
+    INSTALLER_TEMPLATE,
     INSTALLER_VERSION,
     LIFECYCLE_SOURCE,
     REPOSITORY_LIFECYCLE_SOURCE,
+    RUNTIME_INSTALLER,
     install_bundle_manifest,
     runtime_owner,
 )
@@ -634,6 +637,67 @@ def test_installed_runtime_keeps_local_package_after_source_cleanup(tmp_path, ow
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "installed"
+
+
+@pytest.mark.parametrize("entrypoint", [BOOTSTRAP, INSTALLER_TEMPLATE, BUILDER, RUNTIME_INSTALLER],
+                         ids=["repository-bootstrap", "compatible-bootstrap", "builder", "managed"])
+def test_public_installers_build_packages_in_the_selected_checkout(tmp_path, entrypoint):
+    """The real build backend records its location in the installed wheel."""
+    repo = tmp_path / "source"
+    create_compatible_repo(repo, "example/checkout-build", ["alpha-tool"])
+    project = repo / "scripts"
+    project.mkdir(exist_ok=True)
+    package = repo / "packages/checkout-probe"
+    module = package / "src/checkout_probe/__init__.py"
+    module.parent.mkdir(parents=True)
+    module.write_text("VALUE = 'installed'\n", encoding="utf-8")
+    (package / "pyproject.toml").write_text(
+        '[build-system]\nrequires=["hatchling==1.32.4"]\nbuild-backend="hatchling.build"\n'
+        '[project]\nname="checkout-build-probe"\nversion="1.0.0"\n'
+        'requires-python=">=3.14,<3.15"\ndynamic=["description"]\n'
+        '[tool.hatch.build.targets.wheel]\npackages=["src/checkout_probe"]\n'
+        '[tool.hatch.metadata.hooks.custom]\n', encoding="utf-8",
+    )
+    (package / "hatch_build.py").write_text(
+        'from pathlib import Path\n'
+        'from hatchling.metadata.plugin.interface import MetadataHookInterface\n'
+        'class BuildOrigin(MetadataHookInterface):\n'
+        '    def update(self, metadata):\n'
+        '        metadata["description"] = str(Path(self.root).resolve())\n', encoding="utf-8",
+    )
+    (project / "pyproject.toml").write_text(
+        '[project]\nname="checkout-build-runtime"\nversion="0.0.0"\n'
+        'requires-python=">=3.14,<3.15"\ndependencies=["checkout-build-probe==1.0.0"]\n'
+        '[tool.uv]\npackage=false\n[tool.uv.sources]\n'
+        'checkout-build-probe={path="../packages/checkout-probe",editable=true}\n', encoding="utf-8",
+    )
+    locked = subprocess.run(["uv", "lock", "--project", str(project)], capture_output=True, text=True)
+    assert locked.returncode == 0, locked.stderr
+    manifest = repo / "skills/skill-sections.json"
+    declaration = json.loads(manifest.read_text(encoding="utf-8"))
+    declaration["python_runtime_skills"] = ["alpha-tool"]
+    manifest.write_text(json.dumps(declaration), encoding="utf-8")
+    destination = tmp_path / "profile/skills"
+    command = [sys.executable, str(entrypoint), "--repo-root", str(repo),
+               "--install-root", str(destination), "--skill", "alpha-tool"]
+    selected = []
+    for _ in range(2):
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        assert result.returncode == 0, result.stderr
+        runtime = json.loads((destination / "alpha-tool/.runtime-manifest.json").read_text())["python_runtime"]
+        selected.append(runtime)
+        origin = subprocess.run(
+            [runtime, "-I", "-c", "import importlib.metadata as m; print(m.metadata('checkout-build-probe')['Summary'])"],
+            cwd=tmp_path, capture_output=True, text=True, check=False,
+        )
+        assert origin.returncode == 0, origin.stderr
+        assert pathlib.Path(origin.stdout.strip()).resolve() == package.resolve()
+    assert selected[0] == selected[1]
+    assert repo.resolve().parent == tmp_path.resolve()
+    shutil.rmtree(repo)
+    usable = subprocess.run([selected[-1], "-I", "-c", "import checkout_probe; print(checkout_probe.VALUE)"],
+                            cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert usable.returncode == 0 and usable.stdout.strip() == "installed", usable.stderr
 
 
 @pytest.mark.parametrize("owner", ["repository", "template", "managed"])
