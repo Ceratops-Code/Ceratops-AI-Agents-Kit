@@ -116,23 +116,23 @@ def test_public_installers_render_checkout_instead_of_deployment_copy(tmp_path, 
         namespace = module["main"].__globals__
         freeze = namespace["freeze_bootstrap_source"]
 
-        def capture(*args, **kwargs):
+        def capture_bootstrap(*args, **kwargs):
             result = freeze(*args, **kwargs)
             change_copy(result[0])
             return result
 
-        monkeypatch.setitem(namespace, "freeze_bootstrap_source", capture)
+        monkeypatch.setitem(namespace, "freeze_bootstrap_source", capture_bootstrap)
     else:
         provenance = module["source_provenance"]
         freeze = provenance.capture_source
 
         @contextmanager
-        def capture(*args, **kwargs):
+        def capture_managed_source(*args, **kwargs):
             with freeze(*args, **kwargs) as snapshot:
                 change_copy(snapshot.root)
                 yield snapshot
 
-        monkeypatch.setattr(provenance, "capture_source", capture)
+        monkeypatch.setattr(provenance, "capture_source", capture_managed_source)
     monkeypatch.setattr(sys, "argv", [str(entrypoint), "--repo-root", str(repo),
                                     "--install-root", str(destination), "--skill", "alpha-tool"])
     for _ in range(2):
