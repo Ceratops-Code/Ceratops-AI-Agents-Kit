@@ -163,6 +163,18 @@ def test_package_build_keeps_versioned_output_owner_with_empty_source_scope(tmp_
     assert not (repository / ".git/ceratops/builds").exists()
 
 
+@pytest.mark.parametrize("metadata", ['[project]\nname="example"\n', '[build-system]\nrequires=[]\n', 'project="invalid"\n'])
+def test_package_build_missing_version_stops_before_commands_with_explicit_cause(tmp_path, metadata):
+    repository, _package, prepared = _package_build_case(tmp_path)
+    (repository / "package/pyproject.toml").write_text(metadata)
+    assert run_git(repository, "add", "package/pyproject.toml").returncode == 0
+    assert run_git(repository, "commit", "-m", "missing static version").returncode == 0
+    current = runner.prepare_operations(repository, [runner.OperationRequest(prepared.operation)])[0]
+    result = runner.execute_prepared_operation(current)
+    assert result["status"] == "operation_failed" and "static project version" in result["message"]
+    assert not (repository / ".build-count").exists()
+
+
 def test_package_build_corruption_and_different_source_never_fall_back_to_dist(tmp_path):
     repository, package, prepared = _package_build_case(tmp_path)
     result = runner.execute_prepared_operation(prepared)

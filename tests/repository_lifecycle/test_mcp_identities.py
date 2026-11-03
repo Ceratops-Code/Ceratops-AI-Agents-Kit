@@ -7,6 +7,7 @@ import json
 import pathlib
 import runpy
 import secrets
+import shutil
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -105,6 +106,37 @@ def _package_mcp_case(tmp_path, monkeypatch, problem=None):
     callable_path.write_text("# The test replaces the external installation boundary.\n", encoding="utf-8")
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
     _repository(repo)
+    if problem is None:
+        # This fixture represents accepted build output. Installer calls must
+        # consume its shared-store receipt, never discover checkout dist files.
+        from execute_worktree_build import package_build_identity
+
+        name = server["prerequisites"][0]
+        selection = package_build_identity(repo, name, fixture["deliverables"]["packages"][name])
+
+        def build(bundle, _work):
+            (bundle / "artifacts").mkdir()
+            (bundle / "supporting-files").mkdir()
+            shutil.copyfile(wheel, bundle / "artifacts" / wheel.name)
+            shutil.copyfile(lock, bundle / "supporting-files" / lock.name)
+            return runner.BuildProduct(
+                artifacts=[{"deliverable": f"deliverables.packages.{name}", "type": "python-wheel",
+                            "path": "artifacts/" + wheel.name}],
+                supporting_files=[{"type": "package-lock", "path": "supporting-files/uv.lock"}],
+            )
+
+        def acceptance(bundle, artifacts, _work):
+            evidence = bundle / "supporting-files/check.json"
+            evidence.write_bytes(b'{"status":"passed"}\n')
+            return [{"id": "fixture-check", "status": "passed", "artifacts": [
+                {"path": item["path"], "sha256": item["sha256"]} for item in artifacts],
+                "evidence": {"path": "supporting-files/check.json",
+                             "sha256": hashlib.sha256(evidence.read_bytes()).hexdigest()}}]
+
+        receipt = runner.build_bundle(repo, selection=selection, inputs={}, required_tests=["fixture-check"],
+                                      build=build, test=acceptance)
+        wheel = receipt.parent / "artifacts" / wheel.name
+        lock = receipt.parent / "supporting-files/uv.lock"
     return SimpleNamespace(repo=repo, source=source, wheel=wheel, lock=lock, name=server_name,
                            operation=f"deliverables.mcp-servers.{server_name}.actions.install",
                            target=tmp_path / "installed-selection.json")

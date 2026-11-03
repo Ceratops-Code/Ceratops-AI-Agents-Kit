@@ -910,7 +910,10 @@ def hold(identifier, arguments, background=False):
         return
         pass
     if background:
-        Path(arguments["completed"]).write_text(version)
+        completed = Path(arguments["completed"])
+        temporary = completed.with_name("." + completed.name + ".tmp")
+        temporary.write_text(version)
+        temporary.replace(completed)
     elif cancel.is_set():
         emit({"id":identifier,"error":{"code":-32800,"message":"cancelled"}})
     else:

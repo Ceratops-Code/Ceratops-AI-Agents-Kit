@@ -36,7 +36,9 @@ def package_build_identity(root, name, package, *, channel="alpha"):
     project = sdlc_results._plain_path(project)[0]
     if not project.is_relative_to(root.resolve()):
         raise store_artifacts.OperationError("Package project escapes the repository.")
-    metadata = tomllib.loads(project.read_text(encoding="utf-8"))["project"]
+    metadata = tomllib.loads(project.read_text(encoding="utf-8")).get("project", {})
+    if not isinstance(metadata, Mapping) or not isinstance(metadata.get("version"), str) or not metadata["version"]:
+        raise store_artifacts.OperationError("Stored wheel builds require a declared static project version.")
     remote = _git(root, "config", "--get", "remote.origin.url")
     if remote.returncode not in (0, 1):
         _require_command(remote, root=root)
@@ -123,7 +125,8 @@ def execute_package_build(prepared, **options):
         return raw()
     contract = operations.read_repository_contract(root, prepared.contract_path)
     package = contract.get("deliverables", {}).get("packages", {}).get(name, {})
-    if package.get("artifact", {}).get("type") != "python-wheel" or prepared.no_op_reason is not None:
+    if (package.get("artifact", {}).get("type") != "python-wheel" or prepared.no_op_reason is not None
+            or prepared.result_commit_field or pathlib.PurePath(package.get("project", "")).name != "pyproject.toml"):
         return raw()
     outcome = None
     try:
