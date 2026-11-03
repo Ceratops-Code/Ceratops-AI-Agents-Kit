@@ -2781,7 +2781,7 @@ def test_v4_package_build_waits_for_declared_test_gate(tmp_path: pathlib.Path) -
             lambda x: x["repository"]["capabilities"]["uv"].update(
                 version="1.0", channel="stable"
             ),
-            "Additional properties are not allowed",
+            "multiple version authorities",
         ),
         (
             lambda x: x["deliverables"]["apps"]["claims-mobile"]["actions"][

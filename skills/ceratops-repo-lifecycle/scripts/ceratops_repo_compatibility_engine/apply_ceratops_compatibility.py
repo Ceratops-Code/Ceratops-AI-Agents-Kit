@@ -201,12 +201,8 @@ def build_sdlc_contract_candidate(
     The v4 template owns new contracts and repository validation; the target's
     supported version owns existing version-specific data. The compatibility
     contract owns named skill action routing. Existing actions retain their
-    definitions, including target-native version-from references. New executable
-    capabilities remain unversioned unless the target declares a requirement;
-    neither template versions nor the caller's runtime versions are copied.
-    Removed skills lose only exact producer-owned entries. Deployment is never
-    implicit. Invalid inline requirements fail through load_contract before
-    this function returns a candidate; they are not translated or discarded.
+    definitions. Removed skills lose only exact producer-owned entries.
+    Deployment is never implicit.
     """
 
     if not apply_contract:

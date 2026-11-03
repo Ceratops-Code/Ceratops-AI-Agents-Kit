@@ -10,8 +10,7 @@ repository:
         key: project.requires-python
     node:
       executable: node
-      version-from:
-        file: scripts/.nvmrc
+      channel: lts
       includes: [npm]
     git:
       executable: git
