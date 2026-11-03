@@ -26,11 +26,13 @@ from typing import Any, NamedTuple
 import git_branch_operations as git_branches
 from check_deployment_receipts import check_deployment_receipt
 from git_branch_operations import PromotionError, SourceState
+from github_contract_engine.format_report import sanitize_for_output
 from github_pr_workflow import ship_repository as repository_ship
 from github_pr_workflow.command import (
     CommandError,
     capture_failure_report,
     describe_command_failure,
+    failure_excerpt,
     handoff_report_completions,
     operation_report_root,
     project_task_temp_root,
@@ -756,7 +758,7 @@ def _promote_with_rollback(
                     rollback["state"],
                 )
             # Retain both failures even when restoration raises an unforeseen error.
-            except Exception as restore_exc:  # noqa: BLE001
+            except Exception as restore_exc:
                 raise PromotionError(
                     f"Promotion failed: {exc}; restoring the original checkout "
                     f"also failed: {restore_exc}"
@@ -785,7 +787,7 @@ def _save_result(path: pathlib.Path, result: dict[str, object], repo_root: pathl
 
 
 def _result_summary(
-    result: dict[str, object], path: pathlib.Path, digest: str,
+    result: dict[str, object], path: pathlib.Path, digest: str, *, failed: bool,
 ) -> dict[str, object]:
     """Point to a published outcome without duplicating checks or receipts."""
     summary: dict[str, object] = {
@@ -798,10 +800,17 @@ def _result_summary(
     completions = handoff_report_completions(result)
     if completions:
         summary["report_completions"] = completions
+    if failed:
+        # Keep producer-supplied identifiers and usable log paths without
+        # reopening reports or interpreting their contents as execution state.
+        summary.update({key: result[key] for key in
+                        ("check", "evidence_file", "diagnostic_output") if key in result})
     if result.get("message"):
-        # The first line names the failed operation; complete causes and child
-        # streams remain in the exact report rather than spilling into stdout.
-        summary["message"] = str(result["message"]).partition("\n")[0][:2000]
+        message = str(result["message"])
+        # Child check names can follow the operation's first line. Reuse the
+        # bounded failure display; complete streams stay in the saved report.
+        summary["message"] = ((failure_excerpt(sanitize_for_output(message)) or "") if failed else
+                              message.partition("\n")[0][:2000])
     summary.update(result_file=str(path), result_sha256=digest)
     return summary
 
@@ -1341,7 +1350,7 @@ def main(argv: list[str] | None = None) -> int:
             }
             failed = True
     public_result = (
-        _result_summary(result, result_file, result_digest)
+        _result_summary(result, result_file, result_digest, failed=failed)
         if result_file is not None and result_digest is not None else result
     )
     print(

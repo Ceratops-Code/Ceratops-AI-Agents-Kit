@@ -268,7 +268,9 @@ reusable safety logic or bundle nontrivial evidence collection.
 
 With promotion's `--result-file`, the complete outcome stays in the selected
 task-temp report; command output contains its status, target, report path and
-SHA-256. If recording fails, command output preserves the complete outcome.
+SHA-256. Failure summaries also retain a bounded cause excerpt and any supplied
+check name and diagnostic path. Full command output stays in the report.
+If recording fails, command output preserves the complete outcome.
 Per-check test-selection records stay in captured diagnostics while live
 progress remains visible. Result cleanup accepts primary checkout, linked
 worktree and source subdirectory paths, checks receipt ownership against the

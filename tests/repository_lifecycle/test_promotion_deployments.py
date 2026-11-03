@@ -233,7 +233,7 @@ def test_promote_repository_requires_an_explicit_deployment_choice(
     assert run_git(repo, "rev-parse", "HEAD").stdout.strip() == approved_head
 
 
-@pytest.mark.parametrize("status", ["ready", "tests_failed", "pending_work"])
+@pytest.mark.parametrize("status", ["ready", "validation_failed", "tests_failed", "pending_work"])
 @pytest.mark.parametrize("boundary", [
     "uninterrupted", "record-before", "record-after", "output-before", "output-after", "no-report",
 ])
@@ -251,9 +251,14 @@ def test_promotion_output_keeps_full_report_across_interruption(
         "check_summary": {"checks": [{"evidence": "complete-record" * 20000}]},
         "operations": {"status": "completed", "step_results": [{"result": "complete-receipt"}]},
     }
+    failed = status in {"validation_failed", "tests_failed"}
+    if failed:
+        payload["diagnostic_output"] = str(repo / ".build" / "failed-check.log")
+        payload["message"] += ('check: "mypy"\nevidence_file: ' +
+                               json.dumps(payload["diagnostic_output"]) + '\nexit_code: 1')
 
     def promote(_args, **_kwargs):
-        if status == "tests_failed":
+        if failed:
             raise module["PromotionError"]("Repository test step failed.", dict(payload))
         return dict(payload)
 
@@ -291,9 +296,9 @@ def test_promotion_output_keeps_full_report_across_interruption(
         assert json.loads(report.read_text(encoding="utf-8"))["operations"] == payload["operations"]
         capsys.readouterr()
     for _ in range(2):
-        assert module["main"](arguments) == {"ready": 0, "tests_failed": 1, "pending_work": 2}[status]
+        assert module["main"](arguments) == (1 if failed else 2 if status == "pending_work" else 0)
         observed = capsys.readouterr()
-        output = observed.err if status == "tests_failed" else observed.out
+        output = observed.err if failed else observed.out
         summary = json.loads(output)
         assert summary["status"] == status
         if boundary == "no-report":
@@ -307,7 +312,29 @@ def test_promotion_output_keeps_full_report_across_interruption(
             assert recorded["check_summary"] == payload["check_summary"]
             assert recorded["operations"] == payload["operations"]
             assert recorded["message"] == payload["message"]
+            if failed:
+                assert summary["diagnostic_output"] == payload["diagnostic_output"]
+                assert 'check: "mypy"' in summary["message"]
+                assert "failed-check.log" in summary["message"]
+                assert len(summary["message"].encode("utf-8")) <= 2000
+            else:
+                assert summary["message"] == "Repository test step failed."
+                assert "diagnostic_output" not in summary
     assert not list(task.glob("*.tmp"))
+
+
+@pytest.mark.parametrize("context", [False, True], ids=["absent", "structured"])
+def test_promotion_error_summary_uses_only_available_failure_context(tmp_path, context):
+    module = runpy.run_path(str(PROMOTE_REPOSITORY))
+    token = "ghp_" + "a" * 36
+    payload = {"status": "validation_failed", "message": "Gate failed.\n" + "details\n" * 1000 + token}
+    if context:
+        payload.update(check="markdown-lint", evidence_file=str(tmp_path / "check.log"))
+    result = module["_result_summary"](payload, tmp_path / "unopened.json", "a" * 64, failed=True)
+    for field in ("check", "evidence_file", "diagnostic_output"):
+        assert (result[field] == payload[field]) if field in payload else field not in result
+    assert token not in result["message"]
+    assert not (tmp_path / "unopened.json").exists()
 
 
 def test_promote_and_deploy_does_not_inject_base_revision(
