@@ -1598,6 +1598,9 @@ and publication results. Its
 JSON from the same task temp tree. It checks the current registered operation,
 source commit, producer and selected target, retires obsolete unsuccessful
 reports and removes the consumed temporary input without installing again.
+The operation, source commit and receipt's checkout path come from the original
+`--repo-root`, including a linked worktree. The primary checkout identifies shared
+report storage only; its code and SDLC declaration do not replace the source's.
 An interrupted return call can be repeated through the same public entry point.
 
 The compatibility review `ND.COMPATIBILITY.TEST_RESULT_REUSE` checks observed

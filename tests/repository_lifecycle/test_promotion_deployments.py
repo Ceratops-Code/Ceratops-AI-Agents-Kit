@@ -925,7 +925,9 @@ def test_composed_shipping_preserves_caller_identity_at_delegation(tmp_path, mon
         assert run_git(workspace, "branch", "--show-current").stdout.strip() == original_branch
 
 
-def _prepare_standalone_handoff_reports(tmp_path, monkeypatch, outer_result=None):
+def _prepare_standalone_handoff_reports(
+    tmp_path, monkeypatch, outer_result=None, source_checkout="primary",
+):
     """Produce a pending report, then call the selected installer separately."""
     import importlib
 
@@ -937,12 +939,23 @@ def _prepare_standalone_handoff_reports(tmp_path, monkeypatch, outer_result=None
     command = importlib.import_module("github_pr_workflow.command")
     actions = importlib.import_module("execute_skill_actions")
     repo = _registered_skill_fixture(tmp_path, monkeypatch)
+    source = repo
+    if source_checkout != "primary":
+        source = tmp_path / "worktrees" / repo.name / "installer-source"
+        assert run_git(repo, "worktree", "add", "-b", "installer-source", str(source)).returncode == 0
+        if source_checkout == "worktree-primary-changed":
+            contract_path = repo / "sdlc/sdlc.yml"
+            contract = json.loads(contract_path.read_text())
+            del contract["deliverables"]["skills"]["claims-catalog-invoice"]["actions"]["install"]
+            contract_path.write_text(json.dumps(contract))
+            assert run_git(repo, "add", "sdlc/sdlc.yml").returncode == 0
+            assert run_git(repo, "commit", "-m", "Change only the primary installation contract").returncode == 0
     operation = "deliverables.skills.claims-catalog-invoice.actions.install"
-    prepared = runner.prepare_operations(repo, [runner.OperationRequest(operation)], context="return")[0]
+    prepared = runner.prepare_operations(source, [runner.OperationRequest(operation)], context="return")[0]
     pending = runner.execute_prepared_operation(prepared)
     assert pending["status"] == "handoff_required"
     assert pending["report_completion"]["answer_schema"]["required"] == ["actual_completion_file"]
-    assert not (repo / "calls.jsonl").exists()
+    assert not (source / "calls.jsonl").exists()
     if outer_result:
         pending = {"status": "shipped" if outer_result == "deployment" else "ready",
                    outer_result: {"status": "handoff_required", "pending_operations": [operation],
@@ -957,7 +970,7 @@ def _prepare_standalone_handoff_reports(tmp_path, monkeypatch, outer_result=None
     }, repo_root=repo, action="operation")
     step = prepared.steps[0]
     outcome = actions.execute_handoff(
-        step.handoff["lifecycle"] + "/" + step.handoff["action"], repo,
+        step.handoff["lifecycle"] + "/" + step.handoff["action"], source,
         inputs=step.handoff["inputs"],
     )
     assert outcome["status"] == "completed", outcome
@@ -974,16 +987,20 @@ def _prepare_standalone_handoff_reports(tmp_path, monkeypatch, outer_result=None
     assert len(summary["report_completions"]) == 1
     arguments = [value.replace("{actual_completion_file}", str(completion))
                  for value in summary["report_completions"][0]["arguments"]]
-    return runner, repo, previous, completion, unrelated, accepted, arguments
+    assert arguments[arguments.index("--repo-root") + 1] == str(source)
+    return runner, source, previous, completion, unrelated, accepted, arguments
 
 
-@pytest.mark.parametrize("outer_result", [None, "operations", "deployment", "release_publication"])
+@pytest.mark.parametrize("outer_result,source_checkout", [
+    (None, "primary"), ("operations", "primary"), ("deployment", "primary"),
+    ("release_publication", "primary"), (None, "worktree"), (None, "worktree-primary-changed"),
+])
 @pytest.mark.parametrize("interruption", [None, "before-report", "after-report", "before-input", "after-input"])
 def test_standalone_handoff_return_retires_reports_without_reinstalling(
-    tmp_path, monkeypatch, interruption, outer_result,
+    tmp_path, monkeypatch, interruption, outer_result, source_checkout,
 ):
     runner, repo, previous, completion, unrelated, accepted, arguments = _prepare_standalone_handoff_reports(
-        tmp_path, monkeypatch, outer_result,
+        tmp_path, monkeypatch, outer_result, source_checkout,
     )
     calls = (repo / "calls.jsonl").read_bytes()
     retained = {path: path.read_bytes() for path in (unrelated, accepted)}
@@ -1011,6 +1028,24 @@ def test_standalone_handoff_return_retires_reports_without_reinstalling(
         assert not previous.exists()
         assert not completion.exists()
         assert (repo / "calls.jsonl").read_bytes() == calls
+        assert all(path.read_bytes() == content for path, content in retained.items())
+
+
+@pytest.mark.parametrize("source_checkout", ["worktree", "worktree-primary-changed"])
+def test_standalone_handoff_return_cli_uses_installation_worktree(tmp_path, monkeypatch, source_checkout):
+    runner, source, previous, completion, unrelated, accepted, arguments = _prepare_standalone_handoff_reports(
+        tmp_path, monkeypatch, source_checkout=source_checkout,
+    )
+    retained = {path: path.read_bytes() for path in (unrelated, accepted, source / "calls.jsonl")}
+    for _ in range(2):
+        result = subprocess.run(
+            [sys.executable, runner.__file__, *arguments], cwd=source,
+            capture_output=True, text=True, check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "OK"
+        assert not previous.exists()
+        assert not completion.exists()
         assert all(path.read_bytes() == content for path, content in retained.items())
 
 

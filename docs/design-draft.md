@@ -2162,6 +2162,9 @@ Compact promotion/shipping responses expose these descriptors as
 installer result under the release-source lock, using the current registered
 operation and clean source commit. The shared deployment-receipt checker also
 checks producer, destination, selected target and absence of cleanup debt.
+The original `--repo-root` supplies the installation's operation declaration,
+commit and receipt checkout path, even when it is a linked worktree. The primary
+checkout determines shared report storage, not which source installation ran.
 Only matching owned reports in the input's task temp tree are retired; accepted
 results and unrelated operations remain intact. The input is removed after its
 contents and file identity remain unchanged across consumption. A missing input

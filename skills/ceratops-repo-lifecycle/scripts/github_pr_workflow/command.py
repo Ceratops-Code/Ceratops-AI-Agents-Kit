@@ -983,12 +983,15 @@ def _retire_handoff_reports(args: Any) -> None:
 
     if len(args.operation) != 1 or args.validate or args.tests or args.prepare_only or args.ci:
         raise runner.OperationError("Report retirement requires one operation and cannot execute other work.")
-    primary = operation_report_root(args.repo_root)
+    source = pathlib.Path(args.repo_root).resolve()
+    primary = operation_report_root(source)
     selected, _ = _operation_report_scope(args.retire_handoff_reports, primary, "operation")
     with release_lock_module().hold_release_source(primary):
         if not release_lock_module().local_commands_stopped():
             raise runner.OperationError("Report retirement requires stopped writers.")
-        prepared = runner.prepare_operations(primary, [runner.OperationRequest(
+        # Reports share the primary repository's storage, but an installation
+        # belongs to the checkout whose code and contract the installer used.
+        prepared = runner.prepare_operations(source, [runner.OperationRequest(
             args.operation[0], runner.parse_parameters(args.parameter),
         )], args.sdlc_contract, context="return")[0]
         if prepared.commit is None:
@@ -1018,7 +1021,7 @@ def _retire_handoff_reports(args: Any) -> None:
                 raise runner.OperationError("Installation destination is redirected.")
             return path
 
-        check_deployment_receipt(receipt, repo_root=primary, commit=prepared.commit,
+        check_deployment_receipt(receipt, repo_root=source, commit=prepared.commit,
                                  outcome={"handoff": route}, error_type=runner.OperationError,
                                  check_destination_path=destination)
         selector = handoff.get("inputs", {}).get("mcp-server", handoff.get("inputs", {}).get("skill"))
