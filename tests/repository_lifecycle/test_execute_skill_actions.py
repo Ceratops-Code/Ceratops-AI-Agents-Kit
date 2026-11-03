@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import json
 import os
@@ -954,6 +955,35 @@ def test_mcp_handoff_selects_shared_project_lock(tmp_path, monkeypatch, missing_
             "output-directory": ".build", "filename-pattern": "*.whl",
         },
     }}}
+    _repository(repo)
+    stored_wheel, stored_lock = wheel, lock
+    if not missing_lock:
+        flow = importlib.import_module("execute_worktree_build")
+        identity = flow.package_build_identity(repo, "sample-package", context["packages"]["sample-package"])
+
+        def build(bundle, _work):
+            (bundle / "artifacts").mkdir()
+            (bundle / "supporting-files").mkdir()
+            shutil.copyfile(wheel, bundle / "artifacts" / wheel.name)
+            shutil.copyfile(lock, bundle / "supporting-files" / lock.name)
+            return runner.BuildProduct(
+                artifacts=[{"deliverable": "deliverables.packages.sample-package", "type": "python-wheel",
+                            "path": "artifacts/" + wheel.name}],
+                supporting_files=[{"type": "package-lock", "path": "supporting-files/uv.lock"}],
+            )
+
+        def acceptance(bundle, artifacts, _work):
+            evidence = bundle / "supporting-files/check.json"
+            evidence.write_bytes(b'{"status":"passed"}\n')
+            return [{"id": "fixture-check", "status": "passed", "artifacts": [
+                {"path": item["path"], "sha256": item["sha256"]} for item in artifacts],
+                "evidence": {"path": "supporting-files/check.json",
+                             "sha256": hashlib.sha256(evidence.read_bytes()).hexdigest()}}]
+
+        receipt = runner.build_bundle(repo, selection=identity, inputs={}, required_tests=["fixture-check"],
+                                      build=build, test=acceptance)
+        stored_wheel = receipt.parent / "artifacts" / wheel.name
+        stored_lock = receipt.parent / "supporting-files/uv.lock"
     for _ in range(2):
         result = skill_actions.execute_handoff(
             "ceratops-mcp-server-lifecycle/install", repo,
@@ -968,5 +998,38 @@ def test_mcp_handoff_selects_shared_project_lock(tmp_path, monkeypatch, missing_
         assert len(calls) == 2
         for root, argv in calls:
             assert root == installed
-            assert argv[argv.index("--package-lock") + 1] == str(lock)
-            assert argv[argv.index("--package-wheel") + 1] == str(wheel)
+            assert argv[argv.index("--package-lock") + 1] == str(stored_lock)
+            assert argv[argv.index("--package-wheel") + 1] == str(stored_wheel)
+
+
+def test_mcp_package_selection_requires_current_common_store_and_never_copies_to_checkout(tmp_path):
+    from tests.repository_lifecycle.test_completed_builds import _package_build_case
+
+    repo, package, _prepared = _package_build_case(tmp_path)
+    (repo / "mcp").mkdir()
+    (repo / "mcp/pyproject.toml").write_text(
+        '[project]\nname="example-server"\nversion="1.0.0"\ndependencies=["example==1.0.0"]\n'
+    )
+    assert run_git(repo, "add", "mcp").returncode == 0
+    assert run_git(repo, "commit", "-m", "server fixture").returncode == 0
+    prepared = runner.prepare_operations(repo, [runner.OperationRequest("deliverables.packages.example.actions.build")])[0]
+    context = {"source": "mcp", "packages": {"example": package}}
+    with pytest.raises(ValueError, match="shared Git store"):
+        skill_actions._mcp_package_arguments(repo, "example-server", context)
+    result = runner.execute_prepared_operation(prepared)
+    assert result["status"] == "completed", result
+    shutil.rmtree(repo / "dist")
+    for _ in range(2):
+        args = skill_actions._mcp_package_arguments(repo, "example-server", context)
+        assert pathlib.Path(args["{package_wheel}"]).is_relative_to(repo / ".git/ceratops/builds")
+        assert pathlib.Path(args["{package_lock}"]).read_bytes() == (repo / "package/uv.lock").read_bytes()
+        assert not (repo / "dist").exists()
+    assert (repo / ".build-count").read_text() == "x"
+    assert (repo / ".check-count").read_text() == "x"
+    (repo / "package/uv.lock").write_text("version = 2\n")
+    with pytest.raises(ValueError, match="unchanged canonical lock"):
+        skill_actions._mcp_package_arguments(repo, "example-server", context)
+    assert run_git(repo, "add", "package/uv.lock").returncode == 0
+    assert run_git(repo, "commit", "-m", "different source").returncode == 0
+    with pytest.raises(ValueError, match="shared Git store"):
+        skill_actions._mcp_package_arguments(repo, "example-server", context)

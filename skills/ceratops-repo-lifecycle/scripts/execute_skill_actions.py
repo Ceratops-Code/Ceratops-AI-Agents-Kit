@@ -61,11 +61,12 @@ def _call_action(root: pathlib.Path, declaration: Mapping[str, Any], arguments: 
 def _mcp_package_arguments(
     repo_root: pathlib.Path, server_name: str, context: Mapping[str, Any],
 ) -> dict[str, str]:
-    """Select existing declared package outputs; never build or test them again.
+    """Select a completed package in the shared Git store without rebuilding.
 
     The SDLC runner supplies authoritative source and prerequisite declarations.
-    File selection is confined to this checkout, follows the MCP's exact package
-    pin, and admits one wheel and one canonical package lock. The installer owns
+    Source declarations stay in this checkout; accepted files come only from
+    the current source commit's shared build receipt. Selection follows the
+    MCP's exact package pin and admits one wheel and its recorded lock. The installer owns
     wheel-content and deployment checks. No process or persistent output starts
     until this complete selection succeeds.
     """
@@ -112,23 +113,6 @@ def _mcp_package_arguments(
                 or len(pins) != 1
                 or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*\s*==\s*" + re.escape(version), pins[0]) is None):
             raise ValueError(f"MCP package {name} must match its declared distribution and exact version pin")
-        directory = owned_path(artifact["output-directory"])
-        pattern = artifact["filename-pattern"]
-        if "/" in pattern or "\\" in pattern or not pattern.endswith(".whl"):
-            raise ValueError(f"Package {name} needs a wheel filename pattern without directories")
-        wheels = []
-        for candidate in directory.glob(pattern):
-            selected = owned_path(str(candidate.relative_to(root)))
-            # A wheel's distribution and version are its first two filename
-            # components. Content acceptance remains with the existing installer.
-            parts = selected.name.removesuffix(".whl").split("-")
-            if len(parts) not in {5, 6}:
-                raise ValueError(f"Malformed package wheel filename: {selected}")
-            if selected.is_file() and distribution_key(parts[0]) == distribution and parts[1] == version:
-                wheels.append(selected)
-        if len(wheels) != 1:
-            build = package.get("action-locations", {}).get("build", "the declared package build action")
-            raise ValueError(f"Package {name} needs exactly one existing {version} wheel in {directory}; use {build}")
         lock_root = project_path.parent
         # Native package metadata may select the repository's shared uv project.
         # Resolve metadata only; no executable code comes from the checkout.
@@ -146,8 +130,22 @@ def _mcp_package_arguments(
         lock = owned_path(str(locks[0].relative_to(root)))
         if not lock.is_file():
             raise ValueError(f"Package lock must be a file: {lock}")
+        from execute_worktree_build import read_package_build
+
+        completed = read_package_build(root, name, package)
+        if completed is None:
+            build = package.get("action-locations", {}).get("build", "the declared package build action")
+            raise ValueError(f"Package {name} needs an accepted {version} build in the shared Git store; use {build}")
+        wheels = [path for path in completed.artifacts if path.name.endswith(".whl")]
+        stored_locks = [path for path in completed.supporting_files if path.name == lock.name]
+        if (len(wheels) != 1 or len(stored_locks) != 1
+                or hashlib.sha256(stored_locks[0].read_bytes()).digest() != hashlib.sha256(lock.read_bytes()).digest()):
+            raise ValueError(f"Package {name} needs one recorded wheel and its unchanged canonical lock")
+        parts = wheels[0].name.removesuffix(".whl").split("-")
+        if len(parts) not in {5, 6} or distribution_key(parts[0]) != distribution or parts[1] != version:
+            raise ValueError(f"Stored package {name} does not match its exact distribution/version pin")
         selections.append({"{mcp_source}": str(source), "{package_wheel}": str(wheels[0]),
-                           "{package_lock}": str(lock)})
+                           "{package_lock}": str(stored_locks[0])})
     if len(selections) != 1:
         raise ValueError("Package-backed MCP installation requires exactly one directly pinned package prerequisite")
     return selections[0]

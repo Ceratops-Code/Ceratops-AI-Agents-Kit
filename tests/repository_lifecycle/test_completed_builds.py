@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import os
 import pathlib
 import runpy
 import shutil
-import importlib
 import sys
+from dataclasses import replace
 
 import pytest
 
@@ -18,6 +19,7 @@ from tests.repository_lifecycle.test_sdlc_handoffs import (
     _checkpoint_child,
     _new_receipt_fixtures,
     _prepared_versioned_completion,
+    _repository,
     _versioned_build_receipt,
     _versioned_repository,
     _write_fixture_bytes,
@@ -28,6 +30,152 @@ from tests.repository_lifecycle.test_sdlc_handoffs import (
     runner,
     storage,
 )
+
+
+def _package_build_case(tmp_path):
+    """Exercise ordinary declared build commands, not a mocked acceptance flag."""
+    repository = tmp_path / "package-repository"
+    (repository / "package").mkdir(parents=True)
+    (repository / "sdlc").mkdir()
+    (repository / "package/pyproject.toml").write_text('[project]\nname="example"\nversion="1.0.0"\n')
+    (repository / "package/uv.lock").write_text('version = 1\n')
+    (repository / ".gitignore").write_text('dist/\n.build-count\n.check-count\n.fail-build\n')
+    build = (
+        "import pathlib,sys; p=pathlib.Path; "
+        "sys.exit('compiler rejected source') if p('.fail-build').exists() else None; "
+        "p('dist').mkdir(exist_ok=True); p('dist/example-1.0.0-py3-none-any.whl').write_bytes(b'accepted wheel'); "
+        "p('.build-count').write_text(p('.build-count').read_text()+'x' if p('.build-count').exists() else 'x')"
+    )
+    check = (
+        "import pathlib; p=pathlib.Path; assert p('dist/example-1.0.0-py3-none-any.whl').read_bytes()==b'accepted wheel'; "
+        "p('.check-count').write_text(p('.check-count').read_text()+'x' if p('.check-count').exists() else 'x')"
+    )
+    no_op = {"requires": {"capabilities": []}, "no-op": "No additional checks for this fixture."}
+    package = {"source": "package", "project": "package/pyproject.toml", "prerequisites": [],
+               "artifact": {"type": "python-wheel", "distribution": "example", "output-directory": "dist",
+                            "filename-pattern": "*.whl"},
+               "actions": {"validate": no_op, "test": no_op, "build": {"requires": {"capabilities": []},
+                           "steps": [{"run": [sys.executable, "-c", build]}, {"run": [sys.executable, "-c", check]}]}}}
+    contract = {"version": 4, "kind": "ceratops-sdlc", "repository": {"capabilities": {},
+                "actions": {"validate": no_op, "test": no_op}}, "deliverables": {"packages": {"example": package}}}
+    (repository / "sdlc/sdlc.yml").write_text(json.dumps(contract))
+    _repository(repository)
+    prepared = runner.prepare_operations(repository, [runner.OperationRequest("deliverables.packages.example.actions.build")])[0]
+    return repository, package, prepared
+
+
+def test_package_build_stores_commands_lock_and_wheel_and_reuses_from_linked_checkout(tmp_path):
+    repository, _package, prepared = _package_build_case(tmp_path)
+    result = runner.execute_prepared_operation(prepared)
+    assert result["status"] == "completed", result
+    receipt = pathlib.Path(result["build_receipt"])
+    assert receipt.is_relative_to(repository / ".git/ceratops/builds")
+    saved = runner.read_completed_build(repository, receipt_path=receipt)
+    assert saved.artifacts[0].read_bytes() == b"accepted wheel"
+    evidence = next(path for path in saved.supporting_files if path.name == "command-results.json")
+    assert json.loads(evidence.read_text())["build"]["steps"] == [1, 2]
+    assert next(path for path in saved.supporting_files if path.name == "uv.lock").read_bytes() == (repository / "package/uv.lock").read_bytes()
+    shutil.rmtree(repository / "dist")
+    linked = tmp_path / "linked"
+    assert run_git(repository, "worktree", "add", "-b", "linked", str(linked)).returncode == 0
+    linked_prepared = runner.prepare_operations(linked, [runner.OperationRequest(prepared.operation)])[0]
+    again = runner.execute_prepared_operation(linked_prepared)
+    assert again["status"] == "completed" and again["build_reused"], again
+    assert again["build_receipt"] == result["build_receipt"]
+    assert not (linked / ".build-count").exists()
+    assert not (linked / "dist").exists()
+    assert (repository / ".build-count").read_text() == "x"
+    assert (repository / ".check-count").read_text() == "x"
+    assert not list((repository / ".git/ceratops/builds/.staging").iterdir())
+
+
+def test_package_build_public_command_returns_shared_receipt_and_reuses_it(tmp_path, capsys):
+    repository, _package, prepared = _package_build_case(tmp_path)
+    arguments = ["--repo-root", str(repository), "--operation", prepared.operation]
+    assert runner.main(arguments) == 0
+    first = json.loads(capsys.readouterr().out.splitlines()[-1])
+    result = first["results"][0]
+    assert first["status"] == "completed" and result["status"] == "completed", first
+    assert pathlib.Path(result["build_receipt"]).is_relative_to(repository / ".git/ceratops/builds")
+    assert runner.main(arguments) == 0
+    second = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert second["results"][0]["build_reused"]
+    assert (repository / ".build-count").read_text() == "x"
+    assert (repository / ".check-count").read_text() == "x"
+
+
+@pytest.mark.parametrize("timing", ["before", "after"])
+@pytest.mark.parametrize("effect", ["command", "publication"])
+def test_package_build_recovers_each_effect_without_rechecking_published_bytes(tmp_path, monkeypatch, timing, effect):
+    repository, _package, prepared = _package_build_case(tmp_path)
+    owner = runner if effect == "command" else storage
+    name = "run_progress_command" if effect == "command" else "publish_completed_build"
+    original = getattr(owner, name)
+    fired = False
+
+    def interrupted(*args, **kwargs):
+        nonlocal fired
+        fire = not fired
+        if fire:
+            fired = True
+        if fire and timing == "before":
+            raise KeyboardInterrupt("test interruption")
+        value = original(*args, **kwargs)
+        if fire:
+            raise KeyboardInterrupt("test interruption")
+        return value
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(owner, name, interrupted)
+        with pytest.raises(KeyboardInterrupt, match="test interruption"):
+            runner.execute_prepared_operation(prepared)
+    assert fired
+    result = runner.execute_prepared_operation(prepared)
+    assert result["status"] == "completed", result
+    if effect == "publication" and timing == "after":
+        assert result["build_reused"]
+        assert (repository / ".build-count").read_text() == "x"
+        assert (repository / ".check-count").read_text() == "x"
+    repeated = runner.execute_prepared_operation(prepared)
+    assert repeated["build_reused"] and repeated["build_receipt"] == result["build_receipt"]
+    assert not list((repository / ".git/ceratops/builds/.staging").iterdir())
+
+
+def test_package_build_failure_preserves_command_cause_and_creates_no_acceptance(tmp_path):
+    repository, _package, prepared = _package_build_case(tmp_path)
+    (repository / ".fail-build").touch()
+    failed = runner.execute_prepared_operation(prepared)
+    assert failed["status"] in runner.FAILED_STATUSES
+    assert "compiler rejected source" in json.dumps(failed)
+    assert not list((repository / ".git/ceratops/builds").glob("*/receipt.json"))
+    (repository / ".fail-build").unlink()
+    result = runner.execute_prepared_operation(prepared)
+    assert result["status"] == "completed", result
+    assert (repository / ".build-count").read_text() == "x"
+
+
+def test_package_build_keeps_versioned_output_owner_with_empty_source_scope(tmp_path):
+    repository, _package, prepared = _package_build_case(tmp_path)
+    result = runner.execute_prepared_operation(replace(prepared, source_input_paths=()))
+    assert result["status"] == "completed", result
+    assert "build_receipt" not in result
+    assert (repository / "dist/example-1.0.0-py3-none-any.whl").read_bytes() == b"accepted wheel"
+    assert not (repository / ".git/ceratops/builds").exists()
+
+
+def test_package_build_corruption_and_different_source_never_fall_back_to_dist(tmp_path):
+    repository, package, prepared = _package_build_case(tmp_path)
+    result = runner.execute_prepared_operation(prepared)
+    assert result["status"] == "completed", result
+    pathlib.Path(result["artifacts"][0]).write_bytes(b"changed artifact")
+    failed = runner.execute_prepared_operation(prepared)
+    assert failed["status"] in runner.FAILED_STATUSES
+    assert (repository / ".build-count").read_text() == "x"
+    (repository / "new-source.txt").write_text("different source")
+    assert run_git(repository, "add", "new-source.txt").returncode == 0
+    assert run_git(repository, "commit", "-m", "different source").returncode == 0
+    flow = importlib.import_module("execute_worktree_build")
+    assert flow.read_package_build(repository, "example", package) is None
 
 
 def _tag_summary(repository, version, summary, *, target="python-3.14-windows", tagged=True):
@@ -101,10 +249,10 @@ def _worktree_build_case(tmp_path):
     _write_fixture_bytes(repository, "unrelated.txt", b"keep staged change")
     assert run_git(repository, "add", "unrelated.txt").returncode == 0
     prepare = [sys.executable, "-c", "import pathlib,sys;pathlib.Path('version.txt').write_text(sys.argv[1])", "{version}"]
-    options = dict(repository="example/project", release_unit="claims", version=version,
-                   required_targets=[target], attempt_id="worktree-build", source_paths=["version.txt"],
-                   requests={target: [runner.OperationRequest("deliverables.packages.claims.actions.build")]},
-                   preparation_commands=[prepare], describe_receipt=lambda _transaction, _target, _batch: receipt)
+    options = {"repository": "example/project", "release_unit": "claims", "version": version,
+               "required_targets": [target], "attempt_id": "worktree-build", "source_paths": ["version.txt"],
+               "requests": {target: [runner.OperationRequest("deliverables.packages.claims.actions.build")]},
+               "preparation_commands": [prepare], "describe_receipt": lambda _transaction, _target, _batch: receipt}
     return repository, options
 
 

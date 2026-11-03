@@ -1553,6 +1553,19 @@ their allocated version/target directory. Missing or changed files block only
 dependent work; dependent builds receive their selected files in the same
 environment mapping as tests.
 
+Ordinary SDLC Python-wheel builds also publish their successful declared command
+outcomes, wheel and canonical package lock through the existing v2 bundle store
+under `<git-common-dir>/ceratops/builds/`. The operation runner owns that handoff;
+no model copies files between checkouts. The receipt identifies the exact source
+commit, package version and qualification. Repeating that build reads its receipt
+and checks file integrity without running its build commands again. Package-backed
+MCP installation selects that receipt from any linked checkout of the same source
+commit; checkout `dist` directories are never installation inputs. Missing or
+changed stored files stop installation. The store retains three completed bundles
+per repository, package, channel and target and removes its own staging on success
+or the next build. Repository build commands still own their declared scratch
+output directories. Result-producing versioned adapters keep their existing route.
+
 Test errors are saved in `.build/test-diagnostics/pytest-failure.json` or the
 caller-selected diagnostic path. Repeated errors replace that request's current
 details; shared output is stored once per diagnostic, rather than copied into

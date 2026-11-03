@@ -328,8 +328,6 @@ def complete_versioned_build(
     return complete_artifact_builds.complete_versioned_artifacts(transaction, prepared_receipts)
 
 
-
-
 def operation_category(operation: str, *, version: int = 4) -> str:
     """Validate a complete versioned YAML location and return its category."""
 
@@ -645,7 +643,7 @@ def require_build_result_commit(prepared: PreparedOperation, captured: Mapping[s
 def execute_prepared_operation(
     prepared: PreparedOperation, *, diagnostic_output: pathlib.Path | None = None,
     diagnostic_owner: tuple[pathlib.Path, str] | None = None,
-    successful_results: Any = (),
+    successful_results: Any = (), retain_package: bool = True,
 ) -> dict[str, object]:
     """Run one operation; callers choose prerequisites and diagnostic ownership.
 
@@ -653,6 +651,10 @@ def execute_prepared_operation(
     runs in another checkout. No tests are selected or repeated for reporting.
     """
 
+    if retain_package and prepared.category == "build" and prepared.source_input_paths is None and not prepared.result_schema:
+        from execute_worktree_build import execute_package_build
+        return execute_package_build(prepared, diagnostic_output=diagnostic_output,
+                                     diagnostic_owner=diagnostic_owner, successful_results=successful_results)
     base: dict[str, object] = {
         "operation": prepared.operation,
         "commit": prepared.commit,
