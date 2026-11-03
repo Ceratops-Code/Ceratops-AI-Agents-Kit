@@ -178,6 +178,21 @@ skill installer; review packets select the installed source checker. Their
 supporting modules come from the selected installed bundle. First-install
 bootstrap remains a repository-owned workflow because no installation exists yet.
 
+SDLC v4/v5 executable capabilities have one optional version requirement source:
+`version-from.file`, plus `version-from.key` for a field in a structured native
+manifest. JSON, TOML, YAML, XML and INI references require a nonempty dotted key;
+a native single-value file, such as `.nvmrc`, supplies its whole requirement.
+Both schemas reject capability-level `version` and `channel`, malformed reference
+objects, and empty keys. The shared reader also rejects escaping paths. It
+passes references unchanged to operation preparation and compatibility planning;
+these annotation-only records do not read or enforce installed tool versions,
+fetch runtimes, or infer setup commands. Native tooling owns the requirement.
+Existing target references survive generation; newly discovered tools remain
+unversioned unless the target already declares a requirement. No caller runtime
+version or template pin becomes a target requirement. The live Python requirement
+remains in `scripts/pyproject.toml`; Node's LTS requirement lives once in
+`scripts/.nvmrc`. Package/release `version` and `channel` fields are unaffected.
+
 Supported SDLC v4 and v5 place tests in explicit actions. A deliverable may declare
 a no-op with a reason, including coverage by repository-wide tests. Different
 deliverables can name different test entrypoints. The repository validator
