@@ -163,11 +163,17 @@ def test_bootstrap_full_install_materializes_lifecycle_bundle_with_source_runtim
     assert "skill-sections.json" in rejected.stderr
     assert not (tmp_path / "rejected-install").exists()
 
-    # The managed public CLI must also install the complete candidate batch.
+    # Promotion owns the real release source lock. Give this independent CLI
+    # qualification its own input tree instead of borrowing that live lock.
+    managed_source = tmp_path / "managed-source"
+    shutil.copytree(ROOT, managed_source, ignore=shutil.ignore_patterns(
+        ".git", ".venv", ".build", "node_modules", "__pycache__",
+        ".pytest_cache", ".ruff_cache", ".mypy_cache",
+    ))
     managed_root = tmp_path / "managed-installed"
     managed = subprocess.run(
         [sys.executable, str(LIFECYCLE_SOURCE / "scripts/runtime/install-managed-skills.py"),
-         "--repo-root", str(ROOT), "--install-root", str(managed_root)],
+         "--repo-root", str(managed_source), "--install-root", str(managed_root)],
         env=env, capture_output=True, text=True, check=False,
     )
     assert managed.returncode == 0, managed.stderr or managed.stdout
@@ -176,6 +182,17 @@ def test_bootstrap_full_install_materializes_lifecycle_bundle_with_source_runtim
     expected = json.loads((ROOT / "skills/skill-sections.json").read_text())["skills"]
     assert set(receipt["deployed"]) == set(expected)
     assert not receipt["cleanup_debt"]
+    assert managed_source.resolve().parent == tmp_path.resolve()
+    shutil.rmtree(managed_source)
+    for skill, script in (("ceratops-skill-lifecycle", "skill-update-workflow.py"),
+                          ("ceratops-repo-lifecycle", "promote-repository.py")):
+        installed = managed_root / skill
+        runtime = json.loads((installed / ".runtime-manifest.json").read_text())["python_runtime"]
+        checked = subprocess.run(
+            [runtime, "-E", "-s", str(installed / "scripts" / script), "--help"],
+            cwd=tmp_path, capture_output=True, text=True,
+        )
+        assert checked.returncode == 0, checked.stderr
 
 def test_lifecycle_only_installed_bundle_materializes_compatible_repo(
     tmp_path: pathlib.Path,
