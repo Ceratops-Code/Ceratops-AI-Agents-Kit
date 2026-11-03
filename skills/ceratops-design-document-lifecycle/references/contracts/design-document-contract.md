@@ -1,6 +1,6 @@
 # Design Document Contract
 
-Generated from `contracts/design-document-contract.json`; edit that source.
+Generated from `design-document-contract.json`; edit that source.
 
 Use a tailored arc42 organization. Preserve an adequate project layout by
 mapping these topics to its headings; consolidate related sections when

@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import os
 import pathlib
 import runpy
 import shutil
-import importlib
 import sys
 
 import pytest
@@ -101,10 +101,10 @@ def _worktree_build_case(tmp_path):
     _write_fixture_bytes(repository, "unrelated.txt", b"keep staged change")
     assert run_git(repository, "add", "unrelated.txt").returncode == 0
     prepare = [sys.executable, "-c", "import pathlib,sys;pathlib.Path('version.txt').write_text(sys.argv[1])", "{version}"]
-    options = dict(repository="example/project", release_unit="claims", version=version,
-                   required_targets=[target], attempt_id="worktree-build", source_paths=["version.txt"],
-                   requests={target: [runner.OperationRequest("deliverables.packages.claims.actions.build")]},
-                   preparation_commands=[prepare], describe_receipt=lambda _transaction, _target, _batch: receipt)
+    options = {"repository": "example/project", "release_unit": "claims", "version": version,
+               "required_targets": [target], "attempt_id": "worktree-build", "source_paths": ["version.txt"],
+               "requests": {target: [runner.OperationRequest("deliverables.packages.claims.actions.build")]},
+               "preparation_commands": [prepare], "describe_receipt": lambda _transaction, _target, _batch: receipt}
     return repository, options
 
 

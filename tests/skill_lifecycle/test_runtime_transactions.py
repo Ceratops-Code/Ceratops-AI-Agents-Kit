@@ -339,7 +339,7 @@ def test_managed_deploy_repeated_relative_options_restore_entry_directory(
 
     def check(source, affected):
         checked.append(source)
-        assert source != repo and (source / "skills/alpha-tool/SKILL.md").is_file()
+        assert source == repo and (source / "skills/alpha-tool/SKILL.md").is_file()
         assert affected.deploy == ("alpha-tool",)
         if source_failure:
             raise installer["InstallerError"]("source rejected", phase="source_check")
@@ -361,7 +361,7 @@ def test_managed_deploy_repeated_relative_options_restore_entry_directory(
             assert result["repo_root"] == str(repo) and result["install_root"] == str(destination)
             assert result["deployed"] == (["alpha-tool"] if attempt == 0 else [])
             assert runtime_owner(destination, "alpha-tool") == "example/relative"
-    assert len(checked) == 2 and all(source != repo and not source.exists() for source in checked)
+    assert len(checked) == 2 and all(source == repo and source.is_dir() for source in checked)
 
 
 def test_managed_deploy_concurrent_repositories_keep_source_and_receipt_ownership(

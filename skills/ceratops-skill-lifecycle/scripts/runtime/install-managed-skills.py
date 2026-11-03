@@ -858,15 +858,16 @@ def deploy_managed_skills(args: DeployOptions) -> dict[str, Any] | str:
                                                   repo_root, install_root, commit)
                     receipt["status"] = "no_op"
                     return receipt
-                # Leave any installed directory being retired before entering
-                # the disposable source view; Windows must release both trees.
+                # Build from the selected checkout while its release lock is
+                # held. The frozen copy supplies deployment evidence only.
+                # Leave any installed directory being retired for Windows.
                 os.chdir(repo_root)
                 with source_provenance.capture_source(repo_root, install_root) as captured:
-                    _check_deployment_sources(captured.root, affected)
+                    _check_deployment_sources(repo_root, affected)
                     if _source_commit(repo_root) != commit:
                         raise InstallerError("source changed during source checks", phase="source_check", status="source_changed")
                     result = runtime_builder.install_transaction(
-                        captured.root, install_root,
+                        repo_root, install_root,
                         selected=() if affected.all_managed else affected.deploy,
                         remove=affected.remove, all_managed=affected.all_managed,
                         previous_runtime_source_id=args.previous_runtime_source_id,

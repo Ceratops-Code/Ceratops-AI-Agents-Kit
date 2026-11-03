@@ -19,12 +19,13 @@ repository's declared sources of truth.
 
 ### Shared Resources
 
-- Read `references/design-document-contract.md` for content and view selection.
+- Read `references/contracts/design-document-contract.md` for content and view
+  selection.
   It is generated from `references/contracts/design-document-contract.json`;
   the JSON owns the contract. Semantic annotations require agent judgment.
-- Read `references/validator.md` before running
+- Read the Mechanical Checks section of `references/review.md` before running
   `scripts/validate_design_document.py`; it defines inputs, dependencies,
-  mechanical checks, evidence, and cleanup.
+  mechanical checks, evidence, and cleanup for both actions.
 - Use `assets/design-document-template.md` only for a new document without a
   satisfactory project-specific structure. It is a generated starting point.
 
