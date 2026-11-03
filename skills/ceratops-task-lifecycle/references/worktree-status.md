@@ -19,8 +19,10 @@ implementation evidence.
   status do not affect membership. Do not read private app storage.
 - Write a request file with schema `ceratops-worktree-status-request.v1` and a
   nonempty `repositories` array. Each entry has an absolute worktree-root
-  `path`, `release_ref`, `remote_base_ref`, and boolean `fetch`.
-  Set `fetch` only when refreshing that repository's remote is authorized.
+  `path`, `release_ref`, `remote_base_ref`, and `"fetch": true`.
+  Invoking this action authorizes the helper to run `git fetch --prune <remote>`
+  for each selected repository, using the part of `remote_base_ref` before the
+  first `/` as `<remote>`.
 - (D) Run `uv run --no-project --python <python_runtime> python
   <skill_root>/scripts/collect-worktree-status.py --request <request_file>
   --output <report_file>`.
@@ -55,8 +57,8 @@ records, coverage gaps, table-ready cells, and rendered Markdown. It omits
 `main`, `release/local`, configured integration branches, and their remote
 counterparts, including worktrees on those branches. Every other registered
 worktree and remaining local or remote branch appears once. Detached or absent
-worktrees use `-`; shipping remains `Unavailable` without a successful
-authorized fetch. Ignored files do not make a worktree dirty.
+worktrees use `-`; shipping remains `Unavailable` if the fetch fails or the
+remote base ref cannot be resolved. Ignored files do not make a worktree dirty.
 
 An active task is any existing, unarchived local Codex chat, regardless of
 runtime status. List every exact worktree match with its full ID and title;
@@ -69,8 +71,9 @@ The helper owns only the caller-selected report and its fixed `.pending` and
 `.lock` companions. It retains one current report, replaces it atomically only
 after collection, and removes an orphaned pending file under the output lock
 before a fresh run and after success or a handled failure. A lock companion may
-remain as bounded coordination state. It does not change branches, worktrees,
-or tasks; the only remote effect is an explicitly requested fetch.
+remain as bounded coordination state. The fetch refreshes and prunes refs
+according to the selected remote's fetch configuration. The helper only reads
+worktrees and tasks.
 
 ## Done When
 
