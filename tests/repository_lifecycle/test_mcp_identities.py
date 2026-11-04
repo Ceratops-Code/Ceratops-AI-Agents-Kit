@@ -111,8 +111,9 @@ def _package_mcp_case(tmp_path, monkeypatch, problem=None):
 
 
 @pytest.mark.parametrize("interruption", [None, "before", "after"])
-def test_package_prerequisites_reach_installer_on_fresh_repeated_sdlc_calls(tmp_path, monkeypatch, interruption):
-    case = _package_mcp_case(tmp_path, monkeypatch)
+@pytest.mark.parametrize("extra_wheel", [False, True])
+def test_package_prerequisites_reach_installer_on_fresh_repeated_sdlc_calls(tmp_path, monkeypatch, interruption, extra_wheel):
+    case = _package_mcp_case(tmp_path, monkeypatch, "multiple-wheels" if extra_wheel else None)
     original_wheel = case.wheel.read_bytes()
     effects = []
     calls = []
@@ -142,7 +143,8 @@ def test_package_prerequisites_reach_installer_on_fresh_repeated_sdlc_calls(tmp_
     monkeypatch.setattr(skill_actions, "run_progress_command", lambda *_a, **_k: pytest.fail("unexpected build or test"))
     for attempt in range(3):
         # Each call prepares current authoritative inputs without saved execution state.
-        prepared = runner.prepare_operations(case.repo, [runner.OperationRequest(case.operation)])[0]
+        prepared = runner.prepare_operations(case.repo, [runner.OperationRequest(case.operation)],
+            artifacts={"deliverables.packages.claims": [case.wheel.relative_to(case.repo).as_posix()]})[0]
         assert prepared.steps[0].handoff["inputs"] == {"mcp-server": case.name}
         if attempt == 0 and interruption:
             with pytest.raises(KeyboardInterrupt):
@@ -154,7 +156,7 @@ def test_package_prerequisites_reach_installer_on_fresh_repeated_sdlc_calls(tmp_
     assert not (case.source / "pylock.toml").exists()
 
 
-@pytest.mark.parametrize("problem", ["missing-wheel", "stale-wheel", "multiple-wheels", "missing-lock",
+@pytest.mark.parametrize("problem", ["missing-wheel", "stale-wheel", "missing-lock",
                                      "ambiguous-lock", "pin-mismatch", "wrong-project", "wrong-server",
                                      "missing-project", "no-direct-pin", "unpinned-package", "multiple-direct",
                                      "linked-wheel", "linked-project"])
@@ -162,7 +164,8 @@ def test_bad_package_prerequisites_stop_before_installer(tmp_path, monkeypatch, 
     case = _package_mcp_case(tmp_path, monkeypatch, problem)
     monkeypatch.setattr(skill_actions, "_call_action", lambda *_a: pytest.fail("installer must not start"))
     for _ in range(2):
-        prepared = runner.prepare_operations(case.repo, [runner.OperationRequest(case.operation)])[0]
+        prepared = runner.prepare_operations(case.repo, [runner.OperationRequest(case.operation)],
+            artifacts={"deliverables.packages.claims": [case.wheel.relative_to(case.repo).as_posix()]})[0]
         result = runner.execute_prepared_operation(prepared)
         assert result["status"] == "operation_failed", result
         assert "Cannot prepare package-backed MCP installation" in result["message"]

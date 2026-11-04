@@ -1215,7 +1215,7 @@ def main(argv: list[str] | None = None) -> int:
         artifacts = json.loads(args.artifacts) if args.artifacts else {}
         conditional = parse_parameters(args.parameter_if_declared)
         if not (args.validate or args.tests) and any(
-            operation_category(name) in MUTATION_CATEGORIES for name in args.operation
+            operation_category(name, version=5) in MUTATION_CATEGORIES for name in args.operation
         ):
             result = execute_release_builds(
                 root, [OperationRequest(name, parameters, conditional, args.if_declared)

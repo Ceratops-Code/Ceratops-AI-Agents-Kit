@@ -726,10 +726,16 @@ def _deploy_completed_promotion(
                 **operations, "phase": "deployment", "promotion": dict(accepted.result),
                 "remote_mutation": False,
             })
+    delivery_names = {item.operation for item in prepared_operations}
+    operations["build_results"] = [*operations.get("build_results", []), *(
+        item for item in operations.get("results", []) if item["operation"] not in delivery_names
+    )]
+    operations["results"] = [
+        item for item in operations.get("results", []) if item["operation"] in delivery_names
+    ]
     operations["completed_operations"] = [
         operation_result["operation"]
         for operation_result in operations.get("results", [])
-        if operation_result["operation"] in {item.operation for item in prepared_operations}
     ]
     operations.pop("deferred_handoffs", None)
 

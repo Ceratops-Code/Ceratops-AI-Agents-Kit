@@ -544,7 +544,8 @@ def _checkpointed_operation_batch(
                            "pending_operations": operations[first_pending + offset:]}, checkpoints
             result = next(item for item in batch["results"] if item["operation"] == operation)
             result = {**result, "build_results": [item for item in batch["results"]
-                                                if item["operation"] != operation]}
+                                                if item["operation"] != operation]
+                      + batch.get("build_results", [])}
             index = first_pending + offset
             if result["status"] in FAILED_STATUSES:
                 return 1, {

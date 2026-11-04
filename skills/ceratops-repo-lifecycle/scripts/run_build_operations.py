@@ -74,9 +74,9 @@ def prepare_build_operations(root, requests, contract_path=None, *, context="ski
     contract = operations.read_repository_contract(root, contract_path)
     entries = operation_entries(contract)
     requested = {request.operation: request for request in requests}
-    if len(requested) != len(requests):
-        raise operations.OperationError("A build batch must name each action once per target.")
-    pending = list(requests)
+    if any(request != requested[request.operation] for request in requests):
+        raise operations.OperationError("Repeated actions in one target must use the same parameters.")
+    pending = list(requested.values())
     prepared: dict[str, list[Any]] = {}
     checked: set[tuple[str, str | None]] = set()
     while pending:
@@ -116,7 +116,13 @@ def prepare_build_operations(root, requests, contract_path=None, *, context="ski
                             dependency = operations.OperationRequest(location, parameters_if_declared=parameters)
                             requested[location] = dependency
                             pending.append(dependency)
-    result = [item for items in prepared.values() for item in items]
+    # Dependency builds run once; explicitly repeated delivery commands retain
+    # the caller's ordering and number of effects.
+    result = [item for request in requests for item in prepared[request.operation]
+              if item.category != "build"]
+    original_names = {request.operation for request in requests}
+    result.extend(item for name, items in prepared.items() for item in items
+                  if name not in original_names or item.category == "build")
     # A native build may append its receipt commit. Until the unit-wide completer
     # owns that step, no consumer can be prepared against the preceding commit.
     committing = [item for item in result if item.result_commit_field]
@@ -330,6 +336,23 @@ def execute_check_phases(
             results.append(original)
         else:
             run(item)
+    if delivery and not builds and not after and not any(
+        item["status"] in operations.FAILED_STATUSES for item in results
+    ):
+        # An installation with no declared build keeps the existing delivery
+        # response. Supporting source checks do not become installed operations.
+        result = operations.execute_prepared_operations(
+            delivery, diagnostic_output=diagnostic_output, diagnostic_owner=diagnostic_owner,
+            successful_results=(successful_results, results),
+        )
+        # Keep supporting checks available to the next action in this attempt
+        # without reporting them as completed installation/publication actions.
+        result["build_results"] = results
+        for source, destination in (("check_result", "check_results"), ("check_summary", "check_summaries")):
+            check_references = [item[source] for item in results if item.get(source)]
+            if check_references:
+                result[destination] = check_references
+        return result
     if not any(item["status"] in operations.FAILED_STATUSES for item in results):
         accepted = {item["operation"]: item for item in _successful_builds(successful_results)}
         for item in builds:

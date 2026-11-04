@@ -715,6 +715,9 @@ then passes those files to requested delivery operations. A direct Build,
 Promote-and-deploy and Ship's local build phase use this same call. Promotion
 keeps its required source checks; applicable passing results remain reusable.
 Independent task-worktree builds take no release lock.
+Installations without a declared build keep their existing operation reports.
+Repeated delivery requests retain their requested order; dependency builds run
+once per target.
 
 The runner consumes matching successful build results and existing tagged
 receipts with the same recorded source, target and release level. Native builders

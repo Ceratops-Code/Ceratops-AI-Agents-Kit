@@ -260,7 +260,10 @@ def test_promote_repository_requires_an_explicit_deployment_choice(
     if expected_operation is None or declared_handoff is not None:
         assert result["operations"] is None
     else:
-        assert result["operations"] == {
+        operations = result["operations"]
+        assert {key: operations[key] for key in (
+            "status", "completed_operations", "pending_operations", "results"
+        )} == {
             "status": "completed",
             "completed_operations": [expected_operation["operation"]],
             "pending_operations": [],
@@ -268,9 +271,13 @@ def test_promote_repository_requires_an_explicit_deployment_choice(
                 {
                     **expected_operation,
                     "commit": approved_head,
+                    "qualification_level": "beta",
+                    "parameters": {},
                 }
             ],
         }
+        assert all(item["status"] in {"completed", "no_op"}
+                   for item in operations.get("build_results", []))
     assert "managed_skills" not in result
     expected_handoffs = []
     if expected_handoff is not None and declared_handoff is None:

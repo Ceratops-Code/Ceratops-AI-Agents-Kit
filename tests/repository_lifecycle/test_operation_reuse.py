@@ -127,7 +127,11 @@ def test_release_builds_expand_all_kinds_and_pass_exact_outputs(tmp_path, monkey
         args = module["build_parser"]().parse_args(["--repo-root", str(tmp_path)])
         from github_pr_workflow.command import release_write_context
         with release_write_context(tmp_path):
-            result = module["_deploy_completed_promotion"](args, accepted)["operations"]
+            promoted = module["_deploy_completed_promotion"](args, accepted)
+            result = promoted["operations"]
+        module["_completed_deployment"](promoted, accepted.result["head"], repo_root=tmp_path)
+        assert [item["operation"] for item in result["results"]] == [name]
+        assert any(item["operation"].endswith(".actions.build") for item in result["build_results"])
     elif entry == "ship":
         # Ship has no per-operation parameter arguments. Bind this repository's
         # target in its commands, keeping the same declared build graph.

@@ -573,8 +573,10 @@ the existing unfinished flag. Task-worktree builds remain unlocked.
 
 The dependency graph includes declared package prerequisites at every level and
 non-package artifacts named by during-build groups. A joint after-build test
-brings in its other required members. Every action runs once per target, with
-separate artifact maps for different targets. Installers receive the requested
+brings in its other required members. Every build runs once per target, with
+separate artifact maps for different targets. Explicitly repeated delivery
+actions retain their requested order. Without a declared build, installation
+keeps its existing operation-result shape. Installers receive the requested
 build's returned files and dependency files through `selected_artifacts`. An old
 file merely present in the output directory cannot satisfy a failed build.
 The adapter translates these paths; it performs no alternate-file search.
