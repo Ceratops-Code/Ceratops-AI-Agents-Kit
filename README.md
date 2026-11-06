@@ -1573,7 +1573,7 @@ names. Every group has `phase` (`before-build`, `during-build` or `after-build`)
 and `requires-artifacts` (deliverable references). Before-build groups have no
 artifact requirements; after-build groups name at least one. During-build groups
 belong to the build command, which returns their actual successful check records.
-Independent source checks finish before builds. Selected build prerequisites run
+Pre-build checks stop at the first failure. Selected build prerequisites run
 first, failed prerequisites block their dependents, and joint tests wait for all
 their selected files. The executor supplies `--check-group` and `--artifacts`
 JSON to test commands and `CERATOPS_TEST_ARTIFACTS` to their children. File paths

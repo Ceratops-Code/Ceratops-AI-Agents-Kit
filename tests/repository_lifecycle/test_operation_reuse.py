@@ -265,7 +265,7 @@ def _check(root: pathlib.Path, level="beta"):
     return runner.replace(operation, qualification_level=level)
 
 
-def _phased_repository(root, *, fail_before=False, fail_build_check=False):
+def _phased_repository(root, *, source_failure=None, fail_build_check=False):
     """Real commands log their order and test only explicitly passed build files."""
     _fixture(root)
     contract = root / runner.DEFAULT_CONTRACT
@@ -278,7 +278,13 @@ p.add_argument('--build', action='store_true')
 p.add_argument('--check-group')
 p.add_argument('--artifacts')
 a = p.parse_args()
-with pathlib.Path('order.log').open('a') as f: f.write(('build' if a.build else a.check_group) + '\\n')
+source_failure = SOURCE_FAILURE if a.check_group == 'scan-a' else None
+if source_failure != 'before':
+    with pathlib.Path('order.log').open('a') as f:
+        f.write(('build' if a.build else a.check_group) + '\\n')
+if source_failure:
+    print('source scan failed', file=sys.stderr)
+    sys.exit(3)
 if a.build:
     path = pathlib.Path('wheel.bin'); path.write_bytes(b'current build')
     check = {'id': 'compiler-check', 'status': BUILD_STATUS, 'result_id': 'compiler-result', 'check_version': 'compiler-v1'}
@@ -290,9 +296,7 @@ elif a.check_group == 'unit-tests':
     paths = json.loads(a.artifacts)['deliverables.packages.sample']
     assert len(paths) == 1 and pathlib.Path(paths[0]).read_bytes() == b'current build'
     assert json.loads(os.environ['CERATOPS_TEST_ARTIFACTS']) == json.loads(a.artifacts)
-elif a.check_group == 'scan-a' and FAIL_BEFORE:
-    print('source scan failed', file=sys.stderr); sys.exit(3)
-'''.replace('BUILD_STATUS', repr('failed' if fail_build_check else 'passed')).replace('FAIL_BEFORE', repr(fail_before))
+'''.replace('BUILD_STATUS', repr('failed' if fail_build_check else 'passed')).replace('SOURCE_FAILURE', repr(source_failure))
     (root / "scripts/phases.py").write_text(source)
     (root / "older-installed.bin").write_bytes(b'old installation')
     with (root / ".gitignore").open("a") as output:
@@ -328,19 +332,29 @@ def test_check_phases_use_current_artifact_and_build_checks_once(tmp_path):
     assert build["check_summary"]["checks"][0]["result_id"] == "compiler-result"
 
 
-@pytest.mark.parametrize("failure", [False, True])
-def test_check_phases_public_cli_preserves_all_independent_results(tmp_path, failure):
-    _phased_repository(tmp_path, fail_before=failure)
-    process = subprocess.run([
+@pytest.mark.parametrize("source_failure", [None, "before", "after"])
+def test_check_phases_public_cli_reports_first_source_failure(tmp_path, source_failure):
+    _phased_repository(tmp_path, source_failure=source_failure)
+    command = [
         sys.executable, str(ROOT / "skills/ceratops-repo-lifecycle/scripts/repository_operation.py"),
         "--repo-root", str(tmp_path), "--operation", "deliverables.packages.sample.actions.build",
-    ], capture_output=True, text=True, check=False)
-    output = json.loads(process.stderr if process.returncode else process.stdout)
-    assert process.returncode == (1 if failure else 0), output
-    groups = [item.get("check_group") for item in output["results"]]
-    assert "scan-a" in groups and "scan-b" in groups
-    assert (tmp_path / "order.log").read_text().splitlines() == (
-        ["scan-a", "scan-b"] if failure else ["scan-a", "scan-b", "build", "unit-tests"])
+    ]
+    order_log = tmp_path / "order.log"
+    for attempt in range(2 if source_failure else 1):
+        process = subprocess.run(command, capture_output=True, text=True, check=False)
+        output = json.loads(process.stderr if process.returncode else process.stdout)
+        assert process.returncode == (1 if source_failure else 0), output
+        order = order_log.read_text().splitlines() if order_log.exists() else []
+        if source_failure:
+            assert output["status"] == "tests_failed"
+            assert output["results"][-1]["check_group"] == "scan-a"
+            assert output["diagnostic"]["exit_code"] == 3
+            assert "source scan failed" in output["message"]
+            assert "deliverables.packages.sample.actions.build" in output["pending_operations"]
+            assert order == (["scan-a"] * (attempt + 1) if source_failure == "after" else [])
+        else:
+            assert output["status"] == "completed"
+            assert order == ["scan-a", "scan-b", "build", "unit-tests"]
 
 
 @pytest.mark.parametrize("format", ["v2", "v3-single", "v3-multiple"])
@@ -459,12 +473,14 @@ def test_check_phases_orders_selected_build_dependencies_and_joint_tests(tmp_pat
 
 
 @pytest.mark.parametrize("failure", ["source", "compiler"])
-def test_check_phases_finish_independent_checks_and_block_dependents(tmp_path, failure):
-    requests = _phased_repository(tmp_path, fail_before=failure == "source", fail_build_check=failure == "compiler")
+def test_check_phases_block_dependents_on_source_or_build_failure(tmp_path, failure):
+    requests = _phased_repository(
+        tmp_path, source_failure="after" if failure == "source" else None, fail_build_check=failure == "compiler",
+    )
     result = runner.execute_prepared_operations(runner.prepare_operations(tmp_path, requests))
     assert result["status"] in runner.FAILED_STATUSES
     assert (tmp_path / "order.log").read_text().splitlines() == (
-        ["scan-a", "scan-b"] if failure == "source" else ["scan-a", "scan-b", "build"])
+        ["scan-a"] if failure == "source" else ["scan-a", "scan-b", "build"])
     assert not any(item.get("check_group") == "unit-tests" and item["status"] == "completed" for item in result["results"])
 
 

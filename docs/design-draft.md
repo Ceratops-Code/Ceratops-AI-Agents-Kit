@@ -544,10 +544,10 @@ Custom runners are preserved; their support files are managed only when the
 scripts project declares `tool.ceratops.test-support.managed = true`.
 
 `repository_operation.prepare_operations()` reads v5 `check-groups` with required
-`phase` and `requires-artifacts` fields. `execute_check_phases()` completes
-independent source checks, orders declared builds by their prerequisites and
-required artifact inputs,
-and starts after-build checks only with every required artifact available.
+`phase` and `requires-artifacts` fields. `execute_check_phases()` reports the
+first failed source check and stops. After the source checks pass, it orders
+declared builds by prerequisites and required artifact inputs. After-build
+checks start once every required artifact is available.
 During-build groups execute inside the build process and must return their real
 passing records. The executor never creates a pass for a named but absent check.
 Test commands receive `--check-group` and `--artifacts`; their child processes

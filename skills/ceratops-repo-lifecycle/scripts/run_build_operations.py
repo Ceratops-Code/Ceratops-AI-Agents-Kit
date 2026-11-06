@@ -271,6 +271,7 @@ def execute_check_phases(
 ) -> dict[str, Any]:
     """Run source checks, dependency-ordered builds, output tests, then delivery.
 
+    Stop before starting another source check when a pre-build check fails.
     Only returned artifact paths reach consumers. Builders keep their own receipt
     and repeated-call behavior. A caller's matching completed build can be consumed
     directly with its original receipt; unrelated or older source outcomes cannot.
@@ -334,8 +335,8 @@ def execute_check_phases(
                 and ("alpha", "beta", "rc", "final").index(original["qualification_level"])
                 >= ("alpha", "beta", "rc", "final").index(item.qualification_level)):
             results.append(original)
-        else:
-            run(item)
+        elif run(item)["status"] in operations.FAILED_STATUSES:
+            break
     if delivery and not builds and not after and not any(
         item["status"] in operations.FAILED_STATUSES for item in results
     ):
