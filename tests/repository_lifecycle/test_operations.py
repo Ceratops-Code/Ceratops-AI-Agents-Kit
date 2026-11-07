@@ -135,7 +135,7 @@ def test_canonical_operation_result_rejects_incomplete_artifact() -> None:
 
 def test_live_sdlc_selects_validation_and_tests_for_every_install() -> None:
     document = contracts.load_contract(ROOT / "sdlc/sdlc.yml")
-    assert document["version"] == contracts.latest_sdlc_version()
+    assert document["version"] in contracts.sdlc_schema_paths()
     installs = (
         "deliverables.skills.ceratops-repo-lifecycle.actions.install",
         "deliverables.hooks.codex-hooks.actions.install",

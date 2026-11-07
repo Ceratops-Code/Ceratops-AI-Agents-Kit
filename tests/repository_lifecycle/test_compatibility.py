@@ -1296,7 +1296,7 @@ def test_capability_changes_preserve_artifact_release_version_and_channel():
     schema = {"$ref": "#/$defs/buildSelection", "$defs": schema["$defs"]}
     record = {
         "repository": "example/project", "sourceCommit": "a" * 40,
-        "releaseUnit": "example", "channel": "beta", "version": "7.2.0b1", "target": "any",
+        "releaseBundle": "example", "channel": "beta", "version": "7.2.0b1", "target": "any",
     }
     jsonschema.Draft202012Validator(schema).validate(record)
     assert record["channel"] == "beta"
