@@ -330,6 +330,27 @@ def test_generated_runner_retires_removed_parameter_cases_and_only_their_diagnos
     assert not report.exists() and user_copy.read_bytes() == retained
 
 
+@pytest.mark.parametrize("external", [False, True])
+def test_generated_runner_cleans_aborted_first_report_write_before_tests(tmp_path, external):
+    root, script = _mapped_generated_runner(tmp_path)
+    report = tmp_path / "retained.json" if external else root / ".build/test-diagnostics/pytest-failure.json"
+    pending = report.with_name(f".{report.stem}.in_process.json")
+    pending.parent.mkdir(parents=True, exist_ok=True)
+    if external:
+        report.write_text("caller-retained report")
+    (root / "tests/test_a.py").write_text(
+        "from pathlib import Path\ndef test_no_partial_report():\n"
+        f"    assert not Path({str(pending)!r}).exists()\n")
+    for _ in range(2):
+        pending.parent.mkdir(parents=True, exist_ok=True)
+        pending.write_text('{"incomplete":')
+        result = _run_result_runner(root, script, ["tests/test_a.py", "--diagnostic-output", str(report)])
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert not pending.exists()
+        assert report.read_text() == "caller-retained report" if external else not report.exists()
+    assert "1 checks reused recorded passes" in result.stdout
+
+
 def test_generated_runner_records_real_pytest_and_reuses_exact_acceptance(tmp_path: pathlib.Path) -> None:
     root, runner, output = _result_runner(tmp_path)
     count = tmp_path / "test-executions"

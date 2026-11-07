@@ -1610,8 +1610,9 @@ case disappeared. Cleanup covers only the requested files and target; another
 file's unresolved failures remain. Once none remain, the report is deleted.
 At startup, saved passes finish missed report cleanup without rerunning tests.
 Report replacement uses one `.in_process.json` sibling, removed after writing
-or on the next managed-report cleanup. Caller-retained reports outside managed
-storage stay untouched.
+or at the next startup, even if the first report was never published.
+Caller-retained reports outside managed storage stay untouched; the writer
+still removes its own partial-write file beside them.
 Lifecycle commands separately retire their own operation reports after consuming
 successful command results. Cleanup preserves the other entries in
 `check_results.json` and never changes completed builds' Git summaries.

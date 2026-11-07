@@ -169,9 +169,10 @@ def remove_test_diagnostic(path: pathlib.Path, *, root: pathlib.Path, current: A
     later failure. A complete successful command can clear an earlier launch or
     collection error for that same request, which has no individual test result.
     """
+    # The writer owns its partial file even beside a user-retained report.
+    path.with_name(f".{path.stem}.in_process.json").unlink(missing_ok=True)
     if not path.resolve().is_relative_to((root / ".build/test-diagnostics").resolve()):
         return
-    path.with_name(f".{path.stem}.in_process.json").unlink(missing_ok=True)
     report = _read_test_diagnostic(path, root)
     if report is None:
         return

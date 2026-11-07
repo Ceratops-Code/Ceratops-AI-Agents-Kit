@@ -1057,6 +1057,23 @@ def test_deleted_case_cleanup_resumes_between_effects(tmp_path, monkeypatch, eff
     assert not list(report.parent.glob("*.in_process.json"))
 
 
+def test_runner_cleans_aborted_first_report_write_before_tests(test_runner_module, tmp_path, capsys):
+    root = _acceptance_repository(tmp_path)
+    (root / ".gitignore").write_text("__pycache__/\n.pytest_cache/\n.build/\n")
+    pending = root / ".build/test-diagnostics/.pytest-failure.in_process.json"
+    (root / "tests/test_report.py").write_text(
+        "from pathlib import Path\ndef test_no_partial_report():\n"
+        "    assert not Path('.build/test-diagnostics/.pytest-failure.in_process.json').exists()\n")
+    for _ in range(2):
+        pending.parent.mkdir(parents=True, exist_ok=True)
+        pending.write_text('{"incomplete":')
+        assert test_runner_module.execute(["--all"], repo_root=root) == 0
+        result = json.loads(capsys.readouterr().out)
+        assert not pending.exists()
+        assert not (pending.parent / "pytest-failure.json").exists()
+    assert result["pytest"]["checks"]["executed"] == 0
+
+
 def test_changed_arguments_and_dependency_versions_do_not_reuse_results(
     test_runner_module, tmp_path, monkeypatch,
 ):

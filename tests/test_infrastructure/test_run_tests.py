@@ -1296,15 +1296,18 @@ def test_manifest_validation_mode_collects_every_declared_target(
 
 
 def test_committed_diff_reports_unmapped_retired_configuration(
-    test_runner_module: Any, capsys: pytest.CaptureFixture[str]
+    test_runner_module: Any, capsys: pytest.CaptureFixture[str], tmp_path: pathlib.Path,
 ) -> None:
     """A mapped addition does not conceal an unknown deleted input."""
     runner = test_runner_module
     execution = DeterministicExecution(
         runner, b"D\0deploy/deploy.yml\0A\0sdlc/sdlc.yml\0"
     )
+    managed = ROOT / runner.DEFAULT_DIAGNOSTIC_PATH
+    existing = managed.read_bytes() if managed.exists() else None
+    diagnostic = tmp_path / "retired-configuration.json"
     exit_code = runner.execute(
-        ["--base", BASE, "--head", HEAD],
+        ["--base", BASE, "--head", HEAD, "--diagnostic-output", str(diagnostic)],
         repo_root=ROOT,
         text_runner=execution.text,
         bytes_runner=execution.bytes,
@@ -1312,6 +1315,8 @@ def test_committed_diff_reports_unmapped_retired_configuration(
     result = payload(capsys)
 
     assert exit_code == runner.MAPPING_GAP_EXIT_CODE
+    assert diagnostic.is_file()
+    assert (managed.read_bytes() if managed.exists() else None) == existing
     assert result["mapping_gaps"][0]["path"] == "deploy/deploy.yml"
     assert result["full_suite"] is False
     assert result["full_suite_fallback"] is False

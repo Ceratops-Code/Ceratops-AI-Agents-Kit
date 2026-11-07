@@ -913,7 +913,7 @@ def main(argv: list[str] | None = None) -> int:
         args.executed = False
         args.diagnostic_path = (ROOT / (args.diagnostic_output or pathlib.Path(".build/test-diagnostics/pytest-failure.json"))).resolve()
         args.current_results = CurrentCheckResults(ROOT) if support is not None and (ROOT / ".git").exists() else None
-        if support is not None and args.diagnostic_path.exists():
+        if support is not None:
             support.remove_test_diagnostic(args.diagnostic_path, root=ROOT, current=args.current_results)
         if args.probe_command is not None:
             args.probe_command = json.loads(args.probe_command)
@@ -953,7 +953,7 @@ def main(argv: list[str] | None = None) -> int:
             code = run_recorded_check(execute_request, args, invocation, repo_root=ROOT,
                                      checks=(lambda: args.observed_checks) if args.probe_command is None else None,
                                      summary=(lambda: args.check_summary) if args.probe_command is None else None)
-            if support is not None and args.diagnostic_path.exists():
+            if support is not None:
                 support.remove_test_diagnostic(args.diagnostic_path, root=ROOT, current=args.current_results,
                                                successful_request=invocation if code == 0 and (args.executed or not request_executed) else None)
             return code

@@ -620,10 +620,12 @@ Other files and targets remain untouched. Cleanup also reads failure IDs from
 the report so interruption after removing a saved result cannot strand its
 diagnostic. Repeated calls reuse applicable passes. Report replacement uses a
 fixed `.in_process.json` sibling, flushed before replacement and removed on
-completion or next managed-report cleanup. The report disappears when no failure
+completion or next startup, including a write interrupted before the first report
+exists. The report disappears when no failure
 still needs attention. Startup finishes report cleanup from newer saved passes
 without tests. A lifecycle caller retires its separate operation report;
 caller-retained external reports and completed builds' Git summaries are preserved.
+The writer removes its own partial-write file even beside an external report.
 
 `execute_worktree_build.py` owns the internal source-commit-to-completion flow,
 exposed by a thin `repository_operation.execute_worktree_build()` callable. Its
