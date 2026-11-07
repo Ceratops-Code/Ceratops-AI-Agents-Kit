@@ -940,7 +940,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.check_group or args.artifacts:
             invocation.update(check_group=args.check_group, artifacts=args.artifacts)
         args.invocation = invocation
-        token = support.CHECK_REQUEST_INPUTS.set({"checkGroup": args.check_group, "artifacts": args.artifacts}) if support else None
+        token = support.CHECK_REQUEST_INPUTS.set({"checkGroup": args.check_group, "artifacts": args.artifacts,
+                                                 "diagnosticPath": str(args.diagnostic_path)}) if support else None
         request_executed = False
 
         def execute_request() -> int:

@@ -1053,7 +1053,8 @@ def execute_selected(
         *selection.pytest_targets,
     ]
     token = BUILD_REUSE_LEVEL.set("alpha" if args.build_history else None)
-    inputs_token = CHECK_REQUEST_INPUTS.set({"checkGroup": args.check_group, "artifacts": args.artifacts})
+    inputs_token = CHECK_REQUEST_INPUTS.set({"checkGroup": args.check_group, "artifacts": args.artifacts,
+                                            "diagnosticPath": str(diagnostic_path)})
     try:
         measure_selected_artifacts(root, args.artifacts)
         result = text_runner(pytest_command, root)

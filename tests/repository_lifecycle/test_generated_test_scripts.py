@@ -301,6 +301,35 @@ def test_generated_failure_report_keeps_redacted_streams(tmp_path, monkeypatch):
     assert report["stderr"] and report["command"] and report["exit_code"] == 1
 
 
+@pytest.mark.parametrize("filename", ["pytest-failure.json", "selected-checks.json"])
+def test_generated_runner_retires_removed_parameter_cases_and_only_their_diagnostics(tmp_path, filename):
+    root, script = _mapped_generated_runner(tmp_path)
+    test = root / "tests/test_a.py"
+    test.write_text("import pytest\n@pytest.mark.parametrize('value', ['old', 'gone'])\ndef test_value(value):\n    assert False\n")
+    (root / "b.data").write_text("bad")
+    report = root / ".build/test-diagnostics" / filename
+    options = ["--diagnostic-output", str(report)]
+    failed = _run_result_runner(root, script, ["tests", *options])
+    assert failed.returncode == 1, failed.stdout + failed.stderr
+    original = _current_test_records(root, script)
+    user_copy = tmp_path / "retained-report.json"
+    user_copy.write_bytes(report.read_bytes())
+    retained = user_copy.read_bytes()
+    test.write_text("import pytest\n@pytest.mark.parametrize('value', ['new'])\ndef test_value(value):\n    assert value == 'new'\n")
+    for _ in range(2):
+        passed = _run_result_runner(root, script, ["tests/test_a.py", *options])
+        assert passed.returncode == 0, passed.stdout + passed.stderr
+        current = _current_test_records(root, script)
+        assert set(current) == {"tests/test_a.py::test_value[new]", "tests/test_b.py::test_value"}
+        assert current["tests/test_b.py::test_value"] == original["tests/test_b.py::test_value"]
+        assert set(json.loads(report.read_text())["saved_failures"]) == {"tests/test_b.py::test_value"}
+    assert "1 checks reused recorded passes" in passed.stdout
+    (root / "b.data").write_text("good")
+    passed = _run_result_runner(root, script, ["tests", *options])
+    assert passed.returncode == 0, passed.stdout + passed.stderr
+    assert not report.exists() and user_copy.read_bytes() == retained
+
+
 def test_generated_runner_records_real_pytest_and_reuses_exact_acceptance(tmp_path: pathlib.Path) -> None:
     root, runner, output = _result_runner(tmp_path)
     count = tmp_path / "test-executions"

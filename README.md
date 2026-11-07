@@ -1601,12 +1601,20 @@ environment mapping as tests.
 Test errors are saved in `.build/test-diagnostics/pytest-failure.json` or the
 caller-selected diagnostic path. Repeated errors replace that request's current
 details; shared output is stored once per diagnostic, rather than copied into
-every failed test entry. The runner deletes its managed report after newer
-passes resolve every reported failure. Fixing only A keeps a report that still
-contains B. At startup it finishes missed deletion from saved outcomes, without
-rerunning tests. Caller-retained reports outside managed storage stay untouched.
+every failed test entry. Newer passes remove the corresponding failures from
+the managed report. After a successful run with complete collection, the runner
+also removes deleted or renamed test cases from this worktree's current results
+and report. This includes old parameter cases inside a file that still exists.
+Filtered, failed, interrupted or skipped collection cannot establish that a
+case disappeared. Cleanup covers only the requested files and target; another
+file's unresolved failures remain. Once none remain, the report is deleted.
+At startup, saved passes finish missed report cleanup without rerunning tests.
+Report replacement uses one `.in_process.json` sibling, removed after writing
+or on the next managed-report cleanup. Caller-retained reports outside managed
+storage stay untouched.
 Lifecycle commands separately retire their own operation reports after consuming
-successful command results. Neither cleanup deletes `check_results.json`.
+successful command results. Cleanup preserves the other entries in
+`check_results.json` and never changes completed builds' Git summaries.
 
 `github_pr_workflow.command` also owns temporary operation-attempt snapshots in
 the repository's caller-selected task temp tree. Promotion results and operation

@@ -101,6 +101,22 @@ def _unresolved_test_failures(report: Mapping[str, Any], current: Any) -> dict[s
     return remaining
 
 
+def _write_test_diagnostic(path: pathlib.Path, report: Mapping[str, Any]) -> bytes:
+    """Replace one report without losing still-needed failures on interruption."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pending = path.with_name(f".{path.stem}.in_process.json")
+    raw = _json(report) + b"\n"
+    try:
+        with pending.open("wb") as handle:
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(pending, path)
+    finally:
+        pending.unlink(missing_ok=True)
+    return raw
+
+
 def save_test_diagnostic(path: pathlib.Path, payload: Mapping[str, Any], *,
                          root: pathlib.Path, current: Any = None, summary: Any = None) -> bytes:
     """Keep one report, with at most one unresolved diagnostic per failed test.
@@ -140,17 +156,12 @@ def save_test_diagnostic(path: pathlib.Path, payload: Mapping[str, Any], *,
     report = {**detail, "saved_failures": pending, "recorded_ns": time.time_ns(),
               "diagnostics": {key: diagnostics[key] for key in {item["diagnostic_id"] for item in pending.values()}},
               "unrepresented_failure": not failures or any(item.get("result_id") not in saved for item in failures)}
-    path.parent.mkdir(parents=True, exist_ok=True)
-    raw = _json(report) + b"\n"
-    with path.open("wb") as handle:
-        handle.write(raw)
-        handle.flush()
-        os.fsync(handle.fileno())
-    return raw
+    return _write_test_diagnostic(path, report)
 
 
 def remove_test_diagnostic(path: pathlib.Path, *, root: pathlib.Path, current: Any = None,
-                           successful_request: Mapping[str, Any] | None = None) -> None:
+                           successful_request: Mapping[str, Any] | None = None,
+                           retired_checks: set[str] | None = None) -> None:
     """Remove a managed report after its own failures have newer saved passes.
 
     Caller-selected reports outside .build/test-diagnostics are user-retained.
@@ -160,10 +171,24 @@ def remove_test_diagnostic(path: pathlib.Path, *, root: pathlib.Path, current: A
     """
     if not path.resolve().is_relative_to((root / ".build/test-diagnostics").resolve()):
         return
+    path.with_name(f".{path.stem}.in_process.json").unlink(missing_ok=True)
     report = _read_test_diagnostic(path, root)
-    if report is None or _unresolved_test_failures(report, current):
+    if report is None:
         return
     unknown = report.get("unrepresented_failure", not report.get("saved_failures"))
+    remaining = {nodeid: failure for nodeid, failure in _unresolved_test_failures(report, current).items()
+                 if nodeid not in (retired_checks or set())}
+    changed = remaining != report.get("saved_failures", {})
+    if changed:
+        report["saved_failures"] = remaining
+        referenced = {item.get("diagnostic_id") for item in remaining.values()}
+        report["diagnostics"] = {key: value for key, value in report.get("diagnostics", {}).items()
+                                 if key in referenced}
+        report["unrepresented_failure"] = unknown
+    if remaining:
+        if changed:
+            _write_test_diagnostic(path, report)
+        return
     if unknown and current is not None and report.get("result_request") is not None:
         for record in current.records("repository-check"):
             finished = record.get("execution", {}).get("finishedAt")
@@ -173,6 +198,8 @@ def remove_test_diagnostic(path: pathlib.Path, *, root: pathlib.Path, current: A
                 unknown = False
                 break
     if unknown and not (successful_request is not None and report.get("request") == successful_request):
+        if changed:
+            _write_test_diagnostic(path, report)
         return
     path.unlink(missing_ok=True)
     try:
@@ -363,6 +390,7 @@ def result_environment(
     if request := CHECK_REQUEST_INPUTS.get():
         context["checkGroup"] = request.get("checkGroup")
         context["artifacts"] = measure_selected_artifacts(root, request.get("artifacts", {}))
+        context["diagnosticPath"] = request.get("diagnosticPath")
     if raw := environ.get("CERATOPS_REPOSITORY_CHECK_CONTEXT"):
         owner = json.loads(raw)
         if (not isinstance(owner, dict) or owner.get("schema") != "ceratops-repository-check-inputs.v1"
@@ -452,6 +480,9 @@ class ResultStore:
         self.directory = self.current.path.parent
         self.target = {"platform": platform.system(), "architecture": platform.machine()}
         self.checkout = _digest(str(self.root))
+        # Diagnostic location is observational, never a test acceptance input.
+        self.diagnostic_path = pathlib.Path(context.get("diagnosticPath") or
+                                            self.root / ".build/test-diagnostics/pytest-failure.json")
         self.unsaved_reasons: dict[str, str] = {}
         self.qualification_level = context.get("qualificationLevel")
         if self.qualification_level is not None and self.qualification_level not in LEVELS:
@@ -553,19 +584,33 @@ class ResultStore:
     def _load_check(self, nodeid: str) -> None:
         self.records_by_check.setdefault((self.checkout, nodeid), [])
 
-    def discard_deleted_checks(self, collected: set[str], selectors: Sequence[str]) -> None:
-        """Prune missing source files, never files omitted by collection hooks."""
-        covered = [value.replace("\\", "/").removesuffix("/") for value in selectors if "::" not in value]
+    def discard_deleted_checks(self, collected: set[str], selectors: Sequence[str],
+                               *, complete_files: set[str] | None = None) -> None:
+        """Retire missing cases only after successful, complete collection/run.
+
+        The plugin supplies files whose collection was complete and unchanged.
+        Missing files can also be retired inside an explicitly requested folder.
+        Read diagnostic IDs too so interruption between the two cleanup effects
+        does not strand a report after its current-result entry was removed.
+        """
+        covered = [(self.root / value).resolve() for value in selectors if "::" not in value]
+        scope = _failure_scope({"inputs": self.context})
+        known = {row["nodeid"] for row in self.current.records("pytest", target=self.target)
+                 if _failure_scope(row) == scope}
+        report = _read_test_diagnostic(self.diagnostic_path, self.root) or {}
+        known.update(nodeid for nodeid, failure in report.get("saved_failures", {}).items()
+                     if failure["scope"] == scope)
         deleted = {
-            nodeid for checkout, nodeid in self.records_by_check
-            if checkout == self.checkout and nodeid not in collected
-            and self._stat(self.root / nodeid.split("::", 1)[0]) is None
-            and any(value == "." or nodeid.split("::", 1)[0] == value
-                    or nodeid.split("::", 1)[0].startswith(value + "/") for value in covered)
+            nodeid for nodeid in known if nodeid not in collected
+            and ((nodeid.split("::", 1)[0] in (complete_files or set())) or (
+                self._stat(self.root / nodeid.split("::", 1)[0]) is None
+                and any((self.root / nodeid.split("::", 1)[0]).resolve().is_relative_to(path) for path in covered)))
         }
         self.current.remove_deleted("pytest", deleted, self.target)
         for nodeid in deleted:
             self.records_by_check.pop((self.checkout, nodeid), None)
+        if deleted:
+            remove_test_diagnostic(self.diagnostic_path, root=self.root, current=self.current, retired_checks=deleted)
 
     @staticmethod
     def _stat(path: pathlib.Path) -> tuple[int, int] | None:
@@ -1028,6 +1073,10 @@ class ReusePasses:
         self.collection_finished: float | None = None
         self.collection_filtered = False
         self.collection_failed = False
+        self.reuse_deselection = False
+        self.collected: set[str] = set()
+        self.collected_files: dict[str, tuple[int, int] | None] = {}
+        self.complete_collection = False
 
     def _unrepresented(self, nodeid: str, reason: str) -> None:
         """Keep external or incomplete scope separate from original pass facts."""
@@ -1037,10 +1086,27 @@ class ReusePasses:
         }
 
     def pytest_deselected(self, items: list[pytest.Item]) -> None:
-        self.collection_filtered = True
+        if not self.reuse_deselection:
+            self.collection_filtered = True
 
     def pytest_collectreport(self, report: pytest.CollectReport) -> None:
-        self.collection_failed |= report.failed
+        self.collection_failed |= report.failed or report.skipped
+        path = self.store.root / report.nodeid
+        if report.passed and "::" not in report.nodeid and path.is_file():
+            self.collected_files[report.nodeid] = self.store._stat(path)
+
+    @pytest.hookimpl(hookwrapper=True, tryfirst=True, specname="pytest_collection_modifyitems")
+    def pytest_capture_complete_collection(self, config: pytest.Config, items: list[pytest.Item]):
+        """Keep the full inventory before filters; detect silent hook omissions."""
+        self.collected = {item.nodeid for item in items}
+        yield
+        self.complete_collection = (
+            not self.collection_filtered and not self.collection_failed
+            and not config.getoption("keyword") and not config.getoption("markexpr")
+            and not config.pluginmanager.hasplugin("xdist")
+            and not any("::" in value for value in config.args)
+            and self.collected == {item.nodeid for item in items} | self.reused.keys()
+        )
 
     @pytest.hookimpl(trylast=True)
     def pytest_collection_modifyitems(self, config: pytest.Config, items: list[pytest.Item]) -> None:
@@ -1063,10 +1129,7 @@ class ReusePasses:
                         outside_configuration = True
                     else:
                         fixture_modules.append((path.parent, plugin))
-        if (not outside_configuration and not self.collection_filtered and not self.collection_failed
-                and not config.getoption("keyword") and not config.getoption("markexpr")
-                and not config.pluginmanager.hasplugin("xdist")):
-            self.store.discard_deleted_checks({item.nodeid for item in items}, config.args)
+        self.collection_filtered |= outside_configuration
         for item in items:
             # pytest's distributed workers have different effect/teardown
             # ownership; until represented explicitly they execute normally.
@@ -1108,7 +1171,11 @@ class ReusePasses:
             else:
                 remaining.append(item)
         if deselected:
-            config.hook.pytest_deselected(items=deselected)
+            self.reuse_deselection = True
+            try:
+                config.hook.pytest_deselected(items=deselected)
+            finally:
+                self.reuse_deselection = False
         items[:] = remaining
 
     def pytest_collection_finish(self) -> None:
@@ -1211,6 +1278,10 @@ class ReusePasses:
         # error; a complete set of accepted passes satisfies this invocation.
         if exitstatus == pytest.ExitCode.NO_TESTS_COLLECTED and self.original_count == len(self.reused) > 0:
             session.exitstatus = pytest.ExitCode.OK
+        if session.exitstatus == pytest.ExitCode.OK and self.complete_collection:
+            unchanged = {name for name, stamp in self.collected_files.items()
+                         if stamp == self.store._stat(self.store.root / name)}
+            self.store.discard_deleted_checks(self.collected, session.config.args, complete_files=unchanged)
         if destination := os.environ.get(RESULT_SUMMARY_ENV):
             # This caller-selected output belongs to pytest's isolated temp
             # directory. It is ordinary returned check data, removed with that

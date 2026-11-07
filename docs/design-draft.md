@@ -611,11 +611,19 @@ accepted outputs; it blocks only dependent work and returns the original cause.
 
 The test runner owns `.build/test-diagnostics/pytest-failure.json`. Its shared
 support module stores current failure IDs and deduplicated full, redacted command
-details. Newer local outcomes resolve individual failures; both A and B must
-pass before a report for A and B is deleted. Startup finishes interrupted deletion
-from those outcomes without tests. A lifecycle caller consumes the runner result
-and retires its separate operation report. Each report owner handles its own
-file; user-retained external reports and current result files are preserved.
+details. Newer local passes remove their failures. Following a successful pytest
+session, the same owner removes cases absent from completely collected,
+unchanged test files, including deleted parameter cases. It removes those cases
+from the current target's saved results and managed diagnostic together. Filters,
+collection errors/skips, interrupts and failed sessions leave missing cases alone.
+Other files and targets remain untouched. Cleanup also reads failure IDs from
+the report so interruption after removing a saved result cannot strand its
+diagnostic. Repeated calls reuse applicable passes. Report replacement uses a
+fixed `.in_process.json` sibling, flushed before replacement and removed on
+completion or next managed-report cleanup. The report disappears when no failure
+still needs attention. Startup finishes report cleanup from newer saved passes
+without tests. A lifecycle caller retires its separate operation report;
+caller-retained external reports and completed builds' Git summaries are preserved.
 
 `execute_worktree_build.py` owns the internal source-commit-to-completion flow,
 exposed by a thin `repository_operation.execute_worktree_build()` callable. Its
