@@ -357,7 +357,7 @@ def build_result_artifact_paths(
         records = receipt["artifacts"]
     elif schema == sdlc_results.COMMITTED_BUILD_RECEIPT_SCHEMA:
         identity = receipt["identity"]
-        relative = f"{identity['releaseUnit']}/{identity['version']}"
+        relative = f"{identity['releaseBundle']}/{identity['version']}"
         if len(receipt["requiredTargets"]) > 1:
             relative += f"/{identity['target']}"
         bundle = _artifact_store_path(repo_root) / sdlc_results._bundle_relative_path(relative)
@@ -505,7 +505,7 @@ def _build_group(identity: Mapping[str, str]) -> dict[str, str]:
 
     return {
         name: identity[name]
-        for name in ("repository", "releaseUnit", "channel", "target")
+        for name in ("repository", "releaseBundle", "channel", "target")
     }
 
 
@@ -1002,7 +1002,7 @@ def _build_request_record(allocation: ArtifactVersionAllocation) -> dict[str, An
         "worktree": str(allocation.repo_root),
         "worktreeRegistration": allocation.worktree_registration,
         "branch": allocation.branch,
-        "releaseUnit": allocation.release_bundle,
+        "releaseBundle": allocation.release_bundle,
         "version": allocation.version,
         "attemptId": allocation.attempt_id,
         "allocationCommit": allocation.allocation_commit,
@@ -1073,7 +1073,7 @@ def _read_reusable_allocation(
     # Another worktree or another declared input set owns an independent build.
     expected = _build_request_record(allocation)
     for key in ("repository", "worktree", "worktreeRegistration", "branch",
-                "releaseUnit", "version", "requiredTargets", "declaredInputPaths"):
+                "releaseBundle", "version", "requiredTargets", "declaredInputPaths"):
         if record.get(key) != expected[key]:
             return None
     if explicit_attempt is not None and record.get("attemptId") != explicit_attempt:
@@ -1232,7 +1232,7 @@ def _completed_artifact_record(
         raise OperationError("Completed artifact receipt is invalid.") from exc
     identity = receipt["identity"]
     if (
-        identity["releaseUnit"] != unit
+        identity["releaseBundle"] != unit
         or identity["version"] != version
         or (target is not None and identity["target"] != target)
     ):

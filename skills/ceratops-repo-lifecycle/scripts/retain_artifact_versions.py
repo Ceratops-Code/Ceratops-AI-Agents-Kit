@@ -134,7 +134,7 @@ def select_retained_versions(
         if value is None:
             return
         identity = value.build.identity
-        if identity["releaseUnit"] != scope.unit or identity["target"] != scope.target:
+        if identity["releaseBundle"] != scope.unit or identity["target"] != scope.target:
             raise ValueError("Retention input belongs to another unit or target.")
         selected.setdefault(value.key(scope), value)
 

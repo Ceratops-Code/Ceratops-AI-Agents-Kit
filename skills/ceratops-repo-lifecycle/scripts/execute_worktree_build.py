@@ -87,7 +87,7 @@ def _finish(transaction, prepared=None, *, diagnostic_output=None) -> dict[str, 
         try:
             selected = sdlc_results.read_artifact_receipt_chain(
                 transaction.repo_root, tag=completed.tag, expected={
-                    'repository': transaction.repository, 'releaseUnit': transaction.release_bundle,
+                    'repository': transaction.repository, 'releaseBundle': transaction.release_bundle,
                     'version': transaction.version, 'target': target,
                 },
             )
@@ -208,7 +208,7 @@ def execute_worktree_build(
             receipt.update(preTestCommit=transaction.pre_test_commit,
                            receiptPath=transaction.receipt_path(target),
                            requiredTargets=list(transaction.required_targets))
-            receipt['identity'] = {'repository': transaction.repository, 'releaseUnit': transaction.release_bundle,
+            receipt['identity'] = {'repository': transaction.repository, 'releaseBundle': transaction.release_bundle,
                                    'version': transaction.version, 'target': target, 'attemptId': transaction.attempt_id}
             operations.prepare_versioned_receipt(
                 transaction, target, receipt, check_summaries=_summaries(batch),

@@ -16,6 +16,7 @@ import pytest
 
 from tests.repository_lifecycle.test_sdlc_handoffs import (
     _bound_test_build,
+    _build_receipt_fixture,
     _checkpoint_child,
     _new_receipt_fixtures,
     _prepared_versioned_completion,
@@ -121,6 +122,8 @@ def test_worktree_build_commits_selected_source_and_finishes_once(tmp_path):
     selected = results.read_build_check_summary(repository, result["tag"],
                                                 pathlib.Path(result["build_receipts"][0]).relative_to(repository).as_posix())
     assert selected["summary"]["checks"]
+    assert selected["receipt"]["identity"]["releaseBundle"] == options["release_bundle"]
+    assert "releaseUnit" not in selected["receipt"]["identity"]
     again = runner.execute_worktree_build(repository, **options)
     assert again["status"] == "completed" and again["final_commit"] == result["final_commit"], again
     assert (repository / ".build-count").read_text() == "x"
@@ -205,16 +208,18 @@ def test_worktree_build_repeats_commit_and_completion_handoffs(tmp_path, monkeyp
     assert run_git(repository, "log", "--format=%s").stdout.count("Prepare claims") == 1
 
 
-@pytest.fixture(params=["installed", "portable", "generated"])
+@pytest.fixture(params=["installed", "portable", "generated", "reference"])
 def build_reader(request, tmp_path):
     if request.param == "installed":
         return vars(results)
     root = pathlib.Path(__file__).resolve().parents[2]
     path = root / "scripts/result_records.py"
     if request.param == "generated":
-        path = tmp_path / "generated.py"
-        source = (root / "skills/ceratops-repo-lifecycle/references/templates/run-tests.py.tmpl").read_text()
-        path.write_text(source.replace("__TEST_TARGETS__", "['tests']"))
+        from tests.repository_lifecycle.test_generated_test_scripts import _write_generated_runner
+
+        path = _write_generated_runner(tmp_path / "generated", ["tests"])
+    elif request.param == "reference":
+        path = root / "docs/result_records.py.tmpl"
     return runpy.run_path(str(path))
 
 
@@ -815,3 +820,32 @@ def test_versioned_completion_rejects_changed_prepared_result(tmp_path) -> None:
     assert not storage._artifact_tag_exists(
         repository, transaction.release_bundle, transaction.version
     )
+
+
+@pytest.mark.parametrize("receipt_kind", ["build-bundle", "committed-build", "artifact"])
+@pytest.mark.parametrize("keep_current_field", [False, True])
+def test_receipt_identities_require_release_bundle_without_an_old_name_alias(
+    tmp_path, receipt_kind, keep_current_field,
+):
+    if receipt_kind == "build-bundle":
+        _, _, receipt, _ = _build_receipt_fixture(tmp_path)
+
+        def read(value):
+            return results.capture_step_result(
+                json.dumps(value), expected_schema=results.BUILD_RECEIPT_SCHEMA,
+            )
+    else:
+        _, build, _, _, artifact, _ = _new_receipt_fixtures(tmp_path)
+        receipt = build if receipt_kind == "committed-build" else artifact
+        read = results.encode_new_receipt
+
+    assert receipt["identity"]["releaseBundle"] == "claims"
+    assert "releaseUnit" not in receipt["identity"]
+    for _ in range(2):
+        assert read(receipt)
+    wrong = json.loads(json.dumps(receipt))
+    wrong["identity"]["releaseUnit"] = wrong["identity"]["releaseBundle"]
+    if not keep_current_field:
+        del wrong["identity"]["releaseBundle"]
+    with pytest.raises(results.StepResultError):
+        read(wrong)

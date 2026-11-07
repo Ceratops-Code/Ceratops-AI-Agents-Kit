@@ -34,7 +34,7 @@ def accepted(tmp_path):
     build = results.read_artifact_receipt_chain(case["repository"], tag=case["tag"], expected=_artifact_identity_selection(case))
     scope = retention.RetentionScope(
         case["repository"] / ".git" / "ceratops" / "artifacts",
-        build.identity["releaseUnit"], build.identity["target"], "beta-stable",
+        build.identity["releaseBundle"], build.identity["target"], "beta-stable",
     )
     return case, retention.RetentionVersion(build), scope
 
@@ -597,7 +597,7 @@ def test_completed_multi_target_reader_uses_retained_packages_after_original_rem
     kept = {}
     for target in transaction.required_targets:
         selected = results.read_artifact_receipt_chain(repo, tag=completed.tag, expected={
-            "repository": transaction.repository, "releaseUnit": transaction.release_bundle,
+            "repository": transaction.repository, "releaseBundle": transaction.release_bundle,
             "version": transaction.version, "target": target,
         })
         value = retention.RetentionVersion(selected)

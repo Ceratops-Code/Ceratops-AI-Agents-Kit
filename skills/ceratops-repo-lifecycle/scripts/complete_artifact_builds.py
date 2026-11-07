@@ -170,7 +170,7 @@ def _validate_prepared_receipt(
         raise OperationError(str(exc)) from exc
     expected_identity = {
         "repository": transaction.repository,
-        "releaseUnit": transaction.release_bundle,
+        "releaseBundle": transaction.release_bundle,
         "version": transaction.version,
         "target": target,
         "attemptId": transaction.attempt_id,
@@ -375,7 +375,7 @@ def write_versioned_failure_diagnostic(
     value = {
         "schema": "ceratops-artifact-failure.v1",
         "repository": transaction.repository,
-        "releaseUnit": transaction.release_bundle,
+        "releaseBundle": transaction.release_bundle,
         "version": transaction.version,
         "versionClass": transaction.version_class,
         "target": target,
@@ -944,7 +944,7 @@ def read_artifact_build(
     else:
         selected = sdlc_results.read_artifact_receipt_chain(
             root, tag=f"{unit}/{version}", expected={
-                "repository": repository, "releaseUnit": unit,
+                "repository": repository, "releaseBundle": unit,
                 "version": version, "target": targets[0],
             },
         )
@@ -984,7 +984,7 @@ def _completed_versioned_result(
         selected = sdlc_results.read_artifact_receipt_chain(
             transaction.repo_root,
             tag=f"{transaction.release_bundle}/{transaction.version}",
-            expected={"repository": transaction.repository, "releaseUnit": transaction.release_bundle,
+            expected={"repository": transaction.repository, "releaseBundle": transaction.release_bundle,
                       "version": transaction.version, "target": target, "attemptId": transaction.attempt_id},
         )
         _validate_prepared_receipt(transaction, target, selected.build_receipt.raw)

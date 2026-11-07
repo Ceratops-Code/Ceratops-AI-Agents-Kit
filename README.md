@@ -400,11 +400,12 @@ meet that schema and the shared checks. New configuration uses the newest
 installed schema; updates preserve an existing supported version. There is one
 SDLC template and no separate generation-version setting.
 
-Existing immutable build receipts retain their schema IDs and serialized
-`releaseUnit` field, which names the release bundle in those saved formats.
-Readers and writers keep that format without rewriting accepted results,
-changing tags or retesting artifacts. The saved field is not an alternate SDLC
-configuration name.
+Build and artifact receipts name their release bundle with `releaseBundle`
+in every identity, including dependency identities. Receipt writers, schema
+checks, retention and the installed, repository and generated test readers use
+that same field. The former spelling is not accepted as an alternative.
+Artifact contents, source commits, check versions and test-result identities
+are unchanged by this metadata-field rename.
 
 Existing bundle receipts continue to use `ceratops-build-result.v2` in
 `operation-result.v1.schema.json`. The repository-owned `sdlc_results.py`

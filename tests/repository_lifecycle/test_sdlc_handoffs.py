@@ -84,7 +84,7 @@ def _bundle_transaction(tmp_path):
     return repo, {
         "selection": {
             "repository": "https://example.invalid/owner/repo",
-            "sourceCommit": commit, "releaseUnit": "example", "channel": "alpha",
+            "sourceCommit": commit, "releaseBundle": "example", "channel": "alpha",
             "version": "1.0+alpha", "target": "any",
         },
         "inputs": {"dependencySelections": [], "lock": "a" * 64, "adapter": "fixture-v1"},
@@ -150,7 +150,7 @@ def test_completed_build_reader_returns_recorded_dependency_paths(tmp_path) -> N
                 "identity": {
                     **kwargs["selection"],
                     "sourceCommit": "d" * 40,
-                    "releaseUnit": "example-dependency",
+                    "releaseBundle": "example-dependency",
                     "version": "0.1+alpha",
                 },
                 "artifacts": [{
@@ -164,7 +164,7 @@ def test_completed_build_reader_returns_recorded_dependency_paths(tmp_path) -> N
     receipt = runner.build_bundle(repo, **{**kwargs, "build": build_with_dependency})
     completed = runner.read_completed_build(repo, receipt_path=receipt)
     assert len(completed.dependencies) == 1
-    assert completed.dependencies[0].identity["releaseUnit"] == "example-dependency"
+    assert completed.dependencies[0].identity["releaseBundle"] == "example-dependency"
     assert completed.dependencies[0].artifacts == (
         receipt.parent / "dependencies/example-dependency.whl",
     )
@@ -878,7 +878,7 @@ def _build_receipt_fixture(tmp_path: pathlib.Path):
     identity = {
         "repository": "example/project",
         "sourceCommit": "a" * 40,
-        "releaseUnit": "claims",
+        "releaseBundle": "claims",
         "channel": "beta",
         "version": "1.2.0b1",
         "target": "python-3.14-windows",
@@ -913,7 +913,7 @@ def _build_receipt_fixture(tmp_path: pathlib.Path):
             {
                 "identity": {
                     **identity,
-                    "releaseUnit": "converter",
+                    "releaseBundle": "converter",
                     "version": "0.4.0",
                 },
                 "artifacts": [dependency],
@@ -969,7 +969,7 @@ def _new_receipt_fixtures(
     artifact_path = f"artifacts/claims-{version}-py3-none-any.whl"
     identity = {
         "repository": "example/project",
-        "releaseUnit": "claims",
+        "releaseBundle": "claims",
         "version": version,
         "target": target,
         "attemptId": "attempt-001",
@@ -1021,7 +1021,7 @@ def _new_receipt_fixtures(
         "dependencies": [
             {
                 "repository": "example/project",
-                "releaseUnit": "converter",
+                "releaseBundle": "converter",
                 "version": "0.4.0",
                 "target": target,
                 "acceptanceId": "converter-acceptance-004",
@@ -1555,7 +1555,7 @@ def _receipt_chain_fixture(
         / ".git"
         / "ceratops"
         / "artifacts"
-        / identity["releaseUnit"]
+        / identity["releaseBundle"]
         / identity["version"]
         / identity["target"]
     )
@@ -1576,7 +1576,7 @@ def _receipt_chain_fixture(
         _write_fixture_bytes(store, relative, content)
     artifact_path = store / "artifact-receipt.json"
     artifact_path.write_bytes(results.encode_new_receipt(artifact))
-    tag = f"{identity['releaseUnit']}/{identity['version']}"
+    tag = f"{identity['releaseBundle']}/{identity['version']}"
     tagged = run_git(repository, "tag", tag, final_commit)
     assert tagged.returncode == 0, tagged.stderr
 
@@ -1606,7 +1606,7 @@ def _artifact_identity_selection(fixture: Mapping[str, Any]) -> dict[str, str]:
     identity = fixture["artifact"]["identity"]
     return {
         field: identity[field]
-        for field in ("repository", "releaseUnit", "version", "target")
+        for field in ("repository", "releaseBundle", "version", "target")
     }
 
 
@@ -2099,7 +2099,7 @@ def test_build_receipt_integrity_does_not_establish_test_success(
 
 @pytest.mark.parametrize(
     "field",
-    ["repository", "sourceCommit", "releaseUnit", "channel", "version", "target"],
+    ["repository", "sourceCommit", "releaseBundle", "channel", "version", "target"],
 )
 def test_build_receipt_checks_each_expected_identity_before_payload_reads(
     tmp_path, monkeypatch, field
@@ -2218,7 +2218,7 @@ def test_build_receipt_rejects_ambiguous_inventory_before_payload_reads(
             duplicate["identity"]["version"] = "9.0.0"
         receipt["dependencies"].append(duplicate)
     elif problem == "self-dependency":
-        receipt["dependencies"][0]["identity"]["releaseUnit"] = expected["releaseUnit"]
+        receipt["dependencies"][0]["identity"]["releaseBundle"] = expected["releaseBundle"]
     elif problem == "duplicate-test":
         receipt["tests"].append(deepcopy(test))
     elif problem == "unknown-tested-file":
