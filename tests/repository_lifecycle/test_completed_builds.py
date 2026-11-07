@@ -102,7 +102,7 @@ def _worktree_build_case(tmp_path):
     _write_fixture_bytes(repository, "unrelated.txt", b"keep staged change")
     assert run_git(repository, "add", "unrelated.txt").returncode == 0
     prepare = [sys.executable, "-c", "import pathlib,sys;pathlib.Path('version.txt').write_text(sys.argv[1])", "{version}"]
-    options = {"repository": "example/project", "release_unit": "claims", "version": version,
+    options = {"repository": "example/project", "release_bundle": "claims", "version": version,
                "required_targets": [target], "attempt_id": "worktree-build", "source_paths": ["version.txt"],
                "requests": {target: [runner.OperationRequest("deliverables.packages.claims.actions.build")]},
                "preparation_commands": [prepare], "describe_receipt": lambda _transaction, _target, _batch: receipt}
@@ -131,7 +131,7 @@ def test_release_build_consumes_existing_tagged_receipt_without_starting_builder
     contract_path = repository / runner.DEFAULT_CONTRACT
     contract = json.loads(contract_path.read_text())
     reference = "deliverables.packages.claims"
-    contract["repository"]["release-units"] = {"claims": {"members": [reference]}}
+    contract["repository"]["release-bundles"] = {"claims": {"members": [reference]}}
     action = contract["deliverables"]["packages"]["claims"]["actions"]["build"]
     action["parameters"].append("target")
     action["steps"][0]["run"].append("{target}")
@@ -263,7 +263,7 @@ def test_tagged_summary_hash_mismatch_blocks_reuse(tmp_path, build_reader):
 def test_summary_and_receipt_writes_repeat_without_early_tag(tmp_path, monkeypatch, boundary, effect):
     repository, commit = _versioned_repository(tmp_path)
     target, version = "python-3.14-windows", "1.2.10b1"
-    transaction = _bound_test_build(repository, repository="example/project", release_unit="claims", version=version,
+    transaction = _bound_test_build(repository, repository="example/project", release_bundle="claims", version=version,
                                     required_targets=[target], attempt_id="summary-effects", pre_test_commit=commit)
     receipt = _versioned_build_receipt(tmp_path, commit=commit, version=version, target=target,
                                        required_targets=[target], attempt_id="summary-effects")
@@ -290,7 +290,7 @@ def test_summary_and_receipt_writes_repeat_without_early_tag(tmp_path, monkeypat
 def test_failed_compact_check_cannot_create_completed_receipt(tmp_path):
     repository, commit = _versioned_repository(tmp_path)
     target, version = "python-3.14-windows", "1.2.10b1"
-    transaction = _bound_test_build(repository, repository="example/project", release_unit="claims", version=version,
+    transaction = _bound_test_build(repository, repository="example/project", release_bundle="claims", version=version,
                                     required_targets=[target], attempt_id="summary-failure", pre_test_commit=commit)
     receipt = _versioned_build_receipt(tmp_path, commit=commit, version=version, target=target,
                                        required_targets=[target], attempt_id="summary-failure")
@@ -307,7 +307,7 @@ def test_failed_compact_check_cannot_create_completed_receipt(tmp_path):
 def test_completion_binds_original_summary_facts_to_current_source(tmp_path, changed):
     repository, commit = _versioned_repository(tmp_path)
     target, version = "python-3.14-windows", "1.2.11b1"
-    transaction = _bound_test_build(repository, repository="example/project", release_unit="claims", version=version,
+    transaction = _bound_test_build(repository, repository="example/project", release_bundle="claims", version=version,
                                     required_targets=[target], attempt_id="summary-inputs", pre_test_commit=commit)
     receipt = _versioned_build_receipt(tmp_path, commit=commit, version=version, target=target,
                                        required_targets=[target], attempt_id="summary-inputs")
@@ -349,7 +349,7 @@ def test_versioned_receipts_persist_exact_multi_target_direct_state(tmp_path) ->
     transaction = _bound_test_build(
         repository,
         repository="example/project",
-        release_unit="claims",
+        release_bundle="claims",
         version="1.2.3b1",
         required_targets=targets,
         attempt_id=attempt_id,
@@ -412,7 +412,7 @@ def test_versioned_receipt_rejects_changed_tested_artifact(tmp_path) -> None:
     transaction = _bound_test_build(
         repository,
         repository="example/project",
-        release_unit="claims",
+        release_bundle="claims",
         version="1.2.4b1",
         required_targets=[target],
         attempt_id="attempt-beta-002",
@@ -461,7 +461,7 @@ def test_versioned_completion_repeats_before_and_after_each_effect(tmp_path, mon
         with pytest.raises(OSError, match="completion interrupted"):
             runner.complete_versioned_build(transaction, prepared)
     fresh = runner.read_versioned_build(
-        repository, repository=transaction.repository, release_unit=transaction.release_unit,
+        repository, repository=transaction.repository, release_bundle=transaction.release_bundle,
         version=transaction.version, required_targets=transaction.required_targets,
     )
     done = runner.complete_versioned_build(fresh)
@@ -537,7 +537,7 @@ def test_versioned_retention_keeps_three_and_tag_blocks_pruned_reuse(
     transaction = _bound_test_build(
         repository,
         repository="example/project",
-        release_unit="claims",
+        release_bundle="claims",
         version="1.2.3a5",
         required_targets=[target],
         attempt_id="attempt-alpha-005",
@@ -550,7 +550,7 @@ def test_versioned_retention_keeps_three_and_tag_blocks_pruned_reuse(
     sentinel.write_bytes(b"pending output stays protected")
 
     next_build = _bound_test_build(
-        repository, repository="example/project", release_unit="claims",
+        repository, repository="example/project", release_bundle="claims",
         version=versions[0], required_targets=[target],
         attempt_id="attempt-alpha-reuse", pre_test_commit=commit,
     )
@@ -621,7 +621,7 @@ def test_versioned_fresh_instance_discovers_attempt_and_reuses_prepared_results(
     mtimes = {item.worktree_path: item.worktree_path.stat().st_mtime_ns for item in prepared}
     request_bytes = transaction.request_path.read_bytes()
     fresh = _checkpoint_child(repository,
-        "transaction=repository_operation.read_versioned_build(repo,repository='example/project',release_unit='claims',"
+        "transaction=repository_operation.read_versioned_build(repo,repository='example/project',release_bundle='claims',"
         "version='1.2.5b1',required_targets=['python-3.14-linux','python-3.14-windows'])\n"
         "print(transaction.attempt_id)\n"
         "prepared=complete_artifact_builds.load_prepared_versioned_receipts(transaction)\n"
@@ -633,7 +633,7 @@ def test_versioned_fresh_instance_discovers_attempt_and_reuses_prepared_results(
     assert not (transaction.store.parent / "operations/artifact-versions").exists()
     assert not (transaction.store.parent / "locks/artifact-versions").exists()
     repeated = _bound_test_build(
-        repository, repository=transaction.repository, release_unit=transaction.release_unit,
+        repository, repository=transaction.repository, release_bundle=transaction.release_bundle,
         version=transaction.version, required_targets=transaction.required_targets,
         pre_test_commit=checkpoint,
     )
@@ -641,7 +641,7 @@ def test_versioned_fresh_instance_discovers_attempt_and_reuses_prepared_results(
     # New unrelated commits do not invalidate the exact B inputs.
     assert run_git(repository, "commit", "--allow-empty", "-m", "unrelated").returncode == 0
     reused = runner.allocate_versioned_build(
-        repository, repository=transaction.repository, release_unit=transaction.release_unit,
+        repository, repository=transaction.repository, release_bundle=transaction.release_bundle,
         version=transaction.version, required_targets=transaction.required_targets,
     )
     assert reused == repeated
@@ -659,7 +659,7 @@ def test_versioned_completion_needs_no_checkpoint_directory(tmp_path) -> None:
 def test_versioned_request_may_own_multiple_units_without_premature_cleanup(tmp_path) -> None:
     repository, checkpoint, transaction, prepared, _receipts = _prepared_versioned_completion(tmp_path)
     other = _bound_test_build(repository, repository=transaction.repository,
-        release_unit="other-unit", version="1.0.0", required_targets=["any"],
+        release_bundle="other-unit", version="1.0.0", required_targets=["any"],
         pre_test_commit=checkpoint, attempt_id="other-unit-attempt")
     runner.complete_versioned_build(transaction, prepared)
     assert other.request_path.is_file()
@@ -684,7 +684,7 @@ def test_versioned_cleanup_failure_retries_without_repeating_completed_effects(t
         "def forbid(*args,**kwargs): raise AssertionError('completed effect repeated')\n"
         "for name in ('_prepared_receipt_set','_resolve_result_commit','_write_version_artifact_receipts','_create_artifact_tag'):\n"
         " setattr(complete_artifact_builds,name,forbid)\n"
-        "transaction=repository_operation.read_versioned_build(repo,repository='example/project',release_unit='claims',"
+        "transaction=repository_operation.read_versioned_build(repo,repository='example/project',release_bundle='claims',"
         "version='1.2.5b1',required_targets=['python-3.14-linux','python-3.14-windows'])\n"
         "result=repository_operation.complete_versioned_build(transaction)\n"
         "print(result.final_commit)\n", checkpoint)
@@ -732,7 +732,7 @@ def test_versioned_completion_resumes_effects_without_duplicate_commit(
     if interruption == "after-commit":
         transaction.artifact_receipt(transaction.required_targets[0]).write_bytes(b"{")
         assert not storage._artifact_tag_exists(
-            repository, transaction.release_unit, transaction.version
+            repository, transaction.release_bundle, transaction.version
         )
     elif interruption == "after-receipts":
         assert all(
@@ -748,7 +748,7 @@ def test_versioned_completion_resumes_effects_without_duplicate_commit(
             )
     else:
         assert storage._artifact_tag_exists(
-            repository, transaction.release_unit, transaction.version
+            repository, transaction.release_bundle, transaction.version
         )
         assert transaction.request_path.is_file()
     monkeypatch.setattr(completion, name, original)
@@ -792,7 +792,7 @@ def test_versioned_completion_rejects_changed_declared_inputs(tmp_path, change) 
 
     assert run_git(repository, "rev-parse", "HEAD").stdout.strip() == checkpoint
     assert not storage._artifact_tag_exists(
-        repository, transaction.release_unit, transaction.version
+        repository, transaction.release_bundle, transaction.version
     )
     assert transaction.request_path.is_file()
 
@@ -813,5 +813,5 @@ def test_versioned_completion_rejects_changed_prepared_result(tmp_path) -> None:
 
     assert run_git(repository, "rev-parse", "HEAD").stdout.strip() == checkpoint
     assert not storage._artifact_tag_exists(
-        repository, transaction.release_unit, transaction.version
+        repository, transaction.release_bundle, transaction.version
     )

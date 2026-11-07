@@ -1,7 +1,6 @@
 """Resolve repository-owned artifact identities for contract checks.
 
-Publication identity is supplied explicitly to the artifact contract. SDLC v4
-and v5 describe build outputs, not external registry or release identity.
+Publication identity is supplied explicitly to the artifact contract. SDLC declarations describe build outputs, not external registry or release identity.
 """
 
 from __future__ import annotations

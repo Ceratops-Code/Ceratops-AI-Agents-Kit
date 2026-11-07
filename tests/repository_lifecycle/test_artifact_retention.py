@@ -597,11 +597,11 @@ def test_completed_multi_target_reader_uses_retained_packages_after_original_rem
     kept = {}
     for target in transaction.required_targets:
         selected = results.read_artifact_receipt_chain(repo, tag=completed.tag, expected={
-            "repository": transaction.repository, "releaseUnit": transaction.release_unit,
+            "repository": transaction.repository, "releaseUnit": transaction.release_bundle,
             "version": transaction.version, "target": target,
         })
         value = retention.RetentionVersion(selected)
-        arguments = {"unit": transaction.release_unit, "target": target, "approved": value,
+        arguments = {"unit": transaction.release_bundle, "target": target, "approved": value,
                      "file_use": lambda _path: None}
         assert not storage.retain_completed_artifacts(repo, pool="worktree", worktree="producer", **arguments).deferred
         copied = storage.retain_completed_artifacts(repo, pool="beta-stable", **arguments)
@@ -613,7 +613,7 @@ def test_completed_multi_target_reader_uses_retained_packages_after_original_rem
         )
         assert not removed.deferred and not selected.receipt_path.exists()
     repeated = runner.read_versioned_build(
-        repo, repository=transaction.repository, release_unit=transaction.release_unit,
+        repo, repository=transaction.repository, release_bundle=transaction.release_bundle,
         version=transaction.version, required_targets=transaction.required_targets,
     )
     assert {target: repeated.artifact_receipt(target) for target in transaction.required_targets} == kept

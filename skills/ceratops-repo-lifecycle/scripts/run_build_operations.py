@@ -67,7 +67,7 @@ def prepare_build_operations(root, requests, contract_path=None, *, context="ski
 
     Repository checks retain their existing scope. An artifact test that needs a
     requested member also brings its other required members into the batch.
-    Membership alone does not pull unrelated release units into the build.
+    Membership alone does not pull unrelated release bundles into the build.
     """
     import repository_operation as operations
 
@@ -239,7 +239,7 @@ def recorded_build(item, inputs):
 
     contract = operations.read_repository_contract(item.repo_root, item.contract_path)
     reference = item.operation.rsplit(".actions.", 1)[0]
-    units = contract["repository"].get("release-units", {})
+    units = contract["repository"].get("release-bundles", {})
     unit = next((name for name, value in units.items() if value["members"] == [reference]), None)
     parameters = dict(item.parameters)
     target = parameters.get("target")

@@ -13,7 +13,6 @@
     "manifest_profiles",
     "generated_manifest_profile",
     "managed_skill_operations",
-    "sdlc_version",
     "runtime",
     "skill_python_runtime",
     "configuration_layout",
@@ -114,10 +113,6 @@
           "$ref": "#/$defs/managed_skill_action"
         }
       }
-    },
-    "sdlc_version": {
-      "const": 4,
-      "description": "Executable: generated SDLC version and current-compatibility checker requirement."
     },
     "runtime": {
       "type": "object",

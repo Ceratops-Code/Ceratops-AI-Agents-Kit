@@ -1,4 +1,4 @@
-"""Capture SDLC results and explicitly verify saved release-unit build receipts.
+"""Capture SDLC results and explicitly verify saved release-bundle build receipts.
 
 The read-only CLI checks a receipt against an independently supplied release
 selection and the files under its bundle root. It does not build, run tests,
@@ -676,7 +676,7 @@ def _build_files(receipt: Mapping[str, Any]) -> list[dict[str, Any]]:
         if key in dependencies:
             raise StepResultError("Duplicate or competing build dependency selection.")
         if key[:2] == (owner["repository"], owner["releaseUnit"]):
-            raise StepResultError("A build receipt cannot depend on its own release unit.")
+            raise StepResultError("A build receipt cannot depend on its own release bundle.")
         dependencies.add(key)
         for artifact in dependency["artifacts"]:
             add(artifact, artifacts)
@@ -1161,7 +1161,7 @@ def read_build_check_summary(root: pathlib.Path, tag: str, receipt_path: str) ->
     parent = f'.build/{identity["releaseUnit"]}/{identity["version"]}'
     expected_paths = {parent + "/build_receipt.json",
                       parent + "/" + identity["target"] + "/build_receipt.json"}
-    if (receipt.get("schema") != "ceratops-build-result.v3" or receipt.get("status") != "passed"
+    if (receipt.get("schema") != COMMITTED_BUILD_RECEIPT_SCHEMA or receipt.get("status") != "passed"
             or receipt.get("receiptPath") != receipt_path or receipt_path not in expected_paths
             or tag != expected_tag or receipt.get("tag", tag) != tag):
         raise ValueError("Build tag, identity and committed receipt path disagree.")
@@ -1365,7 +1365,7 @@ def read_artifact_receipt_chain(
         raise StepResultError(f"Cannot consume artifact receipt chain: {exc}"[:1024]) from exc
 
 
-def verify_release_unit_build(
+def verify_release_bundle_build(
     receipt_path: pathlib.Path,
     bundle_root: pathlib.Path,
     *,
@@ -1410,20 +1410,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     verify = commands.add_parser(
-        "verify-release-unit-build",
+        "verify-release-bundle-build",
         help="Check identity and bytes, not test success or deployment permission.",
     )
     verify.add_argument("--receipt", type=pathlib.Path, required=True)
     verify.add_argument("--bundle-root", type=pathlib.Path, required=True)
     for field, option in (
         ("repository", "--repository"), ("sourceCommit", "--source-commit"),
-        ("releaseUnit", "--release-unit"), ("channel", "--channel"),
+        ("releaseUnit", "--release-bundle"), ("channel", "--channel"),
         ("version", "--version"), ("target", "--target"),
     ):
         verify.add_argument(option, dest=field, required=True)
     args = parser.parse_args(argv)
     try:
-        verify_release_unit_build(
+        verify_release_bundle_build(
             args.receipt, args.bundle_root,
             expected={field: getattr(args, field) for field in BUILD_SELECTION_FIELDS},
         )

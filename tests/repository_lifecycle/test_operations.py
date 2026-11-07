@@ -133,9 +133,9 @@ def test_canonical_operation_result_rejects_incomplete_artifact() -> None:
         )
 
 
-def test_live_sdlc_v4_selects_validation_and_tests_for_every_install() -> None:
+def test_live_sdlc_selects_validation_and_tests_for_every_install() -> None:
     document = contracts.load_contract(ROOT / "sdlc/sdlc.yml")
-    assert document["version"] == 4
+    assert document["version"] == contracts.latest_sdlc_version()
     installs = (
         "deliverables.skills.ceratops-repo-lifecycle.actions.install",
         "deliverables.hooks.codex-hooks.actions.install",
@@ -178,7 +178,7 @@ def _no_op(reason: str = "No action in this fixture.") -> dict[str, object]:
 
 
 def _app(actions: dict[str, object]) -> dict[str, object]:
-    """Return one complete v4 application around the selected test actions."""
+    """Return one complete typed application around the selected test actions."""
 
     complete = {"validate": _no_op(), "install": _no_op(), **actions}
     return {
@@ -204,7 +204,7 @@ def test_sdlc_template_is_a_schema_valid_empty_skeleton(tmp_path: pathlib.Path) 
     contract = write_sdlc_contract(tmp_path)
     shutil.copy2(SDLC_CONTRACT_TEMPLATE, contract)
     document = contracts.load_contract(contract)
-    assert document["version"] == 4
+    assert document["version"] == contracts.latest_sdlc_version()
     assert document["repository"]["actions"]["validate"]["steps"] == [
         {"run": ["uv", "run", "--locked", "scripts/validate-repository.py"]}
     ]
@@ -1055,7 +1055,9 @@ def test_loader_rejects_retired_sdlc_versions(
     document, errors = contracts.read_contract(path)
     assert document is None
     assert errors == [
-        f"unsupported SDLC version: {version!r}; supported versions: 4, 5"
+        f"unsupported SDLC version: {version!r}; installed schemas: "
+        + ", ".join(str(item) for item in sorted(contracts.sdlc_schema_paths()))
+        + f"; latest installed version: {contracts.latest_sdlc_version()}."
     ]
     with pytest.raises(contracts.SdlcContractError, match="unsupported SDLC version"):
         contracts.load_contract(path)
@@ -1063,7 +1065,7 @@ def test_loader_rejects_retired_sdlc_versions(
 
 @pytest.mark.parametrize(
     "version",
-    [None, True, 1.0, "4", 0, max(contracts.VERSION_SCHEMAS) + 1, [], {}],
+    [None, True, 1.0, "4", 0, contracts.latest_sdlc_version() + 1, [], {}],
 )
 def test_loader_rejects_unsupported_or_unversioned_contracts(
     tmp_path: pathlib.Path,

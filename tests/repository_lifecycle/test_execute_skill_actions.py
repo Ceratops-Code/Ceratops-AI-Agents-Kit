@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 
-from tests.repository_lifecycle.test_sdlc_handoffs import _repository, _v4_fixture
+from tests.repository_lifecycle.test_sdlc_handoffs import _repository, _typed_contract
 from tests.support.repositories import ROOT
 
 runner = importlib.import_module("repository_operation")
@@ -600,7 +600,7 @@ if __name__ == '__main__':
         "scripts/runtime/install-managed-skills.py",
     ):
         (installed / script).write_text(probe)
-    fixture = _v4_fixture()
+    fixture = _typed_contract()
     skill = fixture["deliverables"]["skills"]["claims-catalog-invoice"]
     for action in skill["actions"].values():
         action["steps"][-1]["handoff"]["inputs"]["prerequisite-packages"] = ["claims"]
@@ -613,7 +613,7 @@ if __name__ == '__main__':
 
 @pytest.mark.parametrize("mode", ["skill", "ci", "return"])
 @pytest.mark.parametrize("action", ["validate", "install"])
-def test_v4_registered_skill_handoff_preserves_selection_prerequisites_and_receipt(
+def test_typed_registered_skill_handoff_preserves_selection_prerequisites_and_receipt(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
     mode: str,
@@ -685,7 +685,7 @@ def test_v4_registered_skill_handoff_preserves_selection_prerequisites_and_recei
         "head_changes",
     ],
 )
-def test_v4_skill_handoff_rejects_unsafe_or_unhandled_work_before_deployment(
+def test_typed_skill_handoff_rejects_unsafe_or_unhandled_work_before_deployment(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
     problem: str,

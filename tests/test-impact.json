@@ -1568,7 +1568,6 @@
         "skills/ceratops-repo-lifecycle/references/templates/markdownlint.json.tmpl",
         "skills/ceratops-repo-lifecycle/references/templates/pull-request-template.md.tmpl",
         "skills/ceratops-repo-lifecycle/references/templates/run-actionlint.py.tmpl",
-        "skills/ceratops-repo-lifecycle/references/templates/sdlc.v4.yml.tmpl",
         "skills/ceratops-repo-lifecycle/references/templates/sdlc.yml.tmpl",
         "skills/ceratops-repo-lifecycle/references/templates/skill-sections.json.tmpl",
         "skills/ceratops-repo-lifecycle/references/templates/validate-repository.py.tmpl",

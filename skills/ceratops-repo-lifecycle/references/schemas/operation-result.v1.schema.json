@@ -637,7 +637,7 @@
       ]
     },
     "buildReceipt": {
-      "description": "A release-unit build inventory. Verification establishes file integrity only; build/test statuses remain producer claims and never authorize deployment.",
+      "description": "A release-bundle build inventory. Verification establishes file integrity only; build/test statuses remain producer claims and never authorize deployment.",
       "type": "object",
       "additionalProperties": false,
       "required": [

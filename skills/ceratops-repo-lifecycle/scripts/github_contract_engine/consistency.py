@@ -58,10 +58,7 @@ CONTRACTS = REFERENCES / "contracts"
 SCRIPTS = SKILL_DIR / "scripts"
 SOURCE_DOCS = CONTRACTS / "github-contract-source-docs.json"
 SCHEMAS = REFERENCES / "schemas"
-SDLC_SCHEMAS = (
-    SCHEMAS / "sdlc.v4.schema.json",
-    SCHEMAS / "sdlc.v5.schema.json",
-)
+SDLC_SCHEMAS = tuple(sorted(SCHEMAS.glob("sdlc.*.schema.json")))
 ARTIFACT_IDENTITY_SCHEMA = (
     SCHEMAS / "github-lifecycle-deterministic-contract.schema.json"
 )

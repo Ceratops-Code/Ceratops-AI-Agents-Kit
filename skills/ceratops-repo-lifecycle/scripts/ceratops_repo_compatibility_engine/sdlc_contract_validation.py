@@ -13,28 +13,23 @@ import pathlib
 import re
 from collections.abc import Mapping
 from copy import deepcopy
+from functools import lru_cache
 from typing import Any, cast
 
 import jsonschema
 import yaml
 
 SKILL_ROOT = pathlib.Path(__file__).resolve().parents[2]
-SCHEMA = SKILL_ROOT / "references" / "schemas" / "sdlc.v4.schema.json"
-# Compatibility application stays on v4 until release-unit lifecycle integration.
-# V5 is opt-in; loading a contract never migrates it or executes its declarations.
-VERSION_SCHEMAS = {
-    4: SCHEMA,
-    5: SCHEMA.with_name("sdlc.v5.schema.json"),
-}
+SCHEMA_DIRECTORY = SKILL_ROOT / "references" / "schemas"
 NAME = r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*"
 # MCP project names are manager identities, not rewritten SDLC display names.
 MCP_NAME = r"[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*"
-V4_OPERATION_RE = re.compile(
+OPERATION_RE = re.compile(
     rf"^(?:repository\.actions\.(?P<repository>bootstrap|validate|test|test-selection)|"
     rf"deliverables\.(?P<kind>packages|apps|mcp-servers|skills|hooks)\."
     rf"(?P<name>{MCP_NAME})\.actions\.(?P<action>validate|test|build|install|publish|verify-publish))$"
 )
-V4_ACTIONS_BY_KIND = {
+ACTIONS_BY_KIND = {
     "packages": frozenset({"validate", "test", "build", "publish", "verify-publish"}),
     "apps": frozenset({"validate", "test", "install", "publish", "verify-publish"}),
     "mcp-servers": frozenset(
@@ -43,7 +38,7 @@ V4_ACTIONS_BY_KIND = {
     "skills": frozenset({"validate", "test", "install"}),
     "hooks": frozenset({"validate", "test", "install"}),
 }
-V4_ACTION_CATEGORIES = {
+ACTION_CATEGORIES = {
     "bootstrap": "bootstrap",
     "test-selection": "test-selection",
     "validate": "validate",
@@ -53,7 +48,7 @@ V4_ACTION_CATEGORIES = {
     "publish": "publish",
     "verify-publish": "verify-publish",
 }
-V4_RESULT_SCHEMAS = {
+RESULT_SCHEMAS = {
     "validate": ("ceratops-repository-stage-result.v1",),
     "test": ("ceratops-repository-stage-result.v1",),
     "build": ("ceratops-build-result.v1", "ceratops-build-result.v2", "ceratops-build-result.v3"),
@@ -63,6 +58,36 @@ V4_RESULT_SCHEMAS = {
 
 class SdlcContractError(RuntimeError):
     """Raised when an SDLC contract or its schema is invalid."""
+
+
+@lru_cache(maxsize=1)
+def sdlc_schema_paths() -> dict[int, pathlib.Path]:
+    """Read supported SDLC versions from this installed skill's schema files.
+
+    Schema data owns format differences; all formats use the same readers and
+    semantic checks. The immutable installed payload permits one cached catalog.
+    No checkout, remote download, or version-specific Python implementation is used.
+    """
+
+    paths: dict[int, pathlib.Path] = {}
+    try:
+        for path in sorted(SCHEMA_DIRECTORY.glob("sdlc.*.schema.json")):
+            schema = json.loads(path.read_text(encoding="utf-8"))
+            version = schema["properties"]["version"]["const"]
+            if type(version) is not int or version < 1 or version in paths:
+                raise SdlcContractError(f"Invalid or duplicate SDLC schema version in {path.name}")
+            paths[version] = path
+    except (OSError, UnicodeError, ValueError, KeyError, TypeError) as exc:
+        raise SdlcContractError(f"Cannot read installed SDLC schemas: {exc}") from exc
+    if not paths:
+        raise SdlcContractError("The installed skill contains no SDLC schemas.")
+    return paths
+
+
+def latest_sdlc_version() -> int:
+    """Return the newest SDLC declaration supported by the installed schemas."""
+
+    return max(sdlc_schema_paths())
 
 
 class _ContractLoader(yaml.SafeLoader):
@@ -87,7 +112,7 @@ class _ContractLoader(yaml.SafeLoader):
 
 
 def operation_entries(contract: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
-    """Return the v4/v5 action hierarchy as an executable operation index."""
+    """Return the declared action hierarchy as an executable operation index."""
 
     entries: dict[str, Mapping[str, Any]] = {}
     for action, operation in contract.get("repository", {}).get("actions", {}).items():
@@ -99,20 +124,20 @@ def operation_entries(contract: Mapping[str, Any]) -> dict[str, Mapping[str, Any
     return entries
 
 
-def operation_category(location: str, *, version: int = 4) -> str:
-    """Classify a native versioned location without guessing from operation names."""
+def operation_category(location: str) -> str:
+    """Classify a declared action location without guessing from operation names."""
 
-    if isinstance(location, str) and (match := V4_OPERATION_RE.fullmatch(location)):
+    if isinstance(location, str) and (match := OPERATION_RE.fullmatch(location)):
         action = match.group("repository") or match.group("action")
         kind = match.group("kind")
         if kind not in {None, "mcp-servers"} and re.fullmatch(NAME, match.group("name")) is None:
             raise SdlcContractError(f"Invalid SDLC operation location: {location}")
         if (
             kind is None
-            or action in V4_ACTIONS_BY_KIND[kind]
-            or (version == 5 and action == "build")
+            or action in ACTIONS_BY_KIND[kind]
+            or action == "build"
         ):
-            return V4_ACTION_CATEGORIES[action]
+            return ACTION_CATEGORIES[action]
     raise SdlcContractError(f"Invalid SDLC operation location: {location}")
 
 
@@ -126,7 +151,7 @@ def _relative_path(value: str) -> bool:
     )
 
 
-def _v4_package_records(
+def _package_records(
     contract: Mapping[str, Any],
     direct: list[str],
 ) -> dict[str, dict[str, Any]]:
@@ -159,7 +184,7 @@ def operation_prerequisites(
 ) -> dict[str, Any]:
     """Expose declared setup metadata for one native operation location.
 
-    V4/v5 distinguish executable capabilities from package prerequisites and
+    Declarations distinguish executable capabilities from package prerequisites and
     include transitive package metadata plus selectable action locations.
     Version requirements stay as target-owned version-from references. This
     reader neither rewrites them into inline values nor selects/installs tools.
@@ -167,7 +192,7 @@ def operation_prerequisites(
     """
 
     operation = operation_entries(contract).get(location, {})
-    match = V4_OPERATION_RE.fullmatch(location)
+    match = OPERATION_RE.fullmatch(location)
     if match is None:
         raise SdlcContractError(f"Invalid SDLC operation location: {location}")
     capabilities = contract.get("repository", {}).get("capabilities", {})
@@ -178,33 +203,31 @@ def operation_prerequisites(
         direct_packages = list(deliverable.get("prerequisites", []))
     return {
         "capabilities": {name: capabilities[name] for name in required_capabilities},
-        "packages": _v4_package_records(contract, direct_packages),
+        "packages": _package_records(contract, direct_packages),
     }
 
 
-def release_unit_entries(contract: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
-    """Resolve a validated v5 contract without reading sources or running actions.
+def release_bundle_entries(contract: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    """Read declared release bundles without reading sources or running actions.
 
     Members retain declaration order and exclude dependencies owned by other
-    units. External package dependencies are dependency-first records, including
-    transitive prerequisites and their release-unit owners. Metadata is copied
+    bundles. External package dependencies are dependency-first records, including
+    transitive prerequisites and their release-bundle owners. Metadata is copied
     so a later caller cannot change the validated declaration through this view.
     Callers must use load_contract or validation_errors before this adapter.
-    V4 has no release units and returns an empty mapping.
+    A declaration without release bundles returns an empty mapping.
     """
 
-    if contract.get("version") != 5:
-        return {}
-    units = contract["repository"].get("release-units", {})
+    bundles = contract["repository"].get("release-bundles", {})
     owners = {
-        member: name for name, unit in units.items() for member in unit["members"]
+        member: name for name, bundle in bundles.items() for member in bundle["members"]
     }
     operations = operation_entries(contract)
     entries: dict[str, dict[str, Any]] = {}
-    for name, unit in units.items():
+    for name, bundle in bundles.items():
         members: dict[str, dict[str, Any]] = {}
         dependencies: dict[str, dict[str, Any]] = {}
-        for member in unit["members"]:
+        for member in bundle["members"]:
             _, kind, deliverable_name = member.split(".")
             record = contract["deliverables"][kind][deliverable_name]
             metadata = deepcopy(
@@ -226,7 +249,7 @@ def release_unit_entries(contract: Mapping[str, Any]) -> dict[str, dict[str, Any
                 if owner != name:
                     dependencies[reference] = {
                         **deepcopy(prerequisite),
-                        "release-unit": owner,
+                        "release-bundle": owner,
                     }
         entries[name] = {"members": members, "dependencies": dependencies}
     return entries
@@ -306,7 +329,7 @@ def _typed_semantic_errors(value: Mapping[str, Any]) -> list[str]:
                         f"result-commit-field requires a build ending in a run step at {owner}.actions.{action_name}"
                     )
             if declared_result is not None:
-                expected_result = V4_RESULT_SCHEMAS.get(action_name)
+                expected_result = RESULT_SCHEMAS.get(action_name)
                 if expected_result is None:
                     errors.append(
                         f"result-schema is not supported at {owner}.actions.{action_name}"
@@ -416,12 +439,12 @@ def _typed_semantic_errors(value: Mapping[str, Any]) -> list[str]:
     return errors
 
 
-def _v5_release_unit_errors(value: Mapping[str, Any]) -> list[str]:
+def _release_bundle_errors(value: Mapping[str, Any]) -> list[str]:
     """Reject incomplete release ownership before the reader can expose it.
 
-    The common typed checks have already verified the package graph. Unit
+    The common typed checks have already verified the package graph. Bundle
     cycles are checked separately: grouping an acyclic package graph can still
-    produce mutually dependent release units. No filesystem or Git access is
+    produce mutually dependent release bundles. No filesystem or Git access is
     needed to resolve this declaration-level ownership.
     """
 
@@ -431,16 +454,16 @@ def _v5_release_unit_errors(value: Mapping[str, Any]) -> list[str]:
         for kind, group in value.get("deliverables", {}).items()
         for name, record in group.items()
     }
-    units = value["repository"].get("release-units", {})
+    bundles = value["repository"].get("release-bundles", {})
     owners: dict[str, str] = {}
-    for name, unit in units.items():
-        for member in unit["members"]:
+    for name, bundle in bundles.items():
+        for member in bundle["members"]:
             if member not in records:
-                errors.append(f"release unit {name} has unknown member {member}")
+                errors.append(f"release bundle {name} has unknown member {member}")
                 continue
             if member in owners:
                 errors.append(
-                    f"{member} belongs to multiple release units: {owners[member]}, {name}"
+                    f"{member} belongs to multiple release bundles: {owners[member]}, {name}"
                 )
                 continue
             owners[member] = name
@@ -448,24 +471,24 @@ def _v5_release_unit_errors(value: Mapping[str, Any]) -> list[str]:
             build = record["actions"].get("build", {})
             if not record.get("artifact") or not build.get("steps"):
                 errors.append(
-                    f"release unit {name} member {member} requires artifact metadata "
+                    f"release bundle {name} member {member} requires artifact metadata "
                     "and an executable build action"
                 )
             elif any("run" not in step for step in build["steps"]):
                 errors.append(
-                    f"release unit {name} member {member} build must contain only run steps"
+                    f"release bundle {name} member {member} build must contain only run steps"
                 )
     if errors:
         return errors
-    dependencies: dict[str, set[str]] = {name: set() for name in units}
+    dependencies: dict[str, set[str]] = {name: set() for name in bundles}
     for member, owner in owners.items():
-        packages = _v4_package_records(value, records[member]["prerequisites"])
+        packages = _package_records(value, records[member]["prerequisites"])
         for package in packages:
             reference = f"deliverables.packages.{package}"
             dependency_owner = owners.get(reference)
             if dependency_owner is None:
                 errors.append(
-                    f"release unit {owner} depends on package {package} without a release unit"
+                    f"release bundle {owner} depends on package {package} without a release bundle"
                 )
             elif dependency_owner != owner:
                 dependencies[owner].add(dependency_owner)
@@ -474,7 +497,7 @@ def _v5_release_unit_errors(value: Mapping[str, Any]) -> list[str]:
 
     def visit(name: str) -> None:
         if name in visiting:
-            errors.append(f"release-unit dependency cycle includes {name}")
+            errors.append(f"release-bundle dependency cycle includes {name}")
             return
         if name in visited:
             return
@@ -484,13 +507,13 @@ def _v5_release_unit_errors(value: Mapping[str, Any]) -> list[str]:
         visiting.remove(name)
         visited.add(name)
 
-    for name in units:
+    for name in bundles:
         visit(name)
     return list(dict.fromkeys(errors))
 
 
 def _schema_validator(
-    schema_path: pathlib.Path = SCHEMA,
+    schema_path: pathlib.Path,
 ) -> jsonschema.Draft202012Validator:
     """Load and validate the lifecycle-owned SDLC schema."""
 
@@ -517,14 +540,19 @@ def validation_errors(
     if not isinstance(value, Mapping):
         return ["SDLC contract must be a mapping"]
     version = value.get("version")
-    if type(version) is not int or version not in VERSION_SCHEMAS:
-        supported = ", ".join(str(item) for item in sorted(VERSION_SCHEMAS))
+    schemas = sdlc_schema_paths()
+    if type(version) is not int or version not in schemas:
+        supported = ", ".join(str(item) for item in sorted(schemas))
+        latest = max(schemas)
+        instruction = (
+            " Update the installed repo-lifecycle skill before reading this repository."
+            if type(version) is int and version > latest else ""
+        )
         return [
-            f"unsupported SDLC version: {version!r}; supported versions: {supported}"
+            f"unsupported SDLC version: {version!r}; installed schemas: {supported}; "
+            f"latest installed version: {latest}.{instruction}"
         ]
-    selected_schema = (
-        VERSION_SCHEMAS[version] if schema_path in (None, SCHEMA) else schema_path
-    )
+    selected_schema = schema_path if schema_path is not None else schemas[version]
     validator = _schema_validator(selected_schema)
     errors: list[str] = []
     for error in sorted(
@@ -537,9 +565,9 @@ def validation_errors(
     if errors:
         return errors
     errors = _typed_semantic_errors(value)
-    if errors or version == 4:
+    if errors:
         return errors
-    return _v5_release_unit_errors(value)
+    return _release_bundle_errors(value)
 
 
 def read_contract(

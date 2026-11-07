@@ -69,7 +69,7 @@ def generated_test_runner(
     selected = any(
         relative in step.get("run", [])
         for name, operation in operation_entries(sdlc).items()
-        if operation_category(name, version=int(sdlc["version"])) == "tests"
+        if operation_category(name) == "tests"
         for step in operation.get("steps", [])
     )
     if not targets or not selected:

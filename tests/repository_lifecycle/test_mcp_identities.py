@@ -16,7 +16,7 @@ import pytest
 from tests.repository_lifecycle.test_sdlc_handoffs import (
     ROOT,
     _repository,
-    _v4_fixture,
+    _typed_contract,
     contracts,
     runner,
     skill_actions,
@@ -27,7 +27,7 @@ def _package_mcp_case(tmp_path, monkeypatch, problem=None):
     """Match the real failure: prerequisites exist only on the SDLC deliverable."""
     repo = tmp_path / "repository with spaces"
     repo.mkdir()
-    fixture = _v4_fixture()
+    fixture = _typed_contract()
     server_name = "insurance-claims-mcp-server"
     source = repo / "mcp-servers" / server_name
     source.mkdir(parents=True)
@@ -190,7 +190,7 @@ def test_source_only_mcp_keeps_existing_install_arguments(tmp_path, monkeypatch)
 @pytest.mark.parametrize("version", [4, 5])
 @pytest.mark.parametrize("name", ["source_search_mcp", "ceratops-mcp-server-manager"])
 def test_mcp_identity_survives_contract_preparation(tmp_path, version, name):
-    fixture = _v4_fixture()
+    fixture = _typed_contract()
     fixture["version"] = version
     server = fixture["deliverables"]["mcp-servers"].pop("insurance-claims-mcp-server")
     fixture["deliverables"]["mcp-servers"][name] = server
@@ -216,7 +216,7 @@ def test_malformed_mcp_names_stop_before_execution(tmp_path, monkeypatch, name):
     result = skill_actions.execute_handoff("ceratops-mcp-server-lifecycle/install", tmp_path,
                                     inputs={"mcp-server": name})
     assert result["status"] == "handoff_required" and calls == []
-    fixture = _v4_fixture()
+    fixture = _typed_contract()
     server = fixture["deliverables"]["mcp-servers"].pop("insurance-claims-mcp-server")
     fixture["deliverables"]["mcp-servers"][name] = server
     assert contracts.validation_errors(fixture)

@@ -94,7 +94,6 @@
       ]
     }
   },
-  "sdlc_version": 4,
   "runtime": {
     "project": "scripts",
     "lockfile": "scripts/uv.lock",

@@ -453,7 +453,7 @@ def test_compatibility_preserves_custom_unittest_runner_without_pytest(
 
 
 @pytest.mark.parametrize("mode", ["ci", "skill", "return"])
-def test_v4_tests_gate_mutations_and_ci_never_dispatches_handoffs(
+def test_typed_tests_gate_mutations_and_ci_never_dispatches_handoffs(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
     mode: str,
@@ -482,10 +482,10 @@ def test_v4_tests_gate_mutations_and_ci_never_dispatches_handoffs(
                     "manifest": "apps/service/app.json",
                     "prerequisites": [],
                     "actions": {
-                        "test": _v4_action(
+                        "test": _run_action(
                             {"run": [sys.executable, "-c", "raise SystemExit(7)"]}
                         ),
-                        "validate": _v4_action(
+                        "validate": _run_action(
                             {
                                 "handoff": {
                                     "lifecycle": "example-skill",
@@ -494,7 +494,7 @@ def test_v4_tests_gate_mutations_and_ci_never_dispatches_handoffs(
                                 }
                             }
                         ),
-                        "install": _v4_action(
+                        "install": _run_action(
                             {
                                 "run": [
                                     sys.executable,
@@ -590,7 +590,7 @@ def test_ci_action_runs_skill_engine_without_repository_copies(
                     "source": "skills/service",
                     "prerequisites": [],
                     "actions": {
-                        "validate": _v4_action(
+                        "validate": _run_action(
                             {
                                 "handoff": {
                                     "lifecycle": "ceratops-skill-lifecycle",
@@ -599,7 +599,7 @@ def test_ci_action_runs_skill_engine_without_repository_copies(
                                 }
                             }
                         ),
-                        "install": _v4_action(
+                        "install": _run_action(
                             {
                                 "handoff": {
                                     "lifecycle": "ceratops-skill-lifecycle",
@@ -634,11 +634,11 @@ def test_ci_action_runs_skill_engine_without_repository_copies(
     assert not (repo / "scripts/runtime").exists()
 
 
-def _v4_action(*steps: dict[str, object]) -> dict[str, object]:
+def _run_action(*steps: dict[str, object]) -> dict[str, object]:
     return {"requires": {"capabilities": []}, "steps": list(steps)}
 
 
-def _v4_fixture() -> dict[str, Any]:
+def _typed_contract() -> dict[str, Any]:
     """Exercise package dependency records and separate lifecycle ownership."""
 
     return {
@@ -647,7 +647,7 @@ def _v4_fixture() -> dict[str, Any]:
         "repository": {
             "capabilities": {"uv": {"executable": "uv"}},
             "actions": {
-                "validate": _v4_action({"run": [sys.executable, "-c", "pass"]}),
+                "validate": _run_action({"run": [sys.executable, "-c", "pass"]}),
                 "test": {
                     "requires": {"capabilities": []},
                     "no-op": "No repository tests.",
@@ -667,7 +667,7 @@ def _v4_fixture() -> dict[str, Any]:
                         "filename-pattern": "core_tool-*.whl",
                     },
                     "actions": {
-                        "build": _v4_action({"run": ["uv", "build", "packages/core"]})
+                        "build": _run_action({"run": ["uv", "build", "packages/core"]})
                     },
                 },
                 "claims": {
@@ -681,7 +681,7 @@ def _v4_fixture() -> dict[str, Any]:
                         "filename-pattern": "claims_tool-*.whl",
                     },
                     "actions": {
-                        "build": _v4_action({"run": ["uv", "build", "packages/claims"]})
+                        "build": _run_action({"run": ["uv", "build", "packages/claims"]})
                     },
                 },
             },
@@ -695,7 +695,7 @@ def _v4_fixture() -> dict[str, Any]:
                             "requires": {"capabilities": []},
                             "no-op": "Package tests cover the MCP server.",
                         },
-                        "install": _v4_action(
+                        "install": _run_action(
                             {
                                 "handoff": {
                                     "lifecycle": "ceratops-mcp-server-lifecycle",
@@ -717,7 +717,7 @@ def _v4_fixture() -> dict[str, Any]:
                             "requires": {"capabilities": []},
                             "no-op": "Repository checks cover the app.",
                         },
-                        "install": _v4_action(
+                        "install": _run_action(
                             {
                                 "run": [
                                     sys.executable,
@@ -734,7 +734,7 @@ def _v4_fixture() -> dict[str, Any]:
                     "source": "skills/claims-catalog-invoice",
                     "prerequisites": ["claims"],
                     "actions": {
-                        "validate": _v4_action(
+                        "validate": _run_action(
                             {
                                 "handoff": {
                                     "lifecycle": "ceratops-skill-lifecycle",
@@ -743,7 +743,7 @@ def _v4_fixture() -> dict[str, Any]:
                                 }
                             }
                         ),
-                        "install": _v4_action(
+                        "install": _run_action(
                             {
                                 "handoff": {
                                     "lifecycle": "ceratops-skill-lifecycle",
@@ -759,20 +759,21 @@ def _v4_fixture() -> dict[str, Any]:
     }
 
 
-def test_v4_template_and_typed_operation_index(tmp_path: pathlib.Path) -> None:
+def test_typed_template_and_typed_operation_index(tmp_path: pathlib.Path) -> None:
     template = (
-        ROOT / "skills/ceratops-repo-lifecycle/references/templates/sdlc.v4.yml.tmpl"
+        ROOT / "skills/ceratops-repo-lifecycle/references/templates/sdlc.yml.tmpl"
     )
     path = tmp_path / "sdlc.yml"
     shutil.copyfile(template, path)
     document = contracts.load_contract(path)
-    assert document["version"] == 4
+    assert document["version"] == contracts.latest_sdlc_version()
     assert list(contracts.operation_entries(document)) == [
+        "repository.actions.bootstrap",
         "repository.actions.validate",
         "repository.actions.test",
     ]
 
-    fixture = _v4_fixture()
+    fixture = _typed_contract()
     assert contracts.validation_errors(fixture) == []
     entries = contracts.operation_entries(fixture)
     assert set(entries) == {
@@ -801,16 +802,15 @@ def test_v4_template_and_typed_operation_index(tmp_path: pathlib.Path) -> None:
         )
         == "deploy-local"
     )
-    with pytest.raises(runner.OperationError, match="Invalid SDLC operation location"):
-        runner.operation_category(
-            "deliverables.skills.claims-catalog-invoice.actions.build"
-        )
+    assert runner.operation_category(
+        "deliverables.skills.claims-catalog-invoice.actions.build"
+    ) == "build"
 
 
-def test_v4_prerequisites_are_exposed_without_build_or_install(
+def test_typed_prerequisites_are_exposed_without_build_or_install(
     tmp_path: pathlib.Path,
 ) -> None:
-    fixture = _v4_fixture()
+    fixture = _typed_contract()
     (tmp_path / "sdlc").mkdir()
     (tmp_path / "sdlc/sdlc.yml").write_text(json.dumps(fixture))
     _repository(tmp_path)
@@ -1265,7 +1265,7 @@ def _bound_test_build(repo_root, *, pre_test_commit, **selection):
 @pytest.mark.parametrize("timing", ["before", "after"])
 def test_versioned_allocation_repeats_after_directory_and_request_effects(tmp_path, monkeypatch, stage, timing):
     repository, commit = _versioned_repository(tmp_path)
-    selection = dict(repository="example/project", release_unit="claims", version="1.2.3b1",
+    selection = dict(repository="example/project", release_bundle="claims", version="1.2.3b1",
                      required_targets=["linux", "windows"], attempt_id="attempt-interruption")
     allocation = None
     if stage == "binding":
@@ -1308,7 +1308,7 @@ def test_versioned_allocation_repeats_after_directory_and_request_effects(tmp_pa
 
 def test_versioned_allocation_precedes_embedded_versions_and_commit_b(tmp_path):
     repository, before = _versioned_repository(tmp_path)
-    selection = dict(repository="example/project", release_unit="claims", version="1.2.3b1",
+    selection = dict(repository="example/project", release_bundle="claims", version="1.2.3b1",
                      required_targets=["linux", "windows"], attempt_id="attempt-before-b",
                      declared_input_paths=["src", "version.txt"])
     allocation = runner.allocate_versioned_build(repository, **selection)
@@ -1328,7 +1328,7 @@ def test_versioned_allocation_precedes_embedded_versions_and_commit_b(tmp_path):
 @pytest.mark.parametrize("change", ["worktree", "index", "new-file"])
 def test_versioned_changed_inputs_select_another_directory(tmp_path, change):
     repository, commit = _versioned_repository(tmp_path)
-    selection = dict(repository="example/project", release_unit="claims", version="1.2.3a1",
+    selection = dict(repository="example/project", release_bundle="claims", version="1.2.3a1",
                      required_targets=["linux"], attempt_id="attempt-inputs",
                      declared_input_paths=["src"])
     original = _bound_test_build(repository, pre_test_commit=commit, **selection)
@@ -1351,7 +1351,7 @@ def test_versioned_changed_inputs_select_another_directory(tmp_path, change):
 
 def test_versioned_allocation_propagates_permission_errors_and_requires_final_version_choice(tmp_path, monkeypatch):
     repository, _commit = _versioned_repository(tmp_path)
-    selection = dict(repository="example/project", release_unit="claims", version="1.2.3b1",
+    selection = dict(repository="example/project", release_bundle="claims", version="1.2.3b1",
                      required_targets=["linux"], attempt_id="attempt-permissions")
     mkdir = pathlib.Path.mkdir
 
@@ -1383,7 +1383,7 @@ def test_versioned_competing_processes_allocate_while_retention_is_busy(tmp_path
     program = (
         "import json,pathlib,subprocess,sys; sys.path.insert(0,sys.argv[1]); import repository_operation as r\n"
         "root=pathlib.Path(sys.argv[2]); print('ready',flush=True); input()\n"
-        "a=r.allocate_versioned_build(root,repository='example/project',release_unit='claims',version='1.2.3b1',"
+        "a=r.allocate_versioned_build(root,repository='example/project',release_bundle='claims',version='1.2.3b1',"
         "required_targets=['linux','windows'],attempt_id=root.name,declared_input_paths=['src','version.txt'])\n"
         "(root/'version.txt').write_text(a.version)\n"
         "subprocess.run(['git','-C',str(root),'add','version.txt'],check=True,capture_output=True)\n"
@@ -1425,7 +1425,7 @@ def test_versioned_competing_processes_allocate_while_retention_is_busy(tmp_path
 def test_versioned_requests_preserve_owners_and_coordinate_targets(tmp_path) -> None:
     repository, commit = _versioned_repository(tmp_path)
     targets = ["python-3.14-windows", "python-3.14-linux"]
-    selection = dict(repository="example/project", release_unit="claims", version="1.2.3a1",
+    selection = dict(repository="example/project", release_bundle="claims", version="1.2.3a1",
                      required_targets=targets, attempt_id="attempt-alpha-001")
     transaction = _bound_test_build(repository, pre_test_commit=commit, **selection)
     sentinel = transaction.target_output(targets[0]) / "owned.bin"
@@ -1471,7 +1471,7 @@ def _prepared_versioned_completion(
     transaction = _bound_test_build(
         repository,
         repository="example/project",
-        release_unit="claims",
+        release_bundle="claims",
         version=version,
         required_targets=targets,
         attempt_id=attempt_id,
@@ -1784,7 +1784,7 @@ def test_new_receipt_reader_reports_missing_and_unreadable_data(tmp_path) -> Non
 def test_new_receipt_definitions_preserve_native_v2_reading(tmp_path) -> None:
     path, bundle, receipt, expected = _build_receipt_fixture(tmp_path)
     assert results.BUILD_RECEIPT_SCHEMA == "ceratops-build-result.v2"
-    assert results.verify_release_unit_build(path, bundle, expected=expected) == receipt
+    assert results.verify_release_bundle_build(path, bundle, expected=expected) == receipt
 
 
 @pytest.mark.parametrize("receipt_name", ["build_receipt.json", "receipt.json"])
@@ -2049,7 +2049,7 @@ def test_build_receipt_verifies_complete_bundle_without_mutation(
         "run",
         lambda *a, **k: pytest.fail("Verifier must not execute commands"),
     )
-    checked = results.verify_release_unit_build(path, bundle, expected=expected)
+    checked = results.verify_release_bundle_build(path, bundle, expected=expected)
     assert checked == receipt
     assert {
         item: (item.read_bytes(), item.stat().st_mtime_ns)
@@ -2073,7 +2073,7 @@ def test_build_receipt_ignores_metadata_only_change_time(tmp_path, monkeypatch) 
 
     # Simulate Windows metadata changes without touching file identity or bytes.
     monkeypatch.setattr(results, "_plain_path", changed_metadata)
-    assert results.verify_release_unit_build(path, bundle, expected=expected) == receipt
+    assert results.verify_release_bundle_build(path, bundle, expected=expected) == receipt
 
 
 @pytest.mark.parametrize("build_status", ["passed", "failed", "blocked"])
@@ -2094,7 +2094,7 @@ def test_build_receipt_integrity_does_not_establish_test_success(
         if test_status in {"blocked", "skipped"}:
             receipt["tests"][0]["evidence"] = None
     _save_build_receipt(path, receipt)
-    assert results.verify_release_unit_build(path, bundle, expected=expected) == receipt
+    assert results.verify_release_bundle_build(path, bundle, expected=expected) == receipt
 
 
 @pytest.mark.parametrize(
@@ -2112,7 +2112,7 @@ def test_build_receipt_checks_each_expected_identity_before_payload_reads(
         lambda *a: pytest.fail("Identity must be checked first"),
     )
     with pytest.raises(results.StepResultError, match=f"identity mismatch: {field}"):
-        results.verify_release_unit_build(path, bundle, expected=expected)
+        results.verify_release_bundle_build(path, bundle, expected=expected)
 
 
 @pytest.mark.parametrize(
@@ -2133,7 +2133,7 @@ def test_build_receipt_requires_complete_independent_selection(
     else:
         expected = None
     with pytest.raises(results.StepResultError, match="all six"):
-        results.verify_release_unit_build(path, bundle, expected=expected)
+        results.verify_release_bundle_build(path, bundle, expected=expected)
 
 
 @pytest.mark.parametrize(
@@ -2175,7 +2175,7 @@ def test_build_receipt_rejects_invalid_schema(tmp_path, problem) -> None:
         receipt["artifacts"][0][key] = value
     _save_build_receipt(path, receipt)
     with pytest.raises(results.StepResultError, match="schema"):
-        results.verify_release_unit_build(path, bundle, expected=expected)
+        results.verify_release_bundle_build(path, bundle, expected=expected)
 
 
 @pytest.mark.parametrize(
@@ -2240,7 +2240,7 @@ def test_build_receipt_rejects_ambiguous_inventory_before_payload_reads(
         lambda *a: pytest.fail("Inventory must be checked first"),
     )
     with pytest.raises(results.StepResultError):
-        results.verify_release_unit_build(path, bundle, expected=expected)
+        results.verify_release_bundle_build(path, bundle, expected=expected)
 
 
 @pytest.mark.parametrize(
@@ -2277,7 +2277,7 @@ def test_build_receipt_rejects_nonportable_or_escaping_paths(
         lambda *a: pytest.fail("Unsafe paths must be rejected first"),
     )
     with pytest.raises(results.StepResultError):
-        results.verify_release_unit_build(path, bundle, expected=expected)
+        results.verify_release_bundle_build(path, bundle, expected=expected)
 
 
 @pytest.mark.parametrize("group", ["artifact", "dependency", "lock", "evidence"])
@@ -2306,7 +2306,7 @@ def test_build_receipt_verifies_every_file_category(tmp_path, group, problem) ->
                 reference["sha256"] = record["sha256"]
     _save_build_receipt(path, receipt)
     with pytest.raises(results.StepResultError):
-        results.verify_release_unit_build(path, bundle, expected=expected)
+        results.verify_release_bundle_build(path, bundle, expected=expected)
 
 
 @pytest.mark.parametrize(
@@ -2340,14 +2340,14 @@ def test_build_receipt_rejects_unusable_json(tmp_path, problem) -> None:
     }[problem]
     path.write_bytes(raw)
     with pytest.raises(results.StepResultError):
-        results.verify_release_unit_build(path, bundle, expected=expected)
+        results.verify_release_bundle_build(path, bundle, expected=expected)
 
 
 def test_build_receipt_rejects_hardlinked_payload(tmp_path) -> None:
     path, bundle, receipt, expected = _build_receipt_fixture(tmp_path)
     os.link(bundle / receipt["artifacts"][0]["path"], tmp_path / "other-link.whl")
     with pytest.raises(results.StepResultError, match="regular and unlinked"):
-        results.verify_release_unit_build(path, bundle, expected=expected)
+        results.verify_release_bundle_build(path, bundle, expected=expected)
 
 
 @pytest.mark.parametrize("linked_root", [False, True])
@@ -2375,7 +2375,7 @@ def test_build_receipt_rejects_directory_links(tmp_path, linked_root) -> None:
             receipt["tests"][0]["artifacts"][0]["path"] = "linked-wheels/claims.whl"
             _save_build_receipt(path, receipt)
         with pytest.raises(results.StepResultError, match="traverses a link"):
-            results.verify_release_unit_build(path, bundle, expected=expected)
+            results.verify_release_bundle_build(path, bundle, expected=expected)
     finally:
         # Remove only the test-owned link, never its target or descendants.
         if link.is_symlink():
@@ -2402,7 +2402,7 @@ def test_build_receipt_detects_changes_during_hashing(tmp_path, monkeypatch) -> 
 
     monkeypatch.setattr(results.hashlib, "sha256", ChangingHash)
     with pytest.raises(results.StepResultError, match="changed while reading"):
-        results.verify_release_unit_build(path, bundle, expected=expected)
+        results.verify_release_bundle_build(path, bundle, expected=expected)
 
 
 @pytest.mark.parametrize(
@@ -2449,7 +2449,7 @@ def test_build_receipt_cli_works_from_isolated_skill_and_preserves_inputs(
         sys.executable,
         "-B",
         str(script),
-        "verify-release-unit-build",
+        "verify-release-bundle-build",
         "--receipt",
         str(path),
         "--bundle-root",
@@ -2460,7 +2460,7 @@ def test_build_receipt_cli_works_from_isolated_skill_and_preserves_inputs(
         [
             "--repository",
             "--source-commit",
-            "--release-unit",
+            "--release-bundle",
             "--channel",
             "--version",
             "--target",
@@ -2495,10 +2495,10 @@ def test_build_receipt_cli_works_from_isolated_skill_and_preserves_inputs(
     assert missing.returncode == 2 and "--target" in missing.stderr
 
 
-def test_v4_source_installed_mcp_server_needs_no_package_artifact(
+def test_typed_source_installed_mcp_server_needs_no_package_artifact(
     tmp_path: pathlib.Path,
 ) -> None:
-    fixture = _v4_fixture()
+    fixture = _typed_contract()
     mcp_server = fixture["deliverables"]["mcp-servers"]["insurance-claims-mcp-server"]
     mcp_server["prerequisites"] = []
     assert contracts.validation_errors(fixture) == []
@@ -2515,10 +2515,10 @@ def test_v4_source_installed_mcp_server_needs_no_package_artifact(
     assert not (tmp_path / "dist").exists()
 
 
-def test_v4_mcp_server_install_can_run_standalone_script(tmp_path: pathlib.Path) -> None:
-    fixture = _v4_fixture()
+def test_typed_mcp_server_install_can_run_standalone_script(tmp_path: pathlib.Path) -> None:
+    fixture = _typed_contract()
     mcp_server = fixture["deliverables"]["mcp-servers"]["insurance-claims-mcp-server"]
-    mcp_server["actions"]["install"] = _v4_action(
+    mcp_server["actions"]["install"] = _run_action(
         {
             "run": [
                 sys.executable,
@@ -2544,8 +2544,8 @@ def test_v4_mcp_server_install_can_run_standalone_script(tmp_path: pathlib.Path)
     assert (tmp_path / "installed.txt").read_text() == "done"
 
 
-def test_v4_app_install_can_run_standalone_script(tmp_path: pathlib.Path) -> None:
-    fixture = _v4_fixture()
+def test_typed_app_install_can_run_standalone_script(tmp_path: pathlib.Path) -> None:
+    fixture = _typed_contract()
     assert contracts.validation_errors(fixture) == []
     (tmp_path / "sdlc").mkdir()
     (tmp_path / "sdlc/sdlc.yml").write_text(json.dumps(fixture))
@@ -2563,8 +2563,8 @@ def test_v4_app_install_can_run_standalone_script(tmp_path: pathlib.Path) -> Non
     assert (tmp_path / "app-installed.txt").read_text() == "done"
 
 
-def test_v4_declared_operation_result_is_validated(tmp_path: pathlib.Path) -> None:
-    fixture = _v4_fixture()
+def test_typed_declared_operation_result_is_validated(tmp_path: pathlib.Path) -> None:
+    fixture = _typed_contract()
     action = fixture["deliverables"]["apps"]["claims-mobile"]["actions"]["install"]
     action["result-schema"] = "ceratops-deployment-result.v1"
     payload = {
@@ -2604,10 +2604,10 @@ def test_v4_declared_operation_result_is_validated(tmp_path: pathlib.Path) -> No
     assert result["step_results"] == [{"step": 1, "result": payload}]
 
 
-def test_v4_invalid_required_result_retains_completed_side_effect(
+def test_typed_invalid_required_result_retains_completed_side_effect(
     tmp_path: pathlib.Path,
 ) -> None:
-    fixture = _v4_fixture()
+    fixture = _typed_contract()
     action = fixture["deliverables"]["apps"]["claims-mobile"]["actions"]["install"]
     action["result-schema"] = "ceratops-deployment-result.v1"
     action["steps"] = [
@@ -2638,13 +2638,13 @@ def test_v4_invalid_required_result_retains_completed_side_effect(
 
 
 @pytest.mark.parametrize("mode", ["skill", "ci", "return"])
-def test_v4_runs_commands_then_returns_structured_handoff(
+def test_typed_runs_commands_then_returns_structured_handoff(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
     mode: str,
 ) -> None:
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "unregistered"))
-    fixture = _v4_fixture()
+    fixture = _typed_contract()
     action = fixture["deliverables"]["skills"]["claims-catalog-invoice"]["actions"][
         "install"
     ]
@@ -2679,14 +2679,14 @@ def test_v4_runs_commands_then_returns_structured_handoff(
     assert (tmp_path / "ran.txt").read_text() == "done"
 
 
-def test_v4_package_build_waits_for_declared_test_gate(tmp_path: pathlib.Path) -> None:
-    fixture = _v4_fixture()
-    fixture["repository"]["actions"]["test"] = _v4_action(
+def test_typed_package_build_waits_for_declared_test_gate(tmp_path: pathlib.Path) -> None:
+    fixture = _typed_contract()
+    fixture["repository"]["actions"]["test"] = _run_action(
         {
             "run": [sys.executable, "-c", "raise SystemExit(7)"],
         }
     )
-    fixture["deliverables"]["packages"]["claims"]["actions"]["build"] = _v4_action(
+    fixture["deliverables"]["packages"]["claims"]["actions"]["build"] = _run_action(
         {
             "run": [
                 sys.executable,
@@ -2797,10 +2797,10 @@ def test_v4_package_build_waits_for_declared_test_gate(tmp_path: pathlib.Path) -
         ),
     ],
 )
-def test_v4_rejects_invalid_dependency_or_lifecycle_boundary(
+def test_typed_rejects_invalid_dependency_or_lifecycle_boundary(
     change, expected: str
 ) -> None:
-    fixture = _v4_fixture()
+    fixture = _typed_contract()
     change(fixture)
     assert any(expected in error for error in contracts.validation_errors(fixture))
 
@@ -2809,7 +2809,7 @@ def test_v4_rejects_invalid_dependency_or_lifecycle_boundary(
     "change",
     [
         lambda x: x["deliverables"]["apps"]["claims-mobile"]["actions"].update(
-            build=_v4_action({"run": ["python"]})
+            build=_run_action({"run": ["python"]})
         ),
         lambda x: x["deliverables"]["mcp-servers"]["insurance-claims-mcp-server"].update(
             package="claims"
@@ -2825,20 +2825,20 @@ def test_v4_rejects_invalid_dependency_or_lifecycle_boundary(
         ]["steps"][0].update(run=["python"]),
         lambda x: x["deliverables"]["skills"]["claims-catalog-invoice"][
             "actions"
-        ].update(build=_v4_action({"run": ["python"]})),
+        ].update(build=_run_action({"run": ["python"]})),
     ],
 )
-def test_v4_schema_rejects_ambiguous_steps_or_wrong_deliverable_actions(change) -> None:
-    fixture = _v4_fixture()
+def test_typed_schema_rejects_ambiguous_steps_or_wrong_deliverable_actions(change) -> None:
+    fixture = _typed_contract()
     change(fixture)
     assert contracts.validation_errors(fixture)
 
 
-def _v5_fixture() -> dict[str, Any]:
-    """Two release units independently consume one separately owned package."""
-    document = _v4_fixture()
+def _bundle_contract() -> dict[str, Any]:
+    """Two release bundles independently consume one separately owned package."""
+    document = _typed_contract()
     document["version"] = 5
-    document["repository"]["release-units"] = {
+    document["repository"]["release-bundles"] = {
         "core": {"members": ["deliverables.packages.core"]},
         "claims": {
             "members": [
@@ -2856,7 +2856,7 @@ def _v5_fixture() -> dict[str, Any]:
         "output-directory": "dist/claims-mcp-server",
         "filename-pattern": "insurance_claims_mcp_server-*.whl",
     }
-    mcp_server["actions"]["build"] = _v4_action(
+    mcp_server["actions"]["build"] = _run_action(
         {"run": ["build-claims-mcp-server"]}
     )
     app = document["deliverables"]["apps"]["claims-mobile"]
@@ -2866,26 +2866,26 @@ def _v5_fixture() -> dict[str, Any]:
         "output-directory": "dist/desktop",
         "filename-pattern": "desktop-*.zip",
     }
-    app["actions"]["build"] = _v4_action({"run": ["build-desktop"]})
+    app["actions"]["build"] = _run_action({"run": ["build-desktop"]})
     return document
 
 
-def test_v5_reader_keeps_shared_dependencies_out_of_membership(
+def test_bundle_reader_keeps_shared_dependencies_out_of_membership(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    document = _v5_fixture()
+    document = _bundle_contract()
     original = deepcopy(document)
     path = tmp_path / "sdlc.yml"
     path.write_text(json.dumps(document), encoding="utf-8")
     files_before = list(tmp_path.iterdir())
 
     def forbidden(*_args, **_kwargs):
-        raise AssertionError("Reading release units must not execute a command")
+        raise AssertionError("Reading release bundles must not execute a command")
 
     monkeypatch.setattr(subprocess, "run", forbidden)
     loaded = contracts.load_contract(path)
-    entries = contracts.release_unit_entries(loaded)
+    entries = contracts.release_bundle_entries(loaded)
     assert list(entries) == ["core", "claims", "desktop"]
     assert entries["core"]["dependencies"] == {}
     assert list(entries["claims"]["members"]) == [
@@ -2896,7 +2896,7 @@ def test_v5_reader_keeps_shared_dependencies_out_of_membership(
     for name in ("claims", "desktop"):
         assert list(entries[name]["dependencies"]) == ["deliverables.packages.core"]
         dependency = entries[name]["dependencies"]["deliverables.packages.core"]
-        assert dependency["release-unit"] == "core"
+        assert dependency["release-bundle"] == "core"
         assert dependency["source"] == "packages/core"
         assert dependency["artifact"]["type"] == "python-wheel"
         assert (
@@ -2918,17 +2918,17 @@ def test_v5_reader_keeps_shared_dependencies_out_of_membership(
     assert list(tmp_path.iterdir()) == files_before
 
 
-def test_v5_reader_resolves_transitive_dependency_owners() -> None:
-    document = _v5_fixture()
+def test_bundle_reader_resolves_transitive_dependency_owners() -> None:
+    document = _bundle_contract()
     app = document["deliverables"]["apps"]["claims-mobile"]
     app["prerequisites"] = ["claims"]
     assert contracts.validation_errors(document) == []
-    dependencies = contracts.release_unit_entries(document)["desktop"]["dependencies"]
+    dependencies = contracts.release_bundle_entries(document)["desktop"]["dependencies"]
     assert list(dependencies) == [
         "deliverables.packages.core",
         "deliverables.packages.claims",
     ]
-    assert [record["release-unit"] for record in dependencies.values()] == [
+    assert [record["release-bundle"] for record in dependencies.values()] == [
         "core",
         "claims",
     ]
@@ -2944,8 +2944,8 @@ def test_v5_reader_resolves_transitive_dependency_owners() -> None:
         ("hooks", "example-hook"),
     ],
 )
-def test_v5_release_members_support_non_python_artifacts(kind: str, name: str) -> None:
-    document = _v5_fixture()
+def test_bundle_release_members_support_non_python_artifacts(kind: str, name: str) -> None:
+    document = _bundle_contract()
     if kind == "hooks":
         document["deliverables"]["hooks"] = {
             name: {
@@ -2956,7 +2956,7 @@ def test_v5_release_members_support_non_python_artifacts(kind: str, name: str) -
                         "requires": {"capabilities": []},
                         "no-op": "Covered by repository validation.",
                     },
-                    "install": _v4_action({"run": ["install-hook"]}),
+                    "install": _run_action({"run": ["install-hook"]}),
                 },
             }
         }
@@ -2967,17 +2967,17 @@ def test_v5_release_members_support_non_python_artifacts(kind: str, name: str) -
         "output-directory": f"dist/{name}",
         "filename-pattern": f"{name}-*.zip",
     }
-    record["actions"]["build"] = _v4_action({"run": ["build-archive"]})
+    record["actions"]["build"] = _run_action({"run": ["build-archive"]})
     reference = f"deliverables.{kind}.{name}"
-    units = document["repository"]["release-units"]
+    units = document["repository"]["release-bundles"]
     if kind in {"skills", "hooks"}:
         units["extension"] = {"members": [reference]}
     assert contracts.validation_errors(document) == []
-    entries = contracts.release_unit_entries(document)
+    entries = contracts.release_bundle_entries(document)
     owner = next(unit for unit in entries.values() if reference in unit["members"])
     assert owner["members"][reference]["artifact"]["type"] == "zip"
     assert (
-        contracts.operation_category(f"{reference}.actions.build", version=5) == "build"
+        contracts.operation_category(f"{reference}.actions.build") == "build"
     )
 
 
@@ -3002,11 +3002,11 @@ def test_v5_release_members_support_non_python_artifacts(kind: str, name: str) -
         "wheel_without_distribution",
     ],
 )
-def test_v5_rejects_invalid_release_declarations(
+def test_bundle_rejects_invalid_release_declarations(
     problem: str, tmp_path: pathlib.Path
 ) -> None:
-    document = _v5_fixture()
-    units = document["repository"]["release-units"]
+    document = _bundle_contract()
+    units = document["repository"]["release-bundles"]
     mcp_server = document["deliverables"]["mcp-servers"]["insurance-claims-mcp-server"]
     core = document["deliverables"]["packages"]["core"]
     if problem == "empty_units":
@@ -3039,7 +3039,7 @@ def test_v5_rejects_invalid_release_declarations(
             "no-op": "No build.",
         }
     elif problem == "handoff_build":
-        mcp_server["actions"]["build"] = _v4_action(
+        mcp_server["actions"]["build"] = _run_action(
             {
                 "handoff": {
                     "lifecycle": "some-builder",
@@ -3060,17 +3060,17 @@ def test_v5_rejects_invalid_release_declarations(
         contracts.load_contract(path)
 
 
-def test_v5_rejects_unit_cycle_even_when_package_graph_is_acyclic() -> None:
-    document = _v5_fixture()
+def test_bundle_rejects_unit_cycle_even_when_package_graph_is_acyclic() -> None:
+    document = _bundle_contract()
     packages = document["deliverables"]["packages"]
     packages["left-leaf"] = deepcopy(packages["core"])
     packages["right-root"] = deepcopy(packages["core"])
     packages["right-root"]["prerequisites"] = ["left-leaf"]
-    units = document["repository"]["release-units"]
+    units = document["repository"]["release-bundles"]
     units["claims"]["members"].append("deliverables.packages.left-leaf")
     units["core"]["members"].append("deliverables.packages.right-root")
     errors = contracts.validation_errors(document)
-    assert any("release-unit dependency cycle" in error for error in errors)
+    assert any("release-bundle dependency cycle" in error for error in errors)
     assert not any("package prerequisite cycle" in error for error in errors)
 
 
@@ -3091,8 +3091,8 @@ def test_v5_rejects_unit_cycle_even_when_package_graph_is_acyclic() -> None:
         ("project", "invalid\nname"),
     ],
 )
-def test_v5_rejects_unsafe_paths(field: str, bad_path: str) -> None:
-    document = _v5_fixture()
+def test_bundle_rejects_unsafe_paths(field: str, bad_path: str) -> None:
+    document = _bundle_contract()
     mcp_server = document["deliverables"]["mcp-servers"]["insurance-claims-mcp-server"]
     if field in {"output-directory", "filename-pattern"}:
         mcp_server["artifact"][field] = bad_path
@@ -3103,34 +3103,34 @@ def test_v5_rejects_unsafe_paths(field: str, bad_path: str) -> None:
     assert contracts.validation_errors(document)
 
 
-def test_v5_does_not_change_v4_or_infer_units() -> None:
-    legacy = _v4_fixture()
+def test_bundle_reader_preserves_older_schema_constraints() -> None:
+    legacy = _typed_contract()
     before = deepcopy(legacy)
     assert contracts.validation_errors(legacy) == []
-    assert contracts.release_unit_entries(legacy) == {}
+    assert contracts.release_bundle_entries(legacy) == {}
     assert legacy == before
-    legacy["repository"]["release-units"] = {
+    legacy["repository"]["release-bundles"] = {
         "claims": {"members": ["deliverables.packages.claims"]}
     }
     assert contracts.validation_errors(legacy)
     mcp_server = before["deliverables"]["mcp-servers"]["insurance-claims-mcp-server"]
-    mcp_server["artifact"] = _v5_fixture()["deliverables"]["mcp-servers"]["insurance-claims-mcp-server"][
+    mcp_server["artifact"] = _bundle_contract()["deliverables"]["mcp-servers"]["insurance-claims-mcp-server"][
         "artifact"
     ]
-    mcp_server["actions"]["build"] = _v4_action(
+    mcp_server["actions"]["build"] = _run_action(
         {"run": ["build-mcp-server"]}
     )
     assert contracts.validation_errors(before)
-    document = _v5_fixture()
-    del document["repository"]["release-units"]
+    document = _bundle_contract()
+    del document["repository"]["release-bundles"]
     assert contracts.validation_errors(document) == []
-    assert contracts.release_unit_entries(document) == {}
+    assert contracts.release_bundle_entries(document) == {}
 
 
-def test_v5_duplicate_yaml_unit_names_are_rejected(tmp_path: pathlib.Path) -> None:
+def test_bundle_duplicate_yaml_unit_names_are_rejected(tmp_path: pathlib.Path) -> None:
     path = tmp_path / "sdlc.yml"
     path.write_text(
-        "version: 5\nrepository:\n  release-units:\n"
+        "version: 5\nrepository:\n  release-bundles:\n"
         "    duplicate: {}\n    duplicate: {}\n",
         encoding="utf-8",
     )
@@ -3138,10 +3138,10 @@ def test_v5_duplicate_yaml_unit_names_are_rejected(tmp_path: pathlib.Path) -> No
         contracts.load_contract(path)
 
 
-def test_v5_prepare_and_gates_keep_typed_deliverable_selection(
+def test_bundle_prepare_and_gates_keep_typed_deliverable_selection(
     tmp_path: pathlib.Path,
 ) -> None:
-    document = _v5_fixture()
+    document = _bundle_contract()
     mcp_servers = document["deliverables"]["mcp-servers"]
     mcp_servers["other-mcp-server"] = deepcopy(
         mcp_servers["insurance-claims-mcp-server"]
@@ -3149,11 +3149,11 @@ def test_v5_prepare_and_gates_keep_typed_deliverable_selection(
     mcp_servers["other-mcp-server"]["actions"]["install"]["steps"][0]["handoff"]["inputs"][
         "mcp-server"
     ] = "other-mcp-server"
-    mcp_servers["other-mcp-server"]["actions"]["test"] = _v4_action(
+    mcp_servers["other-mcp-server"]["actions"]["test"] = _run_action(
         {"run": ["other-tests"]}
     )
     selected_mcp_server = mcp_servers["insurance-claims-mcp-server"]
-    selected_mcp_server["actions"]["test"] = _v4_action(
+    selected_mcp_server["actions"]["test"] = _run_action(
         {"run": ["selected-tests"]}
     )
     (tmp_path / "sdlc").mkdir()

@@ -146,7 +146,7 @@ analysis-only child models.
 The `skills/` tree is authoritative skill source for this repository.
 `sdlc/sdlc.yml` declares repository setup and validation, plus capabilities
 of each deliverable. Lifecycle actions decide when those capabilities run.
-Executable capabilities in SDLC v4/v5 declare version requirements only through
+Executable capabilities in SDLC declare version requirements only through
 `version-from`: `file` names repository-relative native metadata, and `key`
 names its dotted field when the file is a structured manifest. A single-value
 file needs no key. Here Python references `scripts/pyproject.toml` at
@@ -324,7 +324,7 @@ Operations are identified by their YAML location, such as
 There are no extra IDs, defaults or full flows in the contract. Prerequisites
 are setup metadata; declaring them does not install dependencies. Bootstrap
 operations perform declared setup, and uv prepares the environment for commands
-invoked through it. SDLC v4/v5 handoffs name a skill/action. For skill callers,
+invoked through it. SDLC handoffs name a skill/action. For skill callers,
 the engine resolves the installed skill's `references/action-executors.json` and
 runs its declared argv or ordered steps through `execute_skill_actions.py`.
 Each action declares `run`, ordered `steps`, or an explicit Python `call`.
@@ -345,7 +345,7 @@ receipt-only installation is planned in refactor step 19, not implemented here.
 CI uses `--ci`, never dispatches skills, and reports deferred handoffs
 separately. SDLC versions 1 through 3 are rejected and must be upgraded before
 lifecycle execution.
-An SDLC v4/v5 `build` may declare `result-commit-field: resultCommit` when its
+An SDLC `build` may declare `result-commit-field: resultCommit` when its
 final command commits native build records. Its complete JSON stdout must have
 a nonempty `schema`, status `OK` or `passed`, and that field naming the exact
 clean final Git HEAD descended from the prepared commit. The operation keeps
@@ -362,37 +362,49 @@ validation at `deliverables.skills.<name>.actions.validate` hands off to
 validator. The corresponding `actions.install` handoff runs the transactional
 installer. The compatible-repository producer adds these actions only for
 source skills in v4 contracts;
-the generic template declares repository validation and an explicit test no-op.
-SDLC v4 also supports separate packages, apps, MCP servers, skills, and hooks.
+the generic template declares repository setup, checks and an explicit test no-op.
+SDLC supports separate packages, apps, MCP servers, skills, and hooks.
 Its schema lives at
 `skills/ceratops-repo-lifecycle/references/schemas/sdlc.v4.schema.json`;
 `scripts/repository_operation.py` resolves action locations and returns package
-prerequisites through `--prepare-only`. Registered v4 skill validation and
+prerequisites through `--prepare-only`. Registered skill validation and
 deployment handoffs pass the exact selected skill to the lifecycle CLI, retain
 completion receipts, and stop on source changes or unsupported inputs. CI still
 defers every handoff; package prerequisites never imply an automatic build.
 MCP servers built directly from source may declare no package prerequisite.
-The compatibility producer and this repository's live declaration use v4.
-Existing v1-v3 repositories are not automatically migrated.
+This repository keeps its existing SDLC declaration version. Configuration
+updates do not convert unsupported formats.
 
-The v4/v5 release-declaration owners are
-`skills/ceratops-repo-lifecycle/references/schemas/sdlc.v5.schema.json` and
-`skills/ceratops-repo-lifecycle/scripts/ceratops_repo_compatibility_engine/sdlc_contract_validation.py`.
-SDLC v5 adds optional `repository.release-units`. Each unit declares a nonempty
-`members` list of full deliverable references, such as
-`deliverables.apps.desktop`. Members can be any supported deliverable kind;
-each member has a build action and artifact metadata and belongs to at most one
-unit. Package prerequisites remain dependencies rather than members. Every
-package dependency has one declared release-unit owner or belongs to the
-consuming unit; ambiguous ownership and dependency cycles are rejected.
+A release bundle groups deliverables released together. A deliverable is one
+package, application, skill, MCP server or hook; its artifacts are the built files.
+The schema declares groups under `repository.release-bundles`, each with a
+nonempty `members` list of full references such as `deliverables.apps.desktop`.
+Each member has a build action and artifact metadata and belongs to at most one
+bundle. Package prerequisites remain dependencies. Each dependency belongs to
+the consuming bundle or to another declared bundle; ambiguous ownership and
+dependency cycles are reported before any action runs.
 
-The loader exposes `release_unit_entries(contract)`: member metadata and action
-locations plus external package dependencies with their owning release units.
-Loading and reading this metadata execute no commands. Existing action
-preparation and validation/test gates understand v5, while compatibility
-generation and this repository's live declaration remain v4. Automatic
-release-unit Build, Promote, Ship, and Deploy are not connected yet; exact
-artifact-output declarations and their consumers remain step 3 work.
+`sdlc_contract_validation.py::release_bundle_entries()` returns member metadata,
+action locations and external package dependencies with their bundle names.
+`_release_bundle_errors()` checks this declaration without running commands.
+Build APIs accept `release_bundle`; the receipt inspection command is
+`verify-release-bundle-build --release-bundle NAME`. The former public group
+name is no longer accepted as an SDLC field, Python parameter or CLI option.
+
+The installed skill's `references/schemas/sdlc.*.schema.json` files define its
+supported format numbers. One set of readers and action checks handles those
+formats, without numbered Python functions or version-number branches. A newer
+repository format reports its number and the newest installed schema before any
+action runs. An older format works when its schema is installed and its fields
+meet that schema and the shared checks. New configuration uses the newest
+installed schema; updates preserve an existing supported version. There is one
+SDLC template and no separate generation-version setting.
+
+Existing immutable build receipts retain their schema IDs and serialized
+`releaseUnit` field, which names the release bundle in those saved formats.
+Readers and writers keep that format without rewriting accepted results,
+changing tags or retesting artifacts. The saved field is not an alternate SDLC
+configuration name.
 
 Existing bundle receipts continue to use `ceratops-build-result.v2` in
 `operation-result.v1.schema.json`. The repository-owned `sdlc_results.py`
@@ -466,12 +478,12 @@ bounded artifact-store lifetime. The internal route creates no temporary log;
 future callers that create one must own and remove it. The readers create,
 rotate and clean up nothing.
 
-Call `sdlc_results.py verify-release-unit-build` with `--receipt`,
+Call `sdlc_results.py verify-release-bundle-build` with `--receipt`,
 `--bundle-root`, and the expected `--repository`, `--source-commit`,
-`--release-unit`, `--channel`, `--version`, and `--target`. Success prints
+`--release-bundle`, `--channel`, `--version`, and `--target`. Success prints
 `RECEIPT_VERIFIED`;
 invalid input or a mismatch returns a nonzero exit code. The Python function
-`verify_release_unit_build` returns the checked receipt with its recorded
+`verify_release_bundle_build` returns the checked receipt with its recorded
 build and test statuses unchanged. Neither interface writes bundle files.
 
 The internal v2 lifecycle now separates production from consumption.
@@ -544,7 +556,7 @@ still in use. It does not scan other worktrees, destinations or units.
 - Original `artifacts/<unit>/<version>/[<target>/]`: the named worktree's latest
   approved build, including alpha. Other worktrees have separate selections.
 
-A bundle uses its release-unit directory instead of separate member directories.
+A bundle uses its release-bundle directory instead of separate member directories.
 Slot overlaps keep one copy. Original receipt bytes, commit, check versions and
 result identities remain unchanged; readers return the retained package paths.
 Copying goes directly to the final directory and finishes before prior copies
@@ -569,7 +581,7 @@ old-path scan or compatibility wrapper is added.
 
 The implemented foundation has six separate responsibilities:
 
-- **1a — declarations:** SDLC v5 describes release-unit members and their
+- **1a — declarations:** SDLC v5 describes release-bundle members and their
   dependencies; loading it validates metadata without building anything.
 - **1b — verification:** the v2 verifier establishes which files and bytes its
   bundle record identifies. The new committed-build and artifact-receipt
@@ -875,7 +887,7 @@ serialize commands.
 
 | Area | Current status | Next boundary |
 | --- | --- | --- |
-| 1a release declarations | Implemented | Keep current v4/v5 readers; connect exact-output producers later |
+| 1a release declarations | Implemented | Keep shared SDLC readers; connect exact-output producers later |
 | 1b receipt verification | Implemented v2 verifier plus internal v3/v1 receipt definitions and saved-chain reader | Connect public lifecycle callers in later steps |
 | 1c correction continuity | Implemented and preservation-verified; finalization consumes recorded success without rechecking the checkout | Reports and matching-success cleanup connected in 3B/4B |
 | 1d/4D/4E build/test/store | Implemented v2 transaction and internal directory-first production with version-local requests, exact B-to-C receipts and immutable tags | Public Build and receipt-driven Promote remain in 16/22 |
@@ -907,7 +919,7 @@ The approved changes below are **planned**, not new behavior of today's commands
   level: alpha can reuse alpha/beta/rc/final; beta can reuse beta/rc/final; rc can
   reuse rc/final; final can reuse only final. Receipts, exact inputs and compatible
   execution context are required; a tag alone proves no test ran.
-- Ship compares each release unit with its last published final version, or its
+- Ship compares each release bundle with its last published final version, or its
   last accepted final CI version when publication is not configured. A changed
   unit initially runs its full final suite; corrections retain applicable passes.
   Unchanged final units retain their versions and do no build/test work. The
@@ -954,7 +966,7 @@ policy. These are the runtime paths used by the foundation and update workflow:
 | Runtime path | Class and owner | Rewrite, retention, or cleanup trigger |
 | --- | --- | --- |
 | `<automation-dir>/dependabot-repository-{preflight,finalize}.json` and the selected output's `.<name>.failed.tmp` | One current report per phase and its temporary failure write; the lifecycle skill's dependency queue entrypoint | `--automation-dir` reads the caller-owned repository scopes and binds the independent snapshot/sync adapters. Preflight retires the preceding final report; each phase retires its selected report and partial before execution. Missing results or operational failures produce dated unavailable-state reports. Atomic failure writing and the next ordinary call remove only that report's partial. Explicit output overrides retain unrelated reports. |
-| `<shared-git-directory>/ceratops/builds/<build-key>/`, including receipt, artifacts and supporting files | Persistent immutable output; `store_artifacts.py` publishes and reads on behalf of `repository_operation` | Grouped by repository, release unit, channel and target. At production startup and after publication, keep the newest completed bundle plus two predecessors by completion time and key; remove older directories without modifying retained bundles. Reading performs no retention or cleanup mutation. |
+| `<shared-git-directory>/ceratops/builds/<build-key>/`, including receipt, artifacts and supporting files | Persistent immutable output; `store_artifacts.py` publishes and reads on behalf of `repository_operation` | Grouped by repository, release bundle, channel and target. At production startup and after publication, keep the newest completed bundle plus two predecessors by completion time and key; remove older directories without modifying retained bundles. Reading performs no retention or cleanup mutation. |
 | `builds/`, `.staging/`, `.locks/`, `.diagnostics/` and `.locks/store.lock` | Persistent bounded infrastructure for the current v2 route; `store_artifacts.py` and `filelock` | One repository lock serializes that route's complete build/test/store transaction and cleanup ownership. The file remains reusable; the OS releases the held lock on normal exit or process death. No per-build lock history accumulates. |
 | `.staging/<build-key>/work/` and `bundle/` | Temporary private work for the current v2 route; `store_artifacts.py` | Removed on success or failure. At every v2 transaction startup, while holding the repository lock, remove every recognizable staging directory left by an earlier instance. Preserve unrecognized entries and report cleanup failure. |
 | `.diagnostics/<release-group-key>.json` and its `.tmp` write file | Persistent latest-failure report and temporary write for the current v2 route; `store_artifacts.py` | Atomically overwrite the group's report on failure and remove it after successful new publication. At v2 production startup remove interrupted `.tmp` writes. The completed-build reader does not rewrite diagnostics. Reports contain bounded excerpts and are never artifact-test evidence. |
@@ -1187,7 +1199,7 @@ Each repository owns one lifecycle contract:
   ordered steps, and exposes declared package prerequisites without executing
   their build or installation actions. MCP server installation can also run a
   repository-owned script directly. An MCP server may declare one package prerequisite
-  or none. Version 5 adds release-unit declarations. The shared loader supports
+  or none. Version 5 adds release-bundle declarations. The shared loader supports
   only v4 and v5; v1 through v3 require an explicit repository-owned upgrade.
 - Operation `status: completed` records command completion. A successful step
   whose entire stdout is a JSON object with nonempty string `schema` and
@@ -1312,7 +1324,7 @@ classify before closure. Repo-health summary JSON includes compact stale-state
 inventory counts and samples for PRs, branches, tags, releases, and local path
 references when present. It also reports the observed community-profile health
 percentage and its 100% contract target; inventory alone is not a finding.
-Local health validates each present `sdlc/sdlc.yml` against the v4 or v5 schema
+Local health validates each present `sdlc/sdlc.yml` against its installed schema
 and checks generic repository compatibility. It rejects v1 through v3 instead
 of proposing an in-place migration. Ship validates selected publication
 operations before remote mutation. Local health records structural
@@ -1578,7 +1590,7 @@ first, failed prerequisites block their dependents, and joint tests wait for all
 their selected files. The executor supplies `--check-group` and `--artifacts`
 JSON to test commands and `CERATOPS_TEST_ARTIFACTS` to their children. File paths
 and byte hashes become reuse inputs; no installed version is selected implicitly.
-SDLC v4/v5 build actions can require a v1, v2 or v3 result. Build receipts
+SDLC build actions can require a v1, v2 or v3 result. Build receipts
 supply every produced file: v1 paths are repository-relative,
 v2 paths belong to their recorded shared build bundle, and v3 paths belong to
 their allocated version/target directory. Missing or changed files block only

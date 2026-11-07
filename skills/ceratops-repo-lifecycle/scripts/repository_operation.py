@@ -170,7 +170,7 @@ def build_bundle(
     One repository lock protects publication, bounded retention and startup
     recovery. Each identity has private staging, removed on exit; the next caller
     removes recognizable staging left by any killed transaction. Completed
-    bundles are grouped by repository, release unit, channel and target, retaining
+    bundles are grouped by repository, release bundle, channel and target, retaining
     the newest three by completion time. One helper-owned diagnostic per group is
     atomically overwritten on failure and removed after a successful new publication.
     Diagnostic excerpts are never test evidence.
@@ -261,7 +261,7 @@ def build_bundle(
 
 
 def allocate_versioned_build(
-    repo_root: pathlib.Path, *, repository: str, release_unit: str, version: str,
+    repo_root: pathlib.Path, *, repository: str, release_bundle: str, version: str,
     required_targets: Sequence[str], attempt_id: str | None = None,
     declared_input_paths: Sequence[str] = (),
 ) -> store_artifacts.ArtifactVersionAllocation:
@@ -271,7 +271,7 @@ def allocate_versioned_build(
     bind_versioned_build_inputs before building. Public adoption is in 16/22.
     """
     return store_artifacts.allocate_artifact_version(
-        repo_root, repository=repository, release_unit=release_unit, version=version,
+        repo_root, repository=repository, release_bundle=release_bundle, version=version,
         required_targets=required_targets, attempt_id=attempt_id,
         declared_input_paths=declared_input_paths,
     )
@@ -285,12 +285,12 @@ def bind_versioned_build_inputs(
 
 
 def read_versioned_build(
-    repo_root: pathlib.Path, *, repository: str, release_unit: str, version: str,
+    repo_root: pathlib.Path, *, repository: str, release_bundle: str, version: str,
     required_targets: Sequence[str],
 ) -> ArtifactVersionTransaction:
     """Read a request or completed receipts for completion-only work; never allocate."""
     return complete_artifact_builds.read_artifact_build(
-        repo_root, repository=repository, release_unit=release_unit,
+        repo_root, repository=repository, release_bundle=release_bundle,
         version=version, required_targets=required_targets,
     )
 
@@ -332,11 +332,11 @@ def complete_versioned_build(
 
 
 
-def operation_category(operation: str, *, version: int = 4) -> str:
+def operation_category(operation: str) -> str:
     """Validate a complete versioned YAML location and return its category."""
 
     try:
-        return contract_operation_category(operation, version=version)
+        return contract_operation_category(operation)
     except SdlcContractError as exc:
         raise OperationError(str(exc)) from exc
 
@@ -506,7 +506,7 @@ def prepare_operations(
     commit = repository_commit(root)
     prepared: list[PreparedOperation] = []
     for request in requests:
-        category = operation_category(request.operation, version=contract["version"])
+        category = operation_category(request.operation)
         selected = entries.get(request.operation)
         if selected is None:
             if not request.if_declared:
@@ -588,7 +588,7 @@ def validation_operations(
     contract = read_repository_contract(repo_root, contract_path)
     if explicit is not None:
         for operation in explicit:
-            if operation_category(operation, version=contract["version"]) not in {
+            if operation_category(operation) not in {
                 "validate",
                 "tests",
             }:
@@ -604,7 +604,7 @@ def validation_operations(
     automatic = [
         operation
         for operation in entries
-        if operation_category(operation, version=contract["version"])
+        if operation_category(operation)
         in {"validate", "tests"}
         and (
             operation.startswith("repository.")
@@ -1161,7 +1161,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--validation-operation",
         action="append",
-        help="Ordered validate/test locations; v4 and v5 retain every applicable gate.",
+        help="Ordered check locations; retain every applicable gate.",
     )
     parser.add_argument(
         "--validate",
@@ -1215,7 +1215,7 @@ def main(argv: list[str] | None = None) -> int:
         artifacts = json.loads(args.artifacts) if args.artifacts else {}
         conditional = parse_parameters(args.parameter_if_declared)
         if not (args.validate or args.tests) and any(
-            operation_category(name, version=5) in MUTATION_CATEGORIES for name in args.operation
+            operation_category(name) in MUTATION_CATEGORIES for name in args.operation
         ):
             result = execute_release_builds(
                 root, [OperationRequest(name, parameters, conditional, args.if_declared)

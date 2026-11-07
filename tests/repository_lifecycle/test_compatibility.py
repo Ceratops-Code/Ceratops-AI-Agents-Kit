@@ -162,7 +162,7 @@ def _write_current_sdlc(
     *,
     deliverables: dict[str, object] | None = None,
 ) -> None:
-    """Replace the shared fixture with the current v4 template."""
+    """Replace the shared fixture with the current template."""
 
     document = yaml.safe_load(SDLC_CONTRACT_TEMPLATE.read_text(encoding="utf-8"))
     if deliverables is not None:
@@ -266,7 +266,7 @@ def test_compatibility_materializer_supplies_target_identity_and_assignments(
     contract = yaml.safe_load(
         (repo / "sdlc" / "sdlc.yml").read_text(encoding="utf-8")
     )
-    assert contract["version"] == 4
+    assert contract["version"] == yaml.safe_load(SDLC_CONTRACT_TEMPLATE.read_text(encoding="utf-8"))["version"]
     assert contract["kind"] == "ceratops-sdlc"
     alpha_actions = contract["deliverables"]["skills"]["alpha-tool"]["actions"]
     assert alpha_actions["validate"]["steps"][0]["handoff"] == {
@@ -472,7 +472,7 @@ def test_compatibility_materializer_supplies_target_identity_and_assignments(
     }
 
 
-def test_compatibility_materializer_preserves_existing_v5_contract(
+def test_compatibility_materializer_preserves_existing_bundle_contract(
     tmp_path: pathlib.Path,
 ) -> None:
     repo = tmp_path / "compatible-v5"
@@ -502,7 +502,7 @@ def test_compatibility_materializer_preserves_existing_v5_contract(
         "steps": [{"run": ["python", "-V"]}],
         "check-groups": {"build-check": {"phase": "during-build", "requires-artifacts": []}},
     }
-    contract["repository"]["release-units"] = {
+    contract["repository"]["release-bundles"] = {
         "skills": {"members": ["deliverables.skills.alpha-tool"]}
     }
     sdlc_path.write_text(
@@ -521,8 +521,8 @@ def test_compatibility_materializer_preserves_existing_v5_contract(
     assert result.returncode == 0, result.stdout + result.stderr
     updated = yaml.safe_load(sdlc_path.read_text(encoding="utf-8"))
     assert updated["version"] == 5
-    assert updated["repository"]["release-units"] == contract["repository"][
-        "release-units"
+    assert updated["repository"]["release-bundles"] == contract["repository"][
+        "release-bundles"
     ]
     updated_alpha = updated["deliverables"]["skills"]["alpha-tool"]
     assert updated_alpha["artifact"] == alpha["artifact"]
@@ -1316,3 +1316,137 @@ def test_repository_capability_requirements_point_to_native_metadata():
     assert set(node_reference) == {"file"}
     assert (ROOT / node_reference["file"]).read_text(encoding="utf-8").strip() == "lts/*"
     assert "version-from" not in capabilities["git"]
+
+
+
+@pytest.fixture
+def installed_sdlc_schemas(tmp_path, monkeypatch):
+    """Give the real reader an isolated installed-schema directory."""
+    reader = importlib.import_module(
+        "ceratops_repo_compatibility_engine.sdlc_contract_validation"
+    )
+    versions = dict(reader.sdlc_schema_paths())
+    directory = tmp_path / "installed-schemas"
+    directory.mkdir()
+    for source in versions.values():
+        shutil.copyfile(source, directory / source.name)
+    reader.sdlc_schema_paths.cache_clear()
+    monkeypatch.setattr(reader, "SCHEMA_DIRECTORY", directory)
+    try:
+        yield reader, directory, versions
+    finally:
+        reader.sdlc_schema_paths.cache_clear()
+
+
+def test_sdlc_schema_catalog_supports_new_metadata_without_new_code(installed_sdlc_schemas):
+    from tests.repository_lifecycle.test_sdlc_handoffs import _bundle_contract
+
+    reader, directory, versions = installed_sdlc_schemas
+    future_version = max(versions) + 11
+    schema = json.loads(versions[max(versions)].read_text(encoding="utf-8"))
+    schema["properties"]["version"]["const"] = future_version
+    (directory / "sdlc.future.schema.json").write_text(json.dumps(schema), encoding="utf-8")
+    document = _bundle_contract()
+    document["version"] = future_version
+    original = json.dumps(document, sort_keys=True)
+    for _ in range(2):
+        assert reader.latest_sdlc_version() == future_version
+        assert reader.validation_errors(document) == []
+        groups = reader.release_bundle_entries(document)
+        assert set(groups) == set(document["repository"]["release-bundles"])
+        for group in groups.values():
+            for member, metadata in group["members"].items():
+                assert reader.operation_category(member + ".actions.build") == "build"
+                assert metadata["artifact"]
+        assert json.dumps(document, sort_keys=True) == original
+    older = _capability_contract(min(versions), {"git": {"executable": "git"}})
+    assert reader.validation_errors(older) == []
+    assert reader.release_bundle_entries(older) == {}
+
+
+def test_new_configuration_uses_latest_installed_schema_and_keeps_existing_version(
+    installed_sdlc_schemas, tmp_path
+):
+    reader, directory, versions = installed_sdlc_schemas
+    materializer = importlib.import_module(
+        "ceratops_repo_compatibility_engine.apply_ceratops_compatibility"
+    )
+    newest = max(versions) + 7
+    schema = json.loads(versions[max(versions)].read_text(encoding="utf-8"))
+    schema["properties"]["version"]["const"] = newest
+    (directory / "sdlc.next.schema.json").write_text(json.dumps(schema), encoding="utf-8")
+    repo = tmp_path / "repository"
+    repo.mkdir()
+    for _ in range(2):
+        document = materializer.build_sdlc_contract_candidate(
+            repo, skill_names=[], apply_contract=True,
+        )
+        assert document["version"] == newest
+        assert reader.validation_errors(document) == []
+        assert not (repo / "sdlc/sdlc.yml").exists()
+    document["version"] = min(versions)
+    path = repo / "sdlc/sdlc.yml"
+    path.parent.mkdir()
+    path.write_text(yaml.safe_dump(document), encoding="utf-8")
+    original = path.read_bytes()
+    repeated = materializer.build_sdlc_contract_candidate(repo, skill_names=[], apply_contract=True)
+    assert repeated["version"] == min(versions)
+    assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize("problem", ["missing", "duplicate", "malformed"])
+def test_installed_sdlc_schema_problems_preserve_the_cause(installed_sdlc_schemas, problem):
+    reader, directory, versions = installed_sdlc_schemas
+    if problem == "missing":
+        for path in directory.iterdir():
+            path.unlink()
+        message = "contains no SDLC schemas"
+    elif problem == "duplicate":
+        source = versions[max(versions)]
+        shutil.copyfile(source, directory / "sdlc.duplicate.schema.json")
+        message = "duplicate SDLC schema version"
+    else:
+        (directory / "sdlc.broken.schema.json").write_text("{broken", encoding="utf-8")
+        message = "Cannot read installed SDLC schemas"
+    for _ in range(2):
+        with pytest.raises(reader.SdlcContractError, match=message):
+            reader.sdlc_schema_paths()
+
+
+def test_public_sdlc_runner_reports_newer_repository_before_running(tmp_path):
+    reader = importlib.import_module(
+        "ceratops_repo_compatibility_engine.sdlc_contract_validation"
+    )
+    latest = reader.latest_sdlc_version()
+    document = _capability_contract(latest + 1, {})
+    document["repository"]["actions"]["test"]["steps"] = [{"run": [
+        sys.executable, "-c", "from pathlib import Path; Path('ran').touch()",
+    ]}]
+    path = tmp_path / "sdlc/sdlc.yml"
+    path.parent.mkdir()
+    path.write_text(yaml.safe_dump(document), encoding="utf-8")
+    for _ in range(2):
+        result = run_operation_cli(tmp_path, "repository.actions.test")
+        assert result.returncode != 0
+        assert f"unsupported SDLC version: {latest + 1}" in result.stderr
+        assert f"latest installed version: {latest}" in result.stderr
+        assert "Update the installed repo-lifecycle skill" in result.stderr
+        assert not (tmp_path / "ran").exists()
+
+
+def test_release_bundle_declarations_have_one_public_name(tmp_path):
+    from tests.repository_lifecycle.test_sdlc_handoffs import _bundle_contract
+
+    reader = importlib.import_module(
+        "ceratops_repo_compatibility_engine.sdlc_contract_validation"
+    )
+    document = _bundle_contract()
+    assert reader.validation_errors(document) == []
+    path = tmp_path / "sdlc/sdlc.yml"
+    path.parent.mkdir()
+    path.write_text(yaml.safe_dump(document), encoding="utf-8")
+    prepared = run_operation_cli(tmp_path, "deliverables.packages.claims.actions.build", prepare_only=True)
+    assert prepared.returncode == 0, prepared.stdout + prepared.stderr
+    document["repository"]["release-units"] = document["repository"].pop("release-bundles")
+    errors = reader.validation_errors(document)
+    assert any("release-units" in error and "Additional properties" in error for error in errors)

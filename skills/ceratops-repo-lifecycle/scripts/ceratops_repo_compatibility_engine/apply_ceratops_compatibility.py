@@ -38,6 +38,7 @@ from .generate_test_script import (
     test_operation,
 )
 from .sdlc_contract_validation import (
+    latest_sdlc_version,
     load_contract,
     validation_errors,
 )
@@ -73,7 +74,7 @@ def serialized_sdlc_contract(
     path: pathlib.Path,
     contract: Mapping[str, object],
 ) -> tuple[str, str]:
-    """Render SDLC v4 while preserving an existing JSON or YAML representation."""
+    """Render SDLC while preserving an existing JSON or YAML representation."""
 
     newline = "\n"
     json_representation = False
@@ -198,8 +199,8 @@ def build_sdlc_contract_candidate(
 ) -> dict[str, object]:
     """Preserve target capabilities and apply the supported typed lifecycle.
 
-    The v4 template owns new contracts and repository validation; the target's
-    supported version owns existing version-specific data. The compatibility
+    The template supplies new configurations using the newest installed schema.
+    Existing supported declarations keep their version and data. The compatibility
     contract owns named skill action routing. Existing actions retain their
     definitions, including target-native version-from references. New executable
     capabilities remain unversioned unless the target declares a requirement;
@@ -213,9 +214,12 @@ def build_sdlc_contract_candidate(
         raise RuntimeError("SDLC is required for current Ceratops compatibility")
     reusable = load_contract(template_path("sdlc"))
     target = repo_root / surface_path("sdlc")
-    contract = load_contract(target) if target.is_file() else dict(reusable)
+    contract = (
+        load_contract(target) if target.is_file()
+        else {**reusable, "version": latest_sdlc_version()}
+    )
     # The versioned loader is the supported-format authority. Preserve its
-    # accepted version so compatibility application cannot downgrade v5 data.
+    # accepted version so an ordinary update cannot downgrade or rewrite its data.
     candidate = dict(contract)
     repository = dict(candidate.get("repository", {}))
     capabilities = dict(repository.get("capabilities", {}))

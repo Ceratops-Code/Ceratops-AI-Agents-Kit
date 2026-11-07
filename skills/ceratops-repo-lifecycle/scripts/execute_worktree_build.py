@@ -47,8 +47,8 @@ def _commit_source(allocation: store_artifacts.ArtifactVersionAllocation, paths:
             _require_command(changed, root=root)
         if changed.returncode == 1:
             _require_command(_git(root, 'commit', '--only', '--no-gpg-sign', '-m',
-                                  f'Prepare {allocation.release_unit} {allocation.version}\n\n'
-                                  f'Ceratops-Source-Build: {allocation.release_unit}/{allocation.version} {allocation.attempt_id}',
+                                  f'Prepare {allocation.release_bundle} {allocation.version}\n\n'
+                                  f'Ceratops-Source-Build: {allocation.release_bundle}/{allocation.version} {allocation.attempt_id}',
                                   '--', *paths), root=root)
     head = _git(root, 'rev-parse', 'HEAD')
     _require_command(head, root=root)
@@ -87,12 +87,12 @@ def _finish(transaction, prepared=None, *, diagnostic_output=None) -> dict[str, 
         try:
             selected = sdlc_results.read_artifact_receipt_chain(
                 transaction.repo_root, tag=completed.tag, expected={
-                    'repository': transaction.repository, 'releaseUnit': transaction.release_unit,
+                    'repository': transaction.repository, 'releaseUnit': transaction.release_bundle,
                     'version': transaction.version, 'target': target,
                 },
             )
             retained = store_artifacts.retain_completed_artifacts(
-                transaction.repo_root, unit=transaction.release_unit, target=target,
+                transaction.repo_root, unit=transaction.release_bundle, target=target,
                 pool='worktree', worktree=registration,
                 approved=retain_artifact_versions.RetentionVersion(selected),
             )
@@ -103,13 +103,13 @@ def _finish(transaction, prepared=None, *, diagnostic_output=None) -> dict[str, 
         result['maintenance_errors'] = maintenance
     operations.remove_resolved_failures(
         result, diagnostic_output=diagnostic_output, repo_root=transaction.repo_root,
-        action='build', resolved_failures=(f'worktree-build:{transaction.release_unit}',),
+        action='build', resolved_failures=(f'worktree-build:{transaction.release_bundle}',),
     )
     return result
 
 
 def execute_worktree_build(
-    repo_root: pathlib.Path, *, repository: str, release_unit: str, version: str,
+    repo_root: pathlib.Path, *, repository: str, release_bundle: str, version: str,
     required_targets: Sequence[str], attempt_id: str,
     source_paths: Sequence[str], requests: Mapping[str, Sequence[Any]],
     describe_receipt: ReceiptDescription,
@@ -144,8 +144,8 @@ def execute_worktree_build(
         operations.read_repository_contract(root, contract_path)
         if set(requests) != set(required_targets) or not required_targets:
             raise store_artifacts.OperationError('Build requests must name every required target exactly once.')
-        if not store_artifacts.RELEASE_UNIT_RE.fullmatch(release_unit) or not store_artifacts.FULL_VERSION_RE.fullmatch(version):
-            raise store_artifacts.OperationError('Build requires a valid release unit and full version.')
+        if not store_artifacts.RELEASE_BUNDLE_RE.fullmatch(release_bundle) or not store_artifacts.FULL_VERSION_RE.fullmatch(version):
+            raise store_artifacts.OperationError('Build requires a valid release bundle and full version.')
         paths = tuple(dict.fromkeys(source_paths))
         for name in paths:
             selected = root / name
@@ -153,10 +153,10 @@ def execute_worktree_build(
                     or '..' in pathlib.PurePosixPath(name).parts
                     or not selected.resolve().is_relative_to(root)):
                 raise store_artifacts.OperationError(f'Build source path must be repository-relative: {name}')
-        tag = _git(root, 'show-ref', '--verify', '--quiet', f'refs/tags/{release_unit}/{version}')
+        tag = _git(root, 'show-ref', '--verify', '--quiet', f'refs/tags/{release_bundle}/{version}')
         if tag.returncode == 0:
             transaction = operations.read_versioned_build(
-                root, repository=repository, release_unit=release_unit, version=version,
+                root, repository=repository, release_bundle=release_bundle, version=version,
                 required_targets=required_targets,
             )
             if store_artifacts._inputs_match_commit(root, transaction.pre_test_commit, paths):
@@ -165,7 +165,7 @@ def execute_worktree_build(
         if tag.returncode != 1:
             _require_command(tag, root=root)
         allocation = operations.allocate_versioned_build(
-            root, repository=repository, release_unit=release_unit, version=version,
+            root, repository=repository, release_bundle=release_bundle, version=version,
             required_targets=required_targets, attempt_id=attempt_id, declared_input_paths=paths,
         )
         if isinstance(allocation, store_artifacts.ArtifactVersionTransaction):
@@ -208,7 +208,7 @@ def execute_worktree_build(
             receipt.update(preTestCommit=transaction.pre_test_commit,
                            receiptPath=transaction.receipt_path(target),
                            requiredTargets=list(transaction.required_targets))
-            receipt['identity'] = {'repository': transaction.repository, 'releaseUnit': transaction.release_unit,
+            receipt['identity'] = {'repository': transaction.repository, 'releaseUnit': transaction.release_bundle,
                                    'version': transaction.version, 'target': target, 'attemptId': transaction.attempt_id}
             operations.prepare_versioned_receipt(
                 transaction, target, receipt, check_summaries=_summaries(batch),
@@ -220,12 +220,12 @@ def execute_worktree_build(
         return completed
     except (OSError, ValueError, store_artifacts.OperationError, sdlc_results.StepResultError,
             operations.OperationError) as exc:
-        failure = {'status': 'operation_failed', 'operation': 'worktree-build', 'target': release_unit,
+        failure = {'status': 'operation_failed', 'operation': 'worktree-build', 'target': release_bundle,
                    'version': transaction.version if transaction is not None else version,
                    'message': str(exc), 'results': results}
         if hasattr(exc, 'command_failure'):
             failure['command_failure'] = exc.command_failure
         return operations.report_failure(
             failure, diagnostic_output=diagnostic_output, repo_root=root, action='build',
-            failure_id=f'worktree-build:{release_unit}', successful_results=results, output_root=root,
+            failure_id=f'worktree-build:{release_bundle}', successful_results=results, output_root=root,
         )
