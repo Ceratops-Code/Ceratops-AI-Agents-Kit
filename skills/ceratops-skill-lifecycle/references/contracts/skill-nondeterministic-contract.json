@@ -44,10 +44,11 @@
     {
       "id": "ND.skill.trigger-fit",
       "applies_when": "Every skill source or metadata review.",
-      "review_required": "Confirm the frontmatter description states what the skill does and when it should trigger; interface metadata and the default prompt target the same task class without overtriggering; and any declared tool dependencies match the workflow without overdeclaring integrations.",
+      "review_required": "Confirm the frontmatter description states what the skill does and when it should trigger; interface metadata and the default prompt target the same task class without overtriggering; and any declared tool dependencies match the workflow without overdeclaring integrations. For a new or changed trigger, record the expected and observed selection for representative in-scope and near-miss prompts through the intended host's normal selection path. Respect the skill's invocation policy. Reuse the latest recorded outcome when the trigger inputs, host selection context, and expected selection match. Otherwise run only the smallest safe, authorized check. Fail on an observed mismatch and report a blocker when required selection evidence is unavailable.",
       "evidence_keys": [
         "skill.SKILL.md",
-        "skill.agents.openai.yaml"
+        "skill.agents.openai.yaml",
+        "skill.trigger_execution_results"
       ]
     },
     {
