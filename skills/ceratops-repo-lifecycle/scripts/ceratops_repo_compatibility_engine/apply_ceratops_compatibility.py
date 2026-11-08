@@ -44,6 +44,7 @@ from .sdlc_contract_validation import (
 )
 from .validate_ceratops_compatibility import (
     action_assignment_errors,
+    qualify_generated_runner_scratch,
     validate_ceratops_compatibility,
 )
 from .validation_environment import (
@@ -847,6 +848,16 @@ def main(argv: list[str] | None = None) -> int:
         for target in mutable_paths:
             if target.is_symlink() or not target.resolve().is_relative_to(repo_root):
                 raise RuntimeError(f"unsafe compatibility destination: {target}")
+        test_runner = repo_root / surface_path("python_test_runner")
+        runner_content = plan.runtime_files.get(test_runner)
+        if runner_content is not None and (
+            not test_runner.is_file() or test_runner.read_text(encoding="utf-8") != runner_content
+        ):
+            phase = "test_runner_scratch_qualification"
+            with tempfile.TemporaryDirectory(prefix="ceratops-test-results-") as probe:
+                qualify_generated_runner_scratch(
+                    runner_content, pathlib.Path(probe), load_compatibility_contract(),
+                )
         phase = "compatibility_application"
         mutation_started = True
         apply_compatibility_plan(repo_root, plan)
@@ -871,16 +882,16 @@ def main(argv: list[str] | None = None) -> int:
             raise RuntimeError("validator environment must not be a directory link")
         setup_runtime(repo_root, runtime)
         phase = "compatibility_validation"
-        test_runner = repo_root / surface_path("python_test_runner")
         if test_runner in plan.runtime_files:
-            # Check only the generated script's result protocol, never its tests.
-            # This caller owns the probe directory; both scopes remove scratch.
+            # Scratch qualification happened before writes. The installed
+            # environment can now exercise the separate result protocol.
             with tempfile.TemporaryDirectory(prefix="ceratops-test-results-") as probe:
                 compatibility = validate_ceratops_compatibility(
                     repo_root, result_directory=pathlib.Path(probe),
                     runner_command=test_operation(
                         repo_root, surface_path("python_test_runner").as_posix(),
                     )["steps"][0]["run"],
+                    qualify_scratch=False,
                 )
         else:
             compatibility = validate_ceratops_compatibility(repo_root)

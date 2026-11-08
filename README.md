@@ -1567,6 +1567,19 @@ absence of leftover siblings. It does not run repository tests or prove that a
 custom implementation never briefly created an internal file. Structural-only
 compatibility success is not proof that results are reusable.
 
+Compatibility probes scratch recovery before writing a new or changed managed
+Python runner to the target. A synthetic worker keeps its scratch after the
+launcher is killed. A fresh invocation reclaims that scratch after the worker
+exits and preserves the caller's other files.
+
+The kit's test runner owns scratch under `.aa` in the selected pytest temp
+parent. The standard generated runner owns `.repo-tests` in the system temp
+parent. Outside Windows these namespaces include the user ID. Each namespace
+keeps one registry lock and one lease for each run with remaining scratch.
+The runner reclaims its idle leases at startup and retires its own scratch on
+exit. A still-running child holds its lease independently. Removal failures
+report the affected path and cause, and a later invocation can finish cleanup.
+
 Result paths stay outside disposable operation checkpoints. 1e.3 defines this
 runner protocol; implemented plan 6A connects production selection, ownership
 and bounded retention under

@@ -99,7 +99,9 @@ def run_text(
         context = (
             pytest_environment.isolated_environment(cwd) if is_pytest else nullcontext(None)
         )
-        with context as environ:
+        with context as environ, (
+            environ.scratch.child_options() if environ is not None else nullcontext({})
+        ) as process_options:
             if environ is not None:
                 # Fixture runners own their identities; neither promotion nor
                 # durable-check inputs from this invocation belong to them.
@@ -112,11 +114,12 @@ def run_text(
                 environ.update(result_environment(command, cwd, os.environ))
                 if request := CHECK_REQUEST_INPUTS.get():
                     environ["CERATOPS_TEST_ARTIFACTS"] = json.dumps(request.get("artifacts", {}))
-                result = pytest_progress.run_pytest(command, cwd, environ)
+                result = pytest_progress.run_pytest(command, cwd, environ, **process_options)
             else:
                 result = subprocess.run(
                     list(command), cwd=cwd, env=environ, capture_output=True,
                     text=True, encoding="utf-8", errors="replace", check=False,
+                    **process_options,
                 )
     except (OSError, pytest_environment.PytestEnvironmentError) as exc:
         if not is_pytest:

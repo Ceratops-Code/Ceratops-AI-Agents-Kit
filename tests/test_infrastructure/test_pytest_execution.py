@@ -10,6 +10,7 @@ import stat
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
@@ -30,7 +31,7 @@ def test_runner_does_not_leak_promotion_context_into_pytest(
     monkeypatch.setenv("CERATOPS_SDLC_TEST_CONTEXT", value)
     environments = []
 
-    def child(command, cwd, environ):
+    def child(command, cwd, environ, **_process_options):
         environments.append(environ)
         return subprocess.CompletedProcess(command, 0, "", "")
 
@@ -55,7 +56,7 @@ def test_pytest_environment_isolates_peers_and_nested_runs_and_cleans_up(
         tmp_path, environ=caller, windows=False
     ) as first:
         root = pathlib.Path(first["TMP"])
-        assert root.parent == tmp_path
+        assert root.parent.parent == tmp_path
         assert all(
             first[key] == str(root)
             for key in ("TEMP", "TMPDIR", "PYTEST_DEBUG_TEMPROOT")
@@ -67,7 +68,7 @@ def test_pytest_environment_isolates_peers_and_nested_runs_and_cleans_up(
             tmp_path, environ=caller, windows=False
         ) as peer:
             peer_root = pathlib.Path(peer["TMP"])
-            assert peer_root != root and peer_root.parent == tmp_path
+            assert peer_root != root and peer_root.parent == root.parent
         assert not peer_root.exists() and root.is_dir()
         with (
             pytest.raises(RuntimeError, match="interrupted work"),
@@ -76,12 +77,126 @@ def test_pytest_environment_isolates_peers_and_nested_runs_and_cleans_up(
             ) as nested,
         ):
             nested_root = pathlib.Path(nested["TMP"])
-            assert nested_root.parent == root
+            assert nested_root != root and nested_root.parent == root.parent
             raise RuntimeError("interrupted work")
         assert not nested_root.exists() and root.is_dir()
     assert not root.exists()
-    assert list(tmp_path.iterdir()) == [sentinel]
+    assert set(tmp_path.iterdir()) == {sentinel, root.parent}
+    assert [path.name for path in root.parent.iterdir()] == [".registry"]
     assert caller == before and dict(os.environ) == process_before
+
+
+def test_test_runner_reclaims_abandoned_scratch_after_its_worker_exits(
+    test_runner_module: Any, tmp_path: pathlib.Path,
+) -> None:
+    parent = tmp_path / "scratch"
+    parent.mkdir()
+    ready = tmp_path / "ready"
+    release = tmp_path / "release"
+    probe = tmp_path / "test_scratch_probe.py"
+    probe.write_text(
+        "import os, pathlib, time\n"
+        "def test_scratch_probe():\n"
+        f"    ready = pathlib.Path({str(ready)!r})\n"
+        "    pending = ready.with_suffix('.pending')\n"
+        "    pending.write_text(os.environ['TMP'], encoding='utf-8')\n"
+        "    pending.replace(ready)\n"
+        "    deadline = time.monotonic() + 25\n"
+        f"    while not pathlib.Path({str(release)!r}).exists():\n"
+        "        assert time.monotonic() < deadline\n"
+        "        time.sleep(0.02)\n",
+        encoding="utf-8",
+    )
+    launcher = (
+        "import pathlib, runpy, sys\n"
+        f"runner = runpy.run_path({str(ROOT / 'scripts/testing/run-tests.py')!r})\n"
+        f"result = runner['run_text']([sys.executable, '-m', 'pytest', {str(probe)!r}], pathlib.Path.cwd())\n"
+        "print(result.stdout, result.stderr, file=sys.stderr)\n"
+        "raise SystemExit(result.returncode)\n"
+    )
+    environment = {**os.environ, "PYTEST_DEBUG_TEMPROOT": str(parent)}
+    environment.pop("PYTEST_ADDOPTS", None)
+    scratch_module = test_runner_module.pytest_environment
+    with subprocess.Popen(
+        [sys.executable, "-c", launcher], cwd=ROOT, env=environment,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    ) as process:
+        try:
+            deadline = time.monotonic() + 20
+            while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.02)
+            if not ready.is_file():
+                process.kill()
+                _, stderr = process.communicate(timeout=5)
+                pytest.fail(f"synthetic pytest did not reach its scratch directory: {stderr}")
+            abandoned = pathlib.Path(ready.read_text(encoding="utf-8"))
+            assert abandoned.parent.parent == parent and abandoned.is_dir()
+            process.kill()
+            process.wait(timeout=5)
+            with scratch_module.isolated_environment(ROOT, environ=environment, windows=False):
+                assert abandoned.is_dir()
+        finally:
+            release.touch()
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=5)
+    record = abandoned.with_suffix(".lease")
+    deadline = time.monotonic() + 10
+    while (lease := scratch_module._acquire_scratch_lease(record)) is None:
+        assert time.monotonic() < deadline, "synthetic pytest still holds its lease"
+        time.sleep(0.02)
+    os.close(lease)
+    with scratch_module.isolated_environment(ROOT, environ=environment, windows=False):
+        assert not abandoned.exists() and not record.exists()
+
+
+def test_test_scratch_startup_finishes_interrupted_registration_and_retirement(
+    test_runner_module: Any, tmp_path: pathlib.Path,
+) -> None:
+    module = test_runner_module.pytest_environment
+    environment = {**os.environ, "PYTEST_DEBUG_TEMPROOT": str(tmp_path)}
+    with module.isolated_environment(ROOT, environ=environment, windows=False) as child:
+        namespace = pathlib.Path(child["TMP"]).parent
+    incomplete = namespace / "00000001.lease"
+    registered = namespace / "00000002.lease"
+    abandoned = namespace / "00000003"
+    abandoned_record = abandoned.with_suffix(".lease")
+    foreign = namespace / "00000004"
+    foreign_record = foreign.with_suffix(".lease")
+    incomplete.touch()
+    for record in (registered, abandoned_record):
+        record.write_bytes(module._SCRATCH_SIGNATURE)
+    abandoned.mkdir()
+    (abandoned / "fixture").write_text("disposable", encoding="utf-8")
+    foreign.mkdir()
+    foreign_record.write_bytes(b"foreign")
+    for _ in range(2):
+        with module.isolated_environment(ROOT, environ=environment, windows=False):
+            assert all(not path.exists() for path in (incomplete, registered, abandoned, abandoned_record))
+            assert foreign.is_dir() and foreign_record.read_bytes() == b"foreign"
+
+
+def test_test_scratch_reports_a_failed_removal_and_retries_on_the_next_run(
+    test_runner_module: Any, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = test_runner_module.pytest_environment
+    environment = {**os.environ, "PYTEST_DEBUG_TEMPROOT": str(tmp_path)}
+    original = module.shutil.rmtree
+    with pytest.raises(OSError, match="controlled sharing failure") as failure, monkeypatch.context() as patch:
+        with module.isolated_environment(ROOT, environ=environment, windows=False) as child:
+            abandoned = pathlib.Path(child["TMP"])
+            record = abandoned.with_suffix(".lease")
+
+            def remove(path, **options):
+                if path == abandoned:
+                    raise PermissionError("controlled sharing failure")
+                return original(path, **options)
+
+            patch.setattr(module.shutil, "rmtree", remove)
+    assert str(abandoned) in str(failure.value)
+    assert abandoned.is_dir() and record.is_file()
+    with module.isolated_environment(ROOT, environ=environment, windows=False):
+        assert not abandoned.exists() and not record.exists()
 
 
 def test_non_windows_environment_keeps_git_and_explicit_pytest_options(
@@ -111,7 +226,9 @@ def test_non_windows_environment_keeps_git_and_explicit_pytest_options(
             "UNRELATED",
         ):
             assert child[key] == caller[key]
-    assert list(tmp_path.iterdir()) == []
+    namespaces = list(tmp_path.iterdir())
+    assert len(namespaces) == 1
+    assert [path.name for path in namespaces[0].iterdir()] == [".registry"]
 
 
 @pytest.mark.parametrize("selection", ["environment", "configuration", "empty"])
@@ -331,7 +448,9 @@ def test_windows_environment_rejects_invalid_setup_and_cleans_owned_directory(
         environment.isolated_environment(tmp_path, environ=caller, windows=True),
     ):
         pytest.fail("invalid environment reached pytest")
-    assert list(tmp_path.iterdir()) == []
+    namespaces = list(tmp_path.iterdir())
+    assert len(namespaces) == 1
+    assert [path.name for path in namespaces[0].iterdir()] == [".registry"]
 
 
 @pytest.mark.parametrize("failure", [False, True])
