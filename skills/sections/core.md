@@ -49,9 +49,14 @@
 - Do not update this `SKILL.md` or other skill/control files during a routine
   run unless the user explicitly asked for skill maintenance or the task cannot
   be completed safely without a narrow in-scope fix.
-- For skill runtime workflows, invoke shared helpers through installed console
-  commands or scripts copied into the installed skill folder; do not locate
-  shared helpers by absolute paths or by the repo's parent directory.
+- Installed skill and MCP operations load their lifecycle implementation and
+  supporting modules only from installed bundles and declared runtimes. Resolve
+  shared helpers through installed commands or skill-relative copies, never
+  through checkout or repository-parent paths.
+- Bootstrap loads its implementation and supporting modules from the selected
+  checkout, without an installed-copy fallback. Installed workflows still run
+  declared repository checks and builds against the candidate checkout; that
+  source does not replace their lifecycle helper code.
 - For every direct invocation of an installed Python helper, prepend
   `uv run --no-project --python <python_runtime> python` to its original module
   or installed-script arguments, using `python_runtime` from that skill's
@@ -59,7 +64,7 @@
   MCP servers retain their installer-owned runtimes.
 - Run repository-maintenance executables only from `scripts/` in an active
   source checkout. Run skill deliverable helpers from the installed skill
-  folder; source maintenance may use the owning skill or declared
+  folder; source maintenance edits the owning skill or declared
   shared-section source. Stop as blocked when the required declared location
   is unavailable.
 - When editing an existing text file, preserve its current line-ending

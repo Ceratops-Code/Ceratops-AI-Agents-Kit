@@ -352,8 +352,10 @@ def prepare_python_runtime(repo_root: pathlib.Path, install_root: pathlib.Path) 
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
     # uv selects the runtime dependency graph from the common lock. Development
     # tools and other workspace products cannot change this environment's identity.
+    # Local path dependencies must be copied into the installed environment;
+    # an editable link would outlive neither a source view nor its checkout.
     command = [uv, "export", "--project", str(project), "--locked", "--no-dev",
-               "--no-default-groups", "--no-emit-workspace", "--no-header", "--no-annotate"]
+               "--no-default-groups", "--no-emit-workspace", "--no-editable", "--no-header", "--no-annotate"]
     try:
         exported = write_locks.run_protected_command(command, cwd=repo_root, env=environment,
                           capture_output=True, text=True, check=False)
@@ -401,7 +403,7 @@ def prepare_python_runtime(repo_root: pathlib.Path, install_root: pathlib.Path) 
         if is_runtime_link(selected):
             raise ValueError("shared skill runtime version cannot be a link")
         checked = write_locks.run_protected_command(
-            [uv, "sync", "--quiet", "--project", str(project), "--locked", "--no-dev", "--no-default-groups", "--no-install-workspace", "--check", "--no-active"],
+            [uv, "sync", "--quiet", "--project", str(project), "--locked", "--no-dev", "--no-default-groups", "--no-install-workspace", "--no-editable", "--check", "--no-active"],
             env=environment, capture_output=True, text=True, check=False,
         )
         if checked.returncode or not interpreter(version).is_file() or is_runtime_link(interpreter(version)):
@@ -410,7 +412,7 @@ def prepare_python_runtime(repo_root: pathlib.Path, install_root: pathlib.Path) 
             environment["UV_PROJECT_ENVIRONMENT"] = str(selected / ".venv")
     if not selected.exists():
         result = write_locks.run_protected_command(
-            [uv, "sync", "--quiet", "--project", str(project), "--locked", "--no-dev", "--no-default-groups", "--no-install-workspace", "--no-active"],
+            [uv, "sync", "--quiet", "--project", str(project), "--locked", "--no-dev", "--no-default-groups", "--no-install-workspace", "--no-editable", "--no-active"],
             env=environment, capture_output=True, text=True, check=False,
         )
         if result.returncode or not interpreter(version).is_file():
@@ -423,7 +425,7 @@ def prepare_python_runtime(repo_root: pathlib.Path, install_root: pathlib.Path) 
             try:
                 _materialize_python_interpreters(interpreter(version))
                 checked = write_locks.run_protected_command(
-                    [uv, "sync", "--quiet", "--project", str(project), "--locked", "--no-dev", "--no-default-groups", "--no-install-workspace", "--check", "--no-active"],
+                    [uv, "sync", "--quiet", "--project", str(project), "--locked", "--no-dev", "--no-default-groups", "--no-install-workspace", "--no-editable", "--check", "--no-active"],
                     env=environment, capture_output=True, text=True, check=False,
                 )
                 if checked.returncode:

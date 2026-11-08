@@ -662,7 +662,16 @@ def summarize_check_result(record: Mapping[str, Any], children: Any = None) -> d
             raise ValueError("unsupported compact check summary")
         result["inputGroups"].update(children["inputGroups"])
         result["checkGroups"].update(children["checkGroups"])
-        result["checks"].extend(dict(item) for item in children["checks"])
+        for item in children["checks"]:
+            outcome = dict(item)
+            # Embedded input facts make the summary independent of mutable local
+            # result files. Their links remain in the original observation only.
+            if (outcome.get("kind") == "pytest"
+                    and outcome.get("inputGroup") in result["inputGroups"]
+                    and outcome.get("checkGroup") in result["checkGroups"]):
+                outcome.pop("path", None)
+                outcome.pop("sha256", None)
+            result["checks"].append(outcome)
     represented = {item["id"] for item in result["checks"]}
     result["checks"].extend({**item, **({"required": False} if item.get("status") in {"skipped", "scope-unrepresented"} else {})}
                             for item in record.get("checks", [])

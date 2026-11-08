@@ -9,7 +9,8 @@ evidence while making assumptions, intended changes, and unknowns explicit.
 
 Resolve the repository, document owner and path, requested scope, governing
 instructions, and whether the document describes current or proposed design.
-Read `design-document-contract.md` and `validator.md` before authoring.
+Read `contracts/design-document-contract.md` and the Mechanical Checks section
+of `review.md` before authoring; that shared section does not invoke `review`.
 
 ## Workflow
 

@@ -309,10 +309,21 @@ def test_contract_covers_current_c4_view_and_notation_sources() -> None:
 def test_generated_resources_match_contract_and_seed_requires_evidence(tmp_path: pathlib.Path) -> None:
     contract = VALIDATOR.load_contract()
     expected = VALIDATOR.render_resources(contract)
+    assert set(expected) == {
+        "references/contracts/design-document-contract.md",
+        "assets/design-document-template.md",
+    }
     VALIDATOR.generate_resources(contract, tmp_path / "generated")
     for relative, content in expected.items():
         assert (SKILL / relative).read_text(encoding="utf-8") == content
         assert (tmp_path / "generated" / relative).read_text(encoding="utf-8") == content
+    # A fresh repeat consumes current files without rewriting accepted content.
+    with pytest.MonkeyPatch.context() as repeated:
+        def unexpected_write(*args: Any, **kwargs: Any) -> int:
+            pytest.fail("Unchanged resource generation must not write files")
+
+        repeated.setattr(pathlib.Path, "write_text", unexpected_write)
+        VALIDATOR.generate_resources(contract, tmp_path / "generated")
     root = tmp_path / "seed-repo"
     (root / "docs").mkdir(parents=True)
     document = root / "docs/design.md"
@@ -322,7 +333,8 @@ def test_generated_resources_match_contract_and_seed_requires_evidence(tmp_path:
 
 @pytest.mark.parametrize("preexisting", [False, True])
 @pytest.mark.parametrize("failure_index", [0, 1])
-def test_resource_generation_restores_partial_writes(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, preexisting: bool, failure_index: int) -> None:
+@pytest.mark.parametrize("failure_phase", ["before", "partial", "after"])
+def test_resource_generation_restores_partial_writes(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, preexisting: bool, failure_index: int, failure_phase: str) -> None:
     contract = VALIDATOR.load_contract()
     targets = [tmp_path / name for name in VALIDATOR.render_resources(contract)]
     originals = {path: b"Previous resource\r\n" if preexisting else None for path in targets}
@@ -334,7 +346,10 @@ def test_resource_generation_restores_partial_writes(tmp_path: pathlib.Path, mon
 
     def partial_write(path: pathlib.Path, data: str, **kwargs: Any) -> int:
         if path == targets[failure_index]:
-            path.write_bytes(b"Partial replacement")
+            if failure_phase == "partial":
+                path.write_bytes(b"Partial replacement")
+            elif failure_phase == "after":
+                write_text(path, data, **kwargs)
             raise OSError("Simulated interrupted write")
         return write_text(path, data, **kwargs)
 
@@ -343,6 +358,11 @@ def test_resource_generation_restores_partial_writes(tmp_path: pathlib.Path, mon
         VALIDATOR.generate_resources(contract, tmp_path)
     for path, content in originals.items():
         assert path.read_bytes() == content if content is not None else not path.exists()
+    # Recovery starts from current output bytes through the normal entry point.
+    monkeypatch.setattr(pathlib.Path, "write_text", write_text)
+    VALIDATOR.generate_resources(contract, tmp_path)
+    for relative, expected in VALIDATOR.render_resources(contract).items():
+        assert (tmp_path / relative).read_text(encoding="utf-8") == expected
 
 
 @pytest.mark.skipif(not os.environ.get("DESIGN_DOCUMENT_MERMAID_CLI"), reason="Optional real Mermaid CLI/browser not supplied")

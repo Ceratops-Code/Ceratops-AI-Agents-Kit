@@ -19,7 +19,6 @@ import re
 import stat
 import subprocess
 import sys
-import tempfile
 import time
 from contextlib import contextmanager
 from typing import Any, NamedTuple
@@ -27,11 +26,15 @@ from typing import Any, NamedTuple
 import git_branch_operations as git_branches
 from check_deployment_receipts import check_deployment_receipt
 from git_branch_operations import PromotionError, SourceState
+from github_contract_engine.format_report import sanitize_for_output
 from github_pr_workflow import ship_repository as repository_ship
 from github_pr_workflow.command import (
     CommandError,
     capture_failure_report,
     describe_command_failure,
+    failure_excerpt,
+    handoff_report_completions,
+    operation_report_root,
     project_task_temp_root,
     release_write_context,
     remove_resolved_failures,
@@ -40,6 +43,7 @@ from github_pr_workflow.command import (
     require_success,
     run_command,
     run_command_for_json,
+    write_operation_report,
 )
 from github_pr_workflow.dependency_common import normalize_github_repo
 from repository_operation import (
@@ -441,8 +445,6 @@ def _promote(
             "refs/heads/release blocks the required release/local branch namespace."
         )
     git_branches._clean(repo_root, "before promotion")
-    if not git_branches._ref_exists(repo_root, f"refs/heads/{args.main_branch}"):
-        raise PromotionError(f"Local main branch does not exist: {args.main_branch}")
     checkout_state = git_branches._preflight_release_checkout(
         repo_root,
         args.main_branch,
@@ -451,20 +453,23 @@ def _promote(
     source_states: dict[str, SourceState] = {}
     if not args.prepare_release_only:
         source_states = git_branches._preflight_sources(repo_root, branches)
-    require_success(
-        git_branches._git(repo_root, "remote", "get-url", args.remote_name),
-        cwd=repo_root,
-    )
-    require_success(
-        git_branches._git(repo_root, "fetch", "--prune", args.remote_name),
-        cwd=repo_root,
-    )
     remote_main = f"{args.remote_name}/{args.main_branch}"
-    if not git_branches._ref_exists(
-        repo_root,
-        f"refs/remotes/{args.remote_name}/{args.main_branch}",
-    ):
-        raise PromotionError(f"Remote main branch does not exist: {remote_main}")
+    if checkout_state.release_head is None:
+        # Only a new batch starts from current remote main. An existing
+        # release is the selected baseline and needs no preparatory fetch.
+        require_success(
+            git_branches._git(repo_root, "remote", "get-url", args.remote_name),
+            cwd=repo_root,
+        )
+        require_success(
+            git_branches._git(repo_root, "fetch", "--prune", args.remote_name),
+            cwd=repo_root,
+        )
+        if not git_branches._ref_exists(
+            repo_root,
+            f"refs/remotes/{args.remote_name}/{args.main_branch}",
+        ):
+            raise PromotionError(f"Remote main branch does not exist: {remote_main}")
     git_branches._prepare_release_checkout(
         repo_root,
         args.main_branch,
@@ -488,6 +493,13 @@ def _promote(
             "head": release_start,
         }
 
+    # Rebase isolation may read existing local main history. It never
+    # refreshes main for an existing batch, and main is optional there.
+    main_head = (
+        git_branches._branch_head(repo_root, args.main_branch)
+        if checkout_state.release_head is None
+        else checkout_state.main_head or release_start
+    )
     merged: list[str] = []
     rebased: list[dict[str, str]] = []
     for branch in branches:
@@ -497,7 +509,7 @@ def _promote(
             release_head,
             branch,
             source_states[branch],
-            git_branches._branch_head(repo_root, args.main_branch),
+            main_head,
         )
         if rebase_result is not None:
             rebased.append(rebase_result)
@@ -753,7 +765,8 @@ def _promote_with_rollback(
                     rollback["release_branch"],
                     rollback["state"],
                 )
-            except Exception as restore_exc:  # Preserve both promotion and restoration failures.
+            # Retain both failures even when restoration raises an unforeseen error.
+            except Exception as restore_exc:
                 raise PromotionError(
                     f"Promotion failed: {exc}; restoring the original checkout "
                     f"also failed: {restore_exc}"
@@ -772,50 +785,40 @@ def _timed_phase(timings: dict[str, float], phase: str, *, diagnostic_output=Non
         timings[phase] = round(time.monotonic() - started, 6)
 
 
-def _save_result(path: pathlib.Path, result: dict[str, object]) -> str:
+def _save_result(path: pathlib.Path, result: dict[str, object], repo_root: pathlib.Path) -> str:
     """Publish the complete report and return its exact-byte cleanup digest.
 
     The caller can print only a summary after publication succeeds. The report
     is observational; neither it nor its digest can resume lifecycle effects.
     """
-    # A long operation may outlive cleanup of its initially empty result
-    # directory. Recreate that directory without replaying the operation.
-    path.parent.mkdir(parents=True, exist_ok=True)
-    staging = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=path.parent,
-            prefix="." + path.name,
-            suffix=".tmp",
-            delete=False,
-        ) as stream:
-            staging = pathlib.Path(stream.name)
-            json.dump(result, stream, indent=2)
-            stream.write("\n")
-        digest = hashlib.sha256(staging.read_bytes()).hexdigest()
-        staging.replace(path)
-        return digest
-    finally:
-        if staging is not None:
-            staging.unlink(missing_ok=True)
+    return write_operation_report(path, result, repo_root=repo_root, action="promote", retain_external_output=True)
 
 
 def _result_summary(
-    result: dict[str, object], path: pathlib.Path, digest: str,
+    result: dict[str, object], path: pathlib.Path, digest: str, *, failed: bool,
 ) -> dict[str, object]:
     """Point to a published outcome without duplicating checks or receipts."""
     summary: dict[str, object] = {
         key: result[key] for key in (
             "status", "phase", "operation", "release_branch", "head", "commit",
             "replay_required", "remote_mutation", "timings_seconds",
+            "report_cleanup_error",
         ) if key in result
     }
+    completions = handoff_report_completions(result)
+    if completions:
+        summary["report_completions"] = completions
+    if failed:
+        # Keep producer-supplied identifiers and usable log paths without
+        # reopening reports or interpreting their contents as execution state.
+        summary.update({key: result[key] for key in
+                        ("check", "evidence_file", "diagnostic_output") if key in result})
     if result.get("message"):
-        # The first line names the failed operation; complete causes and child
-        # streams remain in the exact report rather than spilling into stdout.
-        summary["message"] = str(result["message"]).partition("\n")[0][:2000]
+        message = str(result["message"])
+        # Child check names can follow the operation's first line. Reuse the
+        # bounded failure display; complete streams stay in the saved report.
+        summary["message"] = ((failure_excerpt(sanitize_for_output(message)) or "") if failed else
+                              message.partition("\n")[0][:2000])
     summary.update(result_file=str(path), result_sha256=digest)
     return summary
 
@@ -1307,6 +1310,7 @@ def main(argv: list[str] | None = None) -> int:
     started = time.monotonic()
     timings: dict[str, float] = {}
     result_file = None
+    report_repo_root = args.repo_root
     result_digest = None
     failed = False
     try:
@@ -1320,6 +1324,7 @@ def main(argv: list[str] | None = None) -> int:
             if requested.exists() and not requested.is_file():
                 raise PromotionError("result-file must name a file")
             result_file = requested
+            report_repo_root = operation_report_root(args.repo_root)
         result = promote(args, timings=timings)
     except (
         CommandError,
@@ -1341,8 +1346,8 @@ def main(argv: list[str] | None = None) -> int:
     result["timings_seconds"] = timings
     if result_file is not None:
         try:
-            result_digest = _save_result(result_file, result)
-        except OSError as exc:
+            result_digest = _save_result(result_file, result, report_repo_root)
+        except (OSError, ValueError, CommandError) as exc:
             # Side effects may already be complete. Retain their exact outcome
             # in the error instead of suggesting a replay to recover a record.
             result = {
@@ -1353,7 +1358,7 @@ def main(argv: list[str] | None = None) -> int:
             }
             failed = True
     public_result = (
-        _result_summary(result, result_file, result_digest)
+        _result_summary(result, result_file, result_digest, failed=failed)
         if result_file is not None and result_digest is not None else result
     )
     print(

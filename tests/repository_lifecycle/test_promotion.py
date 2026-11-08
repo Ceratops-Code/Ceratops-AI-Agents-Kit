@@ -685,12 +685,16 @@ def test_validation_failure_restores_original_checkout_and_refs(
     assert run_git(repo, "status", "--porcelain").stdout == ""
 
 
+@pytest.mark.parametrize("remote_advanced", [False, True])
 def test_promote_repository_prepare_only_mode_remains_unchanged(
-    tmp_path: pathlib.Path,
+    tmp_path: pathlib.Path, remote_advanced: bool,
 ) -> None:
-    repo, _, log, _ = prepare_repository_lifecycle_repo(tmp_path)
+    repo, approved_head, log, _ = prepare_repository_lifecycle_repo(tmp_path)
     assert run_git(repo, "switch", "main").returncode == 0
     main_head = run_git(repo, "rev-parse", "main").stdout.strip()
+    if remote_advanced:
+        assert run_git(repo, "push", "origin", "approved:main").returncode == 0
+        main_head = approved_head
     loaded = runpy.run_path(str(PROMOTE_REPOSITORY))
     promote = loaded["promote"]
 
@@ -718,6 +722,7 @@ def test_promote_repository_prepare_only_mode_remains_unchanged(
     assert run_git(repo, "branch", "--show-current").stdout.strip() == "release/local"
     assert run_git(repo, "status", "--porcelain").stdout == ""
     assert not log.exists()
+    assert run_git(repo, "rev-parse", "main").stdout.strip() == main_head
 
 
 def test_promote_repository_rejects_noncanonical_release_branch_before_mutation(

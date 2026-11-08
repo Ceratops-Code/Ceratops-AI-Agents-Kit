@@ -1,7 +1,7 @@
-"""Check deployment receipts consumed by repository promotion finalization.
+"""Check deployment receipts consumed by repository lifecycle boundaries.
 
 This module owns the closed receipt shape and entity checks. It has no deployment,
-publication or record-deletion effects; promotion supplies its existing boundary
+publication or record-deletion effects; each caller supplies its boundary
 policies and performs cleanup only after the receipt passes.
 """
 
@@ -24,9 +24,9 @@ def check_deployment_receipt(
 ) -> None:
     """Check closed completion evidence without scanning or deploying installed files.
 
-    The operation runner holds the requested installer's returned result.
-    There is no separately supplied promotion report or external receipt to
-    match. The caller owns its error class and destination-path guard.
+    Callers supply the actual installer's returned result. The return receiver
+    checks the current registered operation before consuming its temporary
+    input. The caller owns its error class and destination-path guard.
     """
     fields = {
         "schema",

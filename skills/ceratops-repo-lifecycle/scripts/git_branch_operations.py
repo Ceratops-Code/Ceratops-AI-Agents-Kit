@@ -47,7 +47,7 @@ class ReleaseCheckoutState:
 
     branch: str
     head: str
-    main_head: str
+    main_head: str | None
     release_head: str | None
 
 
@@ -162,7 +162,17 @@ def _preflight_release_checkout(
     if not current_branch:
         raise PromotionError("Promotion --repo-root must be on a local branch.")
 
-    for branch in dict.fromkeys((main_branch, release_branch)):
+    release_head = (
+        _branch_head(repo_root, release_branch)
+        if _ref_exists(repo_root, f"refs/heads/{release_branch}")
+        else None
+    )
+    if release_head is None and not _ref_exists(repo_root, f"refs/heads/{main_branch}"):
+        raise PromotionError(f"Local main branch does not exist: {main_branch}")
+    # An existing batch owns only its release checkout. Main may belong to
+    # another worktree or be absent; promotion will not write it.
+    owned_branches = (main_branch, release_branch) if release_head is None else (release_branch,)
+    for branch in dict.fromkeys(owned_branches):
         owner = _selected_worktree(repo_root, branch)
         if owner is not None and owner != repo_root:
             raise PromotionError(
@@ -173,12 +183,12 @@ def _preflight_release_checkout(
     return ReleaseCheckoutState(
         branch=current_branch,
         head=_branch_head(repo_root, current_branch),
-        main_head=_branch_head(repo_root, main_branch),
-        release_head=(
-            _branch_head(repo_root, release_branch)
-            if _ref_exists(repo_root, f"refs/heads/{release_branch}")
+        main_head=(
+            _branch_head(repo_root, main_branch)
+            if _ref_exists(repo_root, f"refs/heads/{main_branch}")
             else None
         ),
+        release_head=release_head,
     )
 
 
@@ -204,7 +214,7 @@ def _restore_release_checkout(
         cwd=repo_root,
     )
 
-    if state.branch != main_branch:
+    if state.release_head is None and state.main_head is not None and state.branch != main_branch:
         require_success(
             _git(repo_root, "branch", "--force", main_branch, state.main_head),
             cwd=repo_root,
@@ -235,7 +245,7 @@ def _restore_release_checkout(
         raise PromotionError("Could not restore the original checkout branch.")
     if _branch_head(repo_root, state.branch) != state.head:
         raise PromotionError("Could not restore the original checkout commit.")
-    if _branch_head(repo_root, main_branch) != state.main_head:
+    if state.release_head is None and _branch_head(repo_root, main_branch) != state.main_head:
         raise PromotionError("Could not restore the original main commit.")
     release_exists = _ref_exists(repo_root, f"refs/heads/{release_branch}")
     if state.release_head is None:
@@ -259,17 +269,18 @@ def _prepare_release_checkout(
     """Prepare the release checkout as one rollback-safe local transaction."""
 
     try:
-        require_success(
-            _git(repo_root, "switch", main_branch),
-            cwd=repo_root,
-        )
-        fast_forward_branch(repo_root, remote_main)
         if state.release_head is not None:
+            if state.branch != release_branch:
+                require_success(
+                    _git(repo_root, "switch", release_branch),
+                    cwd=repo_root,
+                )
+        else:
             require_success(
-                _git(repo_root, "switch", release_branch),
+                _git(repo_root, "switch", main_branch),
                 cwd=repo_root,
             )
-        else:
+            fast_forward_branch(repo_root, remote_main)
             require_success(
                 _git(
                     repo_root,

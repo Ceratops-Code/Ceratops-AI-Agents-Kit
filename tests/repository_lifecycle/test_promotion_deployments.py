@@ -18,6 +18,121 @@ from tests.repository_lifecycle.support import (
 from tests.support.repositories import run_git
 
 
+@pytest.mark.parametrize("main_state", ["remote-advanced", "missing", "other-worktree", "offline"])
+@pytest.mark.parametrize("initial_branch", ["approved", "release/local"])
+def test_existing_release_promotes_without_refreshing_main(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+    main_state: str, initial_branch: str,
+) -> None:
+    repo, approved_head, _log, _environment = prepare_repository_lifecycle_repo(tmp_path)
+    main_head = run_git(repo, "rev-parse", "main").stdout.strip()
+    assert run_git(repo, "branch", "release/local", "main").returncode == 0
+    main_worktree = tmp_path / "main-worktree"
+    if main_state == "remote-advanced":
+        assert run_git(repo, "push", "origin", "approved:main").returncode == 0
+    elif main_state == "missing":
+        assert run_git(repo, "branch", "-D", "main").returncode == 0
+        assert run_git(repo, "remote", "remove", "origin").returncode == 0
+    elif main_state == "other-worktree":
+        assert run_git(repo, "worktree", "add", str(main_worktree), "main").returncode == 0
+        (main_worktree / "README.md").write_text("unrelated main edits", encoding="utf-8")
+    else:
+        assert run_git(repo, "remote", "set-url", "origin", str(tmp_path / "offline.git")).returncode == 0
+    assert run_git(repo, "switch", initial_branch).returncode == 0
+    loaded = runpy.run_path(str(PROMOTE_REPOSITORY))
+    branches = loaded["git_branches"]
+    original_git = branches._git
+    calls: list[tuple[str, ...]] = []
+
+    def track_git(repo_root: pathlib.Path, *arguments: str) -> list[str]:
+        calls.append(arguments)
+        return original_git(repo_root, *arguments)
+
+    monkeypatch.setattr(branches, "_git", track_git)
+    args = loaded["build_parser"]().parse_args([
+        "--repo-root", str(repo), "--source-branch", "approved", "--no-run-operation",
+    ])
+    for _ in range(2):
+        result = loaded["promote"](args)
+        assert result["status"] == "ready"
+        assert result["head"] == approved_head
+        assert result["rebased_branches"] == []
+        assert run_git(repo, "branch", "--show-current").stdout.strip() == "release/local"
+        assert run_git(repo, "status", "--porcelain").stdout == ""
+        if main_state == "missing":
+            assert run_git(repo, "show-ref", "--verify", "refs/heads/main").returncode != 0
+        else:
+            assert run_git(repo, "rev-parse", "main").stdout.strip() == main_head
+    assert not any(call[0] == "fetch" or call == ("switch", "main") for call in calls)
+    assert not any(call[:3] == ("branch", "--force", "main") for call in calls)
+    if main_state == "other-worktree":
+        assert (main_worktree / "README.md").read_text(encoding="utf-8") == "unrelated main edits"
+
+
+@pytest.mark.parametrize("effect", [
+    "existing-switch", "existing-merge", "existing-missing-main",
+    "new-fetch", "new-switch", "new-main-merge", "new-release",
+])
+@pytest.mark.parametrize("after", [False, True])
+def test_release_preparation_retries_interrupted_effects(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, effect: str, after: bool,
+) -> None:
+    repo, approved_head, _log, _environment = prepare_repository_lifecycle_repo(tmp_path)
+    main_head = run_git(repo, "rev-parse", "main").stdout.strip()
+    existing = effect.startswith("existing-")
+    if existing:
+        assert run_git(repo, "branch", "release/local", "main").returncode == 0
+    if effect == "existing-missing-main":
+        assert run_git(repo, "branch", "-D", "main").returncode == 0
+    commands = {
+        "existing-switch": ("switch", "release/local"),
+        "existing-merge": ("merge", "--ff-only", "approved"),
+        "existing-missing-main": ("merge", "--ff-only", "approved"),
+        "new-fetch": ("fetch", "--prune", "origin"),
+        "new-switch": ("switch", "main"),
+        "new-main-merge": ("merge", "--ff-only", "origin/main"),
+        "new-release": ("switch", "-c", "release/local", "main"),
+    }
+    loaded = runpy.run_path(str(PROMOTE_REPOSITORY))
+    branches = loaded["git_branches"]
+    armed = True
+    original_run = branches.require_success
+
+    def interrupt(command: list[str], **kwargs: Any) -> Any:
+        nonlocal armed
+        if armed and tuple(command[3:]) == commands[effect]:
+            armed = False
+            if after:
+                original_run(command, **kwargs)
+            raise loaded["PromotionError"]("interrupted Git effect")
+        return original_run(command, **kwargs)
+
+    monkeypatch.setattr(branches, "require_success", interrupt)
+    # Fetch is owned by the promotion workflow; branch effects by its Git adapter.
+    monkeypatch.setitem(loaded["promote"].__globals__, "require_success", interrupt)
+    args = loaded["build_parser"]().parse_args([
+        "--repo-root", str(repo), "--source-branch", "approved", "--no-run-operation",
+    ])
+    with pytest.raises(loaded["PromotionError"], match="interrupted Git effect"):
+        loaded["promote"](args)
+    assert not armed
+    assert run_git(repo, "branch", "--show-current").stdout.strip() == "approved"
+    assert run_git(repo, "rev-parse", "HEAD").stdout.strip() == approved_head
+    assert run_git(repo, "status", "--porcelain").stdout == ""
+    if effect == "existing-missing-main":
+        assert run_git(repo, "show-ref", "--verify", "refs/heads/main").returncode != 0
+    else:
+        assert run_git(repo, "rev-parse", "main").stdout.strip() == main_head
+    release = run_git(repo, "rev-parse", "--verify", "refs/heads/release/local")
+    assert release.stdout.strip() == main_head if existing else release.returncode != 0
+    for _ in range(2):
+        result = loaded["promote"](args)
+        assert result["status"] == "ready"
+        assert result["head"] == approved_head
+        assert run_git(repo, "branch", "--show-current").stdout.strip() == "release/local"
+        assert run_git(repo, "status", "--porcelain").stdout == ""
+
+
 @pytest.mark.parametrize(
     (
         "operation_arguments",
@@ -233,7 +348,7 @@ def test_promote_repository_requires_an_explicit_deployment_choice(
     assert run_git(repo, "rev-parse", "HEAD").stdout.strip() == approved_head
 
 
-@pytest.mark.parametrize("status", ["ready", "tests_failed", "pending_work"])
+@pytest.mark.parametrize("status", ["ready", "validation_failed", "tests_failed", "pending_work"])
 @pytest.mark.parametrize("boundary", [
     "uninterrupted", "record-before", "record-after", "output-before", "output-after", "no-report",
 ])
@@ -251,9 +366,14 @@ def test_promotion_output_keeps_full_report_across_interruption(
         "check_summary": {"checks": [{"evidence": "complete-record" * 20000}]},
         "operations": {"status": "completed", "step_results": [{"result": "complete-receipt"}]},
     }
+    failed = status in {"validation_failed", "tests_failed"}
+    if failed:
+        payload["diagnostic_output"] = str(repo / ".build" / "failed-check.log")
+        payload["message"] += ('check: "mypy"\nevidence_file: ' +
+                               json.dumps(payload["diagnostic_output"]) + '\nexit_code: 1')
 
     def promote(_args, **_kwargs):
-        if status == "tests_failed":
+        if failed:
             raise module["PromotionError"]("Repository test step failed.", dict(payload))
         return dict(payload)
 
@@ -291,9 +411,9 @@ def test_promotion_output_keeps_full_report_across_interruption(
         assert json.loads(report.read_text(encoding="utf-8"))["operations"] == payload["operations"]
         capsys.readouterr()
     for _ in range(2):
-        assert module["main"](arguments) == {"ready": 0, "tests_failed": 1, "pending_work": 2}[status]
+        assert module["main"](arguments) == (1 if failed else 2 if status == "pending_work" else 0)
         observed = capsys.readouterr()
-        output = observed.err if status == "tests_failed" else observed.out
+        output = observed.err if failed else observed.out
         summary = json.loads(output)
         assert summary["status"] == status
         if boundary == "no-report":
@@ -307,7 +427,29 @@ def test_promotion_output_keeps_full_report_across_interruption(
             assert recorded["check_summary"] == payload["check_summary"]
             assert recorded["operations"] == payload["operations"]
             assert recorded["message"] == payload["message"]
+            if failed:
+                assert summary["diagnostic_output"] == payload["diagnostic_output"]
+                assert 'check: "mypy"' in summary["message"]
+                assert "failed-check.log" in summary["message"]
+                assert len(summary["message"].encode("utf-8")) <= 2000
+            else:
+                assert summary["message"] == "Repository test step failed."
+                assert "diagnostic_output" not in summary
     assert not list(task.glob("*.tmp"))
+
+
+@pytest.mark.parametrize("context", [False, True], ids=["absent", "structured"])
+def test_promotion_error_summary_uses_only_available_failure_context(tmp_path, context):
+    module = runpy.run_path(str(PROMOTE_REPOSITORY))
+    token = "ghp_" + "a" * 36
+    payload = {"status": "validation_failed", "message": "Gate failed.\n" + "details\n" * 1000 + token}
+    if context:
+        payload.update(check="markdown-lint", evidence_file=str(tmp_path / "check.log"))
+    result = module["_result_summary"](payload, tmp_path / "unopened.json", "a" * 64, failed=True)
+    for field in ("check", "evidence_file", "diagnostic_output"):
+        assert (result[field] == payload[field]) if field in payload else field not in result
+    assert token not in result["message"]
+    assert not (tmp_path / "unopened.json").exists()
 
 
 def test_promote_and_deploy_does_not_inject_base_revision(
@@ -593,10 +735,10 @@ def test_repo_owns_installation_result_recording_and_cleanup(
         with monkeypatch.context() as patch:
             patch.setattr(pathlib.Path, "replace", interrupted_replace)
             with pytest.raises(OSError, match="recording"):
-                module["_save_result"](report, result)
+                module["_save_result"](report, result, repo)
         assert report.exists() == after
     # The actual result is still in the caller, not reconstructed by reinstalling.
-    module["_save_result"](report, result)
+    module["_save_result"](report, result, repo)
     digest = hashlib.sha256(report.read_bytes()).hexdigest()
     arguments = ["--repo-root", str(requested), "--finalize-result", "--result-file", str(report),
                  "--task-temp-root", str(task), "--expected-commit", prepared.commit,
@@ -663,7 +805,7 @@ def test_repo_cleanup_keeps_unfinished_installation_report(tmp_path, monkeypatch
     task = repo.parent / "tmp" / repo.name / "pending"
     task.mkdir(parents=True)
     report = task / "promotion.json"
-    module["_save_result"](report, result)
+    module["_save_result"](report, result, repo)
     before = report.read_bytes()
     args = module["build_parser"]().parse_args([
         "--repo-root", str(repo), "--finalize-result", "--result-file", str(report),
@@ -681,7 +823,9 @@ def test_repo_cleanup_keeps_unfinished_installation_report(tmp_path, monkeypatch
                                   "pending-deployment", "unfinished-finalization", "cleanup-error",
                                   "wrong-operation", "invalid-noop"])
 def test_repo_cleanup_retains_mismatched_or_incomplete_shipping_results(tmp_path, monkeypatch, fault):
-    from tests.repository_lifecycle.test_execute_skill_actions import _registered_skill_fixture
+    from tests.repository_lifecycle.test_execute_skill_actions import (
+        _registered_skill_fixture,
+    )
 
     repo = _registered_skill_fixture(tmp_path, monkeypatch)
     assert run_git(repo, "remote", "add", "origin", "https://github.com/owner/repo.git").returncode == 0
@@ -714,7 +858,7 @@ def test_repo_cleanup_retains_mismatched_or_incomplete_shipping_results(tmp_path
     task = repo.parent / "tmp" / repo.name / "shipping-result"
     task.mkdir(parents=True)
     report = task / "shipping.json"
-    module["_save_result"](report, result)
+    module["_save_result"](report, result, repo)
     original = report.read_bytes()
     args = module["build_parser"]().parse_args([
         "--repo-root", str(repo), "--finalize-result", "--result-file", str(report),
@@ -779,3 +923,201 @@ def test_composed_shipping_preserves_caller_identity_at_delegation(tmp_path, mon
         assert retained.read_bytes() == b"accepted product and original checks"
         assert run_git(workspace, "rev-parse", "HEAD").stdout.strip() == commit
         assert run_git(workspace, "branch", "--show-current").stdout.strip() == original_branch
+
+
+def _prepare_standalone_handoff_reports(
+    tmp_path, monkeypatch, outer_result=None, source_checkout="primary",
+):
+    """Produce a pending report, then call the selected installer separately."""
+    import importlib
+
+    from tests.repository_lifecycle.test_execute_skill_actions import (
+        _registered_skill_fixture,
+    )
+
+    runner = importlib.import_module("repository_operation")
+    command = importlib.import_module("github_pr_workflow.command")
+    actions = importlib.import_module("execute_skill_actions")
+    repo = _registered_skill_fixture(tmp_path, monkeypatch)
+    source = repo
+    if source_checkout != "primary":
+        source = tmp_path / "worktrees" / repo.name / "installer-source"
+        assert run_git(repo, "worktree", "add", "-b", "installer-source", str(source)).returncode == 0
+        if source_checkout == "worktree-primary-changed":
+            contract_path = repo / "sdlc/sdlc.yml"
+            contract = json.loads(contract_path.read_text())
+            del contract["deliverables"]["skills"]["claims-catalog-invoice"]["actions"]["install"]
+            contract_path.write_text(json.dumps(contract))
+            assert run_git(repo, "add", "sdlc/sdlc.yml").returncode == 0
+            assert run_git(repo, "commit", "-m", "Change only the primary installation contract").returncode == 0
+    operation = "deliverables.skills.claims-catalog-invoice.actions.install"
+    prepared = runner.prepare_operations(source, [runner.OperationRequest(operation)], context="return")[0]
+    pending = runner.execute_prepared_operation(prepared)
+    assert pending["status"] == "handoff_required"
+    assert pending["report_completion"]["answer_schema"]["required"] == ["actual_completion_file"]
+    assert not (source / "calls.jsonl").exists()
+    if outer_result:
+        pending = {"status": "shipped" if outer_result == "deployment" else "ready",
+                   outer_result: {"status": "handoff_required", "pending_operations": [operation],
+                                  "completed_operations": [], "results": [pending]}}
+    task = repo.parent / "tmp" / repo.name / "standalone-return"
+    task.mkdir(parents=True)
+    previous = task / "_previous-attempt.json"
+    unrelated = task / "_other-operation.json"
+    command.write_operation_report(previous, pending, repo_root=repo, action="promote")
+    command.write_operation_report(unrelated, {
+        "status": "operation_failed", "operation": "deliverables.skills.other.actions.install",
+    }, repo_root=repo, action="operation")
+    step = prepared.steps[0]
+    outcome = actions.execute_handoff(
+        step.handoff["lifecycle"] + "/" + step.handoff["action"], source,
+        inputs=step.handoff["inputs"],
+    )
+    assert outcome["status"] == "completed", outcome
+    actual = json.dumps(outcome["step_results"][-1]["result"]).encode()
+    completion = task / "_actual-completion.json"
+    completion.write_bytes(actual)
+    accepted = task / "accepted-result.json"
+    accepted.write_bytes(actual)
+    assert previous.exists()  # The standalone installer has no repository callback.
+    module = runpy.run_path(str(PROMOTE_REPOSITORY))
+    summary = module["_result_summary"](
+        pending, previous, hashlib.sha256(previous.read_bytes()).hexdigest(), failed=False,
+    )
+    assert len(summary["report_completions"]) == 1
+    arguments = [value.replace("{actual_completion_file}", str(completion))
+                 for value in summary["report_completions"][0]["arguments"]]
+    assert arguments[arguments.index("--repo-root") + 1] == str(source)
+    return runner, source, previous, completion, unrelated, accepted, arguments
+
+
+@pytest.mark.parametrize("outer_result,source_checkout", [
+    (None, "primary"), ("operations", "primary"), ("deployment", "primary"),
+    ("release_publication", "primary"), (None, "worktree"), (None, "worktree-primary-changed"),
+])
+@pytest.mark.parametrize("interruption", [None, "before-report", "after-report", "before-input", "after-input"])
+def test_standalone_handoff_return_retires_reports_without_reinstalling(
+    tmp_path, monkeypatch, interruption, outer_result, source_checkout,
+):
+    runner, repo, previous, completion, unrelated, accepted, arguments = _prepare_standalone_handoff_reports(
+        tmp_path, monkeypatch, outer_result, source_checkout,
+    )
+    calls = (repo / "calls.jsonl").read_bytes()
+    retained = {path: path.read_bytes() for path in (unrelated, accepted)}
+    original_unlink = pathlib.Path.unlink
+    target = previous if interruption and interruption.endswith("report") else completion
+    interrupted = False
+
+    def unlink(path, *args, **kwargs):
+        nonlocal interrupted
+        if interruption and path == target and not interrupted:
+            interrupted = True
+            if interruption.startswith("after"):
+                original_unlink(path, *args, **kwargs)
+            raise KeyboardInterrupt("interrupted report retirement")
+        return original_unlink(path, *args, **kwargs)
+
+    if interruption:
+        with monkeypatch.context() as scoped:
+            scoped.setattr(pathlib.Path, "unlink", unlink)
+            with pytest.raises(KeyboardInterrupt):
+                runner.main(arguments)
+        assert interrupted
+    for _ in range(2):
+        assert runner.main(arguments) == 0
+        assert not previous.exists()
+        assert not completion.exists()
+        assert (repo / "calls.jsonl").read_bytes() == calls
+        assert all(path.read_bytes() == content for path, content in retained.items())
+
+
+@pytest.mark.parametrize("source_checkout", ["worktree", "worktree-primary-changed"])
+def test_standalone_handoff_return_cli_uses_installation_worktree(tmp_path, monkeypatch, source_checkout):
+    runner, source, previous, completion, unrelated, accepted, arguments = _prepare_standalone_handoff_reports(
+        tmp_path, monkeypatch, source_checkout=source_checkout,
+    )
+    retained = {path: path.read_bytes() for path in (unrelated, accepted, source / "calls.jsonl")}
+    for _ in range(2):
+        result = subprocess.run(
+            [sys.executable, runner.__file__, *arguments], cwd=source,
+            capture_output=True, text=True, check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "OK"
+        assert not previous.exists()
+        assert not completion.exists()
+        assert all(path.read_bytes() == content for path, content in retained.items())
+
+
+@pytest.mark.parametrize("problem", ["failed", "wrong-commit", "wrong-repo", "wrong-producer",
+                                     "wrong-target", "cleanup-debt", "missing-input", "missing-source-commit"])
+def test_standalone_handoff_return_preserves_reports_until_actual_completion_matches(
+    tmp_path, monkeypatch, capsys, problem,
+):
+    runner, repo, previous, completion, unrelated, accepted, arguments = _prepare_standalone_handoff_reports(
+        tmp_path, monkeypatch,
+    )
+    actual = completion.read_bytes()
+    read_source_commit = runner.repository_commit
+    receipt = json.loads(actual)
+    if problem == "failed":
+        receipt["status"] = "failed"
+    elif problem == "wrong-commit":
+        receipt["commit"] = "b" * 40
+    elif problem == "wrong-repo":
+        receipt["repo_root"] = str(repo.parent / "another")
+    elif problem == "wrong-producer":
+        receipt["producer"] = "ceratops-mcp-server-lifecycle/install"
+    elif problem == "wrong-target":
+        receipt["deployed"] = ["another-skill"]
+    elif problem == "cleanup-debt":
+        receipt["cleanup_debt"] = ["busy retired directory"]
+    elif problem == "missing-source-commit":
+        monkeypatch.setattr(runner, "repository_commit", lambda _root: None)
+    if problem == "missing-input":
+        completion.unlink()
+    else:
+        completion.write_text(json.dumps(receipt))
+    retained = {path: path.read_bytes() for path in (previous, unrelated, accepted)}
+    input_bytes = completion.read_bytes() if completion.exists() else None
+    calls = (repo / "calls.jsonl").read_bytes()
+    error_report = completion.parent / "_return-error.json"
+    arguments += ["--evidence-file", str(error_report)]
+    for _ in range(2):
+        assert runner.main(arguments) == 1
+        failure = json.loads(capsys.readouterr().err)
+        assert failure["operation"].startswith("retire-handoff-reports:")
+        assert failure["target"] == str(completion)
+        if problem == "missing-source-commit":
+            assert "source Git commit" in failure["message"]
+        assert all(path.read_bytes() == content for path, content in retained.items())
+        assert (completion.read_bytes() if completion.exists() else None) == input_bytes
+        assert (repo / "calls.jsonl").read_bytes() == calls
+        assert error_report.exists()
+    monkeypatch.setattr(runner, "repository_commit", read_source_commit)
+    completion.write_bytes(actual)
+    for _ in range(2):
+        assert runner.main(arguments) == 0
+        assert not previous.exists()
+        assert not completion.exists()
+        assert not error_report.exists()
+        assert (repo / "calls.jsonl").read_bytes() == calls
+        assert unrelated.read_bytes() == retained[unrelated]
+        assert accepted.read_bytes() == retained[accepted]
+
+
+def test_non_deployment_handoff_does_not_offer_installer_receipt_return(tmp_path, monkeypatch):
+    import importlib
+
+    from tests.repository_lifecycle.test_execute_skill_actions import (
+        _registered_skill_fixture,
+    )
+
+    runner = importlib.import_module("repository_operation")
+    repo = _registered_skill_fixture(tmp_path, monkeypatch)
+    operation = "deliverables.skills.claims-catalog-invoice.actions.validate"
+    prepared = runner.prepare_operations(repo, [runner.OperationRequest(operation)], context="return")[0]
+    pending = runner.execute_prepared_operation(prepared)
+    assert pending["status"] == "handoff_required"
+    assert "report_completion" not in pending
+    assert not (repo / "calls.jsonl").exists()
