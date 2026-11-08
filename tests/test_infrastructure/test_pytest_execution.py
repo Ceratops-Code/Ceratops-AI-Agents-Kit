@@ -176,6 +176,34 @@ def test_test_scratch_startup_finishes_interrupted_registration_and_retirement(
             assert foreign.is_dir() and foreign_record.read_bytes() == b"foreign"
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows read-only hard links")
+def test_test_scratch_reclaims_readonly_hardlink_and_preserves_other_link(
+    test_runner_module: Any, tmp_path: pathlib.Path,
+) -> None:
+    module = test_runner_module.pytest_environment
+    environment = {**os.environ, "PYTEST_DEBUG_TEMPROOT": str(tmp_path)}
+    with module.isolated_environment(ROOT, environ=environment, windows=False) as child:
+        namespace = pathlib.Path(child["TMP"]).parent
+    external = tmp_path / "caller-owned-object"
+    external.write_bytes(b"git object")
+    external.chmod(stat.S_IREAD)
+    original = external.stat()
+    abandoned = namespace / "00000001"
+    record = abandoned.with_suffix(".lease")
+    record.write_bytes(module._SCRATCH_SIGNATURE)
+    abandoned.mkdir()
+    (abandoned / "linked-object").hardlink_to(external)
+    try:
+        for _ in range(2):
+            with module.isolated_environment(ROOT, environ=environment, windows=False):
+                assert not abandoned.exists() and not record.exists()
+                assert external.read_bytes() == b"git object"
+                assert external.stat().st_mode == original.st_mode
+                assert external.stat().st_nlink == 1
+    finally:
+        external.chmod(stat.S_IREAD | stat.S_IWRITE)
+
+
 def test_test_scratch_reports_a_failed_removal_and_retries_on_the_next_run(
     test_runner_module: Any, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

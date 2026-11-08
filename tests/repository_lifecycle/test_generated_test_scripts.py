@@ -88,10 +88,20 @@ def test_generated_python_runner_cleans_owned_temp_even_with_overrides(
     repo = tmp_path / "runner"
     (repo / "scripts").mkdir(parents=True)
     marker = tmp_path / "observed.json"
+    external = tmp_path / "caller-owned-object"
+    external.write_bytes(b"git object")
+    readonly = sys.platform == "win32"
+    if readonly:
+        external.chmod(0o444)
+    original_mode = external.stat().st_mode
+    for variable in ("TMP", "TEMP", "TMPDIR"):
+        monkeypatch.setenv(variable, str(tmp_path))
+    link = f"    (tmp_path / 'linked-object').hardlink_to(pathlib.Path({str(external)!r}))\n" if readonly else ""
     (repo / "test_probe.py").write_text(
         "import json, pathlib\n"
         "def test_probe(tmp_path):\n"
         f"    pathlib.Path({str(marker)!r}).write_text(json.dumps(str(tmp_path)))\n"
+        f"{link}"
         "    assert False\n"
     )
     runner = _write_generated_runner(repo, ["test_probe.py"])
@@ -103,14 +113,20 @@ def test_generated_python_runner_cleans_owned_temp_even_with_overrides(
     outside = tmp_path / "caller-temp"
     inherited = f'--basetemp="{tmp_path}"' if inherited_form == "joined" else f'--basetemp "{tmp_path}"'
     monkeypatch.setenv("PYTEST_ADDOPTS", "-q " + inherited)
-    result = subprocess.run([
-        "uv", "run", "--locked", str(runner), "--pytest-arg=--basetemp", "--pytest-arg=" + str(outside),
-        "--pytest-arg=--basetemp=" + str(repo),
-    ], cwd=repo, capture_output=True, text=True, check=False)
-    assert result.returncode == 1, result.stderr
-    observed = pathlib.Path(json.loads(marker.read_text()))
-    assert not observed.exists()
-    assert not outside.exists()
+    try:
+        result = subprocess.run([
+            "uv", "run", "--locked", str(runner), "--pytest-arg=--basetemp", "--pytest-arg=" + str(outside),
+            "--pytest-arg=--basetemp=" + str(repo),
+        ], cwd=repo, capture_output=True, text=True, check=False)
+        assert result.returncode == 1, result.stderr
+        observed = pathlib.Path(json.loads(marker.read_text()))
+        assert not observed.exists()
+        assert not outside.exists()
+        assert external.read_bytes() == b"git object"
+        assert external.stat().st_mode == original_mode and external.stat().st_nlink == 1
+    finally:
+        if readonly:
+            external.chmod(0o666)
 
 
 def _result_runner(tmp_path: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path]:

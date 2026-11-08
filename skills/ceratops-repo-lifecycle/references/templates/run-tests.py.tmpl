@@ -908,15 +908,56 @@ def _scratch_registry(scope: pathlib.Path) -> Iterator[None]:
         os.close(descriptor)
 
 
+if sys.platform == "win32":
+    def _unlink_readonly_scratch_hardlink(path: str) -> None:
+        """Remove the owned name while retaining attributes shared by other links."""
+        import ctypes
+        from ctypes import wintypes
+
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        open_file = kernel.CreateFileW
+        open_file.argtypes = [
+            wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+            wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+        ]
+        open_file.restype = wintypes.HANDLE
+        set_info = kernel.SetFileInformationByHandle
+        set_info.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD]
+        set_info.restype = wintypes.BOOL
+        close_handle = kernel.CloseHandle
+        close_handle.argtypes = [wintypes.HANDLE]
+        close_handle.restype = wintypes.BOOL
+
+        native_path = os.path.abspath(path)
+        if not native_path.startswith("\\\\?\\"):
+            if native_path.startswith("\\\\"):
+                native_path = "\\\\?\\UNC\\" + native_path[2:]
+            else:
+                native_path = "\\\\?\\" + native_path
+        # DELETE access, share read/write/delete, OPEN_EXISTING, OPEN_REPARSE_POINT.
+        handle = open_file(native_path, 0x00010000, 7, None, 3, 0x00200000, None)
+        if handle == ctypes.c_void_p(-1).value:
+            raise OSError(f"Cannot open test scratch link {path}: {ctypes.WinError(ctypes.get_last_error())}")
+        try:
+            # FileDispositionInfoEx: unlink this name and ignore read-only.
+            disposition = wintypes.DWORD(0x01 | 0x02 | 0x10)
+            if not set_info(handle, 21, ctypes.byref(disposition), ctypes.sizeof(disposition)):
+                raise OSError(f"Cannot unlink test scratch link {path}: {ctypes.WinError(ctypes.get_last_error())}")
+        finally:
+            close_handle(handle)
+
+
 def _remove_readonly_scratch(
     remove: Callable[[str], object], path: str, error: BaseException,
 ) -> None:
     entry = pathlib.Path(path).lstat()
-    if (os.name != "nt" or not isinstance(error, PermissionError)
+    if (sys.platform != "win32" or not isinstance(error, PermissionError)
             or entry.st_mode & stat.S_IWRITE
-            or getattr(entry, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
-            or (stat.S_ISREG(entry.st_mode) and entry.st_nlink != 1)):
+            or getattr(entry, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
         raise error
+    if stat.S_ISREG(entry.st_mode) and entry.st_nlink > 1:
+        _unlink_readonly_scratch_hardlink(path)
+        return
     os.chmod(path, entry.st_mode | stat.S_IWRITE)
     remove(path)
 
