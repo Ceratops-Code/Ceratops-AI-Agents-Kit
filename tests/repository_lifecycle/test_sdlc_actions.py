@@ -58,8 +58,8 @@ def test_explicit_group_requests_and_whole_phase_run_the_named_commands(tmp_path
         f"p=Path('{name}'); p.write_text(p.read_text()+'x' if p.exists() else 'x')",
     ]}]} for name in ("source", "interactive")}
     (repo / "sdlc/sdlc.yml").write_text(json.dumps({"version": 5, "kind": "ceratops-sdlc",
-        "repository": {"capabilities": {}, "actions": {"before-build-checks": {"check-groups": groups}}}}))
-    phase = "repository.actions.before-build-checks"
+        "repository": {"capabilities": {}, "actions": {"pre-build-checks": {"check-groups": groups}}}}))
+    phase = "repository.actions.pre-build-checks"
     for locations, source_count, interactive_count in (
         (phase + ".check-groups.source", 1, 0),
         (phase + ".check-groups.source", 2, 0),
@@ -83,13 +83,13 @@ def test_direct_after_group_receives_own_and_extra_files_without_running_sibling
     _phased_repository(tmp_path)
     path = tmp_path / "sdlc/sdlc.yml"
     document = json.loads(path.read_text())
-    document["repository"]["actions"].pop("after-build-checks")
+    document["repository"]["actions"].pop("post-build-checks")
     packages = document["deliverables"]["packages"]
     packages["supplier"] = deepcopy(packages["sample"])
     owner = "deliverables.packages.sample"
     extra = "deliverables.packages.supplier"
     groups = {
-        "combined": {"requires": {"capabilities": []}, "requires-artifacts": [extra], "steps": [{"run": [
+        "combined": {"requires": {"capabilities": []}, "uses-artifacts": [extra], "steps": [{"run": [
             sys.executable, "-c", "import json,sys; from pathlib import Path; files=json.loads(sys.argv[1]); "
             f"assert set(files)=={{{owner!r}, {extra!r}}}; "
             f"assert Path(files[{owner!r}][0]).read_bytes()==b'own'; "
@@ -99,14 +99,14 @@ def test_direct_after_group_receives_own_and_extra_files_without_running_sibling
             sys.executable, "-c", "raise AssertionError('unrequested sibling ran')",
         ]}]},
     }
-    packages["sample"]["actions"]["after-build-checks"] = {"check-groups": groups}
+    packages["sample"]["actions"]["post-build-checks"] = {"check-groups": groups}
     path.write_text(json.dumps(document))
     run_git(tmp_path, "add", ".")
     assert run_git(tmp_path, "commit", "-m", "combined output check").returncode == 0
     own_file, extra_file = tmp_path / ".git/own.bin", tmp_path / ".git/extra.bin"
     own_file.write_bytes(b"own")
     extra_file.write_bytes(b"extra")
-    name = owner + ".actions.after-build-checks.check-groups.combined"
+    name = owner + ".actions.post-build-checks.check-groups.combined"
     for _ in range(2):
         result = runner.execute_release_builds(tmp_path, [runner.OperationRequest(name)],
             artifacts={owner: [str(own_file)], extra: [str(extra_file)]})
@@ -168,7 +168,7 @@ def test_typed_tests_gate_mutations_and_ci_never_dispatches_handoffs(
         "kind": "ceratops-sdlc",
         "repository": {
             "capabilities": {},
-            "actions": {"before-build-checks": {"check-groups": {'source': {
+            "actions": {"pre-build-checks": {"check-groups": {'source': {
                     "requires": {"capabilities": []},
                     "no-op": "No extra structural checks.",
                 }, 'tests': {
@@ -179,10 +179,10 @@ def test_typed_tests_gate_mutations_and_ci_never_dispatches_handoffs(
         "deliverables": {
             "apps": {
                 "service": {
-                    "source": "apps/service",
+                    "root-dir": "apps/service",
                     "manifest": "apps/service/app.json",
-                    "prerequisites": [],
-                    "actions": {"before-build-checks": {"check-groups": {'tests': _run_action(
+                    "build-after": [],
+                    "actions": {"pre-build-checks": {"check-groups": {'tests': _run_action(
                             {"run": [sys.executable, "-c", "raise SystemExit(7)"]}
                         ), 'source': _run_action(
                             {
@@ -205,14 +205,15 @@ def test_typed_tests_gate_mutations_and_ci_never_dispatches_handoffs(
             }
         },
     }
+    (tmp_path / "apps/service").mkdir(parents=True)
     (tmp_path / "sdlc").mkdir()
     (tmp_path / "sdlc/sdlc.yml").write_text(json.dumps(declaration))
     location = "deliverables.apps.service.actions.install"
     selected = runner.validation_operations(
-        tmp_path, [location], ["repository.actions.before-build-checks.check-groups.source",
-                            "deliverables.apps.service.actions.before-build-checks.check-groups.source"]
+        tmp_path, [location], ["repository.actions.pre-build-checks.check-groups.source",
+                            "deliverables.apps.service.actions.pre-build-checks.check-groups.source"]
     )
-    assert "deliverables.apps.service.actions.before-build-checks.check-groups.tests" in selected
+    assert "deliverables.apps.service.actions.pre-build-checks.check-groups.tests" in selected
     calls: list[str] = []
 
     def record_handoff(
@@ -224,7 +225,7 @@ def test_typed_tests_gate_mutations_and_ci_never_dispatches_handoffs(
     monkeypatch.setattr(skill_actions, "execute_handoff", record_handoff)
     handoff = runner.prepare_operations(
         tmp_path,
-        [runner.OperationRequest("deliverables.apps.service.actions.before-build-checks.check-groups.source")],
+        [runner.OperationRequest("deliverables.apps.service.actions.pre-build-checks.check-groups.source")],
         context=mode,
     )[0]
     result = runner.execute_prepared_operation(handoff)
@@ -277,14 +278,14 @@ def test_ci_action_runs_skill_engine_without_repository_copies(
         "kind": "ceratops-sdlc",
         "repository": {
             "capabilities": {},
-            "actions": {"before-build-checks": {"check-groups": {'source': command("validation"), 'tests': command("tests")}}, },
+            "actions": {"pre-build-checks": {"check-groups": {'source': command("validation"), 'tests': command("tests")}}, },
         },
         "deliverables": {
             "skills": {
                 "service": {
-                    "source": "skills/service",
-                    "prerequisites": [],
-                    "actions": {"before-build-checks": {"check-groups": {'source': _run_action(
+                    "root-dir": "skills/service",
+                    "build-after": [],
+                    "actions": {"pre-build-checks": {"check-groups": {'source': _run_action(
                             {
                                 "handoff": {
                                     "lifecycle": "ceratops-skill-lifecycle",
@@ -305,11 +306,12 @@ def test_ci_action_runs_skill_engine_without_repository_copies(
             }
         },
     }
+    (repo / "skills/service").mkdir(parents=True)
     (repo / "sdlc/sdlc.yml").write_text(json.dumps(declaration))
     result = run_ci_action(repo, evidence, tmp_path / "action checkout", operations="\n".join([
-        "repository.actions.before-build-checks.check-groups.source",
-        "deliverables.skills.service.actions.before-build-checks.check-groups.source",
-        "repository.actions.before-build-checks.check-groups.tests",
+        "repository.actions.pre-build-checks.check-groups.source",
+        "deliverables.skills.service.actions.pre-build-checks.check-groups.source",
+        "repository.actions.pre-build-checks.check-groups.tests",
     ]))
     assert result.returncode == (1 if failure else 0), result.stderr
     payload = json.loads(result.stderr if failure else result.stdout)
@@ -334,15 +336,15 @@ def _run_action(*steps: dict[str, object]) -> dict[str, object]:
     return {"requires": {"capabilities": []}, "steps": list(steps)}
 
 
-def _typed_contract() -> dict[str, Any]:
+def _typed_contract(repo_root: pathlib.Path | None = None) -> dict[str, Any]:
     """Exercise package dependency records and separate lifecycle ownership."""
 
-    return {
+    document: dict[str, Any] = {
         "version": 4,
         "kind": "ceratops-sdlc",
         "repository": {
             "capabilities": {"uv": {"executable": "uv"}},
-            "actions": {"before-build-checks": {"check-groups": {'source': _run_action({"run": [sys.executable, "-c", "pass"]}), 'tests': {
+            "actions": {"pre-build-checks": {"check-groups": {'source': _run_action({"run": [sys.executable, "-c", "pass"]}), 'tests': {
                     "requires": {"capabilities": []},
                     "no-op": "No repository tests.",
                 }}}, },
@@ -350,9 +352,9 @@ def _typed_contract() -> dict[str, Any]:
         "deliverables": {
             "packages": {
                 "core": {
-                    "source": "packages/core",
+                    "root-dir": "packages/core",
                     "project": "packages/core/pyproject.toml",
-                    "prerequisites": [],
+                    "build-after": [],
                     "artifact": {
                         "type": "python-wheel",
                         "distribution": "core-tool",
@@ -364,9 +366,9 @@ def _typed_contract() -> dict[str, Any]:
                     },
                 },
                 "claims": {
-                    "source": "packages/claims",
+                    "root-dir": "packages/claims",
                     "project": "packages/claims/pyproject.toml",
-                    "prerequisites": ["core"],
+                    "build-after": ["deliverables.packages.core"],
                     "artifact": {
                         "type": "python-wheel",
                         "distribution": "claims-tool",
@@ -380,10 +382,10 @@ def _typed_contract() -> dict[str, Any]:
             },
             "mcp-servers": {
                 "insurance-claims-mcp-server": {
-                    "source": "packages/claims",
+                    "root-dir": "packages/claims",
                     "manifest": "packages/claims/mcp-server.json",
-                    "prerequisites": ["claims"],
-                    "actions": {"before-build-checks": {"check-groups": {'source': {
+                    "build-after": ["deliverables.packages.claims"],
+                    "actions": {"pre-build-checks": {"check-groups": {'source': {
                             "requires": {"capabilities": []},
                             "no-op": "Package tests cover the MCP server.",
                         }}}, "install": _run_action(
@@ -399,10 +401,10 @@ def _typed_contract() -> dict[str, Any]:
             },
             "apps": {
                 "claims-mobile": {
-                    "source": "apps/claims",
+                    "root-dir": "apps/claims",
                     "manifest": "apps/claims/AndroidManifest.xml",
-                    "prerequisites": ["claims"],
-                    "actions": {"before-build-checks": {"check-groups": {'source': {
+                    "build-after": ["deliverables.packages.claims"],
+                    "actions": {"pre-build-checks": {"check-groups": {'source': {
                             "requires": {"capabilities": []},
                             "no-op": "Repository checks cover the app.",
                         }}}, "install": _run_action(
@@ -418,9 +420,9 @@ def _typed_contract() -> dict[str, Any]:
             },
             "skills": {
                 "claims-catalog-invoice": {
-                    "source": "skills/claims-catalog-invoice",
-                    "prerequisites": ["claims"],
-                    "actions": {"before-build-checks": {"check-groups": {'source': _run_action(
+                    "root-dir": "skills/claims-catalog-invoice",
+                    "build-after": ["deliverables.packages.claims"],
+                    "actions": {"pre-build-checks": {"check-groups": {'source': _run_action(
                             {
                                 "handoff": {
                                     "lifecycle": "ceratops-skill-lifecycle",
@@ -441,6 +443,11 @@ def _typed_contract() -> dict[str, Any]:
             },
         },
     }
+    if repo_root is not None:
+        for deliverables in document["deliverables"].values():
+            for record in deliverables.values():
+                (repo_root / record["root-dir"]).mkdir(parents=True, exist_ok=True)
+    return document
 
 
 def test_typed_template_and_typed_operation_index(tmp_path: pathlib.Path) -> None:
@@ -453,23 +460,23 @@ def test_typed_template_and_typed_operation_index(tmp_path: pathlib.Path) -> Non
     assert document["version"] == contracts.latest_sdlc_version()
     assert list(contracts.operation_entries(document)) == [
         "repository.actions.bootstrap",
-        "repository.actions.before-build-checks.check-groups.source",
-        "repository.actions.before-build-checks.check-groups.tests",
+        "repository.actions.pre-build-checks.check-groups.source",
+        "repository.actions.pre-build-checks.check-groups.tests",
     ]
 
     fixture = _typed_contract()
     assert contracts.validation_errors(fixture) == []
     entries = contracts.operation_entries(fixture)
     assert set(entries) == {
-        "repository.actions.before-build-checks.check-groups.source",
-        "repository.actions.before-build-checks.check-groups.tests",
+        "repository.actions.pre-build-checks.check-groups.source",
+        "repository.actions.pre-build-checks.check-groups.tests",
         "deliverables.packages.core.actions.build",
         "deliverables.packages.claims.actions.build",
-        "deliverables.apps.claims-mobile.actions.before-build-checks.check-groups.source",
+        "deliverables.apps.claims-mobile.actions.pre-build-checks.check-groups.source",
         "deliverables.apps.claims-mobile.actions.install",
-        "deliverables.mcp-servers.insurance-claims-mcp-server.actions.before-build-checks.check-groups.source",
+        "deliverables.mcp-servers.insurance-claims-mcp-server.actions.pre-build-checks.check-groups.source",
         "deliverables.mcp-servers.insurance-claims-mcp-server.actions.install",
-        "deliverables.skills.claims-catalog-invoice.actions.before-build-checks.check-groups.source",
+        "deliverables.skills.claims-catalog-invoice.actions.pre-build-checks.check-groups.source",
         "deliverables.skills.claims-catalog-invoice.actions.install",
     }
     assert (
@@ -494,7 +501,7 @@ def test_typed_template_and_typed_operation_index(tmp_path: pathlib.Path) -> Non
 def test_typed_prerequisites_are_exposed_without_build_or_install(
     tmp_path: pathlib.Path,
 ) -> None:
-    fixture = _typed_contract()
+    fixture = _typed_contract(tmp_path)
     (tmp_path / "sdlc").mkdir()
     (tmp_path / "sdlc/sdlc.yml").write_text(json.dumps(fixture))
     _repository(tmp_path)
@@ -503,41 +510,41 @@ def test_typed_prerequisites_are_exposed_without_build_or_install(
     prepared = runner.prepare_operations(tmp_path, [runner.OperationRequest(location)])[
         0
     ]
-    assert list(prepared.prerequisites["packages"]) == ["core", "claims"]
-    assert prepared.prerequisites["packages"]["claims"]["action-locations"] == {
+    assert list(prepared.prerequisites["deliverables"]) == ["deliverables.packages.core", "deliverables.packages.claims"]
+    assert prepared.prerequisites["deliverables"]["deliverables.packages.claims"]["action-locations"] == {
         "build": "deliverables.packages.claims.actions.build"
     }
     assert prepared.steps[0].handoff["action"] == "deploy"
     assert runner.validation_operations(tmp_path, [location]) == [
-        "repository.actions.before-build-checks.check-groups.source",
-        "repository.actions.before-build-checks.check-groups.tests",
-        "deliverables.skills.claims-catalog-invoice.actions.before-build-checks.check-groups.source",
+        "repository.actions.pre-build-checks.check-groups.source",
+        "repository.actions.pre-build-checks.check-groups.tests",
+        "deliverables.skills.claims-catalog-invoice.actions.pre-build-checks.check-groups.source",
     ]
     assert runner.validation_operations(
         tmp_path, ["deliverables.apps.claims-mobile.actions.install"]
     ) == [
-        "repository.actions.before-build-checks.check-groups.source",
-        "repository.actions.before-build-checks.check-groups.tests",
-        "deliverables.apps.claims-mobile.actions.before-build-checks.check-groups.source",
+        "repository.actions.pre-build-checks.check-groups.source",
+        "repository.actions.pre-build-checks.check-groups.tests",
+        "deliverables.apps.claims-mobile.actions.pre-build-checks.check-groups.source",
     ]
     assert runner.validation_operations(
         tmp_path, ["deliverables.mcp-servers.insurance-claims-mcp-server.actions.install"]
     ) == [
-        "repository.actions.before-build-checks.check-groups.source",
-        "repository.actions.before-build-checks.check-groups.tests",
-        "deliverables.mcp-servers.insurance-claims-mcp-server.actions.before-build-checks.check-groups.source",
+        "repository.actions.pre-build-checks.check-groups.source",
+        "repository.actions.pre-build-checks.check-groups.tests",
+        "deliverables.mcp-servers.insurance-claims-mcp-server.actions.pre-build-checks.check-groups.source",
     ]
     result = run_operation_cli(tmp_path, location, prepare_only=True)
     assert result.returncode == 0
     payload = json.loads(result.stdout)
-    assert list(payload["prerequisites"]["packages"]) == ["core", "claims"]
+    assert list(payload["prerequisites"]["deliverables"]) == ["deliverables.packages.core", "deliverables.packages.claims"]
 
     app_location = "deliverables.apps.claims-mobile.actions.install"
     app_prepared = runner.prepare_operations(
         tmp_path, [runner.OperationRequest(app_location)]
     )[0]
-    assert list(app_prepared.prerequisites["packages"]) == ["core", "claims"]
-    assert app_prepared.prerequisites["packages"]["claims"]["action-locations"] == {
+    assert list(app_prepared.prerequisites["deliverables"]) == ["deliverables.packages.core", "deliverables.packages.claims"]
+    assert app_prepared.prerequisites["deliverables"]["deliverables.packages.claims"]["action-locations"] == {
         "build": "deliverables.packages.claims.actions.build"
     }
 
@@ -545,9 +552,9 @@ def test_typed_prerequisites_are_exposed_without_build_or_install(
 def test_typed_source_installed_mcp_server_needs_no_package_artifact(
     tmp_path: pathlib.Path,
 ) -> None:
-    fixture = _typed_contract()
+    fixture = _typed_contract(tmp_path)
     mcp_server = fixture["deliverables"]["mcp-servers"]["insurance-claims-mcp-server"]
-    mcp_server["prerequisites"] = []
+    mcp_server["build-after"] = []
     assert contracts.validation_errors(fixture) == []
 
     (tmp_path / "sdlc").mkdir()
@@ -557,13 +564,13 @@ def test_typed_source_installed_mcp_server_needs_no_package_artifact(
     prepared = runner.prepare_operations(tmp_path, [runner.OperationRequest(location)])[
         0
     ]
-    assert prepared.prerequisites["packages"] == {}
+    assert prepared.prerequisites["deliverables"] == {}
     assert prepared.steps[0].handoff["action"] == "install"
     assert not (tmp_path / "dist").exists()
 
 
 def test_typed_mcp_server_install_can_run_standalone_script(tmp_path: pathlib.Path) -> None:
-    fixture = _typed_contract()
+    fixture = _typed_contract(tmp_path)
     mcp_server = fixture["deliverables"]["mcp-servers"]["insurance-claims-mcp-server"]
     mcp_server["actions"]["install"] = _run_action(
         {
@@ -592,7 +599,7 @@ def test_typed_mcp_server_install_can_run_standalone_script(tmp_path: pathlib.Pa
 
 
 def test_typed_app_install_can_run_standalone_script(tmp_path: pathlib.Path) -> None:
-    fixture = _typed_contract()
+    fixture = _typed_contract(tmp_path)
     assert contracts.validation_errors(fixture) == []
     (tmp_path / "sdlc").mkdir()
     (tmp_path / "sdlc/sdlc.yml").write_text(json.dumps(fixture))
@@ -611,7 +618,7 @@ def test_typed_app_install_can_run_standalone_script(tmp_path: pathlib.Path) -> 
 
 
 def test_typed_declared_operation_result_is_validated(tmp_path: pathlib.Path) -> None:
-    fixture = _typed_contract()
+    fixture = _typed_contract(tmp_path)
     action = fixture["deliverables"]["apps"]["claims-mobile"]["actions"]["install"]
     action["result-schema"] = "ceratops-deployment-result.v1"
     payload = {
@@ -654,7 +661,7 @@ def test_typed_declared_operation_result_is_validated(tmp_path: pathlib.Path) ->
 def test_typed_invalid_required_result_retains_completed_side_effect(
     tmp_path: pathlib.Path,
 ) -> None:
-    fixture = _typed_contract()
+    fixture = _typed_contract(tmp_path)
     action = fixture["deliverables"]["apps"]["claims-mobile"]["actions"]["install"]
     action["result-schema"] = "ceratops-deployment-result.v1"
     action["steps"] = [
@@ -691,7 +698,7 @@ def test_typed_runs_commands_then_returns_structured_handoff(
     mode: str,
 ) -> None:
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "unregistered"))
-    fixture = _typed_contract()
+    fixture = _typed_contract(tmp_path)
     action = fixture["deliverables"]["skills"]["claims-catalog-invoice"]["actions"][
         "install"
     ]
@@ -727,8 +734,8 @@ def test_typed_runs_commands_then_returns_structured_handoff(
 
 
 def test_typed_package_build_waits_for_declared_test_gate(tmp_path: pathlib.Path) -> None:
-    fixture = _typed_contract()
-    fixture["repository"]["actions"]["before-build-checks"]["check-groups"]["tests"] = _run_action(
+    fixture = _typed_contract(tmp_path)
+    fixture["repository"]["actions"]["pre-build-checks"]["check-groups"]["tests"] = _run_action(
         {
             "run": [sys.executable, "-c", "raise SystemExit(7)"],
         }
@@ -755,15 +762,15 @@ def test_typed_package_build_waits_for_declared_test_gate(tmp_path: pathlib.Path
     [
         (
             lambda x: x["deliverables"]["skills"]["claims-catalog-invoice"].update(
-                prerequisites=["missing"]
+                **{"build-after": ["deliverables.packages.missing"]}
             ),
-            "unknown package missing",
+            "requires an executable build: deliverables.packages.missing",
         ),
         (
             lambda x: x["deliverables"]["packages"]["core"].update(
-                prerequisites=["claims"]
+                **{"build-after": ["deliverables.packages.claims"]}
             ),
-            "package prerequisite cycle",
+            "build dependency cycle",
         ),
         (
             lambda x: x["deliverables"]["mcp-servers"]["insurance-claims-mcp-server"]["actions"][
@@ -811,7 +818,7 @@ def test_typed_package_build_waits_for_declared_test_gate(tmp_path: pathlib.Path
             ]["steps"][0]["handoff"]["inputs"].update(
                 **{"prerequisite-packages": ["core"]}
             ),
-            "prerequisite-packages differ from prerequisites",
+            "prerequisite-packages differ from declared package requirements",
         ),
         (
             lambda x: x["repository"]["capabilities"]["uv"].update(
@@ -862,7 +869,7 @@ def test_typed_rejects_invalid_dependency_or_lifecycle_boundary(
             package="claims"
         ),
         lambda x: x["deliverables"]["mcp-servers"]["insurance-claims-mcp-server"].update(
-            prerequisites=["core", "claims"]
+            **{"build-after": ["deliverables.packages.claims", "deliverables.packages.claims"]}
         ),
         lambda x: x["deliverables"]["skills"]["claims-catalog-invoice"]["actions"][
             "install"
@@ -907,7 +914,7 @@ def _bundle_contract() -> dict[str, Any]:
         {"run": ["build-claims-mcp-server"]}
     )
     app = document["deliverables"]["apps"]["claims-mobile"]
-    app["prerequisites"] = ["core"]
+    app["build-after"] = ["deliverables.packages.core"]
     app["artifact"] = {
         "type": "application-archive",
         "output-directory": "dist/desktop",
@@ -944,7 +951,7 @@ def test_bundle_reader_keeps_shared_dependencies_out_of_membership(
         assert list(entries[name]["dependencies"]) == ["deliverables.packages.core"]
         dependency = entries[name]["dependencies"]["deliverables.packages.core"]
         assert dependency["release-bundle"] == "core"
-        assert dependency["source"] == "packages/core"
+        assert dependency["root-dir"] == "packages/core"
         assert dependency["artifact"]["type"] == "python-wheel"
         assert (
             dependency["action-locations"]["build"]
@@ -955,20 +962,63 @@ def test_bundle_reader_keeps_shared_dependencies_out_of_membership(
         mcp_server["action-locations"]["build"]
         == "deliverables.mcp-servers.insurance-claims-mcp-server.actions.build"
     )
-    assert mcp_server["prerequisites"] == ["claims"]
+    assert mcp_server["build-after"] == ["deliverables.packages.claims"]
     mcp_server["artifact"]["type"] = "changed-view"
     entries["claims"]["dependencies"]["deliverables.packages.core"][
-        "prerequisites"
+        "build-after"
     ].append("changed-view")
     assert loaded == original
     assert document == original
     assert list(tmp_path.iterdir()) == files_before
 
 
+def test_source_inventory_includes_owned_and_additional_files_once(tmp_path):
+    (tmp_path / ".gitignore").write_text("product/excluded.py\n")
+    _repository(tmp_path)
+    (tmp_path / "product").mkdir()
+    (tmp_path / "product/tracked.py").write_text("tracked")
+    (tmp_path / "product/new.py").write_text("new")
+    (tmp_path / "product/excluded.py").write_text("ignored")
+    (tmp_path / ".gitignore").write_text("product/excluded.py\n")
+    (tmp_path / "uv.lock").write_text("lock")
+    assert run_git(tmp_path, "add", "product/tracked.py").returncode == 0
+    root_only = {"root-dir": "product", "additional-source-files": []}
+    assert contracts.deliverable_source_files(tmp_path, root_only) == ["product/new.py", "product/tracked.py"]
+    expanded = {**root_only, "additional-source-files": ["**/*.py", "uv.lock"]}
+    assert contracts.deliverable_source_files(tmp_path, expanded) == ["product/new.py", "product/tracked.py", "uv.lock"]
+
+
+def test_bundle_requirements_keep_three_check_phases_and_unbundled_producers_separate():
+    document = _bundle_contract()
+    del document["repository"]["release-bundles"]["core"]
+    app = document["deliverables"]["apps"]["claims-mobile"]
+    owner = "deliverables.apps.claims-mobile"
+    core = "deliverables.packages.core"
+    claims = "deliverables.packages.claims"
+    app["build-after"] = []
+    action = app["actions"]
+    action["pre-build-checks"]["check-groups"]["source"]["uses-artifacts"] = [core]
+    action["build"]["uses-artifacts"] = [claims]
+    action["build"]["checks"] = {"archive": {"uses-artifacts": [core]}}
+    action["post-build-checks"] = {"check-groups": {"smoke": _run_action({"run": ["smoke"]})}}
+    assert contracts.validation_errors(document) == []
+    entries = contracts.release_bundle_entries(document)["desktop"]
+    member = entries["members"][owner]
+    assert member["build-uses-artifacts"] == [claims]
+    assert member["pre-build-checks-uses-artifacts"] == {
+        owner + ".actions.pre-build-checks.check-groups.source": [core]}
+    assert member["during-build-checks-uses-artifacts"] == {owner + ".actions.build.checks.archive": [core]}
+    assert member["post-build-checks-uses-artifacts"] == {
+        owner + ".actions.post-build-checks.check-groups.smoke": [owner]}
+    assert list(entries["dependencies"]) == [core, claims]
+    assert "release-bundle" not in entries["dependencies"][core]
+    assert entries["dependencies"][claims]["release-bundle"] == "claims"
+
+
 def test_bundle_reader_resolves_transitive_dependency_owners() -> None:
     document = _bundle_contract()
     app = document["deliverables"]["apps"]["claims-mobile"]
-    app["prerequisites"] = ["claims"]
+    app["build-after"] = ["deliverables.packages.claims"]
     assert contracts.validation_errors(document) == []
     dependencies = contracts.release_bundle_entries(document)["desktop"]["dependencies"]
     assert list(dependencies) == [
@@ -996,9 +1046,9 @@ def test_bundle_release_members_support_non_python_artifacts(kind: str, name: st
     if kind == "hooks":
         document["deliverables"]["hooks"] = {
             name: {
-                "source": "hooks",
-                "prerequisites": ["core"],
-                "actions": {"before-build-checks": {"check-groups": {'source': {
+                "root-dir": "hooks",
+                "build-after": ["deliverables.packages.core"],
+                "actions": {"pre-build-checks": {"check-groups": {'source': {
                         "requires": {"capabilities": []},
                         "no-op": "Covered by repository validation.",
                     }}}, "install": _run_action({"run": ["install-hook"]})},
@@ -1036,7 +1086,6 @@ def test_bundle_release_members_support_non_python_artifacts(kind: str, name: st
         "invalid_reference",
         "unknown_field",
         "unknown_dependency",
-        "unowned_dependency",
         "package_cycle",
         "no_artifact",
         "no_build",
@@ -1068,11 +1117,9 @@ def test_bundle_rejects_invalid_release_declarations(
     elif problem == "unknown_field":
         units["claims"]["additional-inputs"] = ["outside/member.py"]
     elif problem == "unknown_dependency":
-        core["prerequisites"] = ["missing"]
-    elif problem == "unowned_dependency":
-        del units["core"]
+        core["build-after"] = ["deliverables.packages.missing"]
     elif problem == "package_cycle":
-        core["prerequisites"] = ["claims"]
+        core["build-after"] = ["deliverables.packages.claims"]
     elif problem == "no_artifact":
         del mcp_server["artifact"]
     elif problem == "no_build":
@@ -1109,21 +1156,21 @@ def test_bundle_rejects_unit_cycle_even_when_package_graph_is_acyclic() -> None:
     packages = document["deliverables"]["packages"]
     packages["left-leaf"] = deepcopy(packages["core"])
     packages["right-root"] = deepcopy(packages["core"])
-    packages["right-root"]["prerequisites"] = ["left-leaf"]
+    packages["right-root"]["build-after"] = ["deliverables.packages.left-leaf"]
     units = document["repository"]["release-bundles"]
     units["claims"]["members"].append("deliverables.packages.left-leaf")
     units["core"]["members"].append("deliverables.packages.right-root")
     errors = contracts.validation_errors(document)
     assert any("release-bundle dependency cycle" in error for error in errors)
-    assert not any("package prerequisite cycle" in error for error in errors)
+    assert not any("build dependency cycle" in error for error in errors)
 
 
 @pytest.mark.parametrize(
     "field,bad_path",
     [
-        ("source", "../escape"),
-        ("source", "C:outside"),
-        ("source", "C:/outside"),
+        ("root-dir", "../escape"),
+        ("root-dir", "C:outside"),
+        ("root-dir", "C:/outside"),
         ("project", "/outside/pyproject.toml"),
         ("manifest", r"mcp-servers\outside.json"),
         ("output-directory", "dist/../../escape"),
@@ -1131,7 +1178,7 @@ def test_bundle_rejects_unit_cycle_even_when_package_graph_is_acyclic() -> None:
         ("filename-pattern", "C:*.whl"),
         ("cwd", "../escape"),
         ("cwd", r"mcp-servers\outside"),
-        ("source", "invalid\x00name"),
+        ("root-dir", "invalid\x00name"),
         ("project", "invalid\nname"),
     ],
 )
@@ -1193,13 +1240,16 @@ def test_bundle_prepare_and_gates_keep_typed_deliverable_selection(
     mcp_servers["other-mcp-server"]["actions"]["install"]["steps"][0]["handoff"]["inputs"][
         "mcp-server"
     ] = "other-mcp-server"
-    mcp_servers["other-mcp-server"]["actions"]["before-build-checks"]["check-groups"]["tests"] = _run_action(
+    mcp_servers["other-mcp-server"]["actions"]["pre-build-checks"]["check-groups"]["tests"] = _run_action(
         {"run": ["other-tests"]}
     )
     selected_mcp_server = mcp_servers["insurance-claims-mcp-server"]
-    selected_mcp_server["actions"]["before-build-checks"]["check-groups"]["tests"] = _run_action(
+    selected_mcp_server["actions"]["pre-build-checks"]["check-groups"]["tests"] = _run_action(
         {"run": ["selected-tests"]}
     )
+    for group in document["deliverables"].values():
+        for record in group.values():
+            (tmp_path / record["root-dir"]).mkdir(parents=True, exist_ok=True)
     (tmp_path / "sdlc").mkdir()
     (tmp_path / "sdlc/sdlc.yml").write_text(json.dumps(document), encoding="utf-8")
     _repository(tmp_path)
@@ -1208,17 +1258,17 @@ def test_bundle_prepare_and_gates_keep_typed_deliverable_selection(
         0
     ]
     assert prepared.category == "build"
-    assert list(prepared.prerequisites["packages"]) == ["core", "claims"]
+    assert list(prepared.prerequisites["deliverables"]) == ["deliverables.packages.core", "deliverables.packages.claims"]
     gates = runner.validation_operations(tmp_path, [location])
     assert gates == [
-        "repository.actions.before-build-checks.check-groups.source",
-        "repository.actions.before-build-checks.check-groups.tests",
-        "deliverables.mcp-servers.insurance-claims-mcp-server.actions.before-build-checks.check-groups.source",
-        "deliverables.mcp-servers.insurance-claims-mcp-server.actions.before-build-checks.check-groups.tests",
+        "repository.actions.pre-build-checks.check-groups.source",
+        "repository.actions.pre-build-checks.check-groups.tests",
+        "deliverables.mcp-servers.insurance-claims-mcp-server.actions.pre-build-checks.check-groups.source",
+        "deliverables.mcp-servers.insurance-claims-mcp-server.actions.pre-build-checks.check-groups.tests",
     ]
     assert (
         runner.validation_operations(
-            tmp_path, [location], ["repository.actions.before-build-checks.check-groups.source"]
+            tmp_path, [location], ["repository.actions.pre-build-checks.check-groups.source"]
         )
         == gates
     )
@@ -1226,4 +1276,4 @@ def test_bundle_prepare_and_gates_keep_typed_deliverable_selection(
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
     assert payload["status"] == "prepared"
-    assert list(payload["prerequisites"]["packages"]) == ["core", "claims"]
+    assert list(payload["prerequisites"]["deliverables"]) == ["deliverables.packages.core", "deliverables.packages.claims"]

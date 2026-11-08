@@ -36,7 +36,7 @@ repository:
       parameters: [base, head]
       steps:
         - run: [uv, run, --project, scripts, --locked, python, scripts/testing/run-tests.py, --select-only, --base, "{base}", --head, "{head}"]
-    before-build-checks:
+    pre-build-checks:
       check-groups:
         source:
           check-results:
@@ -64,11 +64,11 @@ repository:
 deliverables:
   mcp-servers:
     ceratops-mcp-server-manager:
-      source: mcp-servers/ceratops_mcp_server_manager
+      root-dir: mcp-servers/ceratops_mcp_server_manager
       manifest: mcp-servers/ceratops_mcp_server_manager/mcp-server.json
-      prerequisites: []
+      build-after: []
       actions:
-        before-build-checks:
+        pre-build-checks:
           check-groups:
             source:
               requires:
@@ -85,11 +85,11 @@ deliverables:
             - run: [uv, run, --project, scripts, --locked, python, scripts/deploy-mcp-server-manager.py]
 
     source_search_mcp:
-      source: tools
+      root-dir: tools
       manifest: tools/mcp-server.json
-      prerequisites: []
+      build-after: []
       actions:
-        before-build-checks:
+        pre-build-checks:
           check-groups:
             source:
               requires:
@@ -111,10 +111,10 @@ deliverables:
 
   skills:
     ceratops-automation-run:
-      source: skills/ceratops-automation-run
-      prerequisites: []
+      root-dir: skills/ceratops-automation-run
+      build-after: []
       actions:
-        before-build-checks:
+        pre-build-checks:
           check-groups:
             source:
               requires:
@@ -135,10 +135,10 @@ deliverables:
                 inputs:
                   skill: ceratops-automation-run
     ceratops-code-consistency-audit:
-      source: skills/ceratops-code-consistency-audit
-      prerequisites: []
+      root-dir: skills/ceratops-code-consistency-audit
+      build-after: []
       actions:
-        before-build-checks:
+        pre-build-checks:
           check-groups:
             source:
               requires: {capabilities: []}
@@ -147,10 +147,10 @@ deliverables:
           requires: {capabilities: []}
           steps: [{handoff: {lifecycle: ceratops-skill-lifecycle, action: deploy, inputs: {skill: ceratops-code-consistency-audit}}}]
     ceratops-credit-savings-analysis:
-      source: skills/ceratops-credit-savings-analysis
-      prerequisites: []
+      root-dir: skills/ceratops-credit-savings-analysis
+      build-after: []
       actions:
-        before-build-checks:
+        pre-build-checks:
           check-groups:
             source:
               requires: {capabilities: []}
@@ -159,10 +159,10 @@ deliverables:
           requires: {capabilities: []}
           steps: [{handoff: {lifecycle: ceratops-skill-lifecycle, action: deploy, inputs: {skill: ceratops-credit-savings-analysis}}}]
     ceratops-design-document-lifecycle:
-      source: skills/ceratops-design-document-lifecycle
-      prerequisites: []
+      root-dir: skills/ceratops-design-document-lifecycle
+      build-after: []
       actions:
-        before-build-checks:
+        pre-build-checks:
           check-groups:
             source:
               requires: {capabilities: []}
@@ -171,10 +171,10 @@ deliverables:
           requires: {capabilities: []}
           steps: [{handoff: {lifecycle: ceratops-skill-lifecycle, action: deploy, inputs: {skill: ceratops-design-document-lifecycle}}}]
     ceratops-governance-lifecycle:
-      source: skills/ceratops-governance-lifecycle
-      prerequisites: []
+      root-dir: skills/ceratops-governance-lifecycle
+      build-after: []
       actions:
-        before-build-checks:
+        pre-build-checks:
           check-groups:
             source:
               requires: {capabilities: []}
@@ -183,10 +183,10 @@ deliverables:
           requires: {capabilities: []}
           steps: [{handoff: {lifecycle: ceratops-skill-lifecycle, action: deploy, inputs: {skill: ceratops-governance-lifecycle}}}]
     ceratops-misunderstanding-audit:
-      source: skills/ceratops-misunderstanding-audit
-      prerequisites: []
+      root-dir: skills/ceratops-misunderstanding-audit
+      build-after: []
       actions:
-        before-build-checks:
+        pre-build-checks:
           check-groups:
             source:
               requires: {capabilities: []}
@@ -195,10 +195,10 @@ deliverables:
           requires: {capabilities: []}
           steps: [{handoff: {lifecycle: ceratops-skill-lifecycle, action: deploy, inputs: {skill: ceratops-misunderstanding-audit}}}]
     ceratops-repo-lifecycle:
-      source: skills/ceratops-repo-lifecycle
-      prerequisites: []
+      root-dir: skills/ceratops-repo-lifecycle
+      build-after: []
       actions:
-        before-build-checks:
+        pre-build-checks:
           check-groups:
             source:
               requires: {capabilities: []}
@@ -207,10 +207,10 @@ deliverables:
           requires: {capabilities: []}
           steps: [{handoff: {lifecycle: ceratops-skill-lifecycle, action: deploy, inputs: {skill: ceratops-repo-lifecycle}}}]
     ceratops-skill-lifecycle:
-      source: skills/ceratops-skill-lifecycle
-      prerequisites: []
+      root-dir: skills/ceratops-skill-lifecycle
+      build-after: []
       actions:
-        before-build-checks:
+        pre-build-checks:
           check-groups:
             source:
               requires: {capabilities: []}
@@ -219,10 +219,10 @@ deliverables:
           requires: {capabilities: []}
           steps: [{handoff: {lifecycle: ceratops-skill-lifecycle, action: deploy, inputs: {skill: ceratops-skill-lifecycle}}}]
     ceratops-task-lifecycle:
-      source: skills/ceratops-task-lifecycle
-      prerequisites: []
+      root-dir: skills/ceratops-task-lifecycle
+      build-after: []
       actions:
-        before-build-checks:
+        pre-build-checks:
           check-groups:
             source:
               requires: {capabilities: []}
@@ -231,10 +231,10 @@ deliverables:
           requires: {capabilities: []}
           steps: [{handoff: {lifecycle: ceratops-skill-lifecycle, action: deploy, inputs: {skill: ceratops-task-lifecycle}}}]
     ceratops-mcp-server-lifecycle:
-      source: skills/ceratops-mcp-server-lifecycle
-      prerequisites: []
+      root-dir: skills/ceratops-mcp-server-lifecycle
+      build-after: []
       actions:
-        before-build-checks:
+        pre-build-checks:
           check-groups:
             source:
               requires: {capabilities: []}
@@ -243,10 +243,10 @@ deliverables:
           requires: {capabilities: []}
           steps: [{handoff: {lifecycle: ceratops-skill-lifecycle, action: deploy, inputs: {skill: ceratops-mcp-server-lifecycle}}}]
     codex-desktop-upgrade:
-      source: skills/codex-desktop-upgrade
-      prerequisites: []
+      root-dir: skills/codex-desktop-upgrade
+      build-after: []
       actions:
-        before-build-checks:
+        pre-build-checks:
           check-groups:
             source:
               requires: {capabilities: []}
@@ -257,10 +257,10 @@ deliverables:
 
   hooks:
     codex-hooks:
-      source: hooks
-      prerequisites: []
+      root-dir: hooks
+      build-after: []
       actions:
-        before-build-checks:
+        pre-build-checks:
           check-groups:
             source:
               requires:

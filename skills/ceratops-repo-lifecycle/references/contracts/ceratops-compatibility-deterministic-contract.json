@@ -61,7 +61,7 @@
   ],
   "generated_manifest_profile": "ceratops-compatible",
   "managed_skill_operations": {
-    "before-build-checks": {
+    "pre-build-checks": {
       "check-groups": {
         "source": {
           "requires": {
@@ -208,7 +208,7 @@
     "inputs": {
       "repo-root": "${{ github.workspace }}",
       "evidence-file": "${{ runner.temp }}/repository-validation.log",
-      "operations": "repository.actions.before-build-checks"
+      "operations": "repository.actions.pre-build-checks"
     }
   },
   "ci_dependency_updates": {

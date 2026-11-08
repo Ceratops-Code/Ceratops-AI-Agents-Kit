@@ -59,20 +59,18 @@ and publication.
   `--repo-root PATH --sdlc-contract PATH --operation LOCATION`; repeat the last
   flag in order. Locations use `repository.actions.ACTION` or
   `deliverables.KIND.NAME.actions.ACTION`.
-- For SDLC v4 or v5, read the package prerequisites and action locations
-  returned by `--prepare-only` before a dependent action; select prerequisite
-  actions explicitly after checking their artifact state. A structured
-  `steps.handoff` is pending work for the named lifecycle, not evidence that
-  validation, installation, or publication completed.
+- `--prepare-only` reports tool capabilities, build order, and file requirements.
+  The operation runner completes or reuses required builds for the requested
+  action. A structured `steps.handoff` is pending work for the named lifecycle,
+  not evidence that validation, installation, or publication completed.
 - Reject SDLC v1 through v3 in the shared loader and require the repository to
   upgrade its contract before any operation executes. Installer release-number
   differences alone do not establish incompatibility.
 - Apply new compatibility declarations as SDLC v4 with separate validation and
   tests. Compatibility checks and application must accept existing v5
   declarations, preserve their v5-only data, and never rewrite them to v4.
-- Read declared prerequisite metadata before setup; run only explicitly chosen
-  bootstrap operations. Prerequisites and artifact identity are annotations,
-  not inferred check or installation commands.
+- Read declared tool requirements before setup. Run only explicitly requested
+  bootstrap, installation, or publication actions.
 - For SDLC v4 or v5, run skill-owned deterministic action bindings through the
   SDLC engine. Return unresolved routes as blockers before dependent mutation.
   CI defers every skill handoff without claiming its action completed.

@@ -1257,8 +1257,8 @@ def test_repository_ship_prevalidates_and_executes_ordered_phase_selections(
     ]
     assert result["deployment"]["completed_operations"] == [shipping_cases.LOCAL]
     assert prepare_calls
-    assert "repository.actions.before-build-checks.check-groups.source" in next(
-        command for command in commands if "repository.actions.before-build-checks.check-groups.source" in command
+    assert "repository.actions.pre-build-checks.check-groups.source" in next(
+        command for command in commands if "repository.actions.pre-build-checks.check-groups.source" in command
     )
 
 
@@ -1338,7 +1338,7 @@ def test_composed_promotion_and_shipping_each_run_their_validation_boundary(
         repo,
         repository={
             "capabilities": {},
-            "actions": {"before-build-checks": {"check-groups": {'source': {
+            "actions": {"pre-build-checks": {"check-groups": {'source': {
                     "requires": {"capabilities": []},
                     "steps": [{"run": [sys.executable, "other-verifier.py"]}],
                 }, 'tests': {

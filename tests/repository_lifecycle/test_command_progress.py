@@ -47,14 +47,14 @@ def test_sdlc_command_environment_stays_scoped_across_fresh_calls(
     repo, _, _, _ = prepare_repository_lifecycle_repo(tmp_path)
     write_sdlc_contract(repo, repository={
         "capabilities": {},
-        "actions": {"before-build-checks": {"check-groups": {'source': {
+        "actions": {"pre-build-checks": {"check-groups": {'source': {
                 "requires": {"capabilities": []}, "steps": [{"run": argv}],
             }, 'tests': {
                 "requires": {"capabilities": []}, "no-op": "Environment boundary fixture.",
             }}}, },
     })
     prepared = runner.prepare_operations(
-        repo, [runner.OperationRequest("repository.actions.before-build-checks.check-groups.source")], context="skill",
+        repo, [runner.OperationRequest("repository.actions.pre-build-checks.check-groups.source")], context="skill",
     )[0]
     monkeypatch.setenv("VIRTUAL_ENV", "caller-owned-environment")
     monkeypatch.setenv("SCOPED_ENVIRONMENT_TEST", "preserved")
@@ -204,7 +204,7 @@ def test_promotion_streams_real_pytest_progress_through_every_parent(
     )
     write_sdlc_contract(repo, repository={
         "capabilities": {},
-        "actions": {"before-build-checks": {"check-groups": {'source': {"requires": {"capabilities": []}, "no-op": "No check in fixture."}, 'tests': {
+        "actions": {"pre-build-checks": {"check-groups": {'source': {"requires": {"capabilities": []}, "no-op": "No check in fixture."}, 'tests': {
                 "requires": {"capabilities": []},
                 "steps": [{"run": [sys.executable, "scripts/testing/run-tests.py", "tests/test_probe.py"]}],
             }}}, },

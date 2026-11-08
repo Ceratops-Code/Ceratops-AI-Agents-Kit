@@ -1,6 +1,6 @@
 version: 5
 kind: ceratops-sdlc
-# Lifecycle order: before-build-checks, build, after-build-checks, then requested delivery.
+# Lifecycle order: pre-build-checks, build, post-build-checks, then requested delivery.
 # The SDLC runner invokes repository validation and tests before deployment.
 # Repository scripts own result storage, reuse and applicability; success is exit 0.
 # Keep source scans and tests in separate check-groups; each group owns its command.
@@ -17,7 +17,7 @@ repository:
         capabilities: [uv]
       steps:
         - run: [uv, sync, --project, scripts, --locked]
-    before-build-checks:
+    pre-build-checks:
       check-groups:
         source:
           requires:

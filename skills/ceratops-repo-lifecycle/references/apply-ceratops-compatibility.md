@@ -159,9 +159,9 @@ Infer the source identity from stable repository evidence before asking.
   sections to `skills/sections/`, and remove generated section blocks from
   source skills.
 - Create or update `sdlc/sdlc.yml` from the owned template, preserving target
-  capabilities and separate source/test commands in `before-build-checks`
+  capabilities and separate source/test commands in `pre-build-checks`
   groups. For each source skill, add `deliverables.skills.<name>` with
-  `actions.before-build-checks.check-groups.source` handing off to
+  `actions.pre-build-checks.check-groups.source` handing off to
   `ceratops-skill-lifecycle/source-validate` and `actions.install` handing off
   to `ceratops-skill-lifecycle/deploy`. Preserve target-owned entries;
   deployment alternatives are not automatic defaults.

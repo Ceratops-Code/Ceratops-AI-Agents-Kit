@@ -89,11 +89,11 @@ def _worktree_build_case(tmp_path):
     _write_fixture_bytes(repository, "unrelated.txt", b"original")
     _write_fixture_bytes(repository, ".gitignore", b".build-count\n.fail-build\n")
     no_op = {"requires": {"capabilities": []}, "no-op": "No additional checks for this fixture."}
-    contract = {"version": 5, "kind": "ceratops-sdlc", "repository": {"capabilities": {}, "actions": {"before-build-checks": {"check-groups": {'source': no_op, 'tests': no_op}}, }},
+    contract = {"version": 5, "kind": "ceratops-sdlc", "repository": {"capabilities": {}, "actions": {"pre-build-checks": {"check-groups": {'source': no_op, 'tests': no_op}}, }},
                 "deliverables": {"packages": {"claims": {
-                    "source": ".", "project": "pyproject.toml", "prerequisites": [],
+                    "root-dir": ".", "project": "pyproject.toml", "build-after": [],
                     "artifact": {"type": "python-wheel", "distribution": "claims", "output-directory": "dist", "filename-pattern": "*.whl"},
-                    "actions": {"before-build-checks": {"check-groups": {'source': no_op, 'tests': no_op}}, "build": {"requires": {"capabilities": []},
+                    "actions": {"pre-build-checks": {"check-groups": {'source': no_op, 'tests': no_op}}, "build": {"requires": {"capabilities": []},
                         "parameters": ["version", "artifact_directory"],
                         "steps": [{"run": [sys.executable, "scripts/build.py", "{artifact_directory}", "{version}"]}]}}
                 }}}}

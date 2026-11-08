@@ -600,9 +600,9 @@ if __name__ == '__main__':
         "scripts/runtime/install-managed-skills.py",
     ):
         (installed / script).write_text(probe)
-    fixture = _typed_contract()
+    fixture = _typed_contract(repo)
     skill = fixture["deliverables"]["skills"]["claims-catalog-invoice"]
-    for action in [*skill["actions"]["before-build-checks"]["check-groups"].values(), skill["actions"]["install"]]:
+    for action in [*skill["actions"]["pre-build-checks"]["check-groups"].values(), skill["actions"]["install"]]:
         action["steps"][-1]["handoff"]["inputs"]["prerequisite-packages"] = ["claims"]
     (repo / "sdlc").mkdir()
     (repo / "sdlc/sdlc.yml").write_text(json.dumps(fixture))
@@ -612,7 +612,7 @@ if __name__ == '__main__':
     return repo
 
 @pytest.mark.parametrize("mode", ["skill", "ci", "return"])
-@pytest.mark.parametrize("action", ["before-build-checks.check-groups.source", "install"])
+@pytest.mark.parametrize("action", ["pre-build-checks.check-groups.source", "install"])
 def test_typed_registered_skill_handoff_preserves_selection_prerequisites_and_receipt(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -620,14 +620,14 @@ def test_typed_registered_skill_handoff_preserves_selection_prerequisites_and_re
     action: str,
 ) -> None:
     repo = _registered_skill_fixture(tmp_path, monkeypatch)
-    if action == "before-build-checks.check-groups.source":
+    if action == "pre-build-checks.check-groups.source":
         _pin_python(tmp_path / "codex/skills/ceratops-skill-lifecycle")
     location = f"deliverables.skills.claims-catalog-invoice.actions.{action}"
     prepared = runner.prepare_operations(
         repo, [runner.OperationRequest(location)], context=mode
     )[0]
     result = runner.execute_prepared_operation(prepared)
-    assert list(result["prerequisites"]["packages"]) == ["core", "claims"]
+    assert list(result["prerequisites"]["deliverables"]) == ["deliverables.packages.core", "deliverables.packages.claims"]
     if mode != "skill":
         assert result["status"] == (
             "deferred_handoff" if mode == "ci" else "handoff_required"
@@ -639,7 +639,7 @@ def test_typed_registered_skill_handoff_preserves_selection_prerequisites_and_re
         json.loads(line) for line in (repo / "calls.jsonl").read_text().splitlines()
     ]
     expected: list[dict[str, str | None]] = [
-        {"mode": "skill" if action == "before-build-checks.check-groups.source" else None,
+        {"mode": "skill" if action == "pre-build-checks.check-groups.source" else None,
          "skill": "claims-catalog-invoice"}
     ]
     assert calls == expected
@@ -735,7 +735,7 @@ def test_ci_failure_evidence_repeats_after_interrupted_publish_or_deletion(tmp_p
     evidence.write_bytes(previous)
     peer = evidence.parent / "accepted-result.json"
     peer.write_bytes(b"accepted work")
-    result = {"status": "operation_failed" if failed else "completed", "operation": "repository.actions.before-build-checks.check-groups.tests"}
+    result = {"status": "operation_failed" if failed else "completed", "operation": "repository.actions.pre-build-checks.check-groups.tests"}
     current = (json.dumps(result, indent=2) + "\n").encode()
     effect = pathlib.Path.replace if failed else pathlib.Path.unlink
     target = evidence.with_name("." + evidence.name + ".operation-report.tmp") if failed else evidence

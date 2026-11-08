@@ -102,11 +102,11 @@
       "description": "Executable: generator supplies named v4 skill actions and removes only exact owned definitions when source skills disappear; loader validates materialized actions against the SDLC schema.",
       "additionalProperties": false,
       "required": [
-        "before-build-checks",
+        "pre-build-checks",
         "install"
       ],
       "properties": {
-        "before-build-checks": {
+        "pre-build-checks": {
           "type": "object",
           "additionalProperties": false,
           "required": [

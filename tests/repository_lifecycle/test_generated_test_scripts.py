@@ -46,7 +46,7 @@ def _write_generated_runner(root, targets):
     project.parent.mkdir(parents=True, exist_ok=True)
     if not project.exists():
         project.write_text('[project]\nname = "runner-tests"\nversion = "0.0.0"\ndependencies = ["pytest", "packaging"]\n')
-    sdlc = {"version": 4, "repository": {"actions": {"before-build-checks": {"check-groups": {'tests': {"steps": [{"run": ["uv", "run", "--locked", "scripts/run-tests.py"]}]}}}, }}}
+    sdlc = {"version": 4, "repository": {"actions": {"pre-build-checks": {"check-groups": {'tests': {"steps": [{"run": ["uv", "run", "--locked", "scripts/run-tests.py"]}]}}}, }}}
     content = generator.generated_test_runner(root, contract, sdlc, targets)
     assert content is not None
     planned: dict[pathlib.Path, str] = {}
@@ -538,7 +538,7 @@ def test_runner_ownership_is_explicit_and_custom_sources_are_preserved(tmp_path:
     root, runner, _ = _result_runner(tmp_path)
     module = importlib.import_module("ceratops_repo_compatibility_engine.generate_test_script")
     contract = importlib.import_module("ceratops_repo_compatibility_engine.compatibility_contract").load_compatibility_contract()
-    sdlc = {"version": 4, "repository": {"actions": {"before-build-checks": {"check-groups": {'tests': {"steps": [{"run": ["uv", "run", "--locked", "scripts/run-tests.py"]}]}}}, }}}
+    sdlc = {"version": 4, "repository": {"actions": {"pre-build-checks": {"check-groups": {'tests': {"steps": [{"run": ["uv", "run", "--locked", "scripts/run-tests.py"]}]}}}, }}}
     original = runner.read_bytes()
     (root / "scripts/pyproject.toml").write_text('[tool.ceratops.test-runner]\nmanaged = false\n')
     assert module.generated_test_runner(root, contract, sdlc, ["test_probe.py"]) is None

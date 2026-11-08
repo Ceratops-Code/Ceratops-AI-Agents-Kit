@@ -27,20 +27,19 @@ def _package_mcp_case(tmp_path, monkeypatch, problem=None):
     """Match the real failure: prerequisites exist only on the SDLC deliverable."""
     repo = tmp_path / "repository with spaces"
     repo.mkdir()
-    fixture = _typed_contract()
+    fixture = _typed_contract(repo)
     server_name = "insurance-claims-mcp-server"
     source = repo / "mcp-servers" / server_name
     source.mkdir(parents=True)
     server = fixture["deliverables"]["mcp-servers"][server_name]
-    server["source"] = str(source.relative_to(repo)).replace("\\", "/")
-    server["manifest"] = server["source"] + "/mcp-server.json"
+    server["root-dir"] = str(source.relative_to(repo)).replace("\\", "/")
+    server["manifest"] = server["root-dir"] + "/mcp-server.json"
     mcp_project = source / "pyproject.toml"
     mcp_project.write_text(
         '[project]\nname = "insurance-claims-mcp-server"\nversion = "1.0.1"\n'
         'dependencies = ["claims-tool==1.0.0"]\n', encoding="utf-8",
     )
     package = repo / "packages/claims"
-    package.mkdir(parents=True)
     project = package / "pyproject.toml"
     project.write_text('[project]\nname = "claims-tool"\nversion = "1.0.0"\n', encoding="utf-8")
     lock = package / "uv.lock"
@@ -75,7 +74,6 @@ def _package_mcp_case(tmp_path, monkeypatch, problem=None):
         mcp_project.write_text(mcp_project.read_text().replace(
             '"claims-tool==1.0.0"', '"claims-tool==1.0.0", "core-tool==2.0.0"'), encoding="utf-8")
         core = repo / "packages/core"
-        core.mkdir()
         (core / "pyproject.toml").write_text('[project]\nname = "core-tool"\nversion = "2.0.0"\n', encoding="utf-8")
         (core / "uv.lock").write_text("version = 1\n", encoding="utf-8")
         (repo / "dist/core").mkdir()
@@ -90,7 +88,7 @@ def _package_mcp_case(tmp_path, monkeypatch, problem=None):
         except OSError as exc:
             pytest.skip(f"This host cannot create the linked-path fixture: {exc}")
     elif problem == "source-only":
-        server["prerequisites"] = []
+        server["build-after"] = []
     (repo / "sdlc").mkdir()
     (repo / "sdlc/sdlc.yml").write_text(json.dumps(fixture), encoding="utf-8")
     binding_path = pathlib.Path("skills/ceratops-mcp-server-lifecycle/references/action-executors.json")
@@ -190,11 +188,11 @@ def test_source_only_mcp_keeps_existing_install_arguments(tmp_path, monkeypatch)
 @pytest.mark.parametrize("version", [4, 5])
 @pytest.mark.parametrize("name", ["source_search_mcp", "ceratops-mcp-server-manager"])
 def test_mcp_identity_survives_contract_preparation(tmp_path, version, name):
-    fixture = _typed_contract()
+    fixture = _typed_contract(tmp_path)
     fixture["version"] = version
     server = fixture["deliverables"]["mcp-servers"].pop("insurance-claims-mcp-server")
     fixture["deliverables"]["mcp-servers"][name] = server
-    server["prerequisites"] = []
+    server["build-after"] = []
     server["actions"]["install"]["steps"][0]["handoff"]["inputs"]["mcp-server"] = name
     assert contracts.validation_errors(fixture) == []
     (tmp_path / "sdlc").mkdir()

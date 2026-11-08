@@ -29,7 +29,7 @@ runs:
           operation="${operation%$'\r'}"
           [ -z "$operation" ] && continue
           case "$operation" in
-            *.actions.before-build-checks|*.actions.before-build-checks.check-groups.*|*.actions.after-build-checks|*.actions.after-build-checks.check-groups.*)
+            *.actions.pre-build-checks|*.actions.pre-build-checks.check-groups.*|*.actions.post-build-checks|*.actions.post-build-checks.check-groups.*)
               set -- "$@" --operation "$operation" ;;
             *) echo "Expected an SDLC check phase or group: $operation" >&2; exit 2 ;;
           esac

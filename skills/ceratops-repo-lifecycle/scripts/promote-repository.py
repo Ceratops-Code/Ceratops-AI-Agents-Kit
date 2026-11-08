@@ -278,7 +278,7 @@ def _validation_command(
     ]
     checks = validation_operations(repo_root, args.run_operation or [], args.validation_operation, args.sdlc_contract)
     for operation in checks:
-        if operation_category(operation) == "before-build-checks":
+        if operation_category(operation) == "pre-build-checks":
             command.extend(("--operation", operation))
     for parameter in args.parameter or []:
         command.extend(("--parameter-if-declared", parameter))
@@ -401,7 +401,7 @@ def _promotion_inputs(args: argparse.Namespace) -> tuple[pathlib.Path, list[str]
         if args.release_branch in branches or args.main_branch in branches:
             raise PromotionError("Source branches cannot be release or main.")
     _operation_ids(args.run_operation, "deploy-local")
-    _operation_ids(args.validation_operation, "before-build-checks")
+    _operation_ids(args.validation_operation, "pre-build-checks")
     _operation_ids(args.publish_operation, "publish")
     _operation_ids(args.deploy_operation, "deploy-local")
     if args.parameter and args.run_operation is None:

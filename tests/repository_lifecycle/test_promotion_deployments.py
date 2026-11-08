@@ -1082,7 +1082,7 @@ def test_standalone_handoff_return_preserves_reports_until_actual_completion_mat
     elif problem == "missing-source-commit":
         monkeypatch.setattr(runner, "repository_commit", lambda _root: None)
     elif problem == "extra-check":
-        arguments += ["--validation-operation", "repository.actions.before-build-checks"]
+        arguments += ["--validation-operation", "repository.actions.pre-build-checks"]
     if problem == "missing-input":
         completion.unlink()
     else:
@@ -1127,7 +1127,7 @@ def test_non_deployment_handoff_does_not_offer_installer_receipt_return(tmp_path
 
     runner = importlib.import_module("repository_operation")
     repo = _registered_skill_fixture(tmp_path, monkeypatch)
-    operation = "deliverables.skills.claims-catalog-invoice.actions.before-build-checks.check-groups.source"
+    operation = "deliverables.skills.claims-catalog-invoice.actions.pre-build-checks.check-groups.source"
     prepared = runner.prepare_operations(repo, [runner.OperationRequest(operation)], context="return")[0]
     pending = runner.execute_prepared_operation(prepared)
     assert pending["status"] == "handoff_required"

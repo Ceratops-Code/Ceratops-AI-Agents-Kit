@@ -34,7 +34,7 @@ the existing skill-lifecycle validator.
 - Keep this action read-only. Source validation does not establish installed
   runtime correctness or the semantic audit in `skills-consistency-review`.
 - SDLC callers use
-  `deliverables.skills.NAME.actions.before-build-checks.check-groups.source`
+  `deliverables.skills.NAME.actions.pre-build-checks.check-groups.source`
   with handoff `ceratops-skill-lifecycle/source-validate`; the action owns the
   helper invocation. A named-skill handoff checks that exact skill; an untargeted
   action checks the full source set. CI defers this route. Keep helper paths

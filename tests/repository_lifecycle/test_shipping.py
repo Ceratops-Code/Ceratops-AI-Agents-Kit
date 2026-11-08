@@ -75,7 +75,7 @@ def _setup(
             repo,
             repository={
                 "capabilities": {},
-                "actions": {"before-build-checks": {"check-groups": {'source': {
+                "actions": {"pre-build-checks": {"check-groups": {'source': {
                         "requires": {"capabilities": []},
                         "steps": [{"run": [sys.executable, "quality-check.py"]}],
                     }, 'tests': {
@@ -86,10 +86,10 @@ def _setup(
             deliverables={
                 "apps": {
                     "fixture": {
-                        "source": ".",
+                        "root-dir": ".",
                         "manifest": "code.txt",
-                        "prerequisites": [],
-                        "actions": {"before-build-checks": {"check-groups": {'source': {
+                        "build-after": [],
+                        "actions": {"pre-build-checks": {"check-groups": {'source': {
                                 "requires": {"capabilities": []},
                                 "no-op": "Repository validation covers this fixture.",
                             }}}, "install": {
@@ -1338,7 +1338,7 @@ def _saved_stage_fixture(
         "kind": "ceratops-sdlc",
         "repository": {
             "capabilities": {},
-            "actions": {"before-build-checks": {"check-groups": {
+            "actions": {"pre-build-checks": {"check-groups": {
                 "source": {**command("validation"), "requires": {"capabilities": []}},
                 "tests": {**command("tests"), "requires": {"capabilities": []}},
             }}},
@@ -1346,10 +1346,10 @@ def _saved_stage_fixture(
         "deliverables": {
             "apps": {
                 "fixture": {
-                    "source": "apps/fixture",
+                    "root-dir": "apps/fixture",
                     "manifest": "apps/fixture/app.json",
-                    "prerequisites": [],
-                    "actions": {"before-build-checks": {"check-groups": {'tests': {
+                    "build-after": [],
+                    "actions": {"pre-build-checks": {"check-groups": {'tests': {
                             "requires": {"capabilities": []},
                             "no-op": "Repository tests cover this deliverable.",
                         }, 'source': {
@@ -1363,6 +1363,7 @@ def _saved_stage_fixture(
             }
         },
     }
+    (repo / "apps/fixture").mkdir(parents=True)
     (repo / "sdlc/sdlc.yml").write_text(json.dumps(contract), encoding="utf-8")
     assert run_git(repo, "init", "--quiet").returncode == 0
     assert run_git(repo, "add", ".").returncode == 0
@@ -1406,7 +1407,7 @@ def test_promotion_skips_rechecks_only_for_codex_desktop_repositories(
     assert runner.main(
         [
             *base,
-            "--operation", "repository.actions.before-build-checks",
+            "--operation", "repository.actions.pre-build-checks",
             "--commit",
             head,
             "--test-trigger",
@@ -1418,7 +1419,7 @@ def test_promotion_skips_rechecks_only_for_codex_desktop_repositories(
     assert result["results"] == []
     assert not (repo / ".build/events").exists()
 
-    assert runner.main([*base, "--operation", "repository.actions.before-build-checks.check-groups.source"]) == 0
+    assert runner.main([*base, "--operation", "repository.actions.pre-build-checks.check-groups.source"]) == 0
     capsys.readouterr()
     assert (repo / ".build/events").read_text().splitlines() == ["validation"]
 
@@ -1456,9 +1457,9 @@ def test_delivery_uses_saved_stages_without_running_checks(
             == 0
         )
     base = ["--repo-root", str(repo)]
-    assert runner.main([*base, "--operation", "repository.actions.before-build-checks.check-groups.source"]) == 0
-    assert runner.main([*base, "--operation", "repository.actions.before-build-checks.check-groups.tests"]) == 0
-    assert runner.main([*base, "--operation", "repository.actions.before-build-checks.check-groups.tests"]) == 0
+    assert runner.main([*base, "--operation", "repository.actions.pre-build-checks.check-groups.source"]) == 0
+    assert runner.main([*base, "--operation", "repository.actions.pre-build-checks.check-groups.tests"]) == 0
+    assert runner.main([*base, "--operation", "repository.actions.pre-build-checks.check-groups.tests"]) == 0
     assert (repo / ".build/events").read_text().splitlines() == [
         "validation",
         "tests",
@@ -1493,7 +1494,7 @@ def test_delivery_rejects_inapplicable_latest_stage_without_retesting(
     runner = importlib.import_module("repository_operation")
     repo, deploy = _saved_stage_fixture(tmp_path)
     base = ["--repo-root", str(repo)]
-    assert runner.main([*base, "--operation", "repository.actions.before-build-checks"]) == 0
+    assert runner.main([*base, "--operation", "repository.actions.pre-build-checks"]) == 0
     if change == "source":
         (repo / "probe.py").write_text("changed source")
         assert runner.main([*base, "--operation", deploy]) == 1

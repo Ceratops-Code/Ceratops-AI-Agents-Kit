@@ -241,7 +241,7 @@ def test_promotion_hands_context_through_sdlc_to_requested_checks(
         "kind": "ceratops-sdlc",
         "repository": {
             "capabilities": {},
-            "actions": {"before-build-checks": {"check-groups": {'source': {
+            "actions": {"pre-build-checks": {"check-groups": {'source': {
                     "requires": {"capabilities": []},
                     "steps": [
                         {

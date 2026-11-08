@@ -215,7 +215,7 @@ def prepare_sdlc_configuration(
     reusable = load_contract(template_path("sdlc"))
     target = repo_root / surface_path("sdlc")
     contract = (
-        load_contract(target) if target.is_file()
+        load_contract(target, repo_root=repo_root) if target.is_file()
         else {**reusable, "version": latest_sdlc_version()}
     )
     # The versioned loader is the supported-format authority. Preserve its
@@ -225,9 +225,9 @@ def prepare_sdlc_configuration(
     capabilities = dict(repository.get("capabilities", {}))
     capabilities.setdefault("uv", {"executable": "uv"})
     actions = dict(repository.get("actions", {}))
-    checks = dict(actions.get("before-build-checks", {}).get("check-groups", {}))
+    checks = dict(actions.get("pre-build-checks", {}).get("check-groups", {}))
     existing_validation = checks.get("source")
-    template_validation = reusable["repository"]["actions"]["before-build-checks"]["check-groups"]["source"]
+    template_validation = reusable["repository"]["actions"]["pre-build-checks"]["check-groups"]["source"]
     owned_validation = dict(template_validation)
     if any(item["id"] == "shellcheck" for item in repository_checks.contract_checks(repo_root)):
         capabilities.setdefault("shellcheck", {"executable": "shellcheck"})
@@ -243,7 +243,7 @@ def prepare_sdlc_configuration(
         )
     actions.setdefault("bootstrap", reusable["repository"]["actions"]["bootstrap"])
     existing_test = checks.get("tests")
-    owned_test = reusable["repository"]["actions"]["before-build-checks"]["check-groups"]["tests"]
+    owned_test = reusable["repository"]["actions"]["pre-build-checks"]["check-groups"]["tests"]
     infer_tests = existing_test is None or existing_test == owned_test
     test_steps: list[dict[str, list[str]]] = []
     test_capabilities: list[str] = []
@@ -285,8 +285,8 @@ def prepare_sdlc_configuration(
             for index, step in enumerate(test_steps):
                 name = "tests" if index == 0 else str(step["run"][0]) + "-tests"
                 checks[name] = {"requires": {"capabilities": [test_capabilities[index]]}, "steps": [step]}
-    actions["before-build-checks"] = {"check-groups": checks}
-    order = ("bootstrap", "test-selection", "before-build-checks", "build", "after-build-checks", "install", "publish", "verify-publish")
+    actions["pre-build-checks"] = {"check-groups": checks}
+    order = ("bootstrap", "test-selection", "pre-build-checks", "build", "post-build-checks", "install", "publish", "verify-publish")
     actions = {name: actions[name] for name in order if name in actions}
     repository["capabilities"] = capabilities
     repository["actions"] = actions

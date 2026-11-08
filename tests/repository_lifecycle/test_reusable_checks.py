@@ -28,7 +28,7 @@ def check_store(tmp_path: pathlib.Path) -> Any:
 
 def context(level: str = "beta", **changes: Any) -> dict[str, Any]:
     value = {
-        "schema": store.CONTEXT_SCHEMA, "group": "repository.actions.before-build-checks.check-groups.tests", "scope": {"stage": "tests"},
+        "schema": store.CONTEXT_SCHEMA, "group": "repository.actions.pre-build-checks.check-groups.tests", "scope": {"stage": "tests"},
         "qualificationLevel": level, "workVersion": "1" * 40,
         "checkVersion": "2" * 64, "productInputs": {"src/product.py": "3" * 64},
         "checkInputs": {"tests/test_product.py": "4" * 64},
@@ -41,7 +41,7 @@ def context(level: str = "beta", **changes: Any) -> dict[str, Any]:
 
 
 def attempt(check_store: Any, inputs: dict[str, Any], *,
-            status: str = "passed", index: int = 0, check: str = "repository.actions.before-build-checks.check-groups.tests",
+            status: str = "passed", index: int = 0, check: str = "repository.actions.pre-build-checks.check-groups.tests",
             result_id: str | None = None) -> tuple[pathlib.Path, dict[str, Any]]:
     inputs = copy.deepcopy(inputs)
     inputs["group"] = check
@@ -72,7 +72,7 @@ def attempt(check_store: Any, inputs: dict[str, Any], *,
 def test_qualification_matrix_keeps_original_identity(check_store, earlier, candidate):
     path, original = attempt(check_store, context(earlier))
     selected = check_store.select(context(candidate, workVersion="7" * 40),
-                                  check_id="repository.actions.before-build-checks.check-groups.tests")
+                                  check_id="repository.actions.pre-build-checks.check-groups.tests")
     eligible = store.LEVELS.index(earlier) >= store.LEVELS.index(candidate)
     assert selected["decision"] == ("reuse" if eligible else "execute")
     if eligible:
@@ -95,7 +95,7 @@ def test_qualification_matrix_keeps_original_identity(check_store, earlier, cand
 def test_relevant_inputs_block_reuse(check_store, field, changed):
     attempt(check_store, context())
     assert check_store.select(context(**{field: changed}),
-                              check_id="repository.actions.before-build-checks.check-groups.tests")["decision"] == "execute"
+                              check_id="repository.actions.pre-build-checks.check-groups.tests")["decision"] == "execute"
 
 
 def test_newer_failure_only_resolves_with_matching_later_pass(check_store):
@@ -103,17 +103,17 @@ def test_newer_failure_only_resolves_with_matching_later_pass(check_store):
     failed, _ = attempt(check_store, context(), status="failed", index=2)
     attempt(check_store, context(), index=3, check="another-group")
     attempt(check_store, context(productInputs={"src/product.py": "9" * 64}), index=4)
-    selected = check_store.select(context(), check_id="repository.actions.before-build-checks.check-groups.tests")
+    selected = check_store.select(context(), check_id="repository.actions.pre-build-checks.check-groups.tests")
     assert selected["decision"] == "execute"
     _, record = attempt(check_store, context(), index=5)
-    assert check_store.select(context(), check_id="repository.actions.before-build-checks.check-groups.tests")["reference"]["result_id"] == record["result_id"]
+    assert check_store.select(context(), check_id="repository.actions.pre-build-checks.check-groups.tests")["reference"]["result_id"] == record["result_id"]
     assert failed.exists()
 
 
 @pytest.mark.parametrize("status", ["running", "interrupted", "failed"])
 def test_incomplete_or_unsuccessful_attempt_is_never_pass(check_store, status):
     attempt(check_store, context(), status=status)
-    assert check_store.select(context(), check_id="repository.actions.before-build-checks.check-groups.tests")["decision"] == "execute"
+    assert check_store.select(context(), check_id="repository.actions.pre-build-checks.check-groups.tests")["decision"] == "execute"
 
 
 @pytest.mark.parametrize("damage", ["corrupt", "level", "fingerprint", "identity", "duration", "checks", "extra", "subcheck", "status-type", "candidate", "operation", "subcheck-type"])
@@ -148,16 +148,16 @@ def test_malformed_or_conflicting_evidence_blocks_selection(check_store, damage)
             record["check_version"] = "0" * 64
         check_store.current.put("repository-check", record["check_id"], {"stage": "tests"}, record)
     with pytest.raises((ValueError, TypeError, KeyError)):
-        check_store.select(context(), check_id="repository.actions.before-build-checks.check-groups.tests")
+        check_store.select(context(), check_id="repository.actions.pre-build-checks.check-groups.tests")
 
 
 def test_absent_and_unknown_ownership_do_not_invent_evidence(check_store):
-    assert check_store.select(context(), check_id="repository.actions.before-build-checks.check-groups.tests")["decision"] == "execute"
+    assert check_store.select(context(), check_id="repository.actions.pre-build-checks.check-groups.tests")["decision"] == "execute"
     missing = context()
     missing["productInputs"] = {}
     missing["fingerprint"] = store.fingerprint(missing)
     with pytest.raises(ValueError, match="owned input"):
-        check_store.select(missing, check_id="repository.actions.before-build-checks.check-groups.tests")
+        check_store.select(missing, check_id="repository.actions.pre-build-checks.check-groups.tests")
 
 
 def test_record_schema_preserves_original_provenance_and_historical_receipts(check_store):
@@ -165,7 +165,7 @@ def test_record_schema_preserves_original_provenance_and_historical_receipts(che
     validator = results._operation_result_validator()
     assert list(validator.iter_errors(record)) == []
     original = copy.deepcopy(record)
-    selected = check_store.select(context("alpha"), check_id="repository.actions.before-build-checks.check-groups.tests")
+    selected = check_store.select(context("alpha"), check_id="repository.actions.pre-build-checks.check-groups.tests")
     reference_schema = {"$ref": "#/$defs/checkProvenance", "$defs": validator.schema["$defs"]}
     validator.__class__(reference_schema).validate(selected["reference"])
     assert record == original
@@ -185,7 +185,7 @@ def test_large_aggregate_retains_complete_original_test_references(check_store):
     assert 1024 * 1024 < len(raw) < store.MAX_RECORD_BYTES
     check_store.current.put("repository-check", record["check_id"], {"stage": "tests"}, record)
     assert store.read_check_result(path) == record
-    assert check_store.select(context(), check_id="repository.actions.before-build-checks.check-groups.tests")["record"] == record
+    assert check_store.select(context(), check_id="repository.actions.pre-build-checks.check-groups.tests")["record"] == record
     assert store.result_reference(path)["sha256"] == hashlib.sha256(raw).hexdigest()
 
 
@@ -213,7 +213,7 @@ def test_other_worktree_results_are_not_selected_after_its_removal(check_store):
     removed = support.run_git(root, "worktree", "remove", str(worktree))
     assert removed.returncode == 0
     assert path.exists()
-    assert check_store.select(context(), check_id="repository.actions.before-build-checks.check-groups.tests")["record"] is None
+    assert check_store.select(context(), check_id="repository.actions.pre-build-checks.check-groups.tests")["record"] is None
 
 
 def test_old_artifact_and_report_references_do_not_preserve_local_history(check_store):

@@ -1381,8 +1381,8 @@ def test_operation_runner_reports_command_shutdown_to_release_owner(tmp_path, mo
     repo, _, _, _ = prepare_repository_lifecycle_repo(tmp_path)
     commit = operations.repository_commit(repo)
     prepared = operations.PreparedOperation(
-        repo_root=repo, operation="repository.actions.before-build-checks.check-groups.tests",
-        category="before-build-checks", check_phase="before-build", check_group="tests",
+        repo_root=repo, operation="repository.actions.pre-build-checks.check-groups.tests",
+        category="pre-build-checks", check_phase="pre-build", check_group="tests",
         commit=commit, prerequisites={},
         steps=tuple(operations.PreparedStep(index, (name,), repo)
                     for index, name in enumerate(("fixture", "dependent"))),

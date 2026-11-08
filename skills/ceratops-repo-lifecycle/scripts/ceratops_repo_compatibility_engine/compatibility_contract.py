@@ -28,10 +28,10 @@ def _managed_skill_record(
     """Materialize one typed skill record from the owned action templates."""
 
     actions = copy.deepcopy(contract["managed_skill_operations"])
-    expected_routes = {"before-build-checks": "source-validate", "install": "deploy"}
+    expected_routes = {"pre-build-checks": "source-validate", "install": "deploy"}
     for action_name, route in expected_routes.items():
         operation = actions[action_name]
-        if action_name == "before-build-checks":
+        if action_name == "pre-build-checks":
             operation = operation["check-groups"]["source"]
         handoff = operation["steps"][0]["handoff"]
         if handoff["action"] != route or handoff["inputs"] != {"skill": "{skill}"}:
@@ -40,8 +40,8 @@ def _managed_skill_record(
             )
         handoff["inputs"]["skill"] = name
     return {
-        "source": f"skills/{name}",
-        "prerequisites": [],
+        "root-dir": f"skills/{name}",
+        "build-after": [],
         "actions": actions,
     }
 

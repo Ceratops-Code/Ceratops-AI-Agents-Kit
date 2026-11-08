@@ -36,7 +36,9 @@ import sdlc_results
 import store_artifacts
 from ceratops_repo_compatibility_engine.sdlc_contract_validation import (
     SdlcContractError,
+    deliverable_source_files,
     load_contract,
+
     operation_entries,
     operation_prerequisites,
 )
@@ -138,9 +140,54 @@ class PreparedOperation:
     mcp_source: str | None = None
     check_group: str | None = None
     check_phase: str | None = None
-    required_artifacts: tuple[str, ...] = ()
     selected_artifacts: Mapping[str, list[str]] | None = None
-    build_check_groups: tuple[str, ...] = ()
+    build_check_artifacts: Mapping[str, dict[str, list[str]]] | None = None
+    build_source_files: tuple[str, ...] = ()
+
+    @property
+    def artifact_references(self) -> tuple[str, ...]:
+        if self.category == "build":
+            return tuple(self.prerequisites.get("build-uses-artifacts", ()))
+        groups = self.prerequisites.get(f"{self.category}-uses-artifacts", {})
+        return tuple(groups.get(self.operation, ()))
+
+    @property
+    def build_check_references(self) -> Mapping[str, list[str]]:
+        return self.prerequisites.get("during-build-checks-uses-artifacts", {})
+
+    @property
+    def build_check_groups(self) -> tuple[str, ...]:
+        return tuple(location.rsplit(".", 1)[-1] for location in self.build_check_references)
+
+    def mcp_package_records(self) -> dict[str, Any]:
+        """Collect the package installation needs, following its package order edges."""
+        if self.mcp_source is None or self.category != "deploy-local":
+            return {}
+        records = self.prerequisites.get("deliverables", {})
+        packages: dict[str, Any] = {}
+        pending = list(self.prerequisites.get("build-after", []))
+        while pending:
+            reference = pending.pop(0)
+            if not reference.startswith("deliverables.packages."):
+                continue
+            name = reference.rsplit(".", 1)[-1]
+            if name not in packages:
+                packages[name] = records[reference]
+                pending.extend(records[reference].get("build-after", []))
+        return packages
+
+    def with_artifacts(self, available: Mapping[str, list[str]]) -> PreparedOperation:
+        """Give each command and each internal check just the files it declared."""
+        references = (*self.artifact_references,
+                      *(f"deliverables.packages.{name}" for name in self.mcp_package_records()))
+        return replace(
+            self,
+            selected_artifacts={ref: available[ref] for ref in references if ref in available},
+            build_check_artifacts={
+                group: {ref: available[ref] for ref in refs if ref in available}
+                for group, refs in self.build_check_references.items()
+            },
+        )
 
 
 def _build_test_gate(receipt: Mapping[str, Any], required_tests: Sequence[str]) -> None:
@@ -369,7 +416,7 @@ def read_repository_contract(
     if not resolved.is_file():
         raise OperationError("Selected SDLC contract must be a repository file.")
     try:
-        return load_contract(resolved)
+        return load_contract(resolved, repo_root=repo_root)
     except SdlcContractError as exc:
         raise OperationError(f"Invalid SDLC contract: {exc}") from exc
 
@@ -531,22 +578,20 @@ def prepare_operations(
             steps = tuple(_prepared_step(root, step, position, command_parameters)
                           for position, step in enumerate(selected.get("steps", []), 1))
             prerequisites = operation_prerequisites(contract, location)
-            internal = selected.get("check-groups", {}) if category == "build" else {}
-            required = tuple(dict.fromkeys([*prerequisites.get("artifacts", []),
-                *(reference for record in internal.values() for reference in record.get("requires-artifacts", []))]))
-            prepared.append(PreparedOperation(
+            owner = location.split(".actions.", 1)[0].split(".")
+            deliverable = contract["deliverables"][owner[1]][owner[2]] if len(owner) == 3 else {}
+            item = PreparedOperation(
                 root, location, category, commit, steps, prerequisites, selected.get("no-op"),
                 context, contract_path, tuple(sorted(parameters.items())),
                 result_schema=selected.get("result-schema"), check_results=selected.get("check-results"),
                 result_commit_field=selected.get("result-commit-field"),
-                mcp_source=(contract["deliverables"]["mcp-servers"][location.split(".")[2]]["source"]
-                            if location.startswith("deliverables.mcp-servers.") else None),
+                mcp_source=deliverable.get("root-dir") if owner[:2] == ["deliverables", "mcp-servers"] else None,
                 check_group=group,
-                check_phase=category.removesuffix("-checks") if category in {"before-build-checks", "after-build-checks"} else None,
-                required_artifacts=required,
-                selected_artifacts={key: artifacts[key] for key in required if artifacts and key in artifacts},
-                build_check_groups=tuple(internal),
-            ))
+                check_phase=category.removesuffix("-checks") if category in {"pre-build-checks", "post-build-checks"} else None,
+                build_source_files=tuple(deliverable_source_files(root, deliverable))
+                if category == "build" and commit else (),
+            )
+            prepared.append(item.with_artifacts(artifacts or {}))
     if any(item.result_commit_field for item in prepared[:-1]):
         raise OperationError("A build returning its final commit must be the last selected operation.")
     return prepared
@@ -564,11 +609,11 @@ def validation_operations(
     if explicit is not None:
         for operation in explicit:
             if operation_category(operation) not in {
-                "before-build-checks",
-                "after-build-checks",
+                "pre-build-checks",
+                "post-build-checks",
             }:
                 raise OperationError(
-                    "Check requests must name before-build-checks or after-build-checks groups."
+                    "Check requests must name pre-build-checks or post-build-checks groups."
                 )
     selected_deliverables = {
         tuple(operation.split(".")[1:3])
@@ -580,7 +625,7 @@ def validation_operations(
         operation
         for operation in entries
         if operation_category(operation)
-        in {"before-build-checks", "after-build-checks"}
+        in {"pre-build-checks", "post-build-checks"}
         and (
             operation.startswith("repository.")
             or tuple(operation.split(".")[1:3]) in selected_deliverables
@@ -590,7 +635,7 @@ def validation_operations(
     # In the current format an explicit selection can order checks, but cannot
     # bypass a selected deliverable's tests or repository-level prerequisites.
     selected = list(dict.fromkeys([*(explicit or []), *automatic]))
-    return sorted(selected, key=lambda item: operation_category(item) == "after-build-checks")
+    return sorted(selected, key=lambda item: operation_category(item) == "post-build-checks")
 
 
 def _bounded_tail(value: str | None) -> list[str]:
@@ -671,11 +716,15 @@ def execute_prepared_operation(
             "message": "HEAD changed after preparation.",
         }, **report_options)
     try:
-        if prepared.check_group is not None:
-            missing = set(prepared.required_artifacts) - set(prepared.selected_artifacts or {})
+        if prepared.check_group is not None or prepared.category == "build":
+            missing = set(prepared.artifact_references) - set(prepared.selected_artifacts or {})
+            for group, references in prepared.build_check_references.items():
+                missing.update(set(references) - set((prepared.build_check_artifacts or {}).get(group, {})))
             if missing:
-                raise ValueError("Required artifacts are not ready for " + prepared.check_group + ": " + ", ".join(sorted(missing)))
+                raise ValueError(f"Required artifacts are not ready for {prepared.operation}: " + ", ".join(sorted(missing)))
             reuse_operation_checks.artifact_inputs(prepared.repo_root, dict(prepared.selected_artifacts or {}))
+            for files in (prepared.build_check_artifacts or {}).values():
+                reuse_operation_checks.artifact_inputs(prepared.repo_root, files)
         check_plan = prepared.check_plan
         if prepared.check_results is not None and check_plan is None:
             check_plan = reuse_operation_checks.decide_check_reuse(prepared)
@@ -738,10 +787,11 @@ def execute_prepared_operation(
             # Declared package prerequisites are authoritative even when the
             # handoff names only its server. Keep them out of user-authored argv.
             mcp_package_context = None
-            if route == "ceratops-mcp-server-lifecycle/install" and prepared.prerequisites.get("packages"):
+            package_records = prepared.mcp_package_records()
+            if route == "ceratops-mcp-server-lifecycle/install" and package_records:
                 mcp_package_context = {
                     "source": prepared.mcp_source,
-                    "packages": prepared.prerequisites["packages"],
+                    "packages": package_records,
                     "artifacts": dict(prepared.selected_artifacts or {}),
                 }
             outcome = execute_skill_actions.execute_handoff(
@@ -834,7 +884,8 @@ def execute_prepared_operation(
                 and len(argv) > 1 and argv[1] in {"run", "sync", "lock"}
                 and "--active" not in argv and "--no-project" not in argv
             )
-            if repository_uv or prepared.test_context is not None or check_plan is not None or prepared.build_check_groups or prepared.selected_artifacts:
+            if (repository_uv or prepared.test_context is not None or check_plan is not None
+                    or prepared.selected_artifacts or prepared.check_phase or prepared.category == "build"):
                 environment = dict(os.environ)
                 if repository_uv:
                     # Repository-selected environments must not inherit the
@@ -848,8 +899,9 @@ def execute_prepared_operation(
                     environment[reuse_operation_checks.CONTEXT_ENV] = json.dumps(check_plan.context)
                 if prepared.build_check_groups:
                     environment["CERATOPS_BUILD_CHECK_GROUPS"] = json.dumps(prepared.build_check_groups)
-                if prepared.selected_artifacts:
-                    environment["CERATOPS_TEST_ARTIFACTS"] = json.dumps(prepared.selected_artifacts)
+                    environment["CERATOPS_BUILD_CHECK_ARTIFACTS"] = json.dumps(prepared.build_check_artifacts or {})
+                if prepared.selected_artifacts or prepared.check_phase or prepared.category == "build":
+                    environment["CERATOPS_TEST_ARTIFACTS"] = json.dumps(prepared.selected_artifacts or {})
                 process_options["env"] = environment
             with release_lock_module().track_command_completion():
                 result = run_progress_command(argv, cwd=step.cwd, **process_options)
@@ -894,9 +946,9 @@ def execute_prepared_operation(
             failure = {
                 **base,
                 "status": "validation_failed"
-                if prepared.category == "before-build-checks"
+                if prepared.category == "pre-build-checks"
                 else "tests_failed"
-                if prepared.category == "after-build-checks"
+                if prepared.category == "post-build-checks"
                 else "operation_failed",
                 "message": f"SDLC step failed: {prepared.operation} step {step.position}\n{cause}",
                 "steps": completed,
@@ -1018,22 +1070,15 @@ def remove_operation_failures(
     )
 
 
-def _combined_prerequisites(
-    prepared: Sequence[PreparedOperation],
-) -> dict[str, Any]:
-    """Merge one contract version's prerequisite records for prepare-only output."""
-
+def _combined_prerequisites(prepared: Sequence[PreparedOperation]) -> dict[str, Any]:
+    """Aggregate prepare-only requirements without merging different check groups."""
     combined: dict[str, Any] = {}
     for item in prepared:
-        if set(item.prerequisites).issubset({"capabilities", "packages", "artifacts"}):
-            for group in ("capabilities", "packages"):
-                values = item.prerequisites.get(group, {})
-                if values:
-                    combined.setdefault(group, {}).update(values)
-            if artifacts := item.prerequisites.get("artifacts"):
-                combined["artifacts"] = list(dict.fromkeys([*combined.get("artifacts", []), *artifacts]))
-        else:
-            combined.update(item.prerequisites)
+        for key, value in item.prerequisites.items():
+            if isinstance(value, list):
+                combined[key] = list(dict.fromkeys([*combined.get(key, []), *value]))
+            else:
+                combined.setdefault(key, {}).update(value)
     return combined
 
 
@@ -1193,11 +1238,15 @@ def main(argv: list[str] | None = None) -> int:
         requests = [OperationRequest(name, parameters, conditional, args.if_declared)
                     for name in args.operation]
         for name in args.validation_operation or ():
-            if operation_category(name) not in {"before-build-checks", "after-build-checks"}:
-                raise OperationError("Check requests must name before-build-checks or after-build-checks groups.")
+            if operation_category(name) not in {"pre-build-checks", "post-build-checks"}:
+                raise OperationError("Check requests must name pre-build-checks or post-build-checks groups.")
             requests.append(OperationRequest(name, parameters, conditional, args.if_declared))
-        if any(operation_category(request.operation) in MUTATION_CATEGORIES | {"after-build-checks"}
-               for request in requests):
+        scheduled = any(operation_category(request.operation) in MUTATION_CATEGORIES | {"post-build-checks"}
+                        for request in requests)
+        prepared = [] if scheduled else prepare_operations(
+            root, requests, args.sdlc_contract, context=context, artifacts=artifacts,
+        )
+        if scheduled or any(item.check_phase == "pre-build" and item.artifact_references for item in prepared):
             result = execute_release_builds(
                 root, requests, args.sdlc_contract, context=context, artifacts=artifacts,
                 qualification_level=level, expected_commit=args.commit,
@@ -1212,7 +1261,6 @@ def main(argv: list[str] | None = None) -> int:
         reuse_operation_checks.artifact_inputs(root, artifacts)
         if args.commit:
             require_clean_commit(root, args.commit)
-        prepared = prepare_operations(root, requests, args.sdlc_contract, context=context, artifacts=artifacts)
         # Preserve the existing repository-specific promotion exception until its
         # commit evidence can replace that declared exemption.
         if test_context and root.name in PROMOTION_RECHECK_EXEMPT_UNTIL_COMMIT_EVIDENCE_REDESIGN:

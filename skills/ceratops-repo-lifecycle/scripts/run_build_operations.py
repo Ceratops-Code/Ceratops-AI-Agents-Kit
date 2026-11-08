@@ -52,13 +52,14 @@ def build_operation_context(root: pathlib.Path, *, confirm_stopped=False, wait_s
 
 
 def build_dependencies(item: Any) -> set[str]:
-    """Resolve action references, including non-package inputs to build checks."""
-    dependencies = set(item.required_artifacts)
-    for package in item.prerequisites.get("packages", {}).values():
-        location = package.get("action-locations", {}).get("build")
-        if location:
-            dependencies.add(location.rsplit(".actions.", 1)[0])
-    return dependencies
+    """Return producers the operation needs, independently of which files it reads."""
+    order_only = item.prerequisites.get("build-after", ()) if item.category in {
+        "build", "deploy-local", "publish", "verify-publish",
+    } else ()
+    return {
+        *order_only, *item.artifact_references,
+        *(ref for refs in item.build_check_references.values() for ref in refs),
+    }
 
 
 def prepare_build_operations(root, requests, contract_path=None, *, context="skill", artifacts=None,
@@ -76,7 +77,7 @@ def prepare_build_operations(root, requests, contract_path=None, *, context="ski
     requested = {request.operation: request for request in requests}
     if any(request != requested[request.operation] for request in requests):
         raise operations.OperationError("Repeated actions in one target must use the same parameters.")
-    direct_checks = all(operations.operation_category(name) in {"before-build-checks", "after-build-checks"}
+    direct_checks = all(operations.operation_category(name) in {"pre-build-checks", "post-build-checks"}
                         for name in requested)
     pending = list(requested.values())
     prepared: dict[str, list[Any]] = {}
@@ -100,25 +101,29 @@ def prepare_build_operations(root, requests, contract_path=None, *, context="ski
                 requested[location] = dependency
                 pending.append(dependency)
         if include_checks and not pending:
-            builds_requested = any(operations.operation_category(name) == "build" for name in requested)
+            build_owners = {name.rsplit(".actions.", 1)[0] for name in requested
+                            if operations.operation_category(name) == "build"}
             for name in operations.validation_operations(root, list(requested), validation_operations, contract_path):
                 if name in requested:
                     continue
                 # A direct check of supplied files needs no sibling checks.
-                # Newly required builds still bring their before-build checks.
-                if (direct_checks and name not in (validation_operations or ())
-                        and (not builds_requested or operations.operation_category(name) == "after-build-checks")):
-                    continue
+                # Newly required builds still bring their pre-build checks.
+                if direct_checks and name not in (validation_operations or ()):
+                    owner = name.rsplit(".actions.", 1)[0]
+                    if (not build_owners or operations.operation_category(name) == "post-build-checks"
+                            or (owner != "repository" and owner not in build_owners)):
+                        continue
                 parameters = {**(request.parameters_if_declared or {}), **(request.parameters or {})}
                 check_request = operations.OperationRequest(name, parameters_if_declared=parameters)
                 checks = operations.prepare_operations(root, [check_request], contract_path, context=context, artifacts=artifacts)
                 members = {name.rsplit(".actions.", 1)[0] for name in requested}
                 checks = [item for item in checks if (name, item.check_group) not in checked
-                          and (not item.required_artifacts or set(item.required_artifacts) & members)]
+                          and (item.category == "pre-build-checks" or not item.artifact_references
+                               or set(item.artifact_references) & members)]
                 checked.update((name, item.check_group) for item in checks)
                 prepared.setdefault(name, []).extend(replace(item, qualification_level=qualification_level) for item in checks)
                 for item in checks:
-                    for reference in item.required_artifacts:
+                    for reference in item.artifact_references:
                         location = reference + ".actions.build"
                         if reference not in (artifacts or {}) and location in entries and location not in requested:
                             dependency = operations.OperationRequest(location, parameters_if_declared=parameters)
@@ -148,7 +153,7 @@ def prepare_build_operations(root, requests, contract_path=None, *, context="ski
     # owns that step, no consumer can be prepared against the preceding commit.
     committing = [item for item in result if item.result_commit_field]
     if committing and (len(committing) > 1 or any(
-        item.category in {"build", "deploy-local", "publish"} or item.check_phase == "after-build"
+        item.category in {"build", "deploy-local", "publish"} or item.check_phase == "post-build"
         for item in result if item is not committing[0]
     )):
         raise operations.OperationError("A build returning its final commit must be the last selected operation.")
@@ -293,10 +298,9 @@ def execute_check_phases(
 ) -> dict[str, Any]:
     """Run source checks, dependency-ordered builds, output tests, then delivery.
 
-    Stop before starting another source check when a pre-build check fails.
-    Only returned artifact paths reach consumers. Builders keep their own receipt
-    and repeated-call behavior. A caller's matching completed build can be consumed
-    directly with its original receipt; unrelated or older source outcomes cannot.
+    Run a group only after its producer builds finish. A failed prerequisite
+    prevents its dependents from running. Keep order-only edges out of artifact
+    maps, and keep the builder's own receipt and repeated-call behavior.
     """
     import repository_operation as operations
 
@@ -313,26 +317,48 @@ def execute_check_phases(
         return {**failure, "results": [failure], "completed_operations": [],
                 "pending_operations": [item.operation for item in prepared]}
 
-    before = [item for item in prepared if item.category == "before-build-checks"]
+    before = [item for item in prepared if item.category == "pre-build-checks"]
     setup = [item for item in prepared if item.category in {"bootstrap", "test-selection"}]
     builds = [item for item in prepared if item.category == "build"]
+    after = [item for item in prepared if item.check_phase == "post-build"]
+    delivery = [item for item in prepared if item.category not in {
+        "pre-build-checks", "post-build-checks", "build", "bootstrap", "test-selection"}]
     by_reference = {item.operation.rsplit(".actions.", 1)[0]: item for item in builds}
-    dependencies = {key: build_dependencies(item) for key, item in by_reference.items()}
     try:
-        order = TopologicalSorter({key: values & by_reference.keys() for key, values in dependencies.items()}).static_order()
-        builds = [by_reference[key] for key in order]
+        before = [
+            replace(item, check_plan=reuse_operation_checks.decide_check_reuse(item))
+            if item.check_results is not None and not item.artifact_references else item
+            for item in before
+        ]
+    except (OSError, ValueError) as exc:
+        return preparation_failed(str(exc))
+    commands = {item.operation: item for item in [*before, *builds]}
+    dependencies = {
+        item.operation: {
+            by_reference[ref].operation for ref in build_dependencies(item) if ref in by_reference
+        }
+        for item in commands.values()
+    }
+    for item in builds:
+        owner = item.operation.rsplit(".actions.", 1)[0]
+        dependencies[item.operation].update(
+            check.operation for check in before
+            if check.operation.startswith(owner + ".actions.")
+            or (check.operation.startswith("repository.") and not check.artifact_references)
+        )
+    try:
+        order = list(TopologicalSorter({name: sorted(required) for name, required in dependencies.items()}).static_order())
     except ValueError as exc:
         return preparation_failed(str(exc))
-    after = [item for item in prepared if item.check_phase == "after-build"]
-    delivery = [item for item in prepared if item.category not in {
-        "before-build-checks", "after-build-checks", "build", "bootstrap", "test-selection"}]
     results: list[dict[str, Any]] = []
     available: dict[str, list[str]] = {}
     for item in prepared:
-        for key, paths in (item.selected_artifacts or {}).items():
-            if key in available and paths != available[key]:
-                return preparation_failed(f"Conflicting selected artifacts for {key}")
-            available[key] = list(paths)
+        maps = [item.selected_artifacts or {}, *(item.build_check_artifacts or {}).values()]
+        for files in maps:
+            for key, paths in files.items():
+                if key in available and paths != available[key]:
+                    return preparation_failed(f"Conflicting selected artifacts for {key}")
+                available[key] = list(paths)
 
     def run(item):
         result = operations.execute_prepared_operation(
@@ -352,11 +378,19 @@ def execute_check_phases(
                 produced.setdefault(key, []).extend(paths)
         return {key: list(dict.fromkeys(paths)) for key, paths in produced.items()}
 
-    try:
-        before = [replace(item, check_plan=reuse_operation_checks.decide_check_reuse(item))
-                  if item.check_results is not None else item for item in before]
-    except (OSError, ValueError) as exc:
-        return preparation_failed(str(exc))
+    def missing_artifacts(item):
+        return ({*item.artifact_references,
+                 *(ref for refs in item.build_check_references.values() for ref in refs)}
+                - available.keys())
+
+    def blocked(item, reasons):
+        results.append({
+            "operation": item.operation, "check_group": item.check_group,
+            "status": "tests_failed" if item.check_phase else "operation_failed",
+            "steps": [], "blocked": True,
+            "message": "Required work is not ready: " + ", ".join(sorted(reasons)),
+        })
+
     if prepared:
         owner, action = diagnostic_owner or (prepared[0].repo_root, "operation")
         operations.remove_resolved_failures(
@@ -365,54 +399,57 @@ def execute_check_phases(
         )
     source_results = {(value.get("operation"), value.get("check_group")): value
                       for value in _completed_checks(successful_results)}
-    for item in [*setup, *before]:
+    levels = ("alpha", "beta", "rc", "final")
+
+    def sufficient_level(result, item):
+        return (result.get("qualification_level") in levels
+                and levels.index(result["qualification_level"]) >= levels.index(item.qualification_level))
+
+    def run_check(item):
         original = source_results.get((item.operation, item.check_group))
-        if (item.check_results is None and original and original.get("commit") == item.commit
-                and original.get("parameters", {}) == dict(item.parameters)
-                and original.get("qualification_level") in ("alpha", "beta", "rc", "final")
-                and ("alpha", "beta", "rc", "final").index(original["qualification_level"])
-                >= ("alpha", "beta", "rc", "final").index(item.qualification_level)):
+        if (item.check_results is None and not item.artifact_references and original
+                and original.get("commit") == item.commit and sufficient_level(original, item)
+                and original.get("parameters", {}) == dict(item.parameters)):
             results.append(original)
-        elif run(item)["status"] in operations.FAILED_STATUSES:
+            return original
+        return run(item.with_artifacts(available))
+
+    for item in setup:
+        if run(item)["status"] in operations.FAILED_STATUSES:
             break
-    if delivery and not builds and not after and not any(
-        item["status"] in operations.FAILED_STATUSES for item in results
-    ):
-        # An installation with no declared build keeps the existing delivery
-        # response. Supporting source checks do not become installed operations.
-        result = operations.execute_prepared_operations(
-            delivery, diagnostic_output=diagnostic_output, diagnostic_owner=diagnostic_owner,
-            successful_results=(successful_results, results),
-        )
-        # Keep supporting checks available to the next action in this attempt
-        # without reporting them as completed installation/publication actions.
-        result["build_results"] = results
-        for source, destination in (("check_result", "check_results"), ("check_summary", "check_summaries")):
-            check_references = [item[source] for item in results if item.get(source)]
-            if check_references:
-                result[destination] = check_references
-        return result
     if not any(item["status"] in operations.FAILED_STATUSES for item in results):
         accepted = {item["operation"]: item for item in _successful_builds(successful_results)}
-        for item in builds:
-            reference = item.operation.rsplit(".actions.", 1)[0]
-            available.pop(reference, None)
-            missing = dependencies[reference] - available.keys()
-            if missing:
-                results.append({"operation": item.operation, "status": "operation_failed", "blocked": True,
-                                "message": "Required builds did not produce accepted artifacts: " + ", ".join(sorted(missing))})
+        completed_work: set[str] = set()
+        for operation in order:
+            item = commands[operation]
+            if reasons := (dependencies[operation] - completed_work) | missing_artifacts(item):
+                blocked(item, reasons)
                 continue
-            inputs = {key: available[key] for key in dependencies[reference]}
-            item = replace(item, selected_artifacts=inputs or item.selected_artifacts)
-            original = accepted.get(item.operation)
+            if item.category == "pre-build-checks":
+                if run_check(item)["status"] not in operations.FAILED_STATUSES:
+                    completed_work.add(operation)
+                elif operation.startswith("repository.") and not item.artifact_references:
+                    # A repository-wide source gate protects the entire batch.
+                    break
+                continue
+            reference = operation.rsplit(".actions.", 1)[0]
+            available.pop(reference, None)
+            item = item.with_artifacts(available)
+            original = accepted.get(operation)
             try:
-                if original is None:
-                    original = recorded_build(item, inputs)
+                inputs = reuse_operation_checks.artifact_inputs(item.repo_root, dict(item.selected_artifacts or {}))
+                check_inputs = {
+                    group: reuse_operation_checks.artifact_inputs(item.repo_root, files)
+                    for group, files in (item.build_check_artifacts or {}).items()
+                }
+                if original is None and not any(check_inputs.values()):
+                    original = recorded_build(item, item.selected_artifacts)
                 if (original and original.get("commit") == item.commit
-                        and ("alpha", "beta", "rc", "final").index(original.get("qualification_level", "alpha"))
-                        >= ("alpha", "beta", "rc", "final").index(item.qualification_level)
+                        and sufficient_level(original, item)
                         and original.get("parameters", {}) == dict(item.parameters)
-                        and original.get("artifact_inputs", {}) == reuse_operation_checks.artifact_inputs(item.repo_root, inputs)
+                        and original.get("artifact_inputs", {}) == inputs
+                        and original.get("build_check_artifact_inputs", {}) ==
+                        {group: files for group, files in check_inputs.items() if files}
                         and (produced := produced_files(item, original))):
                     result = {**original, "build_decision": "reused"}
                     results.append(result)
@@ -426,27 +463,53 @@ def execute_check_phases(
                 if result["status"] not in operations.FAILED_STATUSES:
                     result.setdefault("qualification_level", item.qualification_level)
                     result["parameters"] = dict(item.parameters)
-                    result["artifact_inputs"] = reuse_operation_checks.artifact_inputs(item.repo_root, inputs)
+                    result["artifact_inputs"] = inputs
+                    if any(check_inputs.values()):
+                        result["build_check_artifact_inputs"] = {group: files for group, files in check_inputs.items() if files}
                     available.update(produced)
+                    completed_work.add(operation)
             except (OSError, ValueError, KeyError, TypeError, store_artifacts.OperationError) as exc:
-                if results and results[-1].get("operation") == item.operation:
+                if results and results[-1].get("operation") == operation:
                     results[-1].update(status="result_invalid", message=str(exc))
                 else:
-                    results.append({"operation": item.operation, "status": "result_invalid", "message": str(exc)})
-        for item in after:
-            missing = set(item.required_artifacts) - available.keys()
-            if missing:
-                results.append({"operation": item.operation, "check_group": item.check_group,
-                                "status": "tests_failed", "steps": [], "blocked": True,
-                                "message": "Required artifacts are not ready: " + ", ".join(sorted(missing))})
+                    results.append({"operation": operation, "status": "result_invalid", "message": str(exc)})
+        source_gate_failed = any(
+            result["status"] in operations.FAILED_STATUSES
+            and result["operation"].startswith("repository.actions.pre-build-checks.")
+            and not commands[result["operation"]].artifact_references
+            for result in results
+        )
+        for item in (() if source_gate_failed else after):
+            owner = item.operation.rsplit(".actions.", 1)[0]
+            required = {by_reference[ref].operation for ref in item.artifact_references if ref in by_reference}
+            required.update(check.operation for check in before if check.operation.startswith(owner + ".actions."))
+            if reasons := (required - completed_work) | missing_artifacts(item):
+                blocked(item, reasons)
             else:
-                run(replace(item, selected_artifacts={key: available[key] for key in item.required_artifacts},
-                            check_plan=None))
+                run_check(item)
+
+    if delivery and not builds and not after and not any(
+        item["status"] in operations.FAILED_STATUSES for item in results
+    ):
+        # Preserve the response for installations with no declared build.
+        result = operations.execute_prepared_operations(
+            delivery, diagnostic_output=diagnostic_output, diagnostic_owner=diagnostic_owner,
+            successful_results=(successful_results, results),
+        )
+        result["build_results"] = results
+        for source, destination in (("check_result", "check_results"), ("check_summary", "check_summaries")):
+            check_references = [item[source] for item in results if item.get(source)]
+            if check_references:
+                result[destination] = check_references
+        return result
     if not any(item["status"] in operations.FAILED_STATUSES for item in results):
         for item in delivery:
             reference = item.operation.rsplit(".actions.", 1)[0]
-            references = build_dependencies(item) | dependencies.get(reference, set()) | {reference}
-            files = {key: available[key] for key in references if key in available}
+            references = build_dependencies(item) | {reference}
+            files = {
+                **(item.with_artifacts(available).selected_artifacts or {}),
+                **{key: available[key] for key in references if key in available},
+            }
             if run(replace(item, selected_artifacts=files or item.selected_artifacts))["status"] in operations.FAILED_STATUSES:
                 break
     failed = [item for item in results if item["status"] in operations.FAILED_STATUSES]

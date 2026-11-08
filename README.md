@@ -319,7 +319,7 @@ The planned replacement preserves accepted results instead of repeating checks
 at each boundary; see [refactor status](#working-folder-lifecycle-refactor-status).
 
 Operations are identified by their YAML location, such as
-`repository.actions.before-build-checks.check-groups.source` or
+`repository.actions.pre-build-checks.check-groups.source` or
 `deliverables.skills.ceratops-managed.actions.install`.
 There are no extra IDs, defaults or full flows in the contract. Prerequisites
 are setup metadata; declaring them does not install dependencies. Bootstrap
@@ -358,22 +358,48 @@ causes automatic replay. Other actions retain the frozen-HEAD guard. This narrow
 contract does not allocate versions or replace native package records.
 Ceratops skill handoffs are declared on each named skill. Skill source
 checks at
-`deliverables.skills.<name>.actions.before-build-checks.check-groups.source`
+`deliverables.skills.<name>.actions.pre-build-checks.check-groups.source`
 hand off to
 `ceratops-skill-lifecycle/source-validate`; its skill-owned binding invokes the
 validator. The corresponding `actions.install` handoff runs the transactional
 installer. The compatible-repository producer adds these actions only for
 source skills in v4 contracts;
 the generic template declares repository setup, checks and an explicit test no-op.
-SDLC supports separate packages, apps, MCP servers, skills, and hooks.
-Its schema lives at
-`skills/ceratops-repo-lifecycle/references/schemas/sdlc.v4.schema.json`;
-`scripts/repository_operation.py` resolves action locations and returns package
-prerequisites through `--prepare-only`. Registered skill validation and
-deployment handoffs pass the exact selected skill to the lifecycle CLI, retain
-completion receipts, and stop on source changes or unsupported inputs. CI still
-defers every handoff; package prerequisites never imply an automatic build.
-MCP servers built directly from source may declare no package prerequisite.
+SDLC supports packages, apps, MCP servers, skills, and hooks. The operation
+runner's `--prepare-only` reports `build-after`, tool capabilities, and artifact
+requirements separately. The runner completes or reuses required builds before
+their consumers. Registered skill handoffs pass the exact requested skill to
+the lifecycle CLI. CI defers skill handoffs and reports them as pending.
+
+Declare the files that belong to a deliverable under `root-dir`. Use
+`additional-source-files` for shared assets and native manifests or lockfiles
+outside that directory. The runner includes tracked and nonignored new files
+and counts overlapping matches once. Native manifests still own package
+versions and dependency pins.
+
+```yaml
+root-dir: packages/report-tool
+additional-source-files: [shared/report-template.html, uv.lock]
+build-after: [deliverables.packages.bootstrap-tool]
+actions:
+  pre-build-checks:
+    check-groups:
+      source-tests:
+        uses-artifacts: [deliverables.packages.text-engine]
+  build:
+    uses-artifacts: [deliverables.packages.ui-assets]
+    checks:
+      package-contents: {}
+  post-build-checks:
+    check-groups:
+      tool-with-engine:
+        uses-artifacts: [deliverables.packages.text-engine]
+```
+
+This excerpt omits command and result declarations. The engine is available
+before the source tests, and the builder receives the UI assets. The bootstrap
+tool only establishes build order. The final check receives the report tool's
+own output automatically, plus the engine it declares.
 This repository keeps its existing SDLC declaration version. Configuration
 updates do not convert unsupported formats.
 
@@ -382,13 +408,13 @@ package, application, skill, MCP server or hook; its artifacts are the built fil
 The schema declares groups under `repository.release-bundles`, each with a
 nonempty `members` list of full references such as `deliverables.apps.desktop`.
 Each member has a build action and artifact metadata and belongs to at most one
-bundle. Package prerequisites remain dependencies. Each dependency belongs to
-the consuming bundle or to another declared bundle; ambiguous ownership and
-dependency cycles are reported before any action runs.
+bundle. A required deliverable may belong to another bundle or stand on its
+own. Ambiguous ownership and dependency cycles are reported before commands run.
 
 `sdlc_contract_validation.py::release_bundle_entries()` returns member metadata,
-action locations and external package dependencies with their bundle names.
-`_release_bundle_errors()` checks this declaration without running commands.
+action locations and required deliverables. An external dependency includes its
+bundle name when one exists. `_find_release_bundle_errors()` checks ownership
+and cycles without running commands.
 Build APIs accept `release_bundle`; the receipt inspection command is
 `verify-release-bundle-build --release-bundle NAME`. The former public group
 name is no longer accepted as an SDLC field, Python parameter or CLI option.
@@ -723,9 +749,9 @@ The waiting limit does not limit the duration of the operation holding the lock.
 
 Declared builds now enter `repository_operation.execute_release_builds()` before
 reading the release commit or SDLC contract. Its implementation in
-`run_build_operations.py` follows declared package prerequisites and required
-artifact inputs for packages, skills, MCP servers and applications. It builds
-dependencies before consumers, runs joint tests with their exact returned files,
+`run_build_operations.py` follows `build-after` and `uses-artifacts` across
+deliverable types. It completes prerequisite builds, runs each ready check
+with its declared files, and passes the exact produced files to consumers,
 then passes those files to requested delivery operations. A direct Build,
 Promote-and-deploy and Ship's local build phase use this same call. Promotion
 keeps its required source checks; applicable passing results remain reusable.
@@ -1462,11 +1488,11 @@ GitHub Actions pins as well as the scripts project.
 Skill callers invoke their bundled engine directly:
 
 ```powershell
-uv run --no-project --python <python_runtime> python "$env:CODEX_HOME/skills/ceratops-repo-lifecycle/scripts/repository_operation.py" --repo-root <repo> --operation repository.actions.before-build-checks
+uv run --no-project --python <python_runtime> python "$env:CODEX_HOME/skills/ceratops-repo-lifecycle/scripts/repository_operation.py" --repo-root <repo> --operation repository.actions.pre-build-checks
 ```
 
 Repeat `--operation LOCATION` to name a whole phase or one group, such as
-`repository.actions.before-build-checks.check-groups.source`. Only requested
+`repository.actions.pre-build-checks.check-groups.source`. Only requested
 groups run; group names do not imply scan or test behavior. A build or delivery
 request still brings in its required checks and prerequisite builds. Promote
 and Ship pass their required group locations explicitly. CI's `operations`
@@ -1588,25 +1614,28 @@ runner executes tests but cannot reuse individual passes. A custom runner stays
 custom; `[tool.ceratops.test-support] managed = true` opts its support files into
 generation. Compatibility checks require the declared support to be present.
 
-SDLC actions run in this order: `before-build-checks`, `build`, then
-`after-build-checks`, even when YAML keys appear in another order. This replaces
+SDLC actions run in this order: `pre-build-checks`, `build`, then
+`post-build-checks`, even when YAML keys appear in another order. This replaces
 the former per-group `phase` layout. Each before/after `check-groups` entry owns
 its command or handoff, runtime requirements and result declaration. Source scans
 and tests remain separate groups; requesting one group runs only that group.
 Groups inside `build` name checks performed and reported by the builder, without
 starting another command. A failed source check prevents dependent builds.
 
-A deliverable's after-build groups automatically receive its own exact files.
-Their optional `requires-artifacts` lists only additional deliverables; explicit
-self-references are errors. Repository-wide after-build groups must list every
-required deliverable. Before-build groups receive no artifacts. Required builds
-run in dependency order; a missing or changed file blocks the dependent check.
+A deliverable's post-build groups automatically receive its own exact files.
+Their optional `uses-artifacts` lists only additional deliverables; explicit
+self-references are errors. Repository-wide post-build groups must list every
+required deliverable. Pre-build groups can receive files from other
+deliverables. Their required builds finish first. A missing or changed file
+blocks the dependent check.
 Installed copies never stand in for the requested build's files.
 
 Commands that accept the runner interface declare `--check-group {check_group}`
 and `--artifacts {artifacts}` in `steps.run`. The executor replaces those arguments
-with the group name and the complete artifact JSON map, and passes that map in
-`CERATOPS_TEST_ARTIFACTS`. It adds no test flags to native scans or custom commands.
+with the group name and that command's artifact map. The command also receives
+the map in `CERATOPS_TEST_ARTIFACTS`. Builders read the separate maps for their
+internal checks from `CERATOPS_BUILD_CHECK_ARTIFACTS`. Native commands receive
+only arguments their declarations request.
 File paths and byte hashes remain part of the saved reuse inputs.
 `prepare_sdlc_configuration()` prepares configuration during compatibility setup;
 its caller writes the YAML. Before a check runs, `collect_check_inputs()` records

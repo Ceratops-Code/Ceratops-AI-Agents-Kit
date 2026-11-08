@@ -74,7 +74,7 @@ def run_ci_action(
     evidence: pathlib.Path,
     bundle: pathlib.Path,
     *,
-    operations: str = "repository.actions.before-build-checks",
+    operations: str = "repository.actions.pre-build-checks",
 ) -> subprocess.CompletedProcess[str]:
     """Execute the real composite action in a caller-owned isolated action checkout."""
     action_root = bundle / "skills/ceratops-repo-lifecycle"
@@ -155,7 +155,7 @@ def write_sdlc_contract(
         "kind": "ceratops-sdlc",
         "repository": {
             "capabilities": {},
-            "actions": {"before-build-checks": {"check-groups": {'source': {
+            "actions": {"pre-build-checks": {"check-groups": {'source': {
                     "requires": {"capabilities": []},
                     "no-op": "No repository validation in this fixture.",
                 }, 'tests': {
@@ -247,10 +247,10 @@ def create_compatible_repo(
         deliverables={
             "skills": {
                 name: {
-                    "source": f"skills/{name}",
-                    "prerequisites": [],
+                    "root-dir": f"skills/{name}",
+                    "build-after": [],
                     "actions": {
-                        "before-build-checks": {"check-groups": {"source": {
+                        "pre-build-checks": {"check-groups": {"source": {
                             "requires": {"capabilities": []}, "steps": [{"handoff": {
                                 "lifecycle": "ceratops-skill-lifecycle", "action": "source-validate", "inputs": {"skill": name}}}],
                         }}},

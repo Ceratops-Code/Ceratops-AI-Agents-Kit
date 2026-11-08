@@ -158,8 +158,8 @@ def test_android_coverage_requires_declared_gradle_checks_in_any_group(
         "validation-capabilities": ["android-lint", "android-build"],
         "steps": [{"run": ["python", "scripts/android-validation.py"]}],
     }
-    original_test = sdlc["repository"]["actions"]["before-build-checks"]["check-groups"]["tests"]
-    sdlc["repository"]["actions"]["before-build-checks"]["check-groups"]["tests"] = android_operation
+    original_test = sdlc["repository"]["actions"]["pre-build-checks"]["check-groups"]["tests"]
+    sdlc["repository"]["actions"]["pre-build-checks"]["check-groups"]["tests"] = android_operation
     sdlc_path.write_text(
         yaml.safe_dump(sdlc, sort_keys=False), encoding="utf-8", newline="\n"
     )
@@ -168,8 +168,8 @@ def test_android_coverage_requires_declared_gradle_checks_in_any_group(
     named_tests = compatibility.validate_ceratops_compatibility(repo)
     assert named_tests["valid"] is True, named_tests["errors"]
 
-    sdlc["repository"]["actions"]["before-build-checks"]["check-groups"]["tests"] = original_test
-    validate = sdlc["repository"]["actions"]["before-build-checks"]["check-groups"]["source"]
+    sdlc["repository"]["actions"]["pre-build-checks"]["check-groups"]["tests"] = original_test
+    validate = sdlc["repository"]["actions"]["pre-build-checks"]["check-groups"]["source"]
     validate["requires"]["capabilities"].extend(["jdk", "android-sdk"])
     validate["validation-capabilities"] = ["android-lint", "android-build"]
     validate["steps"].append({"run": ["python", "scripts/android-validation.py"]})
@@ -251,7 +251,7 @@ def test_ecosystem_coverage_requires_declared_repository_checks(
             for prerequisite in required_prerequisites
         }
     )
-    check_operation = sdlc["repository"]["actions"]["before-build-checks"]["check-groups"]["source"]
+    check_operation = sdlc["repository"]["actions"]["pre-build-checks"]["check-groups"]["source"]
     check_operation["requires"]["capabilities"].extend(required_prerequisites)
     check_operation["validation-capabilities"] = required_capabilities
     check_operation["steps"].append(
@@ -335,7 +335,7 @@ def test_shell_compatibility_declares_its_generated_check_and_repeats(tmp_path: 
         )
         assert result.returncode == 0, result.stdout + result.stderr
         sdlc = yaml.safe_load((repo / "sdlc/sdlc.yml").read_text(encoding="utf-8"))
-        check = sdlc["repository"]["actions"]["before-build-checks"]["check-groups"]["source"]
+        check = sdlc["repository"]["actions"]["pre-build-checks"]["check-groups"]["source"]
         assert check["validation-capabilities"] == ["shellcheck"]
         assert "shellcheck" in check["requires"]["capabilities"]
         generator = importlib.import_module(
@@ -713,7 +713,7 @@ def test_compatibility_materializer_supports_repositories_without_skills(
     assert output["skill_manifest"] == "not_configured"
     assert not (repo / "skills").exists()
     contract = yaml.safe_load((repo / "sdlc" / "sdlc.yml").read_text())
-    assert contract["repository"]["actions"]["before-build-checks"]["check-groups"]["source"]["steps"] == [
+    assert contract["repository"]["actions"]["pre-build-checks"]["check-groups"]["source"]["steps"] == [
         {"run": ["uv", "run", "--locked", "scripts/validate-repository.py"]}
     ]
     assert "deliverables" not in contract
@@ -1127,7 +1127,7 @@ def test_compatibility_materializer_supports_repositories_without_skills(
             "npm-markdown-lint", "ruff", "mypy", "actionlint"
         ]
         assert (config_repo / "scripts/run-tests.py").is_file()
-        assert yaml.safe_load((config_repo / "sdlc/sdlc.yml").read_text())["repository"]["actions"]["before-build-checks"]["check-groups"]["tests"]["steps"]
+        assert yaml.safe_load((config_repo / "sdlc/sdlc.yml").read_text())["repository"]["actions"]["pre-build-checks"]["check-groups"]["tests"]["steps"]
 
     # Contract validation covers entries which do not match the target and
     # rejects broken metadata or evidence links before target mutation.
@@ -1277,7 +1277,7 @@ def test_generated_scripts_and_skill_owned_ci_keep_environments_and_tests_separa
     assert failed.returncode == 1, failed.stdout + failed.stderr
     result = json.loads(evidence.read_text())
     assert result["status"] == "validation_failed"
-    assert result["operation"] == "repository.actions.before-build-checks.check-groups.tests"
+    assert result["operation"] == "repository.actions.pre-build-checks.check-groups.tests"
     assert any("test-gate-evidence" in line for line in result["diagnostic"]["stdout_tail"]), result["diagnostic"]
     collector = importlib.import_module("github_contract_engine.collectors.local_repository")
     facts = collector._repository_validation_facts(
@@ -1291,17 +1291,17 @@ def test_generated_scripts_and_skill_owned_ci_keep_environments_and_tests_separa
         "errors": [],
     }
     assert json.loads(evidence.read_text())["status"] == "validation_failed"
-    validation_only = run_ci_action(repo, evidence, bundle, operations="repository.actions.before-build-checks.check-groups.source")
+    validation_only = run_ci_action(repo, evidence, bundle, operations="repository.actions.pre-build-checks.check-groups.source")
     assert validation_only.returncode == 0, validation_only.stdout + validation_only.stderr
     assert not evidence.exists()
     assert json.loads(validation_only.stdout)["completed_operations"] == [
-        "repository.actions.before-build-checks.check-groups.source"
+        "repository.actions.pre-build-checks.check-groups.source"
     ]
     probe.write_text("def test_probe():\n    assert True\n")
     passed = run_ci_action(repo, evidence, bundle)
     assert passed.returncode == 0, passed.stdout + passed.stderr
     assert not evidence.exists()
-    assert json.loads(passed.stdout)["completed_operations"] == ["repository.actions.before-build-checks.check-groups.source", "repository.actions.before-build-checks.check-groups.tests"]
+    assert json.loads(passed.stdout)["completed_operations"] == ["repository.actions.pre-build-checks.check-groups.source", "repository.actions.pre-build-checks.check-groups.tests"]
     lock = (repo / "scripts/uv.lock").read_bytes()
     reapplied = run_compatibility_engine(REPOSITORY_LIFECYCLE_SCRIPTS, "apply", "--target-repo-root", str(repo))
     assert reapplied.returncode == 0, reapplied.stdout

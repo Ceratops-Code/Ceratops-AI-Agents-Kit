@@ -128,8 +128,8 @@
             }
           }
         },
-        "requires-artifacts": {
-          "description": "Additional deliverables for after-build checks. The owning deliverable is implicit.",
+        "uses-artifacts": {
+          "description": "Deliverables whose built files are passed to this check.",
           "type": "array",
           "uniqueItems": true,
           "items": {
@@ -171,7 +171,7 @@
     },
     "deliverableReference": {
       "type": "string",
-      "pattern": "^deliverables\\.(packages|apps|mcp-servers|skills|hooks)\\.[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"
+      "pattern": "^deliverables\\.(?:(?:packages|apps|skills|hooks)\\.[a-z][a-z0-9]*(?:-[a-z0-9]+)*|mcp-servers\\.[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*)$"
     },
     "identifier": {
       "type": "string",
@@ -447,7 +447,10 @@
             }
           }
         },
-        "check-groups": {
+        "uses-artifacts": {
+          "$ref": "#/$defs/buildAfter"
+        },
+        "checks": {
           "description": "Checks executed and reported by this builder, without additional commands.",
           "type": "object",
           "minProperties": 1,
@@ -458,8 +461,8 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
-              "requires-artifacts": {
-                "description": "Additional deliverables for after-build checks. The owning deliverable is implicit.",
+              "uses-artifacts": {
+                "description": "Deliverables whose built files are passed to this check.",
                 "type": "array",
                 "uniqueItems": true,
                 "items": {
@@ -521,7 +524,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "before-build-checks"
+        "pre-build-checks"
       ],
       "properties": {
         "bootstrap": {
@@ -530,10 +533,10 @@
         "test-selection": {
           "$ref": "#/$defs/testSelectionAction"
         },
-        "before-build-checks": {
+        "pre-build-checks": {
           "$ref": "#/$defs/checkPhaseAction"
         },
-        "after-build-checks": {
+        "post-build-checks": {
           "$ref": "#/$defs/checkPhaseAction"
         }
       }
@@ -545,13 +548,13 @@
         "build"
       ],
       "properties": {
-        "before-build-checks": {
+        "pre-build-checks": {
           "$ref": "#/$defs/checkPhaseAction"
         },
         "build": {
           "$ref": "#/$defs/action"
         },
-        "after-build-checks": {
+        "post-build-checks": {
           "$ref": "#/$defs/checkPhaseAction"
         },
         "publish": {
@@ -566,14 +569,14 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "before-build-checks",
+        "pre-build-checks",
         "install"
       ],
       "properties": {
-        "before-build-checks": {
+        "pre-build-checks": {
           "$ref": "#/$defs/checkPhaseAction"
         },
-        "after-build-checks": {
+        "post-build-checks": {
           "$ref": "#/$defs/checkPhaseAction"
         },
         "install": {
@@ -591,14 +594,14 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "before-build-checks",
+        "pre-build-checks",
         "install"
       ],
       "properties": {
-        "before-build-checks": {
+        "pre-build-checks": {
           "$ref": "#/$defs/checkPhaseAction"
         },
-        "after-build-checks": {
+        "post-build-checks": {
           "$ref": "#/$defs/checkPhaseAction"
         },
         "install": {
@@ -654,20 +657,27 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "source",
-        "prerequisites",
+        "root-dir",
+        "build-after",
         "artifact",
         "actions"
       ],
       "properties": {
-        "source": {
+        "root-dir": {
           "$ref": "#/$defs/relativePath"
+        },
+        "additional-source-files": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/relativePath"
+          }
         },
         "project": {
           "$ref": "#/$defs/relativePath"
         },
-        "prerequisites": {
-          "$ref": "#/$defs/packagePrerequisites"
+        "build-after": {
+          "$ref": "#/$defs/buildAfter"
         },
         "artifact": {
           "$ref": "#/$defs/artifact"
@@ -700,32 +710,38 @@
         }
       ]
     },
-    "packagePrerequisites": {
+    "buildAfter": {
       "type": "array",
       "uniqueItems": true,
       "items": {
-        "$ref": "#/$defs/identifier"
+        "$ref": "#/$defs/deliverableReference"
       }
     },
     "mcpServer": {
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "source",
+        "root-dir",
         "manifest",
-        "prerequisites",
+        "build-after",
         "actions"
       ],
       "properties": {
-        "source": {
+        "root-dir": {
           "$ref": "#/$defs/relativePath"
+        },
+        "additional-source-files": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/relativePath"
+          }
         },
         "manifest": {
           "$ref": "#/$defs/relativePath"
         },
-        "prerequisites": {
-          "$ref": "#/$defs/packagePrerequisites",
-          "maxItems": 1
+        "build-after": {
+          "$ref": "#/$defs/buildAfter"
         },
         "actions": {
           "$ref": "#/$defs/installedActions"
@@ -737,20 +753,27 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "source",
+        "root-dir",
         "manifest",
-        "prerequisites",
+        "build-after",
         "actions"
       ],
       "properties": {
-        "source": {
+        "root-dir": {
           "$ref": "#/$defs/relativePath"
+        },
+        "additional-source-files": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/relativePath"
+          }
         },
         "manifest": {
           "$ref": "#/$defs/relativePath"
         },
-        "prerequisites": {
-          "$ref": "#/$defs/packagePrerequisites"
+        "build-after": {
+          "$ref": "#/$defs/buildAfter"
         },
         "actions": {
           "$ref": "#/$defs/installedActions"
@@ -761,16 +784,23 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "source",
-        "prerequisites",
+        "root-dir",
+        "build-after",
         "actions"
       ],
       "properties": {
-        "source": {
+        "root-dir": {
           "$ref": "#/$defs/relativePath"
         },
-        "prerequisites": {
-          "$ref": "#/$defs/packagePrerequisites"
+        "additional-source-files": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/relativePath"
+          }
+        },
+        "build-after": {
+          "$ref": "#/$defs/buildAfter"
         },
         "actions": {
           "$ref": "#/$defs/skillActions"
@@ -781,16 +811,23 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "source",
-        "prerequisites",
+        "root-dir",
+        "build-after",
         "actions"
       ],
       "properties": {
-        "source": {
+        "root-dir": {
           "$ref": "#/$defs/relativePath"
         },
-        "prerequisites": {
-          "$ref": "#/$defs/packagePrerequisites"
+        "additional-source-files": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/relativePath"
+          }
+        },
+        "build-after": {
+          "$ref": "#/$defs/buildAfter"
         },
         "actions": {
           "$ref": "#/$defs/skillActions"

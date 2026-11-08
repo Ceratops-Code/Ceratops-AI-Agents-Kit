@@ -70,15 +70,15 @@ def test_promote_repository_runs_explicit_operation_ids_in_order(
     }
     repository: dict[str, Any] = {
         "capabilities": {},
-        "actions": {"before-build-checks": {"check-groups": {'source': no_op, 'tests': no_op}}, },
+        "actions": {"pre-build-checks": {"check-groups": {'source': no_op, 'tests': no_op}}, },
     }
     deliverables: dict[str, Any] = {
         "apps": {
             name: {
-                "source": ".",
+                "root-dir": ".",
                 "manifest": "ordered-operation.py",
-                "prerequisites": [],
-                "actions": {"before-build-checks": {"check-groups": {'source': no_op}}, "install": operation(
+                "build-after": [],
+                "actions": {"pre-build-checks": {"check-groups": {'source': no_op}}, "install": operation(
                         name,
                         needs_generation=validation_mode == "parameter",
                     )},
@@ -89,17 +89,17 @@ def test_promote_repository_runs_explicit_operation_ids_in_order(
     selection: list[str] = []
     checks: list[str] = []
     if validation_mode != "absent":
-        repository["actions"]["before-build-checks"]["check-groups"]["source"] = operation("repository-check")
-        deliverables["apps"]["custom-deploy"]["actions"]["before-build-checks"]["check-groups"]["source"] = operation(
+        repository["actions"]["pre-build-checks"]["check-groups"]["source"] = operation("repository-check")
+        deliverables["apps"]["custom-deploy"]["actions"]["pre-build-checks"]["check-groups"]["source"] = operation(
             "deliverable-check"
         )
         checks = ["repository-check", "deliverable-check"]
     if validation_mode == "explicit":
         selection = [
             "--validation-operation",
-            "repository.actions.before-build-checks.check-groups.source",
+            "repository.actions.pre-build-checks.check-groups.source",
             "--validation-operation",
-            "deliverables.apps.custom-deploy.actions.before-build-checks.check-groups.source",
+            "deliverables.apps.custom-deploy.actions.pre-build-checks.check-groups.source",
         ]
     elif validation_mode == "invalid-selection":
         selection = ["--run-operation", "deliverables.apps.missing.actions.install"]
@@ -1035,7 +1035,7 @@ def test_promotion_repairs_and_revalidates_the_final_commit_before_deployment(
         repo,
         repository={
             "capabilities": {},
-            "actions": {"before-build-checks": {"check-groups": {'source': {
+            "actions": {"pre-build-checks": {"check-groups": {'source': {
                     "requires": {"capabilities": []},
                     "steps": [{"run": [sys.executable, "custom-quality.py"]}],
                 }, 'tests': {
@@ -1051,7 +1051,7 @@ def test_promotion_repairs_and_revalidates_the_final_commit_before_deployment(
 
         path = repo / "sdlc/sdlc.yml"
         document = yaml.safe_load(path.read_text())
-        groups = document["repository"]["actions"]["before-build-checks"]["check-groups"]
+        groups = document["repository"]["actions"]["pre-build-checks"]["check-groups"]
         groups["tests"] = groups["source"]
         groups["source"] = {
             "requires": {"capabilities": []},

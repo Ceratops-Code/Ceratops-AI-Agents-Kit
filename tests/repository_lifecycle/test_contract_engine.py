@@ -276,7 +276,7 @@ class GHContractStateEngineTests(unittest.TestCase):
                         "kind": "ceratops-sdlc",
                         "repository": {
                             "capabilities": {},
-                            "actions": {"before-build-checks": {"check-groups": {'source': {
+                            "actions": {"pre-build-checks": {"check-groups": {'source': {
                                     "requires": {"capabilities": []},
                                     "steps": [{"run": "python -V"}],
                                 }, 'tests': {
@@ -306,7 +306,7 @@ class GHContractStateEngineTests(unittest.TestCase):
                         "kind": "ceratops-sdlc",
                         "repository": {
                             "capabilities": {},
-                            "actions": {"before-build-checks": {"check-groups": {
+                            "actions": {"pre-build-checks": {"check-groups": {
                                 action: {
                                     "requires": {"capabilities": []},
                                     "no-op": f"No {action} in this fixture.",
@@ -429,7 +429,7 @@ class GHContractStateEngineTests(unittest.TestCase):
                         "kind": "ceratops-sdlc",
                         "repository": {
                             "capabilities": {},
-                            "actions": {"before-build-checks": {"check-groups": {
+                            "actions": {"pre-build-checks": {"check-groups": {
                                 action: {
                                     "requires": {"capabilities": []},
                                     "no-op": f"No {action} in this fixture.",
@@ -562,7 +562,7 @@ class GHContractStateEngineTests(unittest.TestCase):
                         "kind": "ceratops-sdlc",
                         "repository": {
                             "capabilities": {},
-                            "actions": {"before-build-checks": {"check-groups": {
+                            "actions": {"pre-build-checks": {"check-groups": {
                                 action: {
                                     "requires": {"capabilities": []},
                                     "no-op": f"No {action} in this fixture.",

@@ -42,7 +42,7 @@ jobs:
           CERATOPS_TASK_TEMP_ROOT: ${{ runner.temp }}
         with:
           repo-root: .
-          operations: repository.actions.before-build-checks
+          operations: repository.actions.pre-build-checks
           evidence-file: ${{ runner.temp }}/sdlc-validation.json
 
       - name: Upload validation evidence

@@ -73,10 +73,7 @@ def _repository_entrypoint(root: pathlib.Path, operation: Mapping[str, Any]) -> 
 def _operation_requirements(operation: Mapping[str, Any]) -> set[str]:
     """Return required runtime capabilities across supported SDLC versions."""
 
-    requirements = operation.get("requires")
-    if isinstance(requirements, Mapping):
-        return set(requirements.get("capabilities", []))
-    return set(operation.get("prerequisites", []))
+    return set(operation.get("requires", {}).get("capabilities", []))
 
 
 def _validation_coverage_errors(
@@ -419,14 +416,14 @@ def validate_ceratops_compatibility(
     sdlc_errors: list[str] = []
     entries: dict[str, Mapping[str, Any]] = {}
     if not _regular_file_error(root, paths["sdlc"]):
-        sdlc, sdlc_errors = read_contract(root / paths["sdlc"])
+        sdlc, sdlc_errors = read_contract(root / paths["sdlc"], repo_root=root)
         if sdlc:
             entries = operation_entries(sdlc)
     test_runner_relative = surfaces["python_test_runner"]["path"]
     test_runner_selected = any(
         test_runner_relative in step.get("run", [])
         for name, operation in entries.items()
-        if operation_category(name) in {"before-build-checks", "after-build-checks"}
+        if operation_category(name) in {"pre-build-checks", "post-build-checks"}
         for step in operation.get("steps", [])
     )
     for name, surface in surfaces.items():
@@ -463,7 +460,7 @@ def validate_ceratops_compatibility(
             commands = [
                 step["run"]
                 for name, entry in entries.items()
-                if operation_category(name) == "before-build-checks"
+                if operation_category(name) == "pre-build-checks"
                 for step in entry.get("steps", [])
                 if "run" in step
             ]
@@ -472,7 +469,7 @@ def validate_ceratops_compatibility(
             tests = [
                 entry
                 for name, entry in entries.items()
-                if operation_category(name) in {"before-build-checks", "after-build-checks"}
+                if operation_category(name) in {"pre-build-checks", "post-build-checks"}
             ]
             if not tests:
                 errors.append("SDLC must declare repository tests or an explicit no-op")

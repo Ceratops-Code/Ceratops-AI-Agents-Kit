@@ -159,7 +159,7 @@ abandonment/replacement and worktree removal rather than matching-work success.
 - Required `--parameter name=value` values for promotion-time deploy-local
   operations; the helper forwards them to the declared operation and applies
   them only when declared by a validation or test check.
-- Optional ordered `--validation-operation LOCATION` flags name before-build
+- Optional ordered `--validation-operation LOCATION` flags name pre-build
   phases or groups. Required repository and deliverable groups remain included.
   The helper passes their complete locations to the operation runner.
 
