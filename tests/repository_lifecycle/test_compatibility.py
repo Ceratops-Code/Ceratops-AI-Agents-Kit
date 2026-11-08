@@ -11,7 +11,11 @@ import shutil
 import subprocess
 import sys
 import tomllib
+import urllib.error
+import urllib.request
 import zipfile
+from email.message import Message
+from types import SimpleNamespace
 
 import jsonschema
 import pytest
@@ -131,6 +135,85 @@ def test_actionlint_runner_pins_assets_and_rejects_bad_downloads(
             False,
         )
     ]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        ROOT / "scripts/run-actionlint.py",
+        REPOSITORY_LIFECYCLE_SOURCE / "references/templates/run-actionlint.py.tmpl",
+    ],
+    ids=["repository", "generated"],
+)
+@pytest.mark.parametrize(
+    ("responses", "exit_code"),
+    [((504, None), 0), ((504, 504), 3), ((404,), 3)],
+    ids=["recovers", "bounded", "other-error"],
+)
+def test_actionlint_cli_retries_only_gateway_timeout(
+    source: pathlib.Path,
+    responses: tuple[int | None, ...],
+    exit_code: int,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = tmp_path / "scripts/run-actionlint.py"
+    bin_dir = runner.parent / ".venv" / ("Scripts" if sys.platform == "win32" else "bin")
+    bin_dir.mkdir(parents=True)
+    shutil.copy2(source, runner)
+    workflow = tmp_path / ".github/workflows/validate.yml"
+    workflow.parent.mkdir(parents=True)
+    workflow.write_text("name: Validate\n", encoding="utf-8")
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as package:
+        package.writestr("actionlint.exe", b"fixture actionlint")
+    payload = buffer.getvalue()
+    requests: list[str] = []
+    remaining = iter(responses)
+
+    def fetch(request: urllib.request.Request, *, timeout: int) -> io.BytesIO:
+        requests.append(request.full_url)
+        status = next(remaining)
+        if status is not None:
+            raise urllib.error.HTTPError(
+                request.full_url, status, "fixture", Message(), io.BytesIO()
+            )
+        return io.BytesIO(payload)
+
+    def run(arguments: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        output = "1.7.12\n" if arguments[-1] == "-version" else ""
+        return subprocess.CompletedProcess(arguments, 0, output, "")
+
+    real_sha256 = hashlib.sha256
+
+    def fixture_sha256(content: bytes = b"") -> object:
+        if content == payload:
+            return SimpleNamespace(
+                hexdigest=lambda: "6e7241b51e6817ea6a047693d8e6fed13b31819c9a0dd6c5a726e1592d22f6e9"
+            )
+        return real_sha256(content)
+
+    monkeypatch.setattr(sys, "executable", str(bin_dir / "python"))
+    monkeypatch.setattr("platform.system", lambda: "Windows")
+    monkeypatch.setattr("platform.machine", lambda: "AMD64")
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+    monkeypatch.setattr(urllib.request, "urlopen", fetch)
+    monkeypatch.setattr(hashlib, "sha256", fixture_sha256)
+    monkeypatch.setattr(subprocess, "run", run)
+
+    with pytest.raises(SystemExit) as result:
+        runpy.run_path(str(runner), run_name="__main__")
+    assert result.value.code == exit_code
+    assert len(requests) == len(responses)
+    binary = bin_dir / "actionlint.exe"
+    if exit_code == 0:
+        assert binary.read_bytes() == b"fixture actionlint"
+        with pytest.raises(SystemExit) as repeated:
+            runpy.run_path(str(runner), run_name="__main__")
+        assert repeated.value.code == 0
+        assert len(requests) == len(responses)
+    else:
+        assert not binary.exists()
 
 
 def test_actionlint_contract_selects_recursive_workflows_once(

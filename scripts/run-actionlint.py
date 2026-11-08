@@ -21,6 +21,8 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
+import urllib.error
 import urllib.request
 import zipfile
 
@@ -103,11 +105,19 @@ def extract_executable(payload: bytes, archive: str, executable: str) -> bytes:
 
 
 def download_archive(archive: str, digest: str) -> bytes:
-    """Download one bounded official release asset and verify its digest."""
+    """Download a bounded official asset, retrying one gateway timeout."""
 
     url = f"https://github.com/rhysd/actionlint/releases/download/v{VERSION}/{archive}"
     request = urllib.request.Request(url, headers={"User-Agent": "ceratops-actionlint-runner"})
-    with urllib.request.urlopen(request, timeout=60) as response:
+    try:
+        response = urllib.request.urlopen(request, timeout=60)
+    except urllib.error.HTTPError as error:
+        if error.code != 504:
+            raise
+        error.close()
+        time.sleep(2)
+        response = urllib.request.urlopen(request, timeout=60)
+    with response:
         payload = response.read(MAX_ARCHIVE_BYTES + 1)
     if len(payload) > MAX_ARCHIVE_BYTES:
         raise RuntimeError("actionlint archive exceeds the size limit")
