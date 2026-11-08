@@ -168,9 +168,11 @@ capability requirements together. Git's `linguist-vendored` and
 outputs consistently for check selection and language coverage.
 The repository text collector honors declared HTML encodings in legacy
 documentation while retaining strict UTF-8 reads for executable/configuration files.
-`agents/openai.yaml` is Codex UI metadata and may be ignored by other agents.
-Each Ceratops skill declares the runtime-local icon path
-`./assets/ceratops-logo-500.png`; every source copy matches the canonical
+`SKILL.md` uses Agent Skills frontmatter and free-form Markdown instructions.
+`agents/openai.yaml` is optional Codex metadata. Ceratops skills use the
+enabled implicit-invocation default or set it to `true` explicitly.
+A supplied Ceratops icon uses the runtime-local path
+`./assets/ceratops-logo-500.png` and matches the canonical
 `skills/ceratops-skill-lifecycle/references/templates/ceratops-logo-500.png`.
 Reusable skill-runtime helper logic lives in skill-local lifecycle scripts
 under `skills/*/scripts/`, not in an installed Python package. User-global

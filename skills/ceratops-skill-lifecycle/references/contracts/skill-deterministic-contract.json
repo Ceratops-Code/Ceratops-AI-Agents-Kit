@@ -121,9 +121,9 @@
       "deterministic_evidence": [
         "skill directory name",
         "source SKILL.md frontmatter",
-        "source SKILL.md section and subsection structure"
+        "source SKILL.md Markdown instructions"
       ],
-      "pass_condition": "Source skill frontmatter requires name and description and permits the supported optional Agent Skills fields license, compatibility, metadata, and allowed-tools with their published types and limits; name matches the directory, contains 1 to 64 lowercase ASCII letters, digits, or hyphens, does not start or end with a hyphen, and contains no consecutive hyphens; description contains 40 to 1024 characters; the body contains a Markdown H2 section structure; the ceratops profile additionally requires Boundaries and Output Contract subsections."
+      "pass_condition": "Source skill frontmatter requires name and description and permits the optional Agent Skills fields license, compatibility, metadata, and allowed-tools with their published types and limits. The name matches the directory, contains 1 to 64 lowercase ASCII letters, digits, or hyphens, does not start or end with a hyphen, and contains no consecutive hyphens. The description is nonblank and contains at most 1024 characters. The body contains free-form Markdown instructions."
     },
     {
       "id": "skill.metadata_alignment",
@@ -133,7 +133,7 @@
         "skills/ceratops-skill-lifecycle/references/templates/ceratops-logo-500.png",
         "source SKILL.md description"
       ],
-      "pass_condition": "OpenAI interface metadata exists, default_prompt names the skill, display name resembles the skill identity, and short description contains 25 to 64 characters and overlaps the trigger description; when present, dependencies.tools is an array of supported tool dependency objects and policy.allow_implicit_invocation is Boolean; the ceratops profile additionally requires icon fields, shared Ceratops icon paths, and matching bytes."
+      "pass_condition": "The agents/openai.yaml file is optional. When supplied, interface fields are strings, a supplied default_prompt names the skill, and a supplied short_description contains 25 to 64 characters. When present, dependencies.tools is an array of supported tool dependency objects and policy.allow_implicit_invocation is Boolean. The ceratops profile uses the enabled implicit-invocation default or an explicit true and requires any supplied icon fields to use the shared Ceratops icon and matching bytes."
     },
     {
       "id": "skill.shared_section_generation",
