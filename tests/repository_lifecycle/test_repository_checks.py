@@ -1260,6 +1260,12 @@ def test_generated_scripts_and_skill_owned_ci_keep_environments_and_tests_separa
     assert (repo / "scripts/uv.lock").read_bytes() == lock_before
     project.write_bytes(project_before)
     install_npm(repo)
+    # The parent SDLC check already provisioned the pinned actionlint. Let the
+    # generated checker use that binary in its separate tooling environment.
+    actionlint_name = "actionlint.exe" if os.name == "nt" else "actionlint"
+    cached_actionlint = pathlib.Path(sys.executable).parent / actionlint_name
+    if cached_actionlint.is_file():
+        shutil.copy2(cached_actionlint, pathlib.Path(actual["python"]).parent / actionlint_name)
     prefix = ["uv", "run", "--locked"]
     validation = subprocess.run([*prefix, "scripts/validate-repository.py"], cwd=repo, capture_output=True, text=True, check=False)
     assert validation.returncode == 0, validation.stdout + validation.stderr + (pathlib.Path(json.loads(validation.stdout)["evidence_file"]).read_text() if validation.stdout.startswith("{") else "")

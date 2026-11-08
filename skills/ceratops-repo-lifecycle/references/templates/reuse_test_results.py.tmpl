@@ -170,7 +170,12 @@ def remove_test_diagnostic(path: pathlib.Path, *, root: pathlib.Path, current: A
     collection error for that same request, which has no individual test result.
     """
     # The writer owns its partial file even beside a user-retained report.
-    path.with_name(f".{path.stem}.in_process.json").unlink(missing_ok=True)
+    try:
+        path.with_name(f".{path.stem}.in_process.json").unlink(missing_ok=True)
+    except NotADirectoryError:
+        # Neither report exists below a non-directory ancestor. If a later
+        # failure needs a report, its writer can explain why saving it failed.
+        return
     if not path.resolve().is_relative_to((root / ".build/test-diagnostics").resolve()):
         return
     report = _read_test_diagnostic(path, root)

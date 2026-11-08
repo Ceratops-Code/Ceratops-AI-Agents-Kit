@@ -1145,6 +1145,16 @@ def test_revision_mode_requires_two_full_commit_shas(
         blocked_parent = tmp_path / "blocked"
         blocked_parent.write_text("existing file", encoding="utf-8")
         diagnostic = blocked_parent / "failure.json"
+        partial = blocked_parent / ".failure.in_process.json"
+        original_unlink = pathlib.Path.unlink
+
+        def unlink(path: pathlib.Path, missing_ok: bool = False) -> None:
+            # Exercise POSIX's error for a blocked parent on Windows too.
+            if path == partial:
+                raise NotADirectoryError(str(blocked_parent))
+            original_unlink(path, missing_ok=missing_ok)
+
+        monkeypatch.setattr(pathlib.Path, "unlink", unlink)
     monkeypatch.setattr(runner, "DEFAULT_DIAGNOSTIC_PATH", diagnostic)
     output_arguments = (
         [] if output_kind == "default" else ["--diagnostic-output", str(diagnostic)]
