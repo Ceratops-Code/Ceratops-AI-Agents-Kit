@@ -568,8 +568,10 @@ individual `check-groups`. Each group owns its `steps`, `requires`, optional
 layout; the existing scheduler and saved results remain in use.
 `execute_check_phases()` runs `pre-build-checks`, dependency-ordered `build`
 actions, and `post-build-checks`, regardless of YAML key order. It stops at the
-first failed source check. Builders report the checks named inside their own
-`check-groups`; those groups do not launch separate commands or fabricate passes.
+first failed source check. Builders report the checks named under
+`build.checks` without launching separate commands. When Python tests are
+present, compatibility checking requires a check command in addition to the
+repository source validator.
 
 The repository-operation CLI takes explicit `--operation` phase or group
 locations. A direct group request does not run its siblings. Promote and Ship
@@ -588,7 +590,9 @@ under `capabilities` with their original `version-from` declarations. The
 runner prepares required deliverables recursively and passes only the files
 declared by each command. A post-build check also gets its own deliverable's
 output. A pre-build check can use another deliverable's output. Direct checks
-with artifact requirements enter the same runner as a build.
+with artifact requirements enter the same runner as a build. Only builds and
+check groups accept `uses-artifacts`. Installation and publication receive
+accepted files through their existing delivery contracts.
 
 Commands opt into runner arguments through `{check_group}` and `{artifacts}` in
 their declared `steps.run`; source scans receive no extra arguments. Execution

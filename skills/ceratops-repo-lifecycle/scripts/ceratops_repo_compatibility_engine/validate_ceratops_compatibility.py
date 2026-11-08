@@ -473,7 +473,10 @@ def validate_ceratops_compatibility(
             ]
             if not tests:
                 errors.append("SDLC must declare repository tests or an explicit no-op")
-            if python_tests and not any(entry.get("steps") for entry in tests):
+            if python_tests and not any(
+                "run" in step and step["run"] not in validator_commands
+                for entry in tests for step in entry.get("steps", [])
+            ):
                 errors.append("detected Python tests require an executable SDLC tests operation")
     errors.extend(_environment_errors(root, contract, has_python_skills=bool(python_skills)))
     errors.extend(_skill_runtime_errors(root, contract, has_python_skills=bool(python_skills)))

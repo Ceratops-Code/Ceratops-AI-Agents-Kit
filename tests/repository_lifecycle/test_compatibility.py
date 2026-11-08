@@ -737,6 +737,17 @@ def test_explicit_app_test_ownership_does_not_generate_python_test_runner(
     )
     assert validator.validate_ceratops_compatibility(repo)["valid"] is True
 
+    app = preserved["deliverables"]["apps"]["fixture-app"]
+    groups = app["actions"]["pre-build-checks"]["check-groups"]
+    groups.pop("tests")
+    for group in (None, {"requires": {"capabilities": []}, "no-op": "Tests disabled."}):
+        if group is not None:
+            groups["tests"] = group
+        contract_path.write_text(json.dumps(preserved), encoding="utf-8")
+        checked = validator.validate_ceratops_compatibility(repo)
+        assert checked["valid"] is False
+        assert "detected Python tests require an executable SDLC tests operation" in checked["errors"]
+
 
 def test_compatibility_materializer_preserves_existing_validator_and_ci(
     tmp_path: pathlib.Path,

@@ -489,10 +489,18 @@
         }
       ]
     },
+    "nonBuildAction": {
+      "$ref": "#/$defs/action",
+      "propertyNames": {
+        "not": {
+          "const": "uses-artifacts"
+        }
+      }
+    },
     "testSelectionAction": {
       "allOf": [
         {
-          "$ref": "#/$defs/action"
+          "$ref": "#/$defs/nonBuildAction"
         },
         {
           "required": [
@@ -531,7 +539,7 @@
       ],
       "properties": {
         "bootstrap": {
-          "$ref": "#/$defs/action"
+          "$ref": "#/$defs/nonBuildAction"
         },
         "test-selection": {
           "$ref": "#/$defs/testSelectionAction"
@@ -561,10 +569,10 @@
           "$ref": "#/$defs/checkPhaseAction"
         },
         "publish": {
-          "$ref": "#/$defs/action"
+          "$ref": "#/$defs/nonBuildAction"
         },
         "verify-publish": {
-          "$ref": "#/$defs/action"
+          "$ref": "#/$defs/nonBuildAction"
         }
       }
     },
@@ -586,13 +594,13 @@
           "$ref": "#/$defs/checkPhaseAction"
         },
         "install": {
-          "$ref": "#/$defs/action"
+          "$ref": "#/$defs/nonBuildAction"
         },
         "publish": {
-          "$ref": "#/$defs/action"
+          "$ref": "#/$defs/nonBuildAction"
         },
         "verify-publish": {
-          "$ref": "#/$defs/action"
+          "$ref": "#/$defs/nonBuildAction"
         }
       }
     },
@@ -614,7 +622,7 @@
           "$ref": "#/$defs/checkPhaseAction"
         },
         "install": {
-          "$ref": "#/$defs/action"
+          "$ref": "#/$defs/nonBuildAction"
         }
       }
     },

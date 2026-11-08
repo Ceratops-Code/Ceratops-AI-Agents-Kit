@@ -859,6 +859,24 @@ def test_typed_rejects_invalid_dependency_or_lifecycle_boundary(
     assert any(expected in error for error in contracts.validation_errors(fixture))
 
 
+@pytest.mark.parametrize("version", [4, 5])
+@pytest.mark.parametrize("operation", ["bootstrap", "install", "publish", "verify-publish"])
+def test_artifact_references_require_a_build_or_check_consumer(version, operation):
+    fixture = _typed_contract()
+    fixture["version"] = version
+    if operation == "bootstrap":
+        actions = fixture["repository"]["actions"]
+    elif operation == "install":
+        actions = fixture["deliverables"]["apps"]["claims-mobile"]["actions"]
+    else:
+        actions = fixture["deliverables"]["packages"]["claims"]["actions"]
+    actions.setdefault(operation, _run_action({"run": ["uv", "--version"]}))
+    assert not contracts.validation_errors(fixture)
+    actions[operation]["uses-artifacts"] = ["deliverables.packages.core"]
+    errors = contracts.validation_errors(fixture)
+    assert any(f".actions.{operation}:" in error and "uses-artifacts" in error for error in errors), errors
+
+
 @pytest.mark.parametrize(
     "change",
     [

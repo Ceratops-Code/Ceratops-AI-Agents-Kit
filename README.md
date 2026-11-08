@@ -377,7 +377,9 @@ Declare the files that belong to a deliverable under `root-dir`. Use
 `additional-source-files` for shared assets and native manifests or lockfiles
 outside that directory. The runner includes tracked and nonignored new files
 and counts overlapping matches once. Native manifests still own package
-versions and dependency pins.
+versions and dependency pins. Declare `uses-artifacts` on the build or check
+that reads those files. Delivery actions obtain accepted files through their
+existing installation or publication contract.
 
 ```yaml
 root-dir: packages/report-tool
