@@ -43,12 +43,18 @@ from ceratops_repo_compatibility_engine.sdlc_contract_validation import (
 )
 from complete_artifact_builds import CompletedArtifactVersion, PreparedBuildReceipt
 from github_pr_workflow.command import (
+    CommandError,
+    completed_operation_report_ids,
     failure_excerpt,
+    handoff_report_completion,
     release_lock_module,
     remove_resolved_failures,
     report_failure,
     report_phase,
+    retire_handoff_reports_cli,
     run_progress_command,
+    update_ci_failure_evidence,
+    write_operation_report,
 )
 from sdlc_results import StepResultError, capture_step_result
 from store_artifacts import (
@@ -661,6 +667,8 @@ def execute_prepared_operation(
         "action": action, "failure_id": failure_id,
         "successful_results": successful_results, "output_root": prepared.repo_root,
     }
+    remove_resolved_failures(base, diagnostic_output=diagnostic_output,
+                             repo_root=owner_root, action=action, resolved_failures=())
     if prepared.test_context is not None:
         base["test_context"] = dict(prepared.test_context)
     if prepared.prerequisites and any(prepared.prerequisites.values()):
@@ -710,7 +718,6 @@ def execute_prepared_operation(
                 remove_operation_failures(
                     result, diagnostic_output=diagnostic_output,
                     diagnostic_owner=(owner_root, action),
-                    completed_steps=tuple(step.position for step in prepared.steps),
                 )
                 return result
             base.update(check_decision="executed", check_reason=check_plan.decision["reason"])
@@ -738,6 +745,8 @@ def execute_prepared_operation(
                     if prepared.handoff_mode == "ci"
                     else "handoff_required",
                     "handoff": dict(step.handoff),
+                    **(handoff_report_completion(prepared)
+                       if prepared.handoff_mode == "return" else {}),
                 }
             route = f"{step.handoff['lifecycle']}/{step.handoff['action']}"
             inputs = dict(step.handoff.get("inputs", {}))
@@ -787,6 +796,8 @@ def execute_prepared_operation(
             }
             if receipts:
                 handoff_result["step_results"] = receipts
+            if outcome["status"] == "handoff_required":
+                handoff_result.update(handoff_report_completion(prepared))
             if outcome["status"] == "completed":
                 handoff_result["handoff_completed"] = True
             if repository_commit(prepared.repo_root) != prepared.commit:
@@ -799,7 +810,6 @@ def execute_prepared_operation(
             remove_operation_failures(
                 handoff_result, diagnostic_output=diagnostic_output,
                 diagnostic_owner=(owner_root, action),
-                completed_steps=tuple(item.position for item in prepared.steps),
             )
             return handoff_result
         if prepared.commit and prepared.category in MUTATION_CATEGORIES:
@@ -1006,6 +1016,13 @@ def remove_operation_failures(
             diagnostic_owner=diagnostic_owner,
         )
     operation = result.get("operation")
+    if operation is None and result.get("status") == "completed":
+        completed = completed_operation_report_ids(result)
+        repo_root, action = diagnostic_owner
+        remove_resolved_failures(result, diagnostic_output=diagnostic_output, repo_root=repo_root,
+                                 action=action, resolved_failures=completed,
+                                 resolved_prefixes=tuple(key + ":" for key in completed))
+        return
     if (result.get("status") != "completed" or not isinstance(operation, str)
             or (result.get("handoff") and not result.get("handoff_completed"))):
         return
@@ -1016,6 +1033,7 @@ def remove_operation_failures(
     remove_resolved_failures(
         result, diagnostic_output=diagnostic_output, repo_root=repo_root, action=action,
         resolved_failures=(operation, *(f"{operation}:{position}" for position in positions)),
+        resolved_prefixes=(operation + ":",) if completed_steps is None else (),
     )
 
 
@@ -1096,7 +1114,7 @@ def execute_prepared_operations(
             }
         if result["status"] != "deferred_handoff":
             completed.append(operation.operation)
-    return {
+    final_result = {
         **batch,
         "status": "completed",
         "completed_operations": completed,
@@ -1112,6 +1130,10 @@ def execute_prepared_operations(
             else {}
         ),
     }
+    if prepared:
+        remove_operation_failures(final_result, diagnostic_output=diagnostic_output,
+                                  diagnostic_owner=diagnostic_owner or (prepared[0].repo_root, "operation"))
+    return final_result
 
 
 def execute_check_phases(
@@ -1204,11 +1226,15 @@ def execute_check_phases(
     completed = list(dict.fromkeys(item["operation"] for item in results
                                    if item["status"] in {"completed", "no_op"}
                                    and item["operation"] not in failed_names))
-    return {"status": failed[0]["status"] if failed else "completed", "results": results,
+    final_result = {"status": failed[0]["status"] if failed else "completed", "results": results,
             "deferred_handoffs": [handoff for result in results for handoff in result.get("deferred_handoffs", [])],
             "completed_operations": completed,
             "pending_operations": list(dict.fromkeys(item.operation for item in prepared
                                                      if item.operation not in completed))}
+    if prepared:
+        remove_operation_failures(final_result, diagnostic_output=diagnostic_output,
+                                  diagnostic_owner=diagnostic_owner or (prepared[0].repo_root, "operation"))
+    return final_result
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1257,6 +1283,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--qualification-level", choices=["alpha", "beta", "rc", "final"],
                         help="Required qualification of newly executed or reused checks; default alpha, beta for promotion tests.")
     parser.add_argument("--evidence-file", type=pathlib.Path)
+    parser.add_argument("--retire-handoff-reports", type=pathlib.Path, help="Consume completed installer JSON and retire obsolete reports without executing the operation.")
     parser.add_argument("--diagnostic-output", type=pathlib.Path)
     parser.add_argument("--diagnostic-repo-root", type=pathlib.Path)
     parser.add_argument("--diagnostic-action", default="operation")
@@ -1268,6 +1295,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.retire_handoff_reports is not None:
+        return retire_handoff_reports_cli(args)
     try:
         root = args.repo_root.expanduser().resolve(strict=True)
         context = "ci" if args.ci else "return" if args.return_handoffs else "skill"
@@ -1439,13 +1468,21 @@ def main(argv: list[str] | None = None) -> int:
         )
     failed = result.get("status") in FAILED_STATUSES
     if args.evidence_file:
-        if failed:
-            args.evidence_file.parent.mkdir(parents=True, exist_ok=True)
-            args.evidence_file.write_text(
-                json.dumps(result, indent=2) + "\n", encoding="utf-8"
-            )
-        else:
-            args.evidence_file.unlink(missing_ok=True)
+        try:
+            if args.ci:
+                update_ci_failure_evidence(args.evidence_file, result, failed=failed)
+            else:
+                if failed:
+                    write_operation_report(
+                        args.evidence_file, result, repo_root=args.diagnostic_repo_root or args.repo_root,
+                        action=args.diagnostic_action, pending_operations=tuple(args.operation),
+                    )
+                remove_operation_failures(
+                    result, diagnostic_output=args.evidence_file,
+                    diagnostic_owner=(args.diagnostic_repo_root or args.repo_root, args.diagnostic_action),
+                )
+        except (OSError, ValueError, CommandError) as exc:
+            result["report_cleanup_error"] = str(exc)
     print(
         json.dumps(result, separators=(",", ":")),
         file=sys.stderr if failed else sys.stdout,

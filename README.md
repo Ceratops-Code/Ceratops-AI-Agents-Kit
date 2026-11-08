@@ -146,6 +146,16 @@ analysis-only child models.
 The `skills/` tree is authoritative skill source for this repository.
 `sdlc/sdlc.yml` declares repository setup and validation, plus capabilities
 of each deliverable. Lifecycle actions decide when those capabilities run.
+Executable capabilities in SDLC v4/v5 declare version requirements only through
+`version-from`: `file` names repository-relative native metadata, and `key`
+names its dotted field when the file is a structured manifest. A single-value
+file needs no key. Here Python references `scripts/pyproject.toml` at
+`project.requires-python`; Node references `scripts/.nvmrc`, whose `lts/*`
+keeps the existing LTS requirement. An npm requirement would reference the
+owning `package.json` field `engines.node`. Inline capability `version` and
+`channel` are rejected for every tool; omit `version-from` for an unversioned
+capability. These references report requirements without downloading, installing
+or choosing runtimes. Artifact, package and release versions are separate data.
 The repository-compatibility templates under
 `skills/ceratops-repo-lifecycle/references/templates/` are reusable skeletons
 to copy into other repositories, not live configuration.
@@ -246,7 +256,7 @@ without repository deduplication.
 | `skills/ceratops-governance-lifecycle/scripts/rule_graph.py` | Parses canonical AGENTS rules and rejects structural syntax or rule-local explicit-user override escape clauses. |
 | `skills/ceratops-repo-lifecycle/scripts/github_contract_engine/` | Package CLI for compact local audit snapshots, contract evaluation, shared GitHub API access, sanitized evidence, and evidence-gated CodeQL disposition. |
 | `skills/ceratops-repo-lifecycle/scripts/github_pr_workflow/` | Package CLI for individual PR operations, opt-in scoped branch/stage/commit preparation and checked draft or fork PR publication in `ensure_pr.py`, bounded standalone review and CI inspectors with caller-owned evidence files, shared readiness-owned CI diagnostics, one-call retry-safe review replies and resolutions, decision-complete gate blockers, single-snapshot terminal Actions outage detection, exact-commit checkpointed shipping, four-proof obsolete-prepared-checkpoint cleanup before automatic resume, scoped pending-work checks, concurrent gates, integrated admin merge, reusable-branch restoration, and terminal cleanup. Dependency preflight reads exact-head CheckRun annotations even for successful jobs, counts notices separately, retains up to fifty warning/failure messages per PR in its current report, reports omitted-message counts, and blocks the affected PR when annotation reads are unavailable. Dependency release batches require merge commits so every approved update remains an ancestor of the published branch. |
-| `skills/ceratops-repo-lifecycle/scripts/promote-repository.py` | Prepares the required local `release/local` promotion branch and rejects repositories where `refs/heads/release` occupies that namespace; promotes selected branches with no deployment or an explicit ordered operation selection; or composes promotion into exact-head shipping with ordered release and deploy selections, finalization, and cleanup, automatically retaining the requesting linked worktree and its task files; checks live publication before rebasing only task commits while preserving shared history; records outcomes, recreating the output directory at save time when needed, and finalizes verified promotion-only or bound deployment results within the task temp root without replay. |
+| `skills/ceratops-repo-lifecycle/scripts/promote-repository.py` | Reuses an existing `release/local` without fetching or updating/checking out `main`; only a missing release branch is created from refreshed `main`. Prepares the required local `release/local` promotion branch and rejects repositories where `refs/heads/release` occupies that namespace; promotes selected branches with no deployment or an explicit ordered operation selection; or composes promotion into exact-head shipping with ordered release and deploy selections, finalization, and cleanup, automatically retaining the requesting linked worktree and its task files; checks live publication before rebasing only task commits while preserving shared history; records outcomes, recreating the output directory at save time when needed, and finalizes verified promotion-only or bound deployment results within the task temp root without replay. |
 | `skills/ceratops-repo-lifecycle/scripts/git_branch_operations.py` | Imported local branch/worktree lookup, checkout restoration, rebase, fast-forward and alignment functions shared by promotion, sync and Ship; no CLI or lock acquisition. |
 | `skills/ceratops-repo-lifecycle/scripts/check_deployment_receipts.py` | Checks closed deployment receipts for promotion finalization, preserving MCP server underscores while keeping skill identities unchanged; rejects mismatched records, unfinished cleanup and duplicate identities without running installation or publication. |
 | `skills/ceratops-repo-lifecycle/scripts/manage-pending-work.py` | Records, checks, automatically resumes the retained target commit, and progressively finalizes the exact selected scope; preflight preserves and reports non-cleanup-eligible worktrees, while eligible residual-worktree and identity-matched task-temp cleanup delegates bounded removal to `pending-work-cleanup.py`. |
@@ -268,7 +278,9 @@ reusable safety logic or bundle nontrivial evidence collection.
 
 With promotion's `--result-file`, the complete outcome stays in the selected
 task-temp report; command output contains its status, target, report path and
-SHA-256. If recording fails, command output preserves the complete outcome.
+SHA-256. Failure summaries also retain a bounded cause excerpt and any supplied
+check name and diagnostic path. Full command output stays in the report.
+If recording fails, command output preserves the complete outcome.
 Per-check test-selection records stay in captured diagnostics while live
 progress remains visible. Result cleanup accepts primary checkout, linked
 worktree and source subdirectory paths, checks receipt ownership against the
@@ -1561,6 +1573,36 @@ rerunning tests. Caller-retained reports outside managed storage stay untouched.
 Lifecycle commands separately retire their own operation reports after consuming
 successful command results. Neither cleanup deletes `check_results.json`.
 
+`github_pr_workflow.command` also owns temporary operation-attempt snapshots in
+the repository's caller-selected task temp tree. Promotion results and operation
+`--evidence-file` outputs include `temporary_operation_report` ownership and
+unresolved-operation metadata. Normal successful SDLC operations remove matching
+obsolete diagnostics and attempt snapshots throughout that same task tree, even
+when the next call selects another filename. Partial success retains remaining
+failures; a whole-operation success also retires failed steps removed from the
+current contract. New failure publication keeps one current snapshot per owner
+and original requested-operation set. Startup bounds interrupted predecessors
+to two in that group. Successful snapshots, accepted results,
+foreign files, redirected paths and other tasks remain outside automatic
+deletion. Cleanup errors remain observational and do not replay work.
+Each report reserves `.<report-name>.operation-report.tmp` for atomic writes;
+stopped-writer startup and completion discard unpublished staging bytes.
+Cleanup errors retain their affected paths across independent suboperations.
+Caller-selected promotion exports outside the task temp namespace retain their
+original payload and remain outside automatic deletion.
+For a single-step installation handed back to the caller, `report_completion`
+provides the normal helper call and answer schema. Compact promotion/shipping
+responses keep these calls in `report_completions`, including nested deployment
+and publication results. Its
+`--retire-handoff-reports PATH` mode consumes the actual installer's completion
+JSON from the same task temp tree. It checks the current registered operation,
+source commit, producer and selected target, retires obsolete unsuccessful
+reports and removes the consumed temporary input without installing again.
+The operation, source commit and receipt's checkout path come from the original
+`--repo-root`, including a linked worktree. The primary checkout identifies shared
+report storage only; its code and SDLC declaration do not replace the source's.
+An interrupted return call can be repeated through the same public entry point.
+
 The compatibility review `ND.COMPATIBILITY.TEST_RESULT_REUSE` checks observed
 reuse and interruption behavior. It accepts different storage formats and asks
 what completed work a repository loses if it can reuse only a whole run.
@@ -1613,6 +1655,11 @@ changing the repository and does not copy Ceratops dependencies. Deployment
 uses uv to prepare an environment under `$CODEX_HOME/runtimes/ceratops/versions/`.
 `python_runtime_skills` in the section manifest selects its users. Only their
 installed `.runtime-manifest.json` files record the exact interpreter path.
+Runtime export, installation and existing-environment checks use uv's
+`--no-editable` mode. Local path packages are installed as wheels even when the
+source project requests editable development installs. Installed imports remain
+available after the source checkout or disposable installation view is removed.
+An older editable environment is replaced at a fresh path rather than rewritten.
 After successful manifest activation, deployment retains the selected runtime
 and two predecessors. It also preserves any version still referenced by an
 installed manifest or running interpreter; a later successful deployment
@@ -1675,7 +1722,12 @@ uses complete-tree staging and rollback. Metadata-only staging folders use the
 same ownership and crash recovery as payload stages; their pending manifest file
 is removed with the stage after success or on the next matching fresh call.
 
-Both installers freeze source before rendering. Runtime manifests record the
+Both installers build Python packages and render skills directly from the
+selected checkout. Builds and installation from the primary or release checkout
+stay inside the managed installer's existing release-source lock. Temporary
+source views supply deployment evidence; they are never build inputs.
+Completed files still use temporary deployment staging. Runtime manifests record
+the
 repository identity, primary checkout path, full Git commit when present, and
 relative skill path. Each skill owns a compressed `.source-<sha256>.zip` with
 the exact source inputs, including dirty or unpacked sources. Git supplies clean
@@ -2089,7 +2141,10 @@ arguments and runtime settings are omitted. These explanations use the same
 input comparison as reuse and do not change accepted results or run extra tests.
 
 `ceratops-check-summary.v1` carries `inputGroups`, `checkGroups` and `checks`.
-Tables store repeated input facts once. Outcomes retain original result IDs,
+Tables store repeated input facts once. Exported pytest outcomes omit local
+result-file paths and file hashes when their complete input facts are embedded;
+original local observations keep those references. This avoids repeating local
+links in full-suite result records. Outcomes retain original result IDs,
 check versions, qualification levels, required/optional scope and phase facts;
 reused passes remain distinct from execution. Skips keep their reason, not a
 fabricated pass. Repository checks export the same envelope from the canonical

@@ -390,7 +390,7 @@ def validate_document(
 
 def render_resources(contract: dict[str, Any]) -> dict[str, str]:
     """Generate the readable projection and an intentionally incomplete seed."""
-    reference = ["# Design Document Contract", "", "Generated from `contracts/design-document-contract.json`; edit that source.", ""]
+    reference = ["# Design Document Contract", "", "Generated from `design-document-contract.json`; edit that source.", ""]
     for paragraph in contract["annotations"].values():
         reference.extend([textwrap.fill(paragraph, width=78), ""])
     reference += ["## Content Coverage", "", "| Topic | Applicability | Content |", "| --- | --- | --- |"]
@@ -420,13 +420,18 @@ def render_resources(contract: dict[str, Any]) -> dict[str, str]:
             groups.add(group)
         template += [f"{'###' if group else '##'} {section['heading']}", "", textwrap.fill(section["content"], width=78), ""]
     return {
-        "references/design-document-contract.md": "\n".join(reference).rstrip() + "\n",
+        "references/contracts/design-document-contract.md": "\n".join(reference).rstrip() + "\n",
         "assets/design-document-template.md": "\n".join(template).rstrip() + "\n",
     }
 
 
 def generate_resources(contract: dict[str, Any], output_root: pathlib.Path) -> None:
-    """Prepare both projections before replacement; restore prior bytes on error."""
+    """Prepare current resources, skip unchanged files, and restore failed writes.
+
+    The readable contract and template are the only owned outputs. No on-disk
+    history or recovery checkpoints are created; prior bytes live only for this
+    call's rollback. A fresh call reads current target bytes before each effect.
+    """
     generated = render_resources(contract)
     output_root = output_root.resolve()
     targets = {output_root / name: text for name, text in generated.items()}
@@ -438,9 +443,11 @@ def generate_resources(contract: dict[str, Any], output_root: pathlib.Path) -> N
     written: list[pathlib.Path] = []
     try:
         for path, text in targets.items():
-            path.parent.mkdir(parents=True, exist_ok=True)
             previous = originals[path]
             newline = "\r\n" if previous and b"\r\n" in previous else "\n"
+            if previous == text.replace("\n", newline).encode("utf-8"):
+                continue
+            path.parent.mkdir(parents=True, exist_ok=True)
             # A failed write can already have truncated or partially created its
             # target, so register it for rollback before attempting replacement.
             written.append(path)

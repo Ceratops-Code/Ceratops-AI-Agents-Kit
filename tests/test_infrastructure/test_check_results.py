@@ -364,6 +364,54 @@ def test_declared_writer_preserves_actual_attempt_and_original_timing(
     assert calls == ["executed"] and path.read_bytes() == saved
 
 
+def test_complete_suite_summary_omits_duplicate_local_links(check_writer, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    context = _context(tmp_path)
+    reader = runpy.run_path(str(ROOT / "skills/ceratops-repo-lifecycle/scripts/retain_check_results.py"))
+    context["fingerprint"] = reader["fingerprint"](context)
+    monkeypatch.setenv(check_writer["CHECK_CONTEXT_ENV"], json.dumps(context))
+    facts = {"source.py": "a" * 64}
+    group = hashlib.sha256(check_writer["canonical"](facts).rstrip(b"\n")).hexdigest()
+    observed: list[dict[str, Any]] = [
+        {"kind": "pytest", "id": f"tests/test_suite.py::test_example[{index:04d}]",
+         "status": "passed", "result_id": f"original-{index}", "check_version": "b" * 64,
+         "qualificationLevel": "beta", "inputs_digest": "c" * 64,
+         "phases": {"setup": "passed", "call": "passed", "teardown": "passed"},
+         "path": "ceratops/results/" + "worktree/" * 90 + "check_results.json", "sha256": "d" * 64}
+        for index in range(3500)
+    ]
+    children: dict[str, Any] = {"schema": "ceratops-check-summary.v1", "inputGroups": {group: facts},
+                "checkGroups": {group: facts}, "checks": [
+                    {**item, "inputGroup": group, "checkGroup": group} for item in observed
+                ]}
+    original = copy.deepcopy(children)
+    path = tmp_path / ".git/result.json"
+    request = _request(path)
+    calls = []
+    def execute():
+        calls.append("executed")
+        return 0
+    assert check_writer["run_recorded_check"](
+        execute, request, {}, checks=lambda: observed, summary=lambda: children,
+    ) == 0
+    saved = path.read_bytes()
+    record = reader["read_check_result"](path)
+    assert record["checks"] == observed and children == original
+    exported = [item for item in record["check_summary"]["checks"] if item.get("kind") == "pytest"]
+    assert exported == [{key: value for key, value in item.items() if key not in {"path", "sha256"}}
+                        for item in children["checks"]]
+    duplicate = copy.deepcopy(record)
+    duplicate["check_summary"]["checks"][:len(children["checks"])] = children["checks"]
+    assert len(saved) < reader["MAX_RECORD_BYTES"] < len(reader["canonical"](duplicate))
+    assert check_writer["run_recorded_check"](
+        lambda: pytest.fail("repeated accepted work"), request, {},
+    ) == 0
+    assert path.read_bytes() == saved and calls == ["executed"]
+    # Without complete embedded facts, a local reference must remain available.
+    incomplete = {**children, "checks": [observed[0]]}
+    assert check_writer["summarize_check_result"]({}, incomplete)["checks"] == [observed[0]]
+
+
 def test_compact_repository_summary_keeps_scope_inputs_and_original_result(
     check_writer: dict[str, Any], tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

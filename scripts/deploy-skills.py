@@ -31,7 +31,7 @@ from typing import Any, cast
 import tomlkit
 from tomlkit.exceptions import ParseError
 
-INSTALLER_VERSION = 21
+INSTALLER_VERSION = 22
 MANIFEST_NAME = ".runtime-manifest.json"
 RUNTIME_MANIFEST_SCHEMA = "ceratops-runtime-skill.v3"
 START = "<!-- CERATOPS_SHARED_SECTIONS_START -->"
@@ -420,8 +420,10 @@ def prepare_python_runtime(repo_root: pathlib.Path, install_root: pathlib.Path) 
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
     # uv selects the runtime dependency graph from the common lock. Development
     # tools and other workspace products cannot change this environment's identity.
+    # Local path dependencies must be copied into the installed environment;
+    # an editable link would outlive neither a source view nor its checkout.
     command = [uv, "export", "--project", str(project), "--locked", "--no-dev",
-               "--no-default-groups", "--no-emit-workspace", "--no-header", "--no-annotate"]
+               "--no-default-groups", "--no-emit-workspace", "--no-editable", "--no-header", "--no-annotate"]
     try:
         exported = subprocess.run(command, cwd=repo_root, env=environment,
                           capture_output=True, text=True, check=False)
@@ -465,7 +467,7 @@ def prepare_python_runtime(repo_root: pathlib.Path, install_root: pathlib.Path) 
         if unsafe_link(selected):
             raise ValueError("shared skill runtime version cannot be a link")
         checked = subprocess.run(
-            [uv, "sync", "--quiet", "--project", str(project), "--locked", "--no-dev", "--no-default-groups", "--no-install-workspace", "--check", "--no-active"],
+            [uv, "sync", "--quiet", "--project", str(project), "--locked", "--no-dev", "--no-default-groups", "--no-install-workspace", "--no-editable", "--check", "--no-active"],
             env=environment, capture_output=True, text=True, check=False,
         )
         if checked.returncode or not interpreter(version).is_file() or unsafe_link(interpreter(version)):
@@ -475,7 +477,7 @@ def prepare_python_runtime(repo_root: pathlib.Path, install_root: pathlib.Path) 
     created = not selected.exists()
     if created:
         result = subprocess.run(
-            [uv, "sync", "--quiet", "--project", str(project), "--locked", "--no-dev", "--no-default-groups", "--no-install-workspace", "--no-active"],
+            [uv, "sync", "--quiet", "--project", str(project), "--locked", "--no-dev", "--no-default-groups", "--no-install-workspace", "--no-editable", "--no-active"],
             env=environment, capture_output=True, text=True, check=False,
         )
         if result.returncode or not interpreter(version).is_file():
@@ -486,7 +488,7 @@ def prepare_python_runtime(repo_root: pathlib.Path, install_root: pathlib.Path) 
             try:
                 materialize_python_interpreters(interpreter(version))
                 checked = subprocess.run(
-                    [uv, "sync", "--quiet", "--project", str(project), "--locked", "--no-dev", "--no-default-groups", "--no-install-workspace", "--check", "--no-active"],
+                    [uv, "sync", "--quiet", "--project", str(project), "--locked", "--no-dev", "--no-default-groups", "--no-install-workspace", "--no-editable", "--check", "--no-active"],
                     env=environment, capture_output=True, text=True, check=False,
                 )
                 if checked.returncode:
@@ -1054,8 +1056,9 @@ def freeze_bootstrap_source(repo: pathlib.Path, install_root: pathlib.Path, stag
 
     Clean Git inputs come from HEAD, dirty inputs from tracked and nonignored
     files, and unpacked sources exclude build/cache and destination directories.
-    Rendering and runtime preparation read the extracted bytes. The bootstrap
-    remains self-contained; it never loads installed lifecycle implementation.
+    The extracted view is deployment evidence only. Rendering and runtime
+    preparation read the selected checkout. The bootstrap remains independent
+    and never loads installed lifecycle implementation.
     """
 
     archive, frozen = staging / "_source.zip", staging / "_source"
@@ -1154,16 +1157,16 @@ def install_batch(
             if (install_root / skill).is_dir():
                 prune_bootstrap_sources(install_root / skill)
         staging.mkdir()
-        frozen, source_archive, source_record = freeze_bootstrap_source(repo_root, install_root, staging)
-        manifest = read_manifest(frozen)
-        python_skills = declared_python_skills(frozen, manifest, skills)
+        _, source_archive, source_record = freeze_bootstrap_source(repo_root, install_root, staging)
+        manifest = read_manifest(repo_root)
+        python_skills = declared_python_skills(repo_root, manifest, skills)
         if python_skills and python_runtime is None:
-            python_runtime = prepare_python_runtime(frozen, install_root)
+            python_runtime = prepare_python_runtime(repo_root, install_root)
             if python_runtime is None:
                 raise ValueError("declared Python skills require the source locked project")
         for skill in skills:
             build_skill(
-                frozen, staging, manifest, skill,
+                repo_root, staging, manifest, skill,
                 python_runtime if skill in python_skills else None,
                 source_record, source_archive,
             )
