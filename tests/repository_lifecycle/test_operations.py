@@ -133,9 +133,9 @@ def test_canonical_operation_result_rejects_incomplete_artifact() -> None:
         )
 
 
-def test_live_sdlc_v4_selects_validation_and_tests_for_every_install() -> None:
+def test_live_sdlc_selects_validation_and_tests_for_every_install() -> None:
     document = contracts.load_contract(ROOT / "sdlc/sdlc.yml")
-    assert document["version"] == 4
+    assert document["version"] in contracts.sdlc_schema_paths()
     installs = (
         "deliverables.skills.ceratops-repo-lifecycle.actions.install",
         "deliverables.hooks.codex-hooks.actions.install",
@@ -143,12 +143,12 @@ def test_live_sdlc_v4_selects_validation_and_tests_for_every_install() -> None:
     )
     for install in installs:
         locations = runner.validation_operations(ROOT, [install])
-        assert "repository.actions.validate" in locations
-        assert "repository.actions.test" in locations
-        assert install.replace(".install", ".validate") in locations
+        assert "repository.actions.pre-build-checks.check-groups.source" in locations
+        assert "repository.actions.pre-build-checks.check-groups.tests" in locations
+        assert install.replace(".install", ".pre-build-checks.check-groups.source") in locations
     requests = [
-        runner.OperationRequest("repository.actions.validate"),
-        runner.OperationRequest("repository.actions.test"),
+        runner.OperationRequest("repository.actions.pre-build-checks.check-groups.source"),
+        runner.OperationRequest("repository.actions.pre-build-checks.check-groups.tests"),
     ]
     operations = runner.prepare_operations(ROOT, requests, context="ci")
     assert operations[0].steps[0].argv == (
@@ -178,13 +178,13 @@ def _no_op(reason: str = "No action in this fixture.") -> dict[str, object]:
 
 
 def _app(actions: dict[str, object]) -> dict[str, object]:
-    """Return one complete v4 application around the selected test actions."""
+    """Return one complete typed application around the selected test actions."""
 
-    complete = {"validate": _no_op(), "install": _no_op(), **actions}
+    complete = {"pre-build-checks": {"check-groups": {"source": _no_op()}}, "install": _no_op(), **actions}
     return {
-        "source": ".",
+        "root-dir": ".",
         "manifest": "sdlc/sdlc.yml",
-        "prerequisites": [],
+        "build-after": [],
         "actions": complete,
     }
 
@@ -204,8 +204,8 @@ def test_sdlc_template_is_a_schema_valid_empty_skeleton(tmp_path: pathlib.Path) 
     contract = write_sdlc_contract(tmp_path)
     shutil.copy2(SDLC_CONTRACT_TEMPLATE, contract)
     document = contracts.load_contract(contract)
-    assert document["version"] == 4
-    assert document["repository"]["actions"]["validate"]["steps"] == [
+    assert document["version"] == contracts.latest_sdlc_version()
+    assert document["repository"]["actions"]["pre-build-checks"]["check-groups"]["source"]["steps"] == [
         {"run": ["uv", "run", "--locked", "scripts/validate-repository.py"]}
     ]
     assert "deliverables" not in document
@@ -213,7 +213,7 @@ def test_sdlc_template_is_a_schema_valid_empty_skeleton(tmp_path: pathlib.Path) 
     assert live["version"] == 4
     entries = contracts.operation_entries(live)
     expected = {
-        "deliverables.skills.ceratops-repo-lifecycle.actions.validate": (
+        "deliverables.skills.ceratops-repo-lifecycle.actions.pre-build-checks.check-groups.source": (
             "ceratops-skill-lifecycle",
             "source-validate",
         ),
@@ -240,10 +240,10 @@ def test_sdlc_template_is_a_schema_valid_empty_skeleton(tmp_path: pathlib.Path) 
         "--head",
         "{head}",
     ]
-    assert entries["repository.actions.validate"]["steps"] == [
+    assert entries["repository.actions.pre-build-checks.check-groups.source"]["steps"] == [
         {"run": ["uv", "run", "--project", "scripts", "--locked", "python", "scripts/validate-repository.py"]},
     ]
-    assert entries["repository.actions.test"]["steps"] == [
+    assert entries["repository.actions.pre-build-checks.check-groups.tests"]["steps"] == [
         {
             "run": [
                 "uv",
@@ -255,11 +255,11 @@ def test_sdlc_template_is_a_schema_valid_empty_skeleton(tmp_path: pathlib.Path) 
         },
     ]
     validation = runner.validation_operations(ROOT)
-    assert validation[0] == "repository.actions.validate"
-    assert "deliverables.skills.ceratops-repo-lifecycle.actions.validate" in validation
-    assert "deliverables.hooks.codex-hooks.actions.validate" in validation
-    assert "deliverables.mcp-servers.ceratops-mcp-server-manager.actions.validate" in validation
-    assert "repository.actions.test" in validation
+    assert validation[0] == "repository.actions.pre-build-checks.check-groups.source"
+    assert "deliverables.skills.ceratops-repo-lifecycle.actions.pre-build-checks.check-groups.source" in validation
+    assert "deliverables.hooks.codex-hooks.actions.pre-build-checks.check-groups.source" in validation
+    assert "deliverables.mcp-servers.ceratops-mcp-server-manager.actions.pre-build-checks.check-groups.source" in validation
+    assert "repository.actions.pre-build-checks.check-groups.tests" in validation
 
 
 def test_absent_sdlc_section_is_a_successful_no_op(tmp_path: pathlib.Path) -> None:
@@ -269,14 +269,14 @@ def test_absent_sdlc_section_is_a_successful_no_op(tmp_path: pathlib.Path) -> No
             str(OPERATION_RUNNER),
             "--repo-root",
             str(tmp_path),
-            "--validate",
+            "--operation", "repository.actions.pre-build-checks", "--if-declared",
         ],
         capture_output=True,
         text=True,
         check=False,
     )
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout)["results"] == []
+    assert all(item["status"] == "no_op" for item in json.loads(result.stdout)["results"])
     write_sdlc_contract(tmp_path)
     missing_operation = "deliverables.apps.missing.actions.install"
     missing = run_operation_cli(tmp_path, missing_operation)
@@ -507,13 +507,10 @@ def test_deploy_runs_repository_command_once_from_repository_directory(
             "kind": "ceratops-sdlc",
             "repository": {
                 "capabilities": {},
-                "actions": {
-                    "validate": {
+                "actions": {"pre-build-checks": {"check-groups": {'source': {
                         "requires": {"capabilities": []},
                         "steps": [{"run": "python -V"}],
-                    },
-                    "test": _no_op(),
-                },
+                    }, 'tests': _no_op()}}, },
             },
         },
         {
@@ -521,13 +518,10 @@ def test_deploy_runs_repository_command_once_from_repository_directory(
             "kind": "ceratops-sdlc",
             "repository": {
                 "capabilities": {},
-                "actions": {
-                    "validate": {
+                "actions": {"pre-build-checks": {"check-groups": {'source': {
                         "requires": {"capabilities": ["missing"]},
                         "steps": [{"run": ["python", "-V"]}],
-                    },
-                    "test": _no_op(),
-                },
+                    }, 'tests': _no_op()}}, },
             },
         },
         {
@@ -540,7 +534,7 @@ def test_deploy_runs_repository_command_once_from_repository_directory(
                         "version-from": {"file": "../outside.toml", "key": "x"},
                     },
                 },
-                "actions": {"validate": _no_op(), "test": _no_op()},
+                "actions": {"pre-build-checks": {"check-groups": {'source': _no_op(), 'tests': _no_op()}}, },
             },
         },
     ],
@@ -618,10 +612,7 @@ def test_operation_cli_prevalidates_and_runs_explicit_ids_in_order(
         tmp_path,
         repository={
             "capabilities": {},
-            "actions": {
-                "validate": _step("a-different-check.py", "check-one"),
-                "test": _step("a-different-check.py", "check-two"),
-            },
+            "actions": {"pre-build-checks": {"check-groups": {'source': _step("a-different-check.py", "check-one"), 'tests': _step("a-different-check.py", "check-two")}}, },
         },
         deliverables={
             "apps": {
@@ -685,8 +676,7 @@ def test_execute_prepared_operations_stops_after_failure_with_a_ledger(
         tmp_path,
         repository={
             "capabilities": {},
-            "actions": {
-                "validate": {
+            "actions": {"pre-build-checks": {"check-groups": {'source': {
                     "requires": {"capabilities": []},
                     "steps": [
                         {
@@ -698,9 +688,7 @@ def test_execute_prepared_operations_stops_after_failure_with_a_ledger(
                         },
                         {"run": [sys.executable, "check.py"]},
                     ],
-                },
-                "test": _no_op(),
-            },
+                }, 'tests': _no_op()}}, },
         },
         deliverables={
             "apps": {
@@ -715,11 +703,11 @@ def test_execute_prepared_operations_stops_after_failure_with_a_ledger(
         },
     )
     commit = _repository(tmp_path)
-    failure = run_operation_cli(tmp_path, (CHECK + "validate", DEPLOY + "install"))
+    failure = run_operation_cli(tmp_path, (CHECK + "pre-build-checks.check-groups.source", DEPLOY + "install"))
     assert failure.returncode == 1
     evidence = json.loads(failure.stderr)
     assert evidence["status"] == "validation_failed"
-    assert evidence["operation"] == CHECK + "validate"
+    assert evidence["operation"] == CHECK + "pre-build-checks.check-groups.source"
     assert evidence["commit"] == commit
     assert evidence["diagnostic"]["exit_code"] == 7
     assert evidence["steps"] == [1]
@@ -741,7 +729,7 @@ def test_execute_prepared_operations_stops_after_failure_with_a_ledger(
     (tmp_path / "fixed").touch()
     assert run_git(tmp_path, "add", "fixed").returncode == 0
     assert run_git(tmp_path, "commit", "-m", "repair").returncode == 0
-    repaired = run_operation_cli(tmp_path, (CHECK + "validate", DEPLOY + "install"))
+    repaired = run_operation_cli(tmp_path, (CHECK + "pre-build-checks.check-groups.source", DEPLOY + "install"))
     assert repaired.returncode == 0, repaired.stderr
     assert len(repaired.stdout) < 2500
     assert "line-" not in repaired.stdout and "xxxx" not in repaired.stdout
@@ -777,6 +765,8 @@ def test_prepared_results_cannot_authorize_a_new_commit(tmp_path: pathlib.Path) 
 def test_bootstrap_and_ci_handoffs_need_no_skill_runtime(
     tmp_path: pathlib.Path,
 ) -> None:
+    (tmp_path / "skills/ceratops-managed").mkdir(parents=True)
+
     def skill_handoff(action):
         return {
             "requires": {"capabilities": []},
@@ -802,24 +792,17 @@ def test_bootstrap_and_ci_handoffs_need_no_skill_runtime(
                     },
                 }
             },
-            "actions": {
-                "bootstrap": {
+            "actions": {"pre-build-checks": {"check-groups": {'source': _no_op(), 'tests': _no_op()}}, "bootstrap": {
                     "requires": {"capabilities": ["python"]},
                     "steps": [{"run": [sys.executable, "-c", "print('setup')"]}],
-                },
-                "validate": _no_op(),
-                "test": _no_op(),
-            },
+                }},
         },
         deliverables={
             "skills": {
                 "ceratops-managed": {
-                    "source": "skills/ceratops-managed",
-                    "prerequisites": [],
-                    "actions": {
-                        "validate": skill_handoff("source-validate"),
-                        "install": skill_handoff("deploy"),
-                    },
+                    "root-dir": "skills/ceratops-managed",
+                    "build-after": [],
+                    "actions": {"pre-build-checks": {"check-groups": {'source': skill_handoff("source-validate")}}, "install": skill_handoff("deploy")},
                 }
             }
         },
@@ -831,12 +814,12 @@ def test_bootstrap_and_ci_handoffs_need_no_skill_runtime(
     assert "python" in json.loads(result.stdout)["prerequisites"]["capabilities"]
     result = run_operation_cli(tmp_path, "repository.actions.bootstrap")
     assert result.returncode == 0, result.stderr
-    source_check = "deliverables.skills.ceratops-managed.actions.validate"
+    source_check = "deliverables.skills.ceratops-managed.actions.pre-build-checks.check-groups.source"
     install = "deliverables.skills.ceratops-managed.actions.install"
     assert runner.validation_operations(tmp_path, [install]) == [
-        "repository.actions.validate",
+        "repository.actions.pre-build-checks.check-groups.source",
+        "repository.actions.pre-build-checks.check-groups.tests",
         source_check,
-        "repository.actions.test",
     ]
     result = run_operation_cli(tmp_path, install, ci=True)
     assert result.returncode == 0, result.stderr
@@ -857,7 +840,7 @@ def test_duplicate_yaml_operations_are_rejected_before_execution(
         "      no-op: duplicate\n",
         encoding="utf-8",
     )
-    result = run_operation_cli(tmp_path, "repository.actions.validate")
+    result = run_operation_cli(tmp_path, "repository.actions.pre-build-checks.check-groups.source")
     assert result.returncode == 1
     assert "unique strings" in result.stderr
 
@@ -875,7 +858,6 @@ def test_validation_selection_rejects_non_gate_action(
             str(OPERATION_RUNNER),
             "--repo-root",
             str(tmp_path),
-            "--validate",
             "--validation-operation",
             DEPLOY + "install",
         ],
@@ -884,7 +866,7 @@ def test_validation_selection_rejects_non_gate_action(
         check=False,
     )
     assert result.returncode == 1
-    assert "must name validate or tests" in result.stderr
+    assert "must name pre-build-checks or post-build-checks" in result.stderr
 
 
 def test_validation_parameters_remain_strict(tmp_path: pathlib.Path) -> None:
@@ -892,7 +874,7 @@ def test_validation_parameters_remain_strict(tmp_path: pathlib.Path) -> None:
         tmp_path,
         repository={
             "capabilities": {},
-            "actions": {"validate": _step("-V"), "test": _no_op()},
+            "actions": {"pre-build-checks": {"check-groups": {'source': _step("-V"), 'tests': _no_op()}}, },
         },
     )
     result = subprocess.run(
@@ -901,7 +883,7 @@ def test_validation_parameters_remain_strict(tmp_path: pathlib.Path) -> None:
             str(OPERATION_RUNNER),
             "--repo-root",
             str(tmp_path),
-            "--validate",
+            "--operation", "repository.actions.pre-build-checks.check-groups.source",
             "--parameter",
             "unknown=value",
         ],
@@ -1055,7 +1037,9 @@ def test_loader_rejects_retired_sdlc_versions(
     document, errors = contracts.read_contract(path)
     assert document is None
     assert errors == [
-        f"unsupported SDLC version: {version!r}; supported versions: 4, 5"
+        f"unsupported SDLC version: {version!r}; installed schemas: "
+        + ", ".join(str(item) for item in sorted(contracts.sdlc_schema_paths()))
+        + f"; latest installed version: {contracts.latest_sdlc_version()}."
     ]
     with pytest.raises(contracts.SdlcContractError, match="unsupported SDLC version"):
         contracts.load_contract(path)
@@ -1063,7 +1047,7 @@ def test_loader_rejects_retired_sdlc_versions(
 
 @pytest.mark.parametrize(
     "version",
-    [None, True, 1.0, "4", 0, max(contracts.VERSION_SCHEMAS) + 1, [], {}],
+    [None, True, 1.0, "4", 0, contracts.latest_sdlc_version() + 1, [], {}],
 )
 def test_loader_rejects_unsupported_or_unversioned_contracts(
     tmp_path: pathlib.Path,
@@ -1112,9 +1096,7 @@ def test_tests_only_cli_preserves_declared_parameters(
         tmp_path,
         repository={
             "capabilities": {},
-            "actions": {
-                "validate": _no_op(),
-                "test": {
+            "actions": {"pre-build-checks": {"check-groups": {'source': _no_op(), 'tests': {
                     "requires": {"capabilities": []},
                     "parameters": ["suite"],
                     "steps": [
@@ -1127,18 +1109,17 @@ def test_tests_only_cli_preserves_declared_parameters(
                             ]
                         }
                     ],
-                },
-            },
+                }}}, },
         },
     )
     assert (
         runner.main(
-            ["--repo-root", str(tmp_path), "--tests", "--parameter", "suite=selected"]
+            ["--repo-root", str(tmp_path), "--operation", "repository.actions.pre-build-checks.check-groups.tests", "--parameter", "suite=selected"]
         )
         == 0
     )
     result = json.loads(capsys.readouterr().out)
-    assert result["completed_operations"] == ["repository.actions.test"]
+    assert result["completed_operations"] == ["repository.actions.pre-build-checks.check-groups.tests"]
 
 
 def test_completed_validation_binding_is_not_returned_as_pending_handoff(
@@ -1152,7 +1133,7 @@ def test_completed_validation_binding_is_not_returned_as_pending_handoff(
             "apps": {
                 "service": _app(
                     {
-                        "validate": {
+                        "pre-build-checks": {"check-groups": {"source": {
                             "requires": {"capabilities": []},
                             "steps": [
                                 {
@@ -1163,7 +1144,7 @@ def test_completed_validation_binding_is_not_returned_as_pending_handoff(
                                     }
                                 }
                             ],
-                        },
+                        }}},
                         "install": _step("-c", "pass"),
                     }
                 )
@@ -1211,18 +1192,15 @@ def test_sdlc_launches_native_package_manager_test_command(
         tmp_path,
         repository={
             "capabilities": {},
-            "actions": {
-                "validate": _no_op(),
-                "test": {
+            "actions": {"pre-build-checks": {"check-groups": {'source': _no_op(), 'tests': {
                     "requires": {"capabilities": []},
                     "steps": [{"run": ["npm", "test"]}],
-                },
-            },
+                }}}, },
         },
     )
-    assert runner.main(["--repo-root", str(tmp_path), "--tests", "--ci"]) == 0
+    assert runner.main(["--repo-root", str(tmp_path), "--operation", "repository.actions.pre-build-checks.check-groups.tests", "--ci"]) == 0
     assert json.loads(capsys.readouterr().out)["completed_operations"] == [
-        "repository.actions.test"
+        "repository.actions.pre-build-checks.check-groups.tests"
     ]
 
 
@@ -1462,14 +1440,10 @@ def test_sdlc_test_selection_requires_executable_commit_context(
         "kind": "ceratops-sdlc",
         "repository": {
             "capabilities": {},
-            "actions": {
-                "validate": _no_op(),
-                "test": _no_op(),
-                "test-selection": {
+            "actions": {"pre-build-checks": {"check-groups": {'source': _no_op(), 'tests': _no_op()}}, "test-selection": {
                     "requires": {"capabilities": []},
                     **operation,
-                },
-            },
+                }},
         },
     }
     assert contracts.validation_errors(document)

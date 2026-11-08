@@ -918,8 +918,8 @@ def read_build_check_summary(root: pathlib.Path, tag: str, receipt_path: str) ->
     raw = _build_blob(root, commit, receipt_path, 1024 * 1024)
     receipt = json.loads(raw)
     identity = receipt["identity"]
-    expected_tag = identity["releaseUnit"] + "/" + identity["version"]
-    parent = f'.build/{identity["releaseUnit"]}/{identity["version"]}'
+    expected_tag = identity["releaseBundle"] + "/" + identity["version"]
+    parent = f'.build/{identity["releaseBundle"]}/{identity["version"]}'
     expected_paths = {parent + "/build_receipt.json",
                       parent + "/" + identity["target"] + "/build_receipt.json"}
     if (receipt.get("schema") != "ceratops-build-result.v3" or receipt.get("status") != "passed"
@@ -971,7 +971,7 @@ def select_build_check_summaries(
             try:
                 receipt = json.loads(path.read_bytes())
                 identity = receipt["identity"]
-                name, destination, version = identity["releaseUnit"], identity["target"], identity["version"]
+                name, destination, version = identity["releaseBundle"], identity["target"], identity["version"]
                 level = build_qualification(version)
                 if (unit is not None and name != unit) or (target is not None and destination != target):
                     continue
@@ -993,7 +993,7 @@ def select_build_check_summaries(
             continue
         selected = read_build_check_summary(root, tag, path.relative_to(root).as_posix())
         identity = selected["receipt"]["identity"]
-        if (identity["releaseUnit"], identity["target"]) != (name, destination):
+        if (identity["releaseBundle"], identity["target"]) != (name, destination):
             raise ValueError("Local build selector differs from the tagged identity.")
         chosen[(name, destination)] = selected
     return [chosen[key] for key in sorted(chosen)]

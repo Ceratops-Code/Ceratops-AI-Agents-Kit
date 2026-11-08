@@ -956,6 +956,124 @@ def test_current_results_keep_only_latest_execution_and_other_checks(tmp_path):
     assert {item["result_id"] for item in fresh.current.records("pytest")} == {untouched["result_id"], passed["result_id"]}
     assert list(fresh.directory.iterdir()) == [fresh.current.path]
 
+@pytest.mark.parametrize("partial", ["node", "keyword", "deselect", "hook", "collection-error", "collection-skip", "failed", "interrupt"])
+def test_deleted_case_waits_for_successful_complete_collection(test_runner_module, tmp_path, partial):
+    root = _acceptance_repository(tmp_path)
+    test = root / "tests/test_cases.py"
+    test.write_text("def test_removed():\n    assert False\ndef test_kept():\n    pass\n")
+    assert _acceptance_run(test_runner_module, root).returncode == 1
+    store = _result_store(root)
+    node = "tests/test_cases.py::test_removed"
+    original = next(row for row in store.current.records("pytest") if row["nodeid"] == node)
+    test.write_text("def test_kept():\n    pass\ndef test_other():\n    pass\n")
+    options, targets = [], ["tests"]
+    conftest = root / "conftest.py"
+    if partial == "node":
+        targets = ["tests/test_cases.py::test_kept"]
+    elif partial == "keyword":
+        options = ["-k", "kept"]
+    elif partial == "deselect":
+        options = ["--deselect=tests/test_cases.py::test_other"]
+    elif partial == "hook":
+        conftest.write_text("def pytest_collection_modifyitems(items):\n    items[:] = [x for x in items if x.name == 'test_kept']\n")
+    elif partial == "collection-error":
+        (root / "tests/test_broken.py").write_text("raise RuntimeError('collection stopped')\n")
+    elif partial == "collection-skip":
+        test.write_text("import pytest\npytest.skip('optional module', allow_module_level=True)\n")
+        (root / "tests/test_other.py").write_text("def test_other():\n    pass\n")
+    elif partial == "failed":
+        test.write_text("def test_kept():\n    assert False\n")
+    else:
+        test.write_text("def test_kept():\n    raise KeyboardInterrupt\n")
+    result = test_runner_module.run_text(
+        [sys.executable, "-m", "pytest", "-q", "-o", "addopts=", *targets, *options], root,
+    )
+    assert (result.returncode == 0) is (partial in {"node", "keyword", "deselect", "hook", "collection-skip"})
+    assert next(row for row in store.current.records("pytest") if row["nodeid"] == node) == original
+    conftest.unlink(missing_ok=True)
+    (root / "tests/test_broken.py").unlink(missing_ok=True)
+    test.write_text("def test_kept():\n    pass\ndef test_other():\n    pass\n")
+    for _ in range(2):
+        result = _acceptance_run(test_runner_module, root)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert node not in {row["nodeid"] for row in store.current.records("pytest")}
+    assert result.accepted_checks["executed"] == 0
+
+
+@pytest.mark.parametrize("effect", ["results", "report", "delete"])
+@pytest.mark.parametrize("when", ["before", "after"])
+def test_deleted_case_cleanup_resumes_between_effects(tmp_path, monkeypatch, effect, when):
+    import reuse_test_results as support
+
+    root = _mapped_repository(tmp_path)
+    store = _level_store(root, "alpha")
+    a, b = "tests/a/test_value.py::old_case", "tests/b/test_value.py::test_value"
+    failed = store.save(a, store.inputs(a), outcome="failed", phases={"call": "failed"})
+    other = store.save(b, store.inputs(b), outcome="failed", phases={"call": "failed"})
+    report = root / ".build/test-diagnostics/pytest-failure.json"
+    support.save_test_diagnostic(report, {"cwd": str(root), "exit_code": 1, "stdout": "original failure", "stderr": ""},
+                                root=root, current=store.current, summary=support.compact_results([
+                                    store.reference(row, reused=False) for row in [failed, other]
+                                ]))
+    replacement = "tests/a/test_value.py::test_value"
+    accepted = store.save(replacement, store.inputs(replacement))
+    if effect == "delete":
+        other = store.save(b, store.inputs(b))
+    original_replace, original_unlink = support.os.replace, pathlib.Path.unlink
+
+    def replace(source, destination):
+        target = pathlib.Path(destination)
+        fault = target == (store.current.path if effect == "results" else report) and effect != "delete"
+        if fault and when == "before":
+            raise OSError("cleanup interrupted")
+        original_replace(source, destination)
+        if fault and when == "after":
+            raise OSError("cleanup interrupted")
+
+    def unlink(path, *args, **kwargs):
+        fault = effect == "delete" and path == report
+        if fault and when == "before":
+            raise OSError("cleanup interrupted")
+        original_unlink(path, *args, **kwargs)
+        if fault and when == "after":
+            raise OSError("cleanup interrupted")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(support.os, "replace", replace)
+        patch.setattr(pathlib.Path, "unlink", unlink)
+        with pytest.raises(OSError, match="cleanup interrupted"):
+            store.discard_deleted_checks({replacement}, ["tests/a"], complete_files={"tests/a/test_value.py"})
+    for _ in range(2):
+        fresh = _level_store(root, "alpha")
+        fresh.discard_deleted_checks({replacement}, ["tests/a"], complete_files={"tests/a/test_value.py"})
+        rows = {row["nodeid"]: row for row in fresh.current.records("pytest")}
+        assert a not in rows and rows[b] == other and rows[replacement] == accepted
+        if effect == "delete":
+            assert not report.exists()
+        else:
+            kept = json.loads(report.read_text())
+            assert set(kept["saved_failures"]) == {b}
+            assert "original failure" in kept["stdout"]
+    assert not list(report.parent.glob("*.in_process.json"))
+
+
+def test_runner_cleans_aborted_first_report_write_before_tests(test_runner_module, tmp_path, capsys):
+    root = _acceptance_repository(tmp_path)
+    (root / ".gitignore").write_text("__pycache__/\n.pytest_cache/\n.build/\n")
+    pending = root / ".build/test-diagnostics/.pytest-failure.in_process.json"
+    (root / "tests/test_report.py").write_text(
+        "from pathlib import Path\ndef test_no_partial_report():\n"
+        "    assert not Path('.build/test-diagnostics/.pytest-failure.in_process.json').exists()\n")
+    for _ in range(2):
+        pending.parent.mkdir(parents=True, exist_ok=True)
+        pending.write_text('{"incomplete":')
+        assert test_runner_module.execute(["--all"], repo_root=root) == 0
+        result = json.loads(capsys.readouterr().out)
+        assert not pending.exists()
+        assert not (pending.parent / "pytest-failure.json").exists()
+    assert result["pytest"]["checks"]["executed"] == 0
+
+
 def test_changed_arguments_and_dependency_versions_do_not_reuse_results(
     test_runner_module, tmp_path, monkeypatch,
 ):

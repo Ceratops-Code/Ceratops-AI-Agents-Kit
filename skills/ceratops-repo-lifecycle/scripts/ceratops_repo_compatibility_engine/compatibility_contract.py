@@ -25,20 +25,23 @@ CONTRACT_NAME = "ceratops-compatibility-deterministic-contract.json"
 def _managed_skill_record(
     contract: dict[str, Any], name: str,
 ) -> dict[str, Any]:
-    """Materialize one typed v4 skill record from the owned action templates."""
+    """Materialize one typed skill record from the owned action templates."""
 
     actions = copy.deepcopy(contract["managed_skill_operations"])
-    expected_routes = {"validate": "source-validate", "install": "deploy"}
+    expected_routes = {"pre-build-checks": "source-validate", "install": "deploy"}
     for action_name, route in expected_routes.items():
-        handoff = actions[action_name]["steps"][0]["handoff"]
+        operation = actions[action_name]
+        if action_name == "pre-build-checks":
+            operation = operation["check-groups"]["source"]
+        handoff = operation["steps"][0]["handoff"]
         if handoff["action"] != route or handoff["inputs"] != {"skill": "{skill}"}:
             raise RuntimeError(
                 f"managed skill {action_name} action must route to {route} with the skill token"
             )
         handoff["inputs"]["skill"] = name
     return {
-        "source": f"skills/{name}",
-        "prerequisites": [],
+        "root-dir": f"skills/{name}",
+        "build-after": [],
         "actions": actions,
     }
 
@@ -115,8 +118,6 @@ def load_compatibility_contract(bundle_root: pathlib.Path | None = None) -> dict
         raise RuntimeError("Dependabot must address the validator project")
     sdlc_template = references / "templates" / contract["surfaces"]["sdlc"]["template"]
     sdlc = load_contract(sdlc_template)
-    if sdlc["version"] != contract["sdlc_version"]:
-        raise RuntimeError("compatibility SDLC template version differs from its contract")
     candidate = dict(
         sdlc,
         deliverables={
@@ -131,7 +132,7 @@ def load_compatibility_contract(bundle_root: pathlib.Path | None = None) -> dict
 
 
 def managed_skill_record(name: str) -> dict[str, Any]:
-    """Return one fresh producer-owned v4 skill declaration."""
+    """Return one fresh producer-owned skill declaration."""
 
     return _managed_skill_record(load_compatibility_contract(), name)
 

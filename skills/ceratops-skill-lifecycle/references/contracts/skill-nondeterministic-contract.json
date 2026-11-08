@@ -7,7 +7,7 @@
   "description": "Skill-design quality checks that require AI-agent judgment.",
   "good_skill_definition": "A good skill is a scoped workflow contract that triggers only for the task class it can handle, captures the inputs needed to act, routes to the smallest relevant references or helpers, keeps deterministic behavior in executable code when practical, states safety and blocker boundaries, defines evidence and completion gates, and specifies concise final reporting without becoming a broad best-practices essay.",
   "common_skill_content_roles": {
-    "triggering_metadata": "Frontmatter and agents/openai.yaml trigger only the intended task class.",
+    "triggering_metadata": "Frontmatter and any supplied OpenAI metadata target only the intended task class.",
     "scope_and_applicability": "The skill names its workflow surface, required inputs, in-scope work, and out-of-scope work.",
     "operating_rules_and_constraints": "The skill states safe defaults, blockers, risky-action boundaries, and source-of-truth precedence.",
     "ordered_workflow": "Execution steps are dependency-ordered, evidence-gated, and route failures before further mutation.",
@@ -44,10 +44,11 @@
     {
       "id": "ND.skill.trigger-fit",
       "applies_when": "Every skill source or metadata review.",
-      "review_required": "Confirm the frontmatter description states what the skill does and when it should trigger; interface metadata and the default prompt target the same task class without overtriggering; and any declared tool dependencies match the workflow without overdeclaring integrations.",
+      "review_required": "Confirm the frontmatter description states what the skill does and when it should trigger. Check that any supplied interface metadata and default prompt target the same task class without overtriggering and that declared tool dependencies match the workflow without overdeclaring integrations. For a new or changed trigger, record the expected and observed selection for representative in-scope and near-miss prompts through the intended host's normal selection path. Respect the skill's invocation policy. Reuse the latest recorded outcome when the trigger inputs, host selection context, and expected selection match. Otherwise run only the smallest safe, authorized check. Fail on an observed mismatch and report a blocker when required selection evidence is unavailable.",
       "evidence_keys": [
         "skill.SKILL.md",
-        "skill.agents.openai.yaml"
+        "skill.agents.openai.yaml",
+        "skill.trigger_execution_results"
       ]
     },
     {

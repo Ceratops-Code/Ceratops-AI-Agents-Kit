@@ -20,6 +20,7 @@ jobs:
           CERATOPS_TASK_TEMP_ROOT: ${{ runner.temp }}
         with:
           repo-root: __CI_REPO_ROOT__
+          operations: __CI_OPERATIONS__
           evidence-file: __CI_EVIDENCE__
 
       - name: Upload validation evidence

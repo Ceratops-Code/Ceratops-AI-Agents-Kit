@@ -532,9 +532,8 @@ def cleanup_pytest_diagnostic(
     request: Mapping[str, object], completed_commands: Sequence[Sequence[str]], reused_success: bool = False,
 ) -> None:
     """Use saved corrected passes; caller-selected reports outside managed storage stay."""
-    if path.exists():
-        remove_test_diagnostic(path, root=root, current=current_check_results(root),
-                               successful_request=request if completed_commands or reused_success else None)
+    remove_test_diagnostic(path, root=root, current=current_check_results(root) if path.exists() else None,
+                           successful_request=request if completed_commands or reused_success else None)
 
 
 def node_identity(nodeid: str) -> str:
@@ -791,12 +790,12 @@ def execute(
     outputs: list[dict[str, object]] = []
     completed_commands: list[list[str]] = []
     diagnostic = resolve_data_path(root, args.diagnostic_output or DEFAULT_DIAGNOSTIC_PATH)
-    if diagnostic.exists():
-        try:
-            remove_test_diagnostic(diagnostic, root=root, current=current_check_results(root))
-        except (OSError, ValueError) as exc:
-            emit({"status": "diagnostic-cleanup-failed", "path": str(diagnostic), "message": str(exc)})
-            return CONFIGURATION_EXIT_CODE
+    try:
+        remove_test_diagnostic(diagnostic, root=root,
+                               current=current_check_results(root) if diagnostic.exists() else None)
+    except (OSError, ValueError) as exc:
+        emit({"status": "diagnostic-cleanup-failed", "path": str(diagnostic), "message": str(exc)})
+        return CONFIGURATION_EXIT_CODE
 
     def observe(command: Sequence[str], cwd: pathlib.Path) -> subprocess.CompletedProcess[str]:
         result = text_runner(command, cwd)
@@ -1053,7 +1052,8 @@ def execute_selected(
         *selection.pytest_targets,
     ]
     token = BUILD_REUSE_LEVEL.set("alpha" if args.build_history else None)
-    inputs_token = CHECK_REQUEST_INPUTS.set({"checkGroup": args.check_group, "artifacts": args.artifacts})
+    inputs_token = CHECK_REQUEST_INPUTS.set({"checkGroup": args.check_group, "artifacts": args.artifacts,
+                                            "diagnosticPath": str(diagnostic_path)})
     try:
         measure_selected_artifacts(root, args.artifacts)
         result = text_runner(pytest_command, root)

@@ -75,41 +75,34 @@ def _setup(
             repo,
             repository={
                 "capabilities": {},
-                "actions": {
-                    "validate": {
+                "actions": {"pre-build-checks": {"check-groups": {'source': {
                         "requires": {"capabilities": []},
                         "steps": [{"run": [sys.executable, "quality-check.py"]}],
-                    },
-                    "test": {
+                    }, 'tests': {
                         "requires": {"capabilities": []},
                         "no-op": "No repository tests in this fixture.",
-                    },
-                },
+                    }}}, },
             },
             deliverables={
                 "apps": {
                     "fixture": {
-                        "source": ".",
+                        "root-dir": ".",
                         "manifest": "code.txt",
-                        "prerequisites": [],
-                        "actions": {
-                            "validate": {
+                        "build-after": [],
+                        "actions": {"pre-build-checks": {"check-groups": {'source': {
                                 "requires": {"capabilities": []},
                                 "no-op": "Repository validation covers this fixture.",
-                            },
-                            "install": {
+                            }}}, "install": {
                                 "requires": {"capabilities": []},
                                 "steps": [
                                     {"run": [sys.executable, "install-local.py"]}
                                 ],
-                            },
-                            "publish": {
+                            }, "publish": {
                                 "requires": {"capabilities": []},
                                 "steps": [
                                     {"run": [sys.executable, "publish-package.py"]}
                                 ],
-                            },
-                        },
+                            }},
                     }
                 },
             },
@@ -391,12 +384,12 @@ def test_repository_ship_checkpoints_each_operation_before_the_next(
         args.publish_operation = [PUBLIC, PUBLIC]
     else:
         args.deploy_operation = [LOCAL, LOCAL]
-    original = loaded["execute_prepared_operation"]
+    original = loaded["execute_release_builds"]
     count = 0
 
-    def execute(prepared: Any, **kwargs: Any) -> dict[str, Any]:
+    def execute(root: pathlib.Path, requests: Any, contract: Any, **kwargs: Any) -> dict[str, Any]:
         nonlocal count
-        if prepared.category == category:
+        if not kwargs.get("prepare_only") and requests[0].operation == (PUBLIC if category == "publish" else LOCAL):
             count += 1
             if count == 2:
                 records = [
@@ -410,16 +403,16 @@ def test_repository_ship_checkpoints_each_operation_before_the_next(
                 assert selected[0]["position"] == 1
                 assert selected[0]["result"].get("step_results", []) == expected_results
                 raise RuntimeError("interrupted between operations")
-        return original(prepared, **kwargs)
+        return original(root, requests, contract, **kwargs)
 
     loaded["_checkpointed_operation_batch"].__globals__[
-        "execute_prepared_operation"
+        "execute_release_builds"
     ] = execute
     with pytest.raises(RuntimeError, match="interrupted"):
         loaded["ship_repository"](args)
     assert log.read_text().splitlines().count(label) == 1
     loaded["_checkpointed_operation_batch"].__globals__[
-        "execute_prepared_operation"
+        "execute_release_builds"
     ] = original
     resumed = loaded["ship_repository"](args)
     assert resumed["status"] == "already_shipped"
@@ -1338,42 +1331,39 @@ def _saved_stage_fixture(
     def command(phase: str) -> dict[str, object]:
         return {"steps": [{"run": [sys.executable, "probe.py", phase]}]}
 
-    # Deliberately put tests before validation in the data: execution must order
-    # the phases by their responsibility, while preserving each phase's order.
+    # Groups within one phase follow their declared order. Their names do not
+    # classify the commands or move source scans ahead of tests automatically.
     contract = {
         "version": 4,
         "kind": "ceratops-sdlc",
         "repository": {
             "capabilities": {},
-            "actions": {
-                "test": {**command("tests"), "requires": {"capabilities": []}},
-                "validate": {**command("validation"), "requires": {"capabilities": []}},
-            },
+            "actions": {"pre-build-checks": {"check-groups": {
+                "source": {**command("validation"), "requires": {"capabilities": []}},
+                "tests": {**command("tests"), "requires": {"capabilities": []}},
+            }}},
         },
         "deliverables": {
             "apps": {
                 "fixture": {
-                    "source": "apps/fixture",
+                    "root-dir": "apps/fixture",
                     "manifest": "apps/fixture/app.json",
-                    "prerequisites": [],
-                    "actions": {
-                        "test": {
+                    "build-after": [],
+                    "actions": {"pre-build-checks": {"check-groups": {'tests': {
                             "requires": {"capabilities": []},
                             "no-op": "Repository tests cover this deliverable.",
-                        },
-                        "validate": {
+                        }, 'source': {
                             "requires": {"capabilities": []},
                             "no-op": "Repository validation covers this deliverable.",
-                        },
-                        "install": {
+                        }}}, "install": {
                             **command("deploy"),
                             "requires": {"capabilities": []},
-                        },
-                    },
+                        }},
                 }
             }
         },
     }
+    (repo / "apps/fixture").mkdir(parents=True)
     (repo / "sdlc/sdlc.yml").write_text(json.dumps(contract), encoding="utf-8")
     assert run_git(repo, "init", "--quiet").returncode == 0
     assert run_git(repo, "add", ".").returncode == 0
@@ -1417,8 +1407,7 @@ def test_promotion_skips_rechecks_only_for_codex_desktop_repositories(
     assert runner.main(
         [
             *base,
-            "--validate",
-            "--tests",
+            "--operation", "repository.actions.pre-build-checks",
             "--commit",
             head,
             "--test-trigger",
@@ -1430,7 +1419,7 @@ def test_promotion_skips_rechecks_only_for_codex_desktop_repositories(
     assert result["results"] == []
     assert not (repo / ".build/events").exists()
 
-    assert runner.main([*base, "--validate"]) == 0
+    assert runner.main([*base, "--operation", "repository.actions.pre-build-checks.check-groups.source"]) == 0
     capsys.readouterr()
     assert (repo / ".build/events").read_text().splitlines() == ["validation"]
 
@@ -1468,9 +1457,9 @@ def test_delivery_uses_saved_stages_without_running_checks(
             == 0
         )
     base = ["--repo-root", str(repo)]
-    assert runner.main([*base, "--validate"]) == 0
-    assert runner.main([*base, "--tests"]) == 0
-    assert runner.main([*base, "--tests"]) == 0
+    assert runner.main([*base, "--operation", "repository.actions.pre-build-checks.check-groups.source"]) == 0
+    assert runner.main([*base, "--operation", "repository.actions.pre-build-checks.check-groups.tests"]) == 0
+    assert runner.main([*base, "--operation", "repository.actions.pre-build-checks.check-groups.tests"]) == 0
     assert (repo / ".build/events").read_text().splitlines() == [
         "validation",
         "tests",
@@ -1505,7 +1494,7 @@ def test_delivery_rejects_inapplicable_latest_stage_without_retesting(
     runner = importlib.import_module("repository_operation")
     repo, deploy = _saved_stage_fixture(tmp_path)
     base = ["--repo-root", str(repo)]
-    assert runner.main([*base, "--validate", "--tests"]) == 0
+    assert runner.main([*base, "--operation", "repository.actions.pre-build-checks"]) == 0
     if change == "source":
         (repo / "probe.py").write_text("changed source")
         assert runner.main([*base, "--operation", deploy]) == 1

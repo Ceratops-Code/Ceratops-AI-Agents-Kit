@@ -38,6 +38,7 @@ from .generate_test_script import (
     test_operation,
 )
 from .sdlc_contract_validation import (
+    latest_sdlc_version,
     load_contract,
     validation_errors,
 )
@@ -73,7 +74,7 @@ def serialized_sdlc_contract(
     path: pathlib.Path,
     contract: Mapping[str, object],
 ) -> tuple[str, str]:
-    """Render SDLC v4 while preserving an existing JSON or YAML representation."""
+    """Render SDLC while preserving an existing JSON or YAML representation."""
 
     newline = "\n"
     json_representation = False
@@ -190,7 +191,7 @@ def validate_template(template: Mapping[str, object]) -> None:
         raise RuntimeError("skill-sections template is not repository-neutral")
 
 
-def build_sdlc_contract_candidate(
+def prepare_sdlc_configuration(
     repo_root: pathlib.Path,
     *,
     skill_names: list[str],
@@ -198,8 +199,8 @@ def build_sdlc_contract_candidate(
 ) -> dict[str, object]:
     """Preserve target capabilities and apply the supported typed lifecycle.
 
-    The v4 template owns new contracts and repository validation; the target's
-    supported version owns existing version-specific data. The compatibility
+    The template supplies new configurations using the newest installed schema.
+    Existing supported declarations keep their version and data. The compatibility
     contract owns named skill action routing. Existing actions retain their
     definitions, including target-native version-from references. New executable
     capabilities remain unversioned unless the target declares a requirement;
@@ -213,23 +214,27 @@ def build_sdlc_contract_candidate(
         raise RuntimeError("SDLC is required for current Ceratops compatibility")
     reusable = load_contract(template_path("sdlc"))
     target = repo_root / surface_path("sdlc")
-    contract = load_contract(target) if target.is_file() else dict(reusable)
+    contract = (
+        load_contract(target, repo_root=repo_root) if target.is_file()
+        else {**reusable, "version": latest_sdlc_version()}
+    )
     # The versioned loader is the supported-format authority. Preserve its
-    # accepted version so compatibility application cannot downgrade v5 data.
+    # accepted version so an ordinary update cannot downgrade or rewrite its data.
     candidate = dict(contract)
     repository = dict(candidate.get("repository", {}))
     capabilities = dict(repository.get("capabilities", {}))
     capabilities.setdefault("uv", {"executable": "uv"})
     actions = dict(repository.get("actions", {}))
-    existing_validation = actions.get("validate")
-    template_validation = reusable["repository"]["actions"]["validate"]
+    checks = dict(actions.get("pre-build-checks", {}).get("check-groups", {}))
+    existing_validation = checks.get("source")
+    template_validation = reusable["repository"]["actions"]["pre-build-checks"]["check-groups"]["source"]
     owned_validation = dict(template_validation)
     if any(item["id"] == "shellcheck" for item in repository_checks.contract_checks(repo_root)):
         capabilities.setdefault("shellcheck", {"executable": "shellcheck"})
         owned_validation["requires"] = {"capabilities": ["uv", "shellcheck"]}
         owned_validation["validation-capabilities"] = ["shellcheck"]
     if existing_validation is None or existing_validation == template_validation or isinstance(existing_validation, dict) and "no-op" in existing_validation:
-        actions["validate"] = owned_validation
+        checks["source"] = owned_validation
     elif existing_validation != owned_validation:
         # A custom wrapper may carry arguments or setup that cannot safely be
         # replaced or duplicated. Its owner must integrate that behavior.
@@ -237,10 +242,10 @@ def build_sdlc_contract_candidate(
             "custom repository validation operation requires explicit integration with the uv validator command"
         )
     actions.setdefault("bootstrap", reusable["repository"]["actions"]["bootstrap"])
-    existing_test = actions.get("test")
-    owned_test = reusable["repository"]["actions"]["test"]
+    existing_test = checks.get("tests")
+    owned_test = reusable["repository"]["actions"]["pre-build-checks"]["check-groups"]["tests"]
     infer_tests = existing_test is None or existing_test == owned_test
-    test_steps: list[dict[str, object]] = []
+    test_steps: list[dict[str, list[str]]] = []
     test_capabilities: list[str] = []
     detected = discover_python_tests(
         repo_root, load_compatibility_contract()["python_test_detection"]
@@ -272,14 +277,17 @@ def build_sdlc_contract_candidate(
         test_capabilities.append("cargo")
         test_steps.append({"run": ["cargo", "test"]})
     if infer_tests:
-        actions["test"] = (
-            {
-                "requires": {"capabilities": list(dict.fromkeys(test_capabilities))},
-                "steps": test_steps,
-            }
-            if test_steps
-            else owned_test
-        )
+        if not test_steps:
+            checks["tests"] = owned_test
+        else:
+            # Each detected command is independently requestable. Do not make
+            # one requested Python group launch Node/Go/Rust tests as well.
+            for index, step in enumerate(test_steps):
+                name = "tests" if index == 0 else str(step["run"][0]) + "-tests"
+                checks[name] = {"requires": {"capabilities": [test_capabilities[index]]}, "steps": [step]}
+    actions["pre-build-checks"] = {"check-groups": checks}
+    order = ("bootstrap", "test-selection", "pre-build-checks", "build", "post-build-checks", "install", "publish", "verify-publish")
+    actions = {name: actions[name] for name in order if name in actions}
     repository["capabilities"] = capabilities
     repository["actions"] = actions
     candidate["repository"] = repository
@@ -612,7 +620,7 @@ def plan_ceratops_compatibility(
         action_errors = action_assignment_errors(repo_root, manifest)
         if action_errors:
             raise RuntimeError("; ".join(action_errors))
-    sdlc_contract = build_sdlc_contract_candidate(
+    sdlc_contract = prepare_sdlc_configuration(
         repo_root,
         skill_names=sorted(skill_names),
         apply_contract=apply_sdlc_contract,

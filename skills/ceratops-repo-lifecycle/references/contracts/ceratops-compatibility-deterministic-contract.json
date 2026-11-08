@@ -61,21 +61,25 @@
   ],
   "generated_manifest_profile": "ceratops-compatible",
   "managed_skill_operations": {
-    "validate": {
-      "requires": {
-        "capabilities": []
-      },
-      "steps": [
-        {
-          "handoff": {
-            "lifecycle": "ceratops-skill-lifecycle",
-            "action": "source-validate",
-            "inputs": {
-              "skill": "{skill}"
+    "pre-build-checks": {
+      "check-groups": {
+        "source": {
+          "requires": {
+            "capabilities": []
+          },
+          "steps": [
+            {
+              "handoff": {
+                "lifecycle": "ceratops-skill-lifecycle",
+                "action": "source-validate",
+                "inputs": {
+                  "skill": "{skill}"
+                }
+              }
             }
-          }
+          ]
         }
-      ]
+      }
     },
     "install": {
       "requires": {
@@ -94,7 +98,6 @@
       ]
     }
   },
-  "sdlc_version": 4,
   "runtime": {
     "project": "scripts",
     "lockfile": "scripts/uv.lock",
@@ -110,23 +113,62 @@
   },
   "configuration_layout": {
     "root_file_patterns": [
-      "pyproject.toml", "uv.toml", "uv.lock", "setup.cfg", "setup.py",
-      "package.json", "package-lock.json", "npm-shrinkwrap.json",
-      "pnpm-lock.yaml", "pnpm-workspace.yaml", "yarn.lock", "bun.lock", "bun.lockb",
-      ".npmrc", ".yarnrc*", "tsconfig*.json", "jsconfig*.json",
-      "ruff.toml", ".ruff.toml", "mypy.ini", ".mypy.ini", ".flake8", ".pylintrc",
-      ".markdownlint*", ".yamllint*", ".eslintrc*", "eslint.config.*",
-      ".prettierrc*", "prettier.config.*", ".stylelintrc*", "stylelint.config.*",
-      "pytest.ini", ".pytest.ini", "pytest.toml", ".pytest.toml", "tox.ini",
+      "pyproject.toml",
+      "uv.toml",
+      "uv.lock",
+      "setup.cfg",
+      "setup.py",
+      "package.json",
+      "package-lock.json",
+      "npm-shrinkwrap.json",
+      "pnpm-lock.yaml",
+      "pnpm-workspace.yaml",
+      "yarn.lock",
+      "bun.lock",
+      "bun.lockb",
+      ".npmrc",
+      ".yarnrc*",
+      "tsconfig*.json",
+      "jsconfig*.json",
+      "ruff.toml",
+      ".ruff.toml",
+      "mypy.ini",
+      ".mypy.ini",
+      ".flake8",
+      ".pylintrc",
+      ".markdownlint*",
+      ".yamllint*",
+      ".eslintrc*",
+      "eslint.config.*",
+      ".prettierrc*",
+      "prettier.config.*",
+      ".stylelintrc*",
+      "stylelint.config.*",
+      "pytest.ini",
+      ".pytest.ini",
+      "pytest.toml",
+      ".pytest.toml",
+      "tox.ini",
       ".coveragerc"
     ],
     "python_dependency_file_patterns": [
-      "requirements*.txt", "requirements*.in", "Pipfile", "Pipfile.lock",
-      "poetry.lock", "pdm.lock"
+      "requirements*.txt",
+      "requirements*.in",
+      "Pipfile",
+      "Pipfile.lock",
+      "poetry.lock",
+      "pdm.lock"
     ],
     "excluded_directories": [
-      ".git", ".venv", "venv", "node_modules", "__pycache__",
-      ".build", ".test-results", "build", "dist"
+      ".git",
+      ".venv",
+      "venv",
+      "node_modules",
+      "__pycache__",
+      ".build",
+      ".test-results",
+      "build",
+      "dist"
     ]
   },
   "python_test_detection": {
@@ -165,7 +207,8 @@
     "ref": "refs/heads/main",
     "inputs": {
       "repo-root": "${{ github.workspace }}",
-      "evidence-file": "${{ runner.temp }}/repository-validation.log"
+      "evidence-file": "${{ runner.temp }}/repository-validation.log",
+      "operations": "repository.actions.pre-build-checks"
     }
   },
   "ci_dependency_updates": {

@@ -146,7 +146,7 @@ analysis-only child models.
 The `skills/` tree is authoritative skill source for this repository.
 `sdlc/sdlc.yml` declares repository setup and validation, plus capabilities
 of each deliverable. Lifecycle actions decide when those capabilities run.
-Executable capabilities in SDLC v4/v5 declare version requirements only through
+Executable capabilities in SDLC declare version requirements only through
 `version-from`: `file` names repository-relative native metadata, and `key`
 names its dotted field when the file is a structured manifest. A single-value
 file needs no key. Here Python references `scripts/pyproject.toml` at
@@ -168,9 +168,11 @@ capability requirements together. Git's `linguist-vendored` and
 outputs consistently for check selection and language coverage.
 The repository text collector honors declared HTML encodings in legacy
 documentation while retaining strict UTF-8 reads for executable/configuration files.
-`agents/openai.yaml` is Codex UI metadata and may be ignored by other agents.
-Each Ceratops skill declares the runtime-local icon path
-`./assets/ceratops-logo-500.png`; every source copy matches the canonical
+`SKILL.md` uses Agent Skills frontmatter and free-form Markdown instructions.
+`agents/openai.yaml` is optional Codex metadata. Ceratops skills use the
+enabled implicit-invocation default or set it to `true` explicitly.
+A supplied Ceratops icon uses the runtime-local path
+`./assets/ceratops-logo-500.png` and matches the canonical
 `skills/ceratops-skill-lifecycle/references/templates/ceratops-logo-500.png`.
 Reusable skill-runtime helper logic lives in skill-local lifecycle scripts
 under `skills/*/scripts/`, not in an installed Python package. User-global
@@ -261,7 +263,7 @@ without repository deduplication.
 | `skills/ceratops-repo-lifecycle/scripts/check_deployment_receipts.py` | Checks closed deployment receipts for promotion finalization, preserving MCP server underscores while keeping skill identities unchanged; rejects mismatched records, unfinished cleanup and duplicate identities without running installation or publication. |
 | `skills/ceratops-repo-lifecycle/scripts/manage-pending-work.py` | Records, checks, automatically resumes the retained target commit, and progressively finalizes the exact selected scope; preflight preserves and reports non-cleanup-eligible worktrees, while eligible residual-worktree and identity-matched task-temp cleanup delegates bounded removal to `pending-work-cleanup.py`. |
 | `skills/ceratops-repo-lifecycle/scripts/pending-work-cleanup.py` | Checks named directory boundaries, preserves active skill-update state, and removes selected residual and task-temp trees after clearing read-only Windows files and directories without traversing links. |
-| `skills/ceratops-repo-lifecycle/scripts/action.yml` | GitHub composite action that runs declared validation and, by default, tests using the skill-owned SDLC engine; `run-tests: false` permits validation-only CI when tests require an interactive desktop. CI defers skill handoffs and retains failure evidence. |
+| `skills/ceratops-repo-lifecycle/scripts/action.yml` | GitHub composite action that runs explicitly requested check phases or groups using the skill-owned SDLC engine; The required `operations` input names check phases or individual groups, one per line; name only the source group when tests require an interactive desktop. CI defers skill handoffs and retains failure evidence. |
 | `skills/ceratops-repo-lifecycle/scripts/repository_operation.py` | Single capability runner: resolves complete YAML locations, prevalidates ordered argv/parameters/cwd, runs applicable validation and test gates before deployment or publication, and retains bounded structured step results separately from command completion; skill callers execute registered handoffs and CI defers them. |
 | `skills/ceratops-repo-lifecycle/scripts/execute_skill_actions.py` | Runs a skill action's declared commands for the repository runner. Selects ordinary, named-skill or package-backed MCP arguments before any command starts. MCP package selection uses the SDLC prerequisites, exact project pin, one existing wheel and its canonical package lock; it never builds or tests an artifact. Preserves installed/source agreement and pinned Python execution, and returns step results and complete failure-report paths. It calls the owning skill's implementation; it does not install skills itself. |
 | `skills/ceratops-repo-lifecycle/scripts/ship-repository.py` | Public Ship argument parser and JSON/exit-code adapter; calls `github_pr_workflow/ship_repository.py`. |
@@ -319,12 +321,12 @@ The planned replacement preserves accepted results instead of repeating checks
 at each boundary; see [refactor status](#working-folder-lifecycle-refactor-status).
 
 Operations are identified by their YAML location, such as
-`repository.actions.validate` or
+`repository.actions.pre-build-checks.check-groups.source` or
 `deliverables.skills.ceratops-managed.actions.install`.
 There are no extra IDs, defaults or full flows in the contract. Prerequisites
 are setup metadata; declaring them does not install dependencies. Bootstrap
 operations perform declared setup, and uv prepares the environment for commands
-invoked through it. SDLC v4/v5 handoffs name a skill/action. For skill callers,
+invoked through it. SDLC handoffs name a skill/action. For skill callers,
 the engine resolves the installed skill's `references/action-executors.json` and
 runs its declared argv or ordered steps through `execute_skill_actions.py`.
 Each action declares `run`, ordered `steps`, or an explicit Python `call`.
@@ -345,7 +347,7 @@ receipt-only installation is planned in refactor step 19, not implemented here.
 CI uses `--ci`, never dispatches skills, and reports deferred handoffs
 separately. SDLC versions 1 through 3 are rejected and must be upgraded before
 lifecycle execution.
-An SDLC v4/v5 `build` may declare `result-commit-field: resultCommit` when its
+An SDLC `build` may declare `result-commit-field: resultCommit` when its
 final command commits native build records. Its complete JSON stdout must have
 a nonempty `schema`, status `OK` or `passed`, and that field naming the exact
 clean final Git HEAD descended from the prepared commit. The operation keeps
@@ -357,42 +359,85 @@ Malformed output retains completed effects and blocks continuation; it never
 causes automatic replay. Other actions retain the frozen-HEAD guard. This narrow
 contract does not allocate versions or replace native package records.
 Ceratops skill handoffs are declared on each named skill. Skill source
-validation at `deliverables.skills.<name>.actions.validate` hands off to
+checks at
+`deliverables.skills.<name>.actions.pre-build-checks.check-groups.source`
+hand off to
 `ceratops-skill-lifecycle/source-validate`; its skill-owned binding invokes the
 validator. The corresponding `actions.install` handoff runs the transactional
 installer. The compatible-repository producer adds these actions only for
 source skills in v4 contracts;
-the generic template declares repository validation and an explicit test no-op.
-SDLC v4 also supports separate packages, apps, MCP servers, skills, and hooks.
-Its schema lives at
-`skills/ceratops-repo-lifecycle/references/schemas/sdlc.v4.schema.json`;
-`scripts/repository_operation.py` resolves action locations and returns package
-prerequisites through `--prepare-only`. Registered v4 skill validation and
-deployment handoffs pass the exact selected skill to the lifecycle CLI, retain
-completion receipts, and stop on source changes or unsupported inputs. CI still
-defers every handoff; package prerequisites never imply an automatic build.
-MCP servers built directly from source may declare no package prerequisite.
-The compatibility producer and this repository's live declaration use v4.
-Existing v1-v3 repositories are not automatically migrated.
+the generic template declares repository setup, checks and an explicit test no-op.
+SDLC supports packages, apps, MCP servers, skills, and hooks. The operation
+runner's `--prepare-only` reports `build-after`, tool capabilities, and artifact
+requirements separately. The runner completes or reuses required builds before
+their consumers. Registered skill handoffs pass the exact requested skill to
+the lifecycle CLI. CI defers skill handoffs and reports them as pending.
 
-The v4/v5 release-declaration owners are
-`skills/ceratops-repo-lifecycle/references/schemas/sdlc.v5.schema.json` and
-`skills/ceratops-repo-lifecycle/scripts/ceratops_repo_compatibility_engine/sdlc_contract_validation.py`.
-SDLC v5 adds optional `repository.release-units`. Each unit declares a nonempty
-`members` list of full deliverable references, such as
-`deliverables.apps.desktop`. Members can be any supported deliverable kind;
-each member has a build action and artifact metadata and belongs to at most one
-unit. Package prerequisites remain dependencies rather than members. Every
-package dependency has one declared release-unit owner or belongs to the
-consuming unit; ambiguous ownership and dependency cycles are rejected.
+Declare the files that belong to a deliverable under `root-dir`. Use
+`additional-source-files` for shared assets and native manifests or lockfiles
+outside that directory. The runner includes tracked and nonignored new files
+and counts overlapping matches once. Native manifests still own package
+versions and dependency pins. Declare `uses-artifacts` on the build or check
+that reads those files. Delivery actions obtain accepted files through their
+existing installation or publication contract.
 
-The loader exposes `release_unit_entries(contract)`: member metadata and action
-locations plus external package dependencies with their owning release units.
-Loading and reading this metadata execute no commands. Existing action
-preparation and validation/test gates understand v5, while compatibility
-generation and this repository's live declaration remain v4. Automatic
-release-unit Build, Promote, Ship, and Deploy are not connected yet; exact
-artifact-output declarations and their consumers remain step 3 work.
+```yaml
+root-dir: packages/report-tool
+additional-source-files: [shared/report-template.html, uv.lock]
+build-after: [deliverables.packages.bootstrap-tool]
+actions:
+  pre-build-checks:
+    check-groups:
+      source-tests:
+        uses-artifacts: [deliverables.packages.text-engine]
+  build:
+    uses-artifacts: [deliverables.packages.ui-assets]
+    checks:
+      package-contents: {}
+  post-build-checks:
+    check-groups:
+      tool-with-engine:
+        uses-artifacts: [deliverables.packages.text-engine]
+```
+
+This excerpt omits command and result declarations. The engine is available
+before the source tests, and the builder receives the UI assets. The bootstrap
+tool only establishes build order. The final check receives the report tool's
+own output automatically, plus the engine it declares.
+This repository keeps its existing SDLC declaration version. Configuration
+updates do not convert unsupported formats.
+
+A release bundle groups deliverables released together. A deliverable is one
+package, application, skill, MCP server or hook; its artifacts are the built files.
+The schema declares groups under `repository.release-bundles`, each with a
+nonempty `members` list of full references such as `deliverables.apps.desktop`.
+Each member has a build action and artifact metadata and belongs to at most one
+bundle. A required deliverable may belong to another bundle or stand on its
+own. Ambiguous ownership and dependency cycles are reported before commands run.
+
+`sdlc_contract_validation.py::release_bundle_entries()` returns member metadata,
+action locations and required deliverables. An external dependency includes its
+bundle name when one exists. `_find_release_bundle_errors()` checks ownership
+and cycles without running commands.
+Build APIs accept `release_bundle`; the receipt inspection command is
+`verify-release-bundle-build --release-bundle NAME`. The former public group
+name is no longer accepted as an SDLC field, Python parameter or CLI option.
+
+The installed skill's `references/schemas/sdlc.*.schema.json` files define its
+supported format numbers. One set of readers and action checks handles those
+formats, without numbered Python functions or version-number branches. A newer
+repository format reports its number and the newest installed schema before any
+action runs. An older format works when its schema is installed and its fields
+meet that schema and the shared checks. New configuration uses the newest
+installed schema; updates preserve an existing supported version. There is one
+SDLC template and no separate generation-version setting.
+
+Build and artifact receipts name their release bundle with `releaseBundle`
+in every identity, including dependency identities. Receipt writers, schema
+checks, retention and the installed, repository and generated test readers use
+that same field. The former spelling is not accepted as an alternative.
+Artifact contents, source commits, check versions and test-result identities
+are unchanged by this metadata-field rename.
 
 Existing bundle receipts continue to use `ceratops-build-result.v2` in
 `operation-result.v1.schema.json`. The repository-owned `sdlc_results.py`
@@ -466,12 +511,12 @@ bounded artifact-store lifetime. The internal route creates no temporary log;
 future callers that create one must own and remove it. The readers create,
 rotate and clean up nothing.
 
-Call `sdlc_results.py verify-release-unit-build` with `--receipt`,
+Call `sdlc_results.py verify-release-bundle-build` with `--receipt`,
 `--bundle-root`, and the expected `--repository`, `--source-commit`,
-`--release-unit`, `--channel`, `--version`, and `--target`. Success prints
+`--release-bundle`, `--channel`, `--version`, and `--target`. Success prints
 `RECEIPT_VERIFIED`;
 invalid input or a mismatch returns a nonzero exit code. The Python function
-`verify_release_unit_build` returns the checked receipt with its recorded
+`verify_release_bundle_build` returns the checked receipt with its recorded
 build and test statuses unchanged. Neither interface writes bundle files.
 
 The internal v2 lifecycle now separates production from consumption.
@@ -544,7 +589,7 @@ still in use. It does not scan other worktrees, destinations or units.
 - Original `artifacts/<unit>/<version>/[<target>/]`: the named worktree's latest
   approved build, including alpha. Other worktrees have separate selections.
 
-A bundle uses its release-unit directory instead of separate member directories.
+A bundle uses its release-bundle directory instead of separate member directories.
 Slot overlaps keep one copy. Original receipt bytes, commit, check versions and
 result identities remain unchanged; readers return the retained package paths.
 Copying goes directly to the final directory and finishes before prior copies
@@ -569,7 +614,7 @@ old-path scan or compatibility wrapper is added.
 
 The implemented foundation has six separate responsibilities:
 
-- **1a — declarations:** SDLC v5 describes release-unit members and their
+- **1a — declarations:** SDLC v5 describes release-bundle members and their
   dependencies; loading it validates metadata without building anything.
 - **1b — verification:** the v2 verifier establishes which files and bytes its
   bundle record identifies. The new committed-build and artifact-receipt
@@ -700,10 +745,32 @@ into repository and skill lifecycle runtimes. It finds one shared lock at
 `<git-common-dir>/ceratops/locks/release-local` from any repository worktree,
 without requiring a remote. The pinned library's `lock_descriptor` function uses
 native Windows/Linux locking without truncating the file or falling back to a
-file-existence lock. Promotion and Ship wait up to 60 seconds for another holder,
+file-existence lock. Promotion, Ship and declared builds from the release checkout
+wait up to 60 seconds for another holder,
 using a monotonic deadline inside Python. After acquisition they run their normal
 preconditions against the current repository. Other callers still try once.
 The waiting limit does not limit the duration of the operation holding the lock.
+
+Declared builds now enter `repository_operation.execute_release_builds()` before
+reading the release commit or SDLC contract. Its implementation in
+`run_build_operations.py` follows `build-after` and `uses-artifacts` across
+deliverable types. It completes prerequisite builds, runs each ready check
+with its declared files, and passes the exact produced files to consumers,
+then passes those files to requested delivery operations. A direct Build,
+Promote-and-deploy and Ship's local build phase use this same call. Promotion
+keeps its required source checks; applicable passing results remain reusable.
+Independent task-worktree builds take no release lock.
+Installations without a declared build keep their existing operation reports.
+Repeated delivery requests retain their requested order; dependency builds run
+once per target.
+
+The runner consumes matching successful build results and existing tagged
+receipts with the same recorded source, target and release level. Native builders
+retain ownership of their existing artifacts, receipts and interrupted-output
+cleanup. No new build history or checkpoint folder is created. A failed build
+starts no dependent installation and never rolls back a completed promotion.
+The MCP adapter receives the accepted wheel path and canonical native lock; it
+does not search an output folder for an alternative wheel.
 
 The retained lock file stores one Boolean, `unfinished_run`: its first byte
 is `1` during work and `0` after explicit clean completion. Before allowing
@@ -853,7 +920,7 @@ serialize commands.
 
 | Area | Current status | Next boundary |
 | --- | --- | --- |
-| 1a release declarations | Implemented | Keep current v4/v5 readers; connect exact-output producers later |
+| 1a release declarations | Implemented | Keep shared SDLC readers; connect exact-output producers later |
 | 1b receipt verification | Implemented v2 verifier plus internal v3/v1 receipt definitions and saved-chain reader | Connect public lifecycle callers in later steps |
 | 1c correction continuity | Implemented and preservation-verified; finalization consumes recorded success without rechecking the checkout | Reports and matching-success cleanup connected in 3B/4B |
 | 1d/4D/4E build/test/store | Implemented v2 transaction and internal directory-first production with version-local requests, exact B-to-C receipts and immutable tags | Public Build and receipt-driven Promote remain in 16/22 |
@@ -885,7 +952,7 @@ The approved changes below are **planned**, not new behavior of today's commands
   level: alpha can reuse alpha/beta/rc/final; beta can reuse beta/rc/final; rc can
   reuse rc/final; final can reuse only final. Receipts, exact inputs and compatible
   execution context are required; a tag alone proves no test ran.
-- Ship compares each release unit with its last published final version, or its
+- Ship compares each release bundle with its last published final version, or its
   last accepted final CI version when publication is not configured. A changed
   unit initially runs its full final suite; corrections retain applicable passes.
   Unchanged final units retain their versions and do no build/test work. The
@@ -932,7 +999,7 @@ policy. These are the runtime paths used by the foundation and update workflow:
 | Runtime path | Class and owner | Rewrite, retention, or cleanup trigger |
 | --- | --- | --- |
 | `<automation-dir>/dependabot-repository-{preflight,finalize}.json` and the selected output's `.<name>.failed.tmp` | One current report per phase and its temporary failure write; the lifecycle skill's dependency queue entrypoint | `--automation-dir` reads the caller-owned repository scopes and binds the independent snapshot/sync adapters. Preflight retires the preceding final report; each phase retires its selected report and partial before execution. Missing results or operational failures produce dated unavailable-state reports. Atomic failure writing and the next ordinary call remove only that report's partial. Explicit output overrides retain unrelated reports. |
-| `<shared-git-directory>/ceratops/builds/<build-key>/`, including receipt, artifacts and supporting files | Persistent immutable output; `store_artifacts.py` publishes and reads on behalf of `repository_operation` | Grouped by repository, release unit, channel and target. At production startup and after publication, keep the newest completed bundle plus two predecessors by completion time and key; remove older directories without modifying retained bundles. Reading performs no retention or cleanup mutation. |
+| `<shared-git-directory>/ceratops/builds/<build-key>/`, including receipt, artifacts and supporting files | Persistent immutable output; `store_artifacts.py` publishes and reads on behalf of `repository_operation` | Grouped by repository, release bundle, channel and target. At production startup and after publication, keep the newest completed bundle plus two predecessors by completion time and key; remove older directories without modifying retained bundles. Reading performs no retention or cleanup mutation. |
 | `builds/`, `.staging/`, `.locks/`, `.diagnostics/` and `.locks/store.lock` | Persistent bounded infrastructure for the current v2 route; `store_artifacts.py` and `filelock` | One repository lock serializes that route's complete build/test/store transaction and cleanup ownership. The file remains reusable; the OS releases the held lock on normal exit or process death. No per-build lock history accumulates. |
 | `.staging/<build-key>/work/` and `bundle/` | Temporary private work for the current v2 route; `store_artifacts.py` | Removed on success or failure. At every v2 transaction startup, while holding the repository lock, remove every recognizable staging directory left by an earlier instance. Preserve unrecognized entries and report cleanup failure. |
 | `.diagnostics/<release-group-key>.json` and its `.tmp` write file | Persistent latest-failure report and temporary write for the current v2 route; `store_artifacts.py` | Atomically overwrite the group's report on failure and remove it after successful new publication. At v2 production startup remove interrupted `.tmp` writes. The completed-build reader does not rewrite diagnostics. Reports contain bounded excerpts and are never artifact-test evidence. |
@@ -1165,7 +1232,7 @@ Each repository owns one lifecycle contract:
   ordered steps, and exposes declared package prerequisites without executing
   their build or installation actions. MCP server installation can also run a
   repository-owned script directly. An MCP server may declare one package prerequisite
-  or none. Version 5 adds release-unit declarations. The shared loader supports
+  or none. Version 5 adds release-bundle declarations. The shared loader supports
   only v4 and v5; v1 through v3 require an explicit repository-owned upgrade.
 - Operation `status: completed` records command completion. A successful step
   whose entire stdout is a JSON object with nonempty string `schema` and
@@ -1290,7 +1357,7 @@ classify before closure. Repo-health summary JSON includes compact stale-state
 inventory counts and samples for PRs, branches, tags, releases, and local path
 references when present. It also reports the observed community-profile health
 percentage and its 100% contract target; inventory alone is not a finding.
-Local health validates each present `sdlc/sdlc.yml` against the v4 or v5 schema
+Local health validates each present `sdlc/sdlc.yml` against its installed schema
 and checks generic repository compatibility. It rejects v1 through v3 instead
 of proposing an in-place migration. Ship validates selected publication
 operations before remote mutation. Local health records structural
@@ -1425,13 +1492,18 @@ GitHub Actions pins as well as the scripts project.
 Skill callers invoke their bundled engine directly:
 
 ```powershell
-uv run --no-project --python <python_runtime> python "$env:CODEX_HOME/skills/ceratops-repo-lifecycle/scripts/repository_operation.py" --repo-root <repo> --validate
+uv run --no-project --python <python_runtime> python "$env:CODEX_HOME/skills/ceratops-repo-lifecycle/scripts/repository_operation.py" --repo-root <repo> --operation repository.actions.pre-build-checks
 ```
 
-`--validate` runs validation only. `--tests` runs the separate test stage;
-select both flags to validate first and then test. A deployment invocation
-runs both stages before deployment. `--return-handoffs` exposes unresolved
-routes to a skill caller.
+Repeat `--operation LOCATION` to name a whole phase or one group, such as
+`repository.actions.pre-build-checks.check-groups.source`. Only requested
+groups run; group names do not imply scan or test behavior. A build or delivery
+request still brings in its required checks and prerequisite builds. Promote
+and Ship pass their required group locations explicitly. CI's `operations`
+input takes those same locations, one per line. `--return-handoffs` exposes
+unresolved routes to a skill caller.
+When resolving a published CI action, compatibility setup checks that it declares
+the required inputs before writing a new workflow.
 New repository validators never select test runners. Conventional Python tests
 or pytest configuration generate `scripts/run-tests.py` from its template when
 absent, using `generate_test_script.py`. Setup records
@@ -1546,17 +1618,37 @@ runner executes tests but cannot reuse individual passes. A custom runner stays
 custom; `[tool.ceratops.test-support] managed = true` opts its support files into
 generation. Compatibility checks require the declared support to be present.
 
-SDLC v5 actions may declare `check-groups`, keyed by the repository runner's group
-names. Every group has `phase` (`before-build`, `during-build` or `after-build`)
-and `requires-artifacts` (deliverable references). Before-build groups have no
-artifact requirements; after-build groups name at least one. During-build groups
-belong to the build command, which returns their actual successful check records.
-Independent source checks finish before builds. Selected build prerequisites run
-first, failed prerequisites block their dependents, and joint tests wait for all
-their selected files. The executor supplies `--check-group` and `--artifacts`
-JSON to test commands and `CERATOPS_TEST_ARTIFACTS` to their children. File paths
-and byte hashes become reuse inputs; no installed version is selected implicitly.
-SDLC v4/v5 build actions can require a v1, v2 or v3 result. Build receipts
+SDLC actions run in this order: `pre-build-checks`, `build`, then
+`post-build-checks`, even when YAML keys appear in another order. This replaces
+the former per-group `phase` layout. Each before/after `check-groups` entry owns
+its command or handoff, runtime requirements and result declaration. Source scans
+and tests remain separate groups; requesting one group runs only that group.
+Groups inside `build` name checks performed and reported by the builder, without
+starting another command. A failed source check prevents dependent builds.
+
+A deliverable's post-build groups automatically receive its own exact files.
+Their optional `uses-artifacts` lists only additional deliverables; explicit
+self-references are errors. Repository-wide post-build groups must list every
+required deliverable. Pre-build groups can receive files from other
+deliverables. Their required builds finish first. A missing or changed file
+blocks the dependent check.
+Installed copies never stand in for the requested build's files.
+
+Commands that accept the runner interface declare `--check-group {check_group}`
+and `--artifacts {artifacts}` in `steps.run`. The executor replaces those arguments
+with the group name and that command's artifact map. The command also receives
+the map in `CERATOPS_TEST_ARTIFACTS`. Builders read the separate maps for their
+internal checks from `CERATOPS_BUILD_CHECK_ARTIFACTS`. Native commands receive
+only arguments their declarations request.
+File paths and byte hashes remain part of the saved reuse inputs.
+`prepare_sdlc_configuration()` prepares configuration during compatibility setup;
+its caller writes the YAML. Before a check runs, `collect_check_inputs()` records
+its command, relevant files, runtime, target and artifacts; `decide_check_reuse()`
+compares those facts with saved results. Moving an unchanged command to a new
+phase/group address preserves an applicable result's original identity. Whole
+command reuse and the test runner's individual-test reuse remain in place.
+
+SDLC build actions can require a v1, v2 or v3 result. Build receipts
 supply every produced file: v1 paths are repository-relative,
 v2 paths belong to their recorded shared build bundle, and v3 paths belong to
 their allocated version/target directory. Missing or changed files block only
@@ -1566,12 +1658,21 @@ environment mapping as tests.
 Test errors are saved in `.build/test-diagnostics/pytest-failure.json` or the
 caller-selected diagnostic path. Repeated errors replace that request's current
 details; shared output is stored once per diagnostic, rather than copied into
-every failed test entry. The runner deletes its managed report after newer
-passes resolve every reported failure. Fixing only A keeps a report that still
-contains B. At startup it finishes missed deletion from saved outcomes, without
-rerunning tests. Caller-retained reports outside managed storage stay untouched.
+every failed test entry. Newer passes remove the corresponding failures from
+the managed report. After a successful run with complete collection, the runner
+also removes deleted or renamed test cases from this worktree's current results
+and report. This includes old parameter cases inside a file that still exists.
+Filtered, failed, interrupted or skipped collection cannot establish that a
+case disappeared. Cleanup covers only the requested files and target; another
+file's unresolved failures remain. Once none remain, the report is deleted.
+At startup, saved passes finish missed report cleanup without rerunning tests.
+Report replacement uses one `.in_process.json` sibling, removed after writing
+or at the next startup, even if the first report was never published.
+Caller-retained reports outside managed storage stay untouched; the writer
+still removes its own partial-write file beside them.
 Lifecycle commands separately retire their own operation reports after consuming
-successful command results. Neither cleanup deletes `check_results.json`.
+successful command results. Cleanup preserves the other entries in
+`check_results.json` and never changes completed builds' Git summaries.
 
 `github_pr_workflow.command` also owns temporary operation-attempt snapshots in
 the repository's caller-selected task temp tree. Promotion results and operation

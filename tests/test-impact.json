@@ -1097,6 +1097,7 @@
     "sdlc-handoffs": {
       "pytest": [
         "tests/repository_lifecycle/test_sdlc_handoffs.py",
+        "tests/repository_lifecycle/test_sdlc_actions.py",
         "tests/repository_lifecycle/test_execute_skill_actions.py"
       ],
       "depends_on": [],
@@ -1365,6 +1366,7 @@
       "id": "repository-operation-source",
       "paths": [
         "skills/ceratops-repo-lifecycle/scripts/repository_operation.py",
+        "skills/ceratops-repo-lifecycle/scripts/run_build_operations.py",
         "skills/ceratops-repo-lifecycle/scripts/execute_skill_actions.py",
         "skills/ceratops-repo-lifecycle/scripts/check_deployment_receipts.py",
         "skills/ceratops-repo-lifecycle/references/schemas/sdlc.v*.schema.json"
@@ -1567,7 +1569,6 @@
         "skills/ceratops-repo-lifecycle/references/templates/markdownlint.json.tmpl",
         "skills/ceratops-repo-lifecycle/references/templates/pull-request-template.md.tmpl",
         "skills/ceratops-repo-lifecycle/references/templates/run-actionlint.py.tmpl",
-        "skills/ceratops-repo-lifecycle/references/templates/sdlc.v4.yml.tmpl",
         "skills/ceratops-repo-lifecycle/references/templates/sdlc.yml.tmpl",
         "skills/ceratops-repo-lifecycle/references/templates/skill-sections.json.tmpl",
         "skills/ceratops-repo-lifecycle/references/templates/validate-repository.py.tmpl",

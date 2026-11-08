@@ -32,7 +32,7 @@ from retain_check_results import (
 )
 from sdlc_results import select_build_check_summaries
 
-__all__ = ["CONTEXT_ENV", "CheckPlan", "plan_operation"]
+__all__ = ["CONTEXT_ENV", "CheckPlan", "collect_check_inputs", "decide_check_reuse"]
 
 
 def _digest(path: pathlib.Path) -> str | None:
@@ -110,7 +110,7 @@ def _environment(root: pathlib.Path, argv: tuple[str, ...], declaration: dict[st
     return value
 
 
-def check_inputs(prepared: Any, declaration: dict[str, Any]) -> dict[str, Any]:
+def collect_check_inputs(prepared: Any, declaration: dict[str, Any]) -> dict[str, Any]:
     """Capture the complete declared operation identity before its callback."""
     root = prepared.repo_root.resolve()
     if len(prepared.steps) != 1 or prepared.steps[0].argv is None:
@@ -137,8 +137,10 @@ def check_inputs(prepared: Any, declaration: dict[str, Any]) -> dict[str, Any]:
         "dependencies": dependencies, "environment": environment,
     }
     if group := getattr(prepared, "check_group", None):
-        context["group"] = prepared.operation + "#" + group
-        context["scope"]["checkGroup"] = group
+        # A descriptive SDLC group does not change a native command's work.
+        # Runners that accept group arguments include those values in argv.
+        if "--check-group" in argv:
+            context["scope"]["checkGroup"] = group
     if artifacts := getattr(prepared, "selected_artifacts", None):
         context["scope"]["artifacts"] = artifact_inputs(root, artifacts)
     context["fingerprint"] = fingerprint(context)
@@ -243,12 +245,12 @@ class CheckPlan:
         return reference
 
 
-def plan_operation(prepared: Any) -> CheckPlan | None:
+def decide_check_reuse(prepared: Any) -> CheckPlan | None:
     """Legacy/no-op/handoff operations have no reusable executed outcome."""
     declaration = prepared.check_results
     if declaration is None:
         return None
-    context = check_inputs(prepared, declaration)
+    context = collect_check_inputs(prepared, declaration)
     store = CheckResultStore(prepared.repo_root)
     builds = select_build_check_summaries(prepared.repo_root, qualification_level=prepared.qualification_level)
     decision = store.select(context, check_id=context["group"], builds=builds)

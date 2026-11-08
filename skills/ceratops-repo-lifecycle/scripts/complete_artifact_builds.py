@@ -170,7 +170,7 @@ def _validate_prepared_receipt(
         raise OperationError(str(exc)) from exc
     expected_identity = {
         "repository": transaction.repository,
-        "releaseUnit": transaction.release_unit,
+        "releaseBundle": transaction.release_bundle,
         "version": transaction.version,
         "target": target,
         "attemptId": transaction.attempt_id,
@@ -251,7 +251,7 @@ def prepare_versioned_build_receipt(
     summary_raw = (json.dumps(summary, sort_keys=True, separators=(",", ":"),
                               ensure_ascii=True, allow_nan=False) + "\n").encode()
     summary_path = str(pathlib.PurePosixPath(transaction.receipt_path(target)).with_name("check_summary.json"))
-    value["tag"] = f"{transaction.release_unit}/{transaction.version}"
+    value["tag"] = f"{transaction.release_bundle}/{transaction.version}"
     value["checkSummary"] = {
         "root": "git", "path": summary_path, "size": len(summary_raw),
         "sha256": hashlib.sha256(summary_raw).hexdigest(),
@@ -375,7 +375,7 @@ def write_versioned_failure_diagnostic(
     value = {
         "schema": "ceratops-artifact-failure.v1",
         "repository": transaction.repository,
-        "releaseUnit": transaction.release_unit,
+        "releaseBundle": transaction.release_bundle,
         "version": transaction.version,
         "versionClass": transaction.version_class,
         "target": target,
@@ -694,7 +694,7 @@ def _create_result_commit(
     ) != transaction.pre_test_commit:
         raise RecoveryRequired("Recorded branch moved before result commit creation.")
     message = (
-        f"Record {transaction.release_unit} {transaction.version} build receipts\n\n"
+        f"Record {transaction.release_bundle} {transaction.version} build receipts\n\n"
         f"Ceratops-Attempt: {transaction.attempt_id}"
     )
     added = subprocess.run(
@@ -806,7 +806,7 @@ def _write_version_artifact_receipts(
 def _artifact_tag_commit(
     transaction: ArtifactVersionTransaction,
 ) -> str | None:
-    tag = f"{transaction.release_unit}/{transaction.version}"
+    tag = f"{transaction.release_bundle}/{transaction.version}"
     result = subprocess.run(
         [
             "git",
@@ -832,7 +832,7 @@ def _artifact_tag_commit(
 def _create_artifact_tag(
     transaction: ArtifactVersionTransaction, final_commit: str
 ) -> str:
-    tag = f"{transaction.release_unit}/{transaction.version}"
+    tag = f"{transaction.release_bundle}/{transaction.version}"
     existing = _artifact_tag_commit(transaction)
     if existing is not None:
         if existing != final_commit:
@@ -910,7 +910,7 @@ def complete_versioned_artifacts(
 
 
 def read_artifact_build(
-    repo_root: pathlib.Path, *, repository: str, release_unit: str, version: str,
+    repo_root: pathlib.Path, *, repository: str, release_bundle: str, version: str,
     required_targets: Sequence[str],
 ) -> ArtifactVersionTransaction:
     """Select an unfinished request or completed receipts without allocating.
@@ -920,14 +920,14 @@ def read_artifact_build(
     """
     from store_artifacts import (
         LOGICAL_ID_RE,
-        RELEASE_UNIT_RE,
+        RELEASE_BUNDLE_RE,
         _artifact_store_path,
         _require_identifier,
     )
 
     root = _validated_worktree(repo_root)
     repository = _validated_repository(repository)
-    unit = _require_identifier(release_unit, label="release unit", pattern=RELEASE_UNIT_RE)
+    unit = _require_identifier(release_bundle, label="release bundle", pattern=RELEASE_BUNDLE_RE)
     version, classification = _version_classification(version)
     targets = _validated_targets(required_targets)
     store = _artifact_store_path(root)
@@ -944,7 +944,7 @@ def read_artifact_build(
     else:
         selected = sdlc_results.read_artifact_receipt_chain(
             root, tag=f"{unit}/{version}", expected={
-                "repository": repository, "releaseUnit": unit,
+                "repository": repository, "releaseBundle": unit,
                 "version": version, "target": targets[0],
             },
         )
@@ -959,7 +959,7 @@ def read_artifact_build(
         paths = tuple(sorted(item["path"] for item in _receipt_git_inputs(receipt)))
     transaction = ArtifactVersionTransaction(
         repo_root=root, repository=repository, worktree_registration=registration,
-        branch=branch, release_unit=unit, version=version, version_class=classification,
+        branch=branch, release_bundle=unit, version=version, version_class=classification,
         attempt_id=attempt, allocation_commit=allocation_commit, pre_test_commit=commit,
         required_targets=targets, declared_input_paths=paths, store=store, request_path=request,
         version_root=directory, diagnostic_root=directory / ".diagnostics",
@@ -983,8 +983,8 @@ def _completed_versioned_result(
     for target in transaction.required_targets:
         selected = sdlc_results.read_artifact_receipt_chain(
             transaction.repo_root,
-            tag=f"{transaction.release_unit}/{transaction.version}",
-            expected={"repository": transaction.repository, "releaseUnit": transaction.release_unit,
+            tag=f"{transaction.release_bundle}/{transaction.version}",
+            expected={"repository": transaction.repository, "releaseBundle": transaction.release_bundle,
                       "version": transaction.version, "target": target, "attemptId": transaction.attempt_id},
         )
         _validate_prepared_receipt(transaction, target, selected.build_receipt.raw)
@@ -993,7 +993,7 @@ def _completed_versioned_result(
         artifact_receipts.append(selected.receipt_path)
     return CompletedArtifactVersion(
         final_commit=final_commit,
-        tag=f"{transaction.release_unit}/{transaction.version}",
+        tag=f"{transaction.release_bundle}/{transaction.version}",
         build_receipts=tuple(transaction.repo_root / transaction.receipt_path(target) for target in transaction.required_targets),
         artifact_receipts=tuple(artifact_receipts),
     )

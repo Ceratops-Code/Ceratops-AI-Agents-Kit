@@ -84,7 +84,7 @@ def _bundle_transaction(tmp_path):
     return repo, {
         "selection": {
             "repository": "https://example.invalid/owner/repo",
-            "sourceCommit": commit, "releaseUnit": "example", "channel": "alpha",
+            "sourceCommit": commit, "releaseBundle": "example", "channel": "alpha",
             "version": "1.0+alpha", "target": "any",
         },
         "inputs": {"dependencySelections": [], "lock": "a" * 64, "adapter": "fixture-v1"},
@@ -150,7 +150,7 @@ def test_completed_build_reader_returns_recorded_dependency_paths(tmp_path) -> N
                 "identity": {
                     **kwargs["selection"],
                     "sourceCommit": "d" * 40,
-                    "releaseUnit": "example-dependency",
+                    "releaseBundle": "example-dependency",
                     "version": "0.1+alpha",
                 },
                 "artifacts": [{
@@ -164,7 +164,7 @@ def test_completed_build_reader_returns_recorded_dependency_paths(tmp_path) -> N
     receipt = runner.build_bundle(repo, **{**kwargs, "build": build_with_dependency})
     completed = runner.read_completed_build(repo, receipt_path=receipt)
     assert len(completed.dependencies) == 1
-    assert completed.dependencies[0].identity["releaseUnit"] == "example-dependency"
+    assert completed.dependencies[0].identity["releaseBundle"] == "example-dependency"
     assert completed.dependencies[0].artifacts == (
         receipt.parent / "dependencies/example-dependency.whl",
     )
@@ -412,452 +412,6 @@ def test_bundle_transaction_cleanup_failure_retains_diagnostic_and_recovers(tmp_
     assert not diagnostic.exists()
 
 
-def test_compatibility_preserves_custom_unittest_runner_without_pytest(
-    tmp_path: pathlib.Path,
-) -> None:
-    """An existing test runner owns its framework dependency declaration."""
-
-    repo = tmp_path / "repository"
-    scripts = repo / "scripts"
-    scripts.mkdir(parents=True)
-    (repo / ".git").write_text("gitdir: fixture\n", encoding="utf-8")
-    (scripts / "pyproject.toml").write_text(
-        "[project]\n"
-        'name = "repository-tools"\n'
-        'version = "0.0.0"\n'
-        'requires-python = ">=3.11"\n'
-        'dependencies = ["mypy", "ruff"]\n',
-        encoding="utf-8",
-    )
-    runner = scripts / "run-tests.py"
-    runner_text = "import unittest\n\nunittest.main(module=None)\n"
-    runner.write_text(runner_text, encoding="utf-8")
-    tests = repo / "tests"
-    tests.mkdir()
-    (tests / "test_example.py").write_text("import unittest\n", encoding="utf-8")
-
-    result = run_compatibility_engine(
-        REPOSITORY_LIFECYCLE_SCRIPTS,
-        "apply",
-        "--target-repo-root",
-        str(repo),
-    )
-
-    assert result.returncode == 0, result.stdout
-    assert runner.read_text(encoding="utf-8") == runner_text
-    project = tomllib.loads((scripts / "pyproject.toml").read_text(encoding="utf-8"))
-    assert "pytest" not in project["project"]["dependencies"]
-    assert "scripts/run-tests.py" in (repo / "sdlc/sdlc.yml").read_text(
-        encoding="utf-8"
-    )
-
-
-@pytest.mark.parametrize("mode", ["ci", "skill", "return"])
-def test_v4_tests_gate_mutations_and_ci_never_dispatches_handoffs(
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
-    mode: str,
-) -> None:
-    """Real subprocess failure must stop the batch before a later mutation."""
-    declaration = {
-        "version": 4,
-        "kind": "ceratops-sdlc",
-        "repository": {
-            "capabilities": {},
-            "actions": {
-                "validate": {
-                    "requires": {"capabilities": []},
-                    "no-op": "No extra structural checks.",
-                },
-                "test": {
-                    "requires": {"capabilities": []},
-                    "no-op": "No repository tests.",
-                },
-            },
-        },
-        "deliverables": {
-            "apps": {
-                "service": {
-                    "source": "apps/service",
-                    "manifest": "apps/service/app.json",
-                    "prerequisites": [],
-                    "actions": {
-                        "test": _v4_action(
-                            {"run": [sys.executable, "-c", "raise SystemExit(7)"]}
-                        ),
-                        "validate": _v4_action(
-                            {
-                                "handoff": {
-                                    "lifecycle": "example-skill",
-                                    "action": "check",
-                                    "inputs": {},
-                                }
-                            }
-                        ),
-                        "install": _v4_action(
-                            {
-                                "run": [
-                                    sys.executable,
-                                    "-c",
-                                    "raise AssertionError('must not deploy')",
-                                ]
-                            }
-                        ),
-                    },
-                }
-            }
-        },
-    }
-    (tmp_path / "sdlc").mkdir()
-    (tmp_path / "sdlc/sdlc.yml").write_text(json.dumps(declaration))
-    location = "deliverables.apps.service.actions.install"
-    selected = runner.validation_operations(
-        tmp_path, [location], ["repository.actions.validate"]
-    )
-    assert "deliverables.apps.service.actions.test" in selected
-    calls: list[str] = []
-
-    def record_handoff(
-        route: str, root: pathlib.Path, **_kwargs: object
-    ) -> dict[str, str]:
-        calls.append(route)
-        return {"status": "completed"}
-
-    monkeypatch.setattr(skill_actions, "execute_handoff", record_handoff)
-    handoff = runner.prepare_operations(
-        tmp_path,
-        [runner.OperationRequest("deliverables.apps.service.actions.validate")],
-        context=mode,
-    )[0]
-    result = runner.execute_prepared_operation(handoff)
-    assert calls == (["example-skill/check"] if mode == "skill" else [])
-    assert (
-        result["status"]
-        == {
-            "ci": "deferred_handoff",
-            "skill": "completed",
-            "return": "handoff_required",
-        }[mode]
-    )
-    prepared = runner.prepare_operations(
-        tmp_path,
-        [runner.OperationRequest(item) for item in selected]
-        + [runner.OperationRequest(location)],
-        context=mode,
-    )
-    failed = runner.execute_prepared_operations(prepared)
-    assert failed["status"] == (
-        "handoff_required" if mode == "return" else "tests_failed"
-    )
-    assert location in failed["pending_operations"]
-    assert location not in failed["completed_operations"]
-
-
-@pytest.mark.parametrize("failure", [None, "validation", "tests"])
-def test_ci_action_runs_skill_engine_without_repository_copies(
-    tmp_path: pathlib.Path,
-    failure: str | None,
-) -> None:
-    repo = tmp_path / "repository with spaces"
-    (repo / "sdlc").mkdir(parents=True)
-    evidence = tmp_path / "failure evidence.json"
-    evidence.write_text("previous failure")
-
-    def command(name: str) -> dict[str, object]:
-        program = (
-            "from pathlib import Path; p=Path('order.txt'); "
-            f"p.write_text((p.read_text() if p.exists() else '') + {name!r} + chr(10)); "
-            f"raise SystemExit({7 if failure == name else 0})"
-        )
-        return {
-            "requires": {"capabilities": []},
-            "steps": [{"run": [sys.executable, "-c", program]}],
-        }
-
-    declaration = {
-        "version": 4,
-        "kind": "ceratops-sdlc",
-        "repository": {
-            "capabilities": {},
-            "actions": {
-                "validate": command("validation"),
-                "test": command("tests"),
-            },
-        },
-        "deliverables": {
-            "skills": {
-                "service": {
-                    "source": "skills/service",
-                    "prerequisites": [],
-                    "actions": {
-                        "validate": _v4_action(
-                            {
-                                "handoff": {
-                                    "lifecycle": "ceratops-skill-lifecycle",
-                                    "action": "source-validate",
-                                    "inputs": {"skill": "service"},
-                                }
-                            }
-                        ),
-                        "install": _v4_action(
-                            {
-                                "handoff": {
-                                    "lifecycle": "ceratops-skill-lifecycle",
-                                    "action": "deploy",
-                                    "inputs": {"skill": "service"},
-                                }
-                            }
-                        ),
-                    },
-                }
-            }
-        },
-    }
-    (repo / "sdlc/sdlc.yml").write_text(json.dumps(declaration))
-    result = run_ci_action(repo, evidence, tmp_path / "action checkout")
-    assert result.returncode == (1 if failure else 0), result.stderr
-    payload = json.loads(result.stderr if failure else result.stdout)
-    if failure:
-        assert json.loads(evidence.read_text()) == payload
-        assert payload["status"] == (
-            "validation_failed" if failure == "validation" else "tests_failed"
-        )
-    else:
-        assert not evidence.exists()
-        assert payload["status"] == "completed"
-    expected = "validation\n" if failure == "validation" else "validation\ntests\n"
-    assert (repo / "order.txt").read_text() == expected
-    if failure != "validation":
-        handoff = next(item for item in payload["results"] if item.get("handoff"))
-        assert handoff["status"] == "deferred_handoff"
-    assert not (repo / "scripts/sdlc.py").exists()
-    assert not (repo / "scripts/runtime").exists()
-
-
-def _v4_action(*steps: dict[str, object]) -> dict[str, object]:
-    return {"requires": {"capabilities": []}, "steps": list(steps)}
-
-
-def _v4_fixture() -> dict[str, Any]:
-    """Exercise package dependency records and separate lifecycle ownership."""
-
-    return {
-        "version": 4,
-        "kind": "ceratops-sdlc",
-        "repository": {
-            "capabilities": {"uv": {"executable": "uv"}},
-            "actions": {
-                "validate": _v4_action({"run": [sys.executable, "-c", "pass"]}),
-                "test": {
-                    "requires": {"capabilities": []},
-                    "no-op": "No repository tests.",
-                },
-            },
-        },
-        "deliverables": {
-            "packages": {
-                "core": {
-                    "source": "packages/core",
-                    "project": "packages/core/pyproject.toml",
-                    "prerequisites": [],
-                    "artifact": {
-                        "type": "python-wheel",
-                        "distribution": "core-tool",
-                        "output-directory": "dist/core",
-                        "filename-pattern": "core_tool-*.whl",
-                    },
-                    "actions": {
-                        "build": _v4_action({"run": ["uv", "build", "packages/core"]})
-                    },
-                },
-                "claims": {
-                    "source": "packages/claims",
-                    "project": "packages/claims/pyproject.toml",
-                    "prerequisites": ["core"],
-                    "artifact": {
-                        "type": "python-wheel",
-                        "distribution": "claims-tool",
-                        "output-directory": "dist/claims",
-                        "filename-pattern": "claims_tool-*.whl",
-                    },
-                    "actions": {
-                        "build": _v4_action({"run": ["uv", "build", "packages/claims"]})
-                    },
-                },
-            },
-            "mcp-servers": {
-                "insurance-claims-mcp-server": {
-                    "source": "packages/claims",
-                    "manifest": "packages/claims/mcp-server.json",
-                    "prerequisites": ["claims"],
-                    "actions": {
-                        "validate": {
-                            "requires": {"capabilities": []},
-                            "no-op": "Package tests cover the MCP server.",
-                        },
-                        "install": _v4_action(
-                            {
-                                "handoff": {
-                                    "lifecycle": "ceratops-mcp-server-lifecycle",
-                                    "action": "install",
-                                    "inputs": {"mcp-server": "insurance-claims-mcp-server"},
-                                }
-                            }
-                        ),
-                    },
-                },
-            },
-            "apps": {
-                "claims-mobile": {
-                    "source": "apps/claims",
-                    "manifest": "apps/claims/AndroidManifest.xml",
-                    "prerequisites": ["claims"],
-                    "actions": {
-                        "validate": {
-                            "requires": {"capabilities": []},
-                            "no-op": "Repository checks cover the app.",
-                        },
-                        "install": _v4_action(
-                            {
-                                "run": [
-                                    sys.executable,
-                                    "-c",
-                                    "from pathlib import Path; Path('app-installed.txt').write_text('done')",
-                                ]
-                            }
-                        ),
-                    },
-                },
-            },
-            "skills": {
-                "claims-catalog-invoice": {
-                    "source": "skills/claims-catalog-invoice",
-                    "prerequisites": ["claims"],
-                    "actions": {
-                        "validate": _v4_action(
-                            {
-                                "handoff": {
-                                    "lifecycle": "ceratops-skill-lifecycle",
-                                    "action": "source-validate",
-                                    "inputs": {"skill": "claims-catalog-invoice"},
-                                }
-                            }
-                        ),
-                        "install": _v4_action(
-                            {
-                                "handoff": {
-                                    "lifecycle": "ceratops-skill-lifecycle",
-                                    "action": "deploy",
-                                    "inputs": {"skill": "claims-catalog-invoice"},
-                                }
-                            }
-                        ),
-                    },
-                },
-            },
-        },
-    }
-
-
-def test_v4_template_and_typed_operation_index(tmp_path: pathlib.Path) -> None:
-    template = (
-        ROOT / "skills/ceratops-repo-lifecycle/references/templates/sdlc.v4.yml.tmpl"
-    )
-    path = tmp_path / "sdlc.yml"
-    shutil.copyfile(template, path)
-    document = contracts.load_contract(path)
-    assert document["version"] == 4
-    assert list(contracts.operation_entries(document)) == [
-        "repository.actions.validate",
-        "repository.actions.test",
-    ]
-
-    fixture = _v4_fixture()
-    assert contracts.validation_errors(fixture) == []
-    entries = contracts.operation_entries(fixture)
-    assert set(entries) == {
-        "repository.actions.validate",
-        "repository.actions.test",
-        "deliverables.packages.core.actions.build",
-        "deliverables.packages.claims.actions.build",
-        "deliverables.apps.claims-mobile.actions.validate",
-        "deliverables.apps.claims-mobile.actions.install",
-        "deliverables.mcp-servers.insurance-claims-mcp-server.actions.validate",
-        "deliverables.mcp-servers.insurance-claims-mcp-server.actions.install",
-        "deliverables.skills.claims-catalog-invoice.actions.validate",
-        "deliverables.skills.claims-catalog-invoice.actions.install",
-    }
-    assert (
-        runner.operation_category("deliverables.packages.claims.actions.build")
-        == "build"
-    )
-    assert (
-        runner.operation_category("deliverables.apps.claims-mobile.actions.install")
-        == "deploy-local"
-    )
-    assert (
-        runner.operation_category(
-            "deliverables.mcp-servers.insurance-claims-mcp-server.actions.install"
-        )
-        == "deploy-local"
-    )
-    with pytest.raises(runner.OperationError, match="Invalid SDLC operation location"):
-        runner.operation_category(
-            "deliverables.skills.claims-catalog-invoice.actions.build"
-        )
-
-
-def test_v4_prerequisites_are_exposed_without_build_or_install(
-    tmp_path: pathlib.Path,
-) -> None:
-    fixture = _v4_fixture()
-    (tmp_path / "sdlc").mkdir()
-    (tmp_path / "sdlc/sdlc.yml").write_text(json.dumps(fixture))
-    _repository(tmp_path)
-    (tmp_path / "uncommitted.txt").write_text("inspection must remain read-only")
-    location = "deliverables.skills.claims-catalog-invoice.actions.install"
-    prepared = runner.prepare_operations(tmp_path, [runner.OperationRequest(location)])[
-        0
-    ]
-    assert list(prepared.prerequisites["packages"]) == ["core", "claims"]
-    assert prepared.prerequisites["packages"]["claims"]["action-locations"] == {
-        "build": "deliverables.packages.claims.actions.build"
-    }
-    assert prepared.steps[0].handoff["action"] == "deploy"
-    assert runner.validation_operations(tmp_path, [location]) == [
-        "repository.actions.validate",
-        "deliverables.skills.claims-catalog-invoice.actions.validate",
-        "repository.actions.test",
-    ]
-    assert runner.validation_operations(
-        tmp_path, ["deliverables.apps.claims-mobile.actions.install"]
-    ) == [
-        "repository.actions.validate",
-        "deliverables.apps.claims-mobile.actions.validate",
-        "repository.actions.test",
-    ]
-    assert runner.validation_operations(
-        tmp_path, ["deliverables.mcp-servers.insurance-claims-mcp-server.actions.install"]
-    ) == [
-        "repository.actions.validate",
-        "deliverables.mcp-servers.insurance-claims-mcp-server.actions.validate",
-        "repository.actions.test",
-    ]
-    result = run_operation_cli(tmp_path, location, prepare_only=True)
-    assert result.returncode == 0
-    payload = json.loads(result.stdout)
-    assert list(payload["prerequisites"]["packages"]) == ["core", "claims"]
-
-    app_location = "deliverables.apps.claims-mobile.actions.install"
-    app_prepared = runner.prepare_operations(
-        tmp_path, [runner.OperationRequest(app_location)]
-    )[0]
-    assert list(app_prepared.prerequisites["packages"]) == ["core", "claims"]
-    assert app_prepared.prerequisites["packages"]["claims"]["action-locations"] == {
-        "build": "deliverables.packages.claims.actions.build"
-    }
-
-
 def _build_receipt_fixture(tmp_path: pathlib.Path):
     """The repository runner owns cleanup of all files beneath this pytest root."""
     bundle = tmp_path / "bundle"
@@ -878,7 +432,7 @@ def _build_receipt_fixture(tmp_path: pathlib.Path):
     identity = {
         "repository": "example/project",
         "sourceCommit": "a" * 40,
-        "releaseUnit": "claims",
+        "releaseBundle": "claims",
         "channel": "beta",
         "version": "1.2.0b1",
         "target": "python-3.14-windows",
@@ -913,7 +467,7 @@ def _build_receipt_fixture(tmp_path: pathlib.Path):
             {
                 "identity": {
                     **identity,
-                    "releaseUnit": "converter",
+                    "releaseBundle": "converter",
                     "version": "0.4.0",
                 },
                 "artifacts": [dependency],
@@ -969,7 +523,7 @@ def _new_receipt_fixtures(
     artifact_path = f"artifacts/claims-{version}-py3-none-any.whl"
     identity = {
         "repository": "example/project",
-        "releaseUnit": "claims",
+        "releaseBundle": "claims",
         "version": version,
         "target": target,
         "attemptId": "attempt-001",
@@ -1021,7 +575,7 @@ def _new_receipt_fixtures(
         "dependencies": [
             {
                 "repository": "example/project",
-                "releaseUnit": "converter",
+                "releaseBundle": "converter",
                 "version": "0.4.0",
                 "target": target,
                 "acceptanceId": "converter-acceptance-004",
@@ -1265,7 +819,7 @@ def _bound_test_build(repo_root, *, pre_test_commit, **selection):
 @pytest.mark.parametrize("timing", ["before", "after"])
 def test_versioned_allocation_repeats_after_directory_and_request_effects(tmp_path, monkeypatch, stage, timing):
     repository, commit = _versioned_repository(tmp_path)
-    selection = dict(repository="example/project", release_unit="claims", version="1.2.3b1",
+    selection = dict(repository="example/project", release_bundle="claims", version="1.2.3b1",
                      required_targets=["linux", "windows"], attempt_id="attempt-interruption")
     allocation = None
     if stage == "binding":
@@ -1308,7 +862,7 @@ def test_versioned_allocation_repeats_after_directory_and_request_effects(tmp_pa
 
 def test_versioned_allocation_precedes_embedded_versions_and_commit_b(tmp_path):
     repository, before = _versioned_repository(tmp_path)
-    selection = dict(repository="example/project", release_unit="claims", version="1.2.3b1",
+    selection = dict(repository="example/project", release_bundle="claims", version="1.2.3b1",
                      required_targets=["linux", "windows"], attempt_id="attempt-before-b",
                      declared_input_paths=["src", "version.txt"])
     allocation = runner.allocate_versioned_build(repository, **selection)
@@ -1328,7 +882,7 @@ def test_versioned_allocation_precedes_embedded_versions_and_commit_b(tmp_path):
 @pytest.mark.parametrize("change", ["worktree", "index", "new-file"])
 def test_versioned_changed_inputs_select_another_directory(tmp_path, change):
     repository, commit = _versioned_repository(tmp_path)
-    selection = dict(repository="example/project", release_unit="claims", version="1.2.3a1",
+    selection = dict(repository="example/project", release_bundle="claims", version="1.2.3a1",
                      required_targets=["linux"], attempt_id="attempt-inputs",
                      declared_input_paths=["src"])
     original = _bound_test_build(repository, pre_test_commit=commit, **selection)
@@ -1351,7 +905,7 @@ def test_versioned_changed_inputs_select_another_directory(tmp_path, change):
 
 def test_versioned_allocation_propagates_permission_errors_and_requires_final_version_choice(tmp_path, monkeypatch):
     repository, _commit = _versioned_repository(tmp_path)
-    selection = dict(repository="example/project", release_unit="claims", version="1.2.3b1",
+    selection = dict(repository="example/project", release_bundle="claims", version="1.2.3b1",
                      required_targets=["linux"], attempt_id="attempt-permissions")
     mkdir = pathlib.Path.mkdir
 
@@ -1383,7 +937,7 @@ def test_versioned_competing_processes_allocate_while_retention_is_busy(tmp_path
     program = (
         "import json,pathlib,subprocess,sys; sys.path.insert(0,sys.argv[1]); import repository_operation as r\n"
         "root=pathlib.Path(sys.argv[2]); print('ready',flush=True); input()\n"
-        "a=r.allocate_versioned_build(root,repository='example/project',release_unit='claims',version='1.2.3b1',"
+        "a=r.allocate_versioned_build(root,repository='example/project',release_bundle='claims',version='1.2.3b1',"
         "required_targets=['linux','windows'],attempt_id=root.name,declared_input_paths=['src','version.txt'])\n"
         "(root/'version.txt').write_text(a.version)\n"
         "subprocess.run(['git','-C',str(root),'add','version.txt'],check=True,capture_output=True)\n"
@@ -1425,7 +979,7 @@ def test_versioned_competing_processes_allocate_while_retention_is_busy(tmp_path
 def test_versioned_requests_preserve_owners_and_coordinate_targets(tmp_path) -> None:
     repository, commit = _versioned_repository(tmp_path)
     targets = ["python-3.14-windows", "python-3.14-linux"]
-    selection = dict(repository="example/project", release_unit="claims", version="1.2.3a1",
+    selection = dict(repository="example/project", release_bundle="claims", version="1.2.3a1",
                      required_targets=targets, attempt_id="attempt-alpha-001")
     transaction = _bound_test_build(repository, pre_test_commit=commit, **selection)
     sentinel = transaction.target_output(targets[0]) / "owned.bin"
@@ -1471,7 +1025,7 @@ def _prepared_versioned_completion(
     transaction = _bound_test_build(
         repository,
         repository="example/project",
-        release_unit="claims",
+        release_bundle="claims",
         version=version,
         required_targets=targets,
         attempt_id=attempt_id,
@@ -1555,7 +1109,7 @@ def _receipt_chain_fixture(
         / ".git"
         / "ceratops"
         / "artifacts"
-        / identity["releaseUnit"]
+        / identity["releaseBundle"]
         / identity["version"]
         / identity["target"]
     )
@@ -1576,7 +1130,7 @@ def _receipt_chain_fixture(
         _write_fixture_bytes(store, relative, content)
     artifact_path = store / "artifact-receipt.json"
     artifact_path.write_bytes(results.encode_new_receipt(artifact))
-    tag = f"{identity['releaseUnit']}/{identity['version']}"
+    tag = f"{identity['releaseBundle']}/{identity['version']}"
     tagged = run_git(repository, "tag", tag, final_commit)
     assert tagged.returncode == 0, tagged.stderr
 
@@ -1606,7 +1160,7 @@ def _artifact_identity_selection(fixture: Mapping[str, Any]) -> dict[str, str]:
     identity = fixture["artifact"]["identity"]
     return {
         field: identity[field]
-        for field in ("repository", "releaseUnit", "version", "target")
+        for field in ("repository", "releaseBundle", "version", "target")
     }
 
 
@@ -1784,7 +1338,7 @@ def test_new_receipt_reader_reports_missing_and_unreadable_data(tmp_path) -> Non
 def test_new_receipt_definitions_preserve_native_v2_reading(tmp_path) -> None:
     path, bundle, receipt, expected = _build_receipt_fixture(tmp_path)
     assert results.BUILD_RECEIPT_SCHEMA == "ceratops-build-result.v2"
-    assert results.verify_release_unit_build(path, bundle, expected=expected) == receipt
+    assert results.verify_release_bundle_build(path, bundle, expected=expected) == receipt
 
 
 @pytest.mark.parametrize("receipt_name", ["build_receipt.json", "receipt.json"])
@@ -2049,7 +1603,7 @@ def test_build_receipt_verifies_complete_bundle_without_mutation(
         "run",
         lambda *a, **k: pytest.fail("Verifier must not execute commands"),
     )
-    checked = results.verify_release_unit_build(path, bundle, expected=expected)
+    checked = results.verify_release_bundle_build(path, bundle, expected=expected)
     assert checked == receipt
     assert {
         item: (item.read_bytes(), item.stat().st_mtime_ns)
@@ -2073,7 +1627,7 @@ def test_build_receipt_ignores_metadata_only_change_time(tmp_path, monkeypatch) 
 
     # Simulate Windows metadata changes without touching file identity or bytes.
     monkeypatch.setattr(results, "_plain_path", changed_metadata)
-    assert results.verify_release_unit_build(path, bundle, expected=expected) == receipt
+    assert results.verify_release_bundle_build(path, bundle, expected=expected) == receipt
 
 
 @pytest.mark.parametrize("build_status", ["passed", "failed", "blocked"])
@@ -2094,12 +1648,12 @@ def test_build_receipt_integrity_does_not_establish_test_success(
         if test_status in {"blocked", "skipped"}:
             receipt["tests"][0]["evidence"] = None
     _save_build_receipt(path, receipt)
-    assert results.verify_release_unit_build(path, bundle, expected=expected) == receipt
+    assert results.verify_release_bundle_build(path, bundle, expected=expected) == receipt
 
 
 @pytest.mark.parametrize(
     "field",
-    ["repository", "sourceCommit", "releaseUnit", "channel", "version", "target"],
+    ["repository", "sourceCommit", "releaseBundle", "channel", "version", "target"],
 )
 def test_build_receipt_checks_each_expected_identity_before_payload_reads(
     tmp_path, monkeypatch, field
@@ -2112,7 +1666,7 @@ def test_build_receipt_checks_each_expected_identity_before_payload_reads(
         lambda *a: pytest.fail("Identity must be checked first"),
     )
     with pytest.raises(results.StepResultError, match=f"identity mismatch: {field}"):
-        results.verify_release_unit_build(path, bundle, expected=expected)
+        results.verify_release_bundle_build(path, bundle, expected=expected)
 
 
 @pytest.mark.parametrize(
@@ -2133,7 +1687,7 @@ def test_build_receipt_requires_complete_independent_selection(
     else:
         expected = None
     with pytest.raises(results.StepResultError, match="all six"):
-        results.verify_release_unit_build(path, bundle, expected=expected)
+        results.verify_release_bundle_build(path, bundle, expected=expected)
 
 
 @pytest.mark.parametrize(
@@ -2175,7 +1729,7 @@ def test_build_receipt_rejects_invalid_schema(tmp_path, problem) -> None:
         receipt["artifacts"][0][key] = value
     _save_build_receipt(path, receipt)
     with pytest.raises(results.StepResultError, match="schema"):
-        results.verify_release_unit_build(path, bundle, expected=expected)
+        results.verify_release_bundle_build(path, bundle, expected=expected)
 
 
 @pytest.mark.parametrize(
@@ -2218,7 +1772,7 @@ def test_build_receipt_rejects_ambiguous_inventory_before_payload_reads(
             duplicate["identity"]["version"] = "9.0.0"
         receipt["dependencies"].append(duplicate)
     elif problem == "self-dependency":
-        receipt["dependencies"][0]["identity"]["releaseUnit"] = expected["releaseUnit"]
+        receipt["dependencies"][0]["identity"]["releaseBundle"] = expected["releaseBundle"]
     elif problem == "duplicate-test":
         receipt["tests"].append(deepcopy(test))
     elif problem == "unknown-tested-file":
@@ -2240,7 +1794,7 @@ def test_build_receipt_rejects_ambiguous_inventory_before_payload_reads(
         lambda *a: pytest.fail("Inventory must be checked first"),
     )
     with pytest.raises(results.StepResultError):
-        results.verify_release_unit_build(path, bundle, expected=expected)
+        results.verify_release_bundle_build(path, bundle, expected=expected)
 
 
 @pytest.mark.parametrize(
@@ -2277,7 +1831,7 @@ def test_build_receipt_rejects_nonportable_or_escaping_paths(
         lambda *a: pytest.fail("Unsafe paths must be rejected first"),
     )
     with pytest.raises(results.StepResultError):
-        results.verify_release_unit_build(path, bundle, expected=expected)
+        results.verify_release_bundle_build(path, bundle, expected=expected)
 
 
 @pytest.mark.parametrize("group", ["artifact", "dependency", "lock", "evidence"])
@@ -2306,7 +1860,7 @@ def test_build_receipt_verifies_every_file_category(tmp_path, group, problem) ->
                 reference["sha256"] = record["sha256"]
     _save_build_receipt(path, receipt)
     with pytest.raises(results.StepResultError):
-        results.verify_release_unit_build(path, bundle, expected=expected)
+        results.verify_release_bundle_build(path, bundle, expected=expected)
 
 
 @pytest.mark.parametrize(
@@ -2340,14 +1894,14 @@ def test_build_receipt_rejects_unusable_json(tmp_path, problem) -> None:
     }[problem]
     path.write_bytes(raw)
     with pytest.raises(results.StepResultError):
-        results.verify_release_unit_build(path, bundle, expected=expected)
+        results.verify_release_bundle_build(path, bundle, expected=expected)
 
 
 def test_build_receipt_rejects_hardlinked_payload(tmp_path) -> None:
     path, bundle, receipt, expected = _build_receipt_fixture(tmp_path)
     os.link(bundle / receipt["artifacts"][0]["path"], tmp_path / "other-link.whl")
     with pytest.raises(results.StepResultError, match="regular and unlinked"):
-        results.verify_release_unit_build(path, bundle, expected=expected)
+        results.verify_release_bundle_build(path, bundle, expected=expected)
 
 
 @pytest.mark.parametrize("linked_root", [False, True])
@@ -2375,7 +1929,7 @@ def test_build_receipt_rejects_directory_links(tmp_path, linked_root) -> None:
             receipt["tests"][0]["artifacts"][0]["path"] = "linked-wheels/claims.whl"
             _save_build_receipt(path, receipt)
         with pytest.raises(results.StepResultError, match="traverses a link"):
-            results.verify_release_unit_build(path, bundle, expected=expected)
+            results.verify_release_bundle_build(path, bundle, expected=expected)
     finally:
         # Remove only the test-owned link, never its target or descendants.
         if link.is_symlink():
@@ -2402,7 +1956,7 @@ def test_build_receipt_detects_changes_during_hashing(tmp_path, monkeypatch) -> 
 
     monkeypatch.setattr(results.hashlib, "sha256", ChangingHash)
     with pytest.raises(results.StepResultError, match="changed while reading"):
-        results.verify_release_unit_build(path, bundle, expected=expected)
+        results.verify_release_bundle_build(path, bundle, expected=expected)
 
 
 @pytest.mark.parametrize(
@@ -2449,7 +2003,7 @@ def test_build_receipt_cli_works_from_isolated_skill_and_preserves_inputs(
         sys.executable,
         "-B",
         str(script),
-        "verify-release-unit-build",
+        "verify-release-bundle-build",
         "--receipt",
         str(path),
         "--bundle-root",
@@ -2460,7 +2014,7 @@ def test_build_receipt_cli_works_from_isolated_skill_and_preserves_inputs(
         [
             "--repository",
             "--source-commit",
-            "--release-unit",
+            "--release-bundle",
             "--channel",
             "--version",
             "--target",
@@ -2493,693 +2047,3 @@ def test_build_receipt_cli_works_from_isolated_skill_and_preserves_inputs(
         argv[:-2], cwd=tmp_path, capture_output=True, text=True, check=False
     )
     assert missing.returncode == 2 and "--target" in missing.stderr
-
-
-def test_v4_source_installed_mcp_server_needs_no_package_artifact(
-    tmp_path: pathlib.Path,
-) -> None:
-    fixture = _v4_fixture()
-    mcp_server = fixture["deliverables"]["mcp-servers"]["insurance-claims-mcp-server"]
-    mcp_server["prerequisites"] = []
-    assert contracts.validation_errors(fixture) == []
-
-    (tmp_path / "sdlc").mkdir()
-    (tmp_path / "sdlc/sdlc.yml").write_text(json.dumps(fixture))
-    _repository(tmp_path)
-    location = "deliverables.mcp-servers.insurance-claims-mcp-server.actions.install"
-    prepared = runner.prepare_operations(tmp_path, [runner.OperationRequest(location)])[
-        0
-    ]
-    assert prepared.prerequisites["packages"] == {}
-    assert prepared.steps[0].handoff["action"] == "install"
-    assert not (tmp_path / "dist").exists()
-
-
-def test_v4_mcp_server_install_can_run_standalone_script(tmp_path: pathlib.Path) -> None:
-    fixture = _v4_fixture()
-    mcp_server = fixture["deliverables"]["mcp-servers"]["insurance-claims-mcp-server"]
-    mcp_server["actions"]["install"] = _v4_action(
-        {
-            "run": [
-                sys.executable,
-                "-c",
-                "from pathlib import Path; Path('installed.txt').write_text('done')",
-            ]
-        }
-    )
-    assert contracts.validation_errors(fixture) == []
-    (tmp_path / "sdlc").mkdir()
-    (tmp_path / "sdlc/sdlc.yml").write_text(json.dumps(fixture))
-    prepared = runner.prepare_operations(
-        tmp_path,
-        [
-            runner.OperationRequest(
-                "deliverables.mcp-servers.insurance-claims-mcp-server.actions.install",
-            )
-        ],
-    )[0]
-    result = runner.execute_prepared_operation(prepared)
-    assert result["status"] == "completed"
-    assert result["steps"] == [1]
-    assert (tmp_path / "installed.txt").read_text() == "done"
-
-
-def test_v4_app_install_can_run_standalone_script(tmp_path: pathlib.Path) -> None:
-    fixture = _v4_fixture()
-    assert contracts.validation_errors(fixture) == []
-    (tmp_path / "sdlc").mkdir()
-    (tmp_path / "sdlc/sdlc.yml").write_text(json.dumps(fixture))
-    prepared = runner.prepare_operations(
-        tmp_path,
-        [
-            runner.OperationRequest(
-                "deliverables.apps.claims-mobile.actions.install",
-            )
-        ],
-    )[0]
-    result = runner.execute_prepared_operation(prepared)
-    assert result["status"] == "completed"
-    assert result["steps"] == [1]
-    assert (tmp_path / "app-installed.txt").read_text() == "done"
-
-
-def test_v4_declared_operation_result_is_validated(tmp_path: pathlib.Path) -> None:
-    fixture = _v4_fixture()
-    action = fixture["deliverables"]["apps"]["claims-mobile"]["actions"]["install"]
-    action["result-schema"] = "ceratops-deployment-result.v1"
-    payload = {
-        "schema": "ceratops-deployment-result.v1",
-        "status": "passed",
-        "target": "tablet:37111",
-        "artifact": {
-            "type": "android-apk",
-            "path": "app/build/app.apk",
-            "sha256": "0" * 64,
-            "size": 1,
-        },
-    }
-    action["steps"] = [
-        {
-            "run": [
-                sys.executable,
-                "-c",
-                f"import json; print(json.dumps({payload!r}))",
-            ]
-        }
-    ]
-    assert contracts.validation_errors(fixture) == []
-    (tmp_path / "sdlc").mkdir()
-    (tmp_path / "sdlc/sdlc.yml").write_text(json.dumps(fixture))
-    prepared = runner.prepare_operations(
-        tmp_path,
-        [
-            runner.OperationRequest(
-                "deliverables.apps.claims-mobile.actions.install",
-            )
-        ],
-    )[0]
-    assert prepared.result_schema == "ceratops-deployment-result.v1"
-    result = runner.execute_prepared_operation(prepared)
-    assert result["status"] == "completed"
-    assert result["step_results"] == [{"step": 1, "result": payload}]
-
-
-def test_v4_invalid_required_result_retains_completed_side_effect(
-    tmp_path: pathlib.Path,
-) -> None:
-    fixture = _v4_fixture()
-    action = fixture["deliverables"]["apps"]["claims-mobile"]["actions"]["install"]
-    action["result-schema"] = "ceratops-deployment-result.v1"
-    action["steps"] = [
-        {
-            "run": [
-                sys.executable,
-                "-c",
-                "from pathlib import Path; Path('installed.txt').write_text('done'); print('{}')",
-            ]
-        }
-    ]
-    assert contracts.validation_errors(fixture) == []
-    (tmp_path / "sdlc").mkdir()
-    (tmp_path / "sdlc/sdlc.yml").write_text(json.dumps(fixture))
-    prepared = runner.prepare_operations(
-        tmp_path,
-        [
-            runner.OperationRequest(
-                "deliverables.apps.claims-mobile.actions.install",
-            )
-        ],
-    )[0]
-    result = runner.execute_prepared_operation(prepared)
-    assert result["status"] == "result_invalid"
-    assert result["steps"] == [1]
-    assert "Do not replay" in result["message"]
-    assert (tmp_path / "installed.txt").read_text() == "done"
-
-
-@pytest.mark.parametrize("mode", ["skill", "ci", "return"])
-def test_v4_runs_commands_then_returns_structured_handoff(
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
-    mode: str,
-) -> None:
-    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "unregistered"))
-    fixture = _v4_fixture()
-    action = fixture["deliverables"]["skills"]["claims-catalog-invoice"]["actions"][
-        "install"
-    ]
-    action["steps"].insert(
-        0,
-        {
-            "run": [
-                sys.executable,
-                "-c",
-                "from pathlib import Path; Path('ran.txt').write_text('done')",
-            ]
-        },
-    )
-    (tmp_path / "sdlc").mkdir()
-    (tmp_path / "sdlc/sdlc.yml").write_text(json.dumps(fixture))
-    location = "deliverables.skills.claims-catalog-invoice.actions.install"
-    prepared = runner.prepare_operations(
-        tmp_path,
-        [runner.OperationRequest(location)],
-        context=mode,
-    )[0]
-    result = runner.execute_prepared_operation(prepared)
-    assert result["steps"] == [1]
-    assert result["status"] == (
-        "deferred_handoff" if mode == "ci" else "handoff_required"
-    )
-    assert result["handoff"] == {
-        "lifecycle": "ceratops-skill-lifecycle",
-        "action": "deploy",
-        "inputs": {"skill": "claims-catalog-invoice"},
-    }
-    assert (tmp_path / "ran.txt").read_text() == "done"
-
-
-def test_v4_package_build_waits_for_declared_test_gate(tmp_path: pathlib.Path) -> None:
-    fixture = _v4_fixture()
-    fixture["repository"]["actions"]["test"] = _v4_action(
-        {
-            "run": [sys.executable, "-c", "raise SystemExit(7)"],
-        }
-    )
-    fixture["deliverables"]["packages"]["claims"]["actions"]["build"] = _v4_action(
-        {
-            "run": [
-                sys.executable,
-                "-c",
-                "from pathlib import Path; Path('built.txt').write_text('bad')",
-            ],
-        }
-    )
-    (tmp_path / "sdlc").mkdir()
-    (tmp_path / "sdlc/sdlc.yml").write_text(json.dumps(fixture))
-    result = run_operation_cli(tmp_path, "deliverables.packages.claims.actions.build")
-    assert result.returncode == 1
-    assert json.loads(result.stderr)["status"] == "tests_failed"
-    assert not (tmp_path / "built.txt").exists()
-
-
-@pytest.mark.parametrize(
-    "change, expected",
-    [
-        (
-            lambda x: x["deliverables"]["skills"]["claims-catalog-invoice"].update(
-                prerequisites=["missing"]
-            ),
-            "unknown package missing",
-        ),
-        (
-            lambda x: x["deliverables"]["packages"]["core"].update(
-                prerequisites=["claims"]
-            ),
-            "package prerequisite cycle",
-        ),
-        (
-            lambda x: x["deliverables"]["mcp-servers"]["insurance-claims-mcp-server"]["actions"][
-                "install"
-            ]["steps"][0]["handoff"].update(lifecycle="ceratops-skill-lifecycle"),
-            "must hand off to ceratops-mcp-server-lifecycle",
-        ),
-        (
-            lambda x: x["deliverables"]["mcp-servers"]["insurance-claims-mcp-server"][
-                "actions"
-            ].update(
-                install={
-                    "requires": {"capabilities": []},
-                    "no-op": "Cannot install without lifecycle.",
-                }
-            ),
-            "must end with a handoff",
-        ),
-        (
-            lambda x: x["deliverables"]["skills"]["claims-catalog-invoice"]["actions"][
-                "install"
-            ].update(
-                steps=[
-                    {
-                        "handoff": {
-                            "lifecycle": "ceratops-skill-lifecycle",
-                            "action": "deploy",
-                            "inputs": {},
-                        }
-                    },
-                    {"run": ["python"]},
-                ]
-            ),
-            "handoff must be the single final step",
-        ),
-        (
-            lambda x: x["deliverables"]["packages"]["claims"]["artifact"].update(
-                **{"filename-pattern": "../wrong.whl"}
-            ),
-            "filename-pattern must be a filename pattern",
-        ),
-        (
-            lambda x: x["deliverables"]["mcp-servers"]["insurance-claims-mcp-server"]["actions"][
-                "install"
-            ]["steps"][0]["handoff"]["inputs"].update(
-                **{"prerequisite-packages": ["core"]}
-            ),
-            "prerequisite-packages differ from prerequisites",
-        ),
-        (
-            lambda x: x["repository"]["capabilities"]["uv"].update(
-                **{
-                    "version-from": {
-                        "file": "folder\\tool.toml",
-                        "key": "project.version",
-                    }
-                }
-            ),
-            "capability uv version-from.file must be repository-relative",
-        ),
-        (
-            lambda x: x["repository"]["capabilities"]["uv"].update(
-                version="1.0", channel="stable"
-            ),
-            "Additional properties are not allowed",
-        ),
-        (
-            lambda x: x["deliverables"]["apps"]["claims-mobile"]["actions"][
-                "install"
-            ].update(**{"result-schema": "ceratops-build-result.v1"}),
-            "result-schema must be ceratops-deployment-result.v1",
-        ),
-        (
-            lambda x: x["deliverables"]["skills"]["claims-catalog-invoice"]["actions"][
-                "install"
-            ].update(**{"result-schema": "ceratops-deployment-result.v1"}),
-            "result-schema requires a final run step",
-        ),
-    ],
-)
-def test_v4_rejects_invalid_dependency_or_lifecycle_boundary(
-    change, expected: str
-) -> None:
-    fixture = _v4_fixture()
-    change(fixture)
-    assert any(expected in error for error in contracts.validation_errors(fixture))
-
-
-@pytest.mark.parametrize(
-    "change",
-    [
-        lambda x: x["deliverables"]["apps"]["claims-mobile"]["actions"].update(
-            build=_v4_action({"run": ["python"]})
-        ),
-        lambda x: x["deliverables"]["mcp-servers"]["insurance-claims-mcp-server"].update(
-            package="claims"
-        ),
-        lambda x: x["deliverables"]["mcp-servers"]["insurance-claims-mcp-server"].update(
-            prerequisites=["core", "claims"]
-        ),
-        lambda x: x["deliverables"]["skills"]["claims-catalog-invoice"]["actions"][
-            "install"
-        ].update(**{"no-op": "nothing to install"}),
-        lambda x: x["deliverables"]["skills"]["claims-catalog-invoice"]["actions"][
-            "install"
-        ]["steps"][0].update(run=["python"]),
-        lambda x: x["deliverables"]["skills"]["claims-catalog-invoice"][
-            "actions"
-        ].update(build=_v4_action({"run": ["python"]})),
-    ],
-)
-def test_v4_schema_rejects_ambiguous_steps_or_wrong_deliverable_actions(change) -> None:
-    fixture = _v4_fixture()
-    change(fixture)
-    assert contracts.validation_errors(fixture)
-
-
-def _v5_fixture() -> dict[str, Any]:
-    """Two release units independently consume one separately owned package."""
-    document = _v4_fixture()
-    document["version"] = 5
-    document["repository"]["release-units"] = {
-        "core": {"members": ["deliverables.packages.core"]},
-        "claims": {
-            "members": [
-                "deliverables.packages.claims",
-                "deliverables.mcp-servers.insurance-claims-mcp-server",
-            ]
-        },
-        "desktop": {"members": ["deliverables.apps.claims-mobile"]},
-    }
-    mcp_server = document["deliverables"]["mcp-servers"]["insurance-claims-mcp-server"]
-    mcp_server["project"] = "mcp-servers/insurance-claims-mcp-server/pyproject.toml"
-    mcp_server["artifact"] = {
-        "type": "python-wheel",
-        "distribution": "insurance-claims-mcp-server",
-        "output-directory": "dist/claims-mcp-server",
-        "filename-pattern": "insurance_claims_mcp_server-*.whl",
-    }
-    mcp_server["actions"]["build"] = _v4_action(
-        {"run": ["build-claims-mcp-server"]}
-    )
-    app = document["deliverables"]["apps"]["claims-mobile"]
-    app["prerequisites"] = ["core"]
-    app["artifact"] = {
-        "type": "application-archive",
-        "output-directory": "dist/desktop",
-        "filename-pattern": "desktop-*.zip",
-    }
-    app["actions"]["build"] = _v4_action({"run": ["build-desktop"]})
-    return document
-
-
-def test_v5_reader_keeps_shared_dependencies_out_of_membership(
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    document = _v5_fixture()
-    original = deepcopy(document)
-    path = tmp_path / "sdlc.yml"
-    path.write_text(json.dumps(document), encoding="utf-8")
-    files_before = list(tmp_path.iterdir())
-
-    def forbidden(*_args, **_kwargs):
-        raise AssertionError("Reading release units must not execute a command")
-
-    monkeypatch.setattr(subprocess, "run", forbidden)
-    loaded = contracts.load_contract(path)
-    entries = contracts.release_unit_entries(loaded)
-    assert list(entries) == ["core", "claims", "desktop"]
-    assert entries["core"]["dependencies"] == {}
-    assert list(entries["claims"]["members"]) == [
-        "deliverables.packages.claims",
-        "deliverables.mcp-servers.insurance-claims-mcp-server",
-    ]
-    assert list(entries["desktop"]["members"]) == ["deliverables.apps.claims-mobile"]
-    for name in ("claims", "desktop"):
-        assert list(entries[name]["dependencies"]) == ["deliverables.packages.core"]
-        dependency = entries[name]["dependencies"]["deliverables.packages.core"]
-        assert dependency["release-unit"] == "core"
-        assert dependency["source"] == "packages/core"
-        assert dependency["artifact"]["type"] == "python-wheel"
-        assert (
-            dependency["action-locations"]["build"]
-            == "deliverables.packages.core.actions.build"
-        )
-    mcp_server = entries["claims"]["members"]["deliverables.mcp-servers.insurance-claims-mcp-server"]
-    assert (
-        mcp_server["action-locations"]["build"]
-        == "deliverables.mcp-servers.insurance-claims-mcp-server.actions.build"
-    )
-    assert mcp_server["prerequisites"] == ["claims"]
-    mcp_server["artifact"]["type"] = "changed-view"
-    entries["claims"]["dependencies"]["deliverables.packages.core"][
-        "prerequisites"
-    ].append("changed-view")
-    assert loaded == original
-    assert document == original
-    assert list(tmp_path.iterdir()) == files_before
-
-
-def test_v5_reader_resolves_transitive_dependency_owners() -> None:
-    document = _v5_fixture()
-    app = document["deliverables"]["apps"]["claims-mobile"]
-    app["prerequisites"] = ["claims"]
-    assert contracts.validation_errors(document) == []
-    dependencies = contracts.release_unit_entries(document)["desktop"]["dependencies"]
-    assert list(dependencies) == [
-        "deliverables.packages.core",
-        "deliverables.packages.claims",
-    ]
-    assert [record["release-unit"] for record in dependencies.values()] == [
-        "core",
-        "claims",
-    ]
-
-
-@pytest.mark.parametrize(
-    "kind,name",
-    [
-        ("packages", "claims"),
-        ("mcp-servers", "insurance-claims-mcp-server"),
-        ("apps", "claims-mobile"),
-        ("skills", "claims-catalog-invoice"),
-        ("hooks", "example-hook"),
-    ],
-)
-def test_v5_release_members_support_non_python_artifacts(kind: str, name: str) -> None:
-    document = _v5_fixture()
-    if kind == "hooks":
-        document["deliverables"]["hooks"] = {
-            name: {
-                "source": "hooks",
-                "prerequisites": ["core"],
-                "actions": {
-                    "validate": {
-                        "requires": {"capabilities": []},
-                        "no-op": "Covered by repository validation.",
-                    },
-                    "install": _v4_action({"run": ["install-hook"]}),
-                },
-            }
-        }
-    record = document["deliverables"][kind][name]
-    record.pop("project", None)
-    record["artifact"] = {
-        "type": "zip",
-        "output-directory": f"dist/{name}",
-        "filename-pattern": f"{name}-*.zip",
-    }
-    record["actions"]["build"] = _v4_action({"run": ["build-archive"]})
-    reference = f"deliverables.{kind}.{name}"
-    units = document["repository"]["release-units"]
-    if kind in {"skills", "hooks"}:
-        units["extension"] = {"members": [reference]}
-    assert contracts.validation_errors(document) == []
-    entries = contracts.release_unit_entries(document)
-    owner = next(unit for unit in entries.values() if reference in unit["members"])
-    assert owner["members"][reference]["artifact"]["type"] == "zip"
-    assert (
-        contracts.operation_category(f"{reference}.actions.build", version=5) == "build"
-    )
-
-
-@pytest.mark.parametrize(
-    "problem",
-    [
-        "empty_units",
-        "empty_members",
-        "duplicate_member",
-        "duplicate_owner",
-        "unknown_member",
-        "invalid_reference",
-        "unknown_field",
-        "unknown_dependency",
-        "unowned_dependency",
-        "package_cycle",
-        "no_artifact",
-        "no_build",
-        "noop_build",
-        "handoff_build",
-        "wheel_without_project",
-        "wheel_without_distribution",
-    ],
-)
-def test_v5_rejects_invalid_release_declarations(
-    problem: str, tmp_path: pathlib.Path
-) -> None:
-    document = _v5_fixture()
-    units = document["repository"]["release-units"]
-    mcp_server = document["deliverables"]["mcp-servers"]["insurance-claims-mcp-server"]
-    core = document["deliverables"]["packages"]["core"]
-    if problem == "empty_units":
-        units.clear()
-    elif problem == "empty_members":
-        units["claims"]["members"] = []
-    elif problem == "duplicate_member":
-        units["claims"]["members"].append("deliverables.packages.claims")
-    elif problem == "duplicate_owner":
-        units["desktop"]["members"].append("deliverables.packages.claims")
-    elif problem == "unknown_member":
-        units["claims"]["members"].append("deliverables.packages.missing")
-    elif problem == "invalid_reference":
-        units["claims"]["members"] = ["packages.claims"]
-    elif problem == "unknown_field":
-        units["claims"]["additional-inputs"] = ["outside/member.py"]
-    elif problem == "unknown_dependency":
-        core["prerequisites"] = ["missing"]
-    elif problem == "unowned_dependency":
-        del units["core"]
-    elif problem == "package_cycle":
-        core["prerequisites"] = ["claims"]
-    elif problem == "no_artifact":
-        del mcp_server["artifact"]
-    elif problem == "no_build":
-        del mcp_server["actions"]["build"]
-    elif problem == "noop_build":
-        mcp_server["actions"]["build"] = {
-            "requires": {"capabilities": []},
-            "no-op": "No build.",
-        }
-    elif problem == "handoff_build":
-        mcp_server["actions"]["build"] = _v4_action(
-            {
-                "handoff": {
-                    "lifecycle": "some-builder",
-                    "action": "build",
-                    "inputs": {},
-                },
-            }
-        )
-    elif problem == "wheel_without_project":
-        del mcp_server["project"]
-    else:
-        del mcp_server["artifact"]["distribution"]
-    errors = contracts.validation_errors(document)
-    assert errors, problem
-    path = tmp_path / "sdlc.yml"
-    path.write_text(json.dumps(document), encoding="utf-8")
-    with pytest.raises(contracts.SdlcContractError):
-        contracts.load_contract(path)
-
-
-def test_v5_rejects_unit_cycle_even_when_package_graph_is_acyclic() -> None:
-    document = _v5_fixture()
-    packages = document["deliverables"]["packages"]
-    packages["left-leaf"] = deepcopy(packages["core"])
-    packages["right-root"] = deepcopy(packages["core"])
-    packages["right-root"]["prerequisites"] = ["left-leaf"]
-    units = document["repository"]["release-units"]
-    units["claims"]["members"].append("deliverables.packages.left-leaf")
-    units["core"]["members"].append("deliverables.packages.right-root")
-    errors = contracts.validation_errors(document)
-    assert any("release-unit dependency cycle" in error for error in errors)
-    assert not any("package prerequisite cycle" in error for error in errors)
-
-
-@pytest.mark.parametrize(
-    "field,bad_path",
-    [
-        ("source", "../escape"),
-        ("source", "C:outside"),
-        ("source", "C:/outside"),
-        ("project", "/outside/pyproject.toml"),
-        ("manifest", r"mcp-servers\outside.json"),
-        ("output-directory", "dist/../../escape"),
-        ("filename-pattern", "../*.whl"),
-        ("filename-pattern", "C:*.whl"),
-        ("cwd", "../escape"),
-        ("cwd", r"mcp-servers\outside"),
-        ("source", "invalid\x00name"),
-        ("project", "invalid\nname"),
-    ],
-)
-def test_v5_rejects_unsafe_paths(field: str, bad_path: str) -> None:
-    document = _v5_fixture()
-    mcp_server = document["deliverables"]["mcp-servers"]["insurance-claims-mcp-server"]
-    if field in {"output-directory", "filename-pattern"}:
-        mcp_server["artifact"][field] = bad_path
-    elif field == "cwd":
-        mcp_server["actions"]["build"]["steps"][0]["cwd"] = bad_path
-    else:
-        mcp_server[field] = bad_path
-    assert contracts.validation_errors(document)
-
-
-def test_v5_does_not_change_v4_or_infer_units() -> None:
-    legacy = _v4_fixture()
-    before = deepcopy(legacy)
-    assert contracts.validation_errors(legacy) == []
-    assert contracts.release_unit_entries(legacy) == {}
-    assert legacy == before
-    legacy["repository"]["release-units"] = {
-        "claims": {"members": ["deliverables.packages.claims"]}
-    }
-    assert contracts.validation_errors(legacy)
-    mcp_server = before["deliverables"]["mcp-servers"]["insurance-claims-mcp-server"]
-    mcp_server["artifact"] = _v5_fixture()["deliverables"]["mcp-servers"]["insurance-claims-mcp-server"][
-        "artifact"
-    ]
-    mcp_server["actions"]["build"] = _v4_action(
-        {"run": ["build-mcp-server"]}
-    )
-    assert contracts.validation_errors(before)
-    document = _v5_fixture()
-    del document["repository"]["release-units"]
-    assert contracts.validation_errors(document) == []
-    assert contracts.release_unit_entries(document) == {}
-
-
-def test_v5_duplicate_yaml_unit_names_are_rejected(tmp_path: pathlib.Path) -> None:
-    path = tmp_path / "sdlc.yml"
-    path.write_text(
-        "version: 5\nrepository:\n  release-units:\n"
-        "    duplicate: {}\n    duplicate: {}\n",
-        encoding="utf-8",
-    )
-    with pytest.raises(contracts.SdlcContractError, match="unique strings"):
-        contracts.load_contract(path)
-
-
-def test_v5_prepare_and_gates_keep_typed_deliverable_selection(
-    tmp_path: pathlib.Path,
-) -> None:
-    document = _v5_fixture()
-    mcp_servers = document["deliverables"]["mcp-servers"]
-    mcp_servers["other-mcp-server"] = deepcopy(
-        mcp_servers["insurance-claims-mcp-server"]
-    )
-    mcp_servers["other-mcp-server"]["actions"]["install"]["steps"][0]["handoff"]["inputs"][
-        "mcp-server"
-    ] = "other-mcp-server"
-    mcp_servers["other-mcp-server"]["actions"]["test"] = _v4_action(
-        {"run": ["other-tests"]}
-    )
-    selected_mcp_server = mcp_servers["insurance-claims-mcp-server"]
-    selected_mcp_server["actions"]["test"] = _v4_action(
-        {"run": ["selected-tests"]}
-    )
-    (tmp_path / "sdlc").mkdir()
-    (tmp_path / "sdlc/sdlc.yml").write_text(json.dumps(document), encoding="utf-8")
-    _repository(tmp_path)
-    location = "deliverables.mcp-servers.insurance-claims-mcp-server.actions.build"
-    prepared = runner.prepare_operations(tmp_path, [runner.OperationRequest(location)])[
-        0
-    ]
-    assert prepared.category == "build"
-    assert list(prepared.prerequisites["packages"]) == ["core", "claims"]
-    gates = runner.validation_operations(tmp_path, [location])
-    assert gates == [
-        "repository.actions.validate",
-        "deliverables.mcp-servers.insurance-claims-mcp-server.actions.validate",
-        "repository.actions.test",
-        "deliverables.mcp-servers.insurance-claims-mcp-server.actions.test",
-    ]
-    assert (
-        runner.validation_operations(
-            tmp_path, [location], ["repository.actions.validate"]
-        )
-        == gates
-    )
-    result = run_operation_cli(tmp_path, location, prepare_only=True)
-    assert result.returncode == 0, result.stderr
-    payload = json.loads(result.stdout)
-    assert payload["status"] == "prepared"
-    assert list(payload["prerequisites"]["packages"]) == ["core", "claims"]

@@ -164,16 +164,13 @@ def prepare_repository_lifecycle_repo(
         deliverables={
             "apps": {
                 "sample": {
-                    "source": ".",
+                    "root-dir": ".",
                     "manifest": "README.md",
-                    "prerequisites": [],
-                    "actions": {
-                        "validate": {
+                    "build-after": [],
+                    "actions": {"pre-build-checks": {"check-groups": {'source': {
                             "requires": {"capabilities": []},
                             "no-op": "Repository validation covers this fixture.",
-                        },
-                        "install": operation,
-                    },
+                        }}}, "install": operation},
                 }
             }
         },

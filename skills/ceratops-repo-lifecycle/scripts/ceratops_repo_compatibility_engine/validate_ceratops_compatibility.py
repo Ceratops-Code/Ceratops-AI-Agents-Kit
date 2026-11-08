@@ -73,10 +73,7 @@ def _repository_entrypoint(root: pathlib.Path, operation: Mapping[str, Any]) -> 
 def _operation_requirements(operation: Mapping[str, Any]) -> set[str]:
     """Return required runtime capabilities across supported SDLC versions."""
 
-    requirements = operation.get("requires")
-    if isinstance(requirements, Mapping):
-        return set(requirements.get("capabilities", []))
-    return set(operation.get("prerequisites", []))
+    return set(operation.get("requires", {}).get("capabilities", []))
 
 
 def _validation_coverage_errors(
@@ -84,10 +81,9 @@ def _validation_coverage_errors(
     sdlc: Mapping[str, Any],
     validation_contract: Mapping[str, Any],
 ) -> list[str]:
-    """Require detected repository types to have one declared non-test validator."""
+    """Require detected repository types to declare checks with the required capabilities."""
 
     entries = operation_entries(sdlc)
-    version = int(sdlc["version"])
     errors: list[str] = []
     owned_paths = repository_owned_paths(root)
     for requirement in validation_contract["coverage_requirements"]:
@@ -103,7 +99,7 @@ def _validation_coverage_errors(
         required_capabilities = set(requirement["required_capabilities"])
         required_prerequisites = set(requirement["required_prerequisites"])
         matched = any(
-            operation_category(location, version=version)
+            operation_category(location)
             == requirement["operation_category"]
             and required_capabilities.issubset(
                 operation.get("validation-capabilities", [])
@@ -420,15 +416,14 @@ def validate_ceratops_compatibility(
     sdlc_errors: list[str] = []
     entries: dict[str, Mapping[str, Any]] = {}
     if not _regular_file_error(root, paths["sdlc"]):
-        sdlc, sdlc_errors = read_contract(root / paths["sdlc"])
+        sdlc, sdlc_errors = read_contract(root / paths["sdlc"], repo_root=root)
         if sdlc:
             entries = operation_entries(sdlc)
-    sdlc_version = int(sdlc["version"]) if sdlc else int(contract["sdlc_version"])
     test_runner_relative = surfaces["python_test_runner"]["path"]
     test_runner_selected = any(
         test_runner_relative in step.get("run", [])
         for name, operation in entries.items()
-        if operation_category(name, version=sdlc_version) == "tests"
+        if operation_category(name) in {"pre-build-checks", "post-build-checks"}
         for step in operation.get("steps", [])
     )
     for name, surface in surfaces.items():
@@ -453,7 +448,7 @@ def validate_ceratops_compatibility(
         errors.extend(sdlc_errors)
         if sdlc:
             # The shared loader has already accepted a schema-valid supported
-            # v4 or v5 contract; compatibility requirements are version-neutral.
+            # SDLC declaration; compatibility requirements are version-neutral.
             errors.extend(_validation_coverage_errors(root, sdlc, validation_contract))
             expected = load_compatibility_contract()["runtime"]["project"]
             # uv supports project discovery from the script path and explicit
@@ -465,7 +460,7 @@ def validate_ceratops_compatibility(
             commands = [
                 step["run"]
                 for name, entry in entries.items()
-                if operation_category(name, version=sdlc_version) == "validate"
+                if operation_category(name) == "pre-build-checks"
                 for step in entry.get("steps", [])
                 if "run" in step
             ]
@@ -474,11 +469,14 @@ def validate_ceratops_compatibility(
             tests = [
                 entry
                 for name, entry in entries.items()
-                if operation_category(name, version=sdlc_version) == "tests"
+                if operation_category(name) in {"pre-build-checks", "post-build-checks"}
             ]
             if not tests:
                 errors.append("SDLC must declare repository tests or an explicit no-op")
-            if python_tests and not any(entry.get("steps") for entry in tests):
+            if python_tests and not any(
+                "run" in step and step["run"] not in validator_commands
+                for entry in tests for step in entry.get("steps", [])
+            ):
                 errors.append("detected Python tests require an executable SDLC tests operation")
     errors.extend(_environment_errors(root, contract, has_python_skills=bool(python_skills)))
     errors.extend(_skill_runtime_errors(root, contract, has_python_skills=bool(python_skills)))

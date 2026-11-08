@@ -32,7 +32,7 @@ from sdlc_results import StepResultError
 BUILD_BUNDLE_RETENTION = 3
 VERSIONED_ARTIFACT_RETENTION = 3
 BUILD_KEY_RE = re.compile(r"^[a-f0-9]{64}$")
-RELEASE_UNIT_RE = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
+RELEASE_BUNDLE_RE = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
 LOGICAL_ID_RE = re.compile(
     r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$"
 )
@@ -130,7 +130,7 @@ class ArtifactVersionAllocation:
     repository: str
     worktree_registration: str
     branch: str
-    release_unit: str
+    release_bundle: str
     version: str
     version_class: str
     attempt_id: str
@@ -154,7 +154,7 @@ class ArtifactVersionAllocation:
 
     def receipt_path(self, target: str) -> str:
         _require_transaction_target(self, target)
-        base = f".build/{self.release_unit}/{self.version}"
+        base = f".build/{self.release_bundle}/{self.version}"
         return (
             f"{base}/build_receipt.json"
             if len(self.required_targets) == 1
@@ -357,7 +357,7 @@ def build_result_artifact_paths(
         records = receipt["artifacts"]
     elif schema == sdlc_results.COMMITTED_BUILD_RECEIPT_SCHEMA:
         identity = receipt["identity"]
-        relative = f"{identity['releaseUnit']}/{identity['version']}"
+        relative = f"{identity['releaseBundle']}/{identity['version']}"
         if len(receipt["requiredTargets"]) > 1:
             relative += f"/{identity['target']}"
         bundle = _artifact_store_path(repo_root) / sdlc_results._bundle_relative_path(relative)
@@ -423,7 +423,7 @@ def read_completed_build(
             raise OperationError(
                 "Completed build directory does not match its identity."
             )
-        receipt = sdlc_results.verify_release_unit_build(
+        receipt = sdlc_results.verify_release_bundle_build(
             selected_receipt, bundle, expected=identity
         )
         _completed_build_gate(receipt)
@@ -505,7 +505,7 @@ def _build_group(identity: Mapping[str, str]) -> dict[str, str]:
 
     return {
         name: identity[name]
-        for name in ("repository", "releaseUnit", "channel", "target")
+        for name in ("repository", "releaseBundle", "channel", "target")
     }
 
 
@@ -736,7 +736,7 @@ def publish_completed_build(
         stream.write(canonical_json(receipt))
         stream.flush()
         os.fsync(stream.fileno())
-    sdlc_results.verify_release_unit_build(
+    sdlc_results.verify_release_bundle_build(
         receipt_path, storage.bundle, expected=storage.identity
     )
     _build_inventory(storage.bundle, receipt)
@@ -785,7 +785,7 @@ def discard_build_storage(storage: BuildStorage) -> None:
 @dataclass(frozen=True)
 class _CompletedArtifactOutput:
     repository: str
-    release_unit: str
+    release_bundle: str
     version: str
     target: str
     version_class: str
@@ -1002,7 +1002,7 @@ def _build_request_record(allocation: ArtifactVersionAllocation) -> dict[str, An
         "worktree": str(allocation.repo_root),
         "worktreeRegistration": allocation.worktree_registration,
         "branch": allocation.branch,
-        "releaseUnit": allocation.release_unit,
+        "releaseBundle": allocation.release_bundle,
         "version": allocation.version,
         "attemptId": allocation.attempt_id,
         "allocationCommit": allocation.allocation_commit,
@@ -1073,7 +1073,7 @@ def _read_reusable_allocation(
     # Another worktree or another declared input set owns an independent build.
     expected = _build_request_record(allocation)
     for key in ("repository", "worktree", "worktreeRegistration", "branch",
-                "releaseUnit", "version", "requiredTargets", "declaredInputPaths"):
+                "releaseBundle", "version", "requiredTargets", "declaredInputPaths"):
         if record.get(key) != expected[key]:
             return None
     if explicit_attempt is not None and record.get("attemptId") != explicit_attempt:
@@ -1090,7 +1090,7 @@ def _read_reusable_allocation(
             head = allocation.allocation_commit
             parents = _git_text(allocation.repo_root, ["rev-list", "--parents", "-n", "1", head], label="prepared source parents").split()
             message = _git_text(allocation.repo_root, ["show", "-s", "--format=%B", head], label="prepared source identity", single_line=False)
-            trailer = f"Ceratops-Source-Build: {allocation.release_unit}/{allocation.version} {attempt}"
+            trailer = f"Ceratops-Source-Build: {allocation.release_bundle}/{allocation.version} {attempt}"
             changed = _git_text(allocation.repo_root, ["diff-tree", "--no-commit-id", "--name-only", "-r", allocated_at, head], label="prepared source paths", single_line=False).splitlines()
             if (parents != [head, allocated_at] or trailer not in message.splitlines()
                     or not set(changed).issubset(allocation.declared_input_paths)
@@ -1107,7 +1107,7 @@ def _read_reusable_allocation(
 
 
 def allocate_artifact_version(
-    repo_root: pathlib.Path, *, repository: str, release_unit: str, version: str,
+    repo_root: pathlib.Path, *, repository: str, release_bundle: str, version: str,
     required_targets: Sequence[str], attempt_id: str | None = None,
     declared_input_paths: Sequence[str] = (),
 ) -> ArtifactVersionAllocation:
@@ -1119,7 +1119,7 @@ def allocate_artifact_version(
     """
     root = _validated_worktree(pathlib.Path(repo_root))
     repository = _validated_repository(repository)
-    unit = _require_identifier(release_unit, label="release unit", pattern=RELEASE_UNIT_RE)
+    unit = _require_identifier(release_bundle, label="release bundle", pattern=RELEASE_BUNDLE_RE)
     version, classification = _version_classification(version)
     targets = _validated_targets(required_targets)
     paths = _input_paths(root, declared_input_paths)
@@ -1135,7 +1135,7 @@ def allocate_artifact_version(
         directory = store / unit / version
         allocation = ArtifactVersionAllocation(
             repo_root=root, repository=repository, worktree_registration=registration,
-            branch=branch, release_unit=unit, version=version, version_class=classification,
+            branch=branch, release_bundle=unit, version=version, version_class=classification,
             attempt_id=attempt_id or "", allocation_commit=head, required_targets=targets,
             declared_input_paths=paths, store=store, request_path=directory / "build_request.json",
             version_root=directory, diagnostic_root=directory / ".diagnostics",
@@ -1198,7 +1198,7 @@ def bind_artifact_inputs(
 
 
 def _artifact_tag_exists(
-    repo_root: pathlib.Path, release_unit: str, version: str
+    repo_root: pathlib.Path, release_bundle: str, version: str
 ) -> bool:
     result = subprocess.run(
         [
@@ -1208,7 +1208,7 @@ def _artifact_tag_exists(
             "show-ref",
             "--verify",
             "--quiet",
-            f"refs/tags/{release_unit}/{version}",
+            f"refs/tags/{release_bundle}/{version}",
         ],
         check=False,
     )
@@ -1232,7 +1232,7 @@ def _completed_artifact_record(
         raise OperationError("Completed artifact receipt is invalid.") from exc
     identity = receipt["identity"]
     if (
-        identity["releaseUnit"] != unit
+        identity["releaseBundle"] != unit
         or identity["version"] != version
         or (target is not None and identity["target"] != target)
     ):
@@ -1240,7 +1240,7 @@ def _completed_artifact_record(
     _version, version_class = _version_classification(version)
     return _CompletedArtifactOutput(
         repository=_validated_repository(identity["repository"]),
-        release_unit=unit,
+        release_bundle=unit,
         version=version,
         target=identity["target"],
         version_class=version_class,
@@ -1260,9 +1260,9 @@ def _completed_artifact_outputs(
         if unit_path.name.startswith(".") or unit_path.name == "beta-stable":
             continue
         if not unit_path.is_dir() or unit_path.is_symlink():
-            raise OperationError("Artifact store contains an invalid release unit.")
+            raise OperationError("Artifact store contains an invalid release bundle.")
         unit = _require_identifier(
-            unit_path.name, label="stored release unit", pattern=RELEASE_UNIT_RE
+            unit_path.name, label="stored release bundle", pattern=RELEASE_BUNDLE_RE
         )
         for version_path in unit_path.iterdir():
             if version_path.name.startswith("."):
@@ -1363,7 +1363,7 @@ def _prune_completed_artifacts(
             for output in _completed_artifact_outputs(repo_root, store):
                 group = (
                     output.repository,
-                    output.release_unit,
+                    output.release_bundle,
                     output.target,
                     output.version_class,
                 )

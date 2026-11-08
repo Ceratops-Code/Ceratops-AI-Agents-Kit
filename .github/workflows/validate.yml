@@ -15,7 +15,7 @@ jobs:
   validate-repository:
     name: validate-repository
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -42,6 +42,7 @@ jobs:
           CERATOPS_TASK_TEMP_ROOT: ${{ runner.temp }}
         with:
           repo-root: .
+          operations: repository.actions.pre-build-checks
           evidence-file: ${{ runner.temp }}/sdlc-validation.json
 
       - name: Upload validation evidence

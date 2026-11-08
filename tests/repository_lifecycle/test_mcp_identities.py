@@ -13,10 +13,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests.repository_lifecycle.test_sdlc_handoffs import (
+from tests.repository_lifecycle.test_sdlc_actions import (
     ROOT,
     _repository,
-    _v4_fixture,
+    _typed_contract,
     contracts,
     runner,
     skill_actions,
@@ -27,20 +27,19 @@ def _package_mcp_case(tmp_path, monkeypatch, problem=None):
     """Match the real failure: prerequisites exist only on the SDLC deliverable."""
     repo = tmp_path / "repository with spaces"
     repo.mkdir()
-    fixture = _v4_fixture()
+    fixture = _typed_contract(repo)
     server_name = "insurance-claims-mcp-server"
     source = repo / "mcp-servers" / server_name
     source.mkdir(parents=True)
     server = fixture["deliverables"]["mcp-servers"][server_name]
-    server["source"] = str(source.relative_to(repo)).replace("\\", "/")
-    server["manifest"] = server["source"] + "/mcp-server.json"
+    server["root-dir"] = str(source.relative_to(repo)).replace("\\", "/")
+    server["manifest"] = server["root-dir"] + "/mcp-server.json"
     mcp_project = source / "pyproject.toml"
     mcp_project.write_text(
         '[project]\nname = "insurance-claims-mcp-server"\nversion = "1.0.1"\n'
         'dependencies = ["claims-tool==1.0.0"]\n', encoding="utf-8",
     )
     package = repo / "packages/claims"
-    package.mkdir(parents=True)
     project = package / "pyproject.toml"
     project.write_text('[project]\nname = "claims-tool"\nversion = "1.0.0"\n', encoding="utf-8")
     lock = package / "uv.lock"
@@ -75,7 +74,6 @@ def _package_mcp_case(tmp_path, monkeypatch, problem=None):
         mcp_project.write_text(mcp_project.read_text().replace(
             '"claims-tool==1.0.0"', '"claims-tool==1.0.0", "core-tool==2.0.0"'), encoding="utf-8")
         core = repo / "packages/core"
-        core.mkdir()
         (core / "pyproject.toml").write_text('[project]\nname = "core-tool"\nversion = "2.0.0"\n', encoding="utf-8")
         (core / "uv.lock").write_text("version = 1\n", encoding="utf-8")
         (repo / "dist/core").mkdir()
@@ -90,7 +88,7 @@ def _package_mcp_case(tmp_path, monkeypatch, problem=None):
         except OSError as exc:
             pytest.skip(f"This host cannot create the linked-path fixture: {exc}")
     elif problem == "source-only":
-        server["prerequisites"] = []
+        server["build-after"] = []
     (repo / "sdlc").mkdir()
     (repo / "sdlc/sdlc.yml").write_text(json.dumps(fixture), encoding="utf-8")
     binding_path = pathlib.Path("skills/ceratops-mcp-server-lifecycle/references/action-executors.json")
@@ -111,8 +109,9 @@ def _package_mcp_case(tmp_path, monkeypatch, problem=None):
 
 
 @pytest.mark.parametrize("interruption", [None, "before", "after"])
-def test_package_prerequisites_reach_installer_on_fresh_repeated_sdlc_calls(tmp_path, monkeypatch, interruption):
-    case = _package_mcp_case(tmp_path, monkeypatch)
+@pytest.mark.parametrize("extra_wheel", [False, True])
+def test_package_prerequisites_reach_installer_on_fresh_repeated_sdlc_calls(tmp_path, monkeypatch, interruption, extra_wheel):
+    case = _package_mcp_case(tmp_path, monkeypatch, "multiple-wheels" if extra_wheel else None)
     original_wheel = case.wheel.read_bytes()
     effects = []
     calls = []
@@ -142,7 +141,8 @@ def test_package_prerequisites_reach_installer_on_fresh_repeated_sdlc_calls(tmp_
     monkeypatch.setattr(skill_actions, "run_progress_command", lambda *_a, **_k: pytest.fail("unexpected build or test"))
     for attempt in range(3):
         # Each call prepares current authoritative inputs without saved execution state.
-        prepared = runner.prepare_operations(case.repo, [runner.OperationRequest(case.operation)])[0]
+        prepared = runner.prepare_operations(case.repo, [runner.OperationRequest(case.operation)],
+            artifacts={"deliverables.packages.claims": [case.wheel.relative_to(case.repo).as_posix()]})[0]
         assert prepared.steps[0].handoff["inputs"] == {"mcp-server": case.name}
         if attempt == 0 and interruption:
             with pytest.raises(KeyboardInterrupt):
@@ -154,7 +154,7 @@ def test_package_prerequisites_reach_installer_on_fresh_repeated_sdlc_calls(tmp_
     assert not (case.source / "pylock.toml").exists()
 
 
-@pytest.mark.parametrize("problem", ["missing-wheel", "stale-wheel", "multiple-wheels", "missing-lock",
+@pytest.mark.parametrize("problem", ["missing-wheel", "stale-wheel", "missing-lock",
                                      "ambiguous-lock", "pin-mismatch", "wrong-project", "wrong-server",
                                      "missing-project", "no-direct-pin", "unpinned-package", "multiple-direct",
                                      "linked-wheel", "linked-project"])
@@ -162,7 +162,8 @@ def test_bad_package_prerequisites_stop_before_installer(tmp_path, monkeypatch, 
     case = _package_mcp_case(tmp_path, monkeypatch, problem)
     monkeypatch.setattr(skill_actions, "_call_action", lambda *_a: pytest.fail("installer must not start"))
     for _ in range(2):
-        prepared = runner.prepare_operations(case.repo, [runner.OperationRequest(case.operation)])[0]
+        prepared = runner.prepare_operations(case.repo, [runner.OperationRequest(case.operation)],
+            artifacts={"deliverables.packages.claims": [case.wheel.relative_to(case.repo).as_posix()]})[0]
         result = runner.execute_prepared_operation(prepared)
         assert result["status"] == "operation_failed", result
         assert "Cannot prepare package-backed MCP installation" in result["message"]
@@ -187,11 +188,11 @@ def test_source_only_mcp_keeps_existing_install_arguments(tmp_path, monkeypatch)
 @pytest.mark.parametrize("version", [4, 5])
 @pytest.mark.parametrize("name", ["source_search_mcp", "ceratops-mcp-server-manager"])
 def test_mcp_identity_survives_contract_preparation(tmp_path, version, name):
-    fixture = _v4_fixture()
+    fixture = _typed_contract(tmp_path)
     fixture["version"] = version
     server = fixture["deliverables"]["mcp-servers"].pop("insurance-claims-mcp-server")
     fixture["deliverables"]["mcp-servers"][name] = server
-    server["prerequisites"] = []
+    server["build-after"] = []
     server["actions"]["install"]["steps"][0]["handoff"]["inputs"]["mcp-server"] = name
     assert contracts.validation_errors(fixture) == []
     (tmp_path / "sdlc").mkdir()
@@ -213,7 +214,7 @@ def test_malformed_mcp_names_stop_before_execution(tmp_path, monkeypatch, name):
     result = skill_actions.execute_handoff("ceratops-mcp-server-lifecycle/install", tmp_path,
                                     inputs={"mcp-server": name})
     assert result["status"] == "handoff_required" and calls == []
-    fixture = _v4_fixture()
+    fixture = _typed_contract()
     server = fixture["deliverables"]["mcp-servers"].pop("insurance-claims-mcp-server")
     fixture["deliverables"]["mcp-servers"][name] = server
     assert contracts.validation_errors(fixture)

@@ -24,7 +24,7 @@ from repository_operation import (
     FAILED_STATUSES,
     OperationError,
     OperationRequest,
-    execute_prepared_operation,
+    execute_release_builds,
     execute_prepared_operations,
     operation_category,
     prepare_operations,
@@ -184,18 +184,15 @@ def _prepare_operation_batch(
     operations: list[str],
     validation_operations: list[str] | None = None,
 ) -> None:
-    """Validate a complete ordered selection before lifecycle side effects."""
+    """Prepare requested work inside Ship's already-held source lock."""
 
-    command = _operation_command(
-        repo_root=repo_root,
-        contract=contract,
-        operations=operations,
+    names = list(dict.fromkeys(operations))
+    result = execute_release_builds(
+        repo_root, [OperationRequest(name) for name in names], contract,
+        qualification_level="beta", validation_operations=validation_operations,
         prepare_only=True,
     )
-    for operation in validation_operations or []:
-        command.extend(("--validation-operation", operation))
-    code, result = run_command_for_json(command, cwd=repo_root)
-    if code:
+    if result["status"] in FAILED_STATUSES:
         raise RepositoryShipError(
             str(result.get("message", "Operation preparation failed.")),
             {
@@ -204,7 +201,7 @@ def _prepare_operation_batch(
                 "remote_mutation": False,
             },
         )
-    if result.get("status") != "prepared" or result.get("operations") != operations:
+    if result.get("status") != "prepared" or result.get("operations") != names:
         raise RepositoryShipError("Operation preparation returned an invalid result.")
 
 
@@ -533,33 +530,22 @@ def _checkpointed_operation_batch(
 
     try:
         pending = operations[first_pending:]
-        prepared = prepare_operations(
-            repo_root, [OperationRequest(operation) for operation in pending], contract,
-        )
-        checks = prepare_operations(
-            repo_root,
-            [OperationRequest(operation) for operation in resolve_validations(
-                repo_root, operations, validation_operations, contract,
-            )],
-            contract,
-        )
         require_clean_commit(repo_root, synchronized_commit)
-        checked = execute_prepared_operations(
-            checks, diagnostic_output=diagnostic_output,
-            diagnostic_owner=diagnostic_owner, successful_results=completed_results,
-        )
-        if checked["status"] in FAILED_STATUSES:
-            return 1, {
-                **checked, "completed_operations": operations[:first_pending],
-                "pending_operations": pending,
-            }, checkpoints
-        require_clean_commit(repo_root, synchronized_commit)
-        for offset, prepared_operation in enumerate(prepared):
-            result = execute_prepared_operation(
-                prepared_operation, diagnostic_output=diagnostic_output,
-                diagnostic_owner=diagnostic_owner,
-                successful_results=(checked["results"], completed_results),
+        for offset, operation in enumerate(pending):
+            batch = execute_release_builds(
+                repo_root, [OperationRequest(operation)], contract,
+                expected_commit=synchronized_commit, qualification_level="beta",
+                validation_operations=validation_operations,
+                diagnostic_output=diagnostic_output, diagnostic_owner=diagnostic_owner,
+                successful_results=completed_results,
             )
+            if batch["status"] in FAILED_STATUSES:
+                return 1, {**batch, "completed_operations": operations[:first_pending + offset],
+                           "pending_operations": operations[first_pending + offset:]}, checkpoints
+            result = next(item for item in batch["results"] if item["operation"] == operation)
+            result = {**result, "build_results": [item for item in batch["results"]
+                                                if item["operation"] != operation]
+                      + batch.get("build_results", [])}
             index = first_pending + offset
             if result["status"] in FAILED_STATUSES:
                 return 1, {
@@ -798,7 +784,7 @@ def _resume_ship_command(
     for flag, operations in (
         (
             "--validation-operation",
-            _operation_ids(args.validation_operation, "validate"),
+            _operation_ids(args.validation_operation, "pre-build-checks"),
         ),
         (
             "--publish-operation",
@@ -903,15 +889,16 @@ def _validate_phase(
 ) -> dict[str, Any]:
     """Recheck the current committed checkout at each safe lifecycle boundary.
 
-    Validation runs before tests; matching test outcomes can be reused. The
+    Each pre-build group runs its declared command; matching outcomes can be reused. The
     calling agent repairs ordinary failures and restarts the lifecycle.
     """
 
     command = _operation_command(
         repo_root=repo_root, contract=args.sdlc_contract,
-        operations=operations,
+        operations=[name for name in resolve_validations(
+            repo_root, operations, args.validation_operation, args.sdlc_contract
+        ) if operation_category(name) == "pre-build-checks"],
     )
-    command.extend(("--validate", "--tests"))
     if diagnostic_output := getattr(args, "diagnostic_output", None):
         owner_root, action = getattr(args, "diagnostic_owner", None) or (args.repo_root, "ship")
         command.extend((
@@ -921,8 +908,6 @@ def _validate_phase(
     commit = repository_commit(repo_root)
     if commit:
         command.extend(("--commit", commit))
-    for operation in args.validation_operation or []:
-        command.extend(("--validation-operation", operation))
     code, result = run_command_for_json(command, cwd=repo_root)
     if code:
         raise RepositoryShipError(
@@ -1105,7 +1090,7 @@ def _ship_repository(args: ShipOptions) -> dict[str, object]:
         raise RepositoryShipError(
             "refs/heads/release blocks the required release/local branch namespace."
         )
-    _operation_ids(args.validation_operation, "validate")
+    _operation_ids(args.validation_operation, "pre-build-checks")
     release_operations = _operation_ids(args.publish_operation, "publish")
     deploy_operations = _operation_ids(args.deploy_operation, "deploy-local")
     _prepare_operation_batch(

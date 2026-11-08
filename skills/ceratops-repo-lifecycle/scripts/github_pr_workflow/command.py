@@ -981,7 +981,7 @@ def _retire_handoff_reports(args: Any) -> None:
     from check_deployment_receipts import check_deployment_receipt
     from sdlc_results import StepResultError, _unique_result_object
 
-    if len(args.operation) != 1 or args.validate or args.tests or args.prepare_only or args.ci:
+    if len(args.operation) != 1 or args.validation_operation or args.prepare_only or args.ci:
         raise runner.OperationError("Report retirement requires one operation and cannot execute other work.")
     source = pathlib.Path(args.repo_root).resolve()
     primary = operation_report_root(source)

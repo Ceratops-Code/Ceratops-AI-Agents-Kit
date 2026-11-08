@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 
-from tests.repository_lifecycle.test_sdlc_handoffs import _repository, _v4_fixture
+from tests.repository_lifecycle.test_sdlc_actions import _repository, _typed_contract
 from tests.support.repositories import ROOT
 
 runner = importlib.import_module("repository_operation")
@@ -600,9 +600,9 @@ if __name__ == '__main__':
         "scripts/runtime/install-managed-skills.py",
     ):
         (installed / script).write_text(probe)
-    fixture = _v4_fixture()
+    fixture = _typed_contract(repo)
     skill = fixture["deliverables"]["skills"]["claims-catalog-invoice"]
-    for action in skill["actions"].values():
+    for action in [*skill["actions"]["pre-build-checks"]["check-groups"].values(), skill["actions"]["install"]]:
         action["steps"][-1]["handoff"]["inputs"]["prerequisite-packages"] = ["claims"]
     (repo / "sdlc").mkdir()
     (repo / "sdlc/sdlc.yml").write_text(json.dumps(fixture))
@@ -612,22 +612,22 @@ if __name__ == '__main__':
     return repo
 
 @pytest.mark.parametrize("mode", ["skill", "ci", "return"])
-@pytest.mark.parametrize("action", ["validate", "install"])
-def test_v4_registered_skill_handoff_preserves_selection_prerequisites_and_receipt(
+@pytest.mark.parametrize("action", ["pre-build-checks.check-groups.source", "install"])
+def test_typed_registered_skill_handoff_preserves_selection_prerequisites_and_receipt(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
     mode: str,
     action: str,
 ) -> None:
     repo = _registered_skill_fixture(tmp_path, monkeypatch)
-    if action == "validate":
+    if action == "pre-build-checks.check-groups.source":
         _pin_python(tmp_path / "codex/skills/ceratops-skill-lifecycle")
     location = f"deliverables.skills.claims-catalog-invoice.actions.{action}"
     prepared = runner.prepare_operations(
         repo, [runner.OperationRequest(location)], context=mode
     )[0]
     result = runner.execute_prepared_operation(prepared)
-    assert list(result["prerequisites"]["packages"]) == ["core", "claims"]
+    assert list(result["prerequisites"]["deliverables"]) == ["deliverables.packages.core", "deliverables.packages.claims"]
     if mode != "skill":
         assert result["status"] == (
             "deferred_handoff" if mode == "ci" else "handoff_required"
@@ -639,7 +639,7 @@ def test_v4_registered_skill_handoff_preserves_selection_prerequisites_and_recei
         json.loads(line) for line in (repo / "calls.jsonl").read_text().splitlines()
     ]
     expected: list[dict[str, str | None]] = [
-        {"mode": "skill" if action == "validate" else None,
+        {"mode": "skill" if action == "pre-build-checks.check-groups.source" else None,
          "skill": "claims-catalog-invoice"}
     ]
     assert calls == expected
@@ -685,7 +685,7 @@ def test_v4_registered_skill_handoff_preserves_selection_prerequisites_and_recei
         "head_changes",
     ],
 )
-def test_v4_skill_handoff_rejects_unsafe_or_unhandled_work_before_deployment(
+def test_typed_skill_handoff_rejects_unsafe_or_unhandled_work_before_deployment(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
     problem: str,
@@ -735,7 +735,7 @@ def test_ci_failure_evidence_repeats_after_interrupted_publish_or_deletion(tmp_p
     evidence.write_bytes(previous)
     peer = evidence.parent / "accepted-result.json"
     peer.write_bytes(b"accepted work")
-    result = {"status": "operation_failed" if failed else "completed", "operation": "repository.actions.test"}
+    result = {"status": "operation_failed" if failed else "completed", "operation": "repository.actions.pre-build-checks.check-groups.tests"}
     current = (json.dumps(result, indent=2) + "\n").encode()
     effect = pathlib.Path.replace if failed else pathlib.Path.unlink
     target = evidence.with_name("." + evidence.name + ".operation-report.tmp") if failed else evidence
@@ -931,6 +931,7 @@ def test_mcp_handoff_selects_shared_project_lock(tmp_path, monkeypatch, missing_
     )
     wheel = output / "sample_package-1.0.0-py3-none-any.whl"
     wheel.write_bytes(b"Existing accepted artifact; dispatch does not inspect its contents.")
+    (output / "sample_package-0.9.0-py3-none-any.whl").write_bytes(b"Unrelated old output")
     lock = project / "uv.lock"
     if not missing_lock:
         lock.write_text("version = 1\n")
@@ -948,7 +949,8 @@ def test_mcp_handoff_selects_shared_project_lock(tmp_path, monkeypatch, missing_
         return {"status": "completed"}
 
     monkeypatch.setattr(skill_actions, "_call_action", install)
-    context = {"source": "mcp", "packages": {"sample-package": {
+    context = {"source": "mcp", "artifacts": {"deliverables.packages.sample-package": [str(wheel)]},
+               "packages": {"sample-package": {
         "project": "package/pyproject.toml", "artifact": {
             "type": "python-wheel", "distribution": "sample-package",
             "output-directory": ".build", "filename-pattern": "*.whl",
@@ -970,3 +972,12 @@ def test_mcp_handoff_selects_shared_project_lock(tmp_path, monkeypatch, missing_
             assert root == installed
             assert argv[argv.index("--package-lock") + 1] == str(lock)
             assert argv[argv.index("--package-wheel") + 1] == str(wheel)
+        # A matching wheel on disk cannot replace a missing accepted-build input.
+        context["artifacts"] = {}
+        missing = skill_actions.execute_handoff(
+            "ceratops-mcp-server-lifecycle/install", repo,
+            inputs={"mcp-server": "sample-server", "prerequisite-packages": ["sample-package"]},
+            mcp_package_context=context,
+        )
+        assert missing["status"] == "operation_failed" and "accepted" in missing["message"]
+        assert len(calls) == 2

@@ -8,54 +8,46 @@ missing contract or contract section is allowed.
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import pathlib
 import re
+import subprocess
 from collections.abc import Mapping
 from copy import deepcopy
+from functools import lru_cache
 from typing import Any, cast
 
 import jsonschema
 import yaml
 
 SKILL_ROOT = pathlib.Path(__file__).resolve().parents[2]
-SCHEMA = SKILL_ROOT / "references" / "schemas" / "sdlc.v4.schema.json"
-# Compatibility application stays on v4 until release-unit lifecycle integration.
-# V5 is opt-in; loading a contract never migrates it or executes its declarations.
-VERSION_SCHEMAS = {
-    4: SCHEMA,
-    5: SCHEMA.with_name("sdlc.v5.schema.json"),
-}
+SCHEMA_DIRECTORY = SKILL_ROOT / "references" / "schemas"
 NAME = r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*"
 # MCP project names are manager identities, not rewritten SDLC display names.
 MCP_NAME = r"[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*"
-V4_OPERATION_RE = re.compile(
-    rf"^(?:repository\.actions\.(?P<repository>bootstrap|validate|test|test-selection)|"
+CHECK_ACTIONS = frozenset({"pre-build-checks", "post-build-checks"})
+OPERATION_RE = re.compile(
+    rf"^(?:repository\.actions\.(?P<repository>bootstrap|pre-build-checks|post-build-checks|test-selection)|"
     rf"deliverables\.(?P<kind>packages|apps|mcp-servers|skills|hooks)\."
-    rf"(?P<name>{MCP_NAME})\.actions\.(?P<action>validate|test|build|install|publish|verify-publish))$"
+    rf"(?P<name>{MCP_NAME})\.actions\.(?P<action>pre-build-checks|post-build-checks|build|install|publish|verify-publish))"
+    rf"(?:\.check-groups\.(?P<group>{NAME}))?$"
 )
-V4_ACTIONS_BY_KIND = {
-    "packages": frozenset({"validate", "test", "build", "publish", "verify-publish"}),
-    "apps": frozenset({"validate", "test", "install", "publish", "verify-publish"}),
-    "mcp-servers": frozenset(
-        {"validate", "test", "install", "publish", "verify-publish"}
-    ),
-    "skills": frozenset({"validate", "test", "install"}),
-    "hooks": frozenset({"validate", "test", "install"}),
+ACTIONS_BY_KIND = {
+    "packages": CHECK_ACTIONS | {"build", "publish", "verify-publish"},
+    "apps": CHECK_ACTIONS | {"build", "install", "publish", "verify-publish"},
+    "mcp-servers": CHECK_ACTIONS | {"build", "install", "publish", "verify-publish"},
+    "skills": CHECK_ACTIONS | {"build", "install"},
+    "hooks": CHECK_ACTIONS | {"build", "install"},
 }
-V4_ACTION_CATEGORIES = {
-    "bootstrap": "bootstrap",
-    "test-selection": "test-selection",
-    "validate": "validate",
-    "test": "tests",
-    "build": "build",
-    "install": "deploy-local",
-    "publish": "publish",
-    "verify-publish": "verify-publish",
+ACTION_CATEGORIES = {
+    "bootstrap": "bootstrap", "test-selection": "test-selection",
+    "pre-build-checks": "pre-build-checks", "post-build-checks": "post-build-checks",
+    "build": "build", "install": "deploy-local", "publish": "publish", "verify-publish": "verify-publish",
 }
-V4_RESULT_SCHEMAS = {
-    "validate": ("ceratops-repository-stage-result.v1",),
-    "test": ("ceratops-repository-stage-result.v1",),
+RESULT_SCHEMAS = {
+    "pre-build-checks": ("ceratops-repository-stage-result.v1",),
+    "post-build-checks": ("ceratops-repository-stage-result.v1",),
     "build": ("ceratops-build-result.v1", "ceratops-build-result.v2", "ceratops-build-result.v3"),
     "install": ("ceratops-deployment-result.v1",),
 }
@@ -63,6 +55,36 @@ V4_RESULT_SCHEMAS = {
 
 class SdlcContractError(RuntimeError):
     """Raised when an SDLC contract or its schema is invalid."""
+
+
+@lru_cache(maxsize=1)
+def sdlc_schema_paths() -> dict[int, pathlib.Path]:
+    """Read supported SDLC versions from this installed skill's schema files.
+
+    Schema data owns format differences; all formats use the same readers and
+    semantic checks. The immutable installed payload permits one cached catalog.
+    No checkout, remote download, or version-specific Python implementation is used.
+    """
+
+    paths: dict[int, pathlib.Path] = {}
+    try:
+        for path in sorted(SCHEMA_DIRECTORY.glob("sdlc.*.schema.json")):
+            schema = json.loads(path.read_text(encoding="utf-8"))
+            version = schema["properties"]["version"]["const"]
+            if type(version) is not int or version < 1 or version in paths:
+                raise SdlcContractError(f"Invalid or duplicate SDLC schema version in {path.name}")
+            paths[version] = path
+    except (OSError, UnicodeError, ValueError, KeyError, TypeError) as exc:
+        raise SdlcContractError(f"Cannot read installed SDLC schemas: {exc}") from exc
+    if not paths:
+        raise SdlcContractError("The installed skill contains no SDLC schemas.")
+    return paths
+
+
+def latest_sdlc_version() -> int:
+    """Return the newest SDLC declaration supported by the installed schemas."""
+
+    return max(sdlc_schema_paths())
 
 
 class _ContractLoader(yaml.SafeLoader):
@@ -87,32 +109,45 @@ class _ContractLoader(yaml.SafeLoader):
 
 
 def operation_entries(contract: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
-    """Return the v4/v5 action hierarchy as an executable operation index."""
+    """Index executable groups and ordinary actions in lifecycle order.
 
+    Before/after containers are not commands. Each returned check location names
+    exactly one group's command and result contract. Builders remain one command
+    even when they report several internal checks.
+    """
     entries: dict[str, Mapping[str, Any]] = {}
-    for action, operation in contract.get("repository", {}).get("actions", {}).items():
-        entries[f"repository.actions.{action}"] = operation
+    owners = {"repository": contract.get("repository", {})}
     for kind, deliverables in contract.get("deliverables", {}).items():
-        for name, deliverable in deliverables.items():
-            for action, operation in deliverable.get("actions", {}).items():
-                entries[f"deliverables.{kind}.{name}.actions.{action}"] = operation
+        owners.update({f"deliverables.{kind}.{name}": value for name, value in deliverables.items()})
+    order = {name: index for index, name in enumerate(
+        ("bootstrap", "test-selection", "pre-build-checks", "build", "post-build-checks", "install", "publish", "verify-publish"))}
+    for owner, record in owners.items():
+        for action, operation in sorted(record.get("actions", {}).items(), key=lambda pair: order.get(pair[0], 99)):
+            location = f"{owner}.actions.{action}"
+            if action in CHECK_ACTIONS:
+                entries.update({f"{location}.check-groups.{name}": group
+                                for name, group in operation["check-groups"].items()})
+            else:
+                entries[location] = operation
     return entries
 
 
-def operation_category(location: str, *, version: int = 4) -> str:
-    """Classify a native versioned location without guessing from operation names."""
+def operation_category(location: str) -> str:
+    """Classify a declared action location without guessing from operation names."""
 
-    if isinstance(location, str) and (match := V4_OPERATION_RE.fullmatch(location)):
+    if isinstance(location, str) and (match := OPERATION_RE.fullmatch(location)):
         action = match.group("repository") or match.group("action")
         kind = match.group("kind")
+        if match.group("group") and action not in CHECK_ACTIONS:
+            raise SdlcContractError(f"Only before/after checks have executable groups: {location}")
         if kind not in {None, "mcp-servers"} and re.fullmatch(NAME, match.group("name")) is None:
             raise SdlcContractError(f"Invalid SDLC operation location: {location}")
         if (
             kind is None
-            or action in V4_ACTIONS_BY_KIND[kind]
-            or (version == 5 and action == "build")
+            or action in ACTIONS_BY_KIND[kind]
+            or action == "build"
         ):
-            return V4_ACTION_CATEGORIES[action]
+            return ACTION_CATEGORIES[action]
     raise SdlcContractError(f"Invalid SDLC operation location: {location}")
 
 
@@ -126,113 +161,176 @@ def _relative_path(value: str) -> bool:
     )
 
 
-def _v4_package_records(
-    contract: Mapping[str, Any],
-    direct: list[str],
+def _deliverable_records(contract: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
+    return {
+        f"deliverables.{kind}.{name}": record
+        for kind, group in contract.get("deliverables", {}).items()
+        for name, record in group.items()
+    }
+
+
+def _build_requirements(record: Mapping[str, Any]) -> list[str]:
+    """Return edges that must be satisfied before this build can finish."""
+    actions = record.get("actions", {})
+    build = actions.get("build", {})
+    checks = (
+        *actions.get("pre-build-checks", {}).get("check-groups", {}).values(),
+        *build.get("checks", {}).values(),
+    )
+    return list(dict.fromkeys([
+        *record.get("build-after", []),
+        *build.get("uses-artifacts", []),
+        *(reference for group in checks for reference in group.get("uses-artifacts", [])),
+    ]))
+
+
+def _collect_required_deliverables(
+    contract: Mapping[str, Any], direct: list[str],
 ) -> dict[str, dict[str, Any]]:
-    """Return dependency-first package metadata without executing its actions."""
+    """Return dependency-first declarations without executing commands."""
+    records = _deliverable_records(contract)
+    ordered: dict[str, dict[str, Any]] = {}
+    visiting: set[str] = set()
 
-    packages = contract.get("deliverables", {}).get("packages", {})
-    records: dict[str, dict[str, Any]] = {}
-
-    def add(name: str) -> None:
-        if name in records:
+    def add(reference: str) -> None:
+        if reference in ordered:
             return
-        package = packages[name]
-        for prerequisite in package.get("prerequisites", []):
-            add(prerequisite)
-        metadata = {key: value for key, value in package.items() if key != "actions"}
-        metadata["action-locations"] = {
-            action: f"deliverables.packages.{name}.actions.{action}"
-            for action in package.get("actions", {})
+        if reference in visiting:
+            raise SdlcContractError(f"build dependency cycle includes {reference}")
+        visiting.add(reference)
+        record = records[reference]
+        for dependency in _build_requirements(record):
+            add(dependency)
+        ordered[reference] = {
+            **{key: value for key, value in record.items() if key != "actions"},
+            "action-locations": {
+                action: f"{reference}.actions.{action}" for action in record.get("actions", {})
+            },
         }
-        records[name] = metadata
+        visiting.remove(reference)
 
-    for package_name in direct:
-        add(package_name)
-    return records
+    for reference in direct:
+        add(reference)
+    return ordered
 
 
 def operation_prerequisites(
-    contract: Mapping[str, Any],
-    location: str,
+    contract: Mapping[str, Any], location: str,
 ) -> dict[str, Any]:
-    """Expose declared setup metadata for one native operation location.
-
-    V4/v5 distinguish executable capabilities from package prerequisites and
-    include transitive package metadata plus selectable action locations.
-    Version requirements stay as target-owned version-from references. This
-    reader neither rewrites them into inline values nor selects/installs tools.
-    Nothing in this adapter runs a prerequisite action.
-    """
-
-    operation = operation_entries(contract).get(location, {})
-    match = V4_OPERATION_RE.fullmatch(location)
+    """Describe one operation's build order, tools and phase-specific files."""
+    entries = operation_entries(contract)
+    operation = entries.get(location, {})
+    match = OPERATION_RE.fullmatch(location)
     if match is None:
         raise SdlcContractError(f"Invalid SDLC operation location: {location}")
+    owner = location.split(".actions.", 1)[0]
+    record = _deliverable_records(contract).get(owner, {})
+    phase = match.group("repository") or match.group("action")
     capabilities = contract.get("repository", {}).get("capabilities", {})
-    required_capabilities = operation.get("requires", {}).get("capabilities", [])
-    direct_packages: list[str] = []
-    if match.group("kind") is not None:
-        deliverable = contract["deliverables"][match.group("kind")][match.group("name")]
-        direct_packages = list(deliverable.get("prerequisites", []))
+    build_after = list(record.get("build-after", []))
+    builder = list(operation.get("uses-artifacts", [])) if phase == "build" else []
+    during = {
+        f"{location}.checks.{name}": list(group.get("uses-artifacts", []))
+        for name, group in operation.get("checks", {}).items()
+    } if phase == "build" else {}
+    before: dict[str, list[str]] = {}
+    after: dict[str, list[str]] = {}
+    if phase in CHECK_ACTIONS:
+        groups = (location,) if match.group("group") else (
+            name for name in entries if name.startswith(location + ".check-groups.")
+        )
+        for name in groups:
+            files = list(entries.get(name, {}).get("uses-artifacts", []))
+            if phase == "post-build-checks" and record:
+                files.insert(0, owner)
+            (before if phase == "pre-build-checks" else after)[name] = files
+    direct = [*build_after, *builder, *(ref for groups in (before, during, after)
+                                      for refs in groups.values() for ref in refs)]
     return {
-        "capabilities": {name: capabilities[name] for name in required_capabilities},
-        "packages": _v4_package_records(contract, direct_packages),
+        "build-after": build_after,
+        "capabilities": {
+            name: capabilities[name] for name in operation.get("requires", {}).get("capabilities", [])
+        },
+        "build-uses-artifacts": builder,
+        "pre-build-checks-uses-artifacts": before,
+        "during-build-checks-uses-artifacts": during,
+        "post-build-checks-uses-artifacts": after,
+        "deliverables": _collect_required_deliverables(contract, direct),
     }
 
 
-def release_unit_entries(contract: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
-    """Resolve a validated v5 contract without reading sources or running actions.
+def operation_package_names(requirements: Mapping[str, Any]) -> list[str]:
+    """Derive names for the package-specific installer handoff argument."""
+    references = [*requirements.get("build-after", []), *requirements.get("build-uses-artifacts", [])]
+    for key in ("pre-build-checks-uses-artifacts", "during-build-checks-uses-artifacts",
+                "post-build-checks-uses-artifacts"):
+        references.extend(ref for refs in requirements.get(key, {}).values() for ref in refs)
+    return list(dict.fromkeys(ref.rsplit(".", 1)[-1] for ref in references
+                              if ref.startswith("deliverables.packages.")))
 
-    Members retain declaration order and exclude dependencies owned by other
-    units. External package dependencies are dependency-first records, including
-    transitive prerequisites and their release-unit owners. Metadata is copied
-    so a later caller cannot change the validated declaration through this view.
-    Callers must use load_contract or validation_errors before this adapter.
-    V4 has no release units and returns an empty mapping.
-    """
 
-    if contract.get("version") != 5:
-        return {}
-    units = contract["repository"].get("release-units", {})
-    owners = {
-        member: name for name, unit in units.items() for member in unit["members"]
-    }
-    operations = operation_entries(contract)
+def deliverable_source_files(repo_root: pathlib.Path, record: Mapping[str, Any]) -> list[str]:
+    """List tracked and nonignored new source files once in the current worktree."""
+    root = pathlib.PurePosixPath(record["root-dir"])
+    patterns = record.get("additional-source-files", [])
+    command = ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"]
+    result = subprocess.run(command, cwd=repo_root, capture_output=True, check=False)
+    if result.returncode:
+        raise SdlcContractError(
+            f"Cannot list build sources in {repo_root}: {command!r}; exit={result.returncode}; "
+            f"stdout={result.stdout or '<absent>'!r}; stderr={result.stderr or '<absent>'!r}"
+        )
+    resolved_root = repo_root.resolve()
+    return sorted({
+        name for name in result.stdout.decode("utf-8").split("\0") if name and (
+            pathlib.PurePosixPath(name).is_relative_to(root)
+            or any(fnmatch.fnmatchcase(name, pattern) or
+                   (pattern.startswith("**/") and fnmatch.fnmatchcase(name, pattern[3:]))
+                   for pattern in patterns)
+        ) and (repo_root / name).is_file()
+        and (repo_root / name).resolve().is_relative_to(resolved_root)
+    })
+
+
+def release_bundle_entries(contract: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    """Describe the declared members and the external builds they require."""
+    bundles = contract["repository"].get("release-bundles", {})
+    owners = {member: name for name, bundle in bundles.items() for member in bundle["members"]}
+    records = _deliverable_records(contract)
     entries: dict[str, dict[str, Any]] = {}
-    for name, unit in units.items():
+    for name, bundle in bundles.items():
         members: dict[str, dict[str, Any]] = {}
         dependencies: dict[str, dict[str, Any]] = {}
-        for member in unit["members"]:
-            _, kind, deliverable_name = member.split(".")
-            record = contract["deliverables"][kind][deliverable_name]
-            metadata = deepcopy(
-                {key: value for key, value in record.items() if key != "actions"}
-            )
-            metadata["action-locations"] = {
-                action: f"{member}.actions.{action}"
-                for action in record["actions"]
-                if f"{member}.actions.{action}" in operations
+        for member in bundle["members"]:
+            record = records[member]
+            requirements = operation_prerequisites(contract, f"{member}.actions.build")
+            for phase in ("pre-build-checks", "post-build-checks"):
+                key = f"{phase}-uses-artifacts"
+                requirements[key] = operation_prerequisites(
+                    contract, f"{member}.actions.{phase}",
+                )[key]
+            direct = _build_requirements(record)
+            direct.extend(ref for refs in requirements["post-build-checks-uses-artifacts"].values()
+                          for ref in refs if ref != member)
+            requirements["deliverables"] = _collect_required_deliverables(contract, direct)
+            members[member] = {
+                **{key: item for key, item in record.items() if key != "actions"},
+                "action-locations": {action: f"{member}.actions.{action}" for action in record["actions"]},
+                **requirements,
             }
-            members[member] = metadata
-            prerequisites = operation_prerequisites(
-                contract,
-                f"{member}.actions.build",
-            )["packages"]
-            for package, prerequisite in prerequisites.items():
-                reference = f"deliverables.packages.{package}"
-                owner = owners[reference]
-                if owner != name:
+            for reference, metadata in requirements["deliverables"].items():
+                if owners.get(reference) != name:
                     dependencies[reference] = {
-                        **deepcopy(prerequisite),
-                        "release-unit": owner,
+                        **metadata,
+                        **({"release-bundle": owners[reference]} if reference in owners else {}),
                     }
-        entries[name] = {"members": members, "dependencies": dependencies}
+        entries[name] = deepcopy({"members": members, "dependencies": dependencies})
     return entries
 
 
-def _typed_semantic_errors(value: Mapping[str, Any]) -> list[str]:
+def _find_sdlc_declaration_errors(
+    value: Mapping[str, Any], repo_root: pathlib.Path | None = None,
+) -> list[str]:
     """Validate references and lifecycle separation that JSON Schema cannot."""
 
     errors: list[str] = []
@@ -248,86 +346,66 @@ def _typed_semantic_errors(value: Mapping[str, Any]) -> list[str]:
                 f"capability {name} version-from.file must be repository-relative"
             )
     deliverables = value.get("deliverables", {})
-    packages = deliverables.get("packages", {})
-    owners: list[tuple[str, Mapping[str, Any]]] = [("repository", repository)]
-    for kind, group in deliverables.items():
-        owners.extend(
-            (f"{kind}.{name}", deliverable) for name, deliverable in group.items()
-        )
-    for owner, record in owners:
-        for action_name, action in record["actions"].items():
-            for capability in action["requires"]["capabilities"]:
-                if capability not in capabilities:
-                    errors.append(
-                        f"unknown capability {capability} at {owner}.actions.{action_name}"
-                    )
-            handoff_positions = [
-                position
-                for position, step in enumerate(action.get("steps", []), start=1)
-                if "handoff" in step
-            ]
-            if handoff_positions and handoff_positions != [len(action["steps"])]:
-                errors.append(
-                    f"handoff must be the single final step at {owner}.actions.{action_name}"
-                )
-            check_results = action.get("check-results")
-            groups = action.get("check-groups", {})
-            for group_name, group in groups.items():
-                location = f"{owner}.actions.{action_name}.check-groups.{group_name}"
-                steps = action.get("steps", [])
-                if not steps or any("run" not in step for step in steps):
-                    errors.append(f"{location} requires executable commands, not a no-op or skill handoff")
-                phase = group["phase"]
-                if phase == "during-build" and action_name != "build":
-                    errors.append(f"{location}: during-build checks must belong to a build action")
-                if phase != "during-build" and action_name not in {"validate", "test", "tests"}:
-                    errors.append(f"{location}: before/after-build groups must belong to a check action")
-                if phase != "during-build" and len(steps) != 1:
-                    errors.append(f"{location} requires one test command accepting --check-group and --artifacts")
-                for reference in group["requires-artifacts"]:
-                    _, kind, name = reference.split(".")
-                    artifact_owner = deliverables.get(kind, {}).get(name)
-                    if artifact_owner is None or not artifact_owner.get("artifact"):
-                        errors.append(f"{location} requires an unknown or undeclared artifact: {reference}")
-            if check_results is not None:
-                steps = action.get("steps", [])
-                if action_name not in {"validate", "test", "tests"} or len(steps) != 1 or "run" not in steps[0]:
-                    errors.append(f"check-results requires one check runner command at {owner}.actions.{action_name}")
-                for key in ("product-inputs", "check-inputs", "dependencies"):
-                    for input_path in check_results.get(key, []):
-                        if (input_path.startswith(("/", "\\")) or "\\" in input_path
-                                or ":" in input_path or ".." in input_path.split("/")):
-                            errors.append(f"check-results {key} must be repository-relative at {owner}.actions.{action_name}")
-            declared_result = action.get("result-schema")
-            if action.get("result-commit-field") is not None:
-                steps = action.get("steps", [])
-                if action_name != "build" or not steps or "run" not in steps[-1] or handoff_positions:
-                    errors.append(
-                        f"result-commit-field requires a build ending in a run step at {owner}.actions.{action_name}"
-                    )
-            if declared_result is not None:
-                expected_result = V4_RESULT_SCHEMAS.get(action_name)
-                if expected_result is None:
-                    errors.append(
-                        f"result-schema is not supported at {owner}.actions.{action_name}"
-                    )
-                elif declared_result not in expected_result:
-                    errors.append(
-                        f"{owner}.actions.{action_name} result-schema must be "
-                        f"{' or '.join(expected_result)}"
-                    )
-                steps = action.get("steps", [])
-                if not steps or "run" not in steps[-1]:
-                    errors.append(
-                        f"result-schema requires a final run step at "
-                        f"{owner}.actions.{action_name}"
-                    )
+    records = _deliverable_records(value)
+    for location, action in operation_entries(value).items():
+        match = OPERATION_RE.fullmatch(location)
+        assert match is not None
+        action_name = match.group("repository") or match.group("action")
+        owner = location.split(".actions.", 1)[0]
+        for capability in action["requires"]["capabilities"]:
+            if capability not in capabilities:
+                errors.append(f"unknown capability {capability} at {location}.requires.capabilities")
+        steps = action.get("steps", [])
+        handoff_positions = [position for position, step in enumerate(steps, 1) if "handoff" in step]
+        if handoff_positions and handoff_positions != [len(steps)]:
+            errors.append(f"handoff must be the single final step at {location}")
+        groups = action.get("checks", {})
+        if groups and action_name != "build":
+            errors.append(f"{location}.checks is supported only inside a build")
+        requirements = [(location, action.get("uses-artifacts", []))]
+        requirements.extend((f"{location}.checks.{name}", group.get("uses-artifacts", []))
+                            for name, group in groups.items())
+        if groups and (not steps or any("run" not in step for step in steps)):
+            errors.append(f"{location}.checks requires an executable builder")
+        for field, references in requirements:
+            if action_name == "post-build-checks":
+                if owner == "repository" and not references:
+                    errors.append(f"{field}.uses-artifacts must name every artifact for repository checks")
+                elif owner in references:
+                    errors.append(f"{field}.uses-artifacts: redundant own artifact {owner}")
+                references = ([owner] if owner != "repository" else []) + list(references)
+            for reference in references:
+                _, kind, name = reference.split(".")
+                producer = deliverables.get(kind, {}).get(name)
+                if (producer is None or not producer.get("artifact")
+                        or not producer.get("actions", {}).get("build", {}).get("steps")):
+                    errors.append(f"{field}.uses-artifacts requires an unknown or non-producing artifact: {reference}")
+                if action_name in {"build", "pre-build-checks"} and reference == owner:
+                    errors.append(f"{field}.uses-artifacts cannot require its own unfinished artifact")
+        check_results = action.get("check-results")
+        if check_results is not None:
+            if action_name not in CHECK_ACTIONS or len(steps) != 1 or "run" not in steps[0]:
+                errors.append(f"check-results requires one check runner command at {location}")
+            for key in ("product-inputs", "check-inputs", "dependencies"):
+                for input_path in check_results.get(key, []):
+                    if not _relative_path(input_path):
+                        errors.append(f"check-results {key} must be repository-relative at {location}")
+        if action.get("result-commit-field") is not None:
+            if action_name != "build" or not steps or "run" not in steps[-1] or handoff_positions:
+                errors.append(f"result-commit-field requires a build ending in a run step at {location}")
+        declared_result = action.get("result-schema")
+        if declared_result is not None:
+            expected = RESULT_SCHEMAS.get(action_name)
+            if expected is None or declared_result not in expected:
+                errors.append(f"{location} result-schema must be {' or '.join(expected or ())}")
+            if not steps or "run" not in steps[-1]:
+                errors.append(f"result-schema requires a final run step at {location}")
     path_fields = {
-        "packages": ("source", "project"),
-        "apps": ("source", "manifest", "project"),
-        "mcp-servers": ("source", "manifest", "project"),
-        "skills": ("source", "project"),
-        "hooks": ("source", "project"),
+        "packages": ("root-dir", "project"),
+        "apps": ("root-dir", "manifest", "project"),
+        "mcp-servers": ("root-dir", "manifest", "project"),
+        "skills": ("root-dir", "project"),
+        "hooks": ("root-dir", "project"),
     }
     for kind, fields in path_fields.items():
         for name, record in deliverables.get(kind, {}).items():
@@ -347,81 +425,67 @@ def _typed_semantic_errors(value: Mapping[str, Any]) -> list[str]:
                 errors.append(
                     f"{kind}.{name}.artifact.filename-pattern must be a filename pattern"
                 )
-            unknown = sorted(set(record.get("prerequisites", [])) - set(packages))
-            if unknown:
-                errors.append(f"{kind}.{name} requires unknown package {unknown[0]}")
-    visiting: set[str] = set()
-    visited: set[str] = set()
-
-    def visit(name: str) -> None:
-        if name in visiting:
-            errors.append(f"package prerequisite cycle includes {name}")
-            return
-        if name in visited or name not in packages:
-            return
-        visiting.add(name)
-        for prerequisite in packages[name].get("prerequisites", []):
-            visit(prerequisite)
-        visiting.remove(name)
-        visited.add(name)
-
-    for name in packages:
-        visit(name)
+            reference = f"deliverables.{kind}.{name}"
+            source = record["root-dir"]
+            if repo_root is not None and _relative_path(source):
+                directory = (repo_root / source).resolve()
+                if not directory.is_relative_to(repo_root.resolve()) or not directory.is_dir():
+                    errors.append(f"{reference}.root-dir must name an existing directory inside the repository")
+            for pattern in record.get("additional-source-files", []):
+                if not _relative_path(pattern):
+                    errors.append(f"{reference}.additional-source-files must be repository-relative: {pattern}")
+                elif repo_root is not None:
+                    literal = re.split(r"[*?\[]", pattern, maxsplit=1)[0]
+                    if not (repo_root / literal).resolve().is_relative_to(repo_root.resolve()):
+                        errors.append(f"{reference}.additional-source-files escapes the repository: {pattern}")
+            for dependency in record.get("build-after", []):
+                build = records.get(dependency, {}).get("actions", {}).get("build", {})
+                if not build.get("steps") or any("run" not in step for step in build["steps"]):
+                    errors.append(f"{reference}.build-after requires an executable build: {dependency}")
+    if errors:
+        return errors
+    try:
+        _collect_required_deliverables(value, list(records))
+    except SdlcContractError as exc:
+        return [str(exc)]
     lifecycle_by_kind = {
         "mcp-servers": "ceratops-mcp-server-lifecycle",
         "skills": "ceratops-skill-lifecycle",
     }
     for kind, lifecycle in lifecycle_by_kind.items():
         for name, record in deliverables.get(kind, {}).items():
-            for action_name in ("validate", "install"):
-                action = record["actions"][action_name]
-                # An MCP server may have no separate validation step. Installation
-                # may use a repository script or an MCP-server-lifecycle handoff.
-                if (
-                    kind == "mcp-servers"
-                    and action_name == "validate"
-                    and "no-op" in action
-                ):
-                    continue
-                handoffs = [
-                    step["handoff"]
-                    for step in action.get("steps", [])
-                    if "handoff" in step
-                ]
+            source_groups = record["actions"]["pre-build-checks"]["check-groups"]
+            actions = [("pre-build-checks.check-groups." + group, action)
+                       for group, action in source_groups.items() if any("handoff" in step for step in action.get("steps", []))]
+            if kind == "skills" and not actions:
+                errors.append(f"{kind}.{name}.actions.pre-build-checks must include a source-check handoff")
+            actions.append(("install", record["actions"]["install"]))
+            for action_name, action in actions:
+                handoffs = [step["handoff"] for step in action.get("steps", []) if "handoff" in step]
                 if not handoffs:
-                    if (
-                        kind == "mcp-servers"
-                        and action_name == "install"
-                        and action.get("steps")
-                    ):
+                    if kind == "mcp-servers" and action.get("steps"):
                         continue
-                    errors.append(
-                        f"{kind}.{name}.actions.{action_name} must end with a handoff"
-                    )
+                    errors.append(f"{kind}.{name}.actions.{action_name} must end with a handoff")
                     continue
                 if handoffs[0]["lifecycle"] != lifecycle:
-                    errors.append(
-                        f"{kind}.{name}.actions.{action_name} must hand off to {lifecycle}"
-                    )
+                    errors.append(f"{kind}.{name}.actions.{action_name} must hand off to {lifecycle}")
                 identity = "mcp-server" if kind == "mcp-servers" else "skill"
                 if handoffs[0]["inputs"].get(identity) != name:
-                    errors.append(
-                        f"{kind}.{name}.actions.{action_name} must identify {identity} {name}"
-                    )
+                    errors.append(f"{kind}.{name}.actions.{action_name} must identify {identity} {name}")
                 declared = handoffs[0]["inputs"].get("prerequisite-packages")
-                if declared is not None and declared != record["prerequisites"]:
-                    errors.append(
-                        f"{kind}.{name}.actions.{action_name} prerequisite-packages differ from prerequisites"
-                    )
+                if declared is not None:
+                    location = f"deliverables.{kind}.{name}.actions.{action_name}"
+                    if declared != operation_package_names(operation_prerequisites(value, location)):
+                        errors.append(f"{location} prerequisite-packages differ from declared package requirements")
     return errors
 
 
-def _v5_release_unit_errors(value: Mapping[str, Any]) -> list[str]:
+def _find_release_bundle_errors(value: Mapping[str, Any]) -> list[str]:
     """Reject incomplete release ownership before the reader can expose it.
 
-    The common typed checks have already verified the package graph. Unit
-    cycles are checked separately: grouping an acyclic package graph can still
-    produce mutually dependent release units. No filesystem or Git access is
+    The declaration checks have checked the build graph. Bundle cycles
+    are checked separately: grouping an acyclic graph can still
+    produce mutually dependent release bundles. No filesystem or Git access is
     needed to resolve this declaration-level ownership.
     """
 
@@ -431,16 +495,16 @@ def _v5_release_unit_errors(value: Mapping[str, Any]) -> list[str]:
         for kind, group in value.get("deliverables", {}).items()
         for name, record in group.items()
     }
-    units = value["repository"].get("release-units", {})
+    bundles = value["repository"].get("release-bundles", {})
     owners: dict[str, str] = {}
-    for name, unit in units.items():
-        for member in unit["members"]:
+    for name, bundle in bundles.items():
+        for member in bundle["members"]:
             if member not in records:
-                errors.append(f"release unit {name} has unknown member {member}")
+                errors.append(f"release bundle {name} has unknown member {member}")
                 continue
             if member in owners:
                 errors.append(
-                    f"{member} belongs to multiple release units: {owners[member]}, {name}"
+                    f"{member} belongs to multiple release bundles: {owners[member]}, {name}"
                 )
                 continue
             owners[member] = name
@@ -448,33 +512,28 @@ def _v5_release_unit_errors(value: Mapping[str, Any]) -> list[str]:
             build = record["actions"].get("build", {})
             if not record.get("artifact") or not build.get("steps"):
                 errors.append(
-                    f"release unit {name} member {member} requires artifact metadata "
+                    f"release bundle {name} member {member} requires artifact metadata "
                     "and an executable build action"
                 )
             elif any("run" not in step for step in build["steps"]):
                 errors.append(
-                    f"release unit {name} member {member} build must contain only run steps"
+                    f"release bundle {name} member {member} build must contain only run steps"
                 )
     if errors:
         return errors
-    dependencies: dict[str, set[str]] = {name: set() for name in units}
+    dependencies: dict[str, set[str]] = {name: set() for name in bundles}
     for member, owner in owners.items():
-        packages = _v4_package_records(value, records[member]["prerequisites"])
-        for package in packages:
-            reference = f"deliverables.packages.{package}"
+        required = _collect_required_deliverables(value, _build_requirements(records[member]))
+        for reference in required:
             dependency_owner = owners.get(reference)
-            if dependency_owner is None:
-                errors.append(
-                    f"release unit {owner} depends on package {package} without a release unit"
-                )
-            elif dependency_owner != owner:
+            if dependency_owner is not None and dependency_owner != owner:
                 dependencies[owner].add(dependency_owner)
     visiting: set[str] = set()
     visited: set[str] = set()
 
     def visit(name: str) -> None:
         if name in visiting:
-            errors.append(f"release-unit dependency cycle includes {name}")
+            errors.append(f"release-bundle dependency cycle includes {name}")
             return
         if name in visited:
             return
@@ -484,13 +543,13 @@ def _v5_release_unit_errors(value: Mapping[str, Any]) -> list[str]:
         visiting.remove(name)
         visited.add(name)
 
-    for name in units:
+    for name in bundles:
         visit(name)
     return list(dict.fromkeys(errors))
 
 
 def _schema_validator(
-    schema_path: pathlib.Path = SCHEMA,
+    schema_path: pathlib.Path,
 ) -> jsonschema.Draft202012Validator:
     """Load and validate the lifecycle-owned SDLC schema."""
 
@@ -511,20 +570,26 @@ def validation_errors(
     value: object,
     *,
     schema_path: pathlib.Path | None = None,
+    repo_root: pathlib.Path | None = None,
 ) -> list[str]:
     """Return stable schema errors for one already-loaded contract value."""
 
     if not isinstance(value, Mapping):
         return ["SDLC contract must be a mapping"]
     version = value.get("version")
-    if type(version) is not int or version not in VERSION_SCHEMAS:
-        supported = ", ".join(str(item) for item in sorted(VERSION_SCHEMAS))
+    schemas = sdlc_schema_paths()
+    if type(version) is not int or version not in schemas:
+        supported = ", ".join(str(item) for item in sorted(schemas))
+        latest = max(schemas)
+        instruction = (
+            " Update the installed repo-lifecycle skill before reading this repository."
+            if type(version) is int and version > latest else ""
+        )
         return [
-            f"unsupported SDLC version: {version!r}; supported versions: {supported}"
+            f"unsupported SDLC version: {version!r}; installed schemas: {supported}; "
+            f"latest installed version: {latest}.{instruction}"
         ]
-    selected_schema = (
-        VERSION_SCHEMAS[version] if schema_path in (None, SCHEMA) else schema_path
-    )
+    selected_schema = schema_path if schema_path is not None else schemas[version]
     validator = _schema_validator(selected_schema)
     errors: list[str] = []
     for error in sorted(
@@ -536,16 +601,17 @@ def validation_errors(
         errors.append(f"schema validation failed{suffix}: {error.message}")
     if errors:
         return errors
-    errors = _typed_semantic_errors(value)
-    if errors or version == 4:
+    errors = _find_sdlc_declaration_errors(value, repo_root)
+    if errors:
         return errors
-    return _v5_release_unit_errors(value)
+    return _find_release_bundle_errors(value)
 
 
 def read_contract(
     path: pathlib.Path,
     *,
     schema_path: pathlib.Path | None = None,
+    repo_root: pathlib.Path | None = None,
 ) -> tuple[dict[str, Any] | None, list[str]]:
     """Validate one YAML contract, retaining its version and data without writes."""
 
@@ -554,7 +620,7 @@ def read_contract(
     except (OSError, UnicodeError, yaml.YAMLError) as exc:
         return None, [f"invalid YAML: {exc}"]
     try:
-        errors = validation_errors(value, schema_path=schema_path)
+        errors = validation_errors(value, schema_path=schema_path, repo_root=repo_root)
     except SdlcContractError as exc:
         return None, [str(exc)]
     if errors:
@@ -568,10 +634,11 @@ def load_contract(
     path: pathlib.Path,
     *,
     schema_path: pathlib.Path | None = None,
+    repo_root: pathlib.Path | None = None,
 ) -> Mapping[str, Any]:
     """Load one valid contract or raise one compact deterministic error."""
 
-    value, errors = read_contract(path, schema_path=schema_path)
+    value, errors = read_contract(path, schema_path=schema_path, repo_root=repo_root)
     if errors or value is None:
         raise SdlcContractError(
             ("; ".join(errors[:8]) or "invalid SDLC contract")[:4096]

@@ -260,7 +260,10 @@ def test_promote_repository_requires_an_explicit_deployment_choice(
     if expected_operation is None or declared_handoff is not None:
         assert result["operations"] is None
     else:
-        assert result["operations"] == {
+        operations = result["operations"]
+        assert {key: operations[key] for key in (
+            "status", "completed_operations", "pending_operations", "results"
+        )} == {
             "status": "completed",
             "completed_operations": [expected_operation["operation"]],
             "pending_operations": [],
@@ -268,9 +271,13 @@ def test_promote_repository_requires_an_explicit_deployment_choice(
                 {
                     **expected_operation,
                     "commit": approved_head,
+                    "qualification_level": "beta",
+                    "parameters": {},
                 }
             ],
         }
+        assert all(item["status"] in {"completed", "no_op"}
+                   for item in operations.get("build_results", []))
     assert "managed_skills" not in result
     expected_handoffs = []
     if expected_handoff is not None and declared_handoff is None:
@@ -935,6 +942,8 @@ def _prepare_standalone_handoff_reports(
         _registered_skill_fixture,
     )
 
+    from tests.repository_lifecycle.test_sdlc_actions import _typed_contract
+
     runner = importlib.import_module("repository_operation")
     command = importlib.import_module("github_pr_workflow.command")
     actions = importlib.import_module("execute_skill_actions")
@@ -943,6 +952,7 @@ def _prepare_standalone_handoff_reports(
     if source_checkout != "primary":
         source = tmp_path / "worktrees" / repo.name / "installer-source"
         assert run_git(repo, "worktree", "add", "-b", "installer-source", str(source)).returncode == 0
+        _typed_contract(source)
         if source_checkout == "worktree-primary-changed":
             contract_path = repo / "sdlc/sdlc.yml"
             contract = json.loads(contract_path.read_text())
@@ -1050,7 +1060,7 @@ def test_standalone_handoff_return_cli_uses_installation_worktree(tmp_path, monk
 
 
 @pytest.mark.parametrize("problem", ["failed", "wrong-commit", "wrong-repo", "wrong-producer",
-                                     "wrong-target", "cleanup-debt", "missing-input", "missing-source-commit"])
+                                     "wrong-target", "cleanup-debt", "missing-input", "missing-source-commit", "extra-check"])
 def test_standalone_handoff_return_preserves_reports_until_actual_completion_matches(
     tmp_path, monkeypatch, capsys, problem,
 ):
@@ -1074,6 +1084,8 @@ def test_standalone_handoff_return_preserves_reports_until_actual_completion_mat
         receipt["cleanup_debt"] = ["busy retired directory"]
     elif problem == "missing-source-commit":
         monkeypatch.setattr(runner, "repository_commit", lambda _root: None)
+    elif problem == "extra-check":
+        arguments += ["--validation-operation", "repository.actions.pre-build-checks"]
     if problem == "missing-input":
         completion.unlink()
     else:
@@ -1095,6 +1107,9 @@ def test_standalone_handoff_return_preserves_reports_until_actual_completion_mat
         assert (repo / "calls.jsonl").read_bytes() == calls
         assert error_report.exists()
     monkeypatch.setattr(runner, "repository_commit", read_source_commit)
+    if problem == "extra-check":
+        start = arguments.index("--validation-operation")
+        del arguments[start:start + 2]
     completion.write_bytes(actual)
     for _ in range(2):
         assert runner.main(arguments) == 0
@@ -1115,7 +1130,7 @@ def test_non_deployment_handoff_does_not_offer_installer_receipt_return(tmp_path
 
     runner = importlib.import_module("repository_operation")
     repo = _registered_skill_fixture(tmp_path, monkeypatch)
-    operation = "deliverables.skills.claims-catalog-invoice.actions.validate"
+    operation = "deliverables.skills.claims-catalog-invoice.actions.pre-build-checks.check-groups.source"
     prepared = runner.prepare_operations(repo, [runner.OperationRequest(operation)], context="return")[0]
     pending = runner.execute_prepared_operation(prepared)
     assert pending["status"] == "handoff_required"

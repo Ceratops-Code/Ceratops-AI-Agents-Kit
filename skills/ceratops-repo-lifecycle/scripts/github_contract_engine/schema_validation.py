@@ -46,8 +46,7 @@ SCHEMA_ASSIGNMENTS = {
     SCHEMAS / "ceratops-compatibility-contract.schema.json": (
         CONTRACTS / "ceratops-compatibility-deterministic-contract.json",
     ),
-    SCHEMAS / "sdlc.v4.schema.json": (),
-    SCHEMAS / "sdlc.v5.schema.json": (),
+    **{path: () for path in SCHEMAS.glob("sdlc.*.schema.json")},
 }
 
 

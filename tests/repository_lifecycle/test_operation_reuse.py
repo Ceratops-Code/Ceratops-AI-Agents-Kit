@@ -12,6 +12,7 @@ import runpy
 import shutil
 import subprocess
 import sys
+from typing import Any
 
 import pytest
 
@@ -21,8 +22,207 @@ runner = importlib.import_module("repository_operation")
 reuse = importlib.import_module("reuse_operation_checks")
 
 
+def _release_build_graph(root, monkeypatch):
+    """Five declared producers, a joint test and an installer use returned bytes."""
+    _fixture(root)
+    skill = root / ".git/codex/skills/ceratops-skill-lifecycle"
+    (skill / "references").mkdir(parents=True)
+    binding = {"run": [sys.executable, "-c", "pass", "{skill}"]}
+    (skill / "references/action-executors.json").write_text(json.dumps({
+        "version": 1, "actions": {"source-validate": {**binding, "selected-skill": binding}}}))
+    monkeypatch.setenv("CODEX_HOME", str(root / ".git/codex"))
+    references = {name: f"deliverables.{kind}.{name}" for name, kind in (
+        ("engine", "packages"), ("core", "packages"), ("bridge", "mcp-servers"),
+        ("widget", "skills"), ("desktop", "apps"))}
+    dependencies = {"engine": [], "core": ["engine"], "bridge": ["core"],
+                    "widget": ["core"], "desktop": ["bridge"]}
+    source = '''import argparse, hashlib, json, os, pathlib, sys
+p = argparse.ArgumentParser()
+p.add_argument('action'); p.add_argument('name'); p.add_argument('target')
+p.add_argument('--check-group'); p.add_argument('--artifacts')
+a = p.parse_args()
+files = json.loads(os.environ.get('CERATOPS_TEST_ARTIFACTS', '{}'))
+refs = REFERENCES
+deps = DEPENDENCIES
+if a.action == 'check': needed = ['desktop', 'widget']
+elif a.action == 'install': needed = ['desktop', 'bridge']
+else: needed = [] if a.name == 'desktop' else deps[a.name]
+for name in needed:
+    assert pathlib.Path(files[refs[name]][0]).read_text() == name + ':' + a.target
+if a.action == 'build':
+    assert set(files) == {refs[name] for name in needed}
+    checks = json.loads(os.environ['CERATOPS_BUILD_CHECK_ARTIFACTS'])
+    group = refs[a.name] + '.actions.build.checks.compiler'
+    assert set(checks[group]) == ({refs['bridge']} if a.name == 'desktop' else set())
+    if a.name == 'desktop':
+        assert pathlib.Path(checks[group][refs['bridge']][0]).read_text() == 'bridge:' + a.target
+with pathlib.Path('.order').open('a') as log: log.write(a.action + ':' + a.name + ':' + a.target + '\\n')
+if a.action != 'build': sys.exit(0)
+destination = pathlib.Path('.outputs') / a.target / (a.name + '.bin')
+destination.parent.mkdir(parents=True, exist_ok=True)
+fault = pathlib.Path('.fault').read_text() if pathlib.Path('.fault').exists() else ''
+if fault == a.name + ':before': print('producer failed before output', file=sys.stderr); sys.exit(7)
+destination.write_text(a.name + ':' + a.target)
+if fault == a.name + ':after': print('producer failed after output', file=sys.stderr); sys.exit(8)
+summary = {'schema':'ceratops-check-summary.v1','inputGroups':{},'checkGroups':{},'checks':[
+    {'id':'compiler','status':'passed','result_id':a.name+'-result','check_version':'compiler-v1'}]}
+print(json.dumps({'schema':'ceratops-build-result.v1','status':'passed',
+    'artifact':{'type':'archive','path':destination.as_posix(),'size':destination.stat().st_size,
+                'sha256':hashlib.sha256(destination.read_bytes()).hexdigest()}, 'check_summary':summary}))
+'''.replace('REFERENCES', repr(references)).replace('DEPENDENCIES', repr(dependencies))
+    (root / "scripts/product.py").write_text(source)
+    (root / ".gitignore").write_text(".order\n.outputs/\n.fault\n")
+
+    def action(verb, name):
+        return {"requires": {"capabilities": []}, "parameters": ["target"],
+                "steps": [{"run": [sys.executable, "scripts/product.py", verb, name, "{target}"]}]}
+
+    test = action("check", "bundle")
+    test["uses-artifacts"] = [references["desktop"], references["widget"]]
+    data: dict[str, Any] = {"version": 5, "kind": "ceratops-sdlc", "repository": {"capabilities": {},
+            "actions": {"pre-build-checks": {"check-groups": {"source": _no_op()}},
+                        "post-build-checks": {"check-groups": {"joint": test}}}}, "deliverables": {}}
+    for name, reference in references.items():
+        kind = reference.split('.')[1]
+        build = action("build", name)
+        build.update({"result-schema": "ceratops-build-result.v1", "checks": {
+            "compiler": {"uses-artifacts": (
+                [references["bridge"]] if name == "desktop" else [])}}})
+        build["uses-artifacts"] = [references[dependency] for dependency in dependencies[name] if name != "desktop"]
+        record: dict[str, Any] = {"root-dir": ".", "build-after": [references["bridge"]] if name == "desktop" else [],
+                  "artifact": {"type": "archive", "output-directory": ".outputs", "filename-pattern": "*.bin"},
+                  "actions": {"pre-build-checks": {"check-groups": {'source': _no_op(), 'tests': _no_op()}}, "build": build}}
+        if kind == "packages":
+            record["project"] = "source.py"
+        else:
+            record["actions"]["install"] = action("install", name) if name == "desktop" else _no_op()
+        if kind == "mcp-servers":
+            record["actions"]["install"] = {"requires": {"capabilities": []},
+                                                "steps": [{"run": [sys.executable, "-c", "pass"]}]}
+        if kind == "skills":
+            for category, name_of_action in (("source", "source-validate"), ("install", "deploy")):
+                owner = record["actions"]["pre-build-checks"]["check-groups"] if category == "source" else record["actions"]
+                owner[category] = {"requires": {"capabilities": []}, "steps": [{"handoff": {
+                    "lifecycle": "ceratops-skill-lifecycle", "action": name_of_action, "inputs": {"skill": name}}}]}
+        if kind in {"apps", "mcp-servers"}:
+            record["manifest"] = "source.py"
+        data["deliverables"].setdefault(kind, {})[name] = record
+    (root / runner.DEFAULT_CONTRACT).write_text(json.dumps(data))
+    assert run_git(root, "add", ".").returncode == 0
+    assert run_git(root, "commit", "-m", "mixed build declarations").returncode == 0
+    return references
+
+
 def _no_op():
     return {"requires": {"capabilities": []}, "no-op": "Covered in this fixture."}
+
+
+@pytest.mark.parametrize("entry", ["callable", "cli", "promotion", "ship"])
+def test_release_builds_expand_all_kinds_and_pass_exact_outputs(tmp_path, monkeypatch, entry):
+    references = _release_build_graph(tmp_path, monkeypatch)
+    assert run_git(tmp_path, "branch", "-m", "release/local").returncode == 0
+    name = references["desktop"] + ".actions.install"
+    if entry == "cli":
+        process = subprocess.run([sys.executable, str(ROOT / "skills/ceratops-repo-lifecycle/scripts/repository_operation.py"),
+                                  "--repo-root", str(tmp_path), "--operation", name, "--parameter", "target=one"],
+                                 capture_output=True, text=True, check=False)
+        result = json.loads(process.stdout if process.returncode == 0 else process.stderr)
+        assert process.returncode == 0, result
+    elif entry == "promotion":
+        module = runpy.run_path(str(ROOT / "skills/ceratops-repo-lifecycle/scripts/promote-repository.py"))
+        prepared = runner.prepare_operations(tmp_path, [runner.OperationRequest(name, {"target": "one"})])
+        accepted = module["CompletedPromotion"](
+            {"status": "ready", "head": runner.repository_commit(tmp_path), "pending_work_scope": "fixture"},
+            tmp_path, prepared, {"results": []})
+        args = module["build_parser"]().parse_args(["--repo-root", str(tmp_path)])
+        from github_pr_workflow.command import release_write_context
+        with release_write_context(tmp_path):
+            promoted = module["_deploy_completed_promotion"](args, accepted)
+            result = promoted["operations"]
+        module["_completed_deployment"](promoted, accepted.result["head"], repo_root=tmp_path)
+        assert [item["operation"] for item in result["results"]] == [name]
+        assert any(item["operation"].endswith(".actions.build") for item in result["build_results"])
+    elif entry == "ship":
+        # Ship has no per-operation parameter arguments. Bind this repository's
+        # target in its commands, keeping the same declared build graph.
+        path = tmp_path / runner.DEFAULT_CONTRACT
+        document = json.loads(path.read_text())
+        from ceratops_repo_compatibility_engine.sdlc_contract_validation import operation_entries
+        for operation in operation_entries(document).values():
+            assert isinstance(operation, dict)
+            operation.pop("parameters", None)
+            for step in operation.get("steps", []):
+                if "run" in step:
+                    step["run"] = ["one" if arg == "{target}" else arg for arg in step["run"]]
+        path.write_text(json.dumps(document))
+        assert run_git(tmp_path, "add", ".").returncode == 0
+        assert run_git(tmp_path, "commit", "-m", "bound target").returncode == 0
+        from github_pr_workflow import ship_repository
+        commit = runner.repository_commit(tmp_path)
+        code, result, _ = ship_repository._checkpointed_operation_batch(
+            repo_root=tmp_path, contract=runner.DEFAULT_CONTRACT, operations=[name], phase="deployment",
+            target_branch="release/local", target_commit=commit, synchronized_commit=commit,
+        )
+        assert code == 0, result
+    else:
+        result = runner.execute_release_builds(tmp_path, [runner.OperationRequest(name, {"target": "one"})])
+    assert result["status"] == "completed", result
+    order = (tmp_path / ".order").read_text().splitlines()
+    assert len(order) == 7
+    for name, dependency in (("core", "engine"), ("bridge", "core"), ("widget", "core"), ("desktop", "bridge")):
+        assert order.index(f"build:{dependency}:one") < order.index(f"build:{name}:one")
+    assert order[-2:] == ["check:bundle:one", "install:desktop:one"]
+
+
+@pytest.mark.parametrize("point", ["before", "after"])
+def test_release_build_failure_ignores_stale_output_and_can_repeat(tmp_path, monkeypatch, point):
+    references = _release_build_graph(tmp_path, monkeypatch)
+    request = runner.OperationRequest(references["desktop"] + ".actions.install", {"target": "one"})
+    (tmp_path / ".outputs/one").mkdir(parents=True)
+    (tmp_path / ".outputs/one/bridge.bin").write_text("stale earlier output")
+    (tmp_path / ".fault").write_text("bridge:" + point)
+    head = runner.repository_commit(tmp_path)
+    failed = runner.execute_release_builds(tmp_path, [request])
+    assert failed["status"] == "operation_failed", failed
+    assert "install:desktop:one" not in (tmp_path / ".order").read_text()
+    assert runner.repository_commit(tmp_path) == head
+    (tmp_path / ".fault").unlink()
+    result = runner.execute_release_builds(tmp_path, [request], successful_results=failed["results"])
+    assert result["status"] == "completed", result
+    order = (tmp_path / ".order").read_text().splitlines()
+    assert order.count("build:engine:one") == order.count("build:core:one") == 1
+    assert order.count("build:bridge:one") == 2
+    assert order[-1] == "install:desktop:one"
+
+
+def test_release_builds_keep_different_target_outputs_separate(tmp_path, monkeypatch):
+    references = _release_build_graph(tmp_path, monkeypatch)
+    requests = [runner.OperationRequest(references["desktop"] + ".actions.install", {"target": target})
+                for target in ("one", "two")]
+    result = runner.execute_release_builds(tmp_path, requests)
+    assert result["status"] == "completed", result
+    assert [item["target"] for item in result["target_results"]] == ["one", "two"]
+    for target in ("one", "two"):
+        assert (tmp_path / f".outputs/{target}/desktop.bin").read_text() == "desktop:" + target
+
+
+def test_release_builds_preserve_accepted_bytes_receipts_and_original_results(tmp_path, monkeypatch):
+    references = _release_build_graph(tmp_path, monkeypatch)
+    request = runner.OperationRequest(references["desktop"] + ".actions.build", {"target": "one"})
+    first = runner.execute_release_builds(tmp_path, [request], qualification_level="beta")
+    assert first["status"] == "completed", first
+    second = runner.execute_release_builds(tmp_path, [request], successful_results=first["results"])
+    assert second["status"] == "completed", second
+    for old, new in zip([item for item in first["results"] if item["operation"].endswith(".build")],
+                        [item for item in second["results"] if item["operation"].endswith(".build")], strict=True):
+        assert new["build_decision"] == "reused"
+        assert new["step_results"] == old["step_results"]
+        assert new["qualification_level"] == "beta"
+    for original in first["results"]:
+        if original.get("check_group") != "joint" and not original["operation"].endswith(".build"):
+            assert original in second["results"]
+    order = (tmp_path / ".order").read_text().splitlines()
+    assert sum(line.startswith("build:") for line in order) == 5
 
 
 def _fixture(root: pathlib.Path):
@@ -47,18 +247,15 @@ def _fixture(root: pathlib.Path):
     )
     document = {
         "version": 4, "kind": "ceratops-sdlc",
-        "repository": {"capabilities": {}, "actions": {"validate": _no_op(), "test": check}},
+        "repository": {"capabilities": {}, "actions": {"pre-build-checks": {"check-groups": {'source': _no_op(), 'tests': check}}, }},
         "deliverables": {"packages": {"sample": {
-            "source": ".", "project": "source.py", "prerequisites": [],
+            "root-dir": ".", "project": "source.py", "build-after": [],
             "artifact": {"type": "python-wheel", "distribution": "sample",
                          "output-directory": "dist", "filename-pattern": "*.whl"},
-            "actions": {
-                "validate": _no_op(), "test": _no_op(),
-                "build": {"requires": {"capabilities": []}, "steps": [
+            "actions": {"pre-build-checks": {"check-groups": {'source': _no_op(), 'tests': _no_op()}}, "build": {"requires": {"capabilities": []}, "steps": [
                     {"run": [sys.executable, "-c", build]},
                     {"run": [sys.executable, "-c", artifact_check]},
-                ]},
-            },
+                ]}},
         }}},
     }
     write_sdlc_contract(root).write_text(json.dumps(document))
@@ -71,11 +268,11 @@ def _fixture(root: pathlib.Path):
 
 
 def _check(root: pathlib.Path, level="beta"):
-    operation = runner.prepare_operations(root, [runner.OperationRequest("repository.actions.test")])[0]
+    operation = runner.prepare_operations(root, [runner.OperationRequest("repository.actions.pre-build-checks.check-groups.tests")])[0]
     return runner.replace(operation, qualification_level=level)
 
 
-def _phased_repository(root, *, fail_before=False, fail_build_check=False):
+def _phased_repository(root, *, source_failure=None, fail_build_check=False):
     """Real commands log their order and test only explicitly passed build files."""
     _fixture(root)
     contract = root / runner.DEFAULT_CONTRACT
@@ -88,7 +285,13 @@ p.add_argument('--build', action='store_true')
 p.add_argument('--check-group')
 p.add_argument('--artifacts')
 a = p.parse_args()
-with pathlib.Path('order.log').open('a') as f: f.write(('build' if a.build else a.check_group) + '\\n')
+source_failure = SOURCE_FAILURE if a.check_group == 'scan-a' else None
+if source_failure != 'before':
+    with pathlib.Path('order.log').open('a') as f:
+        f.write(('build' if a.build else a.check_group) + '\\n')
+if source_failure:
+    print('source scan failed', file=sys.stderr)
+    sys.exit(3)
 if a.build:
     path = pathlib.Path('wheel.bin'); path.write_bytes(b'current build')
     check = {'id': 'compiler-check', 'status': BUILD_STATUS, 'result_id': 'compiler-result', 'check_version': 'compiler-v1'}
@@ -100,32 +303,74 @@ elif a.check_group == 'unit-tests':
     paths = json.loads(a.artifacts)['deliverables.packages.sample']
     assert len(paths) == 1 and pathlib.Path(paths[0]).read_bytes() == b'current build'
     assert json.loads(os.environ['CERATOPS_TEST_ARTIFACTS']) == json.loads(a.artifacts)
-elif a.check_group == 'scan-a' and FAIL_BEFORE:
-    print('source scan failed', file=sys.stderr); sys.exit(3)
-'''.replace('BUILD_STATUS', repr('failed' if fail_build_check else 'passed')).replace('FAIL_BEFORE', repr(fail_before))
+'''.replace('BUILD_STATUS', repr('failed' if fail_build_check else 'passed')).replace('SOURCE_FAILURE', repr(source_failure))
     (root / "scripts/phases.py").write_text(source)
     (root / "older-installed.bin").write_bytes(b'old installation')
     with (root / ".gitignore").open("a") as output:
         output.write("order.log\nolder-installed.bin\n.build/\n")
-    document["repository"]["actions"]["test"] = {
-        "requires": {"capabilities": []},
-        "steps": [{"run": [sys.executable, "scripts/phases.py"]}],
-        "check-groups": {
-            "scan-a": {"phase": "before-build", "requires-artifacts": []},
-            "scan-b": {"phase": "before-build", "requires-artifacts": []},
-            "unit-tests": {"phase": "after-build", "requires-artifacts": [reference]},
-        },
+    def check(name, artifacts=()):
+        return {"requires": {"capabilities": []}, "uses-artifacts": list(artifacts),
+                "steps": [{"run": [sys.executable, "scripts/phases.py", "--check-group", name,
+                                   "--artifacts", "{artifacts}"]}]}
+
+    document["repository"]["actions"] = {
+        "post-build-checks": {"check-groups": {"unit-tests": check("unit-tests", [reference])}},
+        "pre-build-checks": {"check-groups": {name: check(name) for name in ("scan-a", "scan-b")}},
     }
     document["deliverables"]["packages"]["sample"]["actions"]["build"] = {
         "requires": {"capabilities": []}, "result-schema": "ceratops-build-result.v1",
         "steps": [{"run": [sys.executable, "scripts/phases.py", "--build"]}],
-        "check-groups": {"compiler-check": {"phase": "during-build", "requires-artifacts": []}},
+        "checks": {"compiler-check": {"uses-artifacts": []}},
     }
     contract.write_text(json.dumps(document))
     assert run_git(root, "add", ".").returncode == 0
     assert run_git(root, "commit", "-m", "phases").returncode == 0
-    return [runner.OperationRequest("repository.actions.test"),
-            runner.OperationRequest(reference + ".actions.build")]
+    return [runner.OperationRequest("repository.actions.post-build-checks"),
+            runner.OperationRequest(reference + ".actions.build"),
+            runner.OperationRequest("repository.actions.pre-build-checks")]
+
+
+@pytest.mark.parametrize("entry", ["callable", "cli"])
+def test_direct_pre_build_check_builds_only_the_supplier_and_receives_its_files(tmp_path, entry):
+    _phased_repository(tmp_path)
+    contract = tmp_path / runner.DEFAULT_CONTRACT
+    document = json.loads(contract.read_text())
+    supplier = "deliverables.packages.sample"
+    consumer = "deliverables.packages.consumer"
+    packages = document["deliverables"]["packages"]
+    packages["consumer"] = json.loads(json.dumps(packages["sample"]))
+    native = (
+        "import json, os, pathlib; files=json.loads(os.environ['CERATOPS_TEST_ARTIFACTS']); "
+        f"assert list(files)==[{supplier!r}]; "
+        f"assert pathlib.Path(files[{supplier!r}][0]).read_bytes()==b'current build'; "
+        "with pathlib.Path('order.log').open('a') as f: f.write('consumer-check\\n')"
+    ).replace("; with", "\nwith")
+    checks = packages["consumer"]["actions"]["pre-build-checks"]["check-groups"]
+    checks["test-supplier"] = {
+        "requires": {"capabilities": []}, "uses-artifacts": [supplier],
+        "steps": [{"run": [sys.executable, "-c", native]}],
+    }
+    checks["unrequested"] = {
+        "requires": {"capabilities": []},
+        "steps": [{"run": [sys.executable, "-c", "raise AssertionError('unrequested check')"]}],
+    }
+    contract.write_text(json.dumps(document))
+    assert run_git(tmp_path, "add", ".").returncode == 0
+    assert run_git(tmp_path, "commit", "-m", "declare a pre-build artifact check").returncode == 0
+    location = consumer + ".actions.pre-build-checks.check-groups.test-supplier"
+    if entry == "cli":
+        process = subprocess.run(
+            [sys.executable, str(ROOT / "skills/ceratops-repo-lifecycle/scripts/repository_operation.py"),
+             "--repo-root", str(tmp_path), "--operation", location],
+            capture_output=True, text=True, check=False,
+        )
+        assert process.returncode == 0, process.stdout + process.stderr
+        result = json.loads(process.stdout)
+    else:
+        result = runner.execute_release_builds(tmp_path, [runner.OperationRequest(location)])
+    assert result["status"] == "completed", result
+    assert consumer + ".actions.build" not in result["completed_operations"]
+    assert (tmp_path / "order.log").read_text().splitlines()[-2:] == ["build", "consumer-check"]
 
 
 def test_check_phases_use_current_artifact_and_build_checks_once(tmp_path):
@@ -138,19 +383,29 @@ def test_check_phases_use_current_artifact_and_build_checks_once(tmp_path):
     assert build["check_summary"]["checks"][0]["result_id"] == "compiler-result"
 
 
-@pytest.mark.parametrize("failure", [False, True])
-def test_check_phases_public_cli_preserves_all_independent_results(tmp_path, failure):
-    _phased_repository(tmp_path, fail_before=failure)
-    process = subprocess.run([
+@pytest.mark.parametrize("source_failure", [None, "before", "after"])
+def test_check_phases_public_cli_reports_first_source_failure(tmp_path, source_failure):
+    _phased_repository(tmp_path, source_failure=source_failure)
+    command = [
         sys.executable, str(ROOT / "skills/ceratops-repo-lifecycle/scripts/repository_operation.py"),
         "--repo-root", str(tmp_path), "--operation", "deliverables.packages.sample.actions.build",
-    ], capture_output=True, text=True, check=False)
-    output = json.loads(process.stderr if process.returncode else process.stdout)
-    assert process.returncode == (1 if failure else 0), output
-    groups = [item.get("check_group") for item in output["results"]]
-    assert "scan-a" in groups and "scan-b" in groups
-    assert (tmp_path / "order.log").read_text().splitlines() == (
-        ["scan-a", "scan-b"] if failure else ["scan-a", "scan-b", "build", "unit-tests"])
+    ]
+    order_log = tmp_path / "order.log"
+    for attempt in range(2 if source_failure else 1):
+        process = subprocess.run(command, capture_output=True, text=True, check=False)
+        output = json.loads(process.stderr if process.returncode else process.stdout)
+        assert process.returncode == (1 if source_failure else 0), output
+        order = order_log.read_text().splitlines() if order_log.exists() else []
+        if source_failure:
+            assert output["status"] == "validation_failed"
+            assert output["results"][-1]["check_group"] == "scan-a"
+            assert output["diagnostic"]["exit_code"] == 3
+            assert "source scan failed" in output["message"]
+            assert "deliverables.packages.sample.actions.build" in output["pending_operations"]
+            assert order == (["scan-a"] * (attempt + 1) if source_failure == "after" else [])
+        else:
+            assert output["status"] == "completed"
+            assert order == ["scan-a", "scan-b", "build", "unit-tests"]
 
 
 @pytest.mark.parametrize("format", ["v2", "v3-single", "v3-multiple"])
@@ -177,7 +432,7 @@ def test_check_phases_pass_every_stored_artifact_and_block_partial_output(tmp_pa
     contract = tmp_path / runner.DEFAULT_CONTRACT
     document = json.loads(contract.read_text())
     build = document["deliverables"]["packages"]["sample"]["actions"]["build"]
-    build.pop("check-groups")
+    build.pop("checks")
     build["result-schema"] = receipt["schema"]
     build["steps"] = [{"run": [sys.executable, "scripts/build.py"]}]
     contract.write_text(json.dumps(document))
@@ -247,9 +502,9 @@ def test_check_phases_orders_selected_build_dependencies_and_joint_tests(tmp_pat
     (tmp_path / "scripts/dependency.py").write_text(program)
     (tmp_path / ".gitignore").write_text((tmp_path / ".gitignore").read_text() + "dependency.bin\n")
     data["deliverables"]["packages"]["dependency"] = dependency
-    sample["prerequisites"] = ["dependency"]
-    groups = data["repository"]["actions"]["test"]["check-groups"]
-    groups["unit-tests"]["requires-artifacts"].append("deliverables.packages.dependency")
+    sample["actions"]["build"]["uses-artifacts"] = ["deliverables.packages.dependency"]
+    groups = data["repository"]["actions"]["post-build-checks"]["check-groups"]
+    groups["unit-tests"]["uses-artifacts"].append("deliverables.packages.dependency")
     program = (tmp_path / "scripts/phases.py").read_text().replace(
         "if a.build:\n",
         "if a.build:\n    assert pathlib.Path(json.loads(os.environ['CERATOPS_TEST_ARTIFACTS'])"
@@ -269,12 +524,14 @@ def test_check_phases_orders_selected_build_dependencies_and_joint_tests(tmp_pat
 
 
 @pytest.mark.parametrize("failure", ["source", "compiler"])
-def test_check_phases_finish_independent_checks_and_block_dependents(tmp_path, failure):
-    requests = _phased_repository(tmp_path, fail_before=failure == "source", fail_build_check=failure == "compiler")
+def test_check_phases_block_dependents_on_source_or_build_failure(tmp_path, failure):
+    requests = _phased_repository(
+        tmp_path, source_failure="after" if failure == "source" else None, fail_build_check=failure == "compiler",
+    )
     result = runner.execute_prepared_operations(runner.prepare_operations(tmp_path, requests))
     assert result["status"] in runner.FAILED_STATUSES
     assert (tmp_path / "order.log").read_text().splitlines() == (
-        ["scan-a", "scan-b"] if failure == "source" else ["scan-a", "scan-b", "build"])
+        ["scan-a"] if failure == "source" else ["scan-a", "scan-b", "build"])
     assert not any(item.get("check_group") == "unit-tests" and item["status"] == "completed" for item in result["results"])
 
 
@@ -283,16 +540,158 @@ def test_check_phase_conflicts_name_the_group(tmp_path, problem):
     requests = _phased_repository(tmp_path)
     path = tmp_path / runner.DEFAULT_CONTRACT
     document = json.loads(path.read_text())
-    group = document["repository"]["actions"]["test"]["check-groups"]["scan-a"]
+    group = document["repository"]["actions"]["pre-build-checks"]["check-groups"]["scan-a"]
     if problem == "before-needs-artifact":
-        group["requires-artifacts"] = ["deliverables.packages.sample"]
+        document["deliverables"]["packages"]["sample"]["actions"]["pre-build-checks"] = {
+            "check-groups": {"scan-a": {**group, "uses-artifacts": ["deliverables.packages.sample"]}}
+        }
     elif problem == "unknown-artifact":
-        group.update(phase="after-build", **{"requires-artifacts": ["deliverables.packages.missing"]})
+        group["uses-artifacts"] = ["deliverables.packages.missing"]
     else:
         group["phase"] = "during-build"
     path.write_text(json.dumps(document))
     with pytest.raises(runner.OperationError, match="scan-a"):
         runner.prepare_operations(tmp_path, requests)
+    assert not (tmp_path / "order.log").exists()
+
+
+def test_phase_group_runs_only_its_native_command_without_added_flags(tmp_path):
+    _fixture(tmp_path)
+    path = tmp_path / runner.DEFAULT_CONTRACT
+    document = json.loads(path.read_text())
+    native = "import argparse; argparse.ArgumentParser().parse_args(); print('native scan passed')"
+    document["repository"]["actions"] = {"pre-build-checks": {"check-groups": {
+        "scan": {"requires": {"capabilities": []}, "steps": [{"run": [sys.executable, "-c", native]}]},
+        "other": {"requires": {"capabilities": []}, "steps": [{"run": [sys.executable, "-c", "raise AssertionError('wrong group')"]}]},
+    }}}
+    path.write_text(json.dumps(document))
+    request = runner.OperationRequest("repository.actions.pre-build-checks.check-groups.scan")
+    for _ in range(2):
+        prepared = runner.prepare_operations(tmp_path, [request, request])
+        assert len(prepared) == 1
+        result = runner.execute_prepared_operations(prepared)
+        assert result["status"] == "completed", result
+        assert len(result["results"]) == 1
+
+
+def test_moving_a_check_keeps_its_original_success_and_result_id(tmp_path):
+    _fixture(tmp_path)
+    current = _check(tmp_path)
+    # Record the command through the previous declaration's address. This is
+    # historical evidence, not an accepted old SDLC declaration or runtime alias.
+    previous = runner.replace(current, operation="repository.actions.test", category="tests", check_group=None)
+    original = runner.execute_prepared_operation(previous)
+    assert original["status"] == "completed", original
+    path = reuse.CheckResultStore(tmp_path).current.path
+    saved = path.read_bytes()
+    for _ in range(2):
+        result = runner.execute_prepared_operation(current)
+        assert result["check_decision"] == "reused", result
+        assert result["check_result"] == original["check_result"]
+        assert path.read_bytes() == saved
+    assert (tmp_path / "source-checks.txt").read_text() == "x"
+
+
+@pytest.mark.parametrize("entry", ["callable", "cli"])
+def test_direct_after_build_checks_build_and_receive_their_implicit_own_files(tmp_path, entry):
+    _phased_repository(tmp_path)
+    path = tmp_path / runner.DEFAULT_CONTRACT
+    document = json.loads(path.read_text())
+    after = document["repository"]["actions"].pop("post-build-checks")
+    after["check-groups"]["unit-tests"].pop("uses-artifacts")
+    document["deliverables"]["packages"]["sample"]["actions"]["post-build-checks"] = after
+    path.write_text(json.dumps(document))
+    assert run_git(tmp_path, "add", ".").returncode == 0
+    assert run_git(tmp_path, "commit", "-m", "own output is implicit").returncode == 0
+    name = "deliverables.packages.sample.actions.post-build-checks.check-groups.unit-tests"
+    item = runner.prepare_operations(tmp_path, [runner.OperationRequest(name)])[0]
+    assert item.artifact_references == ("deliverables.packages.sample",)
+    missing = runner.execute_prepared_operation(item)
+    assert missing["status"] == "result_invalid"
+    assert not (tmp_path / "order.log").exists()
+    if entry == "cli":
+        command = [sys.executable, str(ROOT / "skills/ceratops-repo-lifecycle/scripts/repository_operation.py"),
+                   "--repo-root", str(tmp_path), "--operation", name]
+        process = subprocess.run(command, capture_output=True, text=True, check=False)
+        result = json.loads(process.stdout if process.returncode == 0 else process.stderr)
+        assert process.returncode == 0, result
+    else:
+        result = runner.execute_release_builds(tmp_path, [runner.OperationRequest(name)])
+    assert result["status"] == "completed", result
+    assert (tmp_path / "order.log").read_text().splitlines() == ["scan-a", "scan-b", "build", "unit-tests"]
+
+
+def test_changed_own_artifact_prevents_reusing_an_after_build_pass(tmp_path):
+    _fixture(tmp_path)
+    path = tmp_path / runner.DEFAULT_CONTRACT
+    document = json.loads(path.read_text())
+    check = document["repository"]["actions"]["pre-build-checks"]["check-groups"]["tests"]
+    document["deliverables"]["packages"]["sample"]["actions"]["post-build-checks"] = {"check-groups": {"output": check}}
+    path.write_text(json.dumps(document))
+    artifact = tmp_path / "wheel.bin"
+    artifact.write_bytes(b"first build")
+    name = "deliverables.packages.sample.actions.post-build-checks.check-groups.output"
+    def run():
+        prepared = runner.prepare_operations(tmp_path, [runner.OperationRequest(name)],
+            artifacts={"deliverables.packages.sample": [str(artifact)]})
+        return runner.execute_prepared_operation(prepared[0])
+    first = run()
+    assert first["status"] == "completed", first
+    assert run()["check_decision"] == "reused"
+    artifact.write_bytes(b"different build")
+    changed = run()
+    assert changed["check_decision"] == "executed", changed
+    assert changed["check_result"] != first["check_result"]
+    artifact.unlink()
+    assert run()["status"] == "result_invalid"
+    assert (tmp_path / "source-checks.txt").read_text() == "xx"
+
+
+def test_phase_and_explicit_group_requests_run_each_group_once(tmp_path):
+    _phased_repository(tmp_path)
+    requests = [runner.OperationRequest("repository.actions.pre-build-checks"),
+                runner.OperationRequest("repository.actions.pre-build-checks.check-groups.scan-a")]
+    result = runner.execute_release_builds(tmp_path, requests, include_checks=False)
+    assert result["status"] == "completed", result
+    assert (tmp_path / "order.log").read_text().splitlines() == ["scan-a", "scan-b"]
+
+
+def test_direct_after_build_request_uses_supplied_files_without_building(tmp_path):
+    _phased_repository(tmp_path)
+    artifact = tmp_path / "wheel.bin"
+    artifact.write_bytes(b"current build")
+    result = runner.execute_release_builds(tmp_path, [runner.OperationRequest(
+        "repository.actions.post-build-checks.check-groups.unit-tests")],
+        artifacts={"deliverables.packages.sample": [str(artifact)]}, include_checks=False)
+    assert result["status"] == "completed", result
+    assert (tmp_path / "order.log").read_text().splitlines() == ["unit-tests"]
+    assert artifact.read_bytes() == b"current build"
+
+
+@pytest.mark.parametrize("problem", ["old-action", "old-phase", "self", "duplicate", "unknown", "empty-repository", "non-producing"])
+def test_phase_declarations_reject_wrong_routes_and_artifact_requirements(tmp_path, problem):
+    _phased_repository(tmp_path)
+    path = tmp_path / runner.DEFAULT_CONTRACT
+    document = json.loads(path.read_text())
+    actions = document["repository"]["actions"]
+    group = actions["post-build-checks"]["check-groups"]["unit-tests"]
+    if problem == "old-action":
+        actions["test"] = _no_op()
+    elif problem == "old-phase":
+        group["phase"] = "post-build"
+    elif problem == "self":
+        document["deliverables"]["packages"]["sample"]["actions"]["post-build-checks"] = actions.pop("post-build-checks")
+    elif problem == "duplicate":
+        group["uses-artifacts"] *= 2
+    elif problem == "unknown":
+        group["uses-artifacts"] = ["deliverables.packages.missing"]
+    elif problem == "empty-repository":
+        group.pop("uses-artifacts")
+    else:
+        document["deliverables"]["packages"]["sample"]["actions"]["build"] = _no_op()
+    path.write_text(json.dumps(document))
+    with pytest.raises(runner.OperationError):
+        runner.prepare_operations(tmp_path, [runner.OperationRequest("repository.actions.pre-build-checks")])
     assert not (tmp_path / "order.log").exists()
 
 
@@ -306,11 +705,11 @@ def test_git_build_summary_supplies_public_cli_check_without_original_log(tmp_pa
     tag, _ = _tag_summary(tmp_path, "1.0.0b1", original["check_summary"])
     (tmp_path / ".git" / reference["path"]).unlink()
     argv = [sys.executable, str(ROOT / "skills/ceratops-repo-lifecycle/scripts/repository_operation.py"),
-            "--repo-root", str(tmp_path), "--tests", "--qualification-level", "beta"]
+            "--repo-root", str(tmp_path), "--operation", "repository.actions.pre-build-checks.check-groups.tests", "--qualification-level", "beta"]
     for _ in range(2):
         process = subprocess.run(argv, cwd=tmp_path, text=True, capture_output=True, check=False)
         assert process.returncode == 0, process.stdout + process.stderr
-        result = next(item for item in json.loads(process.stdout)["results"] if item["operation"] == "repository.actions.test")
+        result = next(item for item in json.loads(process.stdout)["results"] if item["operation"] == "repository.actions.pre-build-checks.check-groups.tests")
         assert result["check_decision"] == "reused" and result["check_baseline"]["tag"] == tag
         own = next(item for item in result["check_summary"]["checks"] if item.get("kind") == "repository-check")
         assert own["result_id"] == reference["result_id"] and own["qualificationLevel"] == "beta"
@@ -336,7 +735,7 @@ def test_partial_build_reuse_keeps_only_referenced_input_tables():
              "comparisonInputGroup": comparison, "checkGroup": check_group}
     summary = {"schema": "ceratops-check-summary.v1", "inputGroups": inputs,
                "checkGroups": checks, "checks": [parent, child]}
-    prepared = argparse.Namespace(operation="repository.actions.test", commit="a" * 40)
+    prepared = argparse.Namespace(operation="repository.actions.pre-build-checks.check-groups.tests", commit="a" * 40)
     for revision in range(5):
         stale_input, stale_facts = group(f"changed-{revision}")
         stale_check, stale_check_facts = group(f"changed-check-{revision}")
@@ -365,7 +764,7 @@ def test_git_baseline_never_hides_newer_repository_check_failure(tmp_path, monke
     _fixture(tmp_path)
     original = runner.execute_prepared_operation(_check(tmp_path))
     _tag_summary(tmp_path, "1.0.0b1", original["check_summary"])
-    plan = reuse.plan_operation(_check(tmp_path))
+    plan = reuse.decide_check_reuse(_check(tmp_path))
     inputs = plan.context
     writer = runpy.run_path(str(tmp_path / "scripts/check.py"))
 
@@ -388,7 +787,7 @@ def test_later_success_replaces_failure_without_pinning_old_local_history(tmp_pa
     original = runner.execute_prepared_operation(_check(tmp_path))
     _tag_summary(tmp_path, "1.0.0b1", original["check_summary"])
     (tmp_path / ".git" / original["check_result"]["path"]).unlink()
-    plan = reuse.plan_operation(_check(tmp_path))
+    plan = reuse.decide_check_reuse(_check(tmp_path))
     inputs = plan.context
     writer = runpy.run_path(str(tmp_path / "scripts/check.py"))
     identity, path = plan.store.new_result_path()
@@ -404,7 +803,7 @@ def test_later_success_replaces_failure_without_pinning_old_local_history(tmp_pa
         (tmp_path / "source.py").write_text(f"value = {index + 2}\n")
         assert runner.execute_prepared_operation(_check(tmp_path))["status"] == "completed"
     (tmp_path / "source.py").write_text("value = 1\n")
-    fresh = reuse.plan_operation(_check(tmp_path))
+    fresh = reuse.decide_check_reuse(_check(tmp_path))
     assert path.exists()
     assert fresh.decision["decision"] == "reuse"
     assert fresh.decision["build"]["tag"] == "claims/1.0.0b1"
@@ -412,10 +811,10 @@ def test_later_success_replaces_failure_without_pinning_old_local_history(tmp_pa
 
 def test_promotion_pass_is_consumed_by_a_later_package_build(tmp_path, capsys):
     commit = _fixture(tmp_path)
-    assert runner.main(["--repo-root", str(tmp_path), "--tests", "--commit", commit,
+    assert runner.main(["--repo-root", str(tmp_path), "--operation", "repository.actions.pre-build-checks.check-groups.tests", "--commit", commit,
                         "--test-trigger", "promotion"]) == 0
     first = json.loads(capsys.readouterr().out)
-    original = next(item for item in first["results"] if item["operation"] == "repository.actions.test")
+    original = next(item for item in first["results"] if item["operation"] == "repository.actions.pre-build-checks.check-groups.tests")
     assert original["check_decision"] == "executed"
     record_id = original["check_result"]["result_id"]
     # Ordinary outputs are outside the explicitly declared source/check inputs.
@@ -529,7 +928,7 @@ def test_a_successful_exit_cannot_replace_missing_or_conflicting_producer_eviden
         assert result["diagnostic_output"] == str(report_path)
         assert report["owner"]["action"] == "promote"
         assert report["successful_result_paths"] == [str(accepted)]
-        details = report["failures"]["repository.actions.test:1"]
+        details = report["failures"]["repository.actions.pre-build-checks.check-groups.tests:1"]
         assert len(json.dumps(result)) < 5000
     else:
         assert not report_path.exists()
@@ -567,10 +966,10 @@ def test_sdlc_refuses_unsafe_or_unconsumed_check_declarations(tmp_path, declarat
     _fixture(tmp_path)
     path = tmp_path / "sdlc/sdlc.yml"
     data = json.loads(path.read_text())
-    data["repository"]["actions"]["test"]["check-results"] = declaration
+    data["repository"]["actions"]["pre-build-checks"]["check-groups"]["tests"]["check-results"] = declaration
     path.write_text(json.dumps(data))
     with pytest.raises(runner.OperationError):
-        runner.prepare_operations(tmp_path, [runner.OperationRequest("repository.actions.test")])
+        runner.prepare_operations(tmp_path, [runner.OperationRequest("repository.actions.pre-build-checks.check-groups.tests")])
 
 
 def test_saved_corruption_blocks_a_fresh_call_without_repeating_the_check(tmp_path):
@@ -663,7 +1062,7 @@ def test_incomplete_tool_ownership_keeps_path_relevant(tmp_path, monkeypatch, to
     first = runner.execute_prepared_operation(operation)
     assert first["status"] == "completed", first
     monkeypatch.setenv("PATH", str(tmp_path / ".git/other-folder") + os.pathsep + os.environ["PATH"])
-    plan = reuse.plan_operation(operation)
+    plan = reuse.decide_check_reuse(operation)
     assert plan is not None and plan.decision["decision"] == "execute"
     assert (tmp_path / "source-checks.txt").read_text() == "x"
 
@@ -688,7 +1087,7 @@ def test_path_equivalence_does_not_hide_other_changed_inputs(tmp_path, monkeypat
     else:
         step = operation.steps[0]
         operation = runner.replace(operation, steps=(runner.replace(step, argv=(*step.argv, "--changed")),))
-    plan = reuse.plan_operation(operation)
+    plan = reuse.decide_check_reuse(operation)
     assert plan is not None and plan.decision["decision"] == "execute"
     assert (tmp_path / "source-checks.txt").read_text() == "x"
 
@@ -786,12 +1185,12 @@ def test_commit_reporting_requires_starting_git_before_any_build_effect(tmp_path
         build["result-commit-field"] = "resultCommit"
     document = {
         "version": 4, "kind": "ceratops-sdlc",
-        "repository": {"capabilities": {}, "actions": {"validate": _no_op(), "test": _no_op()}},
+        "repository": {"capabilities": {}, "actions": {"pre-build-checks": {"check-groups": {'source': _no_op(), 'tests': _no_op()}}, }},
         "deliverables": {"packages": {"sample": {
-            "source": ".", "project": "sdlc/sdlc.yml", "prerequisites": [],
+            "root-dir": ".", "project": "sdlc/sdlc.yml", "build-after": [],
             "artifact": {"type": "python-wheel", "distribution": "sample",
                          "output-directory": "dist", "filename-pattern": "*.whl"},
-            "actions": {"validate": _no_op(), "test": _no_op(), "build": build},
+            "actions": {"pre-build-checks": {"check-groups": {'source': _no_op(), 'tests': _no_op()}}, "build": build},
         }}},
     }
     write_sdlc_contract(tmp_path).write_text(json.dumps(document))
@@ -876,7 +1275,40 @@ def test_commit_declaration_blocks_unsafe_flow_before_effects(tmp_path, version,
     path.write_text(json.dumps(data))
     requests = [runner.OperationRequest(BUILD_OPERATION)]
     if change == "later-operation":
-        requests.append(runner.OperationRequest("repository.actions.test"))
+        requests.append(runner.OperationRequest("repository.actions.pre-build-checks.check-groups.tests"))
     with pytest.raises(runner.OperationError):
         runner.prepare_operations(tmp_path, requests)
     assert not (tmp_path / "wheel.bin").exists()
+
+
+@pytest.mark.parametrize("flag", ["--validate", "--tests"])
+def test_old_check_switches_are_rejected_before_any_command(tmp_path, flag):
+    _fixture(tmp_path)
+    with pytest.raises(SystemExit) as stopped:
+        runner.main(["--repo-root", str(tmp_path), flag])
+    assert stopped.value.code == 2
+    assert not (tmp_path / "source-checks.txt").exists()
+
+
+def test_explicit_phase_and_group_cli_requests_do_not_guess_group_kind(tmp_path, capsys):
+    phase = "repository.actions.pre-build-checks"
+    groups = {}
+    for name in ("lint-and-unit", "another-check"):
+        groups[name] = {"requires": {"capabilities": []}, "steps": [{"run": [
+            sys.executable, "-c", "from pathlib import Path; "
+            f"p=Path('{name}'); p.write_text(p.read_text()+'x' if p.exists() else 'x')",
+        ]}]}
+    path = write_sdlc_contract(tmp_path)
+    path.write_text(json.dumps({"version": 5, "kind": "ceratops-sdlc",
+                               "repository": {"capabilities": {}, "actions": {
+                                   "pre-build-checks": {"check-groups": groups}}}}))
+    one = phase + ".check-groups.lint-and-unit"
+    for _ in range(2):
+        assert runner.main(["--repo-root", str(tmp_path), "--operation", one]) == 0
+        assert json.loads(capsys.readouterr().out)["completed_operations"] == [one]
+    assert (tmp_path / "lint-and-unit").read_text() == "xx"
+    assert not (tmp_path / "another-check").exists()
+    assert runner.main(["--repo-root", str(tmp_path), "--operation", phase, "--operation", one]) == 0
+    assert len(json.loads(capsys.readouterr().out)["completed_operations"]) == 2
+    assert (tmp_path / "lint-and-unit").read_text() == "xxx"
+    assert (tmp_path / "another-check").read_text() == "x"

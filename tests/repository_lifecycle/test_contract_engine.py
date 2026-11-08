@@ -276,16 +276,13 @@ class GHContractStateEngineTests(unittest.TestCase):
                         "kind": "ceratops-sdlc",
                         "repository": {
                             "capabilities": {},
-                            "actions": {
-                                "validate": {
+                            "actions": {"pre-build-checks": {"check-groups": {'source': {
                                     "requires": {"capabilities": []},
                                     "steps": [{"run": "python -V"}],
-                                },
-                                "test": {
+                                }, 'tests': {
                                     "requires": {"capabilities": []},
                                     "no-op": "No tests in this fixture.",
-                                },
-                            },
+                                }}}, },
                         },
                     }
                 ),
@@ -309,13 +306,13 @@ class GHContractStateEngineTests(unittest.TestCase):
                         "kind": "ceratops-sdlc",
                         "repository": {
                             "capabilities": {},
-                            "actions": {
+                            "actions": {"pre-build-checks": {"check-groups": {
                                 action: {
                                     "requires": {"capabilities": []},
                                     "no-op": f"No {action} in this fixture.",
                                 }
-                                for action in ("validate", "test")
-                            },
+                                for action in ("source", "tests")
+                            }}},
                         },
                     }
                 ),
@@ -432,13 +429,13 @@ class GHContractStateEngineTests(unittest.TestCase):
                         "kind": "ceratops-sdlc",
                         "repository": {
                             "capabilities": {},
-                            "actions": {
+                            "actions": {"pre-build-checks": {"check-groups": {
                                 action: {
                                     "requires": {"capabilities": []},
                                     "no-op": f"No {action} in this fixture.",
                                 }
-                                for action in ("validate", "test")
-                            },
+                                for action in ("source", "tests")
+                            }}},
                         },
                     }
                 ),
@@ -565,13 +562,13 @@ class GHContractStateEngineTests(unittest.TestCase):
                         "kind": "ceratops-sdlc",
                         "repository": {
                             "capabilities": {},
-                            "actions": {
+                            "actions": {"pre-build-checks": {"check-groups": {
                                 action: {
                                     "requires": {"capabilities": []},
                                     "no-op": f"No {action} in this fixture.",
                                 }
-                                for action in ("validate", "test")
-                            },
+                                for action in ("source", "tests")
+                            }}},
                         },
                     }
                 )

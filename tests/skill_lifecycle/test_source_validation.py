@@ -709,8 +709,9 @@ def test_source_validator_rejects_consecutive_name_hyphens(tmp_path: pathlib.Pat
 @pytest.mark.parametrize(
     ("length", "expected_error"),
     [
-        (39, "description is too short"),
-        (40, None),
+        (0, "description must be nonempty"),
+        (1, None),
+        (39, None),
         (1024, None),
         (1025, "description exceeds 1024 characters"),
     ],
@@ -725,7 +726,8 @@ def test_source_validator_enforces_description_boundaries(
     skill_md = repo / "skills" / "alpha-tool" / "SKILL.md"
     lines = skill_md.read_text(encoding="utf-8").splitlines()
     seed = "Manage alpha tool workflows safely across compatible repositories. "
-    lines[2] = f"description: {(seed * (length // len(seed) + 1))[:length]}"
+    description = (seed * (length // len(seed) + 1))[:length]
+    lines[2] = f"description: {json.dumps(description)}"
     skill_md.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
 
     result = subprocess.run(
@@ -742,25 +744,42 @@ def test_source_validator_enforces_description_boundaries(
         assert expected_error in result.stderr
 
 
-def test_source_validator_accepts_supported_optional_frontmatter(
+@pytest.mark.parametrize(
+    "metadata",
+    [None, "interface:\n  display_name: Workflow Desk\n  short_description: Check product release evidence\n"],
+)
+def test_source_validator_accepts_published_skill_format(
     tmp_path: pathlib.Path,
+    metadata: str | None,
 ) -> None:
-    repo = tmp_path / "compatible"
+    repo = tmp_path / "ceratops"
     create_compatible_repo(repo, "example/compatible", ["alpha-tool"])
+    manifest_path = repo / "skills" / "skill-sections.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["validation_profile"] = "ceratops"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     skill_md = repo / "skills" / "alpha-tool" / "SKILL.md"
     lines = skill_md.read_text(encoding="utf-8").splitlines()
     closing_marker = lines.index("---", 1)
-    lines[closing_marker:closing_marker] = [
+    lines[closing_marker:] = [
         "license: Apache-2.0",
         "compatibility: Requires a local Git checkout.",
         "metadata:",
         "  owner: platform",
         "allowed-tools: Read Write",
+        "---",
+        "",
+        "Stay within the selected repository and report the result.",
     ]
     skill_md.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+    openai_yaml = skill_md.parent / "agents" / "openai.yaml"
+    if metadata is None:
+        openai_yaml.unlink()
+    else:
+        openai_yaml.write_text(metadata, encoding="utf-8", newline="\n")
 
     result = subprocess.run(
-        [sys.executable, str(VALIDATOR), "--repo-root", str(repo), "--mode", "full"],
+        [sys.executable, str(VALIDATOR), "--repo-root", str(repo), "--mode", "skill", "--skill", "alpha-tool"],
         capture_output=True,
         text=True,
         check=False,
@@ -773,6 +792,7 @@ def test_source_validator_accepts_supported_optional_frontmatter(
     ("declaration", "expected_error"),
     [
         (["owner: platform"], "frontmatter has unsupported fields: owner"),
+        (['compatibility: ""'], "compatibility must be nonempty"),
         ([f"compatibility: {'x' * 501}"], "compatibility exceeds 500 characters"),
         (["metadata:", "  owner: 7"], "metadata must map strings to strings"),
         (["allowed-tools:", "  - Read"], "allowed-tools must be a string"),
@@ -802,34 +822,52 @@ def test_source_validator_rejects_invalid_optional_frontmatter(
     assert expected_error in result.stderr
 
 
-def test_source_validator_accepts_openai_dependencies_and_policy(
+@pytest.mark.parametrize(
+    ("profile", "implicit_invocation", "expected_error"),
+    [
+        ("ceratops", True, None),
+        ("ceratops", False, "policy.allow_implicit_invocation must be true"),
+        ("ceratops-compatible", False, None),
+    ],
+)
+def test_source_validator_checks_optional_openai_metadata_and_invocation(
     tmp_path: pathlib.Path,
+    profile: str,
+    implicit_invocation: bool,
+    expected_error: str | None,
 ) -> None:
-    repo = tmp_path / "compatible"
+    repo = tmp_path / "skills-repo"
     create_compatible_repo(repo, "example/compatible", ["alpha-tool"])
+    manifest_path = repo / "skills" / "skill-sections.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["validation_profile"] = profile
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     openai_yaml = repo / "skills" / "alpha-tool" / "agents" / "openai.yaml"
     openai_yaml.write_text(
-        openai_yaml.read_text(encoding="utf-8")
-        + "dependencies:\n"
+        "dependencies:\n"
         + "  tools:\n"
         + "    - type: mcp\n"
         + "      value: github\n"
         + "      description: GitHub MCP server\n"
         + "      transport: streamable_http\n"
         + "policy:\n"
-        + "  allow_implicit_invocation: false\n",
+        + f"  allow_implicit_invocation: {str(implicit_invocation).lower()}\n",
         encoding="utf-8",
         newline="\n",
     )
 
     result = subprocess.run(
-        [sys.executable, str(VALIDATOR), "--repo-root", str(repo), "--mode", "full"],
+        [sys.executable, str(VALIDATOR), "--repo-root", str(repo), "--mode", "skill", "--skill", "alpha-tool"],
         capture_output=True,
         text=True,
         check=False,
     )
 
-    assert result.returncode == 0, result.stderr
+    if expected_error is None:
+        assert result.returncode == 0, result.stderr
+    else:
+        assert result.returncode == 1
+        assert expected_error in result.stderr
 
 
 @pytest.mark.parametrize(

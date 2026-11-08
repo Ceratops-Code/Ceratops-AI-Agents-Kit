@@ -70,21 +70,18 @@ def test_promote_repository_runs_explicit_operation_ids_in_order(
     }
     repository: dict[str, Any] = {
         "capabilities": {},
-        "actions": {"validate": no_op, "test": no_op},
+        "actions": {"pre-build-checks": {"check-groups": {'source': no_op, 'tests': no_op}}, },
     }
     deliverables: dict[str, Any] = {
         "apps": {
             name: {
-                "source": ".",
+                "root-dir": ".",
                 "manifest": "ordered-operation.py",
-                "prerequisites": [],
-                "actions": {
-                    "validate": no_op,
-                    "install": operation(
+                "build-after": [],
+                "actions": {"pre-build-checks": {"check-groups": {'source': no_op}}, "install": operation(
                         name,
                         needs_generation=validation_mode == "parameter",
-                    ),
-                },
+                    )},
             }
             for name in ("promotion-check", "custom-deploy")
         }
@@ -92,17 +89,17 @@ def test_promote_repository_runs_explicit_operation_ids_in_order(
     selection: list[str] = []
     checks: list[str] = []
     if validation_mode != "absent":
-        repository["actions"]["validate"] = operation("repository-check")
-        deliverables["apps"]["custom-deploy"]["actions"]["validate"] = operation(
+        repository["actions"]["pre-build-checks"]["check-groups"]["source"] = operation("repository-check")
+        deliverables["apps"]["custom-deploy"]["actions"]["pre-build-checks"]["check-groups"]["source"] = operation(
             "deliverable-check"
         )
         checks = ["repository-check", "deliverable-check"]
     if validation_mode == "explicit":
         selection = [
             "--validation-operation",
-            "repository.actions.validate",
+            "repository.actions.pre-build-checks.check-groups.source",
             "--validation-operation",
-            "deliverables.apps.custom-deploy.actions.validate",
+            "deliverables.apps.custom-deploy.actions.pre-build-checks.check-groups.source",
         ]
     elif validation_mode == "invalid-selection":
         selection = ["--run-operation", "deliverables.apps.missing.actions.install"]
@@ -1038,16 +1035,13 @@ def test_promotion_repairs_and_revalidates_the_final_commit_before_deployment(
         repo,
         repository={
             "capabilities": {},
-            "actions": {
-                "validate": {
+            "actions": {"pre-build-checks": {"check-groups": {'source': {
                     "requires": {"capabilities": []},
                     "steps": [{"run": [sys.executable, "custom-quality.py"]}],
-                },
-                "test": {
+                }, 'tests': {
                     "requires": {"capabilities": []},
                     "no-op": "Fixture has no test command.",
-                },
-            },
+                }}}, },
         },
     )
     assert run_git(repo, "add", ".").returncode == 0
@@ -1057,9 +1051,9 @@ def test_promotion_repairs_and_revalidates_the_final_commit_before_deployment(
 
         path = repo / "sdlc/sdlc.yml"
         document = yaml.safe_load(path.read_text())
-        actions = document["repository"]["actions"]
-        actions["test"] = actions["validate"]
-        actions["validate"] = {
+        groups = document["repository"]["actions"]["pre-build-checks"]["check-groups"]
+        groups["tests"] = groups["source"]
+        groups["source"] = {
             "requires": {"capabilities": []},
             "no-op": "Fixture has no validation command.",
         }
@@ -1082,9 +1076,7 @@ def test_promotion_repairs_and_revalidates_the_final_commit_before_deployment(
     )
     evidence = json.loads(failed.stderr)
     assert failed.returncode == 1
-    assert evidence["status"] == (
-        "validation_failed" if gate == "validate" else "tests_failed"
-    )
+    assert evidence["status"] == "validation_failed"
     assert evidence["phase"] == "promotion_validation"
     assert evidence["commit"] == broken
     assert pathlib.Path(evidence["pending_work_scope"]).is_file()
@@ -1105,7 +1097,7 @@ def test_promotion_repairs_and_revalidates_the_final_commit_before_deployment(
             cwd: pathlib.Path,
         ) -> tuple[int, dict[str, Any]]:
             code, result = original_run_command_for_json(argv, cwd)
-            if "--validate" in argv and code == 0:
+            if "--test-trigger" in argv and code == 0:
                 (repo / "quality.txt").write_text("changed", encoding="utf-8")
                 if mutation == "head":
                     assert run_git(repo, "add", "quality.txt").returncode == 0

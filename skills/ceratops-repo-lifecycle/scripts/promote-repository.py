@@ -50,12 +50,13 @@ from repository_operation import (
     OperationError,
     OperationRequest,
     PreparedOperation,
-    execute_prepared_operations,
+    execute_release_builds,
     operation_category,
     parse_parameters,
     prepare_operations,
     remove_operation_failures,
     require_clean_commit,
+    validation_operations,
 )
 from sdlc_results import _unique_result_object
 
@@ -270,19 +271,17 @@ def _validation_command(
         str(repo_root),
         "--sdlc-contract",
         str(args.sdlc_contract),
-        "--validate",
-        "--tests",
         "--commit",
         commit,
         "--test-trigger",
         "promotion",
     ]
-    for operation in args.validation_operation or []:
-        command.extend(("--validation-operation", operation))
-    for operation in args.run_operation or []:
-        command.extend(("--operation", operation))
+    checks = validation_operations(repo_root, args.run_operation or [], args.validation_operation, args.sdlc_contract)
+    for operation in checks:
+        if operation_category(operation) == "pre-build-checks":
+            command.extend(("--operation", operation))
     for parameter in args.parameter or []:
-        command.extend(("--parameter", parameter))
+        command.extend(("--parameter-if-declared", parameter))
     if diagnostic_output := getattr(args, "diagnostic_output", None):
         command.extend((
             "--diagnostic-output", str(diagnostic_output),
@@ -402,7 +401,7 @@ def _promotion_inputs(args: argparse.Namespace) -> tuple[pathlib.Path, list[str]
         if args.release_branch in branches or args.main_branch in branches:
             raise PromotionError("Source branches cannot be release or main.")
     _operation_ids(args.run_operation, "deploy-local")
-    _operation_ids(args.validation_operation, "validate")
+    _operation_ids(args.validation_operation, "pre-build-checks")
     _operation_ids(args.publish_operation, "publish")
     _operation_ids(args.deploy_operation, "deploy-local")
     if args.parameter and args.run_operation is None:
@@ -691,8 +690,11 @@ def _deploy_completed_promotion(
     with _timed_phase(timings, "deployment", diagnostic_output=getattr(args, "diagnostic_output", None)):
         try:
             require_clean_commit(repo_root, target_commit)
-            operations = execute_prepared_operations(
-                prepared_operations,
+            operations = execute_release_builds(
+                repo_root,
+                [OperationRequest(item.operation, parameters=dict(item.parameters))
+                 for item in prepared_operations], getattr(args, "sdlc_contract", DEFAULT_SDLC_CONTRACT),
+                expected_commit=target_commit, qualification_level="beta",
                 diagnostic_output=getattr(args, "diagnostic_output", None),
                 diagnostic_owner=(args.repo_root, "promote"),
                 successful_results=validation["results"],
@@ -723,6 +725,13 @@ def _deploy_completed_promotion(
                 **operations, "phase": "deployment", "promotion": dict(accepted.result),
                 "remote_mutation": False,
             })
+    delivery_names = {item.operation for item in prepared_operations}
+    operations["build_results"] = [*operations.get("build_results", []), *(
+        item for item in operations.get("results", []) if item["operation"] not in delivery_names
+    )]
+    operations["results"] = [
+        item for item in operations.get("results", []) if item["operation"] in delivery_names
+    ]
     operations["completed_operations"] = [
         operation_result["operation"]
         for operation_result in operations.get("results", [])

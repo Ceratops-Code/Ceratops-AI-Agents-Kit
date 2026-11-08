@@ -217,12 +217,11 @@ def test_auto_promotion_context_is_bound_before_collection(
         "ordinary",
         "promotion",
         "missing-commit",
-        "missing-tests",
         "ci",
         "detached",
     ],
 )
-def test_promotion_hands_context_through_sdlc_only_to_tests(
+def test_promotion_hands_context_through_sdlc_to_requested_checks(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
     context: str,
@@ -242,20 +241,20 @@ def test_promotion_hands_context_through_sdlc_only_to_tests(
         "kind": "ceratops-sdlc",
         "repository": {
             "capabilities": {},
-            "actions": {
-                "validate": {
+            "actions": {"pre-build-checks": {"check-groups": {'source': {
                     "requires": {"capabilities": []},
                     "steps": [
                         {
                             "run": [
                                 sys.executable,
                                 "-c",
-                                "import os; assert 'CERATOPS_SDLC_TEST_CONTEXT' not in os.environ",
+                                "import os,pathlib; "
+                                f"pathlib.Path({str(record)!r} + '.source').write_text("
+                                "os.environ.get('CERATOPS_SDLC_TEST_CONTEXT', 'null'))",
                             ]
                         }
                     ],
-                },
-                "test": {
+                }, 'tests': {
                     "requires": {"capabilities": []},
                     "steps": [
                         {
@@ -270,8 +269,7 @@ def test_promotion_hands_context_through_sdlc_only_to_tests(
                             ]
                         }
                     ],
-                },
-            },
+                }}}, },
         },
     }
     (repo / "sdlc/sdlc.yml").write_text(json.dumps(contract), encoding="utf-8")
@@ -300,14 +298,13 @@ def test_promotion_hands_context_through_sdlc_only_to_tests(
         parameter=[],
     )
     command = workflow["_validation_command"](args, repo, commit)
-    assert command[-2:] == ["--test-trigger", "promotion"]
+    trigger_index = command.index("--test-trigger")
+    assert command[trigger_index + 1] == "promotion"
     if context == "ordinary":
-        command = command[:-2]
+        del command[trigger_index:trigger_index + 2]
     elif context == "missing-commit":
         index = command.index("--commit")
         del command[index : index + 2]
-    elif context == "missing-tests":
-        command.remove("--tests")
     elif context == "ci":
         command.append("--ci")
     elif context == "detached":
@@ -321,7 +318,7 @@ def test_promotion_hands_context_through_sdlc_only_to_tests(
         assert result.returncode != 0
         assert not record.exists()
         assert (
-            "test context requires" in result.stderr
+            "check context requires" in result.stderr
             or "require a checked-out release branch" in result.stderr
         )
         return
@@ -332,6 +329,7 @@ def test_promotion_hands_context_through_sdlc_only_to_tests(
         else None
     )
     assert json.loads(record.read_text()) == expected
+    assert json.loads(pathlib.Path(str(record) + ".source").read_text()) == expected
     assert "CERATOPS_SDLC_TEST_CONTEXT" not in os.environ
 
 
@@ -1147,6 +1145,16 @@ def test_revision_mode_requires_two_full_commit_shas(
         blocked_parent = tmp_path / "blocked"
         blocked_parent.write_text("existing file", encoding="utf-8")
         diagnostic = blocked_parent / "failure.json"
+        partial = blocked_parent / ".failure.in_process.json"
+        original_unlink = pathlib.Path.unlink
+
+        def unlink(path: pathlib.Path, missing_ok: bool = False) -> None:
+            # Exercise POSIX's error for a blocked parent on Windows too.
+            if path == partial:
+                raise NotADirectoryError(str(blocked_parent))
+            original_unlink(path, missing_ok=missing_ok)
+
+        monkeypatch.setattr(pathlib.Path, "unlink", unlink)
     monkeypatch.setattr(runner, "DEFAULT_DIAGNOSTIC_PATH", diagnostic)
     output_arguments = (
         [] if output_kind == "default" else ["--diagnostic-output", str(diagnostic)]
@@ -1296,15 +1304,18 @@ def test_manifest_validation_mode_collects_every_declared_target(
 
 
 def test_committed_diff_reports_unmapped_retired_configuration(
-    test_runner_module: Any, capsys: pytest.CaptureFixture[str]
+    test_runner_module: Any, capsys: pytest.CaptureFixture[str], tmp_path: pathlib.Path,
 ) -> None:
     """A mapped addition does not conceal an unknown deleted input."""
     runner = test_runner_module
     execution = DeterministicExecution(
         runner, b"D\0deploy/deploy.yml\0A\0sdlc/sdlc.yml\0"
     )
+    managed = ROOT / runner.DEFAULT_DIAGNOSTIC_PATH
+    existing = managed.read_bytes() if managed.exists() else None
+    diagnostic = tmp_path / "retired-configuration.json"
     exit_code = runner.execute(
-        ["--base", BASE, "--head", HEAD],
+        ["--base", BASE, "--head", HEAD, "--diagnostic-output", str(diagnostic)],
         repo_root=ROOT,
         text_runner=execution.text,
         bytes_runner=execution.bytes,
@@ -1312,6 +1323,8 @@ def test_committed_diff_reports_unmapped_retired_configuration(
     result = payload(capsys)
 
     assert exit_code == runner.MAPPING_GAP_EXIT_CODE
+    assert diagnostic.is_file()
+    assert (managed.read_bytes() if managed.exists() else None) == existing
     assert result["mapping_gaps"][0]["path"] == "deploy/deploy.yml"
     assert result["full_suite"] is False
     assert result["full_suite_fallback"] is False

@@ -10,11 +10,13 @@ import pathlib
 import runpy
 import shutil
 import sys
+from dataclasses import replace
 
 import pytest
 
 from tests.repository_lifecycle.test_sdlc_handoffs import (
     _bound_test_build,
+    _build_receipt_fixture,
     _checkpoint_child,
     _new_receipt_fixtures,
     _prepared_versioned_completion,
@@ -87,11 +89,11 @@ def _worktree_build_case(tmp_path):
     _write_fixture_bytes(repository, "unrelated.txt", b"original")
     _write_fixture_bytes(repository, ".gitignore", b".build-count\n.fail-build\n")
     no_op = {"requires": {"capabilities": []}, "no-op": "No additional checks for this fixture."}
-    contract = {"version": 5, "kind": "ceratops-sdlc", "repository": {"capabilities": {}, "actions": {"validate": no_op, "test": no_op}},
+    contract = {"version": 5, "kind": "ceratops-sdlc", "repository": {"capabilities": {}, "actions": {"pre-build-checks": {"check-groups": {'source': no_op, 'tests': no_op}}, }},
                 "deliverables": {"packages": {"claims": {
-                    "source": ".", "project": "pyproject.toml", "prerequisites": [],
+                    "root-dir": ".", "project": "pyproject.toml", "build-after": [],
                     "artifact": {"type": "python-wheel", "distribution": "claims", "output-directory": "dist", "filename-pattern": "*.whl"},
-                    "actions": {"validate": no_op, "test": no_op, "build": {"requires": {"capabilities": []},
+                    "actions": {"pre-build-checks": {"check-groups": {'source': no_op, 'tests': no_op}}, "build": {"requires": {"capabilities": []},
                         "parameters": ["version", "artifact_directory"],
                         "steps": [{"run": [sys.executable, "scripts/build.py", "{artifact_directory}", "{version}"]}]}}
                 }}}}
@@ -101,7 +103,7 @@ def _worktree_build_case(tmp_path):
     _write_fixture_bytes(repository, "unrelated.txt", b"keep staged change")
     assert run_git(repository, "add", "unrelated.txt").returncode == 0
     prepare = [sys.executable, "-c", "import pathlib,sys;pathlib.Path('version.txt').write_text(sys.argv[1])", "{version}"]
-    options = {"repository": "example/project", "release_unit": "claims", "version": version,
+    options = {"repository": "example/project", "release_bundle": "claims", "version": version,
                "required_targets": [target], "attempt_id": "worktree-build", "source_paths": ["version.txt"],
                "requests": {target: [runner.OperationRequest("deliverables.packages.claims.actions.build")]},
                "preparation_commands": [prepare], "describe_receipt": lambda _transaction, _target, _batch: receipt}
@@ -116,12 +118,47 @@ def test_worktree_build_commits_selected_source_and_finishes_once(tmp_path):
     assert run_git(repository, "show", result["tag"] + ":unrelated.txt").stdout == "original"
     assert run_git(repository, "diff", "--cached", "--name-only").stdout.strip() == "unrelated.txt"
     assert (repository / ".build-count").read_text() == "x"
+
     selected = results.read_build_check_summary(repository, result["tag"],
                                                 pathlib.Path(result["build_receipts"][0]).relative_to(repository).as_posix())
     assert selected["summary"]["checks"]
+    assert selected["receipt"]["identity"]["releaseBundle"] == options["release_bundle"]
+    assert "releaseUnit" not in selected["receipt"]["identity"]
     again = runner.execute_worktree_build(repository, **options)
     assert again["status"] == "completed" and again["final_commit"] == result["final_commit"], again
     assert (repository / ".build-count").read_text() == "x"
+
+
+def test_release_build_consumes_existing_tagged_receipt_without_starting_builder(tmp_path):
+    repository, options = _worktree_build_case(tmp_path)
+    contract_path = repository / runner.DEFAULT_CONTRACT
+    contract = json.loads(contract_path.read_text())
+    reference = "deliverables.packages.claims"
+    contract["repository"]["release-bundles"] = {"claims": {"members": [reference]}}
+    action = contract["deliverables"]["packages"]["claims"]["actions"]["build"]
+    action["parameters"].append("target")
+    action["steps"][0]["run"].append("{target}")
+    contract_path.write_text(json.dumps(contract))
+    assert run_git(repository, "add", ".").returncode == 0
+    assert run_git(repository, "commit", "-m", "single-member unit").returncode == 0
+    first = runner.execute_worktree_build(repository, **options)
+    assert first["status"] == "completed", first
+    request = runner.OperationRequest(reference + ".actions.build", {
+        "target": options["required_targets"][0], "version": first["version"],
+        "artifact_directory": str(repository / ".unused-output"),
+    })
+    for _ in range(2):
+        result = runner.execute_release_builds(repository, [request], qualification_level="beta")
+        assert result["status"] == "completed", result
+        built = next(item for item in result["results"] if item["operation"].endswith(".build"))
+        assert built["build_decision"] == "reused" and built["build_tag"] == first["tag"]
+        assert (repository / ".build-count").read_text() == "x"
+        assert not (repository / ".unused-output").exists()
+    # The saved receipt contains no custom builder options; their absence
+    # cannot stand for proof that this package was built with today's options.
+    prepared = runner.prepare_operations(repository, [request])[0]
+    builds = importlib.import_module("run_build_operations")
+    assert builds.recorded_build(replace(prepared, parameters=(*prepared.parameters, ("mode", "debug"))), {}) is None
 
 
 def test_worktree_build_failure_preserves_cause_without_receipt_or_tag(tmp_path):
@@ -171,16 +208,18 @@ def test_worktree_build_repeats_commit_and_completion_handoffs(tmp_path, monkeyp
     assert run_git(repository, "log", "--format=%s").stdout.count("Prepare claims") == 1
 
 
-@pytest.fixture(params=["installed", "portable", "generated"])
+@pytest.fixture(params=["installed", "portable", "generated", "reference"])
 def build_reader(request, tmp_path):
     if request.param == "installed":
         return vars(results)
     root = pathlib.Path(__file__).resolve().parents[2]
     path = root / "scripts/result_records.py"
     if request.param == "generated":
-        path = tmp_path / "generated.py"
-        source = (root / "skills/ceratops-repo-lifecycle/references/templates/run-tests.py.tmpl").read_text()
-        path.write_text(source.replace("__TEST_TARGETS__", "['tests']"))
+        from tests.repository_lifecycle.test_generated_test_scripts import _write_generated_runner
+
+        path = _write_generated_runner(tmp_path / "generated", ["tests"])
+    elif request.param == "reference":
+        path = root / "docs/result_records.py.tmpl"
     return runpy.run_path(str(path))
 
 
@@ -229,7 +268,7 @@ def test_tagged_summary_hash_mismatch_blocks_reuse(tmp_path, build_reader):
 def test_summary_and_receipt_writes_repeat_without_early_tag(tmp_path, monkeypatch, boundary, effect):
     repository, commit = _versioned_repository(tmp_path)
     target, version = "python-3.14-windows", "1.2.10b1"
-    transaction = _bound_test_build(repository, repository="example/project", release_unit="claims", version=version,
+    transaction = _bound_test_build(repository, repository="example/project", release_bundle="claims", version=version,
                                     required_targets=[target], attempt_id="summary-effects", pre_test_commit=commit)
     receipt = _versioned_build_receipt(tmp_path, commit=commit, version=version, target=target,
                                        required_targets=[target], attempt_id="summary-effects")
@@ -256,7 +295,7 @@ def test_summary_and_receipt_writes_repeat_without_early_tag(tmp_path, monkeypat
 def test_failed_compact_check_cannot_create_completed_receipt(tmp_path):
     repository, commit = _versioned_repository(tmp_path)
     target, version = "python-3.14-windows", "1.2.10b1"
-    transaction = _bound_test_build(repository, repository="example/project", release_unit="claims", version=version,
+    transaction = _bound_test_build(repository, repository="example/project", release_bundle="claims", version=version,
                                     required_targets=[target], attempt_id="summary-failure", pre_test_commit=commit)
     receipt = _versioned_build_receipt(tmp_path, commit=commit, version=version, target=target,
                                        required_targets=[target], attempt_id="summary-failure")
@@ -273,7 +312,7 @@ def test_failed_compact_check_cannot_create_completed_receipt(tmp_path):
 def test_completion_binds_original_summary_facts_to_current_source(tmp_path, changed):
     repository, commit = _versioned_repository(tmp_path)
     target, version = "python-3.14-windows", "1.2.11b1"
-    transaction = _bound_test_build(repository, repository="example/project", release_unit="claims", version=version,
+    transaction = _bound_test_build(repository, repository="example/project", release_bundle="claims", version=version,
                                     required_targets=[target], attempt_id="summary-inputs", pre_test_commit=commit)
     receipt = _versioned_build_receipt(tmp_path, commit=commit, version=version, target=target,
                                        required_targets=[target], attempt_id="summary-inputs")
@@ -315,7 +354,7 @@ def test_versioned_receipts_persist_exact_multi_target_direct_state(tmp_path) ->
     transaction = _bound_test_build(
         repository,
         repository="example/project",
-        release_unit="claims",
+        release_bundle="claims",
         version="1.2.3b1",
         required_targets=targets,
         attempt_id=attempt_id,
@@ -378,7 +417,7 @@ def test_versioned_receipt_rejects_changed_tested_artifact(tmp_path) -> None:
     transaction = _bound_test_build(
         repository,
         repository="example/project",
-        release_unit="claims",
+        release_bundle="claims",
         version="1.2.4b1",
         required_targets=[target],
         attempt_id="attempt-beta-002",
@@ -427,7 +466,7 @@ def test_versioned_completion_repeats_before_and_after_each_effect(tmp_path, mon
         with pytest.raises(OSError, match="completion interrupted"):
             runner.complete_versioned_build(transaction, prepared)
     fresh = runner.read_versioned_build(
-        repository, repository=transaction.repository, release_unit=transaction.release_unit,
+        repository, repository=transaction.repository, release_bundle=transaction.release_bundle,
         version=transaction.version, required_targets=transaction.required_targets,
     )
     done = runner.complete_versioned_build(fresh)
@@ -503,7 +542,7 @@ def test_versioned_retention_keeps_three_and_tag_blocks_pruned_reuse(
     transaction = _bound_test_build(
         repository,
         repository="example/project",
-        release_unit="claims",
+        release_bundle="claims",
         version="1.2.3a5",
         required_targets=[target],
         attempt_id="attempt-alpha-005",
@@ -516,7 +555,7 @@ def test_versioned_retention_keeps_three_and_tag_blocks_pruned_reuse(
     sentinel.write_bytes(b"pending output stays protected")
 
     next_build = _bound_test_build(
-        repository, repository="example/project", release_unit="claims",
+        repository, repository="example/project", release_bundle="claims",
         version=versions[0], required_targets=[target],
         attempt_id="attempt-alpha-reuse", pre_test_commit=commit,
     )
@@ -587,7 +626,7 @@ def test_versioned_fresh_instance_discovers_attempt_and_reuses_prepared_results(
     mtimes = {item.worktree_path: item.worktree_path.stat().st_mtime_ns for item in prepared}
     request_bytes = transaction.request_path.read_bytes()
     fresh = _checkpoint_child(repository,
-        "transaction=repository_operation.read_versioned_build(repo,repository='example/project',release_unit='claims',"
+        "transaction=repository_operation.read_versioned_build(repo,repository='example/project',release_bundle='claims',"
         "version='1.2.5b1',required_targets=['python-3.14-linux','python-3.14-windows'])\n"
         "print(transaction.attempt_id)\n"
         "prepared=complete_artifact_builds.load_prepared_versioned_receipts(transaction)\n"
@@ -599,7 +638,7 @@ def test_versioned_fresh_instance_discovers_attempt_and_reuses_prepared_results(
     assert not (transaction.store.parent / "operations/artifact-versions").exists()
     assert not (transaction.store.parent / "locks/artifact-versions").exists()
     repeated = _bound_test_build(
-        repository, repository=transaction.repository, release_unit=transaction.release_unit,
+        repository, repository=transaction.repository, release_bundle=transaction.release_bundle,
         version=transaction.version, required_targets=transaction.required_targets,
         pre_test_commit=checkpoint,
     )
@@ -607,7 +646,7 @@ def test_versioned_fresh_instance_discovers_attempt_and_reuses_prepared_results(
     # New unrelated commits do not invalidate the exact B inputs.
     assert run_git(repository, "commit", "--allow-empty", "-m", "unrelated").returncode == 0
     reused = runner.allocate_versioned_build(
-        repository, repository=transaction.repository, release_unit=transaction.release_unit,
+        repository, repository=transaction.repository, release_bundle=transaction.release_bundle,
         version=transaction.version, required_targets=transaction.required_targets,
     )
     assert reused == repeated
@@ -625,7 +664,7 @@ def test_versioned_completion_needs_no_checkpoint_directory(tmp_path) -> None:
 def test_versioned_request_may_own_multiple_units_without_premature_cleanup(tmp_path) -> None:
     repository, checkpoint, transaction, prepared, _receipts = _prepared_versioned_completion(tmp_path)
     other = _bound_test_build(repository, repository=transaction.repository,
-        release_unit="other-unit", version="1.0.0", required_targets=["any"],
+        release_bundle="other-unit", version="1.0.0", required_targets=["any"],
         pre_test_commit=checkpoint, attempt_id="other-unit-attempt")
     runner.complete_versioned_build(transaction, prepared)
     assert other.request_path.is_file()
@@ -650,7 +689,7 @@ def test_versioned_cleanup_failure_retries_without_repeating_completed_effects(t
         "def forbid(*args,**kwargs): raise AssertionError('completed effect repeated')\n"
         "for name in ('_prepared_receipt_set','_resolve_result_commit','_write_version_artifact_receipts','_create_artifact_tag'):\n"
         " setattr(complete_artifact_builds,name,forbid)\n"
-        "transaction=repository_operation.read_versioned_build(repo,repository='example/project',release_unit='claims',"
+        "transaction=repository_operation.read_versioned_build(repo,repository='example/project',release_bundle='claims',"
         "version='1.2.5b1',required_targets=['python-3.14-linux','python-3.14-windows'])\n"
         "result=repository_operation.complete_versioned_build(transaction)\n"
         "print(result.final_commit)\n", checkpoint)
@@ -698,7 +737,7 @@ def test_versioned_completion_resumes_effects_without_duplicate_commit(
     if interruption == "after-commit":
         transaction.artifact_receipt(transaction.required_targets[0]).write_bytes(b"{")
         assert not storage._artifact_tag_exists(
-            repository, transaction.release_unit, transaction.version
+            repository, transaction.release_bundle, transaction.version
         )
     elif interruption == "after-receipts":
         assert all(
@@ -714,7 +753,7 @@ def test_versioned_completion_resumes_effects_without_duplicate_commit(
             )
     else:
         assert storage._artifact_tag_exists(
-            repository, transaction.release_unit, transaction.version
+            repository, transaction.release_bundle, transaction.version
         )
         assert transaction.request_path.is_file()
     monkeypatch.setattr(completion, name, original)
@@ -758,7 +797,7 @@ def test_versioned_completion_rejects_changed_declared_inputs(tmp_path, change) 
 
     assert run_git(repository, "rev-parse", "HEAD").stdout.strip() == checkpoint
     assert not storage._artifact_tag_exists(
-        repository, transaction.release_unit, transaction.version
+        repository, transaction.release_bundle, transaction.version
     )
     assert transaction.request_path.is_file()
 
@@ -779,5 +818,34 @@ def test_versioned_completion_rejects_changed_prepared_result(tmp_path) -> None:
 
     assert run_git(repository, "rev-parse", "HEAD").stdout.strip() == checkpoint
     assert not storage._artifact_tag_exists(
-        repository, transaction.release_unit, transaction.version
+        repository, transaction.release_bundle, transaction.version
     )
+
+
+@pytest.mark.parametrize("receipt_kind", ["build-bundle", "committed-build", "artifact"])
+@pytest.mark.parametrize("keep_current_field", [False, True])
+def test_receipt_identities_require_release_bundle_without_an_old_name_alias(
+    tmp_path, receipt_kind, keep_current_field,
+):
+    if receipt_kind == "build-bundle":
+        _, _, receipt, _ = _build_receipt_fixture(tmp_path)
+
+        def read(value):
+            return results.capture_step_result(
+                json.dumps(value), expected_schema=results.BUILD_RECEIPT_SCHEMA,
+            )
+    else:
+        _, build, _, _, artifact, _ = _new_receipt_fixtures(tmp_path)
+        receipt = build if receipt_kind == "committed-build" else artifact
+        read = results.encode_new_receipt
+
+    assert receipt["identity"]["releaseBundle"] == "claims"
+    assert "releaseUnit" not in receipt["identity"]
+    for _ in range(2):
+        assert read(receipt)
+    wrong = json.loads(json.dumps(receipt))
+    wrong["identity"]["releaseUnit"] = wrong["identity"]["releaseBundle"]
+    if not keep_current_field:
+        del wrong["identity"]["releaseBundle"]
+    with pytest.raises(results.StepResultError):
+        read(wrong)

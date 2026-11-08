@@ -1243,7 +1243,7 @@ def _sdlc_contract_facts(local: dict[str, Any]) -> dict[str, Any]:
             "valid": False,
             "errors": ["sdlc/sdlc.yml must be a regular file"],
         }
-    contract, errors = read_contract(path)
+    contract, errors = read_contract(path, repo_root=pathlib.Path(local["root"]))
     facts: dict[str, Any] = {
         "present": True,
         "valid": contract is not None and not errors,
@@ -1285,7 +1285,7 @@ def _repository_validation_facts(
     if contract_path.is_symlink():
         errors.append("SDLC must be a regular repository file")
     elif contract_path.exists():
-        _, contract_errors = read_contract(contract_path)
+        _, contract_errors = read_contract(contract_path, repo_root=root)
         errors.extend(contract_errors)
     return {
         "applicable": True,

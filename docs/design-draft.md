@@ -4,7 +4,7 @@
 
 This unfinished draft records repository validation, Python environments,
 SDLC, and deployment decisions. The bounded-search, pytest-diagnostics,
-release-unit, receipt, bundle-transaction, and update-correction sections
+release-bundle, receipt, bundle-transaction, and update-correction sections
 additionally describe their scoped implementation and behavior tests. Other
 sections remain discussion-derived, not a complete
 implementation audit or a new governing contract. This draft owns the lifecycle
@@ -178,11 +178,11 @@ skill installer; review packets select the installed source checker. Their
 supporting modules come from the selected installed bundle. First-install
 bootstrap remains a repository-owned workflow because no installation exists yet.
 
-SDLC v4/v5 executable capabilities have one optional version requirement source:
+SDLC executable capabilities have one optional version requirement source:
 `version-from.file`, plus `version-from.key` for a field in a structured native
 manifest. JSON, TOML, YAML, XML and INI references require a nonempty dotted key;
 a native single-value file, such as `.nvmrc`, supplies its whole requirement.
-Both schemas reject capability-level `version` and `channel`, malformed reference
+Supported schemas reject capability-level `version` and `channel`, malformed reference
 objects, and empty keys. The shared reader also rejects escaping paths. It
 passes references unchanged to operation preparation and compatibility planning;
 these annotation-only records do not read or enforce installed tool versions,
@@ -230,18 +230,37 @@ The module writes no separate state: existing command-report owners retain
 responsibility for report paths and cleanup. Receipt-only deployment remains
 planned in step 19; the current installer still owns its source-check prerequisite.
 
-The v4/v5 declaration owners are
-`skills/ceratops-repo-lifecycle/references/schemas/sdlc.v5.schema.json` and
-`skills/ceratops-repo-lifecycle/scripts/ceratops_repo_compatibility_engine/sdlc_contract_validation.py`.
-Their opt-in v5 release-unit reader groups artifact-producing deliverables for a
-shared release; package prerequisites remain generic dependencies whose
-release-unit owners are resolved without merging membership. The schema and
-semantic validator reject ambiguous ownership, unresolved dependencies, cycles,
-unsafe paths and missing build declarations while preserving v4 and rejecting
-v1-v3. The reader returns metadata and executes no commands. Automatic unit
-builds and receipt-based publication or deployment are later integrations; the
-compatibility producer and live repository declaration remain v4. Exact-output
-declaration changes remain step 3 work.
+A release bundle groups deliverables released together. A deliverable is one
+package, application, skill, MCP server or hook; its artifacts are the built files.
+The schema declares groups under `repository.release-bundles`, each with a
+nonempty `members` list of full references such as `deliverables.apps.desktop`.
+Each member has a build action and artifact metadata and belongs to at most one
+bundle. A required deliverable can belong to another bundle or stand on its
+own. The reader reports ambiguous ownership and cycles before any command runs.
+
+`sdlc_contract_validation.py::release_bundle_entries()` returns member metadata,
+action locations and required deliverables. An external dependency includes its
+bundle name when one exists. `_find_release_bundle_errors()` checks ownership
+and cycles without running commands.
+Build APIs accept `release_bundle`; the receipt inspection command is
+`verify-release-bundle-build --release-bundle NAME`. The former public group
+name is no longer accepted as an SDLC field, Python parameter or CLI option.
+
+The installed skill's `references/schemas/sdlc.*.schema.json` files define its
+supported format numbers. One set of readers and action checks handles those
+formats, without numbered Python functions or version-number branches. A newer
+repository format reports its number and the newest installed schema before any
+action runs. An older format works when its schema is installed and its fields
+meet that schema and the shared checks. New configuration uses the newest
+installed schema; updates preserve an existing supported version. There is one
+SDLC template and no separate generation-version setting.
+
+Build and artifact receipts name their release bundle with `releaseBundle`
+in every identity, including dependency identities. Receipt writers, schema
+checks, retention and the installed, repository and generated test readers use
+that same field. The former spelling is not accepted as an alternative.
+Artifact contents, source commits, check versions and test-result identities
+are unchanged by this metadata-field rename.
 
 `sdlc_results.py` owns explicit build-receipt verification alongside bounded
 operation-result capture. The existing operation-result schema adds a v2 build
@@ -543,31 +562,106 @@ dependency declaration. Missing maps allow execution but no individual-test reus
 Custom runners are preserved; their support files are managed only when the
 scripts project declares `tool.ceratops.test-support.managed = true`.
 
-`repository_operation.prepare_operations()` reads v5 `check-groups` with required
-`phase` and `requires-artifacts` fields. `execute_check_phases()` completes
-independent source checks, orders selected package builds by their prerequisites,
-and starts after-build checks only with every required artifact available.
-During-build groups execute inside the build process and must return their real
-passing records. The executor never creates a pass for a named but absent check.
-Test commands receive `--check-group` and `--artifacts`; their child processes
-receive the same mapping in `CERATOPS_TEST_ARTIFACTS`. Paths and measured hashes
-enter both whole-check and individual-test inputs. Changes during execution
-prevent saving a reusable pass. Existing `build_bundle()` callbacks already
-receive the exact measured artifact inventory; no second selection is added.
+`repository_operation.prepare_operations()` expands phase actions into their
+individual `check-groups`. Each group owns its `steps`, `requires`, optional
+`check-results` and `result-schema`. This replaces the completed 6G declaration
+layout; the existing scheduler and saved results remain in use.
+`execute_check_phases()` runs `pre-build-checks`, dependency-ordered `build`
+actions, and `post-build-checks`, regardless of YAML key order. It stops at the
+first failed source check. Builders report the checks named under
+`build.checks` without launching separate commands. When Python tests are
+present, compatibility checking requires a check command in addition to the
+repository source validator.
+
+The repository-operation CLI takes explicit `--operation` phase or group
+locations. A direct group request does not run its siblings. Promote and Ship
+derive their required pre-build group locations from the SDLC declaration;
+build and delivery calls still bring in their prerequisite checks and builds.
+The CI composite action accepts the same locations through its `operations`
+input, one per line, including source-only requests for noninteractive jobs.
+Compatibility setup checks the resolved published action's input declarations
+before writing a new workflow that calls it.
+
+`operation_prerequisites()` returns ordering references in `build-after` and
+the builder's file references in `build-uses-artifacts`. The
+`pre-build-checks-uses-artifacts`, `during-build-checks-uses-artifacts` and
+`post-build-checks-uses-artifacts` maps retain full group locations. Tools stay
+under `capabilities` with their original `version-from` declarations. The
+runner prepares required deliverables recursively and passes only the files
+declared by each command. A post-build check also gets its own deliverable's
+output. A pre-build check can use another deliverable's output. Direct checks
+with artifact requirements enter the same runner as a build. Only builds and
+check groups accept `uses-artifacts`. Installation and publication receive
+accepted files through their existing delivery contracts.
+
+Commands opt into runner arguments through `{check_group}` and `{artifacts}` in
+their declared `steps.run`; source scans receive no extra arguments. Execution
+fills the artifact JSON argument and `CERATOPS_TEST_ARTIFACTS` environment value
+with that command's file map. The builder receives its internal checks' separate
+maps in `CERATOPS_BUILD_CHECK_ARTIFACTS`, keyed by the full
+`actions.build.checks.<group>` location. Paths and hashes enter the comparisons
+that decide whether a command or test can reuse a pass. Changes during execution
+prevent saving a
+reusable pass. Existing `build_bundle()` callbacks keep their exact measured files.
+
+Compatibility setup calls `prepare_sdlc_configuration()` before writing its YAML.
+The operation executor calls `collect_check_inputs()` to gather command/files/
+runtime/target/artifact facts, then `decide_check_reuse()` to find an applicable
+pass or run the check. An SDLC address change alone does not change that work;
+matching retains the original result/check identities and immutable receipts.
 `store_artifacts.build_result_artifact_paths()` resolves all artifacts in v1,
 v2 and v3 results using their existing repository, shared bundle and allocated
-version/target paths. SDLC v4/v5 declarations accept these same build formats.
+version/target paths. SDLC declarations accept these same build formats.
 Integrity checks complete for the entire build output
 before it becomes available to dependent builds or checks. Multiple output
 steps accumulate their files; a missing or changed file exposes no partial set.
 
+`run_build_operations.py` owns this scheduler and dependency expansion;
+`repository_operation.py` retains its public callable and individual command
+execution. `execute_release_builds()` takes the release lock before preparing
+commands or reading the source commit. Direct calls wait at most 60 seconds;
+promotion and Ship calls retain their existing ownership. The lock covers source
+checks, dependency builds, artifact tests, delivery and local command cleanup.
+Return or exception releases it only after commands stop; unknown shutdown keeps
+the existing unfinished flag. Task-worktree builds remain unlocked.
+
+The graph includes ordering requirements and artifact requirements at every
+level. A joint post-build test brings in its other required deliverables. A
+build can run after its own pre-build checks finish, including those that use
+outputs from an earlier build. Every build runs once per target, with
+separate artifact maps for different targets. Explicitly repeated delivery
+actions retain their requested order. Without a declared build, installation
+keeps its existing operation-result shape. Installers receive the requested
+build's returned files and dependency files through `selected_artifacts`. An old
+file merely present in the output directory cannot satisfy a failed build.
+The adapter translates these paths; it performs no alternate-file search.
+
+The current call consumes matching supplied build receipts before running a
+producer. It can also consume an existing tagged receipt for an explicitly named
+single-member unit and target at its recorded source/final commit. Older builders
+without stored acceptance retain their native repeat behavior. Step 8 adds finer
+input comparison and member-level bundle decisions. This call writes no new
+cache or build-history files: native build/receipt owners keep their existing
+bounded storage and cleanup. Build failure preserves completed promotion and
+accepted outputs; it blocks only dependent work and returns the original cause.
+
 The test runner owns `.build/test-diagnostics/pytest-failure.json`. Its shared
 support module stores current failure IDs and deduplicated full, redacted command
-details. Newer local outcomes resolve individual failures; both A and B must
-pass before a report for A and B is deleted. Startup finishes interrupted deletion
-from those outcomes without tests. A lifecycle caller consumes the runner result
-and retires its separate operation report. Each report owner handles its own
-file; user-retained external reports and current result files are preserved.
+details. Newer local passes remove their failures. Following a successful pytest
+session, the same owner removes cases absent from completely collected,
+unchanged test files, including deleted parameter cases. It removes those cases
+from the current target's saved results and managed diagnostic together. Filters,
+collection errors/skips, interrupts and failed sessions leave missing cases alone.
+Other files and targets remain untouched. Cleanup also reads failure IDs from
+the report so interruption after removing a saved result cannot strand its
+diagnostic. Repeated calls reuse applicable passes. Report replacement uses a
+fixed `.in_process.json` sibling, flushed before replacement and removed on
+completion or next startup, including a write interrupted before the first report
+exists. The report disappears when no failure
+still needs attention. Startup finishes report cleanup from newer saved passes
+without tests. A lifecycle caller retires its separate operation report;
+caller-retained external reports and completed builds' Git summaries are preserved.
+The writer removes its own partial-write file even beside an external report.
 
 `execute_worktree_build.py` owns the internal source-commit-to-completion flow,
 exposed by a thin `repository_operation.execute_worktree_build()` callable. Its
@@ -580,7 +674,8 @@ execution phase. The executor then calls the existing per-target receipt and
 completion functions. Existing receipts skip producer work; an existing tag lets
 the same call finish scoped retention and failure-report deletion. The returned
 commit and tag come from the completer, not a later read of HEAD. Standalone
-builds take no worktree/release lock. Public Build adoption remains a later step.
+builds in independent task worktrees take no lock; the same callable protects
+release source before preparation. Public Build adoption remains a later step.
 
 `ND.COMPATIBILITY.TEST_RESULT_REUSE` reviews independently reusable units using
 saved outcomes and behavior evidence, including interruption and partial fixes.
@@ -821,7 +916,7 @@ owns shared-store resolution, staging, measurement, receipt persistence, atomic
 publication, locking, retention, diagnostics and cleanup. The
 `repository_operation.read_completed_build` entry point is backed by that storage
 module and selects an existing completed v2 build for consumption.
-`sdlc_results.verify_release_unit_build` remains the read-only byte-integrity
+`sdlc_results.verify_release_bundle_build` remains the read-only byte-integrity
 owner; it neither stores bundles nor decides which tests are required today.
 
 The caller provides all six selection fields (repository, commit, unit, channel,
@@ -883,7 +978,7 @@ Real package/skill adapters and installed-artifact tests arrive in later steps.
 The existing SDLC commands and installers are unchanged.
 
 The README's generated-output table is the retention policy. `store_artifacts.py`
-groups completed bundles by repository, release unit, channel and target.
+groups completed bundles by repository, release bundle, channel and target.
 Transaction startup and successful publication retain the newest three per
 group, ordered by completion-directory modification time and then build key, and
 remove older helper-owned directories. Failed work creates no completed receipt.
@@ -1409,7 +1504,7 @@ summaries carry the original outcomes and their comparison facts. Creating those
 summaries does not delete current results. No separate imported-baseline history
 is maintained.
 
-Select the most recent eligible completed baseline for the same release unit and
+Select the most recent eligible completed baseline for the same release bundle and
 target on the candidate's relevant history, recording its exact tag, commit and
 receipt. Do not choose a repository-wide last tag or another branch's newest
 version. Missing baseline evidence leaves missing coverage; without a usable
@@ -1481,7 +1576,7 @@ still block consumption. Public receipt-based Deploy remains a later integration
 ### Affected deliverables and empty delivery
 
 Step 8 uses existing SDLC ownership, declared inputs, dependency edges and
-release-unit membership. A release unit contains members sharing a version or
+release-bundle membership. A release bundle contains members sharing a version or
 release; it is not every deliverable connected anywhere in the dependency graph.
 
 Changed product/build/runtime inputs select their owners and downstream consumers
@@ -1802,8 +1897,8 @@ format or release/destination lock.
 ### Scoped retained artifact copies (4F)
 
 `retain_artifact_versions.py` accepts one `RetentionScope`: an absolute managed
-root, release unit, target, pool and (for original builds) existing worktree ID.
-A bundle occupies its release-unit directory. Separate member versions remain
+root, release bundle, target, pool and (for original builds) existing worktree ID.
+A bundle occupies its release-bundle directory. Separate member versions remain
 step 8C; this library does not add receipt fields for them.
 
 `select_retained_versions()` uses the caller's existing accepted build and

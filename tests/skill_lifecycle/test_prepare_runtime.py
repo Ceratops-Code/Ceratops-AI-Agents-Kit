@@ -395,22 +395,19 @@ def test_shared_skill_python_environment_reuses_lock_and_repairs_missing_package
     (repository / "sdlc/sdlc.yml").write_text(json.dumps({
         "version": 4, "kind": "ceratops-sdlc", "repository": {
             "capabilities": {},
-            "actions": {
-                "validate": {
+            "actions": {"pre-build-checks": {"check-groups": {'source': {
                     "requires": {"capabilities": []},
                     "steps": [{"run": [uv, "run", "--project", "scripts", "--locked", "python", "scripts/probe.py"]}],
-                },
-                "test": {
+                }, 'tests': {
                     "requires": {"capabilities": []},
                     "no-op": "Environment boundary fixture.",
-                },
-            },
+                }}}, },
         },
     }))
     through_skill = subprocess.run([
         uv, "run", "--no-project", "--python", str(interpreter), "python",
         str(destination / names[0] / "scripts/repository_operation.py"),
-        "--repo-root", str(repository), "--validate", "--ci",
+        "--repo-root", str(repository), "--operation", "repository.actions.pre-build-checks.check-groups.source", "--ci",
     ], cwd=tmp_path, env=environment, capture_output=True, text=True, check=False)
     assert through_skill.returncode == 0, through_skill.stderr
     assert pathlib.Path(json.loads((repository / "target-python.json").read_text())) == scripts / ".venv"

@@ -86,30 +86,6 @@ CERATOPS_ICON_SOURCE = (
     / "ceratops-logo-500.png"
 )
 ALLOWED_SKILL_RESOURCE_DIRS = {"agents", "assets", "scripts", "references"}
-SHORT_DESC_STOPWORDS = {
-    "a",
-    "an",
-    "and",
-    "as",
-    "at",
-    "before",
-    "by",
-    "for",
-    "from",
-    "in",
-    "into",
-    "it",
-    "of",
-    "on",
-    "or",
-    "the",
-    "through",
-    "to",
-    "up",
-    "use",
-    "when",
-    "with",
-}
 GOVERNED_TEXT_SUFFIXES = {".md", ".json", ".yml", ".yaml", ".toml", ".txt"}
 runtime_input_checks = runpy.run_path(
     str(pathlib.Path(__file__).with_name("check_skill_runtime_inputs.py"))
@@ -246,12 +222,12 @@ def load_openai_metadata(path: pathlib.Path) -> dict[str, object]:
 
 
 def openai_metadata_shape(
-    metadata: Mapping[str, object],
+    metadata: Mapping[str, object], profile: str,
 ) -> tuple[dict[str, str], list[str]]:
-    """Return interface strings and structural errors for optional metadata."""
+    """Check optional Codex metadata and the managed skill invocation policy."""
 
     errors: list[str] = []
-    interface_value = metadata.get("interface")
+    interface_value = metadata.get("interface", {})
     interface: dict[str, str] = {}
     if not isinstance(interface_value, Mapping):
         errors.append("openai.yaml interface must be a mapping")
@@ -264,12 +240,12 @@ def openai_metadata_shape(
         interface = dict(interface_value)
 
     dependencies = metadata.get("dependencies")
-    if dependencies is not None:
+    if "dependencies" in metadata:
         if not isinstance(dependencies, Mapping):
             errors.append("openai.yaml dependencies must be a mapping")
         else:
             tools = dependencies.get("tools")
-            if tools is not None:
+            if "tools" in dependencies:
                 if not isinstance(tools, list):
                     errors.append("openai.yaml dependencies.tools must be an array")
                 else:
@@ -299,57 +275,18 @@ def openai_metadata_shape(
                                 )
 
     policy = metadata.get("policy")
-    if policy is not None:
+    if "policy" in metadata:
         if not isinstance(policy, Mapping):
             errors.append("openai.yaml policy must be a mapping")
-        elif (
-            "allow_implicit_invocation" in policy
-            and not isinstance(policy["allow_implicit_invocation"], bool)
-        ):
-            errors.append(
-                "openai.yaml policy.allow_implicit_invocation must be Boolean"
-            )
+        elif "allow_implicit_invocation" in policy:
+            implicit_invocation = policy["allow_implicit_invocation"]
+            if not isinstance(implicit_invocation, bool):
+                errors.append("openai.yaml policy.allow_implicit_invocation must be Boolean")
+            elif profile == PROFILE_CERATOPS and not implicit_invocation:
+                errors.append(
+                    "openai.yaml policy.allow_implicit_invocation must be true for Ceratops skills"
+                )
     return interface, errors
-
-
-def normalized_tokens(text: str) -> list[str]:
-    """Tokenize names and descriptions for loose metadata relevance checks."""
-
-    return [token.lower() for token in re.findall(r"[A-Za-z0-9]+", text)]
-
-
-def meaningful_short_description_tokens(text: str) -> set[str]:
-    """Drop common filler so short-description comparisons use real terms."""
-
-    return {
-        token
-        for token in normalized_tokens(text)
-        if token not in SHORT_DESC_STOPWORDS and (len(token) > 2 or token in {"gh", "pr", "ci"})
-    }
-
-
-def display_name_sane(skill_name: str, display_name: str, profile: str) -> bool:
-    """Check that the UI display name still resembles the skill directory."""
-
-    name_tokens = {word for word in normalized_tokens(skill_name) if word != "ceratops"}
-    if not name_tokens:
-        return False
-    display_tokens = set(normalized_tokens(display_name))
-    overlap = len(name_tokens & display_tokens)
-    prefix_ok = profile != PROFILE_CERATOPS or display_name.startswith("Ceratops ")
-    return prefix_ok and overlap / len(name_tokens) >= 0.5
-
-
-def short_description_relevant(short_description: str, skill_description: str) -> bool:
-    """Check that the UI short description overlaps the trigger description."""
-
-    short_tokens = meaningful_short_description_tokens(short_description)
-    if not short_tokens:
-        return False
-    description_tokens = meaningful_short_description_tokens(skill_description)
-    overlap = len(short_tokens & description_tokens)
-    required_overlap = min(2, len(short_tokens))
-    return overlap >= required_overlap
 
 
 def rendered_sections_block(skill_name: str, manifest: dict[str, object]) -> str:
@@ -1071,7 +1008,7 @@ def check_skill(
     skill_names: set[str],
     profile: str,
 ) -> list[str]:
-    """Validate one source skill, metadata file, icon, README row, and refs."""
+    """Check skill source, optional Codex metadata, and repository integration."""
 
     errors: list[str] = []
     name = skill_dir.name
@@ -1114,24 +1051,23 @@ def check_skill(
     description_value = frontmatter.get("description")
     if not isinstance(description_value, str):
         errors.append(f"{name}: description must be a string")
-        description = ""
-    else:
-        description = description_value
-    if len(description) < 40:
-        errors.append(f"{name}: description is too short")
-    if len(description) > 1024:
+    elif not description_value.strip():
+        errors.append(f"{name}: description must be nonempty")
+    elif len(description_value) > 1024:
         errors.append(f"{name}: description exceeds 1024 characters")
     for field in ("license", "allowed-tools"):
         if field in frontmatter and not isinstance(frontmatter[field], str):
             errors.append(f"{name}: {field} must be a string")
     compatibility = frontmatter.get("compatibility")
-    if compatibility is not None:
+    if "compatibility" in frontmatter:
         if not isinstance(compatibility, str):
             errors.append(f"{name}: compatibility must be a string")
+        elif not compatibility.strip():
+            errors.append(f"{name}: compatibility must be nonempty")
         elif len(compatibility) > 500:
             errors.append(f"{name}: compatibility exceeds 500 characters")
     skill_metadata = frontmatter.get("metadata")
-    if skill_metadata is not None and (
+    if "metadata" in frontmatter and (
         not isinstance(skill_metadata, Mapping)
         or not all(
             isinstance(key, str) and isinstance(value, str)
@@ -1148,14 +1084,6 @@ def check_skill(
         errors.append(f"{name}: missing body")
     if name not in readme_rows:
         errors.append(f"{name}: missing README skill table row")
-    h2_headings = re.findall(r"^## (.+)$", core_text, flags=re.MULTILINE)
-    if not h2_headings:
-        errors.append(f"{name}: must contain Markdown H2 sections")
-    if profile == PROFILE_CERATOPS:
-        if "### Boundaries" not in core_text:
-            errors.append(f"{name}: missing Boundaries section")
-        if "### Output Contract" not in core_text:
-            errors.append(f"{name}: missing Output Contract section")
     if SECTIONS_START in core_text or SECTIONS_END in core_text:
         errors.append(f"{name}: source SKILL.md must be delta-only; shared sections are generated at install time")
     else:
@@ -1165,36 +1093,26 @@ def check_skill(
             errors.append(f"{name}: could not render runtime shared sections: {exc}")
     errors.extend(check_resource_layout(skill_dir, profile))
 
-    if not openai_yaml.is_file():
-        errors.append(f"{name}: missing agents/openai.yaml")
-    else:
+    if openai_yaml.exists() or openai_yaml.is_symlink():
         yaml_text = read_source_text(openai_yaml, errors)
         try:
             openai_metadata = load_openai_metadata(openai_yaml)
-            interface, metadata_errors = openai_metadata_shape(openai_metadata)
+            interface, metadata_errors = openai_metadata_shape(openai_metadata, profile)
             errors.extend(f"{name}: {error}" for error in metadata_errors)
         except (OSError, ValueError) as exc:
             errors.append(f"{name}: {exc}")
             interface = {}
-        required_fields = ["display_name", "short_description", "default_prompt"]
-        if profile == PROFILE_CERATOPS:
-            required_fields.extend(("icon_small", "icon_large"))
-        for required in required_fields:
-            if not interface.get(required):
-                errors.append(f"{name}: openai.yaml missing {required}:")
-        default_prompt = interface.get("default_prompt", "")
-        if default_prompt and f"${name}" not in default_prompt:
+        default_prompt = interface.get("default_prompt")
+        if default_prompt is not None and f"${name}" not in default_prompt:
             errors.append(f"{name}: default_prompt should mention ${name}")
-        display_name = interface.get("display_name", "")
-        short_description = interface.get("short_description", "")
-        icon_small = interface.get("icon_small", "")
-        icon_large = interface.get("icon_large", "")
-        if display_name and not display_name_sane(name, display_name, profile):
-            errors.append(f"{name}: display_name no longer matches the skill name closely enough")
-        if short_description and not short_description_relevant(short_description, description):
-            errors.append(f"{name}: short_description no longer matches the skill description closely enough")
-        icon_fields = (("icon_small", icon_small), ("icon_large", icon_large)) if profile == PROFILE_CERATOPS else ()
-        for field_name, icon_value in icon_fields:
+        short_description = interface.get("short_description")
+        if short_description is not None and not 25 <= len(short_description.strip()) <= 64:
+            errors.append(f"{name}: short_description must contain 25 to 64 characters")
+        ceratops_icon_fields = ("icon_small", "icon_large") if profile == PROFILE_CERATOPS else ()
+        for field_name in ceratops_icon_fields:
+            if field_name not in interface:
+                continue
+            icon_value = interface[field_name]
             normalized_icon = icon_value.replace("\\", "/")
             portable_icon = pathlib.PurePosixPath(normalized_icon)
             if not icon_value:
@@ -1203,12 +1121,12 @@ def check_skill(
             if portable_icon.is_absolute() or ".." in portable_icon.parts:
                 errors.append(f"{name}: {field_name} must use a portable relative path")
                 continue
-            if profile == PROFILE_CERATOPS and icon_value != CERATOPS_ICON_REL:
+            if icon_value != CERATOPS_ICON_REL:
                 errors.append(f"{name}: {field_name} should use shared Ceratops icon {CERATOPS_ICON_REL}")
             icon_path = skill_dir / portable_icon
             if not icon_path.is_file():
                 errors.append(f"{name}: {field_name} points to missing file {icon_value}")
-            elif profile == PROFILE_CERATOPS and CERATOPS_ICON_SOURCE.is_file():
+            elif CERATOPS_ICON_SOURCE.is_file():
                 try:
                     if icon_path.read_bytes() != CERATOPS_ICON_SOURCE.read_bytes():
                         errors.append(f"{name}: {field_name} does not match repo icon {CERATOPS_ICON_SOURCE.relative_to(ROOT)}")

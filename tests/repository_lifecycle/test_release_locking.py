@@ -37,6 +37,83 @@ from tests.support.repositories import run_git
 workflow_command = importlib.import_module("github_pr_workflow.command")
 
 
+@pytest.mark.parametrize("interrupt", [None, "before", "after"])
+def test_release_builds_hold_lock_before_preparation_through_cleanup(tmp_path, monkeypatch, interrupt):
+    from tests.repository_lifecycle.test_operation_reuse import _release_build_graph
+    operations = importlib.import_module("repository_operation")
+    builds = importlib.import_module("run_build_operations")
+    references = _release_build_graph(tmp_path, monkeypatch)
+    assert run_git(tmp_path, "branch", "-m", "release/local").returncode == 0
+    original_prepare, original_execute = builds.prepare_build_operations, operations.execute_prepared_operation
+    original_cleanup = operations.remove_operation_failures
+    events = []
+    armed = bool(interrupt)
+
+    def prepare(*args, **kwargs):
+        _compete(tmp_path)
+        events.append("preparation")
+        return original_prepare(*args, **kwargs)
+
+    def execute(item, **kwargs):
+        nonlocal armed
+        _compete(tmp_path)
+        events.append(item.operation)
+        if armed and item.category == "build":
+            armed = False
+            if interrupt == "after":
+                original_execute(item, **kwargs)
+            raise OSError("interrupted build effect")
+        return original_execute(item, **kwargs)
+
+    def cleanup(*args, **kwargs):
+        _compete(tmp_path)
+        return original_cleanup(*args, **kwargs)
+
+    monkeypatch.setattr(builds, "prepare_build_operations", prepare)
+    monkeypatch.setattr(operations, "execute_prepared_operation", execute)
+    monkeypatch.setattr(operations, "remove_operation_failures", cleanup)
+    request = operations.OperationRequest(references["desktop"] + ".actions.install", {"target": "one"})
+    for attempt in range(2):
+        result = operations.execute_release_builds(tmp_path, [request])
+        assert result["status"] == ("result_invalid" if interrupt and attempt == 0 else "completed"), result
+        if interrupt and attempt == 0:
+            assert "interrupted build effect" in json.dumps(result)
+        assert workflow_command.release_lock_module().release_lock_path(tmp_path).read_bytes() == b"0"
+        with workflow_command.release_write_context(tmp_path):
+            pass
+    assert events[0] == "preparation"
+    for kind in ("packages", "skills", "mcp-servers", "apps"):
+        assert any(value.startswith("deliverables." + kind) and value.endswith(".build") for value in events)
+
+
+def test_direct_build_waits_before_reading_contract_and_task_worktree_stays_unlocked(tmp_path, monkeypatch):
+    from tests.repository_lifecycle.test_operation_reuse import _fixture
+    operations = importlib.import_module("repository_operation")
+    _fixture(tmp_path)
+    locks = workflow_command.release_lock_module()
+    script = (
+        "import json,pathlib,sys;sys.path.insert(0,sys.argv[1]);import repository_operation as r;"
+        "print(json.dumps(r.execute_release_builds(pathlib.Path(sys.argv[2]),"
+        "[r.OperationRequest('deliverables.packages.sample.actions.build')],wait_seconds=.02)))"
+    )
+    with workflow_command.release_write_context(tmp_path):
+        result = subprocess.run([sys.executable, "-c", script, str(PROMOTE_REPOSITORY.parent), str(tmp_path)],
+                                capture_output=True, text=True, check=False, timeout=15)
+        assert result.returncode == 0, result.stderr
+        value = json.loads(result.stdout)
+        assert value["release_not_started"] is True and "busy" in value["message"].lower()
+        assert not (tmp_path / "wheel.bin").exists()
+    task = tmp_path / ".task-worktree"
+    assert run_git(tmp_path, "worktree", "add", "-b", "task", str(task)).returncode == 0
+
+    def unexpected_lock(*_args, **_kwargs):
+        pytest.fail("An independent task build acquired the release lock")
+
+    monkeypatch.setattr(locks, "hold_write_attempt", unexpected_lock)
+    result = operations.execute_release_builds(task, [operations.OperationRequest("deliverables.packages.sample.actions.build")])
+    assert result["status"] == "completed", result
+
+
 def test_protected_command_preserves_failure_streams_without_retaining_stopped_flag(tmp_path, monkeypatch):
     locks = workflow_command.release_lock_module()
     monkeypatch.setenv("FIXTURE_API_TOKEN", "environment-secret")
@@ -383,7 +460,7 @@ def install_skill(options):
     for attempt in range(2):
         if ending == "completed":
             result = module["promote"](args)
-            installed = result["operations"]["results"][0]
+            installed = next(item for item in result["operations"]["results"] if item["operation"] == operation)
             assert installed["status"] == "completed" and installed["handoff_completed"] is True
             assert installed["steps"] == [1, 2]
             assert "handoffs" not in result
@@ -406,10 +483,10 @@ def test_promotion_never_turns_an_unexecuted_handoff_into_success(tmp_path, monk
         "operation": "fixture.install", "status": status, "steps": [],
         "handoff": "ceratops-skill-lifecycle/deploy",
     }], "deferred_handoffs": ["fixture.install"]}
-    monkeypatch.setitem(deploy.__globals__, "execute_prepared_operations", lambda *a, **k: operations)
+    monkeypatch.setitem(deploy.__globals__, "execute_release_builds", lambda *a, **k: operations)
     accepted = module["CompletedPromotion"]({"status": "ready", "head": head, "pending_work_scope": "fixture"},
                                            repo, [], {"results": []})
-    args = argparse.Namespace(repo_root=repo)
+    args = argparse.Namespace(repo_root=repo, sdlc_contract=pathlib.Path("sdlc/sdlc.yml"))
     for _ in range(2):
         with pytest.raises(module["PromotionError"]) as raised:
             deploy(args, accepted)
@@ -640,7 +717,8 @@ def test_installation_cannot_undo_completed_promotion(tmp_path, monkeypatch, end
     installed = []
     calls = []
 
-    def install(prepared, **_kwargs):
+    def install(root, requests, _contract, **_kwargs):
+        prepared = importlib.import_module("repository_operation").prepare_operations(root, requests)
         _compete(repo)
         assert len(prepared) == 1
         assert prepared[0].operation == operation
@@ -661,7 +739,7 @@ def test_installation_cannot_undo_completed_promotion(tmp_path, monkeypatch, end
     def unexpected_rollback(*_args, **_kwargs):
         pytest.fail("installation failure rolled back accepted promotion")
 
-    monkeypatch.setitem(promote.__globals__, "execute_prepared_operations", install)
+    monkeypatch.setitem(promote.__globals__, "execute_release_builds", install)
     monkeypatch.setattr(module["git_branches"], "_restore_release_checkout", unexpected_rollback)
     for attempt in range(2):
         if ending == "completed":
@@ -935,7 +1013,7 @@ def test_promote_repository_ship_after_promotion_composes_terminal_workflow(
 
     def run_json(command: list[str], cwd: pathlib.Path) -> tuple[int, dict[str, Any]]:
         if pathlib.Path(command[1]) == OPERATION_RUNNER:
-            assert "--validate" in command
+            assert "--test-trigger" in command
             return original_run_command_for_json(command, cwd)
         commands.append(command)
         if pathlib.Path(command[1]) == MANAGE_PENDING_WORK:
@@ -1038,7 +1116,7 @@ def test_promote_repository_ship_after_promotion_preserves_blocked_state(
 
     def run_json(command: list[str], cwd: pathlib.Path) -> tuple[int, dict[str, Any]]:
         if pathlib.Path(command[1]) == OPERATION_RUNNER:
-            assert "--validate" in command
+            assert "--test-trigger" in command
             return original_run_command_for_json(command, cwd)
         commands.append(command)
         if pathlib.Path(command[1]) == MANAGE_PENDING_WORK:
@@ -1303,7 +1381,8 @@ def test_operation_runner_reports_command_shutdown_to_release_owner(tmp_path, mo
     repo, _, _, _ = prepare_repository_lifecycle_repo(tmp_path)
     commit = operations.repository_commit(repo)
     prepared = operations.PreparedOperation(
-        repo_root=repo, operation="repository.actions.test", category="tests",
+        repo_root=repo, operation="repository.actions.pre-build-checks.check-groups.tests",
+        category="pre-build-checks", check_phase="pre-build", check_group="tests",
         commit=commit, prerequisites={},
         steps=tuple(operations.PreparedStep(index, (name,), repo)
                     for index, name in enumerate(("fixture", "dependent"))),
@@ -1323,7 +1402,7 @@ def test_operation_runner_reports_command_shutdown_to_release_owner(tmp_path, mo
     for _ in range(2):
         with workflow_command.release_write_context(repo):
             result = operations.execute_prepared_operation(prepared)
-            assert result["status"] == "tests_failed"
+            assert result["status"] == "validation_failed"
         assert attempted[-1] == "fixture" and "dependent" not in attempted
         lock_path = workflow_command.release_lock_module().release_lock_path(repo)
         assert lock_path.read_bytes() == (b"1" if unknown_stop else b"0")

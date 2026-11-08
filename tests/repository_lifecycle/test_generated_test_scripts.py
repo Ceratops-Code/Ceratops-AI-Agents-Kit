@@ -46,7 +46,7 @@ def _write_generated_runner(root, targets):
     project.parent.mkdir(parents=True, exist_ok=True)
     if not project.exists():
         project.write_text('[project]\nname = "runner-tests"\nversion = "0.0.0"\ndependencies = ["pytest", "packaging"]\n')
-    sdlc = {"version": 4, "repository": {"actions": {"test": {"steps": [{"run": ["uv", "run", "--locked", "scripts/run-tests.py"]}]}}}}
+    sdlc = {"version": 4, "repository": {"actions": {"pre-build-checks": {"check-groups": {'tests': {"steps": [{"run": ["uv", "run", "--locked", "scripts/run-tests.py"]}]}}}, }}}
     content = generator.generated_test_runner(root, contract, sdlc, targets)
     assert content is not None
     planned: dict[pathlib.Path, str] = {}
@@ -301,6 +301,56 @@ def test_generated_failure_report_keeps_redacted_streams(tmp_path, monkeypatch):
     assert report["stderr"] and report["command"] and report["exit_code"] == 1
 
 
+@pytest.mark.parametrize("filename", ["pytest-failure.json", "selected-checks.json"])
+def test_generated_runner_retires_removed_parameter_cases_and_only_their_diagnostics(tmp_path, filename):
+    root, script = _mapped_generated_runner(tmp_path)
+    test = root / "tests/test_a.py"
+    test.write_text("import pytest\n@pytest.mark.parametrize('value', ['old', 'gone'])\ndef test_value(value):\n    assert False\n")
+    (root / "b.data").write_text("bad")
+    report = root / ".build/test-diagnostics" / filename
+    options = ["--diagnostic-output", str(report)]
+    failed = _run_result_runner(root, script, ["tests", *options])
+    assert failed.returncode == 1, failed.stdout + failed.stderr
+    original = _current_test_records(root, script)
+    user_copy = tmp_path / "retained-report.json"
+    user_copy.write_bytes(report.read_bytes())
+    retained = user_copy.read_bytes()
+    test.write_text("import pytest\n@pytest.mark.parametrize('value', ['new'])\ndef test_value(value):\n    assert value == 'new'\n")
+    for _ in range(2):
+        passed = _run_result_runner(root, script, ["tests/test_a.py", *options])
+        assert passed.returncode == 0, passed.stdout + passed.stderr
+        current = _current_test_records(root, script)
+        assert set(current) == {"tests/test_a.py::test_value[new]", "tests/test_b.py::test_value"}
+        assert current["tests/test_b.py::test_value"] == original["tests/test_b.py::test_value"]
+        assert set(json.loads(report.read_text())["saved_failures"]) == {"tests/test_b.py::test_value"}
+    assert "1 checks reused recorded passes" in passed.stdout
+    (root / "b.data").write_text("good")
+    passed = _run_result_runner(root, script, ["tests", *options])
+    assert passed.returncode == 0, passed.stdout + passed.stderr
+    assert not report.exists() and user_copy.read_bytes() == retained
+
+
+@pytest.mark.parametrize("external", [False, True])
+def test_generated_runner_cleans_aborted_first_report_write_before_tests(tmp_path, external):
+    root, script = _mapped_generated_runner(tmp_path)
+    report = tmp_path / "retained.json" if external else root / ".build/test-diagnostics/pytest-failure.json"
+    pending = report.with_name(f".{report.stem}.in_process.json")
+    pending.parent.mkdir(parents=True, exist_ok=True)
+    if external:
+        report.write_text("caller-retained report")
+    (root / "tests/test_a.py").write_text(
+        "from pathlib import Path\ndef test_no_partial_report():\n"
+        f"    assert not Path({str(pending)!r}).exists()\n")
+    for _ in range(2):
+        pending.parent.mkdir(parents=True, exist_ok=True)
+        pending.write_text('{"incomplete":')
+        result = _run_result_runner(root, script, ["tests/test_a.py", "--diagnostic-output", str(report)])
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert not pending.exists()
+        assert report.read_text() == "caller-retained report" if external else not report.exists()
+    assert "1 checks reused recorded passes" in result.stdout
+
+
 def test_generated_runner_records_real_pytest_and_reuses_exact_acceptance(tmp_path: pathlib.Path) -> None:
     root, runner, output = _result_runner(tmp_path)
     count = tmp_path / "test-executions"
@@ -488,7 +538,7 @@ def test_runner_ownership_is_explicit_and_custom_sources_are_preserved(tmp_path:
     root, runner, _ = _result_runner(tmp_path)
     module = importlib.import_module("ceratops_repo_compatibility_engine.generate_test_script")
     contract = importlib.import_module("ceratops_repo_compatibility_engine.compatibility_contract").load_compatibility_contract()
-    sdlc = {"version": 4, "repository": {"actions": {"test": {"steps": [{"run": ["uv", "run", "--locked", "scripts/run-tests.py"]}]}}}}
+    sdlc = {"version": 4, "repository": {"actions": {"pre-build-checks": {"check-groups": {'tests': {"steps": [{"run": ["uv", "run", "--locked", "scripts/run-tests.py"]}]}}}, }}}
     original = runner.read_bytes()
     (root / "scripts/pyproject.toml").write_text('[tool.ceratops.test-runner]\nmanaged = false\n')
     assert module.generated_test_runner(root, contract, sdlc, ["test_probe.py"]) is None

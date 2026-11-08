@@ -29,7 +29,8 @@ owns timing.
 - Select a contract with `--sdlc-contract PATH`. Repeat
   `--publish-operation LOCATION` or `--deploy-operation LOCATION` for
   explicitly requested work; omission runs neither category. Optional repeated
-  `--validation-operation LOCATION` flags replace validation discovery.
+  `--validation-operation LOCATION` flags name pre-build phases or groups;
+  required repository and deliverable groups remain included.
 - The helper derives the canonical pending-work scope from `--head-branch`.
   When a retained scope exists, the wrapper reuses its recorded exact target
   commit; a caller-supplied `--commit` must match it. An absent scope skips checks

@@ -1227,8 +1227,18 @@ def test_repository_ship_absent_default_contract_is_no_op_and_finalizes(
 
 def test_repository_ship_prevalidates_and_executes_ordered_phase_selections(
     tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _, loaded, args, log, _, commands = shipping_cases._setup(tmp_path)
+    prepare_calls = []
+    execute_builds = loaded["execute_release_builds"]
+
+    def track_builds(*positional, **keywords):
+        if keywords.get("prepare_only"):
+            prepare_calls.append(keywords)
+        return execute_builds(*positional, **keywords)
+
+    monkeypatch.setitem(loaded["ship_repository"].__globals__, "execute_release_builds", track_builds)
     args.publish_operation = [shipping_cases.PUBLIC, shipping_cases.PUBLIC]
     result = loaded["ship_repository"](args)
     assert log.read_text().splitlines() == [
@@ -1246,9 +1256,9 @@ def test_repository_ship_prevalidates_and_executes_ordered_phase_selections(
         shipping_cases.PUBLIC,
     ]
     assert result["deployment"]["completed_operations"] == [shipping_cases.LOCAL]
-    assert "--prepare-only" in commands[0]
-    assert "--validate" in next(
-        command for command in commands if "--validate" in command
+    assert prepare_calls
+    assert "repository.actions.pre-build-checks.check-groups.source" in next(
+        command for command in commands if "repository.actions.pre-build-checks.check-groups.source" in command
     )
 
 
@@ -1263,9 +1273,9 @@ def test_failed_checks_prevent_remote_work_and_succeed_after_committed_repair(
 
         path = repo / "sdlc/sdlc.yml"
         document = yaml.safe_load(path.read_text())
-        actions = document["repository"]["actions"]
-        actions["test"] = actions["validate"]
-        actions["validate"] = {
+        groups = document["repository"]["actions"]["pre-build-checks"]["check-groups"]
+        groups["tests"] = groups["source"]
+        groups["source"] = {
             "requires": {"capabilities": []},
             "no-op": "Fixture has no validation command.",
         }
@@ -1274,9 +1284,7 @@ def test_failed_checks_prevent_remote_work_and_succeed_after_committed_repair(
     broken = shipping_cases._commit(repo)
     with pytest.raises(loaded["RepositoryShipError"]) as failure:
         loaded["ship_repository"](args)
-    assert failure.value.payload["status"] == (
-        "validation_failed" if gate == "validate" else "tests_failed"
-    )
+    assert failure.value.payload["status"] == "validation_failed"
     assert failure.value.payload["phase"] == "before_remote"
     assert failure.value.payload["commit"] == broken
     assert failure.value.payload["diagnostic"]["stderr_tail"] == [
@@ -1328,16 +1336,13 @@ def test_composed_promotion_and_shipping_each_run_their_validation_boundary(
         repo,
         repository={
             "capabilities": {},
-            "actions": {
-                "validate": {
+            "actions": {"pre-build-checks": {"check-groups": {'source': {
                     "requires": {"capabilities": []},
                     "steps": [{"run": [sys.executable, "other-verifier.py"]}],
-                },
-                "test": {
+                }, 'tests': {
                     "requires": {"capabilities": []},
                     "no-op": "Fixture has no test command.",
-                },
-            },
+                }}}, },
         },
     )
     assert run_git(repo, "add", ".").returncode == 0

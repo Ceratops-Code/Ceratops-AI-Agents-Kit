@@ -422,7 +422,7 @@
       "required": [
         "repository",
         "sourceCommit",
-        "releaseUnit",
+        "releaseBundle",
         "channel",
         "version",
         "target"
@@ -436,7 +436,7 @@
         "sourceCommit": {
           "$ref": "#/$defs/gitCommit"
         },
-        "releaseUnit": {
+        "releaseBundle": {
           "type": "string",
           "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"
         },
@@ -637,7 +637,7 @@
       ]
     },
     "buildReceipt": {
-      "description": "A release-unit build inventory. Verification establishes file integrity only; build/test statuses remain producer claims and never authorize deployment.",
+      "description": "A release-bundle build inventory. Verification establishes file integrity only; build/test statuses remain producer claims and never authorize deployment.",
       "type": "object",
       "additionalProperties": false,
       "required": [
@@ -725,7 +725,7 @@
       "additionalProperties": false,
       "required": [
         "repository",
-        "releaseUnit",
+        "releaseBundle",
         "version",
         "target",
         "attemptId"
@@ -734,7 +734,7 @@
         "repository": {
           "$ref": "#/$defs/receiptRepository"
         },
-        "releaseUnit": {
+        "releaseBundle": {
           "type": "string",
           "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"
         },
@@ -1039,7 +1039,7 @@
       "additionalProperties": false,
       "required": [
         "repository",
-        "releaseUnit",
+        "releaseBundle",
         "version",
         "target",
         "acceptanceId",
@@ -1049,7 +1049,7 @@
         "repository": {
           "$ref": "#/$defs/receiptRepository"
         },
-        "releaseUnit": {
+        "releaseBundle": {
           "type": "string",
           "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"
         },
