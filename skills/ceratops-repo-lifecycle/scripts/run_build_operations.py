@@ -391,10 +391,11 @@ def execute_check_phases(
             "message": "Required work is not ready: " + ", ".join(sorted(reasons)),
         })
 
+    preparation_cleanup: dict[str, Any] = {}
     if prepared:
         owner, action = diagnostic_owner or (prepared[0].repo_root, "operation")
         operations.remove_resolved_failures(
-            {}, diagnostic_output=diagnostic_output, repo_root=owner, action=action,
+            preparation_cleanup, diagnostic_output=diagnostic_output, repo_root=owner, action=action,
             resolved_failures=(preparation_id,),
         )
     source_results = {(value.get("operation"), value.get("check_group")): value
@@ -496,7 +497,7 @@ def execute_check_phases(
             delivery, diagnostic_output=diagnostic_output, diagnostic_owner=diagnostic_owner,
             successful_results=(successful_results, results),
         )
-        result["build_results"] = results
+        result = {**preparation_cleanup, **result, "build_results": results}
         for source, destination in (("check_result", "check_results"), ("check_summary", "check_summaries")):
             check_references = [item[source] for item in results if item.get(source)]
             if check_references:
@@ -517,7 +518,7 @@ def execute_check_phases(
     completed = list(dict.fromkeys(item["operation"] for item in results
                                    if item["status"] in {"completed", "no_op"}
                                    and item["operation"] not in failed_names))
-    final_result = {**(failed[0] if failed else {}),
+    final_result = {**preparation_cleanup, **(failed[0] if failed else {}),
                     "status": failed[0]["status"] if failed else "completed", "results": results,
                     "artifacts": available,
                     "deferred_handoffs": [handoff for result in results for handoff in result.get("deferred_handoffs", [])],

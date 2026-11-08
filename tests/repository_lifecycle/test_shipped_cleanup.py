@@ -1273,9 +1273,9 @@ def test_failed_checks_prevent_remote_work_and_succeed_after_committed_repair(
 
         path = repo / "sdlc/sdlc.yml"
         document = yaml.safe_load(path.read_text())
-        actions = document["repository"]["actions"]
-        actions["test"] = actions["validate"]
-        actions["validate"] = {
+        groups = document["repository"]["actions"]["pre-build-checks"]["check-groups"]
+        groups["tests"] = groups["source"]
+        groups["source"] = {
             "requires": {"capabilities": []},
             "no-op": "Fixture has no validation command.",
         }
@@ -1284,9 +1284,7 @@ def test_failed_checks_prevent_remote_work_and_succeed_after_committed_repair(
     broken = shipping_cases._commit(repo)
     with pytest.raises(loaded["RepositoryShipError"]) as failure:
         loaded["ship_repository"](args)
-    assert failure.value.payload["status"] == (
-        "validation_failed" if gate == "validate" else "tests_failed"
-    )
+    assert failure.value.payload["status"] == "validation_failed"
     assert failure.value.payload["phase"] == "before_remote"
     assert failure.value.payload["commit"] == broken
     assert failure.value.payload["diagnostic"]["stderr_tail"] == [

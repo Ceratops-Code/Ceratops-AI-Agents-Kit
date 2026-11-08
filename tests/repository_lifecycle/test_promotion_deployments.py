@@ -942,6 +942,8 @@ def _prepare_standalone_handoff_reports(
         _registered_skill_fixture,
     )
 
+    from tests.repository_lifecycle.test_sdlc_actions import _typed_contract
+
     runner = importlib.import_module("repository_operation")
     command = importlib.import_module("github_pr_workflow.command")
     actions = importlib.import_module("execute_skill_actions")
@@ -950,6 +952,7 @@ def _prepare_standalone_handoff_reports(
     if source_checkout != "primary":
         source = tmp_path / "worktrees" / repo.name / "installer-source"
         assert run_git(repo, "worktree", "add", "-b", "installer-source", str(source)).returncode == 0
+        _typed_contract(source)
         if source_checkout == "worktree-primary-changed":
             contract_path = repo / "sdlc/sdlc.yml"
             contract = json.loads(contract_path.read_text())

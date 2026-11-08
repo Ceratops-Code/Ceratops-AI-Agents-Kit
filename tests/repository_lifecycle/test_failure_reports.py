@@ -606,7 +606,7 @@ def test_direct_workflows_save_errors_at_selected_path(report_repo, monkeypatch,
 
 def prepared(repo, operation, script):
     return runner.PreparedOperation(
-        repo_root=repo, operation=operation, category="tests",
+        repo_root=repo, operation=operation, category="bootstrap",
         commit=run_git(repo, "rev-parse", "HEAD").stdout.strip(),
         steps=(runner.PreparedStep(1, (sys.executable, "-c", script), repo),),
         prerequisites={},
@@ -635,7 +635,7 @@ def test_operation_list_saves_large_failure_and_preserves_prior_success(report_r
         result = runner.execute_prepared_operations(
             operations, diagnostic_output=path, diagnostic_owner=(repo, "promote"),
         )
-        assert result["status"] == "tests_failed"
+        assert result["status"] == "operation_failed"
         assert result["completed_operations"] == ["tests.first"]
         assert result["pending_operations"] == ["tests.second", "tests.dependent"]
         assert result["results"][0]["step_results"][0]["result"] == receipt
@@ -803,7 +803,7 @@ def test_executor_clears_matching_failure_before_next_operation(report_repo):
     result = runner.execute_prepared_operations(
         [passed, later], diagnostic_output=path, diagnostic_owner=(repo, "promote"),
     )
-    assert result["status"] == "tests_failed"
+    assert result["status"] == "operation_failed"
     assert set(json.loads(path.read_text())["failures"]) == {"tests.later:1"}
 
 
@@ -820,7 +820,7 @@ def test_partial_command_success_preserves_other_failure_and_accepted_file(repor
     result = runner.execute_prepared_operation(
         operation, diagnostic_output=path, diagnostic_owner=(repo, "promote"),
     )
-    assert result["status"] == "tests_failed"
+    assert result["status"] == "operation_failed"
     report = json.loads(path.read_text())
     assert set(report["failures"]) == {"tests.unit:2"}
     assert report["successful_result_paths"] == [str(accepted)]
@@ -853,7 +853,7 @@ def test_reused_check_retires_report_without_executing_command(report_repo, monk
         store=SimpleNamespace(select=lambda *_args, **_kwargs: {"decision": "reuse"}),
         reused_result=lambda _prepared: result,
     )
-    monkeypatch.setattr(runner.reuse_operation_checks, "check_inputs", lambda *_args: {"fingerprint": "same", "group": "tests.unit"})
+    monkeypatch.setattr(runner.reuse_operation_checks, "collect_check_inputs", lambda *_args: {"fingerprint": "same", "group": "tests.unit"})
     operation = replace(operation, check_results={}, check_plan=plan)
     original_unlink = pathlib.Path.unlink
 
@@ -1149,13 +1149,13 @@ def test_success_cleanup_does_not_delete_another_actions_report(report_repo):
 def test_batch_preparation_cleanup_error_reaches_caller(report_repo, monkeypatch, fail_later):
     repo, path = report_repo
     script = "import sys; sys.exit(1)" if fail_later else "print('passed')"
-    operation = prepared(repo, "tests.unit", script)
+    operation = replace(prepared(repo, "tests.unit", script), category="pre-build-checks", check_phase="pre-build")
 
-    def cannot_prepare(_operations):
+    def cannot_prepare(_operation):
         raise ValueError("missing check input")
 
     with monkeypatch.context() as patch:
-        patch.setattr(runner.reuse_operation_checks, "plan_operation", cannot_prepare)
+        patch.setattr(runner.reuse_operation_checks, "decide_check_reuse", cannot_prepare)
         assert runner.execute_prepared_operations(
             [runner.replace(operation, check_results={})], diagnostic_output=path, diagnostic_owner=(repo, "promote"),
         )["status"] == "result_invalid"
@@ -1172,7 +1172,7 @@ def test_batch_preparation_cleanup_error_reaches_caller(report_repo, monkeypatch
         result = runner.execute_prepared_operations(
             [operation], diagnostic_output=path, diagnostic_owner=(repo, "promote"),
         )
-    assert result["status"] == ("tests_failed" if fail_later else "completed")
+    assert result["status"] == ("validation_failed" if fail_later else "completed")
     assert "cannot remove preparation report" in result["report_cleanup_error"]
 
 

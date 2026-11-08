@@ -102,7 +102,11 @@ def test_ci_runs_repository_validator_that_owns_both_mypy_platforms() -> None:
     assert "npm --prefix scripts ci" in installation_step["run"]
     gate = next(step for step in steps if step.get("name") == "Validate and test through SDLC")
     assert gate["uses"] == "./skills/ceratops-repo-lifecycle/scripts"
-    assert gate["with"] == {"repo-root": ".", "evidence-file": "${{ runner.temp }}/sdlc-validation.json"}
+    assert gate["with"] == {
+        "repo-root": ".",
+        "operations": "repository.actions.pre-build-checks",
+        "evidence-file": "${{ runner.temp }}/sdlc-validation.json",
+    }
     assert steps.index(installation_step) < steps.index(gate)
     contract = yaml.safe_load((ROOT / "sdlc/sdlc.yml").read_text(encoding="utf-8"))
     assert contract["version"] == 4

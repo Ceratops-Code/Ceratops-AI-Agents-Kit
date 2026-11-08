@@ -927,7 +927,8 @@ def test_compatibility_materializer_supports_repositories_without_skills(
     action_step = next(step for step in yaml.safe_load(uv_workflow)["jobs"]["validate-repository"]["steps"]
                        if step.get("uses", "").startswith("Ceratops-Code/"))
     assert action_step["uses"].endswith("@" + CI_ACTION_REVISION)
-    assert set(action_step["with"]) == {"repo-root", "evidence-file"}
+    assert set(action_step["with"]) == {"repo-root", "evidence-file", "operations"}
+    assert action_step["with"]["operations"] == "repository.actions.pre-build-checks"
     assert (uv_repo / "application/uv.lock").read_text() == "version = 1\n"
 
     # Synthetic recipes exercise extension behavior without coupling the shipped
