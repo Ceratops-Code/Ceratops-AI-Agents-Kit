@@ -99,11 +99,28 @@ def check_inputs_match_for_reuse(recorded: Mapping[str, Any], current: Mapping[s
     """
     if recorded["fingerprint"] == current["fingerprint"]:
         return True
-    ignored = {"fingerprint", "workVersion", "qualificationLevel", "environment"}
-    if ({key: value for key, value in recorded.items() if key not in ignored}
-            != {key: value for key, value in current.items() if key not in ignored}
-            or not _recorded_tools_cover_path_lookup(recorded)
-            or not _recorded_tools_cover_path_lookup(current)):
+    # An SDLC route is an address, not the work performed by its command.
+    # Compare the owning deliverable and complete execution facts, so moving a
+    # command between phase containers preserves its original result identity.
+    # Never remove checkGroup/artifacts/target/cwd/worktree from that comparison.
+    def work(context: Mapping[str, Any]) -> dict[str, Any]:
+        value = {key: item for key, item in context.items()
+                 if key not in {"fingerprint", "workVersion", "qualificationLevel", "environment"}}
+        scope = dict(value["scope"])
+        operation = scope.pop("operation", None)
+        if not isinstance(operation, str) or ".actions." not in operation:
+            return value  # Unrecognized ownership retains exact comparison.
+        value.pop("group", None)
+        scope["owner"] = operation.split(".actions.", 1)[0]
+        scope.pop("stage", None)
+        value["scope"] = scope
+        return value
+
+    if work(recorded) != work(current):
+        return False
+    if recorded["environment"] == current["environment"]:
+        return True
+    if not _recorded_tools_cover_path_lookup(recorded) or not _recorded_tools_cover_path_lookup(current):
         return False
 
     def effective_environment(context: Mapping[str, Any]) -> dict[str, Any]:
@@ -350,8 +367,7 @@ class CheckResultStore:
             decision["reason"] = "Malformed or incomplete durable evidence prevents safe reuse."
             return decision
         matching = [(path, record, raw) for path, record, raw in records
-                    if record["check_id"] == check_id
-                    and check_inputs_match_for_reuse(record["inputs"], request)]
+                    if check_inputs_match_for_reuse(record["inputs"], request)]
         matching.sort(key=lambda item: _order(item[1]), reverse=True)
         if any(_nonreusable(record) for _, record, _ in matching):
             decision["reason"] = "Unrepresented child scope requires fresh execution."
@@ -365,7 +381,7 @@ class CheckResultStore:
         for build in builds:
             summary = build["summary"]
             for check in summary["checks"]:
-                if (check.get("kind") != "repository-check" or check.get("id") != check_id
+                if (check.get("kind") != "repository-check"
                         or check.get("status") != "passed" or check.get("reusable") is False
                         or not {"inputGroup", "result_id", "check_version", "completed_ns"} <= check.keys()):
                     continue

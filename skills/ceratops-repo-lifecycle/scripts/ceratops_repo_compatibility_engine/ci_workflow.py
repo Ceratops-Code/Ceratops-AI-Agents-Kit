@@ -82,6 +82,10 @@ def resolve_action(action: Mapping[str, Any], revision: str | None = None) -> st
             document = yaml.safe_load(response.read(65537))
         if not isinstance(document, dict) or document.get("runs", {}).get("using") != "composite":
             raise ValueError("published revision does not contain the composite action")
+        inputs = document.get("inputs")
+        missing = set(action["inputs"]) - set(inputs if isinstance(inputs, Mapping) else ())
+        if missing:
+            raise ValueError("published action lacks required inputs: " + ", ".join(sorted(missing)))
     except (OSError, ValueError, AttributeError, subprocess.TimeoutExpired, yaml.YAMLError) as exc:
         raise RuntimeError(
             "CI action publication is unavailable; publish the action or provide "
@@ -118,7 +122,7 @@ def workflow_errors(path: pathlib.Path, action: Mapping[str, Any]) -> list[str]:
             if not isinstance(inputs, Mapping) or any(
                 not isinstance(inputs.get(key), str) or not inputs[key].strip() for key in action["inputs"]
             ):
-                errors.append("CI lifecycle action requires repo-root and evidence-file inputs")
+                errors.append("CI lifecycle action requires " + ", ".join(action["inputs"]) + " inputs")
             if step.get("continue-on-error") or job.get("continue-on-error"):
                 errors.append("CI validation and tests must not continue on error")
     if not found:

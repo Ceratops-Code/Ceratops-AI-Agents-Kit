@@ -102,12 +102,30 @@
       "description": "Executable: generator supplies named v4 skill actions and removes only exact owned definitions when source skills disappear; loader validates materialized actions against the SDLC schema.",
       "additionalProperties": false,
       "required": [
-        "validate",
+        "before-build-checks",
         "install"
       ],
       "properties": {
-        "validate": {
-          "$ref": "#/$defs/managed_skill_action"
+        "before-build-checks": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "check-groups"
+          ],
+          "properties": {
+            "check-groups": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "source"
+              ],
+              "properties": {
+                "source": {
+                  "$ref": "#/$defs/managed_skill_action"
+                }
+              }
+            }
+          }
         },
         "install": {
           "$ref": "#/$defs/managed_skill_action"
@@ -142,10 +160,17 @@
     "skill_python_runtime": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["project", "lockfile"],
+      "required": [
+        "project",
+        "lockfile"
+      ],
       "properties": {
-        "project": {"$ref": "#/$defs/relative_path"},
-        "lockfile": {"$ref": "#/$defs/relative_path"}
+        "project": {
+          "$ref": "#/$defs/relative_path"
+        },
+        "lockfile": {
+          "$ref": "#/$defs/relative_path"
+        }
       },
       "description": "Executable: generator copies the source-only pair for Python skills; checker requires its locked declarations."
     },
@@ -153,12 +178,20 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "root_file_patterns", "python_dependency_file_patterns", "excluded_directories"
+        "root_file_patterns",
+        "python_dependency_file_patterns",
+        "excluded_directories"
       ],
       "properties": {
-        "root_file_patterns": {"$ref": "#/$defs/strings"},
-        "python_dependency_file_patterns": {"$ref": "#/$defs/strings"},
-        "excluded_directories": {"$ref": "#/$defs/strings"}
+        "root_file_patterns": {
+          "$ref": "#/$defs/strings"
+        },
+        "python_dependency_file_patterns": {
+          "$ref": "#/$defs/strings"
+        },
+        "excluded_directories": {
+          "$ref": "#/$defs/strings"
+        }
       },
       "description": "Executable: the runtime planner rejects misplaced configuration before writes; the structural checker reports the same paths. Git supplies tracked and unignored inputs, with a pruned non-Git fallback excluding declared output and dependency directories. Existing environment checks own their uv locks; application workspace ownership remains part of the companion review."
     },
@@ -241,7 +274,8 @@
           "additionalProperties": false,
           "required": [
             "repo-root",
-            "evidence-file"
+            "evidence-file",
+            "operations"
           ],
           "properties": {
             "repo-root": {
@@ -249,6 +283,10 @@
               "minLength": 1
             },
             "evidence-file": {
+              "type": "string",
+              "minLength": 1
+            },
+            "operations": {
               "type": "string",
               "minLength": 1
             }

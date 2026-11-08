@@ -217,12 +217,11 @@ def test_auto_promotion_context_is_bound_before_collection(
         "ordinary",
         "promotion",
         "missing-commit",
-        "missing-tests",
         "ci",
         "detached",
     ],
 )
-def test_promotion_hands_context_through_sdlc_only_to_tests(
+def test_promotion_hands_context_through_sdlc_to_requested_checks(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
     context: str,
@@ -242,20 +241,20 @@ def test_promotion_hands_context_through_sdlc_only_to_tests(
         "kind": "ceratops-sdlc",
         "repository": {
             "capabilities": {},
-            "actions": {
-                "validate": {
+            "actions": {"before-build-checks": {"check-groups": {'source': {
                     "requires": {"capabilities": []},
                     "steps": [
                         {
                             "run": [
                                 sys.executable,
                                 "-c",
-                                "import os; assert 'CERATOPS_SDLC_TEST_CONTEXT' not in os.environ",
+                                "import os,pathlib; "
+                                f"pathlib.Path({str(record)!r} + '.source').write_text("
+                                "os.environ.get('CERATOPS_SDLC_TEST_CONTEXT', 'null'))",
                             ]
                         }
                     ],
-                },
-                "test": {
+                }, 'tests': {
                     "requires": {"capabilities": []},
                     "steps": [
                         {
@@ -270,8 +269,7 @@ def test_promotion_hands_context_through_sdlc_only_to_tests(
                             ]
                         }
                     ],
-                },
-            },
+                }}}, },
         },
     }
     (repo / "sdlc/sdlc.yml").write_text(json.dumps(contract), encoding="utf-8")
@@ -300,14 +298,13 @@ def test_promotion_hands_context_through_sdlc_only_to_tests(
         parameter=[],
     )
     command = workflow["_validation_command"](args, repo, commit)
-    assert command[-2:] == ["--test-trigger", "promotion"]
+    trigger_index = command.index("--test-trigger")
+    assert command[trigger_index + 1] == "promotion"
     if context == "ordinary":
-        command = command[:-2]
+        del command[trigger_index:trigger_index + 2]
     elif context == "missing-commit":
         index = command.index("--commit")
         del command[index : index + 2]
-    elif context == "missing-tests":
-        command.remove("--tests")
     elif context == "ci":
         command.append("--ci")
     elif context == "detached":
@@ -321,7 +318,7 @@ def test_promotion_hands_context_through_sdlc_only_to_tests(
         assert result.returncode != 0
         assert not record.exists()
         assert (
-            "test context requires" in result.stderr
+            "check context requires" in result.stderr
             or "require a checked-out release branch" in result.stderr
         )
         return
@@ -332,6 +329,7 @@ def test_promotion_hands_context_through_sdlc_only_to_tests(
         else None
     )
     assert json.loads(record.read_text()) == expected
+    assert json.loads(pathlib.Path(str(record) + ".source").read_text()) == expected
     assert "CERATOPS_SDLC_TEST_CONTEXT" not in os.environ
 
 

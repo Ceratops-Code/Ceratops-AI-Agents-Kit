@@ -158,13 +158,13 @@ Infer the source identity from stable repository evidence before asking.
   source skills exist, write `skills/skill-sections.json`, copy canonical shared
   sections to `skills/sections/`, and remove generated section blocks from
   source skills.
-- Create or reconcile `sdlc/sdlc.yml` from the owned v4 template, preserving
-  target capabilities with separate validation and tests. For each source
-  skill, add a named `deliverables.skills.<name>` record whose
-  `actions.validate` hands off to `ceratops-skill-lifecycle/source-validate`
-  and whose `actions.install` hands off to
-  `ceratops-skill-lifecycle/deploy`. Preserve target-owned entries; deployment
-  alternatives are not automatic defaults.
+- Create or update `sdlc/sdlc.yml` from the owned template, preserving target
+  capabilities and separate source/test commands in `before-build-checks`
+  groups. For each source skill, add `deliverables.skills.<name>` with
+  `actions.before-build-checks.check-groups.source` handing off to
+  `ceratops-skill-lifecycle/source-validate` and `actions.install` handing off
+  to `ceratops-skill-lifecycle/deploy`. Preserve target-owned entries;
+  deployment alternatives are not automatic defaults.
 - When skills exist, make every source `SKILL.md` delta-only, add or align
   `skills/<name>/agents/openai.yaml`, and align the README Skills table without
   changing skill behavior.

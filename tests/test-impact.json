@@ -1097,6 +1097,7 @@
     "sdlc-handoffs": {
       "pytest": [
         "tests/repository_lifecycle/test_sdlc_handoffs.py",
+        "tests/repository_lifecycle/test_sdlc_actions.py",
         "tests/repository_lifecycle/test_execute_skill_actions.py"
       ],
       "depends_on": [],

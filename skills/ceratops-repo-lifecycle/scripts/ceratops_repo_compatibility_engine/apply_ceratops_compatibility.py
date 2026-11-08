@@ -191,7 +191,7 @@ def validate_template(template: Mapping[str, object]) -> None:
         raise RuntimeError("skill-sections template is not repository-neutral")
 
 
-def build_sdlc_contract_candidate(
+def prepare_sdlc_configuration(
     repo_root: pathlib.Path,
     *,
     skill_names: list[str],
@@ -225,15 +225,16 @@ def build_sdlc_contract_candidate(
     capabilities = dict(repository.get("capabilities", {}))
     capabilities.setdefault("uv", {"executable": "uv"})
     actions = dict(repository.get("actions", {}))
-    existing_validation = actions.get("validate")
-    template_validation = reusable["repository"]["actions"]["validate"]
+    checks = dict(actions.get("before-build-checks", {}).get("check-groups", {}))
+    existing_validation = checks.get("source")
+    template_validation = reusable["repository"]["actions"]["before-build-checks"]["check-groups"]["source"]
     owned_validation = dict(template_validation)
     if any(item["id"] == "shellcheck" for item in repository_checks.contract_checks(repo_root)):
         capabilities.setdefault("shellcheck", {"executable": "shellcheck"})
         owned_validation["requires"] = {"capabilities": ["uv", "shellcheck"]}
         owned_validation["validation-capabilities"] = ["shellcheck"]
     if existing_validation is None or existing_validation == template_validation or isinstance(existing_validation, dict) and "no-op" in existing_validation:
-        actions["validate"] = owned_validation
+        checks["source"] = owned_validation
     elif existing_validation != owned_validation:
         # A custom wrapper may carry arguments or setup that cannot safely be
         # replaced or duplicated. Its owner must integrate that behavior.
@@ -241,10 +242,10 @@ def build_sdlc_contract_candidate(
             "custom repository validation operation requires explicit integration with the uv validator command"
         )
     actions.setdefault("bootstrap", reusable["repository"]["actions"]["bootstrap"])
-    existing_test = actions.get("test")
-    owned_test = reusable["repository"]["actions"]["test"]
+    existing_test = checks.get("tests")
+    owned_test = reusable["repository"]["actions"]["before-build-checks"]["check-groups"]["tests"]
     infer_tests = existing_test is None or existing_test == owned_test
-    test_steps: list[dict[str, object]] = []
+    test_steps: list[dict[str, list[str]]] = []
     test_capabilities: list[str] = []
     detected = discover_python_tests(
         repo_root, load_compatibility_contract()["python_test_detection"]
@@ -276,14 +277,17 @@ def build_sdlc_contract_candidate(
         test_capabilities.append("cargo")
         test_steps.append({"run": ["cargo", "test"]})
     if infer_tests:
-        actions["test"] = (
-            {
-                "requires": {"capabilities": list(dict.fromkeys(test_capabilities))},
-                "steps": test_steps,
-            }
-            if test_steps
-            else owned_test
-        )
+        if not test_steps:
+            checks["tests"] = owned_test
+        else:
+            # Each detected command is independently requestable. Do not make
+            # one requested Python group launch Node/Go/Rust tests as well.
+            for index, step in enumerate(test_steps):
+                name = "tests" if index == 0 else str(step["run"][0]) + "-tests"
+                checks[name] = {"requires": {"capabilities": [test_capabilities[index]]}, "steps": [step]}
+    actions["before-build-checks"] = {"check-groups": checks}
+    order = ("bootstrap", "test-selection", "before-build-checks", "build", "after-build-checks", "install", "publish", "verify-publish")
+    actions = {name: actions[name] for name in order if name in actions}
     repository["capabilities"] = capabilities
     repository["actions"] = actions
     candidate["repository"] = repository
@@ -616,7 +620,7 @@ def plan_ceratops_compatibility(
         action_errors = action_assignment_errors(repo_root, manifest)
         if action_errors:
             raise RuntimeError("; ".join(action_errors))
-    sdlc_contract = build_sdlc_contract_candidate(
+    sdlc_contract = prepare_sdlc_configuration(
         repo_root,
         skill_names=sorted(skill_names),
         apply_contract=apply_sdlc_contract,

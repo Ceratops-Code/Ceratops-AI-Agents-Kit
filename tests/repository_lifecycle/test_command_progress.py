@@ -47,17 +47,14 @@ def test_sdlc_command_environment_stays_scoped_across_fresh_calls(
     repo, _, _, _ = prepare_repository_lifecycle_repo(tmp_path)
     write_sdlc_contract(repo, repository={
         "capabilities": {},
-        "actions": {
-            "validate": {
+        "actions": {"before-build-checks": {"check-groups": {'source': {
                 "requires": {"capabilities": []}, "steps": [{"run": argv}],
-            },
-            "test": {
+            }, 'tests': {
                 "requires": {"capabilities": []}, "no-op": "Environment boundary fixture.",
-            },
-        },
+            }}}, },
     })
     prepared = runner.prepare_operations(
-        repo, [runner.OperationRequest("repository.actions.validate")], context="skill",
+        repo, [runner.OperationRequest("repository.actions.before-build-checks.check-groups.source")], context="skill",
     )[0]
     monkeypatch.setenv("VIRTUAL_ENV", "caller-owned-environment")
     monkeypatch.setenv("SCOPED_ENVIRONMENT_TEST", "preserved")
@@ -207,13 +204,10 @@ def test_promotion_streams_real_pytest_progress_through_every_parent(
     )
     write_sdlc_contract(repo, repository={
         "capabilities": {},
-        "actions": {
-            "validate": {"requires": {"capabilities": []}, "no-op": "No check in fixture."},
-            "test": {
+        "actions": {"before-build-checks": {"check-groups": {'source': {"requires": {"capabilities": []}, "no-op": "No check in fixture."}, 'tests': {
                 "requires": {"capabilities": []},
                 "steps": [{"run": [sys.executable, "scripts/testing/run-tests.py", "tests/test_probe.py"]}],
-            },
-        },
+            }}}, },
     })
     assert run_git(repo, "add", ".").returncode == 0
     assert run_git(repo, "commit", "-m", "add live test fixture").returncode == 0
@@ -247,7 +241,7 @@ def test_promotion_streams_real_pytest_progress_through_every_parent(
     assert "[tests] pytest exit " + str(int(failure)) in sink.getvalue()
     assert "[tests] selection " not in sink.getvalue()
     assert result.returncode == int(failure), payload
-    assert payload["status"] == ("tests_failed" if failure else "ready"), payload
+    assert payload["status"] == ("validation_failed" if failure else "ready"), payload
     if failure:
         # Promotion returns the runner's complete report path instead of
         # copying the pytest failure into every parent's bounded response.

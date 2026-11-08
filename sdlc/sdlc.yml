@@ -36,28 +36,30 @@ repository:
       parameters: [base, head]
       steps:
         - run: [uv, run, --project, scripts, --locked, python, scripts/testing/run-tests.py, --select-only, --base, "{base}", --head, "{head}"]
-    validate:
-      check-results:
-        product-inputs: ["**"]
-        check-inputs: [scripts/validate-repository.py, scripts/result_records.py, skills/ceratops-repo-lifecycle/references/contracts/**, skills/ceratops-repo-lifecycle/scripts/ceratops_repo_compatibility_engine/**]
-        dependencies: [scripts/uv.lock, scripts/package-lock.json]
-        environment: [PATH, CI, GITHUB_ACTIONS, UV_OFFLINE]
-        tools: [uv, git, node, npm, powershell]
-      requires:
-        capabilities: [uv]
-      steps:
-        - run: [uv, run, --project, scripts, --locked, python, scripts/validate-repository.py]
-    test:
-      check-results:
-        product-inputs: [skills/**, tools/**, mcp-servers/**, sdlc/**, docs/result_records.py.tmpl, README.md, AGENTS.md, .github/**]
-        check-inputs: [scripts/**, tests/**]
-        dependencies: [scripts/uv.lock, scripts/package-lock.json]
-        environment: [PATH, CI, PYTEST_ADDOPTS, GITHUB_ACTIONS, GITHUB_EVENT_NAME, GITHUB_EVENT_PATH, GITHUB_REF_NAME, UV_OFFLINE]
-        tools: [uv, git, node, npm, powershell]
-      requires:
-        capabilities: [uv]
-      steps:
-        - run: [uv, run, --project, scripts, --locked, python, scripts/testing/run-tests.py, --auto]
+    before-build-checks:
+      check-groups:
+        source:
+          check-results:
+            product-inputs: ["**"]
+            check-inputs: [scripts/validate-repository.py, scripts/result_records.py, skills/ceratops-repo-lifecycle/references/contracts/**, skills/ceratops-repo-lifecycle/scripts/ceratops_repo_compatibility_engine/**]
+            dependencies: [scripts/uv.lock, scripts/package-lock.json]
+            environment: [PATH, CI, GITHUB_ACTIONS, UV_OFFLINE]
+            tools: [uv, git, node, npm, powershell]
+          requires:
+            capabilities: [uv]
+          steps:
+            - run: [uv, run, --project, scripts, --locked, python, scripts/validate-repository.py]
+        tests:
+          check-results:
+            product-inputs: [skills/**, tools/**, mcp-servers/**, sdlc/**, docs/result_records.py.tmpl, README.md, AGENTS.md, .github/**]
+            check-inputs: [scripts/**, tests/**]
+            dependencies: [scripts/uv.lock, scripts/package-lock.json]
+            environment: [PATH, CI, PYTEST_ADDOPTS, GITHUB_ACTIONS, GITHUB_EVENT_NAME, GITHUB_EVENT_PATH, GITHUB_REF_NAME, UV_OFFLINE]
+            tools: [uv, git, node, npm, powershell]
+          requires:
+            capabilities: [uv]
+          steps:
+            - run: [uv, run, --project, scripts, --locked, python, scripts/testing/run-tests.py, --auto]
 
 deliverables:
   mcp-servers:
@@ -66,14 +68,16 @@ deliverables:
       manifest: mcp-servers/ceratops_mcp_server_manager/mcp-server.json
       prerequisites: []
       actions:
-        validate:
-          requires:
-            capabilities: []
-          no-op: Repository validation covers the MCP server manager source and manifest.
-        test:
-          requires:
-            capabilities: []
-          no-op: Repository tests cover managed launchers, selection changes, and version retirement.
+        before-build-checks:
+          check-groups:
+            source:
+              requires:
+                capabilities: []
+              no-op: Repository validation covers the MCP server manager source and manifest.
+            tests:
+              requires:
+                capabilities: []
+              no-op: Repository tests cover managed launchers, selection changes, and version retirement.
         install:
           requires:
             capabilities: [uv]
@@ -85,14 +89,16 @@ deliverables:
       manifest: tools/mcp-server.json
       prerequisites: []
       actions:
-        validate:
-          requires:
-            capabilities: []
-          no-op: Repository checks cover source-search inputs; the MCP installer checks the locked candidate before activation.
-        test:
-          requires:
-            capabilities: []
-          no-op: Repository tests cover bounded source-search behavior and MCP packaging.
+        before-build-checks:
+          check-groups:
+            source:
+              requires:
+                capabilities: []
+              no-op: Repository checks cover source-search inputs; the MCP installer checks the locked candidate before activation.
+            tests:
+              requires:
+                capabilities: []
+              no-op: Repository tests cover bounded source-search behavior and MCP packaging.
         install:
           requires:
             capabilities: []
@@ -108,15 +114,17 @@ deliverables:
       source: skills/ceratops-automation-run
       prerequisites: []
       actions:
-        validate:
-          requires:
-            capabilities: []
-          steps:
-            - handoff:
-                lifecycle: ceratops-skill-lifecycle
-                action: source-validate
-                inputs:
-                  skill: ceratops-automation-run
+        before-build-checks:
+          check-groups:
+            source:
+              requires:
+                capabilities: []
+              steps:
+                - handoff:
+                    lifecycle: ceratops-skill-lifecycle
+                    action: source-validate
+                    inputs:
+                      skill: ceratops-automation-run
         install:
           requires:
             capabilities: []
@@ -130,9 +138,11 @@ deliverables:
       source: skills/ceratops-code-consistency-audit
       prerequisites: []
       actions:
-        validate:
-          requires: {capabilities: []}
-          steps: [{handoff: {lifecycle: ceratops-skill-lifecycle, action: source-validate, inputs: {skill: ceratops-code-consistency-audit}}}]
+        before-build-checks:
+          check-groups:
+            source:
+              requires: {capabilities: []}
+              steps: [{handoff: {lifecycle: ceratops-skill-lifecycle, action: source-validate, inputs: {skill: ceratops-code-consistency-audit}}}]
         install:
           requires: {capabilities: []}
           steps: [{handoff: {lifecycle: ceratops-skill-lifecycle, action: deploy, inputs: {skill: ceratops-code-consistency-audit}}}]
@@ -140,9 +150,11 @@ deliverables:
       source: skills/ceratops-credit-savings-analysis
       prerequisites: []
       actions:
-        validate:
-          requires: {capabilities: []}
-          steps: [{handoff: {lifecycle: ceratops-skill-lifecycle, action: source-validate, inputs: {skill: ceratops-credit-savings-analysis}}}]
+        before-build-checks:
+          check-groups:
+            source:
+              requires: {capabilities: []}
+              steps: [{handoff: {lifecycle: ceratops-skill-lifecycle, action: source-validate, inputs: {skill: ceratops-credit-savings-analysis}}}]
         install:
           requires: {capabilities: []}
           steps: [{handoff: {lifecycle: ceratops-skill-lifecycle, action: deploy, inputs: {skill: ceratops-credit-savings-analysis}}}]
@@ -150,9 +162,11 @@ deliverables:
       source: skills/ceratops-design-document-lifecycle
       prerequisites: []
       actions:
-        validate:
-          requires: {capabilities: []}
-          steps: [{handoff: {lifecycle: ceratops-skill-lifecycle, action: source-validate, inputs: {skill: ceratops-design-document-lifecycle}}}]
+        before-build-checks:
+          check-groups:
+            source:
+              requires: {capabilities: []}
+              steps: [{handoff: {lifecycle: ceratops-skill-lifecycle, action: source-validate, inputs: {skill: ceratops-design-document-lifecycle}}}]
         install:
           requires: {capabilities: []}
           steps: [{handoff: {lifecycle: ceratops-skill-lifecycle, action: deploy, inputs: {skill: ceratops-design-document-lifecycle}}}]
@@ -160,9 +174,11 @@ deliverables:
       source: skills/ceratops-governance-lifecycle
       prerequisites: []
       actions:
-        validate:
-          requires: {capabilities: []}
-          steps: [{handoff: {lifecycle: ceratops-skill-lifecycle, action: source-validate, inputs: {skill: ceratops-governance-lifecycle}}}]
+        before-build-checks:
+          check-groups:
+            source:
+              requires: {capabilities: []}
+              steps: [{handoff: {lifecycle: ceratops-skill-lifecycle, action: source-validate, inputs: {skill: ceratops-governance-lifecycle}}}]
         install:
           requires: {capabilities: []}
           steps: [{handoff: {lifecycle: ceratops-skill-lifecycle, action: deploy, inputs: {skill: ceratops-governance-lifecycle}}}]
@@ -170,9 +186,11 @@ deliverables:
       source: skills/ceratops-misunderstanding-audit
       prerequisites: []
       actions:
-        validate:
-          requires: {capabilities: []}
-          steps: [{handoff: {lifecycle: ceratops-skill-lifecycle, action: source-validate, inputs: {skill: ceratops-misunderstanding-audit}}}]
+        before-build-checks:
+          check-groups:
+            source:
+              requires: {capabilities: []}
+              steps: [{handoff: {lifecycle: ceratops-skill-lifecycle, action: source-validate, inputs: {skill: ceratops-misunderstanding-audit}}}]
         install:
           requires: {capabilities: []}
           steps: [{handoff: {lifecycle: ceratops-skill-lifecycle, action: deploy, inputs: {skill: ceratops-misunderstanding-audit}}}]
@@ -180,9 +198,11 @@ deliverables:
       source: skills/ceratops-repo-lifecycle
       prerequisites: []
       actions:
-        validate:
-          requires: {capabilities: []}
-          steps: [{handoff: {lifecycle: ceratops-skill-lifecycle, action: source-validate, inputs: {skill: ceratops-repo-lifecycle}}}]
+        before-build-checks:
+          check-groups:
+            source:
+              requires: {capabilities: []}
+              steps: [{handoff: {lifecycle: ceratops-skill-lifecycle, action: source-validate, inputs: {skill: ceratops-repo-lifecycle}}}]
         install:
           requires: {capabilities: []}
           steps: [{handoff: {lifecycle: ceratops-skill-lifecycle, action: deploy, inputs: {skill: ceratops-repo-lifecycle}}}]
@@ -190,9 +210,11 @@ deliverables:
       source: skills/ceratops-skill-lifecycle
       prerequisites: []
       actions:
-        validate:
-          requires: {capabilities: []}
-          steps: [{handoff: {lifecycle: ceratops-skill-lifecycle, action: source-validate, inputs: {skill: ceratops-skill-lifecycle}}}]
+        before-build-checks:
+          check-groups:
+            source:
+              requires: {capabilities: []}
+              steps: [{handoff: {lifecycle: ceratops-skill-lifecycle, action: source-validate, inputs: {skill: ceratops-skill-lifecycle}}}]
         install:
           requires: {capabilities: []}
           steps: [{handoff: {lifecycle: ceratops-skill-lifecycle, action: deploy, inputs: {skill: ceratops-skill-lifecycle}}}]
@@ -200,9 +222,11 @@ deliverables:
       source: skills/ceratops-task-lifecycle
       prerequisites: []
       actions:
-        validate:
-          requires: {capabilities: []}
-          steps: [{handoff: {lifecycle: ceratops-skill-lifecycle, action: source-validate, inputs: {skill: ceratops-task-lifecycle}}}]
+        before-build-checks:
+          check-groups:
+            source:
+              requires: {capabilities: []}
+              steps: [{handoff: {lifecycle: ceratops-skill-lifecycle, action: source-validate, inputs: {skill: ceratops-task-lifecycle}}}]
         install:
           requires: {capabilities: []}
           steps: [{handoff: {lifecycle: ceratops-skill-lifecycle, action: deploy, inputs: {skill: ceratops-task-lifecycle}}}]
@@ -210,9 +234,11 @@ deliverables:
       source: skills/ceratops-mcp-server-lifecycle
       prerequisites: []
       actions:
-        validate:
-          requires: {capabilities: []}
-          steps: [{handoff: {lifecycle: ceratops-skill-lifecycle, action: source-validate, inputs: {skill: ceratops-mcp-server-lifecycle}}}]
+        before-build-checks:
+          check-groups:
+            source:
+              requires: {capabilities: []}
+              steps: [{handoff: {lifecycle: ceratops-skill-lifecycle, action: source-validate, inputs: {skill: ceratops-mcp-server-lifecycle}}}]
         install:
           requires: {capabilities: []}
           steps: [{handoff: {lifecycle: ceratops-skill-lifecycle, action: deploy, inputs: {skill: ceratops-mcp-server-lifecycle}}}]
@@ -220,9 +246,11 @@ deliverables:
       source: skills/codex-desktop-upgrade
       prerequisites: []
       actions:
-        validate:
-          requires: {capabilities: []}
-          steps: [{handoff: {lifecycle: ceratops-skill-lifecycle, action: source-validate, inputs: {skill: codex-desktop-upgrade}}}]
+        before-build-checks:
+          check-groups:
+            source:
+              requires: {capabilities: []}
+              steps: [{handoff: {lifecycle: ceratops-skill-lifecycle, action: source-validate, inputs: {skill: codex-desktop-upgrade}}}]
         install:
           requires: {capabilities: []}
           steps: [{handoff: {lifecycle: ceratops-skill-lifecycle, action: deploy, inputs: {skill: codex-desktop-upgrade}}}]
@@ -232,10 +260,12 @@ deliverables:
       source: hooks
       prerequisites: []
       actions:
-        validate:
-          requires:
-            capabilities: []
-          no-op: Repository validation covers the hook sources.
+        before-build-checks:
+          check-groups:
+            source:
+              requires:
+                capabilities: []
+              no-op: Repository validation covers the hook sources.
         install:
           requires:
             capabilities: [uv]

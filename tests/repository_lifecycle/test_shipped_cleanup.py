@@ -1257,8 +1257,8 @@ def test_repository_ship_prevalidates_and_executes_ordered_phase_selections(
     ]
     assert result["deployment"]["completed_operations"] == [shipping_cases.LOCAL]
     assert prepare_calls
-    assert "--validate" in next(
-        command for command in commands if "--validate" in command
+    assert "repository.actions.before-build-checks.check-groups.source" in next(
+        command for command in commands if "repository.actions.before-build-checks.check-groups.source" in command
     )
 
 
@@ -1338,16 +1338,13 @@ def test_composed_promotion_and_shipping_each_run_their_validation_boundary(
         repo,
         repository={
             "capabilities": {},
-            "actions": {
-                "validate": {
+            "actions": {"before-build-checks": {"check-groups": {'source': {
                     "requires": {"capabilities": []},
                     "steps": [{"run": [sys.executable, "other-verifier.py"]}],
-                },
-                "test": {
+                }, 'tests': {
                     "requires": {"capabilities": []},
                     "no-op": "Fixture has no test command.",
-                },
-            },
+                }}}, },
         },
     )
     assert run_git(repo, "add", ".").returncode == 0

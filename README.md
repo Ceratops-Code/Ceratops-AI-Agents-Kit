@@ -261,7 +261,7 @@ without repository deduplication.
 | `skills/ceratops-repo-lifecycle/scripts/check_deployment_receipts.py` | Checks closed deployment receipts for promotion finalization, preserving MCP server underscores while keeping skill identities unchanged; rejects mismatched records, unfinished cleanup and duplicate identities without running installation or publication. |
 | `skills/ceratops-repo-lifecycle/scripts/manage-pending-work.py` | Records, checks, automatically resumes the retained target commit, and progressively finalizes the exact selected scope; preflight preserves and reports non-cleanup-eligible worktrees, while eligible residual-worktree and identity-matched task-temp cleanup delegates bounded removal to `pending-work-cleanup.py`. |
 | `skills/ceratops-repo-lifecycle/scripts/pending-work-cleanup.py` | Checks named directory boundaries, preserves active skill-update state, and removes selected residual and task-temp trees after clearing read-only Windows files and directories without traversing links. |
-| `skills/ceratops-repo-lifecycle/scripts/action.yml` | GitHub composite action that runs declared validation and, by default, tests using the skill-owned SDLC engine; `run-tests: false` permits validation-only CI when tests require an interactive desktop. CI defers skill handoffs and retains failure evidence. |
+| `skills/ceratops-repo-lifecycle/scripts/action.yml` | GitHub composite action that runs explicitly requested check phases or groups using the skill-owned SDLC engine; The required `operations` input names check phases or individual groups, one per line; name only the source group when tests require an interactive desktop. CI defers skill handoffs and retains failure evidence. |
 | `skills/ceratops-repo-lifecycle/scripts/repository_operation.py` | Single capability runner: resolves complete YAML locations, prevalidates ordered argv/parameters/cwd, runs applicable validation and test gates before deployment or publication, and retains bounded structured step results separately from command completion; skill callers execute registered handoffs and CI defers them. |
 | `skills/ceratops-repo-lifecycle/scripts/execute_skill_actions.py` | Runs a skill action's declared commands for the repository runner. Selects ordinary, named-skill or package-backed MCP arguments before any command starts. MCP package selection uses the SDLC prerequisites, exact project pin, one existing wheel and its canonical package lock; it never builds or tests an artifact. Preserves installed/source agreement and pinned Python execution, and returns step results and complete failure-report paths. It calls the owning skill's implementation; it does not install skills itself. |
 | `skills/ceratops-repo-lifecycle/scripts/ship-repository.py` | Public Ship argument parser and JSON/exit-code adapter; calls `github_pr_workflow/ship_repository.py`. |
@@ -319,7 +319,7 @@ The planned replacement preserves accepted results instead of repeating checks
 at each boundary; see [refactor status](#working-folder-lifecycle-refactor-status).
 
 Operations are identified by their YAML location, such as
-`repository.actions.validate` or
+`repository.actions.before-build-checks.check-groups.source` or
 `deliverables.skills.ceratops-managed.actions.install`.
 There are no extra IDs, defaults or full flows in the contract. Prerequisites
 are setup metadata; declaring them does not install dependencies. Bootstrap
@@ -357,7 +357,9 @@ Malformed output retains completed effects and blocks continuation; it never
 causes automatic replay. Other actions retain the frozen-HEAD guard. This narrow
 contract does not allocate versions or replace native package records.
 Ceratops skill handoffs are declared on each named skill. Skill source
-validation at `deliverables.skills.<name>.actions.validate` hands off to
+checks at
+`deliverables.skills.<name>.actions.before-build-checks.check-groups.source`
+hand off to
 `ceratops-skill-lifecycle/source-validate`; its skill-owned binding invokes the
 validator. The corresponding `actions.install` handoff runs the transactional
 installer. The compatible-repository producer adds these actions only for
@@ -1460,13 +1462,18 @@ GitHub Actions pins as well as the scripts project.
 Skill callers invoke their bundled engine directly:
 
 ```powershell
-uv run --no-project --python <python_runtime> python "$env:CODEX_HOME/skills/ceratops-repo-lifecycle/scripts/repository_operation.py" --repo-root <repo> --validate
+uv run --no-project --python <python_runtime> python "$env:CODEX_HOME/skills/ceratops-repo-lifecycle/scripts/repository_operation.py" --repo-root <repo> --operation repository.actions.before-build-checks
 ```
 
-`--validate` runs validation only. `--tests` runs the separate test stage;
-select both flags to validate first and then test. A deployment invocation
-runs both stages before deployment. `--return-handoffs` exposes unresolved
-routes to a skill caller.
+Repeat `--operation LOCATION` to name a whole phase or one group, such as
+`repository.actions.before-build-checks.check-groups.source`. Only requested
+groups run; group names do not imply scan or test behavior. A build or delivery
+request still brings in its required checks and prerequisite builds. Promote
+and Ship pass their required group locations explicitly. CI's `operations`
+input takes those same locations, one per line. `--return-handoffs` exposes
+unresolved routes to a skill caller.
+When resolving a published CI action, compatibility setup checks that it declares
+the required inputs before writing a new workflow.
 New repository validators never select test runners. Conventional Python tests
 or pytest configuration generate `scripts/run-tests.py` from its template when
 absent, using `generate_test_script.py`. Setup records
@@ -1581,16 +1588,33 @@ runner executes tests but cannot reuse individual passes. A custom runner stays
 custom; `[tool.ceratops.test-support] managed = true` opts its support files into
 generation. Compatibility checks require the declared support to be present.
 
-SDLC v5 actions may declare `check-groups`, keyed by the repository runner's group
-names. Every group has `phase` (`before-build`, `during-build` or `after-build`)
-and `requires-artifacts` (deliverable references). Before-build groups have no
-artifact requirements; after-build groups name at least one. During-build groups
-belong to the build command, which returns their actual successful check records.
-Pre-build checks stop at the first failure. Selected build prerequisites run
-first, failed prerequisites block their dependents, and joint tests wait for all
-their selected files. The executor supplies `--check-group` and `--artifacts`
-JSON to test commands and `CERATOPS_TEST_ARTIFACTS` to their children. File paths
-and byte hashes become reuse inputs; no installed version is selected implicitly.
+SDLC actions run in this order: `before-build-checks`, `build`, then
+`after-build-checks`, even when YAML keys appear in another order. This replaces
+the former per-group `phase` layout. Each before/after `check-groups` entry owns
+its command or handoff, runtime requirements and result declaration. Source scans
+and tests remain separate groups; requesting one group runs only that group.
+Groups inside `build` name checks performed and reported by the builder, without
+starting another command. A failed source check prevents dependent builds.
+
+A deliverable's after-build groups automatically receive its own exact files.
+Their optional `requires-artifacts` lists only additional deliverables; explicit
+self-references are errors. Repository-wide after-build groups must list every
+required deliverable. Before-build groups receive no artifacts. Required builds
+run in dependency order; a missing or changed file blocks the dependent check.
+Installed copies never stand in for the requested build's files.
+
+Commands that accept the runner interface declare `--check-group {check_group}`
+and `--artifacts {artifacts}` in `steps.run`. The executor replaces those arguments
+with the group name and the complete artifact JSON map, and passes that map in
+`CERATOPS_TEST_ARTIFACTS`. It adds no test flags to native scans or custom commands.
+File paths and byte hashes remain part of the saved reuse inputs.
+`prepare_sdlc_configuration()` prepares configuration during compatibility setup;
+its caller writes the YAML. Before a check runs, `collect_check_inputs()` records
+its command, relevant files, runtime, target and artifacts; `decide_check_reuse()`
+compares those facts with saved results. Moving an unchanged command to a new
+phase/group address preserves an applicable result's original identity. Whole
+command reuse and the test runner's individual-test reuse remain in place.
+
 SDLC build actions can require a v1, v2 or v3 result. Build receipts
 supply every produced file: v1 paths are repository-relative,
 v2 paths belong to their recorded shared build bundle, and v3 paths belong to

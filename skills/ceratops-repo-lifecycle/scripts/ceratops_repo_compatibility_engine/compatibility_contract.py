@@ -28,9 +28,12 @@ def _managed_skill_record(
     """Materialize one typed skill record from the owned action templates."""
 
     actions = copy.deepcopy(contract["managed_skill_operations"])
-    expected_routes = {"validate": "source-validate", "install": "deploy"}
+    expected_routes = {"before-build-checks": "source-validate", "install": "deploy"}
     for action_name, route in expected_routes.items():
-        handoff = actions[action_name]["steps"][0]["handoff"]
+        operation = actions[action_name]
+        if action_name == "before-build-checks":
+            operation = operation["check-groups"]["source"]
+        handoff = operation["steps"][0]["handoff"]
         if handoff["action"] != route or handoff["inputs"] != {"skill": "{skill}"}:
             raise RuntimeError(
                 f"managed skill {action_name} action must route to {route} with the skill token"

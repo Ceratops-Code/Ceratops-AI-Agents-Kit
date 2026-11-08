@@ -1013,7 +1013,7 @@ def test_promote_repository_ship_after_promotion_composes_terminal_workflow(
 
     def run_json(command: list[str], cwd: pathlib.Path) -> tuple[int, dict[str, Any]]:
         if pathlib.Path(command[1]) == OPERATION_RUNNER:
-            assert "--validate" in command
+            assert "--test-trigger" in command
             return original_run_command_for_json(command, cwd)
         commands.append(command)
         if pathlib.Path(command[1]) == MANAGE_PENDING_WORK:
@@ -1116,7 +1116,7 @@ def test_promote_repository_ship_after_promotion_preserves_blocked_state(
 
     def run_json(command: list[str], cwd: pathlib.Path) -> tuple[int, dict[str, Any]]:
         if pathlib.Path(command[1]) == OPERATION_RUNNER:
-            assert "--validate" in command
+            assert "--test-trigger" in command
             return original_run_command_for_json(command, cwd)
         commands.append(command)
         if pathlib.Path(command[1]) == MANAGE_PENDING_WORK:
@@ -1381,7 +1381,8 @@ def test_operation_runner_reports_command_shutdown_to_release_owner(tmp_path, mo
     repo, _, _, _ = prepare_repository_lifecycle_repo(tmp_path)
     commit = operations.repository_commit(repo)
     prepared = operations.PreparedOperation(
-        repo_root=repo, operation="repository.actions.test", category="tests",
+        repo_root=repo, operation="repository.actions.before-build-checks.check-groups.tests",
+        category="before-build-checks", check_phase="before-build", check_group="tests",
         commit=commit, prerequisites={},
         steps=tuple(operations.PreparedStep(index, (name,), repo)
                     for index, name in enumerate(("fixture", "dependent"))),
@@ -1401,7 +1402,7 @@ def test_operation_runner_reports_command_shutdown_to_release_owner(tmp_path, mo
     for _ in range(2):
         with workflow_command.release_write_context(repo):
             result = operations.execute_prepared_operation(prepared)
-            assert result["status"] == "tests_failed"
+            assert result["status"] == "validation_failed"
         assert attempted[-1] == "fixture" and "dependent" not in attempted
         lock_path = workflow_command.release_lock_module().release_lock_path(repo)
         assert lock_path.read_bytes() == (b"1" if unknown_stop else b"0")

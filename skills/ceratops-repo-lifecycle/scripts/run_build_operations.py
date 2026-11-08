@@ -76,6 +76,8 @@ def prepare_build_operations(root, requests, contract_path=None, *, context="ski
     requested = {request.operation: request for request in requests}
     if any(request != requested[request.operation] for request in requests):
         raise operations.OperationError("Repeated actions in one target must use the same parameters.")
+    direct_checks = all(operations.operation_category(name) in {"before-build-checks", "after-build-checks"}
+                        for name in requested)
     pending = list(requested.values())
     prepared: dict[str, list[Any]] = {}
     checked: set[tuple[str, str | None]] = set()
@@ -90,7 +92,7 @@ def prepare_build_operations(root, requests, contract_path=None, *, context="ski
                 references.add(item.operation.rsplit(".actions.", 1)[0])
         for reference in sorted(references):
             location = reference + ".actions.build"
-            if location in entries and location not in requested:
+            if reference not in (artifacts or {}) and location in entries and location not in requested:
                 # Parameters explicitly supplied for delivery retain their error
                 # checking there. Dependency builds receive only declared ones.
                 request_parameters = {**(request.parameters_if_declared or {}), **(request.parameters or {})}
@@ -98,8 +100,14 @@ def prepare_build_operations(root, requests, contract_path=None, *, context="ski
                 requested[location] = dependency
                 pending.append(dependency)
         if include_checks and not pending:
+            builds_requested = any(operations.operation_category(name) == "build" for name in requested)
             for name in operations.validation_operations(root, list(requested), validation_operations, contract_path):
                 if name in requested:
+                    continue
+                # A direct check of supplied files needs no sibling checks.
+                # Newly required builds still bring their before-build checks.
+                if (direct_checks and name not in (validation_operations or ())
+                        and (not builds_requested or operations.operation_category(name) == "after-build-checks")):
                     continue
                 parameters = {**(request.parameters_if_declared or {}), **(request.parameters or {})}
                 check_request = operations.OperationRequest(name, parameters_if_declared=parameters)
@@ -112,7 +120,7 @@ def prepare_build_operations(root, requests, contract_path=None, *, context="ski
                 for item in checks:
                     for reference in item.required_artifacts:
                         location = reference + ".actions.build"
-                        if location in entries and location not in requested:
+                        if reference not in (artifacts or {}) and location in entries and location not in requested:
                             dependency = operations.OperationRequest(location, parameters_if_declared=parameters)
                             requested[location] = dependency
                             pending.append(dependency)
@@ -123,6 +131,19 @@ def prepare_build_operations(root, requests, contract_path=None, *, context="ski
     original_names = {request.operation for request in requests}
     result.extend(item for name, items in prepared.items() for item in items
                   if name not in original_names or item.category == "build")
+    # A phase request and an explicit group request may name the same command.
+    # Resolve that overlap before effects; delivery repetition remains explicit.
+    unique: list[Any] = []
+    seen: dict[str, Any] = {}
+    for item in result:
+        if item.category not in {"deploy-local", "publish", "verify-publish"}:
+            if item.operation in seen:
+                if seen[item.operation].parameters != item.parameters:
+                    raise operations.OperationError(f"Repeated operation has different parameters: {item.operation}")
+                continue
+            seen[item.operation] = item
+        unique.append(item)
+    result = unique
     # A native build may append its receipt commit. Until the unit-wide completer
     # owns that step, no consumer can be prepared against the preceding commit.
     committing = [item for item in result if item.result_commit_field]
@@ -139,7 +160,7 @@ def execute_release_builds(
     context="skill", artifacts=None, qualification_level="alpha", expected_commit=None,
     validation_operations=None, diagnostic_output=None, diagnostic_owner=None,
     successful_results=(), confirm_stopped=False, prepare_only=False, include_checks=True,
-    wait_seconds=60,
+    wait_seconds=60, test_context=None,
 ) -> dict[str, Any]:
     """Run one fresh build/delivery request against source read under its lock.
 
@@ -174,6 +195,7 @@ def execute_release_builds(
                 operations.require_clean_commit(root, commit)
             result = {"status": "completed", "results": [], "completed_operations": [], "pending_operations": []}
             for target, prepared in batches:
+                prepared = [replace(item, test_context=test_context) if item.check_phase else item for item in prepared]
                 result = execute_check_phases(
                     prepared, diagnostic_output=diagnostic_output, diagnostic_owner=diagnostic_owner,
                     successful_results=(successful_results, finished),
@@ -278,8 +300,21 @@ def execute_check_phases(
     """
     import repository_operation as operations
 
-    before = [item for item in prepared if item.category in {"validate", "tests"}
-              and item.check_phase != "after-build"]
+    preparation_id = "operation_preparation:" + ",".join(item.operation for item in prepared)
+
+    def preparation_failed(message):
+        owner, action = diagnostic_owner or (prepared[0].repo_root, "operation")
+        failure = report_failure(
+            {"status": "result_invalid", "message": message},
+            diagnostic_output=diagnostic_output, repo_root=owner, action=action,
+            failure_id=preparation_id, successful_results=successful_results,
+            output_root=prepared[0].repo_root,
+        )
+        return {**failure, "results": [failure], "completed_operations": [],
+                "pending_operations": [item.operation for item in prepared]}
+
+    before = [item for item in prepared if item.category == "before-build-checks"]
+    setup = [item for item in prepared if item.category in {"bootstrap", "test-selection"}]
     builds = [item for item in prepared if item.category == "build"]
     by_reference = {item.operation.rsplit(".actions.", 1)[0]: item for item in builds}
     dependencies = {key: build_dependencies(item) for key, item in by_reference.items()}
@@ -287,18 +322,16 @@ def execute_check_phases(
         order = TopologicalSorter({key: values & by_reference.keys() for key, values in dependencies.items()}).static_order()
         builds = [by_reference[key] for key in order]
     except ValueError as exc:
-        return {"status": "result_invalid", "message": str(exc), "results": [],
-                "completed_operations": [], "pending_operations": [item.operation for item in prepared]}
+        return preparation_failed(str(exc))
     after = [item for item in prepared if item.check_phase == "after-build"]
-    delivery = [item for item in prepared if item.category not in {"validate", "tests", "build"}]
+    delivery = [item for item in prepared if item.category not in {
+        "before-build-checks", "after-build-checks", "build", "bootstrap", "test-selection"}]
     results: list[dict[str, Any]] = []
     available: dict[str, list[str]] = {}
     for item in prepared:
         for key, paths in (item.selected_artifacts or {}).items():
             if key in available and paths != available[key]:
-                return {"status": "result_invalid", "message": f"Conflicting selected artifacts for {key}",
-                        "results": [], "completed_operations": [],
-                        "pending_operations": [item.operation for item in prepared]}
+                return preparation_failed(f"Conflicting selected artifacts for {key}")
             available[key] = list(paths)
 
     def run(item):
@@ -320,14 +353,19 @@ def execute_check_phases(
         return {key: list(dict.fromkeys(paths)) for key, paths in produced.items()}
 
     try:
-        before = [replace(item, check_plan=reuse_operation_checks.plan_operation(item))
+        before = [replace(item, check_plan=reuse_operation_checks.decide_check_reuse(item))
                   if item.check_results is not None else item for item in before]
     except (OSError, ValueError) as exc:
-        return {"status": "result_invalid", "message": str(exc), "results": [],
-                "completed_operations": [], "pending_operations": [item.operation for item in prepared]}
+        return preparation_failed(str(exc))
+    if prepared:
+        owner, action = diagnostic_owner or (prepared[0].repo_root, "operation")
+        operations.remove_resolved_failures(
+            {}, diagnostic_output=diagnostic_output, repo_root=owner, action=action,
+            resolved_failures=(preparation_id,),
+        )
     source_results = {(value.get("operation"), value.get("check_group")): value
                       for value in _completed_checks(successful_results)}
-    for item in before:
+    for item in [*setup, *before]:
         original = source_results.get((item.operation, item.check_group))
         if (item.check_results is None and original and original.get("commit") == item.commit
                 and original.get("parameters", {}) == dict(item.parameters)

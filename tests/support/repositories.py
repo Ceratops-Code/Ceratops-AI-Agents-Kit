@@ -74,7 +74,7 @@ def run_ci_action(
     evidence: pathlib.Path,
     bundle: pathlib.Path,
     *,
-    run_tests: bool = True,
+    operations: str = "repository.actions.before-build-checks",
 ) -> subprocess.CompletedProcess[str]:
     """Execute the real composite action in a caller-owned isolated action checkout."""
     action_root = bundle / "skills/ceratops-repo-lifecycle"
@@ -108,7 +108,7 @@ def run_ci_action(
         "${{ github.action_path }}": str(action_root),
         "${{ inputs.repo-root }}": str(repo),
         "${{ inputs.evidence-file }}": str(evidence),
-        "${{ inputs.run-tests }}": "true" if run_tests else "false",
+        "${{ inputs.operations }}": operations,
     }
     environment = dict(os.environ)
     environment.pop("UV_PROJECT_ENVIRONMENT", None)
@@ -155,16 +155,13 @@ def write_sdlc_contract(
         "kind": "ceratops-sdlc",
         "repository": {
             "capabilities": {},
-            "actions": {
-                "validate": {
+            "actions": {"before-build-checks": {"check-groups": {'source': {
                     "requires": {"capabilities": []},
                     "no-op": "No repository validation in this fixture.",
-                },
-                "test": {
+                }, 'tests': {
                     "requires": {"capabilities": []},
                     "no-op": "No repository tests in this fixture.",
-                },
-            },
+                }}}, },
         },
     }
     if contract.exists():
@@ -253,22 +250,12 @@ def create_compatible_repo(
                     "source": f"skills/{name}",
                     "prerequisites": [],
                     "actions": {
-                        action: {
-                            "requires": {"capabilities": []},
-                            "steps": [
-                                {
-                                    "handoff": {
-                                        "lifecycle": "ceratops-skill-lifecycle",
-                                        "action": lifecycle_action,
-                                        "inputs": {"skill": name},
-                                    }
-                                }
-                            ],
-                        }
-                        for action, lifecycle_action in (
-                            ("validate", "source-validate"),
-                            ("install", "deploy"),
-                        )
+                        "before-build-checks": {"check-groups": {"source": {
+                            "requires": {"capabilities": []}, "steps": [{"handoff": {
+                                "lifecycle": "ceratops-skill-lifecycle", "action": "source-validate", "inputs": {"skill": name}}}],
+                        }}},
+                        "install": {"requires": {"capabilities": []}, "steps": [{"handoff": {
+                            "lifecycle": "ceratops-skill-lifecycle", "action": "deploy", "inputs": {"skill": name}}}]},
                     },
                 }
                 for name in skill_names

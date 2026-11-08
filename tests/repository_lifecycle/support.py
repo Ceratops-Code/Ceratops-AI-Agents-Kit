@@ -167,13 +167,10 @@ def prepare_repository_lifecycle_repo(
                     "source": ".",
                     "manifest": "README.md",
                     "prerequisites": [],
-                    "actions": {
-                        "validate": {
+                    "actions": {"before-build-checks": {"check-groups": {'source': {
                             "requires": {"capabilities": []},
                             "no-op": "Repository validation covers this fixture.",
-                        },
-                        "install": operation,
-                    },
+                        }}}, "install": operation},
                 }
             }
         },

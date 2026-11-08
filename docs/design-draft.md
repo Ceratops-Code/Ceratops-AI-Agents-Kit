@@ -562,18 +562,43 @@ dependency declaration. Missing maps allow execution but no individual-test reus
 Custom runners are preserved; their support files are managed only when the
 scripts project declares `tool.ceratops.test-support.managed = true`.
 
-`repository_operation.prepare_operations()` reads v5 `check-groups` with required
-`phase` and `requires-artifacts` fields. `execute_check_phases()` reports the
-first failed source check and stops. After the source checks pass, it orders
-declared builds by prerequisites and required artifact inputs. After-build
-checks start once every required artifact is available.
-During-build groups execute inside the build process and must return their real
-passing records. The executor never creates a pass for a named but absent check.
-Test commands receive `--check-group` and `--artifacts`; their child processes
-receive the same mapping in `CERATOPS_TEST_ARTIFACTS`. Paths and measured hashes
-enter both whole-check and individual-test inputs. Changes during execution
-prevent saving a reusable pass. Existing `build_bundle()` callbacks already
-receive the exact measured artifact inventory; no second selection is added.
+`repository_operation.prepare_operations()` expands phase actions into their
+individual `check-groups`. Each group owns its `steps`, `requires`, optional
+`check-results` and `result-schema`. This replaces the completed 6G declaration
+layout; the existing scheduler and saved results remain in use.
+`execute_check_phases()` runs `before-build-checks`, dependency-ordered `build`
+actions, and `after-build-checks`, regardless of YAML key order. It stops at the
+first failed source check. Builders report the checks named inside their own
+`check-groups`; those groups do not launch separate commands or fabricate passes.
+
+The repository-operation CLI takes explicit `--operation` phase or group
+locations. A direct group request does not run its siblings. Promote and Ship
+derive their required before-build group locations from the SDLC declaration;
+build and delivery calls still bring in their prerequisite checks and builds.
+The CI composite action accepts the same locations through its `operations`
+input, one per line, including source-only requests for noninteractive jobs.
+Compatibility setup checks the resolved published action's input declarations
+before writing a new workflow that calls it.
+
+`operation_prerequisites()` includes the deliverable's own artifacts automatically
+for each after-build group, plus its declared additional `requires-artifacts`.
+Repository-wide groups must name every required deliverable. Before-build groups
+receive no artifacts; build groups never depend on their own unfinished output.
+Direct after-build requests use the same prerequisite preparation as build calls.
+Checks start only after all required exact files are available.
+
+Commands opt into runner arguments through `{check_group}` and `{artifacts}` in
+their declared `steps.run`; source scans receive no extra arguments. Execution
+fills the artifact JSON argument and `CERATOPS_TEST_ARTIFACTS` environment value
+with the same complete map. Paths and measured hashes enter whole-command and
+individual-test reuse comparisons. Changes during execution prevent saving a
+reusable pass. Existing `build_bundle()` callbacks keep their exact measured files.
+
+Compatibility setup calls `prepare_sdlc_configuration()` before writing its YAML.
+The operation executor calls `collect_check_inputs()` to gather command/files/
+runtime/target/artifact facts, then `decide_check_reuse()` to find an applicable
+pass or run the check. An SDLC address change alone does not change that work;
+matching retains the original result/check identities and immutable receipts.
 `store_artifacts.build_result_artifact_paths()` resolves all artifacts in v1,
 v2 and v3 results using their existing repository, shared bundle and allocated
 version/target paths. SDLC declarations accept these same build formats.
@@ -591,8 +616,8 @@ Return or exception releases it only after commands stop; unknown shutdown keeps
 the existing unfinished flag. Task-worktree builds remain unlocked.
 
 The dependency graph includes declared package prerequisites at every level and
-non-package artifacts named by during-build groups. A joint after-build test
-brings in its other required members. Every build runs once per target, with
+non-package artifacts named by groups inside build actions. A joint after-build
+test brings in its other required members. Every build runs once per target, with
 separate artifact maps for different targets. Explicitly repeated delivery
 actions retain their requested order. Without a declared build, installation
 keeps its existing operation-result shape. Installers receive the requested

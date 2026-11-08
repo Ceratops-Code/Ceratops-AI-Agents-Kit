@@ -84,7 +84,7 @@ def _validation_coverage_errors(
     sdlc: Mapping[str, Any],
     validation_contract: Mapping[str, Any],
 ) -> list[str]:
-    """Require detected repository types to have one declared non-test validator."""
+    """Require detected repository types to declare checks with the required capabilities."""
 
     entries = operation_entries(sdlc)
     errors: list[str] = []
@@ -426,7 +426,7 @@ def validate_ceratops_compatibility(
     test_runner_selected = any(
         test_runner_relative in step.get("run", [])
         for name, operation in entries.items()
-        if operation_category(name) == "tests"
+        if operation_category(name) in {"before-build-checks", "after-build-checks"}
         for step in operation.get("steps", [])
     )
     for name, surface in surfaces.items():
@@ -463,7 +463,7 @@ def validate_ceratops_compatibility(
             commands = [
                 step["run"]
                 for name, entry in entries.items()
-                if operation_category(name) == "validate"
+                if operation_category(name) == "before-build-checks"
                 for step in entry.get("steps", [])
                 if "run" in step
             ]
@@ -472,7 +472,7 @@ def validate_ceratops_compatibility(
             tests = [
                 entry
                 for name, entry in entries.items()
-                if operation_category(name) == "tests"
+                if operation_category(name) in {"before-build-checks", "after-build-checks"}
             ]
             if not tests:
                 errors.append("SDLC must declare repository tests or an explicit no-op")

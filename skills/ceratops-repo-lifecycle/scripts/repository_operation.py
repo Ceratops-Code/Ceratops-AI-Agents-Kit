@@ -505,73 +505,48 @@ def prepare_operations(
     entries = operation_entries(contract)
     commit = repository_commit(root)
     prepared: list[PreparedOperation] = []
+    included: dict[str, OperationRequest] = {}
     for request in requests:
         category = operation_category(request.operation)
-        selected = entries.get(request.operation)
-        if selected is None:
+        locations = [name for name in entries if name == request.operation or name.startswith(request.operation + ".check-groups.")]
+        if not locations:
             if not request.if_declared:
-                raise OperationError(
-                    f"SDLC operation is not declared: {request.operation}"
-                )
-            prepared.append(
-                PreparedOperation(
-                    root,
-                    request.operation,
-                    category,
-                    commit,
-                    (),
-                    {},
-                    "operation_not_declared",
-                )
-            )
-            continue
-        parameters = _parameters(selected, request)
-        steps = tuple(
-            _prepared_step(root, step, position, parameters)
-            for position, step in enumerate(selected.get("steps", []), start=1)
-        )
-        prepared.append(
-            PreparedOperation(
-                root,
-                request.operation,
-                category,
-                commit,
-                steps,
-                operation_prerequisites(contract, request.operation),
-                selected.get("no-op"),
-                context,
-                contract_path,
-                tuple(sorted(parameters.items())),
-                result_schema=selected.get("result-schema"),
-                check_results=selected.get("check-results"),
+                raise OperationError(f"SDLC operation is not declared: {request.operation}")
+            prepared.append(PreparedOperation(root, request.operation, category, commit, (), {}, "operation_not_declared"))
+        for location in locations:
+            if location in included:
+                previous = included[location]
+                if (previous.parameters, previous.parameters_if_declared) != (request.parameters, request.parameters_if_declared):
+                    raise OperationError(f"Repeated operation has different parameters: {location}")
+                continue
+            included[location] = request
+            selected = entries[location]
+            parameters = _parameters(selected, request)
+            group = location.split(".check-groups.", 1)[1] if ".check-groups." in location else None
+            # Artifact paths become known after prerequisite builds. Only explicit
+            # whole-argument placeholders are supplied; native scans get no extra flags.
+            command_parameters = {**parameters, "artifacts": "{artifacts}"}
+            if group:
+                command_parameters["check_group"] = group
+            steps = tuple(_prepared_step(root, step, position, command_parameters)
+                          for position, step in enumerate(selected.get("steps", []), 1))
+            prerequisites = operation_prerequisites(contract, location)
+            internal = selected.get("check-groups", {}) if category == "build" else {}
+            required = tuple(dict.fromkeys([*prerequisites.get("artifacts", []),
+                *(reference for record in internal.values() for reference in record.get("requires-artifacts", []))]))
+            prepared.append(PreparedOperation(
+                root, location, category, commit, steps, prerequisites, selected.get("no-op"),
+                context, contract_path, tuple(sorted(parameters.items())),
+                result_schema=selected.get("result-schema"), check_results=selected.get("check-results"),
                 result_commit_field=selected.get("result-commit-field"),
-                mcp_source=(
-                    contract["deliverables"]["mcp-servers"][request.operation.split(".")[2]]["source"]
-                    if request.operation.startswith("deliverables.mcp-servers.") else None
-                ),
-            )
-        )
-    grouped = []
-    for item in prepared:
-        groups = entries.get(item.operation, {}).get("check-groups", {})
-        if item.category == "build":
-            grouped.append(replace(
-                item, build_check_groups=tuple(groups),
-                required_artifacts=tuple(dict.fromkeys(reference for group in groups.values()
-                                                       for reference in group["requires-artifacts"])),
-                selected_artifacts=artifacts,
+                mcp_source=(contract["deliverables"]["mcp-servers"][location.split(".")[2]]["source"]
+                            if location.startswith("deliverables.mcp-servers.") else None),
+                check_group=group,
+                check_phase=category.removesuffix("-checks") if category in {"before-build-checks", "after-build-checks"} else None,
+                required_artifacts=required,
+                selected_artifacts={key: artifacts[key] for key in required if artifacts and key in artifacts},
+                build_check_groups=tuple(internal),
             ))
-        elif groups:
-            for name, group in groups.items():
-                required = tuple(group["requires-artifacts"])
-                grouped.append(replace(
-                    item, check_group=name, check_phase=group["phase"],
-                    required_artifacts=required,
-                    selected_artifacts={key: artifacts[key] for key in required if artifacts and key in artifacts},
-                ))
-        else:
-            grouped.append(replace(item, selected_artifacts=artifacts))
-    prepared = grouped
     if any(item.result_commit_field for item in prepared[:-1]):
         raise OperationError("A build returning its final commit must be the last selected operation.")
     return prepared
@@ -583,17 +558,17 @@ def validation_operations(
     explicit: Sequence[str] | None = None,
     contract_path: pathlib.Path | None = None,
 ) -> list[str]:
-    """Select repository checks and checks of selected deliverables, in YAML order."""
+    """Return repository and requested deliverable groups in execution order."""
 
     contract = read_repository_contract(repo_root, contract_path)
     if explicit is not None:
         for operation in explicit:
             if operation_category(operation) not in {
-                "validate",
-                "tests",
+                "before-build-checks",
+                "after-build-checks",
             }:
                 raise OperationError(
-                    "Validation selections must name validate or tests entries."
+                    "Check requests must name before-build-checks or after-build-checks groups."
                 )
     selected_deliverables = {
         tuple(operation.split(".")[1:3])
@@ -605,7 +580,7 @@ def validation_operations(
         operation
         for operation in entries
         if operation_category(operation)
-        in {"validate", "tests"}
+        in {"before-build-checks", "after-build-checks"}
         and (
             operation.startswith("repository.")
             or tuple(operation.split(".")[1:3]) in selected_deliverables
@@ -615,7 +590,7 @@ def validation_operations(
     # In the current format an explicit selection can order checks, but cannot
     # bypass a selected deliverable's tests or repository-level prerequisites.
     selected = list(dict.fromkeys([*(explicit or []), *automatic]))
-    return sorted(selected, key=lambda item: operation_category(item) == "tests")
+    return sorted(selected, key=lambda item: operation_category(item) == "after-build-checks")
 
 
 def _bounded_tail(value: str | None) -> list[str]:
@@ -670,7 +645,7 @@ def execute_prepared_operation(
     }
     if prepared.check_group is not None:
         base["check_group"] = prepared.check_group
-    failure_id = prepared.operation + ("#" + prepared.check_group if prepared.check_group else "")
+    failure_id = prepared.operation
     owner_root, action = diagnostic_owner or (prepared.repo_root, "operation")
     report_options = {
         "diagnostic_output": diagnostic_output, "repo_root": owner_root,
@@ -703,15 +678,15 @@ def execute_prepared_operation(
             reuse_operation_checks.artifact_inputs(prepared.repo_root, dict(prepared.selected_artifacts or {}))
         check_plan = prepared.check_plan
         if prepared.check_results is not None and check_plan is None:
-            check_plan = reuse_operation_checks.plan_operation(prepared)
+            check_plan = reuse_operation_checks.decide_check_reuse(prepared)
         if check_plan is not None:
             if prepared.check_results is None:
                 raise ValueError("Check plan has no current owned input declaration.")
             # An earlier callback may have changed declared inputs after the batch
             # preflight. Read current inputs before consuming that original pass.
-            current = reuse_operation_checks.check_inputs(prepared, prepared.check_results)
+            current = reuse_operation_checks.collect_check_inputs(prepared, prepared.check_results)
             if current["fingerprint"] != check_plan.context["fingerprint"]:
-                check_plan = reuse_operation_checks.plan_operation(prepared)
+                check_plan = reuse_operation_checks.decide_check_reuse(prepared)
             else:
                 check_plan.decision = check_plan.store.select(
                     current, check_id=current["group"],
@@ -840,10 +815,8 @@ def execute_prepared_operation(
                 }, **report_options)
         try:
             assert step.argv is not None
-            argv = list(step.argv)
-            if prepared.check_group is not None:
-                argv.extend(["--check-group", prepared.check_group, "--artifacts",
-                             json.dumps(dict(prepared.selected_artifacts or {}), sort_keys=True)])
+            argv = [json.dumps(dict(prepared.selected_artifacts or {}), sort_keys=True)
+                    if argument == "{artifacts}" else argument for argument in step.argv]
             if check_plan is not None:
                 argv.extend(check_plan.arguments())
             # CreateProcess does not apply PATHEXT to bare npm/pnpm commands.
@@ -921,9 +894,9 @@ def execute_prepared_operation(
             failure = {
                 **base,
                 "status": "validation_failed"
-                if prepared.category == "validate"
+                if prepared.category == "before-build-checks"
                 else "tests_failed"
-                if prepared.category == "tests"
+                if prepared.category == "after-build-checks"
                 else "operation_failed",
                 "message": f"SDLC step failed: {prepared.operation} step {step.position}\n{cause}",
                 "steps": completed,
@@ -946,10 +919,9 @@ def execute_prepared_operation(
             )
         completed.append(step.position)
         expected_schema = prepared.result_schema if step is prepared.steps[-1] else None
-        expected_stage = {
-            "validate": "validation",
-            "tests": "tests",
-        }.get(prepared.category)
+        # Source scans and tests can share a phase. The declared result schema
+        # checks their own stage; the action name must not invent a result stage.
+        expected_stage = None
         try:
             captured = capture_step_result(
                 stdout,
@@ -1038,8 +1010,6 @@ def remove_operation_failures(
             or (result.get("handoff") and not result.get("handoff_completed"))):
         return
     positions = result.get("steps", []) if completed_steps is None else completed_steps
-    if result.get("check_group"):
-        operation += "#" + result["check_group"]
     repo_root, action = diagnostic_owner
     remove_resolved_failures(
         result, diagnostic_output=diagnostic_output, repo_root=repo_root, action=action,
@@ -1055,11 +1025,13 @@ def _combined_prerequisites(
 
     combined: dict[str, Any] = {}
     for item in prepared:
-        if set(item.prerequisites).issubset({"capabilities", "packages"}):
+        if set(item.prerequisites).issubset({"capabilities", "packages", "artifacts"}):
             for group in ("capabilities", "packages"):
                 values = item.prerequisites.get(group, {})
                 if values:
                     combined.setdefault(group, {}).update(values)
+            if artifacts := item.prerequisites.get("artifacts"):
+                combined["artifacts"] = list(dict.fromkeys([*combined.get("artifacts", []), *artifacts]))
         else:
             combined.update(item.prerequisites)
     return combined
@@ -1085,7 +1057,7 @@ def execute_prepared_operations(
     try:
         if any(item.result_commit_field for item in prepared[:-1]):
             raise ValueError("A build returning its final commit must be the last selected operation.")
-        prepared = [replace(item, check_plan=reuse_operation_checks.plan_operation(item))
+        prepared = [replace(item, check_plan=reuse_operation_checks.decide_check_reuse(item))
                     if item.check_results is not None and item.check_plan is None else item
                     for item in prepared]
     except (OSError, ValueError) as exc:
@@ -1156,17 +1128,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--operation",
         action="append",
         default=[],
-        help="Complete YAML location; repeat in execution order.",
+        help="Exact action, check phase, or check-group location; repeat for additional work.",
     )
     parser.add_argument(
         "--validation-operation",
         action="append",
         help="Ordered check locations; retain every applicable gate.",
-    )
-    parser.add_argument(
-        "--validate",
-        action="store_true",
-        help="Run selected validation without tests or deployment; add --tests for the following test stage.",
     )
     parser.add_argument("--parameter", action="append", default=[])
     parser.add_argument("--parameter-if-declared", action="append", default=[])
@@ -1176,9 +1143,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--ci",
         action="store_true",
         help="Execute commands only; never dispatch skill handoffs.",
-    )
-    parser.add_argument(
-        "--tests", action="store_true", help="Run only selected SDLC tests."
     )
     parser.add_argument(
         "--test-trigger",
@@ -1214,176 +1178,62 @@ def main(argv: list[str] | None = None) -> int:
         parameters = parse_parameters(args.parameter)
         artifacts = json.loads(args.artifacts) if args.artifacts else {}
         conditional = parse_parameters(args.parameter_if_declared)
-        if not (args.validate or args.tests) and any(
-            operation_category(name) in MUTATION_CATEGORIES for name in args.operation
-        ):
+        test_context = None
+        if args.test_trigger:
+            if not args.commit or args.ci:
+                raise OperationError("Promotion check context requires --commit outside CI.")
+            branch = subprocess.run(
+                ["git", "branch", "--show-current"], cwd=root,
+                capture_output=True, text=True, check=False,
+            )
+            if branch.returncode or not branch.stdout.strip():
+                raise OperationError("Promotion checks require a checked-out release branch.")
+            test_context = {"trigger": args.test_trigger, "branch": branch.stdout.strip(), "commit": args.commit}
+        level = args.qualification_level or ("beta" if test_context else "alpha")
+        requests = [OperationRequest(name, parameters, conditional, args.if_declared)
+                    for name in args.operation]
+        for name in args.validation_operation or ():
+            if operation_category(name) not in {"before-build-checks", "after-build-checks"}:
+                raise OperationError("Check requests must name before-build-checks or after-build-checks groups.")
+            requests.append(OperationRequest(name, parameters, conditional, args.if_declared))
+        if any(operation_category(request.operation) in MUTATION_CATEGORIES | {"after-build-checks"}
+               for request in requests):
             result = execute_release_builds(
-                root, [OperationRequest(name, parameters, conditional, args.if_declared)
-                       for name in args.operation], args.sdlc_contract,
-                context=context, artifacts=artifacts,
-                qualification_level=args.qualification_level or "alpha",
-                expected_commit=args.commit, validation_operations=args.validation_operation,
+                root, requests, args.sdlc_contract, context=context, artifacts=artifacts,
+                qualification_level=level, expected_commit=args.commit,
+                validation_operations=args.validation_operation, test_context=test_context,
                 diagnostic_output=args.diagnostic_output,
                 diagnostic_owner=(args.diagnostic_repo_root or root, args.diagnostic_action),
                 confirm_stopped=args.confirm_previous_commands_stopped, prepare_only=args.prepare_only,
             )
             return finish_operation_request(args, result)
+        # Explicit check requests do not pull in sibling groups. Build/delivery
+        # requests above still expand their required checks and prerequisite builds.
         reuse_operation_checks.artifact_inputs(root, artifacts)
         if args.commit:
             require_clean_commit(root, args.commit)
-        test_context = None
-        if args.test_trigger:
-            if not args.tests or not args.commit or args.ci:
-                raise OperationError(
-                    "Promotion test context requires --tests and --commit outside CI."
-                )
-            branch = subprocess.run(
-                ["git", "branch", "--show-current"],
-                cwd=root,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            if branch.returncode or not branch.stdout.strip():
-                raise OperationError(
-                    "Promotion tests require a checked-out release branch."
-                )
-            test_context = {
-                "trigger": args.test_trigger,
-                "branch": branch.stdout.strip(),
-                "commit": args.commit,
-            }
-        prepared = prepare_operations(
-            root,
-            [
-                OperationRequest(operation, parameters, conditional, args.if_declared)
-                for operation in args.operation
-            ],
-            args.sdlc_contract,
-            context=context,
-            artifacts=artifacts,
-        )
-        if not args.prepare_only and any(
-            item.category in MUTATION_CATEGORIES for item in prepared
-        ):
-            commit = repository_commit(root)
-            if commit:
-                require_clean_commit(root, commit)
-                args.commit = args.commit or commit
-        selecting_delivery = any(
-            item.category in {"deploy-local", "publish"} for item in prepared
-        )
-        checking_delivery = any(
-            item.category in {"deploy-local", "publish"} for item in prepared
-        )
-        checking_build = any(item.category == "build" for item in prepared)
-        requires_validation = (
-            not (
-                args.test_trigger == "promotion"
-                and root.name
-                in PROMOTION_RECHECK_EXEMPT_UNTIL_COMMIT_EVIDENCE_REDESIGN
-            )
-            and (args.validate or args.tests or checking_delivery or checking_build)
-        )
-        validations = (
-            prepare_operations(
-                root,
-                [
-                    OperationRequest(
-                        operation,
-                        parameters=parameters
-                        if (args.validate or args.tests) and not selecting_delivery
-                        else None,
-                        parameters_if_declared=conditional
-                        if (args.validate or args.tests) and not selecting_delivery
-                        else {**conditional, **parameters},
-                    )
-                    for operation in validation_operations(
-                        root,
-                        args.operation,
-                        args.validation_operation,
-                        args.sdlc_contract,
-                    )
-                    if (
-                        (args.validate and operation_category(operation) == "validate")
-                        or (args.tests and operation_category(operation) == "tests")
-                        or (
-                            (checking_delivery or checking_build)
-                            and not (args.validate or args.tests)
-                        )
-                    )
-                ],
-                args.sdlc_contract,
-                context=context,
-                artifacts=artifacts,
-            )
-            if requires_validation
-            else []
-        )
-        level = args.qualification_level or ("beta" if args.test_trigger == "promotion" else "alpha")
-        validations = [replace(item, qualification_level=level) for item in validations]
-        prepared = [replace(item, qualification_level=level) for item in prepared]
+        prepared = prepare_operations(root, requests, args.sdlc_contract, context=context, artifacts=artifacts)
+        # Preserve the existing repository-specific promotion exception until its
+        # commit evidence can replace that declared exemption.
+        if test_context and root.name in PROMOTION_RECHECK_EXEMPT_UNTIL_COMMIT_EVIDENCE_REDESIGN:
+            prepared = [item for item in prepared if not item.check_phase]
+        prepared = [replace(item, qualification_level=level, test_context=test_context) for item in prepared]
         if args.prepare_only:
-            result = {
-                "status": "prepared",
-                "operations": args.operation,
-            }
-            requirements = _combined_prerequisites([*validations, *prepared])
+            result = {"status": "prepared", "operations": [item.operation for item in prepared]}
+            requirements = _combined_prerequisites(prepared)
             if requirements:
                 result["prerequisites"] = requirements
         else:
-            phased_build = not (args.validate or args.tests) and any(
-                item.check_phase or item.build_check_groups for item in [*validations, *prepared]
-            )
-            if phased_build:
-                validations = [*validations, *prepared]
-            checks = execute_prepared_operations(
-                [
-                    replace(item, test_context=test_context)
-                    if item.category == "tests"
-                    else item
-                    for item in validations
-                ],
-                diagnostic_output=args.diagnostic_output,
+            result = execute_prepared_operations(
+                prepared, diagnostic_output=args.diagnostic_output,
                 diagnostic_owner=(args.diagnostic_repo_root or root, args.diagnostic_action),
             )
-            if checks["status"] in FAILED_STATUSES:
-                result = {
-                    **checks,
-                    "completed_operations": [],
-                    "pending_operations": args.operation
-                    if not (args.validate or args.tests)
-                    else checks["pending_operations"],
-                    "results": checks["results"]
-                    if args.validate or args.tests or phased_build
-                    else [checks["results"][-1]],
-                }
-            else:
-                if args.commit and not phased_build:
-                    require_clean_commit(root, args.commit)
-                result = (
-                    checks
-                    if args.validate or args.tests or phased_build
-                    else execute_prepared_operations(
-                        prepared, diagnostic_output=args.diagnostic_output,
-                        diagnostic_owner=(args.diagnostic_repo_root or root, args.diagnostic_action),
-                        successful_results=checks["results"],
-                    )
-                )
-                check_references = [item["check_result"] for item in checks["results"]
-                                    if item.get("check_result")]
-                if check_references:
-                    result["check_results"] = check_references
-                check_summaries = [item["check_summary"] for item in checks["results"] if item.get("check_summary")]
-                if check_summaries:
-                    result["check_summaries"] = check_summaries
-                advisory_checks = [
-                    item
-                    for item in checks["results"]
-                    if item.get("handoff") and not item.get("handoff_completed")
-                ]
-                if advisory_checks and not (args.validate or args.tests):
-                    result["validation_handoffs"] = advisory_checks
+            for source, destination in (("check_result", "check_results"), ("check_summary", "check_summaries")):
+                references = [item[source] for item in result["results"] if item.get(source)]
+                if references:
+                    result[destination] = references
+            if args.commit and result["status"] not in FAILED_STATUSES:
+                require_clean_commit(root, args.commit)
     except (OperationError, OSError, ValueError) as exc:
         result = report_failure(
             {"status": "error", "message": str(exc)},

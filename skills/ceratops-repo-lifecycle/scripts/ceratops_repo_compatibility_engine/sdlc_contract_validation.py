@@ -24,33 +24,28 @@ SCHEMA_DIRECTORY = SKILL_ROOT / "references" / "schemas"
 NAME = r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*"
 # MCP project names are manager identities, not rewritten SDLC display names.
 MCP_NAME = r"[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*"
+CHECK_ACTIONS = frozenset({"before-build-checks", "after-build-checks"})
 OPERATION_RE = re.compile(
-    rf"^(?:repository\.actions\.(?P<repository>bootstrap|validate|test|test-selection)|"
+    rf"^(?:repository\.actions\.(?P<repository>bootstrap|before-build-checks|after-build-checks|test-selection)|"
     rf"deliverables\.(?P<kind>packages|apps|mcp-servers|skills|hooks)\."
-    rf"(?P<name>{MCP_NAME})\.actions\.(?P<action>validate|test|build|install|publish|verify-publish))$"
+    rf"(?P<name>{MCP_NAME})\.actions\.(?P<action>before-build-checks|after-build-checks|build|install|publish|verify-publish))"
+    rf"(?:\.check-groups\.(?P<group>{NAME}))?$"
 )
 ACTIONS_BY_KIND = {
-    "packages": frozenset({"validate", "test", "build", "publish", "verify-publish"}),
-    "apps": frozenset({"validate", "test", "install", "publish", "verify-publish"}),
-    "mcp-servers": frozenset(
-        {"validate", "test", "install", "publish", "verify-publish"}
-    ),
-    "skills": frozenset({"validate", "test", "install"}),
-    "hooks": frozenset({"validate", "test", "install"}),
+    "packages": CHECK_ACTIONS | {"build", "publish", "verify-publish"},
+    "apps": CHECK_ACTIONS | {"build", "install", "publish", "verify-publish"},
+    "mcp-servers": CHECK_ACTIONS | {"build", "install", "publish", "verify-publish"},
+    "skills": CHECK_ACTIONS | {"build", "install"},
+    "hooks": CHECK_ACTIONS | {"build", "install"},
 }
 ACTION_CATEGORIES = {
-    "bootstrap": "bootstrap",
-    "test-selection": "test-selection",
-    "validate": "validate",
-    "test": "tests",
-    "build": "build",
-    "install": "deploy-local",
-    "publish": "publish",
-    "verify-publish": "verify-publish",
+    "bootstrap": "bootstrap", "test-selection": "test-selection",
+    "before-build-checks": "before-build-checks", "after-build-checks": "after-build-checks",
+    "build": "build", "install": "deploy-local", "publish": "publish", "verify-publish": "verify-publish",
 }
 RESULT_SCHEMAS = {
-    "validate": ("ceratops-repository-stage-result.v1",),
-    "test": ("ceratops-repository-stage-result.v1",),
+    "before-build-checks": ("ceratops-repository-stage-result.v1",),
+    "after-build-checks": ("ceratops-repository-stage-result.v1",),
     "build": ("ceratops-build-result.v1", "ceratops-build-result.v2", "ceratops-build-result.v3"),
     "install": ("ceratops-deployment-result.v1",),
 }
@@ -112,15 +107,26 @@ class _ContractLoader(yaml.SafeLoader):
 
 
 def operation_entries(contract: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
-    """Return the declared action hierarchy as an executable operation index."""
+    """Index executable groups and ordinary actions in lifecycle order.
 
+    Before/after containers are not commands. Each returned check location names
+    exactly one group's command and result contract. Builders remain one command
+    even when they report several internal checks.
+    """
     entries: dict[str, Mapping[str, Any]] = {}
-    for action, operation in contract.get("repository", {}).get("actions", {}).items():
-        entries[f"repository.actions.{action}"] = operation
+    owners = {"repository": contract.get("repository", {})}
     for kind, deliverables in contract.get("deliverables", {}).items():
-        for name, deliverable in deliverables.items():
-            for action, operation in deliverable.get("actions", {}).items():
-                entries[f"deliverables.{kind}.{name}.actions.{action}"] = operation
+        owners.update({f"deliverables.{kind}.{name}": value for name, value in deliverables.items()})
+    order = {name: index for index, name in enumerate(
+        ("bootstrap", "test-selection", "before-build-checks", "build", "after-build-checks", "install", "publish", "verify-publish"))}
+    for owner, record in owners.items():
+        for action, operation in sorted(record.get("actions", {}).items(), key=lambda pair: order.get(pair[0], 99)):
+            location = f"{owner}.actions.{action}"
+            if action in CHECK_ACTIONS:
+                entries.update({f"{location}.check-groups.{name}": group
+                                for name, group in operation["check-groups"].items()})
+            else:
+                entries[location] = operation
     return entries
 
 
@@ -130,6 +136,8 @@ def operation_category(location: str) -> str:
     if isinstance(location, str) and (match := OPERATION_RE.fullmatch(location)):
         action = match.group("repository") or match.group("action")
         kind = match.group("kind")
+        if match.group("group") and action not in CHECK_ACTIONS:
+            raise SdlcContractError(f"Only before/after checks have executable groups: {location}")
         if kind not in {None, "mcp-servers"} and re.fullmatch(NAME, match.group("name")) is None:
             raise SdlcContractError(f"Invalid SDLC operation location: {location}")
         if (
@@ -201,7 +209,11 @@ def operation_prerequisites(
     if match.group("kind") is not None:
         deliverable = contract["deliverables"][match.group("kind")][match.group("name")]
         direct_packages = list(deliverable.get("prerequisites", []))
+    artifacts = list(operation.get("requires-artifacts", []))
+    if (match.group("repository") or match.group("action")) == "after-build-checks" and match.group("kind"):
+        artifacts.insert(0, location.split(".actions.", 1)[0])
     return {
+        **({"artifacts": list(dict.fromkeys(artifacts))} if artifacts else {}),
         "capabilities": {name: capabilities[name] for name in required_capabilities},
         "packages": _package_records(contract, direct_packages),
     }
@@ -222,7 +234,6 @@ def release_bundle_entries(contract: Mapping[str, Any]) -> dict[str, dict[str, A
     owners = {
         member: name for name, bundle in bundles.items() for member in bundle["members"]
     }
-    operations = operation_entries(contract)
     entries: dict[str, dict[str, Any]] = {}
     for name, bundle in bundles.items():
         members: dict[str, dict[str, Any]] = {}
@@ -236,7 +247,6 @@ def release_bundle_entries(contract: Mapping[str, Any]) -> dict[str, dict[str, A
             metadata["action-locations"] = {
                 action: f"{member}.actions.{action}"
                 for action in record["actions"]
-                if f"{member}.actions.{action}" in operations
             }
             members[member] = metadata
             prerequisites = operation_prerequisites(
@@ -272,79 +282,61 @@ def _typed_semantic_errors(value: Mapping[str, Any]) -> list[str]:
             )
     deliverables = value.get("deliverables", {})
     packages = deliverables.get("packages", {})
-    owners: list[tuple[str, Mapping[str, Any]]] = [("repository", repository)]
-    for kind, group in deliverables.items():
-        owners.extend(
-            (f"{kind}.{name}", deliverable) for name, deliverable in group.items()
-        )
-    for owner, record in owners:
-        for action_name, action in record["actions"].items():
-            for capability in action["requires"]["capabilities"]:
-                if capability not in capabilities:
-                    errors.append(
-                        f"unknown capability {capability} at {owner}.actions.{action_name}"
-                    )
-            handoff_positions = [
-                position
-                for position, step in enumerate(action.get("steps", []), start=1)
-                if "handoff" in step
-            ]
-            if handoff_positions and handoff_positions != [len(action["steps"])]:
-                errors.append(
-                    f"handoff must be the single final step at {owner}.actions.{action_name}"
-                )
-            check_results = action.get("check-results")
-            groups = action.get("check-groups", {})
-            for group_name, group in groups.items():
-                location = f"{owner}.actions.{action_name}.check-groups.{group_name}"
-                steps = action.get("steps", [])
-                if not steps or any("run" not in step for step in steps):
-                    errors.append(f"{location} requires executable commands, not a no-op or skill handoff")
-                phase = group["phase"]
-                if phase == "during-build" and action_name != "build":
-                    errors.append(f"{location}: during-build checks must belong to a build action")
-                if phase != "during-build" and action_name not in {"validate", "test", "tests"}:
-                    errors.append(f"{location}: before/after-build groups must belong to a check action")
-                if phase != "during-build" and len(steps) != 1:
-                    errors.append(f"{location} requires one test command accepting --check-group and --artifacts")
-                for reference in group["requires-artifacts"]:
-                    _, kind, name = reference.split(".")
-                    artifact_owner = deliverables.get(kind, {}).get(name)
-                    if artifact_owner is None or not artifact_owner.get("artifact"):
-                        errors.append(f"{location} requires an unknown or undeclared artifact: {reference}")
-            if check_results is not None:
-                steps = action.get("steps", [])
-                if action_name not in {"validate", "test", "tests"} or len(steps) != 1 or "run" not in steps[0]:
-                    errors.append(f"check-results requires one check runner command at {owner}.actions.{action_name}")
-                for key in ("product-inputs", "check-inputs", "dependencies"):
-                    for input_path in check_results.get(key, []):
-                        if (input_path.startswith(("/", "\\")) or "\\" in input_path
-                                or ":" in input_path or ".." in input_path.split("/")):
-                            errors.append(f"check-results {key} must be repository-relative at {owner}.actions.{action_name}")
-            declared_result = action.get("result-schema")
-            if action.get("result-commit-field") is not None:
-                steps = action.get("steps", [])
-                if action_name != "build" or not steps or "run" not in steps[-1] or handoff_positions:
-                    errors.append(
-                        f"result-commit-field requires a build ending in a run step at {owner}.actions.{action_name}"
-                    )
-            if declared_result is not None:
-                expected_result = RESULT_SCHEMAS.get(action_name)
-                if expected_result is None:
-                    errors.append(
-                        f"result-schema is not supported at {owner}.actions.{action_name}"
-                    )
-                elif declared_result not in expected_result:
-                    errors.append(
-                        f"{owner}.actions.{action_name} result-schema must be "
-                        f"{' or '.join(expected_result)}"
-                    )
-                steps = action.get("steps", [])
-                if not steps or "run" not in steps[-1]:
-                    errors.append(
-                        f"result-schema requires a final run step at "
-                        f"{owner}.actions.{action_name}"
-                    )
+    for location, action in operation_entries(value).items():
+        match = OPERATION_RE.fullmatch(location)
+        assert match is not None
+        action_name = match.group("repository") or match.group("action")
+        owner = location.split(".actions.", 1)[0]
+        for capability in action["requires"]["capabilities"]:
+            if capability not in capabilities:
+                errors.append(f"unknown capability {capability} at {location}.requires.capabilities")
+        steps = action.get("steps", [])
+        handoff_positions = [position for position, step in enumerate(steps, 1) if "handoff" in step]
+        if handoff_positions and handoff_positions != [len(steps)]:
+            errors.append(f"handoff must be the single final step at {location}")
+        groups = action.get("check-groups", {})
+        if groups and action_name != "build":
+            errors.append(f"{location}.check-groups is supported only inside a build")
+        requirements = [(location, action.get("requires-artifacts", []))]
+        requirements.extend((f"{location}.check-groups.{name}", group.get("requires-artifacts", []))
+                            for name, group in groups.items())
+        if groups and (not steps or any("run" not in step for step in steps)):
+            errors.append(f"{location}.check-groups requires an executable builder")
+        for field, references in requirements:
+            if action_name == "before-build-checks" and references:
+                errors.append(f"{field}.requires-artifacts: before-build checks cannot require artifacts")
+            if action_name == "after-build-checks":
+                if owner == "repository" and not references:
+                    errors.append(f"{field}.requires-artifacts must name every artifact for repository checks")
+                elif owner in references:
+                    errors.append(f"{field}.requires-artifacts: redundant own artifact {owner}")
+                references = ([owner] if owner != "repository" else []) + list(references)
+            for reference in references:
+                _, kind, name = reference.split(".")
+                producer = deliverables.get(kind, {}).get(name)
+                if (producer is None or not producer.get("artifact")
+                        or not producer.get("actions", {}).get("build", {}).get("steps")):
+                    errors.append(f"{field}.requires-artifacts requires an unknown or non-producing artifact: {reference}")
+                if action_name == "build" and reference == owner:
+                    errors.append(f"{field}.requires-artifacts cannot require the builder's unfinished own artifact")
+        check_results = action.get("check-results")
+        if check_results is not None:
+            if action_name not in CHECK_ACTIONS or len(steps) != 1 or "run" not in steps[0]:
+                errors.append(f"check-results requires one check runner command at {location}")
+            for key in ("product-inputs", "check-inputs", "dependencies"):
+                for input_path in check_results.get(key, []):
+                    if not _relative_path(input_path):
+                        errors.append(f"check-results {key} must be repository-relative at {location}")
+        if action.get("result-commit-field") is not None:
+            if action_name != "build" or not steps or "run" not in steps[-1] or handoff_positions:
+                errors.append(f"result-commit-field requires a build ending in a run step at {location}")
+        declared_result = action.get("result-schema")
+        if declared_result is not None:
+            expected = RESULT_SCHEMAS.get(action_name)
+            if expected is None or declared_result not in expected:
+                errors.append(f"{location} result-schema must be {' or '.join(expected or ())}")
+            if not steps or "run" not in steps[-1]:
+                errors.append(f"result-schema requires a final run step at {location}")
     path_fields = {
         "packages": ("source", "project"),
         "apps": ("source", "manifest", "project"),
@@ -396,46 +388,27 @@ def _typed_semantic_errors(value: Mapping[str, Any]) -> list[str]:
     }
     for kind, lifecycle in lifecycle_by_kind.items():
         for name, record in deliverables.get(kind, {}).items():
-            for action_name in ("validate", "install"):
-                action = record["actions"][action_name]
-                # An MCP server may have no separate validation step. Installation
-                # may use a repository script or an MCP-server-lifecycle handoff.
-                if (
-                    kind == "mcp-servers"
-                    and action_name == "validate"
-                    and "no-op" in action
-                ):
-                    continue
-                handoffs = [
-                    step["handoff"]
-                    for step in action.get("steps", [])
-                    if "handoff" in step
-                ]
+            source_groups = record["actions"]["before-build-checks"]["check-groups"]
+            actions = [("before-build-checks.check-groups." + group, action)
+                       for group, action in source_groups.items() if any("handoff" in step for step in action.get("steps", []))]
+            if kind == "skills" and not actions:
+                errors.append(f"{kind}.{name}.actions.before-build-checks must include a source-check handoff")
+            actions.append(("install", record["actions"]["install"]))
+            for action_name, action in actions:
+                handoffs = [step["handoff"] for step in action.get("steps", []) if "handoff" in step]
                 if not handoffs:
-                    if (
-                        kind == "mcp-servers"
-                        and action_name == "install"
-                        and action.get("steps")
-                    ):
+                    if kind == "mcp-servers" and action.get("steps"):
                         continue
-                    errors.append(
-                        f"{kind}.{name}.actions.{action_name} must end with a handoff"
-                    )
+                    errors.append(f"{kind}.{name}.actions.{action_name} must end with a handoff")
                     continue
                 if handoffs[0]["lifecycle"] != lifecycle:
-                    errors.append(
-                        f"{kind}.{name}.actions.{action_name} must hand off to {lifecycle}"
-                    )
+                    errors.append(f"{kind}.{name}.actions.{action_name} must hand off to {lifecycle}")
                 identity = "mcp-server" if kind == "mcp-servers" else "skill"
                 if handoffs[0]["inputs"].get(identity) != name:
-                    errors.append(
-                        f"{kind}.{name}.actions.{action_name} must identify {identity} {name}"
-                    )
+                    errors.append(f"{kind}.{name}.actions.{action_name} must identify {identity} {name}")
                 declared = handoffs[0]["inputs"].get("prerequisite-packages")
                 if declared is not None and declared != record["prerequisites"]:
-                    errors.append(
-                        f"{kind}.{name}.actions.{action_name} prerequisite-packages differ from prerequisites"
-                    )
+                    errors.append(f"{kind}.{name}.actions.{action_name} prerequisite-packages differ from prerequisites")
     return errors
 
 

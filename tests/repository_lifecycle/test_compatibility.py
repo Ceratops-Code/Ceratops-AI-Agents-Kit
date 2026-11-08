@@ -182,11 +182,7 @@ def test_compatibility_materializer_supplies_target_identity_and_assignments(
             "source": "mcp-servers/custom-mcp-server",
             "manifest": "mcp-servers/custom-mcp-server/mcp-server.json",
             "prerequisites": [],
-            "actions": {
-                "validate": {"requires": {"capabilities": []}, "no-op": "Covered by repository validation."},
-                "install": {"requires": {"capabilities": []}, "steps": [{"run": [sys.executable, "-V"]}]},
-                "publish": {"requires": {"capabilities": []}, "steps": [{"run": [sys.executable, "-V"]}]},
-            },
+            "actions": {"before-build-checks": {"check-groups": {'source': {"requires": {"capabilities": []}, "no-op": "Covered by repository validation."}}}, "install": {"requires": {"capabilities": []}, "steps": [{"run": [sys.executable, "-V"]}]}, "publish": {"requires": {"capabilities": []}, "steps": [{"run": [sys.executable, "-V"]}]}},
         }}},
     )
     (repo / ".git").write_text("gitdir: test\n", encoding="utf-8", newline="\n")
@@ -269,7 +265,7 @@ def test_compatibility_materializer_supplies_target_identity_and_assignments(
     assert contract["version"] == yaml.safe_load(SDLC_CONTRACT_TEMPLATE.read_text(encoding="utf-8"))["version"]
     assert contract["kind"] == "ceratops-sdlc"
     alpha_actions = contract["deliverables"]["skills"]["alpha-tool"]["actions"]
-    assert alpha_actions["validate"]["steps"][0]["handoff"] == {
+    assert alpha_actions["before-build-checks"]["check-groups"]["source"]["steps"][0]["handoff"] == {
         "lifecycle": "ceratops-skill-lifecycle",
         "action": "source-validate",
         "inputs": {"skill": "alpha-tool"},
@@ -295,26 +291,26 @@ def test_compatibility_materializer_supplies_target_identity_and_assignments(
         "ceratops_repo_compatibility_engine.apply_ceratops_compatibility"
     )
     # Current generated entries are idempotent and retire with their skill source.
-    assert materializer.build_sdlc_contract_candidate(
+    assert materializer.prepare_sdlc_configuration(
         repo, skill_names=["alpha-tool", "beta-tool"], apply_contract=True,
     ) == contract
-    skillless = materializer.build_sdlc_contract_candidate(
+    skillless = materializer.prepare_sdlc_configuration(
         repo, skill_names=[], apply_contract=True,
     )
     assert skillless["deliverables"] == {"mcp-servers": contract["deliverables"]["mcp-servers"]}
 
     # A target's custom definitions survive even under a producer-owned name.
-    contract["deliverables"]["skills"]["alpha-tool"]["actions"]["test"] = {
+    contract["deliverables"]["skills"]["alpha-tool"]["actions"]["before-build-checks"]["check-groups"]["tests"] = {
         "requires": {"capabilities": []},
         "no-op": "Target-owned skill tests remain separate.",
     }
     custom = contract["deliverables"]["skills"]["alpha-tool"]
     sdlc = repo / "sdlc" / "sdlc.yml"
     sdlc.write_text(yaml.safe_dump(contract, sort_keys=False), encoding="utf-8")
-    assert materializer.build_sdlc_contract_candidate(
+    assert materializer.prepare_sdlc_configuration(
         repo, skill_names=["alpha-tool", "beta-tool"], apply_contract=True,
     ) == contract
-    skillless = materializer.build_sdlc_contract_candidate(
+    skillless = materializer.prepare_sdlc_configuration(
         repo, skill_names=[], apply_contract=True,
     )
     assert skillless["deliverables"]["skills"] == {"alpha-tool": custom}
@@ -465,7 +461,7 @@ def test_compatibility_materializer_supplies_target_identity_and_assignments(
     assert (alternate / "scripts/bootstrap-skills.py").is_file()
     assert not (alternate / "scripts/deploy-skills.py").exists()
     actual = yaml.safe_load((alternate / "sdlc/sdlc.yml").read_text(encoding="utf-8"))
-    assert actual["deliverables"]["skills"]["alpha-tool"]["actions"]["validate"]["steps"][0]["handoff"] == {
+    assert actual["deliverables"]["skills"]["alpha-tool"]["actions"]["before-build-checks"]["check-groups"]["source"]["steps"][0]["handoff"] == {
         "lifecycle": "ceratops-skill-lifecycle",
         "action": "source-validate",
         "inputs": {"skill": "alpha-tool"},
@@ -603,20 +599,16 @@ def test_explicit_app_test_ownership_does_not_generate_python_test_runner(
                     "source": ".",
                     "manifest": "runtime/app.json",
                     "prerequisites": [],
-                    "actions": {
-                        "validate": {
+                    "actions": {"before-build-checks": {"check-groups": {'source': {
                             "requires": {"capabilities": []},
                             "no-op": "Covered by repository validation.",
-                        },
-                        "test": {
+                        }, 'tests': {
                             "requires": {"capabilities": ["python"]},
                             "steps": [{"run": ["python", "-V"]}],
-                        },
-                        "install": {
+                        }}}, "install": {
                             "requires": {"capabilities": []},
                             "no-op": "Fixture has no installation side effect.",
-                        },
-                    },
+                        }},
                 }
             }
         },
@@ -624,7 +616,7 @@ def test_explicit_app_test_ownership_does_not_generate_python_test_runner(
     contract_path = repo / "sdlc" / "sdlc.yml"
     contract = yaml.safe_load(contract_path.read_text(encoding="utf-8"))
     contract["repository"]["capabilities"]["python"] = {"executable": "python"}
-    contract["repository"]["actions"]["test"] = {
+    contract["repository"]["actions"]["before-build-checks"]["check-groups"]["tests"] = {
         "requires": {"capabilities": []},
         "no-op": "The app deliverable owns executable tests.",
     }
@@ -650,10 +642,10 @@ def test_explicit_app_test_ownership_does_not_generate_python_test_runner(
     preserved_text = contract_path.read_text(encoding="utf-8")
     assert preserved_text.startswith("{\n")
     preserved = json.loads(preserved_text)
-    assert preserved["repository"]["actions"]["test"]["no-op"] == (
+    assert preserved["repository"]["actions"]["before-build-checks"]["check-groups"]["tests"]["no-op"] == (
         "The app deliverable owns executable tests."
     )
-    assert preserved["deliverables"]["apps"]["fixture-app"]["actions"]["test"][
+    assert preserved["deliverables"]["apps"]["fixture-app"]["actions"]["before-build-checks"]["check-groups"]["tests"][
         "steps"
     ] == [{"run": ["python", "-V"]}]
     validator = importlib.import_module(
@@ -1003,7 +995,7 @@ def test_compatibility_materializes_action_assignments(tmp_path: pathlib.Path, i
 
 
 
-@pytest.mark.parametrize("failure", [None, "git", "ambiguous", "missing-action", "wrong-action"])
+@pytest.mark.parametrize("failure", [None, "git", "ambiguous", "missing-action", "wrong-action", "missing-inputs"])
 def test_ci_action_resolution_requires_published_unambiguous_action(
     monkeypatch: pytest.MonkeyPatch, failure: str | None,
 ) -> None:
@@ -1024,7 +1016,14 @@ def test_ci_action_resolution_requires_published_unambiguous_action(
         assert kwargs["timeout"] == 30
         if failure == "missing-action":
             raise OSError("not published")
-        return io.BytesIO(b"runs: {using: node24}" if failure == "wrong-action" else b"runs: {using: composite}")
+        inputs = {name: {"required": True} for name in action["inputs"]}
+        declaration = {
+            "runs": {"using": "node24" if failure == "wrong-action" else "composite"},
+            "inputs": inputs,
+        }
+        if failure == "missing-inputs":
+            inputs.pop("operations")
+        return io.BytesIO(yaml.safe_dump(declaration).encode())
 
     monkeypatch.setattr(ci.subprocess, "run", git)
     monkeypatch.setattr(ci.urllib.request, "urlopen", published)
@@ -1145,13 +1144,10 @@ def _capability_contract(version, capabilities):
         "kind": "ceratops-sdlc",
         "repository": {
             "capabilities": capabilities,
-            "actions": {
-                "validate": {"requires": {"capabilities": []}, "no-op": "fixture"},
-                "test": {
+            "actions": {"before-build-checks": {"check-groups": {'source': {"requires": {"capabilities": []}, "no-op": "fixture"}, 'tests': {
                     "requires": {"capabilities": list(capabilities)},
                     "steps": [{"run": [sys.executable, "-c", "print('checked')"]}],
-                },
-            },
+                }}}, },
         },
     }
 
@@ -1254,13 +1250,13 @@ def test_sdlc_capabilities_preserve_native_references_and_unversioned_tools(
     original = {path: path.read_bytes() for path in (sdlc, *native_paths)}
     for _ in range(2):
         assert reader.validation_errors(contract) == []
-        candidate = materializer.build_sdlc_contract_candidate(
+        candidate = materializer.prepare_sdlc_configuration(
             tmp_path, skill_names=[], apply_contract=True,
         )
         assert candidate["version"] == schema_version
         for tool, capability in capabilities.items():
             assert candidate["repository"]["capabilities"][tool] == capability
-        prepared = run_operation_cli(tmp_path, "repository.actions.test", prepare_only=True)
+        prepared = run_operation_cli(tmp_path, "repository.actions.before-build-checks.check-groups.tests", prepare_only=True)
         assert prepared.returncode == 0, prepared.stderr
         assert json.loads(prepared.stdout)["prerequisites"]["capabilities"] == capabilities
         assert {path: path.read_bytes() for path in original} == original
@@ -1271,21 +1267,21 @@ def test_sdlc_invalid_capability_stops_public_runner_before_effects(tmp_path, sc
     contract = _capability_contract(schema_version, {
         "git": {"executable": "git", "channel": "stable"},
     })
-    contract["repository"]["actions"]["test"]["steps"] = [{"run": [
+    contract["repository"]["actions"]["before-build-checks"]["check-groups"]["tests"]["steps"] = [{"run": [
         sys.executable, "-c", "from pathlib import Path; Path('ran').touch()",
     ]}]
     sdlc = tmp_path / "sdlc/sdlc.yml"
     sdlc.parent.mkdir()
     sdlc.write_text(yaml.safe_dump(contract), encoding="utf-8")
     for _ in range(2):
-        blocked = run_operation_cli(tmp_path, "repository.actions.test")
+        blocked = run_operation_cli(tmp_path, "repository.actions.before-build-checks.check-groups.tests")
         assert blocked.returncode != 0
         assert "repository.capabilities.git" in blocked.stderr
         assert "channel" in blocked.stderr
         assert not (tmp_path / "ran").exists()
     contract["repository"]["capabilities"]["git"].pop("channel")
     sdlc.write_text(yaml.safe_dump(contract), encoding="utf-8")
-    completed = run_operation_cli(tmp_path, "repository.actions.test")
+    completed = run_operation_cli(tmp_path, "repository.actions.before-build-checks.check-groups.tests")
     assert completed.returncode == 0, completed.stderr
     assert (tmp_path / "ran").is_file()
 
@@ -1339,7 +1335,7 @@ def installed_sdlc_schemas(tmp_path, monkeypatch):
 
 
 def test_sdlc_schema_catalog_supports_new_metadata_without_new_code(installed_sdlc_schemas):
-    from tests.repository_lifecycle.test_sdlc_handoffs import _bundle_contract
+    from tests.repository_lifecycle.test_sdlc_actions import _bundle_contract
 
     reader, directory, versions = installed_sdlc_schemas
     future_version = max(versions) + 11
@@ -1378,7 +1374,7 @@ def test_new_configuration_uses_latest_installed_schema_and_keeps_existing_versi
     repo = tmp_path / "repository"
     repo.mkdir()
     for _ in range(2):
-        document = materializer.build_sdlc_contract_candidate(
+        document = materializer.prepare_sdlc_configuration(
             repo, skill_names=[], apply_contract=True,
         )
         assert document["version"] == newest
@@ -1389,7 +1385,7 @@ def test_new_configuration_uses_latest_installed_schema_and_keeps_existing_versi
     path.parent.mkdir()
     path.write_text(yaml.safe_dump(document), encoding="utf-8")
     original = path.read_bytes()
-    repeated = materializer.build_sdlc_contract_candidate(repo, skill_names=[], apply_contract=True)
+    repeated = materializer.prepare_sdlc_configuration(repo, skill_names=[], apply_contract=True)
     assert repeated["version"] == min(versions)
     assert path.read_bytes() == original
 
@@ -1419,14 +1415,14 @@ def test_public_sdlc_runner_reports_newer_repository_before_running(tmp_path):
     )
     latest = reader.latest_sdlc_version()
     document = _capability_contract(latest + 1, {})
-    document["repository"]["actions"]["test"]["steps"] = [{"run": [
+    document["repository"]["actions"]["before-build-checks"]["check-groups"]["tests"]["steps"] = [{"run": [
         sys.executable, "-c", "from pathlib import Path; Path('ran').touch()",
     ]}]
     path = tmp_path / "sdlc/sdlc.yml"
     path.parent.mkdir()
     path.write_text(yaml.safe_dump(document), encoding="utf-8")
     for _ in range(2):
-        result = run_operation_cli(tmp_path, "repository.actions.test")
+        result = run_operation_cli(tmp_path, "repository.actions.before-build-checks.check-groups.tests")
         assert result.returncode != 0
         assert f"unsupported SDLC version: {latest + 1}" in result.stderr
         assert f"latest installed version: {latest}" in result.stderr
@@ -1435,7 +1431,7 @@ def test_public_sdlc_runner_reports_newer_repository_before_running(tmp_path):
 
 
 def test_release_bundle_declarations_have_one_public_name(tmp_path):
-    from tests.repository_lifecycle.test_sdlc_handoffs import _bundle_contract
+    from tests.repository_lifecycle.test_sdlc_actions import _bundle_contract
 
     reader = importlib.import_module(
         "ceratops_repo_compatibility_engine.sdlc_contract_validation"

@@ -1,6 +1,6 @@
 ---
 name: Ceratops repository checks
-description: Run declared validation and optional tests through the lifecycle.
+description: Run explicitly named SDLC check phases or groups through the lifecycle.
 inputs:
   repo-root:
     description: Repository root containing sdlc/sdlc.yml.
@@ -8,10 +8,9 @@ inputs:
   evidence-file:
     description: Failure evidence path owned by the caller.
     required: true
-  run-tests:
-    description: Run tests after validation; disable for noninteractive CI.
-    required: false
-    default: "true"
+  operations:
+    description: Complete SDLC check-phase or group locations, one per line.
+    required: true
 runs:
   using: composite
   steps:
@@ -21,17 +20,21 @@ runs:
         CERATOPS_ACTION_ROOT: ${{ github.action_path }}
         CERATOPS_REPOSITORY: ${{ inputs.repo-root }}
         CERATOPS_EVIDENCE: ${{ inputs.evidence-file }}
-        CERATOPS_RUN_TESTS: ${{ inputs.run-tests }}
+        CERATOPS_CHECK_OPERATIONS: ${{ inputs.operations }}
       run: |
         : "${CERATOPS_EVIDENCE:?evidence-file input is required}"
-        case "$CERATOPS_RUN_TESTS" in
-          true) set -- --validate --tests --ci ;;
-          false) set -- --validate --ci ;;
-          *)
-            echo "run-tests must be true or false" >&2
-            exit 2
-            ;;
-        esac
+        : "${CERATOPS_CHECK_OPERATIONS:?operations input is required}"
+        set -- --ci
+        while IFS= read -r operation || [ -n "$operation" ]; do
+          operation="${operation%$'\r'}"
+          [ -z "$operation" ] && continue
+          case "$operation" in
+            *.actions.before-build-checks|*.actions.before-build-checks.check-groups.*|*.actions.after-build-checks|*.actions.after-build-checks.check-groups.*)
+              set -- "$@" --operation "$operation" ;;
+            *) echo "Expected an SDLC check phase or group: $operation" >&2; exit 2 ;;
+          esac
+        done <<< "$CERATOPS_CHECK_OPERATIONS"
+        [ "$#" -gt 1 ] || { echo "operations must name at least one check" >&2; exit 2; }
         uv run --quiet --locked \
           --project "$CERATOPS_ACTION_ROOT/../../../scripts" \
           python "$CERATOPS_ACTION_ROOT/repository_operation.py" \

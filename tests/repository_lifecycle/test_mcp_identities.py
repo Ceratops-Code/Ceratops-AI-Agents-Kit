@@ -13,7 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests.repository_lifecycle.test_sdlc_handoffs import (
+from tests.repository_lifecycle.test_sdlc_actions import (
     ROOT,
     _repository,
     _typed_contract,

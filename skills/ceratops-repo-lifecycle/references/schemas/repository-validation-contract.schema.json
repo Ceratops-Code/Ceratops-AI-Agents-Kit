@@ -102,7 +102,7 @@
       "properties": {
         "id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$"},
         "when": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/pathAny"}},
-        "operation_category": {"const": "validate"},
+        "operation_category": {"const": "before-build-checks"},
         "required_capabilities": {
           "type": "array",
           "minItems": 1,

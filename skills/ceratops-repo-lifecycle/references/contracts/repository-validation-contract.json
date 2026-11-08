@@ -29,7 +29,7 @@
           ]
         }
       ],
-      "operation_category": "validate",
+      "operation_category": "before-build-checks",
       "required_capabilities": [
         "android-lint",
         "android-build"
@@ -50,7 +50,7 @@
           ]
         }
       ],
-      "operation_category": "validate",
+      "operation_category": "before-build-checks",
       "required_capabilities": [
         "go-vet"
       ],
@@ -69,7 +69,7 @@
           ]
         }
       ],
-      "operation_category": "validate",
+      "operation_category": "before-build-checks",
       "required_capabilities": [
         "rustfmt-check",
         "rust-clippy"
@@ -92,7 +92,7 @@
           ]
         }
       ],
-      "operation_category": "validate",
+      "operation_category": "before-build-checks",
       "required_capabilities": [
         "dotnet-format-check"
       ],
@@ -111,7 +111,7 @@
           ]
         }
       ],
-      "operation_category": "validate",
+      "operation_category": "before-build-checks",
       "required_capabilities": [
         "shellcheck"
       ],

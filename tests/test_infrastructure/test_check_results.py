@@ -73,7 +73,7 @@ def test_saved_success_finishes_report_cleanup_without_repeating_tests(
     identity = str(uuid.uuid4())
     diagnostic = root / ".build/test-diagnostics/pytest-failure.json"
     arguments = ["--all", "--result-file", str(current.path), "--result-id", identity,
-                 "--candidate-id", "1" * 40, "--check-id", "repository.actions.test",
+                 "--candidate-id", "1" * 40, "--check-id", "repository.actions.before-build-checks.check-groups.tests",
                  "--check-version", "2" * 64]
     request = test_runner_module.diagnostic_request(test_runner_module.parse_request(arguments)[0])
     diagnostic.parent.mkdir(parents=True)
@@ -212,7 +212,7 @@ def check_writer(request: pytest.FixtureRequest, tmp_path: pathlib.Path) -> dict
 def _request(path: pathlib.Path, result_id: str = "attempt-1") -> argparse.Namespace:
     return argparse.Namespace(
         result_file=path, result_id=result_id, candidate_id="1" * 40,
-        check_id="repository.actions.test", check_version="2" * 64,
+        check_id="repository.actions.before-build-checks.check-groups.tests", check_version="2" * 64,
         repair_unaccepted_result=False, probe_command=None,
     )
 
@@ -255,8 +255,8 @@ def _context(root: pathlib.Path) -> dict[str, Any]:
         return hashlib.sha256((root / name).read_bytes()).hexdigest()
     return {
         "schema": "ceratops-repository-check-inputs.v1",
-        "group": "repository.actions.test",
-        "scope": {"operation": "repository.actions.test", "stage": "tests", "cwd": ".",
+        "group": "repository.actions.before-build-checks.check-groups.tests",
+        "scope": {"operation": "repository.actions.before-build-checks.check-groups.tests", "stage": "tests", "cwd": ".",
                   "inputRules": {"product-inputs": ["source*.py"], "check-inputs": ["checks.py"],
                                  "dependencies": [], "environment": [], "tools": []}},
         "qualificationLevel": "beta", "workVersion": "1" * 40, "checkVersion": "2" * 64,
@@ -319,7 +319,7 @@ def test_path_equivalent_outcomes_survive_interrupted_replacement(
             lambda: 0, _request(original_path, str(uuid.uuid4())), {},
         ) == 2
     fresh = reader["CheckResultStore"](tmp_path)
-    result = fresh.select(current_inputs, check_id="repository.actions.test")
+    result = fresh.select(current_inputs, check_id="repository.actions.before-build-checks.check-groups.tests")
     assert result["decision"] == ("reuse" if boundary == "after" else "execute")
     assert failure_path == original_path
     assert len(fresh.current.records("repository-check")) == 1
@@ -544,7 +544,7 @@ def test_custom_runner_exposes_existing_result_interface_without_changing_select
     monkeypatch.setenv("CERATOPS_REPOSITORY_CHECK_CONTEXT", json.dumps(context))
     path = tmp_path / ".git/result.json"
     args = ["--result-file", str(path), "--result-id", "attempt-1", "--candidate-id", "1" * 40,
-            "--check-id", "repository.actions.test", "--check-version", "2" * 64,
+            "--check-id", "repository.actions.before-build-checks.check-groups.tests", "--check-version", "2" * 64,
             "--probe-command", json.dumps([sys.executable, "-c", "pass"])]
     assert test_runner_module.execute(args, repo_root=tmp_path) == 0
     saved = path.read_bytes()
@@ -783,7 +783,7 @@ def test_qualified_group_retains_the_original_inherited_child_level(
         identity = str(uuid.uuid4())
         path = root / ".git" / f"{identity}.json"
         arguments = ["--all", "--result-file", str(path), "--result-id", identity,
-                     "--candidate-id", "1" * 40, "--check-id", "repository.actions.test",
+                     "--candidate-id", "1" * 40, "--check-id", "repository.actions.before-build-checks.check-groups.tests",
                      "--check-version", "2" * 64]
         if saved and fault is not None:
             original_path = root / ".git" / saved[0]["checks"][0]["path"]
@@ -860,14 +860,14 @@ def test_aggregate_reuse_preserves_external_input_markers_and_original_child_pas
     saved: list[dict[str, Any]] = []
     original_bytes: dict[pathlib.Path, bytes] = {}
     for _ in range(2):
-        decision = store.select(context, check_id="repository.actions.test")
+        decision = store.select(context, check_id="repository.actions.before-build-checks.check-groups.tests")
         assert decision["decision"] == "execute"
         if saved:
             assert "Unrepresented child scope" in decision["reason"]
         identity, path = store.new_result_path()
         assert test_runner_module.execute([
             "--all", "--result-file", str(path), "--result-id", identity,
-            "--candidate-id", "1" * 40, "--check-id", "repository.actions.test",
+            "--candidate-id", "1" * 40, "--check-id", "repository.actions.before-build-checks.check-groups.tests",
             "--check-version", "2" * 64,
         ], repo_root=root) == 0
         record = reader["read_check_result"](path)
@@ -896,7 +896,7 @@ def test_aggregate_reuse_preserves_external_input_markers_and_original_child_pas
         assert inherited["result_id"] == original["result_id"]
         assert inherited["check_version"] == original["check_version"]
         assert inherited["reused"] is True
-    assert store.select(context, check_id="repository.actions.test")["decision"] == "execute"
+    assert store.select(context, check_id="repository.actions.before-build-checks.check-groups.tests")["decision"] == "execute"
     assert "result_references" not in capsys.readouterr().out
 
 
@@ -918,7 +918,7 @@ def test_check_reader_rejects_nonboolean_child_reuse_constraint(
     with pytest.raises(ValueError, match="Reported checks conflict"):
         reader["read_check_result"](path)
     with pytest.raises(ValueError, match="Reported checks conflict"):
-        reader["CheckResultStore"](tmp_path).select(context, check_id="repository.actions.test")
+        reader["CheckResultStore"](tmp_path).select(context, check_id="repository.actions.before-build-checks.check-groups.tests")
 
 
 @pytest.mark.parametrize("boundary", ["complete", "interrupted_teardown", "missing_teardown_report", "marked_skip", "xpass"])
@@ -968,12 +968,12 @@ def test_aggregate_expected_skips_keep_actual_outcomes_and_complete_scope(
     store = reader["CheckResultStore"](root)
     identity, path = store.new_result_path()
     arguments = ["--all", "--result-file", str(path), "--result-id", identity,
-                 "--candidate-id", "1" * 40, "--check-id", "repository.actions.test", "--check-version", "2" * 64]
+                 "--candidate-id", "1" * 40, "--check-id", "repository.actions.before-build-checks.check-groups.tests", "--check-version", "2" * 64]
     code = test_runner_module.execute(arguments, repo_root=root)
     assert code == (2 if boundary == "interrupted_teardown" else 0)
     original = path.read_bytes()
     record = reader["read_check_result"](path)
-    decision = store.select(context, check_id="repository.actions.test")
+    decision = store.select(context, check_id="repository.actions.before-build-checks.check-groups.tests")
     skips = {item["id"]: item for item in record["checks"] if item.get("status") == "skipped"}
     nodeid = "tests/test_skips.py::test_call_skip"
     if boundary == "xpass":
@@ -1067,7 +1067,7 @@ def test_aggregate_excludes_changed_or_incomplete_child_inputs(
     store = reader["CheckResultStore"](root)
     identity, path = store.new_result_path()
     arguments = ["--all", "--result-file", str(path), "--result-id", identity,
-                 "--candidate-id", "1" * 40, "--check-id", "repository.actions.test", "--check-version", "2" * 64]
+                 "--candidate-id", "1" * 40, "--check-id", "repository.actions.before-build-checks.check-groups.tests", "--check-version", "2" * 64]
     code = test_runner_module.execute(arguments, repo_root=root)
     assert code == (2 if boundary == "interrupted_teardown" else 0)
     original = path.read_bytes()
@@ -1075,7 +1075,7 @@ def test_aggregate_excludes_changed_or_incomplete_child_inputs(
     assert record["result_id"] == identity
     assert counter.read_text().splitlines() == ["example"]
     assert not list(store.directory.glob("pytest-attempt-*.json"))
-    decision = store.select(context, check_id="repository.actions.test")
+    decision = store.select(context, check_id="repository.actions.before-build-checks.check-groups.tests")
     assert decision["decision"] == "execute"
     assert not any(item.get("status") == "passed" for item in record["checks"])
     constraint, = record["checks"]

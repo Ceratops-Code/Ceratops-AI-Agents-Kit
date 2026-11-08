@@ -159,9 +159,9 @@ abandonment/replacement and worktree removal rather than matching-work success.
 - Required `--parameter name=value` values for promotion-time deploy-local
   operations; the helper forwards them to the declared operation and applies
   them only when declared by a validation or test check.
-- Optional ordered `--validation-operation LOCATION` flags select checks.
-  SDLC v4/v5 retain repository and selected-deliverable validation and tests;
-  v1-v3 contracts are rejected before any operation executes.
+- Optional ordered `--validation-operation LOCATION` flags name before-build
+  phases or groups. Required repository and deliverable groups remain included.
+  The helper passes their complete locations to the operation runner.
 
 ## Constraints
 

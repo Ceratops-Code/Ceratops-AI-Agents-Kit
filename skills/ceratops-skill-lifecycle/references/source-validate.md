@@ -33,15 +33,15 @@ the existing skill-lifecycle validator.
 - Use `--skill` only with `skill` mode and require at least one selected name.
 - Keep this action read-only. Source validation does not establish installed
   runtime correctness or the semantic audit in `skills-consistency-review`.
-- SDLC callers route through `deliverables.skills.NAME.actions.validate`
+- SDLC callers use
+  `deliverables.skills.NAME.actions.before-build-checks.check-groups.source`
   with handoff `ceratops-skill-lifecycle/source-validate`; the action owns the
   helper invocation. A named-skill handoff checks that exact skill; an untargeted
   action checks the full source set. CI defers this route. Keep helper paths
-  in the skill-owned binding and keep tests in separate SDLC test operations.
-- For SDLC v4, read the named skill's `prerequisites` and its returned package
-  records before resolving `deliverables.skills.NAME.actions.validate`; verify
-  required package artifacts against the package's declared build and check
-  actions. A `steps.handoff` request routes here only after those checks.
+  in the skill-owned binding and source/test commands in separate groups.
+- Run this source check before builds, without requiring built artifacts.
+  The repository executor owns package build ordering and artifact checks
+  for later operations.
 
 ## Workflow
 

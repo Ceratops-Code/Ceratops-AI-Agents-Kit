@@ -89,7 +89,7 @@ def test_nested_command_failure_keeps_native_case_and_exception_in_compact_resul
     encoded = json.dumps({"result": "failed", "error": json.dumps(child)})
     excerpt = command.failure_excerpt(encoded)
     assert excerpt and "fork-video-transport" in excerpt and "RuntimeError:" in excerpt
-    payload = {"status": "tests_failed", "message": "SDLC step failed: repository.actions.test step 1",
+    payload = {"status": "tests_failed", "message": "SDLC step failed: repository.actions.before-build-checks.check-groups.tests step 1",
                "diagnostic": {"message": excerpt, "exit_code": 8}}
     for _ in range(2):
         result = command.report_failure(payload, diagnostic_output=path, repo_root=repo,
@@ -777,14 +777,11 @@ def test_operation_cli_forwards_report_path_without_high_level_receipt(report_re
 
     write_sdlc_contract(repo, repository={
         "capabilities": {},
-        "actions": {
-            "validate": {"requires": {"capabilities": []}, "no-op": "No source scans in this fixture."},
-            "test": {"requires": {"capabilities": []}, "steps": [{"run": [sys.executable, "-c", "import sys; print('complete error'); sys.exit(1)"]}]},
-        },
+        "actions": {"before-build-checks": {"check-groups": {'source': {"requires": {"capabilities": []}, "no-op": "No source scans in this fixture."}, 'tests': {"requires": {"capabilities": []}, "steps": [{"run": [sys.executable, "-c", "import sys; print('complete error'); sys.exit(1)"]}]}}}, },
     })
     result = subprocess.run([
         sys.executable, str(OPERATION_RUNNER), "--repo-root", str(repo),
-        "--operation", "repository.actions.test", "--tests",
+        "--operation", "repository.actions.before-build-checks.check-groups.tests",
         "--diagnostic-output", str(path),
     ], capture_output=True, text=True, check=False)
     assert result.returncode == 1, result.stdout + result.stderr
@@ -1223,8 +1220,8 @@ def test_review_cleanup_error_reaches_gate_caller(report_repo, monkeypatch):
 
 
 @pytest.mark.parametrize("operation,category", [
-    ("repository.actions.validate", "validate"),
-    ("repository.actions.test", "tests"),
+    ("repository.actions.before-build-checks.check-groups.source", "validate"),
+    ("repository.actions.before-build-checks.check-groups.tests", "tests"),
     ("deliverables.packages.example.actions.build", "build"),
     ("deliverables.packages.example.actions.publish", "publish"),
     ("deliverables.mcp-servers.example.actions.install", "deploy-local"),
@@ -1382,7 +1379,7 @@ def test_successful_shipping_report_with_noop_is_never_an_unsuccessful_attempt(r
 def test_grouped_operation_completion_removes_its_whole_pending_attempt(report_repo):
     repo, anchor = report_repo
     path = anchor.with_name("_earlier_checks.json")
-    operation = "repository.actions.test"
+    operation = "repository.actions.before-build-checks.check-groups.tests"
     command.write_operation_report(path, {"status": "tests_failed", "pending_operations": [operation]},
                                    repo_root=repo, action="operation")
     operations = [replace(prepared(repo, operation, "print('done')"), check_group=group)

@@ -583,6 +583,7 @@ def validation_surfaces(
             "__CI_ACTION__",
             "__CI_REPO_ROOT__",
             "__CI_EVIDENCE__",
+            "__CI_OPERATIONS__",
         )
         if any(template.count(marker) != 1 for marker in markers):
             raise RuntimeError("CI validation template markers are invalid")
@@ -595,6 +596,7 @@ def validation_surfaces(
             .replace("__CI_ACTION__", resolve_action(action, ci_action_revision))
             .replace("__CI_REPO_ROOT__", action["inputs"]["repo-root"])
             .replace("__CI_EVIDENCE__", action["inputs"]["evidence-file"])
+            .replace("__CI_OPERATIONS__", json.dumps(action["inputs"]["operations"]))
         )
     if workflow.is_file():
         payload = yaml.safe_load(workflow.read_text(encoding="utf-8"))

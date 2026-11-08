@@ -784,7 +784,7 @@ def _resume_ship_command(
     for flag, operations in (
         (
             "--validation-operation",
-            _operation_ids(args.validation_operation, "validate"),
+            _operation_ids(args.validation_operation, "before-build-checks"),
         ),
         (
             "--publish-operation",
@@ -889,15 +889,16 @@ def _validate_phase(
 ) -> dict[str, Any]:
     """Recheck the current committed checkout at each safe lifecycle boundary.
 
-    Validation runs before tests; matching test outcomes can be reused. The
+    Each before-build group runs its declared command; matching outcomes can be reused. The
     calling agent repairs ordinary failures and restarts the lifecycle.
     """
 
     command = _operation_command(
         repo_root=repo_root, contract=args.sdlc_contract,
-        operations=operations,
+        operations=[name for name in resolve_validations(
+            repo_root, operations, args.validation_operation, args.sdlc_contract
+        ) if operation_category(name) == "before-build-checks"],
     )
-    command.extend(("--validate", "--tests"))
     if diagnostic_output := getattr(args, "diagnostic_output", None):
         owner_root, action = getattr(args, "diagnostic_owner", None) or (args.repo_root, "ship")
         command.extend((
@@ -907,8 +908,6 @@ def _validate_phase(
     commit = repository_commit(repo_root)
     if commit:
         command.extend(("--commit", commit))
-    for operation in args.validation_operation or []:
-        command.extend(("--validation-operation", operation))
     code, result = run_command_for_json(command, cwd=repo_root)
     if code:
         raise RepositoryShipError(
@@ -1091,7 +1090,7 @@ def _ship_repository(args: ShipOptions) -> dict[str, object]:
         raise RepositoryShipError(
             "refs/heads/release blocks the required release/local branch namespace."
         )
-    _operation_ids(args.validation_operation, "validate")
+    _operation_ids(args.validation_operation, "before-build-checks")
     release_operations = _operation_ids(args.publish_operation, "publish")
     deploy_operations = _operation_ids(args.deploy_operation, "deploy-local")
     _prepare_operation_batch(
