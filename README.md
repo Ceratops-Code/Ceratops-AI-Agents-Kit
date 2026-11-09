@@ -152,9 +152,10 @@ names its dotted field when the file is a structured manifest. A single-value
 file needs no key. Here Python references `scripts/pyproject.toml` at
 `project.requires-python`; Node references `scripts/.nvmrc`, whose `lts/*`
 keeps the existing LTS requirement. An npm requirement would reference the
-owning `package.json` field `engines.node`. Inline `version` and `channel` are rejected for every tool. Omit
-`version-from` for an unversioned tool. These references report requirements without downloading, installing
-or choosing runtimes. Artifact, package and release versions are separate data.
+owning `package.json` field `engines.node`. Inline `version` and `channel` are
+rejected for every tool. Omit `version-from` for an unversioned tool. These
+references report requirements without downloading, installing or choosing
+runtimes. Artifact, package and release versions are separate data.
 The repository-compatibility templates under
 `skills/ceratops-repo-lifecycle/references/templates/` are reusable skeletons
 to copy into other repositories, not live configuration.
