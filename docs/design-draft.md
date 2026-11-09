@@ -2523,8 +2523,18 @@ means the thread's decision is recorded, not that the whole system was audited.
 Declared SDLC check operations can provide `check-results` with owned
 `product-inputs` and `check-inputs` patterns, dependency files, environment names
 and executable tools. The shared operation executor reads these inputs before
-callbacks. It supplies the existing five result arguments to one declared runner
-command; unmarked custom operations retain their existing interface.
+callbacks. SDLC v5 requires direct source-check groups for applicable shared
+checks such as Ruff, mypy and the configured package and workflow linters.
+`validation-tools` identifies the shared check the command performs.
+For `result-owner: operation`, the executor passes the declared command
+unchanged, checks that inputs held stable, and records its exit result. It also
+writes one JUnit case per attempt under the Git common directory's
+`ceratops/results/test-history/` and prunes its reports older than one year
+when recording a new source attempt. History is separate from acceptance.
+
+The executor supplies the existing five result arguments to a test runner
+that owns its report. Commands without `check-results` retain their existing
+interface.
 
 Under `<git-common-dir>/ceratops/`, the runner writes actual outcomes to
 `results/repository-checks/<worktree-id>/check_results.json`, completing each

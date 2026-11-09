@@ -189,6 +189,10 @@ def test_source_only_mcp_keeps_existing_install_arguments(tmp_path, monkeypatch)
 @pytest.mark.parametrize("name", ["source_search_mcp", "ceratops-mcp-server-manager"])
 def test_mcp_identity_survives_contract_preparation(tmp_path, version, name):
     fixture = _typed_contract(tmp_path)
+    if version == 5:
+        from tests.repository_lifecycle.support import fixture_with_tools
+
+        fixture = fixture_with_tools(fixture)
     fixture["version"] = version
     server = fixture["deliverables"]["mcp-servers"].pop("insurance-claims-mcp-server")
     fixture["deliverables"]["mcp-servers"][name] = server

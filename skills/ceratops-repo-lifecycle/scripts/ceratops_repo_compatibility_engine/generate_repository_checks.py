@@ -531,9 +531,23 @@ def _validation_workflow(
     return runner, "\n".join(setup)
 
 
+def direct_source_check(check: dict[str, object]) -> tuple[str, list[str]]:
+    """Bind a shared source check to the repository's pinned tools."""
+    args = check["command"]
+    assert isinstance(args, list)
+    executable, *arguments = args
+    if executable == "{python}":
+        project = load_compatibility_contract()["runtime"]["project"]
+        return "uv", ["uv", "run", "--project", project, "--locked", "python", *arguments]
+    tool = executable.strip("{}")
+    return tool, [tool, *arguments]
+
+
 def validation_surfaces(
     repo_root: pathlib.Path,
     ci_action_revision: str | None = None,
+    *,
+    legacy_validator: bool = True,
 ) -> tuple[str | None, str | None, list[str], dict[str, str]]:
     """Create missing validators and reconcile the CI edge without losing custom steps."""
 
@@ -564,7 +578,7 @@ def validation_surfaces(
             planned_paths=planned_paths,
         )
     validator_text = None
-    if not validator.is_file():
+    if legacy_validator and not validator.is_file():
         template = template_path("validator").read_text(encoding="utf-8")
         marker = "__CHECK_DEFINITIONS__"
         if template.count(marker) != 1:
@@ -673,6 +687,6 @@ def validation_surfaces(
             )
     # Report only checks we generated; preserved validators own their internals.
     generated_checks = (
-        [str(check["id"]) for check in checks] if validator_text is not None else []
+        [str(check["id"]) for check in checks] if validator_text is not None or not legacy_validator else []
     )
     return validator_text, workflow_text, generated_checks, markdown_files

@@ -28,7 +28,11 @@ import yaml
 
 from .ci_workflow import workflow_errors
 from .compatibility_contract import load_compatibility_contract, template_path
-from .generate_repository_checks import repository_owned_paths
+from .generate_repository_checks import (
+    contract_checks,
+    direct_source_check,
+    repository_owned_paths,
+)
 from .generate_test_script import discover_python_tests
 from .python_tool_configuration import ruff_policy_errors
 from .repository_validation_contract import load_validation_contract
@@ -36,6 +40,7 @@ from .sdlc_contract_validation import (
     operation_category,
     operation_entries,
     read_contract,
+    tools_key,
 )
 from .validation_environment import (
     detected_python_skills,
@@ -71,12 +76,6 @@ def _repository_entrypoint(root: pathlib.Path, operation: Mapping[str, Any]) -> 
     return False
 
 
-def _operation_requirements(operation: Mapping[str, Any]) -> set[str]:
-    """Return required runtime capabilities across supported SDLC versions."""
-
-    return set(operation.get("requires", {}).get("capabilities", []))
-
-
 def _validation_coverage_errors(
     root: pathlib.Path,
     sdlc: Mapping[str, Any],
@@ -85,6 +84,7 @@ def _validation_coverage_errors(
     """Require detected repository types to declare checks with the required capabilities."""
 
     entries = operation_entries(sdlc)
+    key = tools_key(sdlc["version"])
     errors: list[str] = []
     owned_paths = repository_owned_paths(root)
     for requirement in validation_contract["coverage_requirements"]:
@@ -103,12 +103,14 @@ def _validation_coverage_errors(
             operation_category(location)
             == requirement["operation_category"]
             and required_capabilities.issubset(
-                operation.get("validation-capabilities", [])
+                operation.get(f"validation-{key}", [])
             )
-            and required_prerequisites.issubset(_operation_requirements(operation))
+            and required_prerequisites.issubset(operation.get("requires", {}).get(key, []))
             and (
                 not requirement["require_repository_entrypoint"]
                 or _repository_entrypoint(root, operation)
+                or (sdlc["version"] >= 5 and requirement["id"] == "shell"
+                    and operation.get("check-results", {}).get("result-owner") == "operation")
             )
             for location, operation in entries.items()
         )
@@ -121,6 +123,33 @@ def _validation_coverage_errors(
                 f"{capabilities} with prerequisites {prerequisites} and a "
                 "repository-owned entrypoint"
             )
+    return errors
+
+
+def _direct_source_errors(root: pathlib.Path, entries: Mapping[str, Mapping[str, Any]]) -> list[str]:
+    """Require applicable shared tools to have a recorded, executable check."""
+    groups = [entry for name, entry in entries.items() if operation_category(name) == "pre-build-checks"]
+    errors = []
+    for check in contract_checks(root):
+        name = check["id"]
+        _, command = direct_source_check(check)
+        # Required default commands or configured variants identified by their
+        # actual module, package script or script filename, not their group name.
+        identity = command[command.index("python") + 1:] if "python" in command else command
+        if identity[0] == "-m":
+            identity = identity[:2]
+        elif identity[0] in {"npm", "pnpm"}:
+            identity = [identity[0], *identity[-2:]]
+        else:
+            identity = identity[:1]
+        if not any(
+            name in group.get("validation-tools", [])
+            and group.get("check-results", {}).get("result-owner") == "operation"
+            and len(group.get("steps", [])) == 1
+            and all(token in group["steps"][0].get("run", []) for token in identity)
+            for group in groups
+        ):
+            errors.append(f"SDLC v5 requires a recorded source check for {name}")
     return errors
 
 
@@ -435,6 +464,8 @@ def validate_ceratops_compatibility(
             and bool(python_tests)
             and test_runner_selected
         )
+        if name == "validator" and sdlc and sdlc["version"] >= 5:
+            continue
         if (required or name in present) and (error := _regular_file_error(root, paths[name])):
             errors.append(error)
     if not _regular_file_error(root, paths["workflow"]):
@@ -465,7 +496,11 @@ def validate_ceratops_compatibility(
                 for step in entry.get("steps", [])
                 if "run" in step
             ]
-            if not any(command in commands for command in validator_commands):
+            if sdlc["version"] >= 5:
+                errors.extend(_direct_source_errors(root, entries))
+                if any(surfaces["validator"]["path"] in command for command in commands):
+                    errors.append("SDLC v5 source checks must declare their commands directly.")
+            elif not any(command in commands for command in validator_commands):
                 errors.append("SDLC must invoke the repository validator through its locked uv project")
             tests = [
                 entry
@@ -476,6 +511,7 @@ def validate_ceratops_compatibility(
                 errors.append("SDLC must declare repository tests or an explicit no-op")
             if python_tests and not any(
                 "run" in step and step["run"] not in validator_commands
+                and not entry.get("validation-tools")
                 for entry in tests for step in entry.get("steps", [])
             ):
                 errors.append("detected Python tests require an executable SDLC tests operation")

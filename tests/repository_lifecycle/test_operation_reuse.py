@@ -12,11 +12,17 @@ import runpy
 import shutil
 import subprocess
 import sys
+import xml.etree.ElementTree as ET
 from typing import Any
 
 import pytest
 
-from tests.repository_lifecycle.support import ROOT, run_git, write_sdlc_contract
+from tests.repository_lifecycle.support import (
+    ROOT,
+    fixture_with_tools,
+    run_git,
+    write_sdlc_contract,
+)
 
 runner = importlib.import_module("repository_operation")
 reuse = importlib.import_module("reuse_operation_checks")
@@ -79,8 +85,8 @@ print(json.dumps({'schema':'ceratops-build-result.v1','status':'passed',
 
     test = action("check", "bundle")
     test["uses-artifacts"] = [references["desktop"], references["widget"]]
-    data: dict[str, Any] = {"version": 5, "kind": "ceratops-sdlc", "repository": {"capabilities": {},
-            "actions": {"pre-build-checks": {"check-groups": {"source": _no_op()}},
+    data: dict[str, Any] = {"version": 5, "kind": "ceratops-sdlc", "repository": {"tools": {},
+            "actions": {"pre-build-checks": {"check-groups": {"source": fixture_with_tools(_no_op())}},
                         "post-build-checks": {"check-groups": {"joint": test}}}}, "deliverables": {}}
     for name, reference in references.items():
         kind = reference.split('.')[1]
@@ -91,18 +97,18 @@ print(json.dumps({'schema':'ceratops-build-result.v1','status':'passed',
         build["uses-artifacts"] = [references[dependency] for dependency in dependencies[name] if name != "desktop"]
         record: dict[str, Any] = {"root-dir": ".", "build-after": [references["bridge"]] if name == "desktop" else [],
                   "artifact": {"type": "archive", "output-directory": ".outputs", "filename-pattern": "*.bin"},
-                  "actions": {"pre-build-checks": {"check-groups": {'source': _no_op(), 'tests': _no_op()}}, "build": build}}
+                  "actions": {"pre-build-checks": {"check-groups": {'source': fixture_with_tools(_no_op()), 'tests': fixture_with_tools(_no_op())}}, "build": build}}
         if kind == "packages":
             record["project"] = "source.py"
         else:
-            record["actions"]["install"] = action("install", name) if name == "desktop" else _no_op()
+            record["actions"]["install"] = action("install", name) if name == "desktop" else fixture_with_tools(_no_op())
         if kind == "mcp-servers":
-            record["actions"]["install"] = {"requires": {"capabilities": []},
+            record["actions"]["install"] = {"requires": {"tools": []},
                                                 "steps": [{"run": [sys.executable, "-c", "pass"]}]}
         if kind == "skills":
             for category, name_of_action in (("source", "source-validate"), ("install", "deploy")):
                 owner = record["actions"]["pre-build-checks"]["check-groups"] if category == "source" else record["actions"]
-                owner[category] = {"requires": {"capabilities": []}, "steps": [{"handoff": {
+                owner[category] = {"requires": {"tools": []}, "steps": [{"handoff": {
                     "lifecycle": "ceratops-skill-lifecycle", "action": name_of_action, "inputs": {"skill": name}}}]}
         if kind in {"apps", "mcp-servers"}:
             record["manifest"] = "source.py"
@@ -147,14 +153,16 @@ def test_release_builds_expand_all_kinds_and_pass_exact_outputs(tmp_path, monkey
         # target in its commands, keeping the same declared build graph.
         path = tmp_path / runner.DEFAULT_CONTRACT
         document = json.loads(path.read_text())
-        from ceratops_repo_compatibility_engine.sdlc_contract_validation import operation_entries
+        from ceratops_repo_compatibility_engine.sdlc_contract_validation import (
+            operation_entries,
+        )
         for operation in operation_entries(document).values():
             assert isinstance(operation, dict)
             operation.pop("parameters", None)
             for step in operation.get("steps", []):
                 if "run" in step:
                     step["run"] = ["one" if arg == "{target}" else arg for arg in step["run"]]
-        path.write_text(json.dumps(document))
+        path.write_text(json.dumps(fixture_with_tools(document) if document["version"] == 5 else document))
         assert run_git(tmp_path, "add", ".").returncode == 0
         assert run_git(tmp_path, "commit", "-m", "bound target").returncode == 0
         from github_pr_workflow import ship_repository
@@ -277,6 +285,7 @@ def _phased_repository(root, *, source_failure=None, fail_build_check=False):
     _fixture(root)
     contract = root / runner.DEFAULT_CONTRACT
     document = json.loads(contract.read_text())
+    document = fixture_with_tools(document)
     document["version"] = 5
     reference = "deliverables.packages.sample"
     source = '''import argparse, hashlib, json, os, pathlib, sys
@@ -309,7 +318,7 @@ elif a.check_group == 'unit-tests':
     with (root / ".gitignore").open("a") as output:
         output.write("order.log\nolder-installed.bin\n.build/\n")
     def check(name, artifacts=()):
-        return {"requires": {"capabilities": []}, "uses-artifacts": list(artifacts),
+        return {"requires": {"tools": []}, "uses-artifacts": list(artifacts),
                 "steps": [{"run": [sys.executable, "scripts/phases.py", "--check-group", name,
                                    "--artifacts", "{artifacts}"]}]}
 
@@ -318,7 +327,7 @@ elif a.check_group == 'unit-tests':
         "pre-build-checks": {"check-groups": {name: check(name) for name in ("scan-a", "scan-b")}},
     }
     document["deliverables"]["packages"]["sample"]["actions"]["build"] = {
-        "requires": {"capabilities": []}, "result-schema": "ceratops-build-result.v1",
+        "requires": {"tools": []}, "result-schema": "ceratops-build-result.v1",
         "steps": [{"run": [sys.executable, "scripts/phases.py", "--build"]}],
         "checks": {"compiler-check": {"uses-artifacts": []}},
     }
@@ -347,11 +356,11 @@ def test_direct_pre_build_check_builds_only_the_supplier_and_receives_its_files(
     ).replace("; with", "\nwith")
     checks = packages["consumer"]["actions"]["pre-build-checks"]["check-groups"]
     checks["test-supplier"] = {
-        "requires": {"capabilities": []}, "uses-artifacts": [supplier],
+        "requires": {"tools": []}, "uses-artifacts": [supplier],
         "steps": [{"run": [sys.executable, "-c", native]}],
     }
     checks["unrequested"] = {
-        "requires": {"capabilities": []},
+        "requires": {"tools": []},
         "steps": [{"run": [sys.executable, "-c", "raise AssertionError('unrequested check')"]}],
     }
     contract.write_text(json.dumps(document))
@@ -412,7 +421,10 @@ def test_check_phases_public_cli_reports_first_source_failure(tmp_path, source_f
 @pytest.mark.parametrize("damage", [None, "missing", "changed"])
 @pytest.mark.parametrize("public_cli", [False, True])
 def test_check_phases_pass_every_stored_artifact_and_block_partial_output(tmp_path, format, damage, public_cli):
-    from tests.repository_lifecycle.test_sdlc_handoffs import _build_receipt_fixture, _new_receipt_fixtures
+    from tests.repository_lifecycle.test_sdlc_handoffs import (
+        _build_receipt_fixture,
+        _new_receipt_fixtures,
+    )
 
     requests = _phased_repository(tmp_path)
     fixture = tmp_path / "receipt-fixture"
@@ -477,10 +489,12 @@ def test_build_action_accepts_supported_receipt_formats(tmp_path, contract_versi
     _fixture(tmp_path)
     path = tmp_path / runner.DEFAULT_CONTRACT
     document = json.loads(path.read_text())
+    if contract_version == 5:
+        document = fixture_with_tools(document)
     document["version"] = contract_version
     schema = f"ceratops-build-result.v{receipt_version}"
     document["deliverables"]["packages"]["sample"]["actions"]["build"]["result-schema"] = schema
-    path.write_text(json.dumps(document))
+    path.write_text(json.dumps(fixture_with_tools(document) if document["version"] == 5 else document))
     prepared = runner.prepare_operations(tmp_path, [
         runner.OperationRequest("deliverables.packages.sample.actions.build"),
     ])
@@ -512,7 +526,7 @@ def test_check_phases_orders_selected_build_dependencies_and_joint_tests(tmp_pat
         "paths = json.loads(a.artifacts)",
         "assert pathlib.Path(json.loads(a.artifacts)['deliverables.packages.dependency'][0]).read_bytes() == b'current build'\n    paths = json.loads(a.artifacts)")
     (tmp_path / "scripts/phases.py").write_text(program)
-    path.write_text(json.dumps(data))
+    path.write_text(json.dumps(fixture_with_tools(data) if data["version"] == 5 else data))
     assert run_git(tmp_path, "add", ".").returncode == 0
     assert run_git(tmp_path, "commit", "-m", "dependent builds").returncode == 0
     requests.append(runner.OperationRequest("deliverables.packages.dependency.actions.build"))
@@ -549,7 +563,7 @@ def test_check_phase_conflicts_name_the_group(tmp_path, problem):
         group["uses-artifacts"] = ["deliverables.packages.missing"]
     else:
         group["phase"] = "during-build"
-    path.write_text(json.dumps(document))
+    path.write_text(json.dumps(fixture_with_tools(document) if document["version"] == 5 else document))
     with pytest.raises(runner.OperationError, match="scan-a"):
         runner.prepare_operations(tmp_path, requests)
     assert not (tmp_path / "order.log").exists()
@@ -564,7 +578,7 @@ def test_phase_group_runs_only_its_native_command_without_added_flags(tmp_path):
         "scan": {"requires": {"capabilities": []}, "steps": [{"run": [sys.executable, "-c", native]}]},
         "other": {"requires": {"capabilities": []}, "steps": [{"run": [sys.executable, "-c", "raise AssertionError('wrong group')"]}]},
     }}}
-    path.write_text(json.dumps(document))
+    path.write_text(json.dumps(fixture_with_tools(document) if document["version"] == 5 else document))
     request = runner.OperationRequest("repository.actions.pre-build-checks.check-groups.scan")
     for _ in range(2):
         prepared = runner.prepare_operations(tmp_path, [request, request])
@@ -572,6 +586,42 @@ def test_phase_group_runs_only_its_native_command_without_added_flags(tmp_path):
         result = runner.execute_prepared_operations(prepared)
         assert result["status"] == "completed", result
         assert len(result["results"]) == 1
+
+
+@pytest.mark.parametrize("exit_code", [0, 4, 130])
+def test_native_source_check_records_junit_and_reuses_only_passes(tmp_path, exit_code):
+    _fixture(tmp_path)
+    path = tmp_path / runner.DEFAULT_CONTRACT
+    data = fixture_with_tools(json.loads(path.read_text()))
+    data["version"] = 5
+    (tmp_path / "source.txt").write_text(str(exit_code))
+    source = """import argparse, pathlib
+argparse.ArgumentParser().parse_args()
+p = pathlib.Path('native-attempts.txt')
+p.write_text((p.read_text() if p.exists() else '') + 'x')
+raise SystemExit(int(pathlib.Path('source.txt').read_text()))
+"""
+    data["repository"]["actions"]["pre-build-checks"]["check-groups"] = {
+        "scan": {"requires": {"tools": []}, "steps": [{"run": [sys.executable, "-c", source]}],
+                 "check-results": {"result-owner": "operation", "product-inputs": ["source.txt"],
+                                   "check-inputs": ["sdlc/sdlc.yml"]}},
+    }
+    path.write_text(json.dumps(fixture_with_tools(data) if data["version"] == 5 else data))
+    request = runner.OperationRequest("repository.actions.pre-build-checks.check-groups.scan")
+    for attempt in range(2):
+        result = runner.execute_prepared_operation(runner.prepare_operations(tmp_path, [request])[0])
+        assert result["status"] == ("completed" if exit_code == 0 else "validation_failed"), result
+        assert result["check_result"]["result_id"]
+        if not exit_code and attempt:
+            assert result["check_decision"] == "reused"
+    calls = 2 if exit_code else 1
+    assert (tmp_path / "native-attempts.txt").read_text() == "x" * calls
+    reports = list((tmp_path / ".git/ceratops/results/test-history").glob("source-*.xml"))
+    assert len(reports) == calls
+    for report in reports:
+        case = ET.parse(report).find("./testsuite/testcase")
+        assert case.attrib["name"] == request.operation
+        assert [item.tag for item in case] == (["error"] if exit_code == 130 else ["failure"] if exit_code else [])
 
 
 def test_moving_a_check_keeps_its_original_success_and_result_id(tmp_path):
@@ -600,7 +650,7 @@ def test_direct_after_build_checks_build_and_receive_their_implicit_own_files(tm
     after = document["repository"]["actions"].pop("post-build-checks")
     after["check-groups"]["unit-tests"].pop("uses-artifacts")
     document["deliverables"]["packages"]["sample"]["actions"]["post-build-checks"] = after
-    path.write_text(json.dumps(document))
+    path.write_text(json.dumps(fixture_with_tools(document) if document["version"] == 5 else document))
     assert run_git(tmp_path, "add", ".").returncode == 0
     assert run_git(tmp_path, "commit", "-m", "own output is implicit").returncode == 0
     name = "deliverables.packages.sample.actions.post-build-checks.check-groups.unit-tests"
@@ -627,7 +677,7 @@ def test_changed_own_artifact_prevents_reusing_an_after_build_pass(tmp_path):
     document = json.loads(path.read_text())
     check = document["repository"]["actions"]["pre-build-checks"]["check-groups"]["tests"]
     document["deliverables"]["packages"]["sample"]["actions"]["post-build-checks"] = {"check-groups": {"output": check}}
-    path.write_text(json.dumps(document))
+    path.write_text(json.dumps(fixture_with_tools(document) if document["version"] == 5 else document))
     artifact = tmp_path / "wheel.bin"
     artifact.write_bytes(b"first build")
     name = "deliverables.packages.sample.actions.post-build-checks.check-groups.output"
@@ -689,7 +739,7 @@ def test_phase_declarations_reject_wrong_routes_and_artifact_requirements(tmp_pa
         group.pop("uses-artifacts")
     else:
         document["deliverables"]["packages"]["sample"]["actions"]["build"] = _no_op()
-    path.write_text(json.dumps(document))
+    path.write_text(json.dumps(fixture_with_tools(document) if document["version"] == 5 else document))
     with pytest.raises(runner.OperationError):
         runner.prepare_operations(tmp_path, [runner.OperationRequest("repository.actions.pre-build-checks")])
     assert not (tmp_path / "order.log").exists()
@@ -967,7 +1017,7 @@ def test_sdlc_refuses_unsafe_or_unconsumed_check_declarations(tmp_path, declarat
     path = tmp_path / "sdlc/sdlc.yml"
     data = json.loads(path.read_text())
     data["repository"]["actions"]["pre-build-checks"]["check-groups"]["tests"]["check-results"] = declaration
-    path.write_text(json.dumps(data))
+    path.write_text(json.dumps(fixture_with_tools(data) if data["version"] == 5 else data))
     with pytest.raises(runner.OperationError):
         runner.prepare_operations(tmp_path, [runner.OperationRequest("repository.actions.pre-build-checks.check-groups.tests")])
 
@@ -1164,6 +1214,7 @@ def test_sdlc_v5_build_reports_its_clean_final_commit(tmp_path, capsys):
     _committing_build(tmp_path)
     contract = tmp_path / "sdlc/sdlc.yml"
     data = json.loads(contract.read_text())
+    data = fixture_with_tools(data)
     data["version"] = 5
     contract.write_text(json.dumps(data))
     assert run_git(tmp_path, "add", ".").returncode == 0
@@ -1264,6 +1315,8 @@ def test_commit_declaration_blocks_unsafe_flow_before_effects(tmp_path, version,
     _committing_build(tmp_path)
     path = tmp_path / "sdlc/sdlc.yml"
     data = json.loads(path.read_text())
+    if version == 5:
+        data = fixture_with_tools(data)
     data["version"] = version
     actions = data["deliverables"]["packages"]["sample"]["actions"]
     if change == "non-build":
@@ -1272,7 +1325,7 @@ def test_commit_declaration_blocks_unsafe_flow_before_effects(tmp_path, version,
         actions["build"]["steps"] = [{"handoff": {"lifecycle": "ceratops-skill-lifecycle", "action": "deploy", "inputs": {"skill": "sample"}}}]
     elif change == "bad-field":
         actions["build"]["result-commit-field"] = "nested.commit"
-    path.write_text(json.dumps(data))
+    path.write_text(json.dumps(fixture_with_tools(data) if data["version"] == 5 else data))
     requests = [runner.OperationRequest(BUILD_OPERATION)]
     if change == "later-operation":
         requests.append(runner.OperationRequest("repository.actions.pre-build-checks.check-groups.tests"))
@@ -1294,13 +1347,13 @@ def test_explicit_phase_and_group_cli_requests_do_not_guess_group_kind(tmp_path,
     phase = "repository.actions.pre-build-checks"
     groups = {}
     for name in ("lint-and-unit", "another-check"):
-        groups[name] = {"requires": {"capabilities": []}, "steps": [{"run": [
+        groups[name] = {"requires": {"tools": []}, "steps": [{"run": [
             sys.executable, "-c", "from pathlib import Path; "
             f"p=Path('{name}'); p.write_text(p.read_text()+'x' if p.exists() else 'x')",
         ]}]}
     path = write_sdlc_contract(tmp_path)
     path.write_text(json.dumps({"version": 5, "kind": "ceratops-sdlc",
-                               "repository": {"capabilities": {}, "actions": {
+                               "repository": {"tools": {}, "actions": {
                                    "pre-build-checks": {"check-groups": groups}}}}))
     one = phase + ".check-groups.lint-and-unit"
     for _ in range(2):

@@ -144,17 +144,16 @@ assigned to skills whose primary output is evidence-backed findings, while
 `bounded-model-analysis` is assigned to skills that invoke bounded
 analysis-only child models.
 The `skills/` tree is authoritative skill source for this repository.
-`sdlc/sdlc.yml` declares repository setup and validation, plus capabilities
-of each deliverable. Lifecycle actions decide when those capabilities run.
-Executable capabilities in SDLC declare version requirements only through
+`sdlc/sdlc.yml` declares repository setup, checks, and deliverable actions
+and the tools they require. SDLC v5 calls these prerequisites `tools`.
+Executable tool requirements in SDLC declare versions only through
 `version-from`: `file` names repository-relative native metadata, and `key`
 names its dotted field when the file is a structured manifest. A single-value
 file needs no key. Here Python references `scripts/pyproject.toml` at
 `project.requires-python`; Node references `scripts/.nvmrc`, whose `lts/*`
 keeps the existing LTS requirement. An npm requirement would reference the
-owning `package.json` field `engines.node`. Inline capability `version` and
-`channel` are rejected for every tool; omit `version-from` for an unversioned
-capability. These references report requirements without downloading, installing
+owning `package.json` field `engines.node`. Inline `version` and `channel` are rejected for every tool. Omit
+`version-from` for an unversioned tool. These references report requirements without downloading, installing
 or choosing runtimes. Artifact, package and release versions are separate data.
 The repository-compatibility templates under
 `skills/ceratops-repo-lifecycle/references/templates/` are reusable skeletons
@@ -2313,11 +2312,18 @@ executed in 12.44 seconds. After an unrelated test-file edit, all 33 original
 passes were reused: 0.17 seconds collection, 0.002 seconds execution. These are
 local observations, not a whole-suite speed guarantee.
 
-SDLC `check-results` declarations connect one repository runner command to
-durable unchanged-input reuse. The operation executor supplies the existing
-five result arguments; the declared runner writes its actual outcome before
-returning. Later promotion/build calls consume eligible original passes while
-new artifact checks still run. Corrupt evidence blocks the operation.
+SDLC v5 declares executable prerequisites under `tools` and
+`requires.tools`. Declare each applicable source check in its own
+`pre-build-checks` group. With `check-results.result-owner: operation`,
+Ceratops runs that command as written and saves its outcome and JUnit case.
+A failing source check blocks the dependent build and tests. Select one check
+by its group address, or select the pre-build action to run all its groups.
+
+A test runner that reports individual cases keeps the existing five-argument
+result interface. Later promotion and build calls reuse eligible passes with
+matching inputs. Corrupt evidence blocks the operation. Actual Ceratops-owned
+source attempts remain in `<git-common-dir>/ceratops/results/test-history/`
+for up to a year, pruned when Ceratops records another source attempt.
 
 Results live in each worktree's `results/repository-checks/<worktree-id>/check_results.json`
 under `<git-common-dir>/ceratops/`. Source cleanup scopes do not retain check

@@ -57,6 +57,11 @@ class SdlcContractError(RuntimeError):
     """Raised when an SDLC contract or its schema is invalid."""
 
 
+def tools_key(version: int) -> str:
+    """Use the spelling defined by the selected schema version."""
+    return "tools" if version >= 5 else "capabilities"
+
+
 @lru_cache(maxsize=1)
 def sdlc_schema_paths() -> dict[int, pathlib.Path]:
     """Read supported SDLC versions from this installed skill's schema files.
@@ -226,7 +231,8 @@ def operation_prerequisites(
     owner = location.split(".actions.", 1)[0]
     record = _deliverable_records(contract).get(owner, {})
     phase = match.group("repository") or match.group("action")
-    capabilities = contract.get("repository", {}).get("capabilities", {})
+    key = tools_key(contract["version"])
+    tools = contract.get("repository", {}).get(key, {})
     build_after = list(record.get("build-after", []))
     builder = list(operation.get("uses-artifacts", [])) if phase == "build" else []
     during = {
@@ -248,8 +254,8 @@ def operation_prerequisites(
                                       for refs in groups.values() for ref in refs)]
     return {
         "build-after": build_after,
-        "capabilities": {
-            name: capabilities[name] for name in operation.get("requires", {}).get("capabilities", [])
+        key: {
+            name: tools[name] for name in operation.get("requires", {}).get(key, [])
         },
         "build-uses-artifacts": builder,
         "pre-build-checks-uses-artifacts": before,
@@ -335,15 +341,17 @@ def _find_sdlc_declaration_errors(
 
     errors: list[str] = []
     repository = value["repository"]
-    capabilities = repository["capabilities"]
-    for name, capability in capabilities.items():
+    key = tools_key(value["version"])
+    tools = repository[key]
+    tool_label = "tool" if key == "tools" else "capability"
+    for name, capability in tools.items():
         version_source = capability.get("version-from")
         if version_source and (
             not _relative_path(version_source["file"])
             or pathlib.PurePosixPath(version_source["file"]).name in {"", "."}
         ):
             errors.append(
-                f"capability {name} version-from.file must be repository-relative"
+                f"{tool_label} {name} version-from.file must be repository-relative"
             )
     deliverables = value.get("deliverables", {})
     records = _deliverable_records(value)
@@ -352,9 +360,9 @@ def _find_sdlc_declaration_errors(
         assert match is not None
         action_name = match.group("repository") or match.group("action")
         owner = location.split(".actions.", 1)[0]
-        for capability in action["requires"]["capabilities"]:
-            if capability not in capabilities:
-                errors.append(f"unknown capability {capability} at {location}.requires.capabilities")
+        for tool in action["requires"][key]:
+            if tool not in tools:
+                errors.append(f"unknown {tool_label} {tool} at {location}.requires.{key}")
         steps = action.get("steps", [])
         handoff_positions = [position for position, step in enumerate(steps, 1) if "handoff" in step]
         if handoff_positions and handoff_positions != [len(steps)]:
@@ -386,10 +394,10 @@ def _find_sdlc_declaration_errors(
         if check_results is not None:
             if action_name not in CHECK_ACTIONS or len(steps) != 1 or "run" not in steps[0]:
                 errors.append(f"check-results requires one check runner command at {location}")
-            for key in ("product-inputs", "check-inputs", "dependencies"):
-                for input_path in check_results.get(key, []):
+            for field in ("product-inputs", "check-inputs", "dependencies"):
+                for input_path in check_results.get(field, []):
                     if not _relative_path(input_path):
-                        errors.append(f"check-results {key} must be repository-relative at {location}")
+                        errors.append(f"check-results {field} must be repository-relative at {location}")
         if action.get("result-commit-field") is not None:
             if action_name != "build" or not steps or "run" not in steps[-1] or handoff_positions:
                 errors.append(f"result-commit-field requires a build ending in a run step at {location}")
