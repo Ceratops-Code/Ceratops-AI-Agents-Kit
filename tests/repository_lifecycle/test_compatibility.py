@@ -400,7 +400,6 @@ def test_compatibility_materializer_supplies_target_identity_and_assignments(
     )
     assert skillless["deliverables"]["skills"] == {"alpha-tool": custom}
     assert (repo / "scripts" / "deploy-skills.py").is_file()
-    assert not (repo / "scripts" / "validate-repository.py").exists()
     assert (repo / "scripts" / "run-actionlint.py").is_file()
     assert (repo / ".github" / "workflows" / "validate.yml").is_file()
     issue_template = repo / ".github" / "ISSUE_TEMPLATE" / "bug_report.yml"
@@ -958,7 +957,6 @@ def test_compatibility_materializer_rolls_back_every_target_write_on_blocker(
     assert output["phase"] == "compatibility_validation"
     assert output["rollback"] == "completed"
     assert {path: path.read_bytes() for path in changed_paths} == original
-    assert not (repo / "scripts" / "validate-repository.py").exists()
     assert not (repo / ".github" / "workflows" / "validate.yml").exists()
     assert not (repo / ".github" / "ISSUE_TEMPLATE" / "bug_report.yml").exists()
     assert not (repo / ".github" / "pull_request_template.md").exists()

@@ -730,7 +730,6 @@ def test_compatibility_materializer_supports_repositories_without_skills(
         "checks": expected,
         "workflow": "applied",
     }
-    assert not (repo / "scripts" / "validate-repository.py").exists()
     assert (repo / "scripts" / "run-actionlint.py").is_file()
     assert (repo / ".github" / "workflows" / "validate.yml").is_file()
 
@@ -949,10 +948,8 @@ def test_compatibility_materializer_supports_repositories_without_skills(
 
     unittest_repo = empty_repository("unittest-compatible")
     (unittest_repo / "scripts").mkdir()
-    (unittest_repo / "scripts" / "validate_repository.py").write_text(
-        "# --temp-root --build-dir\n"
-        "def repository_checks():\n"
-        "    raise AssertionError('Undeclared helper must not run')\n",
+    (unittest_repo / "scripts" / "run-unlisted-check.py").write_text(
+        "raise AssertionError('Undeclared helper must not run')\n",
         encoding="utf-8",
         newline="\n",
     )
