@@ -178,6 +178,12 @@ skill installer; review packets select the installed source checker. Their
 supporting modules come from the selected installed bundle. First-install
 bootstrap remains a repository-owned workflow because no installation exists yet.
 
+For SDLC v5 repositories with a matching npm or pnpm lockfile, compatibility
+adds locked Node dependency setup to the default bootstrap. The launcher uses
+the locked Python project to find the package manager on PATH, including Windows
+command shims, and returns its exit status. The SDLC loader rejects direct npm
+and pnpm bootstrap commands. Repository-owned setup can supply its own launcher.
+
 SDLC executable capabilities have one optional version requirement source:
 `version-from.file`, plus `version-from.key` for a field in a structured native
 manifest. JSON, TOML, YAML, XML and INI references require a nonempty dotted key;

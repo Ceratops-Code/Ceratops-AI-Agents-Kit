@@ -364,6 +364,14 @@ def _find_sdlc_declaration_errors(
             if tool not in tools:
                 errors.append(f"unknown {tool_label} {tool} at {location}.requires.{key}")
         steps = action.get("steps", [])
+        if key == "tools" and action_name == "bootstrap":
+            for position, step in enumerate(steps, 1):
+                command = step.get("run", [])
+                if command and command[0].casefold() in {"npm", "npm.cmd", "pnpm", "pnpm.cmd"}:
+                    errors.append(
+                        f"{location}.steps[{position}] must resolve {command[0]} on PATH "
+                        "before running it. Use the portable Node bootstrap launcher."
+                    )
         handoff_positions = [position for position, step in enumerate(steps, 1) if "handoff" in step]
         if handoff_positions and handoff_positions != [len(steps)]:
             errors.append(f"handoff must be the single final step at {location}")

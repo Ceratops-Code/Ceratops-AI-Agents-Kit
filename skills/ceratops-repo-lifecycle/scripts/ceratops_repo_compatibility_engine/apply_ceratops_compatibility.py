@@ -199,6 +199,7 @@ def prepare_sdlc_configuration(
     skill_names: list[str],
     apply_contract: bool,
     generated_checks: list[dict[str, object]] | None = None,
+    planned_markdown: bool = False,
 ) -> dict[str, object]:
     """Preserve target capabilities and apply the supported typed lifecycle.
 
@@ -266,7 +267,18 @@ def prepare_sdlc_configuration(
                                   "tools": [tool]},
             }
         checks = {**{name: group for name, group in checks.items() if group.get("validation-tools")}, **checks}
-    actions.setdefault("bootstrap", {**reusable["repository"]["actions"]["bootstrap"], "requires": {key: ["uv"]}})
+    bootstrap = {**reusable["repository"]["actions"]["bootstrap"], "requires": {key: ["uv"]}}
+    actions.setdefault("bootstrap", bootstrap)
+    if key == "tools" and actions["bootstrap"] == bootstrap:
+        node_setup = repository_checks.node_package_bootstrap(repo_root, planned_markdown=planned_markdown)
+        if node_setup is not None:
+            node_manager, command = node_setup
+            for dependency_tool in ("node", node_manager):
+                capabilities.setdefault(dependency_tool, {"executable": dependency_tool})
+            actions["bootstrap"] = {
+                "requires": {key: ["uv", "node", node_manager]},
+                "steps": [*bootstrap["steps"], {"run": command}],
+            }
     existing_test = checks.get("tests")
     owned_test = reusable["repository"]["actions"]["pre-build-checks"]["check-groups"]["tests"]
     owned_test = {**owned_test, "requires": {key: []}}
@@ -658,7 +670,7 @@ def plan_ceratops_compatibility(
     )
     sdlc_contract = prepare_sdlc_configuration(
         repo_root, skill_names=sorted(skill_names), apply_contract=apply_sdlc_contract,
-        generated_checks=source_checks,
+        generated_checks=source_checks, planned_markdown=bool(markdown_files),
     )
     compatibility_contract = load_compatibility_contract()
     python_tests = discover_python_tests(

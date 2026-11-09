@@ -7,6 +7,7 @@
   "source_doc_scopes": [
     "repository_validation"
   ],
+  "node_bootstrap_launcher": "import shutil, subprocess, sys; tool = shutil.which(sys.argv[1]); sys.exit(subprocess.call([tool, *sys.argv[2:]]) if tool else f'{sys.argv[1]} is not on PATH')",
   "ruff_policy": {
     "target-version": "py314",
     "select": [

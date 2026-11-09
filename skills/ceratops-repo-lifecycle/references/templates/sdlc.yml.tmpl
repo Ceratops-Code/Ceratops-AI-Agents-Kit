@@ -17,6 +17,8 @@ repository:
         tools: [uv]
       steps:
         - run: [uv, sync, --project, scripts, --locked]
+        # Compatibility adds the portable Node bootstrap from the repository
+        # validation contract when the repository owns a package lockfile.
     pre-build-checks:
       check-groups:
         tests:
