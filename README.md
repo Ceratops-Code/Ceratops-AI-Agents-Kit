@@ -2327,7 +2327,7 @@ A test runner that reports individual cases keeps the existing five-argument
 result interface. Later promotion and build calls reuse eligible passes with
 matching inputs. Corrupt evidence blocks the operation. Actual Ceratops-owned
 source attempts remain in `<git-common-dir>/ceratops/results/test-history/`
-for up to a year, pruned when Ceratops records another source attempt.
+for 30 days, pruned when Ceratops records another source attempt.
 
 Results live in each worktree's `results/repository-checks/<worktree-id>/check_results.json`
 under `<git-common-dir>/ceratops/`. Source cleanup scopes do not retain check

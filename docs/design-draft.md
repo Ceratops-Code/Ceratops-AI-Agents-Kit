@@ -2535,7 +2535,7 @@ checks such as Ruff, mypy and the configured package and workflow linters.
 For `result-owner: operation`, the executor passes the declared command
 unchanged, checks that inputs held stable, and records its exit result. It also
 writes one JUnit case per attempt under the Git common directory's
-`ceratops/results/test-history/` and prunes its reports older than one year
+`ceratops/results/test-history/` and prunes its reports older than 30 days
 when recording a new source attempt. History is separate from acceptance.
 
 The executor supplies the existing five result arguments to a test runner
