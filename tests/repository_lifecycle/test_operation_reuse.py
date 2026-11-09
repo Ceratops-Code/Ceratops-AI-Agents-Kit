@@ -12,6 +12,7 @@ import runpy
 import shutil
 import subprocess
 import sys
+import time
 import xml.etree.ElementTree as ET
 from typing import Any
 
@@ -608,6 +609,16 @@ raise SystemExit(int(pathlib.Path('source.txt').read_text()))
     }
     path.write_text(json.dumps(fixture_with_tools(data) if data["version"] == 5 else data))
     request = runner.OperationRequest("repository.actions.pre-build-checks.check-groups.scan")
+    history = tmp_path / ".git/ceratops/results/test-history"
+    history.mkdir(parents=True)
+    expired = history / "source-00000000-0000-0000-0000-000000000001.xml"
+    recent = history / "source-00000000-0000-0000-0000-000000000002.xml"
+    other_owner = history / "native-00000000-0000-0000-0000-000000000003.xml"
+    now = time.time()
+    for report, age in ((expired, 31), (recent, 29), (other_owner, 31)):
+        report.write_text("<testsuites/>")
+        modified = now - age * 86400
+        os.utime(report, (modified, modified))
     for attempt in range(2):
         result = runner.execute_prepared_operation(runner.prepare_operations(tmp_path, [request])[0])
         assert result["status"] == ("completed" if exit_code == 0 else "validation_failed"), result
@@ -628,7 +639,9 @@ raise SystemExit(int(pathlib.Path('source.txt').read_text()))
         assert accepted["check_summary"] == result["check_summary"]
     calls = 2 if exit_code else 1
     assert (tmp_path / "native-attempts.txt").read_text() == "x" * calls
-    reports = list((tmp_path / ".git/ceratops/results/test-history").glob("source-*.xml"))
+    assert not expired.exists()
+    assert recent.is_file() and other_owner.is_file()
+    reports = [report for report in history.glob("source-*.xml") if report != recent]
     assert len(reports) == calls
     for report in reports:
         case = ET.parse(report).find("./testsuite/testcase")

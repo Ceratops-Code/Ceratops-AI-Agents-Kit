@@ -223,7 +223,7 @@ class CheckPlan:
     def write_tool_junit(self, check: str, started: datetime.datetime, duration: float, status: str, code: int) -> None:
         history = self.store.common / "ceratops" / "results" / "test-history"
         history.mkdir(parents=True, exist_ok=True)
-        cutoff = time.time() - 365 * 86400
+        cutoff = time.time() - 30 * 86400
         for previous in history.glob("source-*.xml"):
             suffix = previous.stem.removeprefix("source-")
             if (len(suffix) == 36 and all(char in "0123456789abcdef-" for char in suffix)
