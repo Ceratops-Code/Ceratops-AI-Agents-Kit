@@ -222,7 +222,7 @@ without repository deduplication.
 | `skills/sections/scripts/store_check_results.py` | Shares the current-results reader/writer between repository and skill lifecycle. Each worktree has one file; finished checks replace only their own entries. Build summaries in Git remain independent. |
 | `scripts/testing/pytest-diagnostics.py` | Extracts bounded failure summaries using exact pytest and unittest-subtest identities and source-file evidence, including parameter names containing summary separators; reports terminal import errors, nested exception-group messages and assertion differences over source context, excluding captured output. Native stderr failures before collection use the explicit `<pytest startup>` identity. Ambiguous or missing test tracebacks use only that test's summary reason. Full diagnostic files remain owned by the runner. |
 | `scripts/run-actionlint.py` | Provisions the pinned, checksum-verified actionlint release inside the scripts environment and validates every GitHub Actions workflow. |
-| `scripts/validate-repository.py` | Local validation coordinator; checks the running Python against `scripts/pyproject.toml`, runs workflow, repository lint and type checks, and captures first-failure evidence. Tests run separately through `scripts/testing/run-tests.py`. |
+| `sdlc/sdlc.yml` | Declares the native source checks. Ceratops records each command result. Tests run separately through `scripts/testing/run-tests.py`. |
 | `skills/ceratops-repo-lifecycle/references/templates/deploy-skills.py.tmpl` | Authoritative standalone installer copied into compatible skill repositories as `scripts/deploy-skills.py`; invoke it through uv using the scripts project. |
 | `skills/ceratops-repo-lifecycle/references/templates/run-tests.py.tmpl` | Standard Python runner with a caller-selected immutable test-result interface, exact successful-result reuse and direct final writes. Its compatibility probe uses its own command identity and result directory, without executing repository tests or inheriting another operation's check inputs. |
 | `skills/ceratops-repo-lifecycle/references/contracts/repository-validation-contract.json` | Schema-validated repository checks used by compatibility generation and included in repository contract review and validator discovery. |
@@ -2000,14 +2000,17 @@ working-tree diff before retrying; no crash-recovery journal is maintained.
 
 ## Validate
 
-Install the declared Python and Node development dependencies, optionally
-select a failure-evidence path, then run the same repository validator and
-explicit test runner used by CI:
+Install the declared Python and Node development dependencies and run the
+source check commands and test runner used by CI.
 
 ```powershell
 npm --prefix scripts ci
-$validationEvidence = Join-Path $env:TEMP "repository-validation.log"
-uv run --project scripts --locked python scripts/validate-repository.py --evidence-file $validationEvidence
+npm --prefix scripts run lint:markdown
+uv run --project scripts --locked python scripts/run-actionlint.py
+uv run --project scripts --locked python -m yamllint --config-file scripts/.yamllint.yml . skills/ceratops-repo-lifecycle/references/templates/sdlc.yml.tmpl
+uv run --project scripts --locked python -m ruff check --config scripts/pyproject.toml scripts mcp-servers skills/ceratops-repo-lifecycle/references/templates/deploy-skills.py.tmpl
+uv run --project scripts --locked python -m mypy --config-file scripts/pyproject.toml --platform linux
+uv run --project scripts --locked python -m mypy --config-file scripts/pyproject.toml --platform win32
 uv run --project scripts --locked python scripts/testing/run-tests.py --all
 ```
 
@@ -2024,7 +2027,7 @@ Without the flag, evidence defaults to
 Failure evidence remains available for diagnosis until the next successful run,
 which removes the selected evidence file and prunes the dedicated default
 directory when it is empty.
-The validator runs Markdown and YAML lint, Ruff, and mypy for Linux and Win32;
+The source checks run Markdown and YAML lint, Ruff, and mypy for Linux and Win32.
 it never runs tests.
 SDLC separately runs `scripts/testing/run-tests.py --auto`: exact PR base/head
 impact selection in GitHub, build-summary reuse locally, and all-group scope on

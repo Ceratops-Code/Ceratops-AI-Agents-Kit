@@ -143,21 +143,20 @@ def test_live_sdlc_selects_validation_and_tests_for_every_install() -> None:
     )
     for install in installs:
         locations = runner.validation_operations(ROOT, [install])
-        assert "repository.actions.pre-build-checks.check-groups.source" in locations
+        assert "repository.actions.pre-build-checks.check-groups.ruff" in locations
         assert "repository.actions.pre-build-checks.check-groups.tests" in locations
         assert install.replace(".install", ".pre-build-checks.check-groups.source") in locations
-    requests = [
-        runner.OperationRequest("repository.actions.pre-build-checks.check-groups.source"),
-        runner.OperationRequest("repository.actions.pre-build-checks.check-groups.tests"),
-    ]
+    requests = [runner.OperationRequest("repository.actions.pre-build-checks")]
     operations = runner.prepare_operations(ROOT, requests, context="ci")
-    assert operations[0].steps[0].argv == (
-        "uv",
-        "run", "--project", "scripts",
-        "--locked", "python",
-        "scripts/validate-repository.py",
-    )
-    assert operations[1].steps[0].argv == (
+    assert [operation.check_group for operation in operations] == [
+        "npm-markdown-lint", "actionlint", "yaml-lint", "ruff",
+        "mypy-linux", "mypy-windows", "tests",
+    ]
+    for operation in operations[:-1]:
+        assert operation.check_results is not None
+        assert operation.check_results["result-owner"] == "operation"
+        assert len(operation.steps) == 1
+    assert operations[-1].steps[0].argv == (
         "uv",
         "run", "--project", "scripts",
         "--locked", "python",
@@ -211,7 +210,7 @@ def test_sdlc_template_is_a_schema_valid_empty_skeleton(tmp_path: pathlib.Path) 
     assert "no-op" in groups["tests"]
     assert "deliverables" not in document
     live = contracts.load_contract(ROOT / "sdlc" / "sdlc.yml")
-    assert live["version"] == 4
+    assert live["version"] == 5
     entries = contracts.operation_entries(live)
     expected = {
         "deliverables.skills.ceratops-repo-lifecycle.actions.pre-build-checks.check-groups.source": (
@@ -241,9 +240,10 @@ def test_sdlc_template_is_a_schema_valid_empty_skeleton(tmp_path: pathlib.Path) 
         "--head",
         "{head}",
     ]
-    assert entries["repository.actions.pre-build-checks.check-groups.source"]["steps"] == [
-        {"run": ["uv", "run", "--project", "scripts", "--locked", "python", "scripts/validate-repository.py"]},
-    ]
+    for name, platform in (("mypy-linux", "linux"), ("mypy-windows", "win32")):
+        group = entries[f"repository.actions.pre-build-checks.check-groups.{name}"]
+        assert group["validation-tools"] == ["mypy"]
+        assert group["steps"][0]["run"][-2:] == ["--platform", platform]
     assert entries["repository.actions.pre-build-checks.check-groups.tests"]["steps"] == [
         {
             "run": [
@@ -256,7 +256,7 @@ def test_sdlc_template_is_a_schema_valid_empty_skeleton(tmp_path: pathlib.Path) 
         },
     ]
     validation = runner.validation_operations(ROOT)
-    assert validation[0] == "repository.actions.pre-build-checks.check-groups.source"
+    assert validation[0] == "repository.actions.pre-build-checks.check-groups.npm-markdown-lint"
     assert "deliverables.skills.ceratops-repo-lifecycle.actions.pre-build-checks.check-groups.source" in validation
     assert "deliverables.hooks.codex-hooks.actions.pre-build-checks.check-groups.source" in validation
     assert "deliverables.mcp-servers.ceratops-mcp-server-manager.actions.pre-build-checks.check-groups.source" in validation

@@ -586,7 +586,7 @@ before writing a new workflow that calls it.
 the builder's file references in `build-uses-artifacts`. The
 `pre-build-checks-uses-artifacts`, `during-build-checks-uses-artifacts` and
 `post-build-checks-uses-artifacts` maps retain full group locations. Tools stay
-under `capabilities` with their original `version-from` declarations. The
+under `repository.tools` with their original `version-from` declarations. The
 runner prepares required deliverables recursively and passes only the files
 declared by each command. A post-build check also gets its own deliverable's
 output. A pre-build check can use another deliverable's output. Direct checks
