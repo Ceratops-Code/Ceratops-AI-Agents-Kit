@@ -589,7 +589,7 @@ def test_phase_group_runs_only_its_native_command_without_added_flags(tmp_path):
 
 
 @pytest.mark.parametrize("exit_code", [0, 4, 130])
-def test_native_source_check_records_junit_and_reuses_only_passes(tmp_path, exit_code):
+def test_native_source_check_records_junit_and_reuses_only_passes(tmp_path, exit_code, monkeypatch):
     _fixture(tmp_path)
     path = tmp_path / runner.DEFAULT_CONTRACT
     data = fixture_with_tools(json.loads(path.read_text()))
@@ -614,6 +614,18 @@ raise SystemExit(int(pathlib.Path('source.txt').read_text()))
         assert result["check_result"]["result_id"]
         if not exit_code and attempt:
             assert result["check_decision"] == "reused"
+    if exit_code == 0:
+        result_file = reuse.CheckResultStore(tmp_path).current.path
+        result_file.unlink()
+        def retained_builds(*_args, **_kwargs):
+            return [{"summary": result["check_summary"], "tag": "accepted-source",
+                     "commit": result["commit"], "receiptPath": "accepted/build.json"}]
+
+        monkeypatch.setattr(reuse, "select_build_check_summaries", retained_builds)
+        monkeypatch.setattr(runner.sdlc_results, "select_build_check_summaries", retained_builds)
+        accepted = runner.execute_prepared_operation(runner.prepare_operations(tmp_path, [request])[0])
+        assert accepted["check_decision"] == "reused"
+        assert accepted["check_summary"] == result["check_summary"]
     calls = 2 if exit_code else 1
     assert (tmp_path / "native-attempts.txt").read_text() == "x" * calls
     reports = list((tmp_path / ".git/ceratops/results/test-history").glob("source-*.xml"))

@@ -210,7 +210,10 @@ class CheckPlan:
             "check_summary": {"schema": "ceratops-check-summary.v1", "inputGroups": {input_group: self.context},
                               "checkGroups": {}, "checks": [{"kind": "repository-check", "id": check,
                               "status": status, "required": True, "result_id": self.result_id,
-                              "check_version": version, "inputGroup": input_group}]},
+                              "check_version": version, "inputGroup": input_group,
+                              "candidate_id": work, "qualificationLevel": self.context["qualificationLevel"],
+                              "inputs_digest": self.context["fingerprint"],
+                              "completed_ns": int(finished.timestamp() * 1_000_000_000)}]},
         }
         target = {key: value for key, value in self.context["scope"].items()
                   if key not in {"worktree", "inputRules", "artifacts"}}
