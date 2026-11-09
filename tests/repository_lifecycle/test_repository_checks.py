@@ -149,19 +149,19 @@ def test_android_coverage_requires_declared_gradle_checks_in_any_group(
 
     sdlc_path = repo / "sdlc/sdlc.yml"
     sdlc = yaml.safe_load(sdlc_path.read_text(encoding="utf-8"))
-    sdlc["repository"]["capabilities"].update(
+    sdlc["repository"]["tools"].update(
         {
             "jdk": {"executable": "java"},
             "android-sdk": {"executable": "sdkmanager"},
         }
     )
     android_operation = {
-        "requires": {"capabilities": ["jdk", "android-sdk"]},
-        "validation-capabilities": ["android-lint", "android-build"],
+        "requires": {"tools": ["jdk", "android-sdk"]},
+        "validation-tools": ["android-lint", "android-build"],
         "steps": [{"run": ["python", "scripts/android-validation.py"]}],
     }
-    original_test = sdlc["repository"]["actions"]["pre-build-checks"]["check-groups"]["tests"]
-    sdlc["repository"]["actions"]["pre-build-checks"]["check-groups"]["tests"] = android_operation
+    groups = sdlc["repository"]["actions"]["pre-build-checks"]["check-groups"]
+    groups["android-tests"] = android_operation
     sdlc_path.write_text(
         yaml.safe_dump(sdlc, sort_keys=False), encoding="utf-8", newline="\n"
     )
@@ -170,17 +170,13 @@ def test_android_coverage_requires_declared_gradle_checks_in_any_group(
     named_tests = compatibility.validate_ceratops_compatibility(repo)
     assert named_tests["valid"] is True, named_tests["errors"]
 
-    sdlc["repository"]["actions"]["pre-build-checks"]["check-groups"]["tests"] = original_test
-    validate = sdlc["repository"]["actions"]["pre-build-checks"]["check-groups"]["source"]
-    validate["requires"]["capabilities"].extend(["jdk", "android-sdk"])
-    validate["validation-capabilities"] = ["android-lint", "android-build"]
-    validate["steps"].append({"run": ["python", "scripts/android-validation.py"]})
+    validate = groups["android-source"] = groups.pop("android-tests")
     sdlc_path.write_text(
         yaml.safe_dump(sdlc, sort_keys=False), encoding="utf-8", newline="\n"
     )
     assert compatibility.validate_ceratops_compatibility(repo)["valid"] is True
 
-    validate["validation-capabilities"] = ["android-build"]
+    validate["validation-tools"] = ["android-build"]
     sdlc_path.write_text(
         yaml.safe_dump(sdlc, sort_keys=False), encoding="utf-8", newline="\n"
     )
@@ -248,25 +244,32 @@ def test_ecosystem_coverage_requires_declared_repository_checks(
     entrypoint.write_text("# Repository-owned check entrypoint.\n", encoding="utf-8")
     sdlc_path = repo / "sdlc/sdlc.yml"
     sdlc = yaml.safe_load(sdlc_path.read_text(encoding="utf-8"))
-    sdlc["repository"]["capabilities"].update(
+    sdlc["repository"]["tools"].update(
         {
             prerequisite: {"executable": prerequisite}
             for prerequisite in required_prerequisites
         }
     )
-    check_operation = sdlc["repository"]["actions"]["pre-build-checks"]["check-groups"]["source"]
-    check_operation["requires"]["capabilities"].extend(required_prerequisites)
-    check_operation["validation-capabilities"] = required_capabilities
-    check_operation["steps"].append(
-        {"run": ["python", f"scripts/{coverage_id}-check.py"]}
-    )
+    groups = sdlc["repository"]["actions"]["pre-build-checks"]["check-groups"]
+    check_operation = {
+        "requires": {"tools": required_prerequisites},
+        "validation-tools": required_capabilities,
+        "steps": [{"run": ["python", f"scripts/{coverage_id}-check.py"]}],
+    }
+    if coverage_id == "shell":
+        check_operation["steps"] = [{"run": ["shellcheck", "--severity=error", "--", marker_path]}]
+        check_operation["check-results"] = {
+            "result-owner": "operation", "product-inputs": ["**/*.sh"],
+            "check-inputs": ["sdlc/sdlc.yml"],
+        }
+    groups["ecosystem-source"] = check_operation
     sdlc_path.write_text(
         yaml.safe_dump(sdlc, sort_keys=False), encoding="utf-8", newline="\n"
     )
     assert compatibility.validate_ceratops_compatibility(repo)["valid"] is True
 
     missing_capability = required_capabilities[-1]
-    check_operation["validation-capabilities"] = (
+    check_operation["validation-tools"] = (
         required_capabilities[:-1] or ["unrelated-check"]
     )
     sdlc_path.write_text(
@@ -725,7 +728,6 @@ def test_compatibility_materializer_supports_repositories_without_skills(
     assert not (repo / "scripts" / "deploy-skills.py").exists()
     assert output["repository_validation"] == {
         "checks": expected,
-        "validator": "not_configured",
         "workflow": "applied",
     }
     assert not (repo / "scripts" / "validate-repository.py").exists()
@@ -840,7 +842,7 @@ def test_compatibility_materializer_supports_repositories_without_skills(
     assert "corepack prepare pnpm@10.33.4 --activate" in pnpm_workflow
     assert "pnpm --dir scripts install --frozen-lockfile" in pnpm_workflow
     assert "python -m pip install" not in pnpm_workflow
-    pnpm_steps = yaml.safe_load(pnpm_workflow)["jobs"]["validate-repository"]["steps"]
+    pnpm_steps = yaml.safe_load(pnpm_workflow)["jobs"]["repository-checks"]["steps"]
     assert [
         step["run"].splitlines()
         for step in pnpm_steps
@@ -889,13 +891,13 @@ def test_compatibility_materializer_supports_repositories_without_skills(
     assert 'python-version-file: "pyproject.toml"' not in uv_workflow
     assert 'python-version: "3.12"' not in uv_workflow
     assert "uv sync --extra dev --frozen" not in uv_workflow
-    uv_steps = yaml.safe_load(uv_workflow)["jobs"]["validate-repository"]["steps"]
+    uv_steps = yaml.safe_load(uv_workflow)["jobs"]["repository-checks"]["steps"]
     assert [
         step["run"].splitlines()
         for step in uv_steps
         if step.get("name") == "Install Python validation dependencies"
     ] == []
-    action_step = next(step for step in yaml.safe_load(uv_workflow)["jobs"]["validate-repository"]["steps"]
+    action_step = next(step for step in yaml.safe_load(uv_workflow)["jobs"]["repository-checks"]["steps"]
                        if step.get("uses", "").startswith("Ceratops-Code/"))
     assert action_step["uses"].endswith("@" + CI_ACTION_REVISION)
     assert set(action_step["with"]) == {"repo-root", "evidence-file", "operations"}
@@ -913,16 +915,6 @@ def test_compatibility_materializer_supports_repositories_without_skills(
                 "when": [{"kind": "path-any", "value": ["tools/quality.ps1"]}],
                 "command": ["{pwsh}", "-NoProfile", "-File", "tools/quality.ps1"],
                 "cwd": ".",
-            },
-            {
-                "id": "custom-validator",
-                "when": [{"kind": "path-any", "value": ["scripts/check_project.py"]}],
-                "command": [
-                    "{python}", "scripts/check_project.py", "--temp-root", "{temp}/custom",
-                    "--evidence-file", "{temp}/custom-validation.log",
-                ],
-                "cwd": ".",
-                "exclusive": True,
             },
         ]
     )
@@ -1011,30 +1003,38 @@ def test_compatibility_materializer_supports_repositories_without_skills(
     docs_workflow = (
         docs_repo / ".github" / "workflows" / "validate.yml"
     ).read_text(encoding="utf-8")
-    docs_steps = yaml.safe_load(docs_workflow)["jobs"]["validate-repository"]["steps"]
+    docs_steps = yaml.safe_load(docs_workflow)["jobs"]["repository-checks"]["steps"]
     assert all(
         step.get("name") != "Install Python validation dependencies"
         for step in docs_steps
     )
 
-    authoritative_repo = empty_repository("authoritative-compatible")
+    from tests.repository_lifecycle.test_sdlc_handoffs import _repository
+
+    authoritative_primary = empty_repository("authoritative-primary")
+    (authoritative_primary / ".git").unlink()
+    _repository(authoritative_primary)
+    authoritative_repo = tmp_path / "authoritative-compatible"
+    subprocess.run(["git", "-C", str(authoritative_primary), "worktree", "add", "-b",
+                    "fixture", str(authoritative_repo)], check=True, capture_output=True)
     _write_current_sdlc(authoritative_repo)
     (authoritative_repo / "scripts").mkdir()
     (authoritative_repo / "scripts" / "check_project.py").write_text(
-        "import argparse\n"
-        "import pathlib\n"
-        "parser = argparse.ArgumentParser()\n"
-        "parser.add_argument('--temp-root')\n"
-        "parser.add_argument('--evidence-file', type=pathlib.Path, required=True)\n"
-        "args = parser.parse_args()\n"
-        "if not pathlib.Path(args.temp_root).is_dir():\n"
-        "    args.evidence_file.write_text('temp root missing\\n', encoding='utf-8')\n"
-        "    raise SystemExit(2)\n"
-        "args.evidence_file.write_text('inner diagnostic\\n', encoding='utf-8')\n"
+        "print('inner diagnostic')\n"
         "raise SystemExit(1)\n",
         encoding="utf-8",
         newline="\n",
     )
+    authoritative_sdlc = authoritative_repo / "sdlc/sdlc.yml"
+    document = yaml.safe_load(authoritative_sdlc.read_text())
+    groups = document["repository"]["actions"]["pre-build-checks"]["check-groups"]
+    groups["custom"] = {
+        "requires": {"tools": ["uv"]}, "validation-tools": ["project-check"],
+        "steps": [{"run": ["uv", "run", "--project", "scripts", "--locked", "python", "scripts/check_project.py"]}],
+        "check-results": {"result-owner": "operation", "product-inputs": ["scripts/check_project.py"],
+                          "check-inputs": ["sdlc/sdlc.yml"]},
+    }
+    authoritative_sdlc.write_text(yaml.safe_dump(document, sort_keys=False))
     _write_tooling_settings(authoritative_repo, '[tool.mypy]\npython_version = "3.12"\n')
     authoritative_result = run_compatibility_engine(
         engine_scripts,
@@ -1049,32 +1049,16 @@ def test_compatibility_materializer_supports_repositories_without_skills(
         (authoritative_repo / "scripts/pyproject.toml").read_text(encoding="utf-8")
     )
     assert "ruff" in authoritative_tools["project"]["dependencies"]
-    assert json.loads(authoritative_result.stdout)["repository_validation"]["checks"] == [
-        "custom-validator"
-    ]
-    assert not (authoritative_repo / "package.json").exists()
-    assert not (authoritative_repo / ".markdownlint.json").exists()
-    authoritative_validator = (
-        authoritative_repo / "scripts" / "validate-repository.py"
-    ).read_text(encoding="utf-8")
-    assert max(len(line) for line in authoritative_validator.splitlines()) <= 100
-    authoritative_evidence = tmp_path / "authoritative-validation.log"
-    authoritative_validation = subprocess.run(
-        [
-            sys.executable,
-            str(authoritative_repo / "scripts" / "validate-repository.py"),
-            "--evidence-file",
-            str(authoritative_evidence),
-        ],
-        cwd=authoritative_repo,
-        capture_output=True,
-        text=True,
-        check=False,
+    declared = yaml.safe_load(authoritative_sdlc.read_text())
+    assert declared["repository"]["actions"]["pre-build-checks"]["check-groups"]["custom"] == groups["custom"]
+    assert (authoritative_repo / "scripts/.markdownlint.json").is_file()
+    authoritative_evidence = tmp_path / "authoritative-result.json"
+    authoritative_validation = run_ci_action(
+        authoritative_repo, authoritative_evidence, tmp_path / "authoritative-action",
+        operations="repository.actions.pre-build-checks.check-groups.custom",
     )
     assert authoritative_validation.returncode == 1
-    retained_evidence = authoritative_evidence.read_text(encoding="utf-8")
-    assert "child_evidence: custom-validation.log" in retained_evidence
-    assert "inner diagnostic" in retained_evidence
+    assert "inner diagnostic" in authoritative_evidence.read_text(encoding="utf-8")
 
     # Every supported configuration identifies repository-owned Python tests;
     # no test framework belongs to the generated repository validator.
@@ -1239,20 +1223,24 @@ def test_generated_scripts_and_skill_owned_ci_keep_environments_and_tests_separa
     cached_actionlint = pathlib.Path(sys.executable).parent / actionlint_name
     if cached_actionlint.is_file():
         shutil.copy2(cached_actionlint, pathlib.Path(actual["python"]).parent / actionlint_name)
-    prefix = ["uv", "run", "--locked"]
-    validation = subprocess.run([*prefix, "scripts/validate-repository.py"], cwd=repo, capture_output=True, text=True, check=False)
-    assert validation.returncode == 0, validation.stdout + validation.stderr + (pathlib.Path(json.loads(validation.stdout)["evidence_file"]).read_text() if validation.stdout.startswith("{") else "")
+    evidence = tmp_path / "sdlc-failure.json"
+    bundle = tmp_path / "ci-action"
+    location = "repository.actions.pre-build-checks.check-groups."
+
+    def source_check(name: str) -> subprocess.CompletedProcess[str]:
+        return run_ci_action(repo, evidence, bundle, operations=location + name)
+
+    validation = source_check("source-ruff")
+    assert validation.returncode == 0, validation.stdout + validation.stderr
     # The generated settings must be consumed, not merely written to TOML.
     check_probe = repo / "scripts/check_probe.py"
     check_probe.write_text("import math\n")
-    lint_failure = subprocess.run([*prefix, "scripts/validate-repository.py"], cwd=repo, capture_output=True, text=True, check=False)
-    assert json.loads(lint_failure.stdout)["check"] == "ruff"
+    assert source_check("source-ruff").returncode == 1
+    assert json.loads(evidence.read_text())["operation"] == location + "source-ruff"
     check_probe.write_text('def value() -> int:\n    return "wrong-type"\n')
-    type_failure = subprocess.run([*prefix, "scripts/validate-repository.py"], cwd=repo, capture_output=True, text=True, check=False)
-    assert json.loads(type_failure.stdout)["check"] == "mypy"
+    assert source_check("source-mypy").returncode == 1
+    assert json.loads(evidence.read_text())["operation"] == location + "source-mypy"
     check_probe.write_text("def value() -> int:\n    return 1\n")
-    evidence = tmp_path / "sdlc-failure.json"
-    bundle = tmp_path / "ci-action"
     failed = run_ci_action(repo, evidence, bundle)
     assert failed.returncode == 1, failed.stdout + failed.stderr
     result = json.loads(evidence.read_text())
@@ -1265,23 +1253,25 @@ def test_generated_scripts_and_skill_owned_ci_keep_environments_and_tests_separa
     )
     assert facts == {
         "applicable": True,
-        "validator_present": True,
+        "sdlc_present": True,
         "workflow_present": True,
         "valid": True,
         "errors": [],
     }
     assert json.loads(evidence.read_text())["status"] == "validation_failed"
-    validation_only = run_ci_action(repo, evidence, bundle, operations="repository.actions.pre-build-checks.check-groups.source")
+    validation_only = source_check("source-ruff")
     assert validation_only.returncode == 0, validation_only.stdout + validation_only.stderr
     assert not evidence.exists()
     assert json.loads(validation_only.stdout)["completed_operations"] == [
-        "repository.actions.pre-build-checks.check-groups.source"
+        location + "source-ruff"
     ]
     probe.write_text("def test_probe():\n    assert True\n")
     passed = run_ci_action(repo, evidence, bundle)
     assert passed.returncode == 0, passed.stdout + passed.stderr
     assert not evidence.exists()
-    assert json.loads(passed.stdout)["completed_operations"] == ["repository.actions.pre-build-checks.check-groups.source", "repository.actions.pre-build-checks.check-groups.tests"]
+    assert json.loads(passed.stdout)["completed_operations"] == [
+        location + name for name in ("source-npm-markdown-lint", "source-ruff", "source-mypy", "source-actionlint", "tests")
+    ]
     lock = (repo / "scripts/uv.lock").read_bytes()
     reapplied = run_compatibility_engine(REPOSITORY_LIFECYCLE_SCRIPTS, "apply", "--target-repo-root", str(repo))
     assert reapplied.returncode == 0, reapplied.stdout
@@ -1293,7 +1283,7 @@ def test_generated_scripts_and_skill_owned_ci_keep_environments_and_tests_separa
     reapplied = run_compatibility_engine(REPOSITORY_LIFECYCLE_SCRIPTS, "apply", "--target-repo-root", str(repo))
     assert reapplied.returncode == 0, reapplied.stdout
     assert project.read_bytes() == configured
-    configured_check = subprocess.run([*prefix, "scripts/validate-repository.py"], cwd=repo, capture_output=True, text=True, check=False)
+    configured_check = source_check("source-ruff")
     assert configured_check.returncode == 0, configured_check.stdout + configured_check.stderr
     # Adding an absent table must preserve the other tool's configuration.
     without_mypy = project.read_text().split("\n[tool.mypy]", 1)[0].rstrip() + "\n"
@@ -1350,8 +1340,7 @@ def test_configuration_policy_reports_paths_and_blocks_setup_without_writes(
     materializer = importlib.import_module("ceratops_repo_compatibility_engine.apply_ceratops_compatibility")
     contract = contracts.load_compatibility_contract()
     # A declared surface makes this an applicable structural-check target.
-    (repo / "scripts").mkdir(exist_ok=True)
-    (repo / "scripts/validate-repository.py").write_text("print('OK')\n")
+    _write_current_sdlc(repo)
     before = {p.relative_to(repo): p.read_bytes() for p in repo.rglob("*") if p.is_file()}
     for _ in range(2):
         errors = environment.repository_configuration_errors(repo, contract)

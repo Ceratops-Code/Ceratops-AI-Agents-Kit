@@ -194,9 +194,9 @@ def test_repository_changes_select_only_their_actual_check_owners(test_runner_mo
     (REPOSITORY_SKILL + "scripts/github_contract_engine/collectors/local_repository.py",
      "tests/repository_lifecycle/test_operations.py",
      "tests/repository_lifecycle/test_sdlc_handoffs.py"),
-    (".github/workflows/codeql.yml", "tests/test_infrastructure/test_repository_validator.py",
+    (".github/workflows/codeql.yml", "tests/test_infrastructure/test_repository_entrypoints.py",
      "tests/credit_analysis/test_batch.py"),
-    ("scripts/uv.lock", "tests/test_infrastructure/test_repository_validator.py",
+    ("scripts/uv.lock", "tests/test_infrastructure/test_repository_entrypoints.py",
      "tests/credit_analysis/test_batch.py"),
     ("scripts/pyproject.toml", "tests/skill_lifecycle/test_source_validation.py",
      "tests/repository_lifecycle/test_artifact_retention.py"),
@@ -545,7 +545,6 @@ def test_worktree_manifest_validation_includes_untracked_paths(
             ".github/workflows/**",
             "scripts/pyproject.toml",
             "scripts/testing/run-tests.py",
-            "scripts/validate-repository.py",
             "tests/__init__.py",
             "tests/support/**",
             "tests/test-impact.json",
@@ -653,7 +652,7 @@ def test_missing_node_is_reported_by_the_execution_collection(
     """Missing node diagnostics come from pytest's one execution collection."""
     report = tmp_path / "missing-node.json"
     code = test_runner_module.execute(
-        ["tests/test_infrastructure/test_repository_validator.py::missing_node",
+        ["tests/test_infrastructure/test_repository_entrypoints.py::missing_node",
          "--diagnostic-output", str(report)],
         repo_root=ROOT,
     )

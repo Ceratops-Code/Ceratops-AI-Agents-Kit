@@ -110,7 +110,7 @@ def load_compatibility_contract(bundle_root: pathlib.Path | None = None) -> dict
         raise RuntimeError("skill Python runtime paths must match the shared source layout")
     destinations = {
         "validation_project": "scripts/pyproject.toml",
-        "validator": "scripts/validate-repository.py", "python_test_runner": "scripts/run-tests.py",
+        "python_test_runner": "scripts/run-tests.py",
         "actionlint_runner": "scripts/run-actionlint.py",
     }
     if any(contract["surfaces"][key]["path"] != value for key, value in destinations.items()):

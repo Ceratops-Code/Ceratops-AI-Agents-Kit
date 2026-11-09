@@ -1272,24 +1272,21 @@ def _repository_validation_facts(
         return {"applicable": False, "valid": None, "errors": []}
 
     root = pathlib.Path(local["root"]).resolve()
-    validator = root / "scripts" / "validate-repository.py"
     workflow = root / ".github" / "workflows" / "validate.yml"
-    validator_present = validator.is_file() and not validator.is_symlink()
+    contract_path = root / "sdlc/sdlc.yml"
+    sdlc_present = contract_path.is_file() and not contract_path.is_symlink()
     workflow_present = workflow.is_file() and not workflow.is_symlink()
     errors: list[str] = []
-    if not validator_present:
-        errors.append("scripts/validate-repository.py must be a regular file")
     if not workflow_present:
         errors.append(".github/workflows/validate.yml must be a regular file")
-    contract_path = root / "sdlc/sdlc.yml"
-    if contract_path.is_symlink():
+    if not sdlc_present:
         errors.append("SDLC must be a regular repository file")
-    elif contract_path.exists():
+    else:
         _, contract_errors = read_contract(contract_path, repo_root=root)
         errors.extend(contract_errors)
     return {
         "applicable": True,
-        "validator_present": validator_present,
+        "sdlc_present": sdlc_present,
         "workflow_present": workflow_present,
         "valid": not errors,
         "errors": errors,

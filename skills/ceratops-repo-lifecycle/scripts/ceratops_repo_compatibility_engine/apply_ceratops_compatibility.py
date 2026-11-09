@@ -40,7 +40,6 @@ from .generate_test_script import (
 from .sdlc_contract_validation import (
     latest_sdlc_version,
     load_contract,
-    tools_key,
     validation_errors,
 )
 from .validate_ceratops_compatibility import (
@@ -114,7 +113,6 @@ class CompatibilityPlan:
     skill_updates: dict[pathlib.Path, tuple[str, str]]
     canonical_sources: dict[str, pathlib.Path]
     sdlc_contract: dict[str, object] | None
-    validator_text: str | None
     workflow_text: str | None
     markdown_files: dict[str, str]
     validation_checks: list[str]
@@ -200,10 +198,10 @@ def prepare_sdlc_configuration(
     apply_contract: bool,
     generated_checks: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
-    """Preserve target capabilities and apply the supported typed lifecycle.
+    """Preserve target tools and apply the current typed lifecycle.
 
     The template supplies new configurations using the newest installed schema.
-    Existing supported declarations keep their version and data. The compatibility
+    Existing current declarations keep their data. The compatibility
     contract owns named skill action routing. Existing actions retain their
     definitions, including target-native version-from references. New executable
     capabilities remain unversioned unless the target declares a requirement;
@@ -221,51 +219,28 @@ def prepare_sdlc_configuration(
         load_contract(target, repo_root=repo_root) if target.is_file()
         else {**reusable, "version": latest_sdlc_version()}
     )
-    # The versioned loader is the supported-format authority. Preserve its
-    # accepted version so an ordinary update cannot downgrade or rewrite its data.
+    if contract["version"] != latest_sdlc_version():
+        raise RuntimeError("Update the repository's SDLC to the current version before applying compatibility.")
     candidate = dict(contract)
     repository = dict(candidate.get("repository", {}))
-    key = tools_key(int(candidate["version"]))
+    key = "tools"
     capabilities = dict(repository.get(key, {}))
     capabilities.setdefault("uv", {"executable": "uv"})
     actions = dict(repository.get("actions", {}))
     checks = dict(actions.get("pre-build-checks", {}).get("check-groups", {}))
-    if key == "capabilities":
-        existing_validation = checks.get("source")
-        template_validation = {"requires": {key: ["uv"]}, "steps": [{"run": [
-            "uv", "run", "--locked", surface_path("validator").as_posix(),
-        ]}]}
-        owned_validation = dict(template_validation)
-        if any(item["id"] == "shellcheck" for item in repository_checks.contract_checks(repo_root)):
-            capabilities.setdefault("shellcheck", {"executable": "shellcheck"})
-            owned_validation["requires"] = {key: ["uv", "shellcheck"]}
-            owned_validation[f"validation-{key}"] = ["shellcheck"]
-        if existing_validation is None or existing_validation == template_validation or isinstance(existing_validation, dict) and "no-op" in existing_validation:
-            checks["source"] = owned_validation
-        elif existing_validation != owned_validation:
-            # A custom wrapper may carry arguments or setup that cannot safely be
-            # replaced or duplicated. Its owner must integrate that behavior.
-            raise RuntimeError(
-                "custom repository validation operation requires explicit integration with the uv validator command"
-            )
-        checks = {"source": checks["source"], **checks}
-    else:
-        for check in generated_checks if generated_checks is not None else repository_checks.contract_checks(repo_root):
-            name = str(check["id"])
-            if any(name in group.get("validation-tools", []) for group in checks.values()):
-                continue
-            tool, command = repository_checks.direct_source_check(check)
-            capabilities.setdefault(tool, {"executable": tool})
-            checks[f"source-{name}"] = {
-                "requires": {key: [tool]},
-                "validation-tools": [name],
-                "steps": [{"run": command}],
-                # Default tooling can discover new files anywhere in the checkout.
-                "check-results": {"result-owner": "operation", "product-inputs": ["**"],
-                                  "check-inputs": ["sdlc/sdlc.yml", "scripts/pyproject.toml", "scripts/uv.lock"],
-                                  "tools": [tool]},
-            }
-        checks = {**{name: group for name, group in checks.items() if group.get("validation-tools")}, **checks}
+    for check in generated_checks if generated_checks is not None else repository_checks.contract_checks(repo_root):
+        name = str(check["id"])
+        if any(name in group.get("validation-tools", []) for group in checks.values()):
+            continue
+        tool, command = repository_checks.direct_source_check(check)
+        capabilities.setdefault(tool, {"executable": tool})
+        checks[f"source-{name}"] = {
+            "requires": {key: [tool]},
+            "validation-tools": [name],
+            "steps": [{"run": command}],
+            "check-results": repository_checks.source_check_results(check, tool),
+        }
+    checks = {**{name: group for name, group in checks.items() if group.get("validation-tools")}, **checks}
     actions.setdefault("bootstrap", {**reusable["repository"]["actions"]["bootstrap"], "requires": {key: ["uv"]}})
     existing_test = checks.get("tests")
     owned_test = reusable["repository"]["actions"]["pre-build-checks"]["check-groups"]["tests"]
@@ -646,16 +621,8 @@ def plan_ceratops_compatibility(
         action_errors = action_assignment_errors(repo_root, manifest)
         if action_errors:
             raise RuntimeError("; ".join(action_errors))
-    target_sdlc = repo_root / surface_path("sdlc")
-    version = load_contract(target_sdlc, repo_root=repo_root)["version"] if target_sdlc.is_file() else latest_sdlc_version()
-    validator_text, workflow_text, validation_checks, markdown_files = (
-        repository_checks.validation_surfaces(repo_root, ci_action_revision, legacy_validator=version < 5)
-    )
-    planned_paths = {surface_path("workflow").as_posix()} if workflow_text is not None else set()
-    source_checks = repository_checks.contract_checks(
-        repo_root, package=json.loads(markdown_files["scripts/package.json"]) if markdown_files else None,
-        planned_paths=planned_paths,
-    )
+    workflow_text, source_checks, markdown_files = repository_checks.validation_surfaces(repo_root, ci_action_revision)
+    validation_checks = [str(check["id"]) for check in source_checks]
     sdlc_contract = prepare_sdlc_configuration(
         repo_root, skill_names=sorted(skill_names), apply_contract=apply_sdlc_contract,
         generated_checks=source_checks,
@@ -695,7 +662,6 @@ def plan_ceratops_compatibility(
         skill_updates=skill_updates,
         canonical_sources=canonical_sources,
         sdlc_contract=sdlc_contract,
-        validator_text=validator_text,
         workflow_text=workflow_text,
         markdown_files=markdown_files,
         validation_checks=validation_checks,
@@ -760,14 +726,6 @@ def apply_compatibility_plan(
             sdlc_text,
             encoding="utf-8",
             newline=newline,
-        )
-    if plan.validator_text is not None:
-        validator_path = repo_root / surface_path("validator")
-        validator_path.parent.mkdir(parents=True, exist_ok=True)
-        validator_path.write_text(
-            plan.validator_text,
-            encoding="utf-8",
-            newline="\n",
         )
     if plan.workflow_text is not None:
         workflow_path = repo_root / surface_path("workflow")
@@ -838,8 +796,6 @@ def main(argv: list[str] | None = None) -> int:
             mutable_paths.append(repo_root / surface_path("skill_bootstrap"))
         if plan.sdlc_contract is not None:
             mutable_paths.append(repo_root / surface_path("sdlc"))
-        if plan.validator_text is not None:
-            mutable_paths.append(repo_root / surface_path("validator"))
         if plan.workflow_text is not None:
             mutable_paths.append(repo_root / surface_path("workflow"))
         snapshots = [snapshot_file(path) for path in dict.fromkeys(mutable_paths)]
@@ -858,7 +814,6 @@ def main(argv: list[str] | None = None) -> int:
             and (
                 path.name not in {"scripts"}
                 or bool(plan.skills)
-                or plan.validator_text is not None
             )
             and (path.name not in {"sdlc"} or plan.sdlc_contract is not None)
             and (
@@ -975,20 +930,12 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 "repository_validation": {
                     "checks": plan.validation_checks,
-                    "validator": (
-                        "applied" if plan.validator_text is not None
-                        else "preserved" if (repo_root / surface_path("validator")).is_file()
-                        else "not_configured"
-                    ),
                     "workflow": (
                         "applied" if plan.workflow_text is not None else "preserved"
                     ),
                 },
                 "python_tests": plan.python_tests,
                 "validator_environment": runtime["environment"],
-                "custom_validation_review_required": (
-                    plan.validator_text is None and (repo_root / surface_path("validator")).is_file()
-                ),
                 "markers_removed": plan.updated_markers,
                 "rollback": "not_needed",
                 "runtime_source_id": source_id,

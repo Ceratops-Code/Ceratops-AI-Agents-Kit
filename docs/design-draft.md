@@ -62,7 +62,7 @@ surfaces while preserving repository-owned choices. Template changes belong
 with their generators and consumers so other repositories receive the same
 behavior.
 
-The recorded template set includes `validate-repository.py.tmpl`,
+The template set includes `validate.yml.tmpl`,
 `run-actionlint.py.tmpl`, `run-tests.py.tmpl`, `deploy-skills.py.tmpl`,
 `sdlc.yml.tmpl`, and `skill-sections.json.tmpl`. Compatible repositories receive
 the pinned actionlint runner, while repositories with Python tests receive the

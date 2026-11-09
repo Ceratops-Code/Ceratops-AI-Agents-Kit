@@ -1,6 +1,6 @@
 """Structural compatibility and explicit runner result and scratch probes.
 
-The structural checker never runs the repository aggregate or tests. Ruff's
+The structural checker never runs the repository's check groups or tests. Ruff's
 read-only settings commands enforce the shared rule and Python-target policy. Optional
 result probes run controlled commands only in a caller-owned result directory;
 structural success alone is not acceptance of reusable test results.
@@ -37,6 +37,7 @@ from .generate_test_script import discover_python_tests
 from .python_tool_configuration import ruff_policy_errors
 from .repository_validation_contract import load_validation_contract
 from .sdlc_contract_validation import (
+    latest_sdlc_version,
     operation_category,
     operation_entries,
     read_contract,
@@ -133,20 +134,23 @@ def _direct_source_errors(root: pathlib.Path, entries: Mapping[str, Mapping[str,
     for check in contract_checks(root):
         name = check["id"]
         _, command = direct_source_check(check)
-        # Required default commands or configured variants identified by their
-        # actual module, package script or script filename, not their group name.
-        identity = command[command.index("python") + 1:] if "python" in command else command
-        if identity[0] == "-m":
-            identity = identity[:2]
-        elif identity[0] in {"npm", "pnpm"}:
-            identity = [identity[0], *identity[-2:]]
+        # Permit target-specific flags and scan paths after the check identity.
+        # Executable and ordered arguments must both identify the real check.
+        if command[0] == "uv":
+            entrypoint = command.index("python") + 1
+            identity_length = entrypoint + (2 if command[entrypoint] == "-m" else 1)
+            if name == "ruff":
+                identity_length += 1
+        elif "-File" in command:
+            identity_length = command.index("-File") + 2
         else:
-            identity = identity[:1]
+            identity_length = len(command) if command[0] in {"npm", "pnpm"} else 1
+        identity = command[:identity_length]
         if not any(
             name in group.get("validation-tools", [])
             and group.get("check-results", {}).get("result-owner") == "operation"
             and len(group.get("steps", [])) == 1
-            and all(token in group["steps"][0].get("run", []) for token in identity)
+            and group["steps"][0].get("run", [])[:len(identity)] == identity
             for group in groups
         ):
             errors.append(f"SDLC v5 requires a recorded source check for {name}")
@@ -464,8 +468,6 @@ def validate_ceratops_compatibility(
             and bool(python_tests)
             and test_runner_selected
         )
-        if name == "validator" and sdlc and sdlc["version"] >= 5:
-            continue
         if (required or name in present) and (error := _regular_file_error(root, paths[name])):
             errors.append(error)
     if not _regular_file_error(root, paths["workflow"]):
@@ -479,39 +481,21 @@ def validate_ceratops_compatibility(
     if "sdlc" in present and not _regular_file_error(root, paths["sdlc"]):
         errors.extend(sdlc_errors)
         if sdlc:
-            # The shared loader has already accepted a schema-valid supported
-            # SDLC declaration; compatibility requirements are version-neutral.
             errors.extend(_validation_coverage_errors(root, sdlc, validation_contract))
-            expected = load_compatibility_contract()["runtime"]["project"]
-            # uv supports project discovery from the script path and explicit
-            # project selection for existing repository commands.
-            validator_commands = [
-                ["uv", "run", "--locked", surfaces["validator"]["path"]],
-                ["uv", "run", "--project", expected, "--locked", "python", surfaces["validator"]["path"]],
-            ]
-            commands = [
-                step["run"]
-                for name, entry in entries.items()
-                if operation_category(name) == "pre-build-checks"
-                for step in entry.get("steps", [])
-                if "run" in step
-            ]
-            if sdlc["version"] >= 5:
+            if sdlc["version"] == latest_sdlc_version():
                 errors.extend(_direct_source_errors(root, entries))
-                if any(surfaces["validator"]["path"] in command for command in commands):
-                    errors.append("SDLC v5 source checks must declare their commands directly.")
-            elif not any(command in commands for command in validator_commands):
-                errors.append("SDLC must invoke the repository validator through its locked uv project")
+            else:
+                errors.append("Ceratops compatibility requires the current SDLC version.")
             tests = [
                 entry
                 for name, entry in entries.items()
                 if operation_category(name) in {"pre-build-checks", "post-build-checks"}
+                and not entry.get("validation-tools")
             ]
             if not tests:
                 errors.append("SDLC must declare repository tests or an explicit no-op")
             if python_tests and not any(
-                "run" in step and step["run"] not in validator_commands
-                and not entry.get("validation-tools")
+                "run" in step
                 for entry in tests for step in entry.get("steps", [])
             ):
                 errors.append("detected Python tests require an executable SDLC tests operation")

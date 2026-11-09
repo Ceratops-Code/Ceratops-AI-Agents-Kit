@@ -49,7 +49,6 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "validator",
         "workflow",
         "issue_template",
         "pull_request_template",
@@ -61,9 +60,6 @@
         "actionlint_runner"
       ],
       "properties": {
-        "validator": {
-          "$ref": "#/$defs/surface"
-        },
         "workflow": {
           "$ref": "#/$defs/surface"
         },

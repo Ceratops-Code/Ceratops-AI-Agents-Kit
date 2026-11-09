@@ -12,7 +12,6 @@ from __future__ import annotations
 import json
 import os
 import pathlib
-import pprint
 import subprocess
 import tomllib
 from collections.abc import Mapping
@@ -285,7 +284,7 @@ def contract_checks(
                     "cwd": _safe_validation_path(
                         check["cwd"], "validation check cwd"
                     ).as_posix(),
-                    "exclusive": check.get("exclusive", False),
+                    "result-inputs": check.get("result-inputs", ["**"]),
                 }
             )
             tool = check["id"]
@@ -339,10 +338,7 @@ def contract_checks(
                         "--config-file",
                         configuration,
                     ]
-    exclusive_checks = [check for check in selected if check["exclusive"]]
-    if len(exclusive_checks) > 1:
-        raise RuntimeError("multiple exclusive repository validators matched")
-    return exclusive_checks or selected
+    return selected
 
 
 def default_markdown_files(repo_root: pathlib.Path) -> dict[str, str]:
@@ -543,49 +539,37 @@ def direct_source_check(check: dict[str, object]) -> tuple[str, list[str]]:
     return tool, [tool, *arguments]
 
 
+def source_check_results(check: dict[str, object], tool: str) -> dict[str, object]:
+    """Bind generated check receipts to the files and tools the command reads."""
+    return {
+        "result-owner": "operation",
+        "product-inputs": check["result-inputs"],
+        "check-inputs": ["sdlc/sdlc.yml", ".gitattributes"],
+        "dependencies": ["scripts/pyproject.toml", "scripts/uv.lock"] if tool == "uv" else [],
+        "tools": [tool],
+    }
+
+
 def validation_surfaces(
     repo_root: pathlib.Path,
     ci_action_revision: str | None = None,
-    *,
-    legacy_validator: bool = True,
-) -> tuple[str | None, str | None, list[str], dict[str, str]]:
-    """Create missing validators and reconcile the CI edge without losing custom steps."""
+) -> tuple[str | None, list[dict[str, object]], dict[str, str]]:
+    """Plan direct source checks and their CI entry point."""
 
-    validator = repo_root / surface_path("validator")
     workflow = repo_root / surface_path("workflow")
-    for path, label in (
-        (validator, "repository validator"),
-        (workflow, "CI validation workflow"),
-    ):
-        if path.is_symlink() or (path.exists() and not path.is_file()):
-            raise RuntimeError(f"existing {label} must be a regular file: {path}")
+    if workflow.is_symlink() or (workflow.exists() and not workflow.is_file()):
+        raise RuntimeError(f"existing CI workflow must be a regular file: {workflow}")
 
     planned_paths = (
         {surface_path("workflow").as_posix()} if not workflow.is_file() else set()
     )
     checks = contract_checks(repo_root, planned_paths=planned_paths)
-    markdown_files = (
-        default_markdown_files(repo_root)
-        if not validator.is_file()
-        and not workflow.is_file()
-        and not any(check["exclusive"] for check in checks)
-        else {}
-    )
+    markdown_files = default_markdown_files(repo_root) if not workflow.is_file() else {}
     if markdown_files:
         checks = contract_checks(
             repo_root,
             package=json.loads(markdown_files["scripts/package.json"]),
             planned_paths=planned_paths,
-        )
-    validator_text = None
-    if legacy_validator and not validator.is_file():
-        template = template_path("validator").read_text(encoding="utf-8")
-        marker = "__CHECK_DEFINITIONS__"
-        if template.count(marker) != 1:
-            raise RuntimeError("repository validator template marker is invalid")
-        validator_text = template.replace(
-            marker,
-            pprint.pformat(checks, sort_dicts=False, width=72),
         )
     workflow_text = None
     action = load_compatibility_contract()["ci_action"]
@@ -622,7 +606,6 @@ def validation_surfaces(
             payload["on"] = payload.pop(True)
         changed = False
         found = False
-        resolved_action = None
         for job in payload["jobs"].values():
             if not isinstance(job, dict):
                 continue
@@ -648,35 +631,6 @@ def validation_surfaces(
                         if step["uses"] != chosen:
                             step["uses"] = chosen
                             changed = True
-                elif surface_path("validator").as_posix() in command:
-                    if "\n" in command.strip() or any(
-                        token in command for token in ("&&", ";", "|")
-                    ):
-                        raise RuntimeError(
-                            "custom CI validation command requires explicit SDLC integration"
-                        )
-                    if step.get("working-directory") not in (None, "."):
-                        raise RuntimeError(
-                            "custom CI working-directory requires explicit action integration"
-                        )
-                    if resolved_action is None:
-                        resolved_action = resolve_action(action, ci_action_revision)
-                    step.pop("run")
-                    step.pop("shell", None)
-                    step.pop("working-directory", None)
-                    step.update(
-                        uses=resolved_action, **{"with": dict(action["inputs"])}
-                    )
-                    changed = found = True
-                    if not any(
-                        "astral-sh/setup-uv@" in item.get("uses", "")
-                        for item in steps
-                        if isinstance(item, dict)
-                    ):
-                        steps.insert(
-                            steps.index(step),
-                            {"name": "Set up uv", "uses": SETUP_UV.split(" #", 1)[0]},
-                        )
         if not found:
             raise RuntimeError(
                 "existing CI workflow must expose a repository validation invocation before integration"
@@ -685,8 +639,4 @@ def validation_surfaces(
             workflow_text = yaml.dump(
                 payload, Dumper=IndentedSafeDumper, sort_keys=False
             )
-    # Report only checks we generated; preserved validators own their internals.
-    generated_checks = (
-        [str(check["id"]) for check in checks] if validator_text is not None or not legacy_validator else []
-    )
-    return validator_text, workflow_text, generated_checks, markdown_files
+    return workflow_text, checks, markdown_files
