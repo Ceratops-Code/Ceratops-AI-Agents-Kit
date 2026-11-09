@@ -695,6 +695,7 @@ def _deploy_completed_promotion(
                 [OperationRequest(item.operation, parameters=dict(item.parameters))
                  for item in prepared_operations], getattr(args, "sdlc_contract", DEFAULT_SDLC_CONTRACT),
                 expected_commit=target_commit, qualification_level="beta",
+                validation_operations=getattr(args, "validation_operation", None),
                 diagnostic_output=getattr(args, "diagnostic_output", None),
                 diagnostic_owner=(args.repo_root, "promote"),
                 successful_results=validation["results"],
