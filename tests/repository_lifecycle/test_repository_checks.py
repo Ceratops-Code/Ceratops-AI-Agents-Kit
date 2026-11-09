@@ -760,6 +760,14 @@ def test_compatibility_materializer_supports_repositories_without_skills(
         (nested / "scripts" / lockfile).write_text("{}\n", encoding="utf-8")
         check = next(item for item in materializer.repository_checks.contract_checks(nested) if item["id"] == manager + "-lint")
         assert check["command"] == ["{" + manager + "}", flag, "scripts", "run", "lint"]
+        generated = materializer.prepare_sdlc_configuration(
+            nested, skill_names=[], apply_contract=True, generated_checks=[check],
+        )
+        repository = generated["repository"]
+        operation = repository["actions"]["pre-build-checks"]["check-groups"][f"source-{manager}-lint"]
+        assert operation["requires"]["tools"] == ["node", manager]
+        assert operation["check-results"]["tools"] == ["node", manager]
+        assert repository["tools"]["node"] == {"executable": "node"}
         assert materializer.repository_checks.default_markdown_files(nested) == {}
         _, setup = materializer.repository_checks._validation_workflow(nested, [check], markdown_files={})
         assert f"{manager} {flag} scripts " in setup

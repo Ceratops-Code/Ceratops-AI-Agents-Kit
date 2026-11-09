@@ -256,15 +256,17 @@ def prepare_sdlc_configuration(
             if any(name in group.get("validation-tools", []) for group in checks.values()):
                 continue
             tool, command = repository_checks.direct_source_check(check)
-            capabilities.setdefault(tool, {"executable": tool})
+            check_tools = ["node", tool] if tool in {"npm", "pnpm"} else [tool]
+            for check_tool in check_tools:
+                capabilities.setdefault(check_tool, {"executable": check_tool})
             checks[f"source-{name}"] = {
-                "requires": {key: [tool]},
+                "requires": {key: check_tools},
                 "validation-tools": [name],
                 "steps": [{"run": command}],
                 # Default tooling can discover new files anywhere in the checkout.
                 "check-results": {"result-owner": "operation", "product-inputs": ["**"],
                                   "check-inputs": ["sdlc/sdlc.yml", "scripts/pyproject.toml", "scripts/uv.lock"],
-                                  "tools": [tool]},
+                                  "tools": check_tools.copy()},
             }
         checks = {**{name: group for name, group in checks.items() if group.get("validation-tools")}, **checks}
     bootstrap = {**reusable["repository"]["actions"]["bootstrap"], "requires": {key: ["uv"]}}
