@@ -36,7 +36,7 @@ repository:
       steps:
         - run: [uv, sync, --project, scripts, --locked]
         # Resolve npm.cmd on Windows and npm on other platforms.
-        - run: [npm, ci, --prefix, scripts]
+        - run: [uv, run, --project, scripts, --locked, python, -c, "import shutil, subprocess; subprocess.run([shutil.which('npm'), '--prefix', 'scripts', 'ci'], check=True)"]
     test-selection:
       requires:
         tools:
