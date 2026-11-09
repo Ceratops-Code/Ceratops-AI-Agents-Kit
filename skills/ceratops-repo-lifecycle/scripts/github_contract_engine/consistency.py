@@ -129,6 +129,7 @@ VALIDATION_EXECUTABLE_FIELDS = frozenset(
         "root.kind",
         "root.name",
         "root.source_docs_ref",
+        "root.node_bootstrap_launcher",
         "root.ruff_policy",
         "root.coverage_requirements",
         "root.checks",
