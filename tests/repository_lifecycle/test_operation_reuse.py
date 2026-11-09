@@ -620,6 +620,7 @@ raise SystemExit(int(pathlib.Path('source.txt').read_text()))
     assert len(reports) == calls
     for report in reports:
         case = ET.parse(report).find("./testsuite/testcase")
+        assert case is not None
         assert case.attrib["name"] == request.operation
         assert [item.tag for item in case] == (["error"] if exit_code == 130 else ["failure"] if exit_code else [])
 
