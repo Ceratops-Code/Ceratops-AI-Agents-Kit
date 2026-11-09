@@ -1242,6 +1242,14 @@ def test_generated_scripts_and_skill_owned_ci_keep_environments_and_tests_separa
     prefix = ["uv", "run", "--locked"]
     validation = subprocess.run([*prefix, "scripts/validate-repository.py"], cwd=repo, capture_output=True, text=True, check=False)
     assert validation.returncode == 0, validation.stdout + validation.stderr + (pathlib.Path(json.loads(validation.stdout)["evidence_file"]).read_text() if validation.stdout.startswith("{") else "")
+    if sys.platform == "win32":
+        # Catch Linux type errors in the generated runner before remote CI.
+        linux_types = subprocess.run(
+            ["uv", "run", "--project", "scripts", "--locked", "python", "-m", "mypy",
+             "--config-file", "scripts/pyproject.toml", "--platform", "linux", "scripts/run-tests.py"],
+            cwd=repo, capture_output=True, text=True, check=False,
+        )
+        assert linux_types.returncode == 0, linux_types.stdout + linux_types.stderr
     # The generated settings must be consumed, not merely written to TOML.
     check_probe = repo / "scripts/check_probe.py"
     check_probe.write_text("import math\n")

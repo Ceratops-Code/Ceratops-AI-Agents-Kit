@@ -951,15 +951,18 @@ def _remove_readonly_scratch(
     remove: Callable[[str], object], path: str, error: BaseException,
 ) -> None:
     entry = pathlib.Path(path).lstat()
-    if (sys.platform != "win32" or not isinstance(error, PermissionError)
-            or entry.st_mode & stat.S_IWRITE
-            or getattr(entry, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
-        raise error
-    if stat.S_ISREG(entry.st_mode) and entry.st_nlink > 1:
-        _unlink_readonly_scratch_hardlink(path)
+    if sys.platform == "win32":
+        if (not isinstance(error, PermissionError)
+                or entry.st_mode & stat.S_IWRITE
+                or getattr(entry, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+            raise error
+        if stat.S_ISREG(entry.st_mode) and entry.st_nlink > 1:
+            _unlink_readonly_scratch_hardlink(path)
+            return
+        os.chmod(path, entry.st_mode | stat.S_IWRITE)
+        remove(path)
         return
-    os.chmod(path, entry.st_mode | stat.S_IWRITE)
-    remove(path)
+    raise error
 
 
 def _reclaim_test_scratch(record: pathlib.Path) -> None:

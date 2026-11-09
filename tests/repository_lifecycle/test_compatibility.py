@@ -1414,19 +1414,19 @@ def test_capability_changes_preserve_artifact_release_version_and_channel():
     assert record["version"] == "7.2.0b1"
 
 
-def test_repository_capability_requirements_point_to_native_metadata():
+def test_repository_tool_requirements_point_to_native_metadata():
     reader = importlib.import_module(
         "ceratops_repo_compatibility_engine.sdlc_contract_validation"
     )
-    capabilities = reader.load_contract(ROOT / "sdlc/sdlc.yml")["repository"]["capabilities"]
-    python_reference = capabilities["python"]["version-from"]
+    tools = reader.load_contract(ROOT / "sdlc/sdlc.yml")["repository"]["tools"]
+    python_reference = tools["python"]["version-from"]
     python_metadata = tomllib.loads((ROOT / python_reference["file"]).read_text(encoding="utf-8"))
     assert python_reference["key"] == "project.requires-python"
     assert python_metadata["project"]["requires-python"]
-    node_reference = capabilities["node"]["version-from"]
+    node_reference = tools["node"]["version-from"]
     assert set(node_reference) == {"file"}
     assert (ROOT / node_reference["file"]).read_text(encoding="utf-8").strip() == "lts/*"
-    assert "version-from" not in capabilities["git"]
+    assert "version-from" not in tools["git"]
 
 
 
