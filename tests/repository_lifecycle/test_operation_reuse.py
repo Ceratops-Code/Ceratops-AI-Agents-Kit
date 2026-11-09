@@ -80,7 +80,7 @@ print(json.dumps({'schema':'ceratops-build-result.v1','status':'passed',
     (root / ".gitignore").write_text(".order\n.outputs/\n.fault\n")
 
     def action(verb, name):
-        return {"requires": {"capabilities": []}, "parameters": ["target"],
+        return {"requires": {"tools": []}, "parameters": ["target"],
                 "steps": [{"run": [sys.executable, "scripts/product.py", verb, name, "{target}"]}]}
 
     test = action("check", "bundle")

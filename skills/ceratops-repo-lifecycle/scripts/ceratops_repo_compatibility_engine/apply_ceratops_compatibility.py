@@ -248,6 +248,7 @@ def prepare_sdlc_configuration(
             raise RuntimeError(
                 "custom repository validation operation requires explicit integration with the uv validator command"
             )
+        checks = {"source": checks["source"], **checks}
     else:
         for check in generated_checks if generated_checks is not None else repository_checks.contract_checks(repo_root):
             name = str(check["id"])
@@ -975,7 +976,9 @@ def main(argv: list[str] | None = None) -> int:
                 "repository_validation": {
                     "checks": plan.validation_checks,
                     "validator": (
-                        "applied" if plan.validator_text is not None else "preserved"
+                        "applied" if plan.validator_text is not None
+                        else "preserved" if (repo_root / surface_path("validator")).is_file()
+                        else "not_configured"
                     ),
                     "workflow": (
                         "applied" if plan.workflow_text is not None else "preserved"
@@ -983,7 +986,9 @@ def main(argv: list[str] | None = None) -> int:
                 },
                 "python_tests": plan.python_tests,
                 "validator_environment": runtime["environment"],
-                "custom_validation_review_required": plan.validator_text is None,
+                "custom_validation_review_required": (
+                    plan.validator_text is None and (repo_root / surface_path("validator")).is_file()
+                ),
                 "markers_removed": plan.updated_markers,
                 "rollback": "not_needed",
                 "runtime_source_id": source_id,

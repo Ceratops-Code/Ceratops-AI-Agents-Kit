@@ -594,13 +594,16 @@ def test_custom_pytest_child_does_not_inherit_the_owning_check_context(
     monkeypatch.setenv("CERATOPS_REPOSITORY_CHECK_CONTEXT", "outer writer inputs")
     monkeypatch.setenv("CERATOPS_SDLC_TEST_CONTEXT", "outer promotion inputs")
     monkeypatch.setenv("UNRELATED_CALLER_INPUT", "keep")
+    class FixtureEnvironment(dict):
+        scratch = type("FixtureScratch", (), {"child_options": lambda _self: nullcontext({})})()
+
     monkeypatch.setattr(
         test_runner_module.pytest_environment, "isolated_environment",
-        lambda _root: nullcontext(dict(os.environ)),
+        lambda _root: nullcontext(FixtureEnvironment(os.environ)),
     )
     observed = []
 
-    def pytest_child(command, root, environment):
+    def pytest_child(command, root, environment, **_options):
         observed.append(environment)
         assert "CERATOPS_REPOSITORY_CHECK_CONTEXT" not in environment
         assert "CERATOPS_SDLC_TEST_CONTEXT" not in environment

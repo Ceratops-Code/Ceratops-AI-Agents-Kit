@@ -254,11 +254,13 @@ def _write_current_sdlc(
     actions["bootstrap"]["requires"] = {"capabilities": ["uv"]}
     groups = actions["pre-build-checks"]["check-groups"]
     groups["tests"]["requires"] = {"capabilities": []}
-    groups["source"] = {"requires": {"capabilities": ["uv"]},
-                        "steps": [{"run": ["uv", "run", "--locked", "scripts/validate-repository.py"]}]}
+    source = {"requires": {"capabilities": ["uv"]},
+              "steps": [{"run": ["uv", "run", "--locked", "scripts/validate-repository.py"]}]}
+    actions["pre-build-checks"]["check-groups"] = {"source": source, **groups}
     if deliverables is not None:
         document["deliverables"] = deliverables
     target = repo / "sdlc" / "sdlc.yml"
+    target.parent.mkdir(exist_ok=True)
     target.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
 
 
@@ -354,7 +356,7 @@ def test_compatibility_materializer_supplies_target_identity_and_assignments(
     contract = yaml.safe_load(
         (repo / "sdlc" / "sdlc.yml").read_text(encoding="utf-8")
     )
-    assert contract["version"] == yaml.safe_load(SDLC_CONTRACT_TEMPLATE.read_text(encoding="utf-8"))["version"]
+    assert contract["version"] == 4
     assert contract["kind"] == "ceratops-sdlc"
     alpha_actions = contract["deliverables"]["skills"]["alpha-tool"]["actions"]
     assert alpha_actions["pre-build-checks"]["check-groups"]["source"]["steps"][0]["handoff"] == {

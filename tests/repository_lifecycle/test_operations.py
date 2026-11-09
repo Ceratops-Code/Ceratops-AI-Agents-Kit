@@ -205,9 +205,10 @@ def test_sdlc_template_is_a_schema_valid_empty_skeleton(tmp_path: pathlib.Path) 
     shutil.copy2(SDLC_CONTRACT_TEMPLATE, contract)
     document = contracts.load_contract(contract)
     assert document["version"] == contracts.latest_sdlc_version()
-    assert document["repository"]["actions"]["pre-build-checks"]["check-groups"]["source"]["steps"] == [
-        {"run": ["uv", "run", "--locked", "scripts/validate-repository.py"]}
-    ]
+    assert set(document["repository"]["tools"]) == {"uv"}
+    groups = document["repository"]["actions"]["pre-build-checks"]["check-groups"]
+    assert list(groups) == ["tests"]
+    assert "no-op" in groups["tests"]
     assert "deliverables" not in document
     live = contracts.load_contract(ROOT / "sdlc" / "sdlc.yml")
     assert live["version"] == 4

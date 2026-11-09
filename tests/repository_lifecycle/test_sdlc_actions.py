@@ -90,13 +90,13 @@ def test_direct_after_group_receives_own_and_extra_files_without_running_sibling
     owner = "deliverables.packages.sample"
     extra = "deliverables.packages.supplier"
     groups = {
-        "combined": {"requires": {"capabilities": []}, "uses-artifacts": [extra], "steps": [{"run": [
+        "combined": {"requires": {"tools": []}, "uses-artifacts": [extra], "steps": [{"run": [
             sys.executable, "-c", "import json,sys; from pathlib import Path; files=json.loads(sys.argv[1]); "
             f"assert set(files)=={{{owner!r}, {extra!r}}}; "
             f"assert Path(files[{owner!r}][0]).read_bytes()==b'own'; "
             f"assert Path(files[{extra!r}][0]).read_bytes()==b'extra'; print('OK')", "{artifacts}",
         ]}]},
-        "unrequested": {"requires": {"capabilities": []}, "steps": [{"run": [
+        "unrequested": {"requires": {"tools": []}, "steps": [{"run": [
             sys.executable, "-c", "raise AssertionError('unrequested sibling ran')",
         ]}]},
     }
