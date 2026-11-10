@@ -58,7 +58,13 @@ def test_dependabot_retarget_reads_current_base_after_interruption(monkeypatch, 
     assert len(patches) == 1
 
 
-def test_dependabot_retarget_preserves_concurrent_base_change(monkeypatch):
+@pytest.mark.parametrize(("current_base", "auto_merge", "message"), [
+    ("maintenance", None, "PR target changed to 'maintenance'"),
+    ("main", {"enabled_by": "maintainer"}, "PR has auto-merge enabled"),
+])
+def test_dependabot_retarget_preserves_existing_pr_controls(
+    monkeypatch, current_base, auto_merge, message,
+):
     queue = load_pr_workflow_module(monkeypatch, "dependency_queue")
     repo = "owner/repo"
     key = (repo, 12)
@@ -72,13 +78,14 @@ def test_dependabot_retarget_preserves_concurrent_base_change(monkeypatch):
         return SimpleNamespace(ok=True, data={
             "state": "open", "user": {"login": "dependabot[bot]"},
             "head": {"repo": {"full_name": repo}},
-            "base": {"repo": {"full_name": repo}, "ref": "maintenance"},
+            "base": {"repo": {"full_name": repo}, "ref": current_base},
+            "auto_merge": auto_merge,
         })
 
     monkeypatch.setattr(queue, "run_gh_api", api)
     _, blockers = queue.retarget_dependabot_prs(snapshot, {key: live})
     assert len(blockers) == 1
-    assert "PR target changed to 'maintenance'" in blockers[0]["message"]
+    assert message in blockers[0]["message"]
 
 
 @pytest.mark.parametrize("wait_status", ["ready", "timed_out", "failed"])

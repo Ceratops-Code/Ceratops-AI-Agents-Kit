@@ -238,6 +238,8 @@ def retarget_dependabot_prs(
                         continue
                     elif target.get("ref") != default:
                         problem = f"PR target changed to {target.get('ref')!r}; retarget skipped"
+                    elif pull.get("auto_merge") is not None:
+                        problem = "PR has auto-merge enabled; disable it before retargeting"
                     else:
                         response = run_gh_api("PATCH", endpoint, {"base": RELEASE_BRANCH})
                         if response.ok:
