@@ -199,6 +199,7 @@
   "dependency_updates": {
     "package-ecosystem": "uv",
     "directory": "/scripts",
+    "target-branch": "release/local",
     "schedule": {
       "interval": "weekly"
     }

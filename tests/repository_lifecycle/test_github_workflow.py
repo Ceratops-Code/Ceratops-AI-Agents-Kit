@@ -30,6 +30,59 @@ class EnsurePrTests(unittest.TestCase):
     def args(self) -> argparse.Namespace:
         return argparse.Namespace(head_branch="release/local")
 
+    def test_main_requires_release_branch_before_publication(self) -> None:
+        args = argparse.Namespace(
+            repo_root=pathlib.Path.cwd(), head_branch="task", base_branch="main",
+        )
+        with mock.patch.object(ensure_pr, "_publication_target") as bind:
+            with self.assertRaisesRegex(ensure_pr.EnsurePrError, "repository's release/local"):
+                ensure_pr._ensure_pr(args)
+            bind.assert_not_called()
+
+    def test_main_binds_implicit_repository_and_rejects_fork_push(self) -> None:
+        for push_repo in ("owner/repo", "fork/repo"):
+            with self.subTest(push_repo=push_repo):
+                args = argparse.Namespace(
+                    repo_root=pathlib.Path.cwd(), remote_name="origin",
+                    base_branch="main", head_branch="release/local",
+                )
+                with (
+                    mock.patch.object(ensure_pr, "require_output", side_effect=[
+                        "https://github.com/owner/repo.git", f"git@github.com:{push_repo}.git",
+                    ]),
+                    mock.patch.object(ensure_pr, "_api") as api,
+                ):
+                    if push_repo == "owner/repo":
+                        ensure_pr._publication_target(args)
+                        self.assertEqual(args.repo, push_repo)
+                        self.assertEqual(args.pr_head, "owner:release/local")
+                        api.assert_called_once_with("GET", "/repos/owner/repo", args)
+                    else:
+                        with self.assertRaisesRegex(ensure_pr.EnsurePrError, "repository's release/local"):
+                            ensure_pr._publication_target(args)
+                        api.assert_not_called()
+
+    def test_main_readiness_requires_same_repository_release(self) -> None:
+        for base, head, fork, blocked in (
+            ("main", "task", False, True),
+            ("main", "release/local", True, True),
+            ("main", "release/local", None, True),
+            ("main", "release/local", False, False),
+            ("release/local", "task", False, False),
+        ):
+            with self.subTest(base=base, head=head, fork=fork):
+                payload = {
+                    "baseRefName": base, "headRefName": head, "isCrossRepository": fork,
+                    "state": "OPEN", "mergeable": "MERGEABLE", "reviewDecision": "APPROVED",
+                }
+                with mock.patch.object(ship.readiness, "gh_pr_view", return_value=payload):
+                    _, findings = ship.readiness.pr_readiness("12", pathlib.Path.cwd())
+                release_errors = [
+                    finding for finding in findings
+                    if finding.check == "pr.release_source" and finding.level == "ERROR"
+                ]
+                self.assertEqual(bool(release_errors), blocked)
+
     def test_waits_until_github_reports_the_pushed_head(self) -> None:
         responses = [
             {"headRefOid": "old"},

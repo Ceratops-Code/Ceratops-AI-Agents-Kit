@@ -276,3 +276,15 @@ class DependabotCoverageTests(unittest.TestCase):
         result = compare_states({"repository": repository}, {"rules": [rule], "contracts": []})
         self.assertTrue(any(finding["path"].endswith("/missing_manifest_directories")
                             and finding["level"] == "WARN" for finding in result["findings"]))
+
+    def test_version_updates_target_release_and_security_only_entries_use_main(self):
+        version_entry = self.entry("pip", directory="/")
+        security_entry = {**version_entry, "open-pull-requests-limit": 0}
+        files = {"requirements.txt": "pytest"}
+        facts = self.coverage(files, [version_entry])
+        self.assertEqual(len(facts["version_update_target_errors"]), 1)
+        facts = self.coverage(files, [
+            {**version_entry, "target-branch": "release/local"}, security_entry,
+        ])
+        self.assertEqual(facts["version_update_target_errors"], [])
+        self.assertEqual(facts["missing_manifest_directories"], [])

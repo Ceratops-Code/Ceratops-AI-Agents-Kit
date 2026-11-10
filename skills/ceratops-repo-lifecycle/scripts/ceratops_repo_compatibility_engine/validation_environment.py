@@ -158,11 +158,16 @@ def runtime_files(
     data = yaml.safe_load(dependabot.read_text(encoding="utf-8")) if dependabot.is_file() else {"version": 2, "updates": []}
     if not isinstance(data, dict) or data.get("version") != 2 or not isinstance(data.get("updates"), list):
         raise RuntimeError("Dependabot configuration must have version 2 and an updates list")
-    registrations = [dict(contract["dependency_updates"]), dict(contract["ci_dependency_updates"])]
+    target_branch = contract["dependency_updates"]["target-branch"]
+    registrations = [
+        dict(contract["dependency_updates"]),
+        {**contract["ci_dependency_updates"], "target-branch": target_branch},
+    ]
     npm_directory = "/" if (root / "package.json").is_file() else "/scripts"
     if (root / npm_directory.lstrip("/") / "package.json").is_file() or "scripts/package.json" in planned_files:
         registrations.append({
             "package-ecosystem": "npm", "directory": npm_directory,
+            "target-branch": target_branch,
             "schedule": dict(contract["dependency_updates"]["schedule"]),
         })
     if has_python_skills:

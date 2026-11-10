@@ -42,6 +42,7 @@ PR_CONTRACT_SCHEMA = (
     / "github-pr-readiness-deterministic-contract.schema.json"
 )
 IMPLEMENTED_CHECK_LEVELS = {
+    "pr.release_source": "ERROR",
     "pr.state_open": "ERROR",
     "pr.not_draft": "ERROR",
     "pr.mergeable": "ERROR_OR_WARN",
@@ -70,6 +71,7 @@ PR_VIEW_FIELDS = (
     "headRefName",
     "headRefOid",
     "baseRefName",
+    "isCrossRepository",
     "autoMergeRequest",
 )
 IMPLEMENTED_EVIDENCE_FIELDS = frozenset(
@@ -801,6 +803,16 @@ def pr_readiness(selector: str | None, cwd: pathlib.Path, *, allow_admin_review_
 
     pr_data = gh_pr_view(selector, cwd)
     findings: list[Finding] = []
+
+    if pr_data.get("baseRefName") == "main":
+        head = pr_data.get("headRefName")
+        if head != "release/local" or pr_data.get("isCrossRepository") is not False:
+            add(
+                findings, "ERROR", "pr.release_source",
+                "Pull requests to main must come from this repository's release/local.",
+                actual={"head": head, "cross_repository": pr_data.get("isCrossRepository")},
+                expected={"head": "release/local", "cross_repository": False},
+            )
 
     if pr_data.get("state") == "OPEN":
         add(findings, "PASS", "pr.state_open", "PR is open.")

@@ -37,6 +37,10 @@ first.
   reads its repository-scope configuration and binds its independent adapters;
   explicit options override defaults. It owns current-report retirement and
   dated unavailable-state reports, preserving genuine blocked queue results.
+- Preflight with `--retarget-dependabot-prs` moves eligible open Dependabot PRs
+  from the default branch to the repository's published `release/local`.
+  It refreshes the moved PRs before collecting readiness evidence. Use this
+  option when the caller authorizes the target changes.
 - Queue preflight owns dependency and exact-CI evidence. Finalization binds
   each approval to its exact PR head, stages eligible updates through
   `release/local`, and delegates publication to the repository's shipping
@@ -102,6 +106,9 @@ first.
 - Publish dependency updates through `release/local` in every repository.
   Preserve the source PR readiness and Codex review gates, then use the
   repository shipping workflow for the assembled release.
+- Treat a dependency PR merged into staging as staged work until the approved
+  head is an ancestor of the published default branch. Resume a blocked release
+  through its Ship result and retained worktree.
 - Pass every model-approved PR to queue finalization. Process all eligible
   updates without a per-repository merge limit; changed PR heads require fresh
   preflight and approval.

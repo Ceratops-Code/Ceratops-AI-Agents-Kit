@@ -4,12 +4,81 @@ import hashlib
 import json
 import pathlib
 import subprocess
+from types import SimpleNamespace
 from typing import Any, Self
 
 import pytest
 
 from tests.repository_lifecycle.support import load_pr_workflow_module
 from tests.support.repositories import run_git
+
+
+@pytest.mark.parametrize("interruption", [None, "before", "after"])
+def test_dependabot_retarget_reads_current_base_after_interruption(monkeypatch, interruption):
+    queue = load_pr_workflow_module(monkeypatch, "dependency_queue")
+    repo = "owner/repo"
+    key = (repo, 12)
+    snapshot = {"queue": [{"repo": repo, "default_branch": "main"}]}
+    live = {"state": "OPEN", "base_ref": "main", "author": "app/dependabot", "is_cross_repository": False}
+    patches = []
+
+    def api(method, endpoint, body=None):
+        nonlocal interruption
+        if method == "GET" and endpoint.endswith("/git/ref/heads/release/local"):
+            return SimpleNamespace(ok=True, data={"ref": "refs/heads/release/local"})
+        if method == "GET":
+            assert endpoint == f"repos/{repo}/pulls/12"
+            return SimpleNamespace(ok=True, data={
+                "state": "open", "user": {"login": "dependabot[bot]"},
+                "head": {"repo": {"full_name": repo}},
+                "base": {"repo": {"full_name": repo}, "ref": live["base_ref"]},
+            })
+        assert (method, endpoint, body) == ("PATCH", f"repos/{repo}/pulls/12", {"base": "release/local"})
+        if interruption == "before":
+            interruption = None
+            raise OSError("interrupted before write")
+        live["base_ref"] = "release/local"
+        patches.append(endpoint)
+        if interruption == "after":
+            interruption = None
+            raise OSError("interrupted after write")
+        return SimpleNamespace(ok=True)
+
+    monkeypatch.setattr(queue, "run_gh_api", api)
+    monkeypatch.setattr(queue, "fetch_pr_batch", lambda requested: ({key: dict(live)}, []))
+    initial_fault = interruption
+    details, blockers = queue.retarget_dependabot_prs(snapshot, {key: dict(live)})
+    assert bool(blockers) == bool(initial_fault)
+    if not initial_fault:
+        assert details[key]["base_ref"] == "release/local"
+    for _ in range(2):
+        details, blockers = queue.retarget_dependabot_prs(snapshot, {key: dict(live)})
+        assert blockers == []
+        assert details[key]["base_ref"] == "release/local"
+    assert len(patches) == 1
+
+
+def test_dependabot_retarget_preserves_concurrent_base_change(monkeypatch):
+    queue = load_pr_workflow_module(monkeypatch, "dependency_queue")
+    repo = "owner/repo"
+    key = (repo, 12)
+    snapshot = {"queue": [{"repo": repo, "default_branch": "main"}]}
+    live = {"state": "OPEN", "base_ref": "main", "author": "app/dependabot", "is_cross_repository": False}
+
+    def api(method, endpoint):
+        assert method == "GET"
+        if endpoint.endswith("/git/ref/heads/release/local"):
+            return SimpleNamespace(ok=True, data={"ref": "refs/heads/release/local"})
+        return SimpleNamespace(ok=True, data={
+            "state": "open", "user": {"login": "dependabot[bot]"},
+            "head": {"repo": {"full_name": repo}},
+            "base": {"repo": {"full_name": repo}, "ref": "maintenance"},
+        })
+
+    monkeypatch.setattr(queue, "run_gh_api", api)
+    _, blockers = queue.retarget_dependabot_prs(snapshot, {key: live})
+    assert len(blockers) == 1
+    assert "PR target changed to 'maintenance'" in blockers[0]["message"]
 
 
 @pytest.mark.parametrize("wait_status", ["ready", "timed_out", "failed"])

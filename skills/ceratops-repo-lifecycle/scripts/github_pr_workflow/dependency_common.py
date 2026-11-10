@@ -10,6 +10,7 @@ import sys
 from datetime import datetime, timezone
 from typing import Any, Iterable, cast
 
+RELEASE_BRANCH = "release/local"
 PR_FIELDS = ",".join(
     [
         "author",
@@ -18,6 +19,7 @@ PR_FIELDS = ",".join(
         "files",
         "headRefName",
         "headRefOid",
+        "isCrossRepository",
         "isDraft",
         "mergeable",
         "mergeStateStatus",
