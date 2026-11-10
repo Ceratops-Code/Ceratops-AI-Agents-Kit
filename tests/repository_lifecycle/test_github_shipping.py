@@ -213,12 +213,14 @@ def test_ensure_pr_metadata_preserves_overrides_and_existing_fields(
 ) -> None:
     ensure_pr = load_pr_workflow_module(monkeypatch, "ensure_pr")
     repo = metadata_repo
-    local_base = run_git(repo, "rev-parse", "main").stdout.strip()
+    # The local bare remote exercises the implicit metadata path for a non-main PR.
+    assert run_git(repo, "branch", "staging", "main").returncode == 0
+    local_base = run_git(repo, "rev-parse", "staging").stdout.strip()
     assert run_git(repo, "commit", "--allow-empty", "-m", "Already merged remote change").returncode == 0
     remote_base = run_git(repo, "rev-parse", "HEAD").stdout.strip()
-    assert run_git(repo, "push", "origin", "HEAD:main").returncode == 0
-    # Keep both local main and its cached remote ref behind the actual remote.
-    assert run_git(repo, "update-ref", "refs/remotes/origin/main", local_base).returncode == 0
+    assert run_git(repo, "push", "origin", "HEAD:staging").returncode == 0
+    # Keep both the local base and its cached remote ref behind the actual remote.
+    assert run_git(repo, "update-ref", "refs/remotes/origin/staging", local_base).returncode == 0
     assert run_git(
         repo, "commit", "--allow-empty", "-m", "Complete Dev Tools catalog",
         "-m", "Use explicit collection exclusions.",
@@ -257,12 +259,12 @@ def test_ensure_pr_metadata_preserves_overrides_and_existing_fields(
     monkeypatch.setattr(ensure_pr, "require_output", output)
     monkeypatch.setattr(ensure_pr, "require_success", publish)
     arguments = ensure_pr.build_parser().parse_args(
-        ["--repo-root", str(repo), "--head-branch", "release/local"]
+        ["--repo-root", str(repo), "--head-branch", "release/local", "--base-branch", "staging"]
     )
     arguments.title, arguments.body = title, body
     assert ensure_pr.ensure_pr(arguments)["status"] == "pr_ready"
-    assert run_git(repo, "rev-parse", "main").stdout.strip() == local_base
-    assert run_git(repo, "rev-parse", "origin/main").stdout.strip() == remote_base
+    assert run_git(repo, "rev-parse", "staging").stdout.strip() == local_base
+    assert run_git(repo, "rev-parse", "origin/staging").stdout.strip() == remote_base
     assert len(pushes) == 1
     needs_defaults = not existing and (title is None or body is None)
     assert any("log" in command for command in git_reads) == needs_defaults
