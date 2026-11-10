@@ -14,6 +14,7 @@ status is preserved separately from command completion and checkpointed by calle
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import os
 import pathlib
@@ -29,16 +30,12 @@ from typing import Any
 import complete_artifact_builds
 import execute_skill_actions
 import reuse_operation_checks
-from run_build_operations import (
-    build_operation_context, execute_check_phases, execute_release_builds,
-)
 import sdlc_results
 import store_artifacts
 from ceratops_repo_compatibility_engine.sdlc_contract_validation import (
     SdlcContractError,
     deliverable_source_files,
     load_contract,
-
     operation_entries,
     operation_prerequisites,
 )
@@ -59,6 +56,11 @@ from github_pr_workflow.command import (
     run_progress_command,
     update_ci_failure_evidence,
     write_operation_report,
+)
+from run_build_operations import (
+    build_operation_context,
+    execute_check_phases,
+    execute_release_builds,
 )
 from sdlc_results import StepResultError, capture_step_result
 from store_artifacts import (
@@ -759,6 +761,7 @@ def execute_prepared_operation(
         return report_failure({**base, "status": "result_invalid", "message": str(exc)}, **report_options)
     completed: list[int | str] = []
     step_results: list[dict[str, Any]] = []
+    operation_records_check = (prepared.check_results or {}).get("result-owner") == "operation"
     for step in prepared.steps:
         if step.handoff is not None:
             if prepared.commit and prepared.category in MUTATION_CATEGORIES:
@@ -863,11 +866,12 @@ def execute_prepared_operation(
                     "status": "state_changed",
                     "message": str(exc),
                 }, **report_options)
+        started = datetime.datetime.now(datetime.UTC)
         try:
             assert step.argv is not None
             argv = [json.dumps(dict(prepared.selected_artifacts or {}), sort_keys=True)
                     if argument == "{artifacts}" else argument for argument in step.argv]
-            if check_plan is not None:
+            if check_plan is not None and not operation_records_check:
                 argv.extend(check_plan.arguments())
             # CreateProcess does not apply PATHEXT to bare npm/pnpm commands.
             # Resolve a bare executable while leaving repository-relative paths
@@ -906,12 +910,24 @@ def execute_prepared_operation(
             with release_lock_module().track_command_completion():
                 result = run_progress_command(argv, cwd=step.cwd, **process_options)
             code, stdout, stderr = result.returncode, result.stdout, result.stderr
+        except KeyboardInterrupt:
+            if check_plan is None or not operation_records_check:
+                raise
+            code, stdout, stderr = 130, "", "Source check interrupted."
         except OSError as exc:
             code, stdout, stderr = None, "", str(exc)
         except ValueError as exc:
             return report_failure({**base, "status": "result_invalid", "message": str(exc)}, **report_options)
-        if check_plan is not None and code is not None:
+        if check_plan is not None and (code is not None or operation_records_check):
             try:
+                if operation_records_check:
+                    inputs_changed = check_plan.inputs_changed(prepared)
+                    reported_code = 127 if code is None else code
+                    if inputs_changed and reported_code == 0:
+                        reported_code = 1
+                    check_plan.record_tool_result(prepared, argv, started, reported_code)
+                    if inputs_changed:
+                        raise ValueError("Source check inputs changed during execution.")
                 base["check_result"] = check_plan.completed(prepared, passed=code == 0)
                 if check_plan.summary is not None:
                     base["check_summary"] = check_plan.summary

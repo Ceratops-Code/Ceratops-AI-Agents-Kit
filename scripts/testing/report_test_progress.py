@@ -16,7 +16,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
-from typing import TextIO
+from typing import Any, TextIO
 
 import pytest
 from reuse_test_results import RESULT_CONTEXT_ENV, RESULT_SUMMARY_ENV
@@ -218,6 +218,7 @@ def pytest_unconfigure(config: pytest.Config) -> None:
 
 def run_pytest(
     command: Sequence[str], cwd: pathlib.Path, environ: Mapping[str, str],
+    **process_options: Any,
 ) -> subprocess.CompletedProcess[str]:
     """Capture both streams and forward only progress while the child still runs.
 
@@ -245,7 +246,7 @@ def run_pytest(
     read_errors: list[OSError] = []
     with subprocess.Popen(
         argv, cwd=cwd, env=child, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, encoding="utf-8", errors="replace",
+        text=True, encoding="utf-8", errors="replace", **process_options,
     ) as process:
         assert process.stdout is not None and process.stderr is not None
 

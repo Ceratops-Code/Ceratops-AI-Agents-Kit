@@ -9,6 +9,7 @@
     "kind",
     "description",
     "non_deterministic_review_file",
+    "managed_python_test_scratch_recovery",
     "surfaces",
     "manifest_profiles",
     "generated_manifest_profile",
@@ -38,6 +39,10 @@
     "non_deterministic_review_file": {
       "$ref": "#/$defs/filename",
       "description": "Executable: loader validates the companion and reverse reference."
+    },
+    "managed_python_test_scratch_recovery": {
+      "const": true,
+      "description": "Executable: when qualifying a managed Python runner, probe that a fresh invocation reclaims abandoned owned scratch, preserves live scratch and caller files, and surfaces cleanup failures."
     },
     "surfaces": {
       "description": "Executable: generator destinations/templates and checker applicability/required files.",

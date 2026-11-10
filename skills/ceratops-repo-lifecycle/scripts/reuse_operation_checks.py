@@ -1,20 +1,21 @@
 """Plan unchanged-input check reuse and bind declared runners to durable results.
 
-SDLC's optional ``check-results`` declaration extends the existing operation
-input map. It opts one command into the established five-argument runner
-contract. This module allocates paths and reads outcomes; only the repository
-runner writes an executed outcome. Unmarked/custom operations retain their
-existing behavior and never acquire invented acceptance.
+SDLC's optional ``check-results`` declaration binds one command to its input
+map. A runner can report its own results, or the operation owner can record
+the observed exit status and a JUnit case for an unmodified tool command.
 """
 
 from __future__ import annotations
 
+import datetime
 import fnmatch
 import hashlib
 import json
 import os
 import pathlib
 import subprocess
+import time
+import xml.etree.ElementTree as ET
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -23,6 +24,7 @@ from read_check_environment import read_environment
 from retain_check_results import (
     CONTEXT_ENV,
     CONTEXT_SCHEMA,
+    RESULT_SCHEMA,
     CheckResultStore,
     canonical,
     check_context,
@@ -184,6 +186,72 @@ class CheckPlan:
     result_id: str | None = None
     path: pathlib.Path | None = None
     summary: dict[str, Any] | None = None
+
+    def inputs_changed(self, prepared: Any) -> bool:
+        return collect_check_inputs(prepared, prepared.check_results) != self.context
+
+    def record_tool_result(self, prepared: Any, argv: list[str], started: datetime.datetime, code: int) -> None:
+        """Save a native command's exit observation and its reporting copy."""
+        self.result_id, self.path = self.store.new_result_path()
+        finished = max(started, datetime.datetime.now(datetime.UTC))
+        duration = (finished - started).total_seconds()
+        status = "passed" if code == 0 else "interrupted" if code == 130 else "failed"
+        check = self.context["group"]
+        version = self.context["checkVersion"]
+        work = self.context["workVersion"]
+        input_group = hashlib.sha256(canonical(self.context).rstrip(b"\n")).hexdigest()
+        record = {
+            "schema": RESULT_SCHEMA, "result_id": self.result_id, "candidate_id": work,
+            "check_id": check, "check_version": version, "status": status, "exit_code": code,
+            "invocation": {"argv": argv, "cwd": prepared.steps[0].cwd.relative_to(prepared.repo_root).as_posix()},
+            "inputs": self.context,
+            "execution": {"startedAt": started.isoformat(), "finishedAt": finished.isoformat(),
+                          "durationSeconds": duration, "workerPid": os.getpid()},
+            "check_summary": {"schema": "ceratops-check-summary.v1", "inputGroups": {input_group: self.context},
+                              "checkGroups": {}, "checks": [{"kind": "repository-check", "id": check,
+                              "status": status, "required": True, "result_id": self.result_id,
+                              "check_version": version, "inputGroup": input_group,
+                              "candidate_id": work, "qualificationLevel": self.context["qualificationLevel"],
+                              "inputs_digest": self.context["fingerprint"],
+                              "completed_ns": int(finished.timestamp() * 1_000_000_000)}]},
+        }
+        target = {key: value for key, value in self.context["scope"].items()
+                  if key not in {"worktree", "inputRules", "artifacts"}}
+        self.write_tool_junit(check, started, duration, status, code)
+        self.store.current.put("repository-check", check, target, record)
+
+    def write_tool_junit(self, check: str, started: datetime.datetime, duration: float, status: str, code: int) -> None:
+        history = self.store.common / "ceratops" / "results" / "test-history"
+        history.mkdir(parents=True, exist_ok=True)
+        cutoff = time.time() - 365 * 86400
+        for previous in history.glob("source-*.xml"):
+            suffix = previous.stem.removeprefix("source-")
+            if (len(suffix) == 36 and all(char in "0123456789abcdef-" for char in suffix)
+                    and not previous.is_symlink() and previous.is_file()):
+                try:
+                    if previous.stat().st_mtime < cutoff:
+                        previous.unlink(missing_ok=True)
+                except FileNotFoundError:
+                    continue
+        root = ET.Element("testsuites")
+        suite = ET.SubElement(root, "testsuite", name="source-check", tests="1",
+                              failures=str(int(status == "failed")), errors=str(int(status == "interrupted")),
+                              timestamp=started.isoformat())
+        properties = ET.SubElement(suite, "properties")
+        for name, value in (("ceratops.result-id", self.result_id),
+                            ("ceratops.work-version", self.context["workVersion"]),
+                            ("ceratops.check-version", self.context["checkVersion"])):
+            ET.SubElement(properties, "property", name=name, value=str(value))
+        case = ET.SubElement(suite, "testcase", classname="source-check", name=check, time=str(duration))
+        if code:
+            ET.SubElement(case, "error" if status == "interrupted" else "failure", message=f"Command exit {code}")
+        path = history / f"source-{self.result_id}.xml"
+        pending = path.with_suffix(".tmp")
+        try:
+            ET.ElementTree(root).write(pending, encoding="utf-8", xml_declaration=True)
+            pending.replace(path)
+        finally:
+            pending.unlink(missing_ok=True)
 
     def arguments(self) -> list[str]:
         if self.path is None:

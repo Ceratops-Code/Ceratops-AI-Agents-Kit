@@ -17,6 +17,7 @@ from tests.repository_lifecycle.support import (
     REPOSITORY_LIFECYCLE_SCRIPTS,
     REPOSITORY_LIFECYCLE_SOURCE,
 )
+from tests.repository_lifecycle.test_compatibility import _write_current_sdlc
 from tests.support.processes import (
     CI_ACTION_REVISION,
     COMPATIBILITY_ENGINE,
@@ -125,6 +126,7 @@ def test_android_coverage_requires_declared_gradle_checks_in_any_group(
     (repo / "README.md").write_text(
         "# Android compatible\n", encoding="utf-8", newline="\n"
     )
+    _write_current_sdlc(repo)
     applied = run_compatibility_engine(
         REPOSITORY_LIFECYCLE_SCRIPTS,
         "apply",
@@ -221,6 +223,7 @@ def test_ecosystem_coverage_requires_declared_repository_checks(
     (repo / "README.md").write_text(
         f"# {coverage_id} compatible\n", encoding="utf-8", newline="\n"
     )
+    _write_current_sdlc(repo)
     applied = run_compatibility_engine(
         REPOSITORY_LIFECYCLE_SCRIPTS,
         "apply",
@@ -335,14 +338,15 @@ def test_shell_compatibility_declares_its_generated_check_and_repeats(tmp_path: 
         )
         assert result.returncode == 0, result.stdout + result.stderr
         sdlc = yaml.safe_load((repo / "sdlc/sdlc.yml").read_text(encoding="utf-8"))
-        check = sdlc["repository"]["actions"]["pre-build-checks"]["check-groups"]["source"]
-        assert check["validation-capabilities"] == ["shellcheck"]
-        assert "shellcheck" in check["requires"]["capabilities"]
+        check = sdlc["repository"]["actions"]["pre-build-checks"]["check-groups"]["source-shellcheck"]
+        assert check["validation-tools"] == ["shellcheck"]
+        assert "shellcheck" in check["requires"]["tools"]
         generator = importlib.import_module(
             "ceratops_repo_compatibility_engine.generate_repository_checks"
         )
         shell = next(item for item in generator.contract_checks(repo) if item["id"] == "shellcheck")
-        assert shell["command"] == ["shellcheck", "--severity=error", "--", "build.sh"]
+        assert check["steps"][0]["run"] == shell["command"] == ["shellcheck", "--severity=error", "--", "build.sh"]
+        assert check["check-results"]["result-owner"] == "operation"
 
 
 def test_language_checks_respect_git_vendor_and_generated_attributes(tmp_path: pathlib.Path) -> None:
@@ -713,53 +717,20 @@ def test_compatibility_materializer_supports_repositories_without_skills(
     assert output["skill_manifest"] == "not_configured"
     assert not (repo / "skills").exists()
     contract = yaml.safe_load((repo / "sdlc" / "sdlc.yml").read_text())
-    assert contract["repository"]["actions"]["pre-build-checks"]["check-groups"]["source"]["steps"] == [
-        {"run": ["uv", "run", "--locked", "scripts/validate-repository.py"]}
-    ]
+    groups = contract["repository"]["actions"]["pre-build-checks"]["check-groups"]
+    expected = ["npm-lint", "ruff", "mypy", "actionlint"]
+    assert list(groups) == [*(f"source-{name}" for name in expected), "tests"]
+    assert all(groups[f"source-{name}"]["check-results"]["result-owner"] == "operation" for name in expected)
     assert "deliverables" not in contract
     assert not (repo / "scripts" / "deploy-skills.py").exists()
     assert output["repository_validation"] == {
-        "checks": ["npm-lint", "ruff", "mypy", "actionlint"],
-        "validator": "applied",
+        "checks": expected,
+        "validator": "not_configured",
         "workflow": "applied",
     }
-    assert (repo / "scripts" / "validate-repository.py").is_file()
-    actionlint_runner = repo / "scripts" / "run-actionlint.py"
-    assert actionlint_runner.is_file()
+    assert not (repo / "scripts" / "validate-repository.py").exists()
+    assert (repo / "scripts" / "run-actionlint.py").is_file()
     assert (repo / ".github" / "workflows" / "validate.yml").is_file()
-    actionlint_marker = repo / "scripts" / ".actionlint-invoked"
-    actionlint_runner.write_text(
-        '"""Record actionlint orchestration without using the network."""\n\n'
-        "import pathlib\n\n"
-        "marker = pathlib.Path(__file__).with_name('.actionlint-invoked')\n"
-        "marker.write_text('OK', encoding='utf-8')\n",
-        encoding="utf-8",
-        newline="\n",
-    )
-    validation_evidence = tmp_path / "zero-skill-validation.log"
-    validation_evidence.write_text("stale failure evidence\n", encoding="utf-8")
-    validation_temporary = validation_evidence.with_name(
-        f".{validation_evidence.name}.tmp"
-    )
-    validation_temporary.write_text("stale partial evidence\n", encoding="utf-8")
-    validation = subprocess.run(
-        [
-            sys.executable,
-            str(repo / "scripts" / "validate-repository.py"),
-            "--evidence-file",
-            str(validation_evidence),
-        ],
-        cwd=repo,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert validation.returncode == 0, validation.stdout + validation.stderr + (validation_evidence.read_text() if validation_evidence.exists() else "")
-    assert validation.stdout == "OK\n"
-    assert actionlint_marker.read_text(encoding="utf-8") == "OK"
-    assert not validation_evidence.exists()
-    assert not validation_temporary.exists()
-    assert not [path for path in repo.rglob("__pycache__") if ".venv" not in path.parts]
 
     omitted = run_compatibility_engine(
         engine_scripts, "apply", "--target-repo-root", str(repo), "--no-sdlc-contract",
@@ -789,6 +760,14 @@ def test_compatibility_materializer_supports_repositories_without_skills(
         (nested / "scripts" / lockfile).write_text("{}\n", encoding="utf-8")
         check = next(item for item in materializer.repository_checks.contract_checks(nested) if item["id"] == manager + "-lint")
         assert check["command"] == ["{" + manager + "}", flag, "scripts", "run", "lint"]
+        generated = materializer.prepare_sdlc_configuration(
+            nested, skill_names=[], apply_contract=True, generated_checks=[check],
+        )
+        repository = generated["repository"]
+        operation = repository["actions"]["pre-build-checks"]["check-groups"][f"source-{manager}-lint"]
+        assert operation["requires"]["tools"] == ["node", manager]
+        assert operation["check-results"]["tools"] == ["node", manager]
+        assert repository["tools"]["node"] == {"executable": "node"}
         assert materializer.repository_checks.default_markdown_files(nested) == {}
         _, setup = materializer.repository_checks._validation_workflow(nested, [check], markdown_files={})
         assert f"{manager} {flag} scripts " in setup
@@ -1047,6 +1026,7 @@ def test_compatibility_materializer_supports_repositories_without_skills(
     )
 
     authoritative_repo = empty_repository("authoritative-compatible")
+    _write_current_sdlc(authoritative_repo)
     (authoritative_repo / "scripts").mkdir()
     (authoritative_repo / "scripts" / "check_project.py").write_text(
         "import argparse\n"
@@ -1223,6 +1203,7 @@ def test_generated_scripts_and_skill_owned_ci_keep_environments_and_tests_separa
     # Test and validation commands share scripts/.venv while the application's
     # own declarations remain untouched.
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "no-installed-skills"))
+    _write_current_sdlc(repo)
     created = run_compatibility_engine(REPOSITORY_LIFECYCLE_SCRIPTS, "apply", "--target-repo-root", str(repo))
     assert created.returncode == 0, created.stdout + created.stderr
     assert (repo / "application/pyproject.toml").read_text() == application
@@ -1269,6 +1250,14 @@ def test_generated_scripts_and_skill_owned_ci_keep_environments_and_tests_separa
     prefix = ["uv", "run", "--locked"]
     validation = subprocess.run([*prefix, "scripts/validate-repository.py"], cwd=repo, capture_output=True, text=True, check=False)
     assert validation.returncode == 0, validation.stdout + validation.stderr + (pathlib.Path(json.loads(validation.stdout)["evidence_file"]).read_text() if validation.stdout.startswith("{") else "")
+    if sys.platform == "win32":
+        # Catch Linux type errors in the generated runner before remote CI.
+        linux_types = subprocess.run(
+            ["uv", "run", "--project", "scripts", "--locked", "python", "-m", "mypy",
+             "--config-file", "scripts/pyproject.toml", "--platform", "linux", "scripts/run-tests.py"],
+            cwd=repo, capture_output=True, text=True, check=False,
+        )
+        assert linux_types.returncode == 0, linux_types.stdout + linux_types.stderr
     # The generated settings must be consumed, not merely written to TOML.
     check_probe = repo / "scripts/check_probe.py"
     check_probe.write_text("import math\n")

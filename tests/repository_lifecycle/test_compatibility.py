@@ -245,12 +245,22 @@ def _write_current_sdlc(
     *,
     deliverables: dict[str, object] | None = None,
 ) -> None:
-    """Replace the shared fixture with the current template."""
+    """Prepare the v4 fixture used by legacy compatibility tests."""
 
     document = yaml.safe_load(SDLC_CONTRACT_TEMPLATE.read_text(encoding="utf-8"))
+    document["version"] = 4
+    document["repository"]["capabilities"] = document["repository"].pop("tools")
+    actions = document["repository"]["actions"]
+    actions["bootstrap"]["requires"] = {"capabilities": ["uv"]}
+    groups = actions["pre-build-checks"]["check-groups"]
+    groups["tests"]["requires"] = {"capabilities": []}
+    source = {"requires": {"capabilities": ["uv"]},
+              "steps": [{"run": ["uv", "run", "--locked", "scripts/validate-repository.py"]}]}
+    actions["pre-build-checks"]["check-groups"] = {"source": source, **groups}
     if deliverables is not None:
         document["deliverables"] = deliverables
     target = repo / "sdlc" / "sdlc.yml"
+    target.parent.mkdir(exist_ok=True)
     target.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
 
 
@@ -346,7 +356,7 @@ def test_compatibility_materializer_supplies_target_identity_and_assignments(
     contract = yaml.safe_load(
         (repo / "sdlc" / "sdlc.yml").read_text(encoding="utf-8")
     )
-    assert contract["version"] == yaml.safe_load(SDLC_CONTRACT_TEMPLATE.read_text(encoding="utf-8"))["version"]
+    assert contract["version"] == 4
     assert contract["kind"] == "ceratops-sdlc"
     alpha_actions = contract["deliverables"]["skills"]["alpha-tool"]["actions"]
     assert alpha_actions["pre-build-checks"]["check-groups"]["source"]["steps"][0]["handoff"] == {
@@ -570,7 +580,11 @@ def test_compatibility_materializer_preserves_existing_bundle_contract(
     assert prepared.returncode == 0, prepared.stdout + prepared.stderr
     sdlc_path = repo / "sdlc" / "sdlc.yml"
     contract = yaml.safe_load(sdlc_path.read_text(encoding="utf-8"))
+    from tests.repository_lifecycle.support import fixture_with_tools
+
+    contract = fixture_with_tools(contract)
     contract["version"] = 5
+    del contract["repository"]["actions"]["pre-build-checks"]["check-groups"]["source"]
     alpha = contract["deliverables"]["skills"]["alpha-tool"]
     alpha["artifact"] = {
         "type": "skill-bundle",
@@ -578,7 +592,7 @@ def test_compatibility_materializer_preserves_existing_bundle_contract(
         "filename-pattern": "alpha-tool-*.zip",
     }
     alpha["actions"]["build"] = {
-        "requires": {"capabilities": []},
+        "requires": {"tools": []},
         "steps": [{"run": ["python", "-V"]}],
         "checks": {"build-check": {"uses-artifacts": []}},
     }
@@ -611,6 +625,11 @@ def test_compatibility_materializer_preserves_existing_bundle_contract(
         "ceratops_repo_compatibility_engine.validate_ceratops_compatibility"
     )
     assert compatibility.validate_ceratops_compatibility(repo)["valid"] is True
+
+    groups = updated["repository"]["actions"]["pre-build-checks"]["check-groups"]
+    source_groups = [name for name, group in groups.items() if group.get("validation-tools")]
+    assert source_groups and list(groups)[:len(source_groups)] == source_groups
+    assert all(groups[name]["check-results"]["result-owner"] == "operation" for name in source_groups)
 
 
 def test_non_python_skill_needs_no_shared_skill_runtime(
@@ -1234,13 +1253,14 @@ def test_unpublished_ci_action_blocks_compatibility_before_target_writes(
 
 def _capability_contract(version, capabilities):
     """Supply ordinary actions so capability tests exercise the real SDLC reader."""
+    key = "tools" if version >= 5 else "capabilities"
     return {
         "version": version,
         "kind": "ceratops-sdlc",
         "repository": {
-            "capabilities": capabilities,
-            "actions": {"pre-build-checks": {"check-groups": {'source': {"requires": {"capabilities": []}, "no-op": "fixture"}, 'tests': {
-                    "requires": {"capabilities": list(capabilities)},
+            key: capabilities,
+            "actions": {"pre-build-checks": {"check-groups": {'source': {"requires": {key: []}, "no-op": "fixture"}, 'tests': {
+                    "requires": {key: list(capabilities)},
                     "steps": [{"run": [sys.executable, "-c", "print('checked')"]}],
                 }}}, },
         },
@@ -1263,7 +1283,7 @@ def test_sdlc_capabilities_reject_inline_requirements(
             "file": "tooling/package.json", "key": "engines.node",
         }
     errors = reader.validation_errors(_capability_contract(schema_version, {tool: capability}))
-    assert any("repository.capabilities." + tool in error for error in errors)
+    assert any(("repository.tools." if schema_version == 5 else "repository.capabilities.") + tool in error for error in errors)
     assert any("Additional properties are not allowed" in error for error in errors)
 
 
@@ -1350,10 +1370,10 @@ def test_sdlc_capabilities_preserve_native_references_and_unversioned_tools(
         )
         assert candidate["version"] == schema_version
         for tool, capability in capabilities.items():
-            assert candidate["repository"]["capabilities"][tool] == capability
+            assert candidate["repository"][reader.tools_key(schema_version)][tool] == capability
         prepared = run_operation_cli(tmp_path, "repository.actions.pre-build-checks.check-groups.tests", prepare_only=True)
         assert prepared.returncode == 0, prepared.stderr
-        assert json.loads(prepared.stdout)["prerequisites"]["capabilities"] == capabilities
+        assert json.loads(prepared.stdout)["prerequisites"][reader.tools_key(schema_version)] == capabilities
         assert {path: path.read_bytes() for path in original} == original
 
 
@@ -1371,10 +1391,10 @@ def test_sdlc_invalid_capability_stops_public_runner_before_effects(tmp_path, sc
     for _ in range(2):
         blocked = run_operation_cli(tmp_path, "repository.actions.pre-build-checks.check-groups.tests")
         assert blocked.returncode != 0
-        assert "repository.capabilities.git" in blocked.stderr
+        assert ("repository.tools.git" if schema_version == 5 else "repository.capabilities.git") in blocked.stderr
         assert "channel" in blocked.stderr
         assert not (tmp_path / "ran").exists()
-    contract["repository"]["capabilities"]["git"].pop("channel")
+    contract["repository"]["tools" if schema_version == 5 else "capabilities"]["git"].pop("channel")
     sdlc.write_text(yaml.safe_dump(contract), encoding="utf-8")
     completed = run_operation_cli(tmp_path, "repository.actions.pre-build-checks.check-groups.tests")
     assert completed.returncode == 0, completed.stderr
@@ -1394,19 +1414,19 @@ def test_capability_changes_preserve_artifact_release_version_and_channel():
     assert record["version"] == "7.2.0b1"
 
 
-def test_repository_capability_requirements_point_to_native_metadata():
+def test_repository_tool_requirements_point_to_native_metadata():
     reader = importlib.import_module(
         "ceratops_repo_compatibility_engine.sdlc_contract_validation"
     )
-    capabilities = reader.load_contract(ROOT / "sdlc/sdlc.yml")["repository"]["capabilities"]
-    python_reference = capabilities["python"]["version-from"]
+    tools = reader.load_contract(ROOT / "sdlc/sdlc.yml")["repository"]["tools"]
+    python_reference = tools["python"]["version-from"]
     python_metadata = tomllib.loads((ROOT / python_reference["file"]).read_text(encoding="utf-8"))
     assert python_reference["key"] == "project.requires-python"
     assert python_metadata["project"]["requires-python"]
-    node_reference = capabilities["node"]["version-from"]
+    node_reference = tools["node"]["version-from"]
     assert set(node_reference) == {"file"}
     assert (ROOT / node_reference["file"]).read_text(encoding="utf-8").strip() == "lts/*"
-    assert "version-from" not in capabilities["git"]
+    assert "version-from" not in tools["git"]
 
 
 
@@ -1475,7 +1495,7 @@ def test_new_configuration_uses_latest_installed_schema_and_keeps_existing_versi
         assert document["version"] == newest
         assert reader.validation_errors(document) == []
         assert not (repo / "sdlc/sdlc.yml").exists()
-    document["version"] = min(versions)
+    document = _capability_contract(min(versions), {})
     path = repo / "sdlc/sdlc.yml"
     path.parent.mkdir()
     path.write_text(yaml.safe_dump(document), encoding="utf-8")

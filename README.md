@@ -144,18 +144,18 @@ assigned to skills whose primary output is evidence-backed findings, while
 `bounded-model-analysis` is assigned to skills that invoke bounded
 analysis-only child models.
 The `skills/` tree is authoritative skill source for this repository.
-`sdlc/sdlc.yml` declares repository setup and validation, plus capabilities
-of each deliverable. Lifecycle actions decide when those capabilities run.
-Executable capabilities in SDLC declare version requirements only through
+`sdlc/sdlc.yml` declares repository setup, checks, and deliverable actions
+and the tools they require. SDLC v5 calls these prerequisites `tools`.
+Executable tool requirements in SDLC declare versions only through
 `version-from`: `file` names repository-relative native metadata, and `key`
 names its dotted field when the file is a structured manifest. A single-value
 file needs no key. Here Python references `scripts/pyproject.toml` at
 `project.requires-python`; Node references `scripts/.nvmrc`, whose `lts/*`
 keeps the existing LTS requirement. An npm requirement would reference the
-owning `package.json` field `engines.node`. Inline capability `version` and
-`channel` are rejected for every tool; omit `version-from` for an unversioned
-capability. These references report requirements without downloading, installing
-or choosing runtimes. Artifact, package and release versions are separate data.
+owning `package.json` field `engines.node`. Inline `version` and `channel` are
+rejected for every tool. Omit `version-from` for an unversioned tool. These
+references report requirements without downloading, installing or choosing
+runtimes. Artifact, package and release versions are separate data.
 The repository-compatibility templates under
 `skills/ceratops-repo-lifecycle/references/templates/` are reusable skeletons
 to copy into other repositories, not live configuration.
@@ -222,7 +222,7 @@ without repository deduplication.
 | `skills/sections/scripts/store_check_results.py` | Shares the current-results reader/writer between repository and skill lifecycle. Each worktree has one file; finished checks replace only their own entries. Build summaries in Git remain independent. |
 | `scripts/testing/pytest-diagnostics.py` | Extracts bounded failure summaries using exact pytest and unittest-subtest identities and source-file evidence, including parameter names containing summary separators; reports terminal import errors, nested exception-group messages and assertion differences over source context, excluding captured output. Native stderr failures before collection use the explicit `<pytest startup>` identity. Ambiguous or missing test tracebacks use only that test's summary reason. Full diagnostic files remain owned by the runner. |
 | `scripts/run-actionlint.py` | Provisions the pinned, checksum-verified actionlint release inside the scripts environment and validates every GitHub Actions workflow. |
-| `scripts/validate-repository.py` | Local validation coordinator; checks the running Python against `scripts/pyproject.toml`, runs workflow, repository lint and type checks, and captures first-failure evidence. Tests run separately through `scripts/testing/run-tests.py`. |
+| `sdlc/sdlc.yml` | Declares the native source checks. Ceratops records each command result. Tests run separately through `scripts/testing/run-tests.py`. |
 | `skills/ceratops-repo-lifecycle/references/templates/deploy-skills.py.tmpl` | Authoritative standalone installer copied into compatible skill repositories as `scripts/deploy-skills.py`; invoke it through uv using the scripts project. |
 | `skills/ceratops-repo-lifecycle/references/templates/run-tests.py.tmpl` | Standard Python runner with a caller-selected immutable test-result interface, exact successful-result reuse and direct final writes. Its compatibility probe uses its own command identity and result directory, without executing repository tests or inheriting another operation's check inputs. |
 | `skills/ceratops-repo-lifecycle/references/contracts/repository-validation-contract.json` | Schema-validated repository checks used by compatibility generation and included in repository contract review and validator discovery. |
@@ -1567,6 +1567,19 @@ absence of leftover siblings. It does not run repository tests or prove that a
 custom implementation never briefly created an internal file. Structural-only
 compatibility success is not proof that results are reusable.
 
+Compatibility probes scratch recovery before writing a new or changed managed
+Python runner to the target. A synthetic worker keeps its scratch after the
+launcher is killed. A fresh invocation reclaims that scratch after the worker
+exits and preserves the caller's other files.
+
+The kit's test runner owns scratch under `.aa` in the selected pytest temp
+parent. The standard generated runner owns `.repo-tests` in the system temp
+parent. Outside Windows these namespaces include the user ID. Each namespace
+keeps one registry lock and one lease for each run with remaining scratch.
+The runner reclaims its idle leases at startup and retires its own scratch on
+exit. A still-running child holds its lease independently. Removal failures
+report the affected path and cause, and a later invocation can finish cleanup.
+
 Result paths stay outside disposable operation checkpoints. 1e.3 defines this
 runner protocol; implemented plan 6A connects production selection, ownership
 and bounded retention under
@@ -1987,14 +2000,17 @@ working-tree diff before retrying; no crash-recovery journal is maintained.
 
 ## Validate
 
-Install the declared Python and Node development dependencies, optionally
-select a failure-evidence path, then run the same repository validator and
-explicit test runner used by CI:
+Install the declared Python and Node development dependencies and run the
+source check commands and test runner used by CI.
 
 ```powershell
 npm --prefix scripts ci
-$validationEvidence = Join-Path $env:TEMP "repository-validation.log"
-uv run --project scripts --locked python scripts/validate-repository.py --evidence-file $validationEvidence
+npm --prefix scripts run lint:markdown
+uv run --project scripts --locked python scripts/run-actionlint.py
+uv run --project scripts --locked python -m yamllint --config-file scripts/.yamllint.yml . skills/ceratops-repo-lifecycle/references/templates/sdlc.yml.tmpl
+uv run --project scripts --locked python -m ruff check --config scripts/pyproject.toml scripts mcp-servers skills/ceratops-repo-lifecycle/references/templates/deploy-skills.py.tmpl
+uv run --project scripts --locked python -m mypy --config-file scripts/pyproject.toml --platform linux
+uv run --project scripts --locked python -m mypy --config-file scripts/pyproject.toml --platform win32
 uv run --project scripts --locked python scripts/testing/run-tests.py --all
 ```
 
@@ -2011,7 +2027,7 @@ Without the flag, evidence defaults to
 Failure evidence remains available for diagnosis until the next successful run,
 which removes the selected evidence file and prunes the dedicated default
 directory when it is empty.
-The validator runs Markdown and YAML lint, Ruff, and mypy for Linux and Win32;
+The source checks run Markdown and YAML lint, Ruff, and mypy for Linux and Win32.
 it never runs tests.
 SDLC separately runs `scripts/testing/run-tests.py --auto`: exact PR base/head
 impact selection in GitHub, build-summary reuse locally, and all-group scope on
@@ -2300,11 +2316,18 @@ executed in 12.44 seconds. After an unrelated test-file edit, all 33 original
 passes were reused: 0.17 seconds collection, 0.002 seconds execution. These are
 local observations, not a whole-suite speed guarantee.
 
-SDLC `check-results` declarations connect one repository runner command to
-durable unchanged-input reuse. The operation executor supplies the existing
-five result arguments; the declared runner writes its actual outcome before
-returning. Later promotion/build calls consume eligible original passes while
-new artifact checks still run. Corrupt evidence blocks the operation.
+SDLC v5 declares executable prerequisites under `tools` and
+`requires.tools`. Declare each applicable source check in its own
+`pre-build-checks` group. With `check-results.result-owner: operation`,
+Ceratops runs that command as written and saves its outcome and JUnit case.
+A failing source check blocks the dependent build and tests. Select one check
+by its group address, or select the pre-build action to run all its groups.
+
+A test runner that reports individual cases keeps the existing five-argument
+result interface. Later promotion and build calls reuse eligible passes with
+matching inputs. Corrupt evidence blocks the operation. Actual Ceratops-owned
+source attempts remain in `<git-common-dir>/ceratops/results/test-history/`
+for up to a year, pruned when Ceratops records another source attempt.
 
 Results live in each worktree's `results/repository-checks/<worktree-id>/check_results.json`
 under `<git-common-dir>/ceratops/`. Source cleanup scopes do not retain check

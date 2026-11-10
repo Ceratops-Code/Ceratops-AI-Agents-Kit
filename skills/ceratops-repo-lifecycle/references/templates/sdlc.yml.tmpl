@@ -1,11 +1,11 @@
 version: 5
 kind: ceratops-sdlc
 # Lifecycle order: pre-build-checks, build, post-build-checks, then requested delivery.
-# The SDLC runner invokes repository validation and tests before deployment.
-# Repository scripts own result storage, reuse and applicability; success is exit 0.
+# Ceratops records native source checks and reuses applicable passes.
+# Test runners can supply case-level evidence through their result contract.
 # Keep source scans and tests in separate check-groups; each group owns its command.
 repository:
-  capabilities:
+  tools:
     # Point version-from.file at this target's native version metadata; use key
     # for a manifest field, or omit key for a single-value file such as .nvmrc.
     # Inline version/channel are invalid. Omit version-from for unversioned tools.
@@ -14,17 +14,14 @@ repository:
   actions:
     bootstrap:
       requires:
-        capabilities: [uv]
+        tools: [uv]
       steps:
         - run: [uv, sync, --project, scripts, --locked]
+        # Compatibility adds the portable Node bootstrap from the repository
+        # validation contract when the repository owns a package lockfile.
     pre-build-checks:
       check-groups:
-        source:
-          requires:
-            capabilities: [uv]
-          steps:
-            - run: [uv, run, --locked, scripts/validate-repository.py]
         tests:
           requires:
-            capabilities: []
+            tools: []
           no-op: No repository test command has been detected or declared.

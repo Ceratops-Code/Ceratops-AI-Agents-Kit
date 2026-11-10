@@ -34,7 +34,7 @@
         "requires": {
           "$ref": "#/$defs/requirements"
         },
-        "validation-capabilities": {
+        "validation-tools": {
           "description": "Validation behavior supplied by this action and consumed by repository coverage requirements.",
           "type": "array",
           "minItems": 1,
@@ -81,6 +81,10 @@
             "check-inputs"
           ],
           "properties": {
+            "result-owner": {
+              "description": "Have repository operations record the command exit and a JUnit report without changing its arguments.",
+              "const": "operation"
+            },
             "product-inputs": {
               "type": "array",
               "uniqueItems": true,
@@ -193,7 +197,7 @@
         }
       ]
     },
-    "capability": {
+    "tool": {
       "description": "Annotation-only executable metadata. Version requirements reference target-owned native metadata through version-from; omitted requirements leave the capability unversioned. Callers must not infer setup commands or select runtimes from it.",
       "type": "object",
       "additionalProperties": false,
@@ -266,10 +270,10 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "capabilities"
+        "tools"
       ],
       "properties": {
-        "capabilities": {
+        "tools": {
           "type": "array",
           "uniqueItems": true,
           "items": {
@@ -351,7 +355,7 @@
         "requires": {
           "$ref": "#/$defs/requirements"
         },
-        "validation-capabilities": {
+        "validation-tools": {
           "description": "Validation behavior supplied by this action and consumed by repository coverage requirements.",
           "type": "array",
           "minItems": 1,
@@ -1034,17 +1038,17 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "capabilities",
+        "tools",
         "actions"
       ],
       "properties": {
-        "capabilities": {
+        "tools": {
           "type": "object",
           "propertyNames": {
             "$ref": "#/$defs/identifier"
           },
           "additionalProperties": {
-            "$ref": "#/$defs/capability"
+            "$ref": "#/$defs/tool"
           }
         },
         "actions": {

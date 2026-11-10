@@ -509,7 +509,6 @@ def test_stale_rule_globs_are_rejected(test_runner_module: Any, tmp_path: pathli
             ".github/workflows/**",
             "scripts/pyproject.toml",
             "scripts/testing/run-tests.py",
-            "scripts/validate-repository.py",
             "tests/__init__.py",
             "tests/support/**",
             "tests/test-impact.json",

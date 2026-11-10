@@ -40,16 +40,17 @@ Run before opening a pull request:
 ```powershell
 npm --prefix scripts ci
 uv sync --project scripts --locked
-$validationEvidence = Join-Path $env:TEMP "repository-validation.log"
-uv run --project scripts --locked python scripts/validate-repository.py --evidence-file $validationEvidence
+npm --prefix scripts run lint:markdown
+uv run --project scripts --locked python scripts/run-actionlint.py
+uv run --project scripts --locked python -m yamllint --config-file scripts/.yamllint.yml . skills/ceratops-repo-lifecycle/references/templates/sdlc.yml.tmpl
+uv run --project scripts --locked python -m ruff check --config scripts/pyproject.toml scripts mcp-servers skills/ceratops-repo-lifecycle/references/templates/deploy-skills.py.tmpl
+uv run --project scripts --locked python -m mypy --config-file scripts/pyproject.toml --platform linux
+uv run --project scripts --locked python -m mypy --config-file scripts/pyproject.toml --platform win32
 uv run --project scripts --locked python scripts/testing/run-tests.py --all
 ```
 
-These are the same validation and test entrypoints used by CI. The validator
-never runs tests. Its shared bootstrap selects the locked scripts environment
-before validation. Complete first-failure diagnostics go only to the selected
-evidence file. It does not invoke skill-local validators. The test suite needs
-`rg` (ripgrep) on `PATH`.
+CI runs these source checks and the separate test group from `sdlc/sdlc.yml`.
+The test suite needs `rg` (ripgrep) on `PATH`.
 
 Run full skill-source validation separately when skill source, metadata, shared
 sections, runtime inputs, or skill contracts change:

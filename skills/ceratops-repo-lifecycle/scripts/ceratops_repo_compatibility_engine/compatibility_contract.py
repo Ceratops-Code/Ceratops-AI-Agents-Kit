@@ -16,14 +16,14 @@ from typing import Any
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
 
-from .sdlc_contract_validation import load_contract, validation_errors
+from .sdlc_contract_validation import load_contract, tools_key, validation_errors
 
 BUNDLE_ROOT = pathlib.Path(__file__).resolve().parents[2]
 CONTRACT_NAME = "ceratops-compatibility-deterministic-contract.json"
 
 
 def _managed_skill_record(
-    contract: dict[str, Any], name: str,
+    contract: dict[str, Any], name: str, version: int = 5,
 ) -> dict[str, Any]:
     """Materialize one typed skill record from the owned action templates."""
 
@@ -33,6 +33,7 @@ def _managed_skill_record(
         operation = actions[action_name]
         if action_name == "pre-build-checks":
             operation = operation["check-groups"]["source"]
+        operation["requires"] = {tools_key(version): []}
         handoff = operation["steps"][0]["handoff"]
         if handoff["action"] != route or handoff["inputs"] != {"skill": "{skill}"}:
             raise RuntimeError(
@@ -131,10 +132,10 @@ def load_compatibility_contract(bundle_root: pathlib.Path | None = None) -> dict
     return contract
 
 
-def managed_skill_record(name: str) -> dict[str, Any]:
+def managed_skill_record(name: str, version: int = 5) -> dict[str, Any]:
     """Return one fresh producer-owned skill declaration."""
 
-    return _managed_skill_record(load_compatibility_contract(), name)
+    return _managed_skill_record(load_compatibility_contract(), name, version)
 
 
 def surface_path(surface: str) -> pathlib.Path:

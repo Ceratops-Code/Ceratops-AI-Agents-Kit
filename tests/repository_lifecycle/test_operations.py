@@ -143,21 +143,20 @@ def test_live_sdlc_selects_validation_and_tests_for_every_install() -> None:
     )
     for install in installs:
         locations = runner.validation_operations(ROOT, [install])
-        assert "repository.actions.pre-build-checks.check-groups.source" in locations
+        assert "repository.actions.pre-build-checks.check-groups.ruff" in locations
         assert "repository.actions.pre-build-checks.check-groups.tests" in locations
         assert install.replace(".install", ".pre-build-checks.check-groups.source") in locations
-    requests = [
-        runner.OperationRequest("repository.actions.pre-build-checks.check-groups.source"),
-        runner.OperationRequest("repository.actions.pre-build-checks.check-groups.tests"),
-    ]
+    requests = [runner.OperationRequest("repository.actions.pre-build-checks")]
     operations = runner.prepare_operations(ROOT, requests, context="ci")
-    assert operations[0].steps[0].argv == (
-        "uv",
-        "run", "--project", "scripts",
-        "--locked", "python",
-        "scripts/validate-repository.py",
-    )
-    assert operations[1].steps[0].argv == (
+    assert [operation.check_group for operation in operations] == [
+        "npm-markdown-lint", "actionlint", "yaml-lint", "ruff",
+        "mypy-linux", "mypy-windows", "tests",
+    ]
+    for operation in operations[:-1]:
+        assert operation.check_results is not None
+        assert operation.check_results["result-owner"] == "operation"
+        assert len(operation.steps) == 1
+    assert operations[-1].steps[0].argv == (
         "uv",
         "run", "--project", "scripts",
         "--locked", "python",
@@ -205,12 +204,13 @@ def test_sdlc_template_is_a_schema_valid_empty_skeleton(tmp_path: pathlib.Path) 
     shutil.copy2(SDLC_CONTRACT_TEMPLATE, contract)
     document = contracts.load_contract(contract)
     assert document["version"] == contracts.latest_sdlc_version()
-    assert document["repository"]["actions"]["pre-build-checks"]["check-groups"]["source"]["steps"] == [
-        {"run": ["uv", "run", "--locked", "scripts/validate-repository.py"]}
-    ]
+    assert set(document["repository"]["tools"]) == {"uv"}
+    groups = document["repository"]["actions"]["pre-build-checks"]["check-groups"]
+    assert list(groups) == ["tests"]
+    assert "no-op" in groups["tests"]
     assert "deliverables" not in document
     live = contracts.load_contract(ROOT / "sdlc" / "sdlc.yml")
-    assert live["version"] == 4
+    assert live["version"] == 5
     entries = contracts.operation_entries(live)
     expected = {
         "deliverables.skills.ceratops-repo-lifecycle.actions.pre-build-checks.check-groups.source": (
@@ -240,9 +240,10 @@ def test_sdlc_template_is_a_schema_valid_empty_skeleton(tmp_path: pathlib.Path) 
         "--head",
         "{head}",
     ]
-    assert entries["repository.actions.pre-build-checks.check-groups.source"]["steps"] == [
-        {"run": ["uv", "run", "--project", "scripts", "--locked", "python", "scripts/validate-repository.py"]},
-    ]
+    for name, platform in (("mypy-linux", "linux"), ("mypy-windows", "win32")):
+        group = entries[f"repository.actions.pre-build-checks.check-groups.{name}"]
+        assert group["validation-tools"] == ["mypy"]
+        assert group["steps"][0]["run"][-2:] == ["--platform", platform]
     assert entries["repository.actions.pre-build-checks.check-groups.tests"]["steps"] == [
         {
             "run": [
@@ -255,7 +256,7 @@ def test_sdlc_template_is_a_schema_valid_empty_skeleton(tmp_path: pathlib.Path) 
         },
     ]
     validation = runner.validation_operations(ROOT)
-    assert validation[0] == "repository.actions.pre-build-checks.check-groups.source"
+    assert validation[0] == "repository.actions.pre-build-checks.check-groups.npm-markdown-lint"
     assert "deliverables.skills.ceratops-repo-lifecycle.actions.pre-build-checks.check-groups.source" in validation
     assert "deliverables.hooks.codex-hooks.actions.pre-build-checks.check-groups.source" in validation
     assert "deliverables.mcp-servers.ceratops-mcp-server-manager.actions.pre-build-checks.check-groups.source" in validation
@@ -964,37 +965,92 @@ def test_publication_identity_is_explicit_and_separate_from_sdlc(
 
 
 @pytest.mark.parametrize("exit_code", [0, 17])
-def test_repository_bootstrap_resolves_platform_npm_and_preserves_failure(
+@pytest.mark.parametrize(
+    ("source", "manager", "arguments"),
+    [
+        ("live", "npm", ["--prefix", "scripts", "ci"]),
+        ("package", "npm", ["--prefix", "scripts", "ci"]),
+        ("package", "pnpm", ["--dir", "scripts", "install", "--frozen-lockfile"]),
+        ("planned-markdown", "npm", ["--prefix", "scripts", "ci"]),
+    ],
+)
+def test_repository_bootstrap_resolves_platform_launcher_and_preserves_exit_status(
     tmp_path: pathlib.Path,
     exit_code: int,
+    source: str,
+    manager: str,
+    arguments: list[str],
 ) -> None:
-    """Exercise the declared bootstrap against a harmless fake npm, not an install."""
+    """Run the declared command against a fake platform-specific package manager."""
 
-    executable = tmp_path / ("npm.cmd" if os.name == "nt" else "npm")
+    executable = tmp_path / (f"{manager}.cmd" if os.name == "nt" else manager)
     executable.write_text(
-        f"@echo SDLC-npm-%*\n@exit /b {exit_code}\n"
+        f"@echo SDLC-{manager}-%*\n@exit /b {exit_code}\n"
         if os.name == "nt"
-        else f"#!/bin/sh\nprintf 'SDLC-npm-%s\\n' \"$*\"\nexit {exit_code}\n",
+        else f"#!/bin/sh\nprintf 'SDLC-{manager}-%s\\n' \"$*\"\nexit {exit_code}\n",
         encoding="utf-8",
     )
     executable.chmod(0o755)
-    contract = contracts.load_contract(
-        OPERATION_RUNNER.parents[3] / "sdlc" / "sdlc.yml"
-    )
-    argv = contract["repository"]["actions"]["bootstrap"]["steps"][-1]["run"]
     prepare_script_environment(tmp_path)
-    result = subprocess.run(
-        argv,
-        cwd=tmp_path,
-        env={**os.environ, "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"]},
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert (result.returncode == 0) is (exit_code == 0)
-    assert result.stdout.strip() == "SDLC-npm---prefix scripts ci"
-    if exit_code:
-        assert str(exit_code) in result.stderr
+    if source == "live":
+        contract = contracts.load_contract(ROOT / "sdlc" / "sdlc.yml")
+    else:
+        materializer = importlib.import_module(
+            "ceratops_repo_compatibility_engine.apply_ceratops_compatibility"
+        )
+        scripts = tmp_path / "scripts"
+        if source == "package":
+            (scripts / "package.json").write_text(
+                json.dumps({"name": "bootstrap-fixture", "packageManager": f"{manager}@10.0.0"}),
+                encoding="utf-8",
+            )
+            lockfile = "package-lock.json" if manager == "npm" else "pnpm-lock.yaml"
+            (scripts / lockfile).touch()
+        contract = materializer.prepare_sdlc_configuration(
+            tmp_path, skill_names=[], apply_contract=True, generated_checks=[],
+            planned_markdown=source == "planned-markdown",
+        )
+        assert contracts.validation_errors(contract) == []
+
+    bootstrap = contract["repository"]["actions"]["bootstrap"]
+    assert bootstrap["requires"]["tools"] == ["uv", "node", manager]
+    argv = bootstrap["steps"][-1]["run"]
+    for _ in range(2):
+        result = subprocess.run(
+            argv,
+            cwd=tmp_path,
+            env={**os.environ, "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"]},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == exit_code
+        assert result.stdout.strip() == f"SDLC-{manager}-{' '.join(arguments)}"
+
+
+@pytest.mark.parametrize("executable", ["npm", "npm.cmd", "pnpm", "pnpm.cmd"])
+def test_contract_rejects_direct_node_bootstrap(
+    tmp_path: pathlib.Path, executable: str,
+) -> None:
+    path = write_sdlc_contract(tmp_path)
+    contract = contracts.load_contract(SDLC_CONTRACT_TEMPLATE)
+    bootstrap = contract["repository"]["actions"]["bootstrap"]
+    bootstrap["steps"].append({"run": [executable, "ci"]})
+    path.write_text(json.dumps(contract), encoding="utf-8")
+    document, errors = contracts.read_contract(path)
+    assert document is None
+    assert errors == [
+        (
+            f"repository.actions.bootstrap.steps[2] must resolve {executable} on PATH "
+            "before running it. Use the portable Node bootstrap launcher."
+        )
+    ]
+
+
+@pytest.mark.parametrize("exit_code", [0, 17])
+def test_github_command_reports_bounded_failure_evidence(
+    tmp_path: pathlib.Path, exit_code: int,
+) -> None:
     command = importlib.import_module("github_pr_workflow.command")
     if exit_code:
         payload = json.dumps(

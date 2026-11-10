@@ -1,4 +1,4 @@
-"""Structural compatibility and explicit repository test-result probes.
+"""Structural compatibility and explicit runner result and scratch probes.
 
 The structural checker never runs the repository aggregate or tests. Ruff's
 read-only settings commands enforce the shared rule and Python-target policy. Optional
@@ -19,6 +19,7 @@ import runpy
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 from collections.abc import Mapping
 from typing import Any, TypedDict
@@ -27,7 +28,11 @@ import yaml
 
 from .ci_workflow import workflow_errors
 from .compatibility_contract import load_compatibility_contract, template_path
-from .generate_repository_checks import repository_owned_paths
+from .generate_repository_checks import (
+    contract_checks,
+    direct_source_check,
+    repository_owned_paths,
+)
 from .generate_test_script import discover_python_tests
 from .python_tool_configuration import ruff_policy_errors
 from .repository_validation_contract import load_validation_contract
@@ -35,6 +40,7 @@ from .sdlc_contract_validation import (
     operation_category,
     operation_entries,
     read_contract,
+    tools_key,
 )
 from .validation_environment import (
     detected_python_skills,
@@ -70,12 +76,6 @@ def _repository_entrypoint(root: pathlib.Path, operation: Mapping[str, Any]) -> 
     return False
 
 
-def _operation_requirements(operation: Mapping[str, Any]) -> set[str]:
-    """Return required runtime capabilities across supported SDLC versions."""
-
-    return set(operation.get("requires", {}).get("capabilities", []))
-
-
 def _validation_coverage_errors(
     root: pathlib.Path,
     sdlc: Mapping[str, Any],
@@ -84,6 +84,7 @@ def _validation_coverage_errors(
     """Require detected repository types to declare checks with the required capabilities."""
 
     entries = operation_entries(sdlc)
+    key = tools_key(sdlc["version"])
     errors: list[str] = []
     owned_paths = repository_owned_paths(root)
     for requirement in validation_contract["coverage_requirements"]:
@@ -102,12 +103,14 @@ def _validation_coverage_errors(
             operation_category(location)
             == requirement["operation_category"]
             and required_capabilities.issubset(
-                operation.get("validation-capabilities", [])
+                operation.get(f"validation-{key}", [])
             )
-            and required_prerequisites.issubset(_operation_requirements(operation))
+            and required_prerequisites.issubset(operation.get("requires", {}).get(key, []))
             and (
                 not requirement["require_repository_entrypoint"]
                 or _repository_entrypoint(root, operation)
+                or (sdlc["version"] >= 5 and requirement["id"] == "shell"
+                    and operation.get("check-results", {}).get("result-owner") == "operation")
             )
             for location, operation in entries.items()
         )
@@ -120,6 +123,33 @@ def _validation_coverage_errors(
                 f"{capabilities} with prerequisites {prerequisites} and a "
                 "repository-owned entrypoint"
             )
+    return errors
+
+
+def _direct_source_errors(root: pathlib.Path, entries: Mapping[str, Mapping[str, Any]]) -> list[str]:
+    """Require applicable shared tools to have a recorded, executable check."""
+    groups = [entry for name, entry in entries.items() if operation_category(name) == "pre-build-checks"]
+    errors = []
+    for check in contract_checks(root):
+        name = check["id"]
+        _, command = direct_source_check(check)
+        # Required default commands or configured variants identified by their
+        # actual module, package script or script filename, not their group name.
+        identity = command[command.index("python") + 1:] if "python" in command else command
+        if identity[0] == "-m":
+            identity = identity[:2]
+        elif identity[0] in {"npm", "pnpm"}:
+            identity = [identity[0], *identity[-2:]]
+        else:
+            identity = identity[:1]
+        if not any(
+            name in group.get("validation-tools", [])
+            and group.get("check-results", {}).get("result-owner") == "operation"
+            and len(group.get("steps", [])) == 1
+            and all(token in group["steps"][0].get("run", []) for token in identity)
+            for group in groups
+        ):
+            errors.append(f"SDLC v5 requires a recorded source check for {name}")
     return errors
 
 
@@ -383,9 +413,9 @@ def _skill_runtime_errors(
 
 def validate_ceratops_compatibility(
     repo_root: pathlib.Path, *, result_directory: pathlib.Path | None = None,
-    runner_command: list[str] | None = None,
+    runner_command: list[str] | None = None, qualify_scratch: bool = True,
 ) -> CompatibilityResult:
-    """Check structure; explicitly supplied probe arguments also gate result reuse."""
+    """Check structure and optionally qualify observable runner behavior."""
 
     root = repo_root.resolve()
     try:
@@ -434,6 +464,8 @@ def validate_ceratops_compatibility(
             and bool(python_tests)
             and test_runner_selected
         )
+        if name == "validator" and sdlc and sdlc["version"] >= 5:
+            continue
         if (required or name in present) and (error := _regular_file_error(root, paths[name])):
             errors.append(error)
     if not _regular_file_error(root, paths["workflow"]):
@@ -464,7 +496,11 @@ def validate_ceratops_compatibility(
                 for step in entry.get("steps", [])
                 if "run" in step
             ]
-            if not any(command in commands for command in validator_commands):
+            if sdlc["version"] >= 5:
+                errors.extend(_direct_source_errors(root, entries))
+                if any(surfaces["validator"]["path"] in command for command in commands):
+                    errors.append("SDLC v5 source checks must declare their commands directly.")
+            elif not any(command in commands for command in validator_commands):
                 errors.append("SDLC must invoke the repository validator through its locked uv project")
             tests = [
                 entry
@@ -475,6 +511,7 @@ def validate_ceratops_compatibility(
                 errors.append("SDLC must declare repository tests or an explicit no-op")
             if python_tests and not any(
                 "run" in step and step["run"] not in validator_commands
+                and not entry.get("validation-tools")
                 for entry in tests for step in entry.get("steps", [])
             ):
                 errors.append("detected Python tests require an executable SDLC tests operation")
@@ -489,7 +526,7 @@ def validate_ceratops_compatibility(
     if (result_directory is None) != (runner_command is None):
         errors.append("test-result probing requires both runner_command and result_directory")
     elif not errors and result_directory is not None and runner_command is not None:
-        errors.extend(probe_test_results(root, runner_command, result_directory))
+        errors.extend(probe_test_results(root, runner_command, result_directory, qualify_scratch=qualify_scratch))
     unique_errors = list(dict.fromkeys(error for error in errors if error))
     return {
         "applicable": True,
@@ -498,13 +535,179 @@ def validate_ceratops_compatibility(
     }
 
 
-def probe_test_results(root: pathlib.Path, command: list[str], result_directory: pathlib.Path) -> list[str]:
-    """Exercise the observable result protocol without running repository tests.
+def _probe_command_evidence(root: pathlib.Path, result: subprocess.CompletedProcess[str]) -> str:
+    detail = json.dumps({
+        "operation": "managed test runner probe",
+        "target": str(root),
+        "command": result.args,
+        "python_runtime": sys.executable,
+        "cwd": str(root),
+        "exit_status": result.returncode,
+        "stdout": result.stdout or "<empty>",
+        "stderr": result.stderr or "<empty>",
+    })
+    for name, value in os.environ.items():
+        if len(value) >= 4 and any(part in name.upper() for part in ("TOKEN", "PASSWORD", "SECRET", "API_KEY")):
+            detail = detail.replace(value, "<redacted>")
+    return detail
+
+
+def _wait_for_scratch_probe_worker(pid: int) -> None:
+    """Wait for the probe's own worker to release every inherited handle."""
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        open_process = kernel.OpenProcess
+        open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        open_process.restype = wintypes.HANDLE
+        wait = kernel.WaitForSingleObject
+        wait.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        wait.restype = wintypes.DWORD
+        close = kernel.CloseHandle
+        close.argtypes = [wintypes.HANDLE]
+        close.restype = wintypes.BOOL
+        handle = open_process(0x00100000, False, pid)  # SYNCHRONIZE only.
+        if not handle:
+            error = ctypes.get_last_error()
+            if error == 87:  # The known worker already exited.
+                return
+            raise ctypes.WinError(error)
+        try:
+            if wait(handle, 10_000) != 0:
+                raise TimeoutError(f"Scratch probe worker {pid} did not exit")
+        finally:
+            close(handle)
+        return
+
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        status = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, check=False, timeout=2,
+        )
+        state = status.stdout.strip()
+        if (status.returncode == 1 and not state) or state.startswith("Z"):
+            return
+        if status.returncode:
+            raise OSError(f"Cannot observe scratch probe worker {pid}: {status.stderr.strip()}")
+        time.sleep(0.02)
+    raise TimeoutError(f"Scratch probe worker {pid} did not exit")
+
+
+def _probe_managed_test_scratch(root: pathlib.Path, probe: pathlib.Path, contract: Mapping[str, Any]) -> None:
+    project = root / contract["surfaces"]["validation_project"]["path"]
+    if not project.is_file():
+        return
+    metadata = tomllib.loads(project.read_text(encoding="utf-8"))
+    if metadata.get("tool", {}).get("ceratops", {}).get("test-runner", {}).get("managed") is not True:
+        return
+    _probe_test_scratch(root, probe, pathlib.Path(contract["surfaces"]["python_test_runner"]["path"]))
+
+
+def qualify_generated_runner_scratch(content: str, probe: pathlib.Path, contract: Mapping[str, Any]) -> None:
+    """Exercise the rendered candidate before compatibility can write it to the target."""
+    if not contract["managed_python_test_scratch_recovery"]:
+        return
+    staged = probe / "candidate"
+    relative = pathlib.Path(contract["surfaces"]["python_test_runner"]["path"])
+    runner = staged / relative
+    runner.parent.mkdir(parents=True)
+    runner.write_text(content, encoding="utf-8")
+    _probe_test_scratch(staged, probe, relative)
+
+
+def _probe_test_scratch(root: pathlib.Path, probe: pathlib.Path, runner_relative: pathlib.Path) -> None:
+    """Interrupt the real runner inside caller-owned scratch, using only synthetic work."""
+    parent = probe / "scratch"
+    parent.mkdir()
+    sentinel = parent / "caller-owned.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+    ready, release = probe / "scratch-ready", probe / "scratch-release"
+    environment = os.environ.copy()
+    for name in ("CERATOPS_REPOSITORY_CHECK_CONTEXT", "CERATOPS_SDLC_TEST_CONTEXT",
+                 "CERATOPS_PYTEST_SCRATCH_ROOT", "CERATOPS_PYTEST_SCRATCH_PARENT"):
+        environment.pop(name, None)
+    environment.update({name: str(parent) for name in ("TMP", "TEMP", "TMPDIR")})
+    # Use the generated entry point directly so the process handle belongs
+    # to the runner itself, even when the repository uses a uv launcher.
+    if error := _regular_file_error(root, runner_relative):
+        raise ValueError(error)
+    runner = root / runner_relative
+    worker = (
+        "import json, os, pathlib, sys, time\n"
+        "ready, release = map(pathlib.Path, sys.argv[1:])\n"
+        "scratch = pathlib.Path(os.environ['PYTHONPYCACHEPREFIX']).parent\n"
+        "(scratch / 'worker-active').touch()\n"
+        "pending = ready.with_suffix('.pending')\n"
+        "pending.write_text(json.dumps([str(scratch), os.getpid()]), encoding='utf-8')\n"
+        "pending.replace(ready)\n"
+        "deadline = time.monotonic() + 25\n"
+        "while not release.exists() and time.monotonic() < deadline: time.sleep(0.02)\n"
+    )
+
+    def invocation(name: str, child: list[str]) -> list[str]:
+        return [
+            sys.executable, str(runner), "--result-file", str(probe / (name + ".json")),
+            "--result-id", name, "--candidate-id", "scratch-probe", "--check-id", "scratch-recovery",
+            "--check-version", "1", "--probe-command", json.dumps(child),
+        ]
+
+    def start_fresh(name: str) -> None:
+        result = subprocess.run(
+            invocation(name, [sys.executable, "-c", "pass"]), cwd=root,
+            env=environment, capture_output=True, text=True, check=False, timeout=15,
+        )
+        if result.returncode:
+            raise ValueError("Fresh managed runner failed: " + _probe_command_evidence(root, result))
+
+    child = [sys.executable, "-c", worker, str(ready), str(release)]
+    interrupted = invocation("scratch-interrupted", child)
+    with subprocess.Popen(
+        interrupted, cwd=root, env=environment,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    ) as launcher:
+        try:
+            deadline = time.monotonic() + 10
+            while not ready.is_file() and launcher.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.02)
+            if not ready.is_file():
+                launcher.kill()
+                stdout, stderr = launcher.communicate(timeout=5)
+                result = subprocess.CompletedProcess(interrupted, launcher.returncode, stdout, stderr)
+                raise ValueError("Managed runner did not reach scratch: " + _probe_command_evidence(root, result))
+            path, pid = json.loads(ready.read_text(encoding="utf-8"))
+            scratch = pathlib.Path(path).resolve()
+            if not scratch.is_relative_to(parent) or scratch == parent or not scratch.is_dir():
+                raise ValueError(f"Managed runner used scratch outside its probe scope: {scratch}")
+            launcher.kill()
+            launcher.wait(timeout=5)
+            start_fresh("scratch-worker-live")
+            if not (scratch / "worker-active").is_file():
+                raise ValueError(f"Managed runner removed scratch still in use: {scratch}")
+        finally:
+            release.touch()
+            if launcher.poll() is None:
+                launcher.kill()
+            launcher.wait(timeout=5)
+            if ready.is_file():
+                _, pid = json.loads(ready.read_text(encoding="utf-8"))
+                _wait_for_scratch_probe_worker(pid)
+    start_fresh("scratch-worker-exited")
+    if scratch.exists() or sentinel.read_text(encoding="utf-8") != "keep":
+        raise ValueError(f"Managed runner did not reclaim only abandoned scratch: {scratch}")
+
+
+def probe_test_results(
+    root: pathlib.Path, command: list[str], result_directory: pathlib.Path, *, qualify_scratch: bool = True,
+) -> list[str]:
+    """Exercise result reuse and, for managed runners, scratch recovery.
 
     The caller owns result_directory. Only an isolated child is created/deleted;
-    probe results never become repository acceptance. This checks actual command
-    executions and saved bytes, not a custom runner's source implementation.
+    probe results never become repository acceptance. Controlled commands check
+    actual executions and saved bytes without running the repository test suite.
     """
+    root = root.resolve()
     expected_declaration = {
         "schema": "ceratops-test-result-contract.v1",
         "result_schema": "ceratops-repository-check-result.v1",
@@ -575,14 +778,8 @@ def probe_test_results(root: pathlib.Path, command: list[str], result_directory:
 
             path, args, expected = request("success")
             completed = invoke(args)
-            details = json.dumps({"operation": "test-result contract probe", "target": str(root),
-                "command": completed.args, "python_runtime": sys.executable, "cwd": str(root),
-                "exit_status": completed.returncode, "stdout": completed.stdout or "<empty>",
-                "stderr": completed.stderr or "<empty>"})
-            for name, value in os.environ.items():
-                if len(value) >= 4 and any(part in name.upper() for part in ("TOKEN", "PASSWORD", "SECRET", "API_KEY")):
-                    details = details.replace(value, "<redacted>")
-            require(completed.returncode == 0, "runner did not complete the controlled check: " + details)
+            require(completed.returncode == 0,
+                    "runner did not complete the controlled check: " + _probe_command_evidence(root, completed))
             accepted = path.read_bytes()
             require(accepted == encoded(expected) and count() == 1, "runner did not write canonical final acceptance")
             modified = path.stat().st_mtime_ns
@@ -616,14 +813,18 @@ def probe_test_results(root: pathlib.Path, command: list[str], result_directory:
                 "success.json", "malformed.json", "failed.json", "interrupted.json",
             }, "runner left sibling result files")
             require({p.name for p in probe.iterdir()} == {"results", "executions"}, "runner left probe-side files")
+            if qualify_scratch:
+                contract = load_compatibility_contract()
+                if contract["managed_python_test_scratch_recovery"]:
+                    _probe_managed_test_scratch(root, probe, contract)
     except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError) as exc:
         return ["test-result contract probe failed: " + str(exc)]
     return []
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Check a custom or generated runner's result contract, not its test suite."""
-    parser = argparse.ArgumentParser(description="Probe a repository runner's reusable test results.")
+    """Qualify a runner with controlled commands in caller-owned scratch."""
+    parser = argparse.ArgumentParser(description="Probe reusable test results and managed scratch recovery.")
     parser.add_argument("--repo-root", required=True, type=pathlib.Path)
     parser.add_argument("--runner-command", required=True, help="JSON argv using the runner's declared environment.")
     parser.add_argument("--result-directory", required=True, type=pathlib.Path, help="Existing caller-owned probe directory.")

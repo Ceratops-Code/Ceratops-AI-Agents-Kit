@@ -23,6 +23,7 @@ import pytest
 
 from tests.repository_lifecycle.support import (
     REPOSITORY_LIFECYCLE_SCRIPTS,
+    fixture_with_tools,
     run_operation_cli,
 )
 from tests.support.processes import run_compatibility_engine
@@ -53,12 +54,12 @@ def _repository(repo: pathlib.Path) -> str:
 def test_explicit_group_requests_and_whole_phase_run_the_named_commands(tmp_path, entrypoint):
     repo = tmp_path / "repo"
     (repo / "sdlc").mkdir(parents=True)
-    groups = {name: {"requires": {"capabilities": []}, "steps": [{"run": [
+    groups = {name: {"requires": {"tools": []}, "steps": [{"run": [
         sys.executable, "-c", "from pathlib import Path; "
         f"p=Path('{name}'); p.write_text(p.read_text()+'x' if p.exists() else 'x')",
     ]}]} for name in ("source", "interactive")}
     (repo / "sdlc/sdlc.yml").write_text(json.dumps({"version": 5, "kind": "ceratops-sdlc",
-        "repository": {"capabilities": {}, "actions": {"pre-build-checks": {"check-groups": groups}}}}))
+        "repository": {"tools": {}, "actions": {"pre-build-checks": {"check-groups": groups}}}}))
     phase = "repository.actions.pre-build-checks"
     for locations, source_count, interactive_count in (
         (phase + ".check-groups.source", 1, 0),
@@ -89,13 +90,13 @@ def test_direct_after_group_receives_own_and_extra_files_without_running_sibling
     owner = "deliverables.packages.sample"
     extra = "deliverables.packages.supplier"
     groups = {
-        "combined": {"requires": {"capabilities": []}, "uses-artifacts": [extra], "steps": [{"run": [
+        "combined": {"requires": {"tools": []}, "uses-artifacts": [extra], "steps": [{"run": [
             sys.executable, "-c", "import json,sys; from pathlib import Path; files=json.loads(sys.argv[1]); "
             f"assert set(files)=={{{owner!r}, {extra!r}}}; "
             f"assert Path(files[{owner!r}][0]).read_bytes()==b'own'; "
             f"assert Path(files[{extra!r}][0]).read_bytes()==b'extra'; print('OK')", "{artifacts}",
         ]}]},
-        "unrequested": {"requires": {"capabilities": []}, "steps": [{"run": [
+        "unrequested": {"requires": {"tools": []}, "steps": [{"run": [
             sys.executable, "-c", "raise AssertionError('unrequested sibling ran')",
         ]}]},
     }
@@ -332,8 +333,8 @@ def test_ci_action_runs_skill_engine_without_repository_copies(
     assert not (repo / "scripts/runtime").exists()
 
 
-def _run_action(*steps: dict[str, object]) -> dict[str, object]:
-    return {"requires": {"capabilities": []}, "steps": list(steps)}
+def _run_action(*steps: dict[str, object], tool_key: str = "capabilities") -> dict[str, object]:
+    return {"requires": {tool_key: []}, "steps": list(steps)}
 
 
 def _typed_contract(repo_root: pathlib.Path | None = None) -> dict[str, Any]:
@@ -460,7 +461,6 @@ def test_typed_template_and_typed_operation_index(tmp_path: pathlib.Path) -> Non
     assert document["version"] == contracts.latest_sdlc_version()
     assert list(contracts.operation_entries(document)) == [
         "repository.actions.bootstrap",
-        "repository.actions.pre-build-checks.check-groups.source",
         "repository.actions.pre-build-checks.check-groups.tests",
     ]
 
@@ -871,6 +871,12 @@ def test_artifact_references_require_a_build_or_check_consumer(version, operatio
     else:
         actions = fixture["deliverables"]["packages"]["claims"]["actions"]
     actions.setdefault(operation, _run_action({"run": ["uv", "--version"]}))
+    if version == 5:
+        fixture = fixture_with_tools(fixture)
+        actions = fixture["repository"]["actions"] if operation == "bootstrap" else (
+            fixture["deliverables"]["apps"]["claims-mobile"]["actions"] if operation == "install"
+            else fixture["deliverables"]["packages"]["claims"]["actions"]
+        )
     assert not contracts.validation_errors(fixture)
     actions[operation]["uses-artifacts"] = ["deliverables.packages.core"]
     errors = contracts.validation_errors(fixture)
@@ -906,9 +912,13 @@ def test_typed_schema_rejects_ambiguous_steps_or_wrong_deliverable_actions(chang
     assert contracts.validation_errors(fixture)
 
 
+def _run_v5_action(*steps: dict[str, object]) -> dict[str, object]:
+    return _run_action(*steps, tool_key="tools")
+
+
 def _bundle_contract() -> dict[str, Any]:
     """Two release bundles independently consume one separately owned package."""
-    document = _typed_contract()
+    document = fixture_with_tools(_typed_contract())
     document["version"] = 5
     document["repository"]["release-bundles"] = {
         "core": {"members": ["deliverables.packages.core"]},
@@ -928,7 +938,7 @@ def _bundle_contract() -> dict[str, Any]:
         "output-directory": "dist/claims-mcp-server",
         "filename-pattern": "insurance_claims_mcp_server-*.whl",
     }
-    mcp_server["actions"]["build"] = _run_action(
+    mcp_server["actions"]["build"] = _run_v5_action(
         {"run": ["build-claims-mcp-server"]}
     )
     app = document["deliverables"]["apps"]["claims-mobile"]
@@ -938,7 +948,7 @@ def _bundle_contract() -> dict[str, Any]:
         "output-directory": "dist/desktop",
         "filename-pattern": "desktop-*.zip",
     }
-    app["actions"]["build"] = _run_action({"run": ["build-desktop"]})
+    app["actions"]["build"] = _run_v5_action({"run": ["build-desktop"]})
     return document
 
 
@@ -1018,7 +1028,7 @@ def test_bundle_requirements_keep_three_check_phases_and_unbundled_producers_sep
     action["pre-build-checks"]["check-groups"]["source"]["uses-artifacts"] = [core]
     action["build"]["uses-artifacts"] = [claims]
     action["build"]["checks"] = {"archive": {"uses-artifacts": [core]}}
-    action["post-build-checks"] = {"check-groups": {"smoke": _run_action({"run": ["smoke"]})}}
+    action["post-build-checks"] = {"check-groups": {"smoke": _run_v5_action({"run": ["smoke"]})}}
     assert contracts.validation_errors(document) == []
     entries = contracts.release_bundle_entries(document)["desktop"]
     member = entries["members"][owner]
@@ -1067,9 +1077,9 @@ def test_bundle_release_members_support_non_python_artifacts(kind: str, name: st
                 "root-dir": "hooks",
                 "build-after": ["deliverables.packages.core"],
                 "actions": {"pre-build-checks": {"check-groups": {'source': {
-                        "requires": {"capabilities": []},
+                        "requires": {"tools": []},
                         "no-op": "Covered by repository validation.",
-                    }}}, "install": _run_action({"run": ["install-hook"]})},
+                    }}}, "install": _run_v5_action({"run": ["install-hook"]})},
             }
         }
     record = document["deliverables"][kind][name]
@@ -1079,7 +1089,7 @@ def test_bundle_release_members_support_non_python_artifacts(kind: str, name: st
         "output-directory": f"dist/{name}",
         "filename-pattern": f"{name}-*.zip",
     }
-    record["actions"]["build"] = _run_action({"run": ["build-archive"]})
+    record["actions"]["build"] = _run_v5_action({"run": ["build-archive"]})
     reference = f"deliverables.{kind}.{name}"
     units = document["repository"]["release-bundles"]
     if kind in {"skills", "hooks"}:
@@ -1144,11 +1154,11 @@ def test_bundle_rejects_invalid_release_declarations(
         del mcp_server["actions"]["build"]
     elif problem == "noop_build":
         mcp_server["actions"]["build"] = {
-            "requires": {"capabilities": []},
+            "requires": {"tools": []},
             "no-op": "No build.",
         }
     elif problem == "handoff_build":
-        mcp_server["actions"]["build"] = _run_action(
+        mcp_server["actions"]["build"] = _run_v5_action(
             {
                 "handoff": {
                     "lifecycle": "some-builder",
@@ -1258,11 +1268,11 @@ def test_bundle_prepare_and_gates_keep_typed_deliverable_selection(
     mcp_servers["other-mcp-server"]["actions"]["install"]["steps"][0]["handoff"]["inputs"][
         "mcp-server"
     ] = "other-mcp-server"
-    mcp_servers["other-mcp-server"]["actions"]["pre-build-checks"]["check-groups"]["tests"] = _run_action(
+    mcp_servers["other-mcp-server"]["actions"]["pre-build-checks"]["check-groups"]["tests"] = _run_v5_action(
         {"run": ["other-tests"]}
     )
     selected_mcp_server = mcp_servers["insurance-claims-mcp-server"]
-    selected_mcp_server["actions"]["pre-build-checks"]["check-groups"]["tests"] = _run_action(
+    selected_mcp_server["actions"]["pre-build-checks"]["check-groups"]["tests"] = _run_v5_action(
         {"run": ["selected-tests"]}
     )
     for group in document["deliverables"].values():

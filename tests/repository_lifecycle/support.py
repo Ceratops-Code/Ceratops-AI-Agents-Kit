@@ -284,3 +284,13 @@ def run_pending_work(
         text=True,
         check=False,
     )
+
+
+def fixture_with_tools(document):
+    """Express a shared lifecycle fixture with the v5 tool keys."""
+    if isinstance(document, dict):
+        fields = {"capabilities": "tools", "validation-capabilities": "validation-tools"}
+        return {fields.get(key, key): fixture_with_tools(value) for key, value in document.items()}
+    if isinstance(document, list):
+        return [fixture_with_tools(value) for value in document]
+    return document

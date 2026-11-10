@@ -88,10 +88,20 @@ def test_generated_python_runner_cleans_owned_temp_even_with_overrides(
     repo = tmp_path / "runner"
     (repo / "scripts").mkdir(parents=True)
     marker = tmp_path / "observed.json"
+    external = tmp_path / "caller-owned-object"
+    external.write_bytes(b"git object")
+    readonly = sys.platform == "win32"
+    if readonly:
+        external.chmod(0o444)
+    original_mode = external.stat().st_mode
+    for variable in ("TMP", "TEMP", "TMPDIR"):
+        monkeypatch.setenv(variable, str(tmp_path))
+    link = f"    (tmp_path / 'linked-object').hardlink_to(pathlib.Path({str(external)!r}))\n" if readonly else ""
     (repo / "test_probe.py").write_text(
         "import json, pathlib\n"
         "def test_probe(tmp_path):\n"
         f"    pathlib.Path({str(marker)!r}).write_text(json.dumps(str(tmp_path)))\n"
+        f"{link}"
         "    assert False\n"
     )
     runner = _write_generated_runner(repo, ["test_probe.py"])
@@ -103,14 +113,20 @@ def test_generated_python_runner_cleans_owned_temp_even_with_overrides(
     outside = tmp_path / "caller-temp"
     inherited = f'--basetemp="{tmp_path}"' if inherited_form == "joined" else f'--basetemp "{tmp_path}"'
     monkeypatch.setenv("PYTEST_ADDOPTS", "-q " + inherited)
-    result = subprocess.run([
-        "uv", "run", "--locked", str(runner), "--pytest-arg=--basetemp", "--pytest-arg=" + str(outside),
-        "--pytest-arg=--basetemp=" + str(repo),
-    ], cwd=repo, capture_output=True, text=True, check=False)
-    assert result.returncode == 1, result.stderr
-    observed = pathlib.Path(json.loads(marker.read_text()))
-    assert not observed.exists()
-    assert not outside.exists()
+    try:
+        result = subprocess.run([
+            "uv", "run", "--locked", str(runner), "--pytest-arg=--basetemp", "--pytest-arg=" + str(outside),
+            "--pytest-arg=--basetemp=" + str(repo),
+        ], cwd=repo, capture_output=True, text=True, check=False)
+        assert result.returncode == 1, result.stderr
+        observed = pathlib.Path(json.loads(marker.read_text()))
+        assert not observed.exists()
+        assert not outside.exists()
+        assert external.read_bytes() == b"git object"
+        assert external.stat().st_mode == original_mode and external.stat().st_nlink == 1
+    finally:
+        if readonly:
+            external.chmod(0o666)
 
 
 def _result_runner(tmp_path: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
@@ -480,14 +496,14 @@ def test_test_result_probe_accepts_generated_and_custom_compliant_runners(tmp_pa
     module = importlib.import_module("ceratops_repo_compatibility_engine.validate_ceratops_compatibility")
     caller_file = output / "caller-owned.txt"
     caller_file.write_text("keep", encoding="utf-8")
-    assert module.probe_test_results(root, [sys.executable, str(runner)], output) == []
+    assert module.probe_test_results(root, [sys.executable, str(runner)], output, qualify_scratch=False) == []
     custom = root / "scripts/custom_tests.py"
     custom.write_text(
         "import runpy\n"
         f"runner = runpy.run_path({str(runner)!r})\n"
         "raise SystemExit(runner['main']())\n", encoding="utf-8",
     )
-    assert module.probe_test_results(root, [sys.executable, str(custom)], output) == []
+    assert module.probe_test_results(root, [sys.executable, str(custom)], output, qualify_scratch=False) == []
     assert list(output.iterdir()) == [caller_file]
     cli = run_compatibility_engine(
         REPOSITORY_LIFECYCLE_SCRIPTS, "check-test-results", "--repo-root", str(root),
@@ -495,6 +511,25 @@ def test_test_result_probe_accepts_generated_and_custom_compliant_runners(tmp_pa
     )
     assert cli.returncode == 0 and cli.stdout.strip() == "OK", cli.stdout + cli.stderr
     assert list(output.iterdir()) == [caller_file]
+
+
+def test_managed_runner_qualification_rejects_scratch_cleanup_while_worker_is_live(tmp_path):
+    root, runner, output = _result_runner(tmp_path)
+    original = runner.with_name("original_runner.py")
+    runner.rename(original)
+    runner.write_text(
+        "from contextlib import nullcontext\n"
+        "import runpy\n"
+        f"main = runpy.run_path({str(original)!r})['main']\n"
+        "main.__globals__['_TestScratch'].child_options = lambda self: nullcontext({})\n"
+        "raise SystemExit(main())\n",
+        encoding="utf-8",
+    )
+    module = importlib.import_module("ceratops_repo_compatibility_engine.validate_ceratops_compatibility")
+    assert module.probe_test_results(root, [sys.executable, str(runner)], output, qualify_scratch=False) == []
+    errors = module.probe_test_results(root, [sys.executable, str(runner)], output)
+    assert len(errors) == 1 and "removed scratch still in use" in errors[0]
+    assert not list(output.iterdir())
 
 
 @pytest.mark.parametrize("fault", ["declaration_only", "leftover", "no_reuse"])
@@ -570,6 +605,27 @@ def test_missing_uv_rolls_back_generated_files_before_compatibility_claim(tmp_pa
     assert outcome["phase"] == "validator_environment_setup"
     assert outcome["rollback"] == "completed"
     assert {p.name for p in tmp_path.iterdir()} == {".git"}
+
+
+def test_compatibility_qualifies_scratch_before_writing_a_new_runner(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    application = importlib.import_module("ceratops_repo_compatibility_engine.apply_ceratops_compatibility")
+    original = application.qualify_generated_runner_scratch
+    (tmp_path / ".git").write_text("gitdir: test\n", encoding="utf-8")
+    (tmp_path / "test_probe.py").write_text("def test_example(): pass\n", encoding="utf-8")
+
+    def interrupt_after_probe(content, probe, contract):
+        original(content, probe, contract)
+        assert not (tmp_path / "scripts/run-tests.py").exists()
+        raise ValueError("controlled failure before runner publication")
+
+    monkeypatch.setattr(application, "qualify_generated_runner_scratch", interrupt_after_probe)
+    assert application.main(["--target-repo-root", str(tmp_path), "--ci-action-revision", CI_ACTION_REVISION]) == 1
+    outcome = json.loads(capsys.readouterr().out)
+    assert outcome["phase"] == "test_runner_scratch_qualification"
+    assert "controlled failure before runner publication" in str(outcome)
+    assert {path.name for path in tmp_path.iterdir()} == {".git", "test_probe.py"}
 
 
 def test_result_records_template_binds_source_artifact_and_bounds_evidence(

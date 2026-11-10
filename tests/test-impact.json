@@ -1210,7 +1210,6 @@
     {
       "id": "repository-lint-source",
       "paths": [
-        "scripts/validate-repository.py",
         "scripts/run-actionlint.py"
       ],
       "suites": [

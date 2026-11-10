@@ -3,6 +3,7 @@
   "kind": "ceratops_compatibility_contract",
   "description": "Internal Ceratops repository structure and compatibility-generation defaults. Structural success is separate from the companion behavioral review. This contract stays in the lifecycle skill; targets own their generated files and dependencies.",
   "non_deterministic_review_file": "ceratops-compatibility-nondeterministic-contract.json",
+  "managed_python_test_scratch_recovery": true,
   "surfaces": {
     "validator": {
       "path": "scripts/validate-repository.py",
