@@ -13,19 +13,6 @@ jobs:
     name: validate-repository
     runs-on: __RUNNER__
     steps:
-      - name: Check pull request source for main
-        if: github.event_name == 'pull_request' && github.base_ref == 'main'
-        shell: bash
-        env:
-          PR_HEAD_BRANCH: ${{ github.head_ref }}
-          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
-          PR_BASE_REPO: ${{ github.repository }}
-        run: |
-          if [[ "$PR_HEAD_BRANCH" != release/local || "$PR_HEAD_REPO" != "$PR_BASE_REPO" ]]; then
-            echo "::error::Pull requests to main must come from this repository's release/local."
-            exit 1
-          fi
-
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # __SETUP_STEPS__

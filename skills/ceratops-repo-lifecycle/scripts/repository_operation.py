@@ -1229,12 +1229,33 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def require_release_source_for_ci() -> None:
+    """Reject direct task or fork PRs to main before running any SDLC operation."""
+    if os.environ.get("GITHUB_EVENT_NAME") != "pull_request" or os.environ.get("GITHUB_BASE_REF") != "main":
+        return
+    repository = os.environ.get("GITHUB_REPOSITORY")
+    path = os.environ.get("GITHUB_EVENT_PATH")
+    if not repository or not path:
+        raise OperationError("Missing GitHub repository or event payload for the main PR source check.")
+    try:
+        pull_request = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))["pull_request"]
+        head = pull_request["head"]
+        head_ref = head["ref"]
+        head_repository = head["repo"]["full_name"]
+    except (KeyError, TypeError, OSError, ValueError) as exc:
+        raise OperationError(f"Could not read the GitHub PR source from the event payload: {exc}") from exc
+    if head_ref != "release/local" or head_repository != repository:
+        raise OperationError("Pull requests to main must come from this repository's release/local.")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.retire_handoff_reports is not None:
         return retire_handoff_reports_cli(args)
     try:
         root = args.repo_root.expanduser().resolve(strict=True)
+        if args.ci:
+            require_release_source_for_ci()
         context = "ci" if args.ci else "return" if args.return_handoffs else "skill"
         parameters = parse_parameters(args.parameter)
         artifacts = json.loads(args.artifacts) if args.artifacts else {}

@@ -763,6 +763,44 @@ def test_prepared_results_cannot_authorize_a_new_commit(tmp_path: pathlib.Path) 
     assert not (tmp_path / "deployed").exists()
 
 
+@pytest.mark.parametrize(
+    ("base", "head", "source", "allowed"),
+    [
+        ("main", "release/local", "owner/repo", True),
+        ("main", "release/local", "fork/repo", False),
+        ("main", "Release/local", "owner/repo", False),
+        ("main", "codex/task", "owner/repo", False),
+        ("release/local", "codex/task", "owner/repo", True),
+    ],
+)
+def test_ci_operation_rejects_invalid_sources_for_main(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+    base: str, head: str, source: str, allowed: bool,
+) -> None:
+    event = tmp_path / "event.json"
+    event.write_text(json.dumps({
+        "pull_request": {"head": {"ref": head, "repo": {"full_name": source}}},
+    }), encoding="utf-8")
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request")
+    monkeypatch.setenv("GITHUB_EVENT_PATH", str(event))
+    monkeypatch.setenv("GITHUB_BASE_REF", base)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "owner/repo")
+    write_sdlc_contract(
+        tmp_path,
+        repository={
+            "capabilities": {},
+            "actions": {"pre-build-checks": {"check-groups": {"source": _no_op()}}},
+        },
+    )
+    for _ in range(2):
+        result = run_operation_cli(
+            tmp_path, CHECK + "pre-build-checks.check-groups.source", ci=True,
+        )
+        assert (result.returncode == 0) is allowed, result.stdout + result.stderr
+        if not allowed:
+            assert "must come from this repository's release/local" in json.loads(result.stderr)["message"]
+
+
 def test_bootstrap_and_ci_handoffs_need_no_skill_runtime(
     tmp_path: pathlib.Path,
 ) -> None:

@@ -200,6 +200,7 @@ def retarget_dependabot_prs(
         base = live.get("base_ref")
         is_bot = live.get("author") in {"app/dependabot", "dependabot[bot]"}
         same_repo = live.get("is_cross_repository") is False
+        problem: str | None
         if not (is_bot and same_repo):
             problem = "live PR is not an open same-repository Dependabot update"
         elif base == RELEASE_BRANCH:
