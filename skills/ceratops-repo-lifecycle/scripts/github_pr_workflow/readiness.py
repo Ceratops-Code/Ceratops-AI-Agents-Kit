@@ -804,15 +804,20 @@ def pr_readiness(selector: str | None, cwd: pathlib.Path, *, allow_admin_review_
     pr_data = gh_pr_view(selector, cwd)
     findings: list[Finding] = []
 
-    if pr_data.get("baseRefName") == "main":
-        head = pr_data.get("headRefName")
-        if head != "release/local" or pr_data.get("isCrossRepository") is not False:
-            add(
-                findings, "ERROR", "pr.release_source",
-                "Pull requests to main must come from this repository's release/local.",
-                actual={"head": head, "cross_repository": pr_data.get("isCrossRepository")},
-                expected={"head": "release/local", "cross_repository": False},
-            )
+    base = pr_data.get("baseRefName")
+    head = pr_data.get("headRefName")
+    cross_repository = pr_data.get("isCrossRepository")
+    if not isinstance(base, str) or not base:
+        add(findings, "ERROR", "pr.release_source", "PR base branch is unavailable.", actual=base)
+    elif base == "main" and (head != "release/local" or cross_repository is not False):
+        add(
+            findings, "ERROR", "pr.release_source",
+            "Pull requests to main must come from this repository's release/local.",
+            actual={"head": head, "cross_repository": cross_repository},
+            expected={"head": "release/local", "cross_repository": False},
+        )
+    else:
+        add(findings, "PASS", "pr.release_source", "PR source complies with the release-branch policy.")
 
     if pr_data.get("state") == "OPEN":
         add(findings, "PASS", "pr.state_open", "PR is open.")

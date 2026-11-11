@@ -64,6 +64,7 @@ class EnsurePrTests(unittest.TestCase):
 
     def test_main_readiness_requires_same_repository_release(self) -> None:
         for base, head, fork, blocked in (
+            (None, "release/local", False, True),
             ("main", "task", False, True),
             ("main", "release/local", True, True),
             ("main", "release/local", None, True),
@@ -76,12 +77,13 @@ class EnsurePrTests(unittest.TestCase):
                     "state": "OPEN", "mergeable": "MERGEABLE", "reviewDecision": "APPROVED",
                 }
                 with mock.patch.object(ship.readiness, "gh_pr_view", return_value=payload):
-                    _, findings = ship.readiness.pr_readiness("12", pathlib.Path.cwd())
-                release_errors = [
-                    finding for finding in findings
-                    if finding.check == "pr.release_source" and finding.level == "ERROR"
-                ]
-                self.assertEqual(bool(release_errors), blocked)
+                    _, findings = ship.readiness.validate_readiness(
+                        "12", pathlib.Path.cwd(), ship.readiness.default_contract_path(),
+                    )
+                self.assertEqual(
+                    [finding.level for finding in findings if finding.check == "pr.release_source"],
+                    ["ERROR" if blocked else "PASS"],
+                )
 
     def test_waits_until_github_reports_the_pushed_head(self) -> None:
         responses = [
