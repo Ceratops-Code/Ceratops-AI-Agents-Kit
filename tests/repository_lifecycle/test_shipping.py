@@ -655,13 +655,15 @@ def _publish_pr_setup(
     (repo / "removed.txt").write_text("old\n", encoding="utf-8")
     _commit(repo)
     assert run_git(repo, "remote", "add", "origin", str(remote)).returncode == 0
-    assert run_git(repo, "push", "origin", "main").returncode == 0
+    assert run_git(repo, "push", "origin", "main", "HEAD:refs/heads/release/local").returncode == 0
     args = module.build_parser().parse_args(
         [
             "--repo-root",
             str(repo),
             "--head-branch",
             "codex/publish",
+            "--base-branch",
+            "release/local",
             "--prepare",
             "--path",
             "code.txt",
@@ -859,7 +861,7 @@ def test_publish_pr_rejects_unsafe_preparation_before_local_writes(
     elif kind == "message":
         args.commit_message = " "
     elif kind == "base":
-        args.head_branch = "main"
+        args.head_branch = args.base_branch
     elif kind == "detached":
         assert run_git(repo, "checkout", "--detach").returncode == 0
     elif kind == "operation":
@@ -1067,6 +1069,8 @@ def test_publish_pr_head_readback_failure_reports_retained_push(
                 str(repo),
                 "--head-branch",
                 args.head_branch,
+                "--base-branch",
+                args.base_branch,
                 "--prepare",
                 "--path",
                 "code.txt",
