@@ -41,7 +41,7 @@ class DependencyFinalizationTests(unittest.TestCase):
     def live(head: str, *, failed: bool = False) -> dict[str, Any]:
         return {
             "url": "https://github.com/owner/repo/pull/1",
-            "head_oid": head, "base_ref": "main", "state": "OPEN", "is_draft": False,
+            "head_oid": head, "base_ref": "release/local", "state": "OPEN", "is_draft": False,
             "checks": [{"name": "ci", "classification": "failed"}] if failed else [],
             "mergeable": "MERGEABLE", "review_decision": "APPROVED", "merge_state": "CLEAN",
         }
@@ -62,7 +62,7 @@ class DependencyFinalizationTests(unittest.TestCase):
                     if candidate_repo != repo:
                         continue
                     head = str(number) * 40
-                    approved_live: dict[str, Any] = {"head_oid": head}
+                    approved_live: dict[str, Any] = {"head_oid": head, "base_ref": "release/local"}
                     if rebase_timeout:
                         approved_live["rebase_wait"] = {"status": "timed_out"}
                     prs.append({"number": number, "live": approved_live})
@@ -114,6 +114,7 @@ class DependencyFinalizationTests(unittest.TestCase):
 
             policy = {
                 "isArchived": False, "mergeCommitAllowed": True,
+                "defaultBranchRef": {"name": "main"},
                 "rebaseMergeAllowed": False, "squashMergeAllowed": False, "viewerPermission": "ADMIN",
             }
             with (
@@ -207,7 +208,7 @@ class DependencyFinalizationTests(unittest.TestCase):
         for admin in (False, True):
             with (
                 self.subTest(admin=admin),
-                mock.patch.object(merge, "_validate_readiness", return_value={"head_oid": head, "base": "main"}) as gate,
+                mock.patch.object(merge, "_validate_readiness", return_value={"head_oid": head, "base": "release/local"}) as gate,
                 mock.patch.object(codex_review, "wait_for_codex_threads", return_value={"head_oid": head}),
                 mock.patch.object(flow, "run_command") as command,
             ):
@@ -219,7 +220,7 @@ class DependencyFinalizationTests(unittest.TestCase):
         head = "a" * 40
         with (
             mock.patch.object(merge, "_validate_readiness", side_effect=[
-                {"head_oid": head, "base": "main"}, {"head_oid": "b" * 40, "base": "main"},
+                {"head_oid": head, "base": "release/local"}, {"head_oid": "b" * 40, "base": "release/local"},
             ]),
             mock.patch.object(codex_review, "wait_for_codex_threads", return_value={"head_oid": head}),
             self.assertRaisesRegex(flow.WorkflowError, "changed during"),
@@ -229,7 +230,7 @@ class DependencyFinalizationTests(unittest.TestCase):
     def test_source_review_does_not_accept_active_codex_threads(self):
         head = "a" * 40
         with (
-            mock.patch.object(merge, "_validate_readiness", return_value={"head_oid": head, "base": "main"}),
+            mock.patch.object(merge, "_validate_readiness", return_value={"head_oid": head, "base": "release/local"}),
             mock.patch.object(codex_review, "wait_for_codex_threads", return_value={
                 "head_oid": head, "active_codex_thread_count": 1,
             }),
@@ -240,7 +241,7 @@ class DependencyFinalizationTests(unittest.TestCase):
     def test_source_review_preserves_required_conversation_resolution(self):
         head = "a" * 40
         with (
-            mock.patch.object(merge, "_validate_readiness", return_value={"head_oid": head, "base": "main"}),
+            mock.patch.object(merge, "_validate_readiness", return_value={"head_oid": head, "base": "release/local"}),
             mock.patch.object(codex_review, "wait_for_codex_threads", return_value={
                 "head_oid": head, "unresolved_review_thread_count": 1,
             }),
@@ -329,6 +330,7 @@ class DependencyPublicationTests(unittest.TestCase):
             ))
             items = [{
                 "repo": "owner/repo", "pr": n, "approved_head": head,
+                "default_branch": "main",
                 "live": DependencyFinalizationTests.live(head),
             } for n, head in heads.items()]
 
@@ -369,6 +371,7 @@ class DependencyPublicationTests(unittest.TestCase):
                     self.assertEqual(cwd, primary)
                     self.assertIn("--ship-after-promotion", arguments)
                     self.assertEqual(arguments[arguments.index("--release-branch") + 1], "release/local")
+                    self.assertEqual(arguments[arguments.index("--main-branch") + 1], "main")
                     source = arguments[arguments.index("--source-branch") + 1]
                     self.git(cwd, "push", "origin", f"{source}:main")
                     tip = self.git(cwd, "rev-parse", source)

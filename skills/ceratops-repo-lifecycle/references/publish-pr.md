@@ -38,6 +38,9 @@ Optionally prepare a branch and commit first; stop before merge or deployment.
   push repository; discover the actual default base branch instead of assuming
   `main`. Do not change remotes, fork a repository, or widen authentication to
   resolve an ambiguous target without the required authority.
+- For a repository with default branch `main`, publish task PRs against
+  `release/local` unless another eligible base was expressly selected.
+  A PR targeting `main` requires the same repository's `release/local` source.
 - Review the selected diff and preserve unrelated work. Preparation accepts
   literal repository-relative whole files, not directories or wildcard
   expansion, and refuses any unselected index, worktree, or untracked changes.

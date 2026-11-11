@@ -76,6 +76,11 @@ ambiguous, paid, or credential-bound.
 
 - Create or fork the GitHub repo, preserve upstream linkage when needed, push
   the repo, and verify the live endpoint.
+- When setting up a new repository with Dependabot, create `release/local`
+  at the initial default-branch commit and publish both branches on the first
+  push. Set `target-branch: release/local` for every version-update entry.
+  Preserve security-only entries on the default branch. Use CI that tests PRs
+  to `release/local` and checks the source of PRs to `main`.
 - Turn off unused live features such as wiki or projects when the repo does not
   actually use them.
 - When the host supports repository rulesets, implement maintainer self-ship as
@@ -98,6 +103,8 @@ ambiguous, paid, or credential-bound.
 
 ### Completion Gate
 
+- For a new Dependabot repository, the default branch and `release/local`
+  are both present on the remote after initial publication.
 - Final GitHub setting claims are backed by successful mutation commands or a
   relevant `python -m github_contract_engine validate repo` run.
 - Maintainer bypass claims are backed by live pull-request-only ruleset evidence

@@ -24,6 +24,7 @@
       "headRefName",
       "headRefOid",
       "baseRefName",
+      "isCrossRepository",
       "autoMergeRequest",
       "ref.rules.type",
       "ref.rules.parameters.requiredApprovingReviewCount",
@@ -37,6 +38,11 @@
     ]
   },
   "checks": [
+    {
+      "id": "pr.release_source",
+      "level_on_drift": "ERROR",
+      "behavior_explanation": "A pull request targeting main must have the same repository's release/local as its source."
+    },
     {
       "id": "pr.state_open",
       "level_on_drift": "ERROR",

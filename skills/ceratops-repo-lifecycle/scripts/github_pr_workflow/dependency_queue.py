@@ -13,7 +13,10 @@ import time
 from collections import defaultdict
 from typing import Any
 
+from github_contract_engine.github_api import run_gh_api
+
 from .dependency_common import (
+    RELEASE_BRANCH,
     WorkflowError,
     as_object,
     blocker_scope,
@@ -176,8 +179,99 @@ def wait_for_dependabot_rebases(
     return details, blockers
 
 
+def retarget_dependabot_prs(
+    snapshot: dict[str, Any],
+    live_details: dict[tuple[str, int], dict[str, Any]],
+) -> tuple[dict[tuple[str, int], dict[str, Any]], list[dict[str, Any]]]:
+    """Route open same-repository Dependabot PRs before collecting acceptance evidence."""
+    repositories = {
+        str(repo.get("repo") or repo.get("full_name")).lower(): repo
+        for repo in queued_repositories(snapshot)
+    }
+    blockers = []
+    changed: dict[str, set[int]] = defaultdict(set)
+    destination_errors: dict[str, str | None] = {}
+
+    for (repo, number), live in live_details.items():
+        repository = repositories.get(repo)
+        if repository is None or repository.get("archived") or live.get("state") != "OPEN":
+            continue
+        default = repository.get("default_branch")
+        base = live.get("base_ref")
+        is_bot = live.get("author") in {"app/dependabot", "dependabot[bot]"}
+        same_repo = live.get("is_cross_repository") is False
+        problem: str | None
+        if not (is_bot and same_repo):
+            problem = "live PR is not an open same-repository Dependabot update"
+        elif base == RELEASE_BRANCH:
+            continue
+        elif not default or base != default:
+            problem = f"PR targets {base!r}; expected {default!r} or {RELEASE_BRANCH!r}"
+        else:
+            try:
+                if repo not in destination_errors:
+                    endpoint = f"repos/{repo}/git/ref/heads/{RELEASE_BRANCH}"
+                    branch = run_gh_api("GET", endpoint)
+                    destination_errors[repo] = (
+                        None if branch.ok and as_object(branch.data).get("ref") == f"refs/heads/{RELEASE_BRANCH}"
+                        else f"cannot identify published {RELEASE_BRANCH}: {branch.message or branch.status}"
+                    )
+                problem = destination_errors[repo]
+                if problem is None:
+                    endpoint = f"repos/{repo}/pulls/{number}"
+                    current = run_gh_api("GET", endpoint)
+                    pull = as_object(current.data)
+                    head = as_object(pull.get("head"))
+                    target = as_object(pull.get("base"))
+                    source_repo = as_object(head.get("repo"))
+                    target_repo = as_object(target.get("repo"))
+                    author = as_object(pull.get("user"))
+                    if (
+                        not current.ok or pull.get("state") != "open"
+                        or author.get("login") != "dependabot[bot]"
+                        or str(source_repo.get("full_name") or "").lower() != repo
+                        or str(target_repo.get("full_name") or "").lower() != repo
+                    ):
+                        problem = f"could not confirm the same open Dependabot PR: {current.message or current.status}"
+                    elif target.get("ref") == RELEASE_BRANCH:
+                        changed[repo].add(number)
+                        continue
+                    elif target.get("ref") != default:
+                        problem = f"PR target changed to {target.get('ref')!r}; retarget skipped"
+                    elif pull.get("auto_merge") is not None:
+                        problem = "PR has auto-merge enabled; disable it before retargeting"
+                    else:
+                        response = run_gh_api("PATCH", endpoint, {"base": RELEASE_BRANCH})
+                        if response.ok:
+                            changed[repo].add(number)
+                            continue
+                        problem = f"retarget failed (HTTP {response.status}): {response.message}"
+            except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+                problem = f"retarget could not be confirmed: {exc}"
+        blockers.append(scoped_blocker({
+            "repo": repo, "pr": number, "check": "dependabot_release_target", "message": problem,
+        }))
+
+    if changed:
+        refreshed, errors = fetch_pr_batch(changed)
+        blockers.extend(errors)
+        for repo, numbers in changed.items():
+            for number in numbers:
+                key = (repo, number)
+                live_details.pop(key, None)
+                observed = refreshed.get(key)
+                if observed is not None and observed.get("base_ref") == RELEASE_BRANCH:
+                    live_details[key] = observed
+                else:
+                    blockers.append(scoped_blocker({
+                        "repo": repo, "pr": number, "check": "dependabot_release_target",
+                        "message": f"live PR target did not confirm {RELEASE_BRANCH}",
+                    }))
+    return live_details, blockers
+
+
 def preflight(args: argparse.Namespace) -> int:
-    """Build a non-mutating queue gate from the caller's complete snapshot."""
+    """Build queue evidence after any explicitly requested Dependabot retargeting."""
 
     workspace_root = args.workspace_root.resolve()
     checkout_overrides = parse_checkout_overrides(args.checkout)
@@ -193,6 +287,9 @@ def preflight(args: argparse.Namespace) -> int:
         if isinstance(item, dict) and isinstance(item.get("repo"), str) and isinstance(item.get("number"), int):
             requested[item["repo"]].add(item["number"])
     live_details, blockers = fetch_pr_batch(requested)
+    if getattr(args, "retarget_dependabot_prs", False) and not snapshot_blocked:
+        live_details, target_blockers = retarget_dependabot_prs(snapshot, live_details)
+        blockers.extend(target_blockers)
     live_details, rebase_blockers = wait_for_dependabot_rebases(live_details)
     blockers.extend(rebase_blockers)
     if snapshot_blocked:
@@ -569,6 +666,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Build the snapshot and pre-edit dependency evidence.",
     )
     preflight_parser.add_argument("--automation-dir", type=pathlib.Path, help="Supply scope and required adapter/output paths from this directory; explicit options override defaults.")
+    preflight_parser.add_argument(
+        "--retarget-dependabot-prs", action="store_true",
+        help="Move eligible open Dependabot PRs to published release/local before collecting PR evidence.",
+    )
     preflight_parser.add_argument("--org", required=True)
     preflight_parser.add_argument("--exclude-repo", action="append", default=[])
     preflight_parser.add_argument(

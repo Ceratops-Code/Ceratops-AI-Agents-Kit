@@ -901,6 +901,15 @@ def finalize_scope(
             continue
         worktree = _selected_worktree(repo_root, branch)
         reason = retention_reason(branch, worktree) if retention_reason else None
+        record_path = _residual_cleanup_record_path(path, branch)
+        if reason is None and _source_record(repo_root, branch)["commit"] != source["commit"]:
+            if record_path.exists():
+                raise PendingWorkError(
+                    f"Source branch {branch!r} moved with unfinished worktree cleanup at {record_path}."
+                )
+            # The saved source can no longer authorize removal. Repository-wide
+            # cleanup can independently consider the current head.
+            reason = "source_head_changed"
         if reason is not None:
             preserved.append(branch)
             if worktree is not None:
@@ -928,7 +937,6 @@ def finalize_scope(
         if source["state"] == "retained":
             scope = _set_source_state(path, scope, branch, "deleting")
         residual_preserved: dict[str, str] | None = None
-        record_path = _residual_cleanup_record_path(path, branch)
         if worktree is not None and expected_root is not None:
             cleanup_roots.add(expected_root)
             residual_preserved = _remove_selected_worktree(

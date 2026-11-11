@@ -186,6 +186,7 @@ def project_pr(value: dict[str, Any]) -> dict[str, Any]:
         "head_ref": value.get("headRefName"),
         "base_ref": value.get("baseRefName"),
         "base_oid": value.get("baseRefOid"),
+        "is_cross_repository": value.get("isCrossRepository"),
         "mergeable": value.get("mergeable"),
         "merge_state": value.get("mergeStateStatus"),
         "review_decision": value.get("reviewDecision"),

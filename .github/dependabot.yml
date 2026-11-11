@@ -2,6 +2,7 @@ version: 2
 updates:
   - package-ecosystem: github-actions
     directory: /
+    target-branch: release/local
     schedule:
       interval: weekly
     groups:
@@ -9,6 +10,31 @@ updates:
         applies-to: version-updates
         patterns:
           - "github/codeql-action/*"
+    labels:
+      - dependencies
+      - github-actions
+  - package-ecosystem: npm
+    directory: /scripts
+    target-branch: release/local
+    schedule:
+      interval: weekly
+    labels:
+      - dependencies
+      - npm
+  - package-ecosystem: uv
+    directory: /scripts
+    target-branch: release/local
+    schedule:
+      interval: weekly
+    labels:
+      - dependencies
+      - python
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+    groups:
       codeql-action-security-updates:
         applies-to: security-updates
         patterns:
@@ -20,6 +46,7 @@ updates:
     directory: /scripts
     schedule:
       interval: weekly
+    open-pull-requests-limit: 0
     labels:
       - dependencies
       - npm
@@ -27,6 +54,7 @@ updates:
     directory: /scripts
     schedule:
       interval: weekly
+    open-pull-requests-limit: 0
     labels:
       - dependencies
       - python

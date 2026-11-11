@@ -27,6 +27,9 @@ from .command import (
     run_command,
 )
 
+# A UTF-8 byte cap also fits GitHub's character limit for multibyte text.
+GITHUB_PR_BODY_MAX_BYTES = 65_536
+
 
 class EnsurePrError(RuntimeError):
     """Raised when a prepared branch cannot be published safely."""
@@ -156,8 +159,8 @@ def _default_metadata(
 ) -> tuple[str, str]:
     """Describe the prepared commit range without assuming a repository domain.
 
-    Merge subjects describe integration rather than the shipped changes. Keep
-    every non-merge message in the body even when the title needs shortening.
+    Merge subjects describe integration rather than the shipped changes.
+    Include non-merge messages up to the body limit.
     """
 
     raw = require_output(
@@ -176,6 +179,11 @@ def _default_metadata(
     if len(title) > 120:
         title = title[:117].rstrip() + "..."
     body = "\n\n".join("- " + message.replace("\n", "\n  ") for message in messages)
+    encoded_body = body.encode("utf-8")
+    if len(encoded_body) > GITHUB_PR_BODY_MAX_BYTES:
+        notice = "\n\n_Description shortened. See the PR commits for the full messages._"
+        available = GITHUB_PR_BODY_MAX_BYTES - len(notice.encode("utf-8"))
+        body = encoded_body[:available].decode("utf-8", errors="ignore").rstrip() + notice
     return title, body
 
 
@@ -346,24 +354,29 @@ def _github_remote(value: str) -> str:
 
 
 def _publication_target(args: argparse.Namespace) -> None:
-    """Bind optional explicit base/push repositories before mutation, including forks."""
+    """Bind explicit targets and every main PR to its base and push repositories."""
 
     repo = getattr(args, "repo", None)
+    base_remote = getattr(args, "base_remote", None)
     if not repo:
-        if getattr(args, "base_remote", None):
+        if base_remote:
             raise EnsurePrError("--base-remote requires an explicit --repo target")
-        return
-    if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) is None:
+        if args.base_branch != "main":
+            return
+    elif re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) is None:
         raise EnsurePrError("--repo must use OWNER/REPO")
-    base_remote = getattr(args, "base_remote", None) or args.remote_name
     base_repo = _github_remote(require_output(
-        _git(args.repo_root, "remote", "get-url", base_remote), cwd=args.repo_root,
+        _git(args.repo_root, "remote", "get-url", base_remote or args.remote_name), cwd=args.repo_root,
     ))
+    repo = repo or base_repo
     push_repo = _github_remote(require_output(
         _git(args.repo_root, "remote", "get-url", "--push", args.remote_name), cwd=args.repo_root,
     ))
     if base_repo.lower() != repo.lower():
         raise EnsurePrError("The base remote does not match --repo")
+    if args.base_branch == "main" and push_repo.lower() != repo.lower():
+        raise EnsurePrError("Pull requests to main must come from this repository's release/local.")
+    args.repo = repo
     args.push_repo = push_repo
     args.pr_head = f"{push_repo.split('/')[0]}:{args.head_branch}"
     # This authenticated read diagnoses target access before branch/commit/push.
@@ -413,6 +426,8 @@ def _ensure_pr(args: argparse.Namespace) -> dict[str, object]:
     repo_root = args.repo_root.expanduser().resolve(strict=True)
     args.repo_root = repo_root
     args.publication_phase = "preflight"
+    if args.base_branch == "main" and args.head_branch != "release/local":
+        raise EnsurePrError("Pull requests to main must come from this repository's release/local.")
     _publication_target(args)
     if getattr(args, "prepare", False):
         args.publication_phase = "preparation_pending"

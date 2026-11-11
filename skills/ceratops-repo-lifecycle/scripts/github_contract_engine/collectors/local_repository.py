@@ -373,6 +373,7 @@ def dependabot_coverage(
         "missing_manifest_directories": [],
         "unmatched_configured_directories": [],
         "config_errors": [],
+        "version_update_target_errors": [],
         "updates_present": False,
         "schedule_present": False,
     }
@@ -412,7 +413,14 @@ def dependabot_coverage(
             continue
         schedule = update.get("schedule")
         schedules.append(isinstance(schedule, dict) and bool(schedule.get("interval")))
-        if update.get("target-branch") not in (None, default_branch):
+        target = update.get("target-branch")
+        limit = update.get("open-pull-requests-limit")
+        security_only = type(limit) is int and limit == 0
+        if not security_only and target != "release/local":
+            result["version_update_target_errors"].append(
+                f"{label}.target-branch must be release/local for version updates"
+            )
+        if target not in (None, default_branch, "release/local"):
             continue
         configured.add(ecosystem)
         plural = "directories" in update

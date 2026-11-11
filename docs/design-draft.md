@@ -146,6 +146,13 @@ retain the command, target, exit status and both output streams. Alerts without
 a PR keep their local context. These facts feed the existing compatibility
 review and promotion through `release/local`; they do not grant merge approval.
 
+Routine Dependabot PRs target `release/local`. Authorized dependency preflight
+moves same-repository bot PRs from the default branch when the published
+release branch exists, and reads the new PR target before collecting checks.
+Finalization binds approval to the reviewed head and release target. It reads
+the repository's default branch separately for shipping, and reports a
+published dependency only after that branch contains the approved commit.
+
 Android application-plugin updates resolve their exact release coordinates in
 Google Maven and collect literal Kotlin plugin declarations from that selected
 commit. Dynamic or ambiguous declarations remain unavailable or blocked; actual
@@ -2535,7 +2542,7 @@ checks such as Ruff, mypy and the configured package and workflow linters.
 For `result-owner: operation`, the executor passes the declared command
 unchanged, checks that inputs held stable, and records its exit result. It also
 writes one JUnit case per attempt under the Git common directory's
-`ceratops/results/test-history/` and prunes its reports older than one year
+`ceratops/results/test-history/` and prunes its reports older than 30 days
 when recording a new source attempt. History is separate from acceptance.
 
 The executor supplies the existing five result arguments to a test runner

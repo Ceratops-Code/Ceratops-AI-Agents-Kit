@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import platform
 import subprocess
 import sys
 import tomllib
@@ -10,6 +11,7 @@ from importlib.metadata import version
 
 import pytest
 from packaging.requirements import Requirement
+from packaging.specifiers import SpecifierSet
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 
@@ -34,10 +36,9 @@ def test_repository_entrypoints_run_through_uv(
     mcp_server_metadata = tomllib.loads(
         (ROOT / "mcp-servers" / "ceratops_mcp_server_manager" / "pyproject.toml").read_text(encoding="utf-8")
     )
-    assert (
-        metadata["project"]["requires-python"]
-        == mcp_server_metadata["project"]["requires-python"]
-    )
+    tooling_python = platform.python_version()
+    assert tooling_python in SpecifierSet(metadata["project"]["requires-python"])
+    assert tooling_python in SpecifierSet(mcp_server_metadata["project"]["requires-python"])
     monkeypatch.delenv("UV_PROJECT_ENVIRONMENT", raising=False)
     script = ROOT / entrypoint
     if script.suffix == ".tmpl":

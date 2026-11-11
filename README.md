@@ -230,7 +230,7 @@ without repository deduplication.
 | `skills/ceratops-repo-lifecycle/references/templates/validate-repository.py.tmpl`, `validate.yml.tmpl`, and `run-actionlint.py.tmpl` | Repository-neutral validation templates created only when their target files are absent; new validation setups receive a pinned, checksum-verified actionlint runner, and setups without JavaScript package-manager files also receive locked Markdown dependencies and default rules. Existing tooling, Markdown settings, and exclusive validators are preserved. |
 | `skills/ceratops-repo-lifecycle/scripts/ceratops_repo_compatibility_engine/` | Skill-owned package with the shared compatibility-contract loader, read-only compatibility checks, SDLC-contract validation, rollback-protected Ceratops compatibility application, and version-only bootstrap synchronization; it operates on explicit target repositories and is never copied into them. |
 | `skills/ceratops-repo-lifecycle/scripts/github_pr_workflow/dependency_evidence.py` | Collects exact-commit dependency context and official release metadata, including Android application-plugin POM coordinates from Google Maven and literal Kotlin plugin declarations. Dynamic or ambiguous declarations remain blocked; candidate builds own compatibility checks. |
-| `skills/ceratops-repo-lifecycle/scripts/github_pr_workflow/dependency_finalization.py` | Reviews approved dependency heads with at most 32 concurrent read-only workers. Every source keeps its full configured Codex window and before/after readiness checks; publication starts after all workers stop, preserving independent PR failures and repository release batches. |
+| `skills/ceratops-repo-lifecycle/scripts/github_pr_workflow/dependency_finalization.py` | Reviews approved dependency heads against `release/local` with at most 32 concurrent read-only workers. After all workers stop, publishes each eligible release batch to its default branch and checks that it contains the approved commits. |
 | `skills/ceratops-repo-lifecycle/references/templates/skill-sections.json.tmpl` | Repository-neutral template for creating a target repository's live `skills/skill-sections.json`; never a live manifest. |
 | `skills/ceratops-skill-lifecycle/scripts/runtime/install-managed-skills.py` | Owns the managed deployment callable and its CLI: checks installation inputs and the exact source selection before one runtime transaction; handles inventory and explicit prior-owner migration; returns the actual installed/removed skills, source commit, transaction and runtime-cleanup debt. It receives no promotion report and never calls repository cleanup. |
 | `skills/ceratops-skill-lifecycle/scripts/runtime/managed_runtime_builder.py` | Renders desired files before copying, leaves current skills in place, atomically applies manifest-only changes, and stages, activates, rolls back, recovers, and cleans changed skills in one locked transaction. |
@@ -264,7 +264,7 @@ without repository deduplication.
 | `skills/ceratops-repo-lifecycle/scripts/manage-pending-work.py` | Records, checks, automatically resumes the retained target commit, and progressively finalizes the exact selected scope; preflight preserves and reports non-cleanup-eligible worktrees, while eligible residual-worktree and identity-matched task-temp cleanup delegates bounded removal to `pending-work-cleanup.py`. |
 | `skills/ceratops-repo-lifecycle/scripts/pending-work-cleanup.py` | Checks named directory boundaries, preserves active skill-update state, and removes selected residual and task-temp trees after clearing read-only Windows files and directories without traversing links. |
 | `skills/ceratops-repo-lifecycle/scripts/action.yml` | GitHub composite action that runs explicitly requested check phases or groups using the skill-owned SDLC engine; The required `operations` input names check phases or individual groups, one per line; name only the source group when tests require an interactive desktop. CI defers skill handoffs and retains failure evidence. |
-| `skills/ceratops-repo-lifecycle/scripts/repository_operation.py` | Single capability runner: resolves complete YAML locations, prevalidates ordered argv/parameters/cwd, runs applicable validation and test gates before deployment or publication, and retains bounded structured step results separately from command completion; skill callers execute registered handoffs and CI defers them. |
+| `skills/ceratops-repo-lifecycle/scripts/repository_operation.py` | Runs named SDLC operations and keeps their structured results separate from command completion. Skill callers execute registered handoffs. CI defers handoffs and checks that PRs to `main` come from the same repository's `release/local`. |
 | `skills/ceratops-repo-lifecycle/scripts/execute_skill_actions.py` | Runs a skill action's declared commands for the repository runner. Selects ordinary, named-skill or package-backed MCP arguments before any command starts. MCP package selection uses the SDLC prerequisites, exact project pin, one existing wheel and its canonical package lock; it never builds or tests an artifact. Preserves installed/source agreement and pinned Python execution, and returns step results and complete failure-report paths. It calls the owning skill's implementation; it does not install skills itself. |
 | `skills/ceratops-repo-lifecycle/scripts/ship-repository.py` | Public Ship argument parser and JSON/exit-code adapter; calls `github_pr_workflow/ship_repository.py`. |
 | `skills/ceratops-repo-lifecycle/scripts/github_pr_workflow/ship_repository.py` | Callable Ship orchestration and shared inputs/errors, used by both the CLI and Promote: SDLC checks, direct GitHub workflow calls, publication, installation and cleanup. |
@@ -289,8 +289,9 @@ worktree and source subdirectory paths, checks receipt ownership against the
 primary checkout, and removes only the selected report without replaying work.
 
 New shipping PRs use non-merge commit subjects from the base-to-head range for
-their title, shortened to 120 characters, and all those commit messages for
-their description. Both direct shipping and promotion with
+their title, shortened to 120 characters. The generated description is capped
+at 65,536 UTF-8 bytes and points to the PR commits when shortened. Both direct
+shipping and promotion with
 `--ship-after-promotion` accept independent `--title` and `--body` overrides.
 Supplied text, including an empty body, is preserved; existing PR fields change
 only when explicitly supplied. A range without change commits requires both
@@ -1085,6 +1086,10 @@ Before Git removal, exact matching promotion sources become `deleting`; after
 their branch is gone, cleanup retires those entries through the promotion owner.
 Unrelated entries stay intact, and interrupted removal cannot leave a missing
 `retained` source blocking the next Ship.
+If a selected source head has moved since promotion, scoped cleanup retires
+its stale entry and leaves the branch to repository-wide cleanup, which checks
+the live head independently. An unfinished worktree cleanup record still
+blocks retirement of the stale entry.
 
 ### Governance proposal construction
 
@@ -2327,7 +2332,7 @@ A test runner that reports individual cases keeps the existing five-argument
 result interface. Later promotion and build calls reuse eligible passes with
 matching inputs. Corrupt evidence blocks the operation. Actual Ceratops-owned
 source attempts remain in `<git-common-dir>/ceratops/results/test-history/`
-for up to a year, pruned when Ceratops records another source attempt.
+for 30 days, pruned when Ceratops records another source attempt.
 
 Results live in each worktree's `results/repository-checks/<worktree-id>/check_results.json`
 under `<git-common-dir>/ceratops/`. Source cleanup scopes do not retain check

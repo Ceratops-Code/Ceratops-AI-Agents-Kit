@@ -1051,6 +1051,74 @@ def test_ship_finalization_removes_shipped_unarchived_worktrees(
     assert git(repository, "rev-parse", "release/local") == head
 
 
+@pytest.mark.parametrize(
+    ("state", "interruption"),
+    [("retained", "before"), ("deleting", "after"), ("deleting", "residual")],
+)
+def test_ship_finalization_uses_live_head_after_selected_source_moves(
+    cleanup: ModuleType,
+    repository: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+    interruption: str,
+) -> None:
+    branch = "codex/advanced-source"
+    git(repository, "branch", branch)
+    git(repository, "commit", "--allow-empty", "-m", "later shipped commit")
+    git(repository, "branch", "release/local")
+    head = git(repository, "rev-parse", "main")
+    manager = cleanup._scope_manager()
+    recorded = manager["record_scope"](
+        repository, target_branch="release/local", target_commit=head, source_branches=[branch],
+    )
+    scope = pathlib.Path(recorded["pending_work_scope"])
+    if state == "deleting":
+        manager["_set_source_state"](scope, manager["_read_scope"](scope), branch, state)
+    git(repository, "branch", "-f", branch, head)
+    threads(cleanup, monkeypatch, [])
+
+    def finalize() -> dict[str, Any]:
+        return cleanup.finalize_shipping(
+            repository, scope, target_branch="release/local", target_commit=head,
+            current_branch="main", current_commit=head,
+        )
+
+    if interruption == "residual":
+        residual = manager["_residual_cleanup_record_path"](scope, branch)
+        residual.parent.mkdir(parents=True, exist_ok=True)
+        residual.write_text("unfinished cleanup", encoding="utf-8")
+        with pytest.raises(manager["PendingWorkError"], match="unfinished worktree cleanup"):
+            finalize()
+        assert scope.exists()
+        assert residual.read_text(encoding="utf-8") == "unfinished cleanup"
+        assert git(repository, "rev-parse", branch) == head
+        return
+
+    retire = manager["_remove_source_record"]
+
+    def interrupt_scope_retirement(*args: Any) -> None:
+        if interruption == "after":
+            retire(*args)
+        raise KeyboardInterrupt
+
+    with monkeypatch.context() as fault:
+        fault.setattr(cleanup, "_scope_manager", lambda: manager)
+        fault.setitem(
+            manager["finalize_scope"].__globals__, "_remove_source_record", interrupt_scope_retirement,
+        )
+        with pytest.raises(KeyboardInterrupt):
+            finalize()
+    assert scope.exists() is (interruption == "before")
+    assert git(repository, "rev-parse", branch) == head
+
+    completed = finalize()
+    assert completed["status"] == "finalized"
+    assert completed["removed"] == [branch]
+    assert completed["repository_cleanup"]["removed"][0]["head"] == head
+    assert not scope.exists()
+    assert finalize()["removed"] == []
+
+
 def test_ship_finalization_command_without_scope_calls_repository_cleanup(
     cleanup: ModuleType,
     repository: pathlib.Path,

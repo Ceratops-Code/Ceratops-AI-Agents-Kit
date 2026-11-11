@@ -1,6 +1,6 @@
 ---
 name: Ceratops repository checks
-description: Run explicitly named SDLC check phases or groups through the lifecycle.
+description: Check the pull request source and run named SDLC check phases or groups.
 inputs:
   repo-root:
     description: Repository root containing sdlc/sdlc.yml.

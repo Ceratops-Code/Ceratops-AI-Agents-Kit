@@ -227,6 +227,7 @@
       "required": [
         "package-ecosystem",
         "directory",
+        "target-branch",
         "schedule"
       ],
       "properties": {
@@ -236,6 +237,9 @@
         "directory": {
           "type": "string",
           "pattern": "^/"
+        },
+        "target-branch": {
+          "const": "release/local"
         },
         "schedule": {
           "type": "object",

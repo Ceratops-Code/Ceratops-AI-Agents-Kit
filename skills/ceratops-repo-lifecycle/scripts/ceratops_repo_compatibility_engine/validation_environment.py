@@ -155,14 +155,20 @@ def runtime_files(
     if ".gitignore" in planned_files or not root_ignore.is_file() or root_ignore.read_bytes().decode("utf-8") != existing_root_ignore:
         files[root_ignore] = existing_root_ignore
     dependabot = root / ".github/dependabot.yml"
-    data = yaml.safe_load(dependabot.read_text(encoding="utf-8")) if dependabot.is_file() else {"version": 2, "updates": []}
+    existing_dependabot = dependabot.read_bytes().decode("utf-8") if dependabot.is_file() else None
+    data = yaml.safe_load(existing_dependabot) if existing_dependabot is not None else {"version": 2, "updates": []}
     if not isinstance(data, dict) or data.get("version") != 2 or not isinstance(data.get("updates"), list):
         raise RuntimeError("Dependabot configuration must have version 2 and an updates list")
-    registrations = [dict(contract["dependency_updates"]), dict(contract["ci_dependency_updates"])]
+    target_branch = contract["dependency_updates"]["target-branch"]
+    registrations = [
+        dict(contract["dependency_updates"]),
+        {**contract["ci_dependency_updates"], "target-branch": target_branch},
+    ]
     npm_directory = "/" if (root / "package.json").is_file() else "/scripts"
     if (root / npm_directory.lstrip("/") / "package.json").is_file() or "scripts/package.json" in planned_files:
         registrations.append({
             "package-ecosystem": "npm", "directory": npm_directory,
+            "target-branch": target_branch,
             "schedule": dict(contract["dependency_updates"]["schedule"]),
         })
     if has_python_skills:
@@ -173,12 +179,28 @@ def runtime_files(
         })
     if not all(isinstance(item, dict) for item in data["updates"]):
         raise RuntimeError("Dependabot updates must be objects")
+    changed = False
+    version_updates = []
+    for item in data["updates"]:
+        limit = item.get("open-pull-requests-limit")
+        if type(limit) is int and limit == 0:
+            continue
+        version_updates.append(item)
+        if item.get("target-branch") != target_branch:
+            item["target-branch"] = target_branch
+            changed = True
     for registration in registrations:
         if not any(item.get("package-ecosystem") == registration["package-ecosystem"] and (
             item.get("directory") == registration["directory"] or registration["directory"] in item.get("directories", [])
-        ) for item in data["updates"]):
+        ) for item in version_updates):
             data["updates"].append(registration)
-            files[dependabot] = yaml.safe_dump(data, sort_keys=False)
+            version_updates.append(registration)
+            changed = True
+    if changed:
+        rendered_dependabot = yaml.safe_dump(data, sort_keys=False)
+        if existing_dependabot is not None and "\r\n" in existing_dependabot:
+            rendered_dependabot = rendered_dependabot.replace("\n", "\r\n")
+        files[dependabot] = rendered_dependabot
     return files
 
 

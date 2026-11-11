@@ -199,6 +199,10 @@
           "operator": "empty"
         },
         {
+          "path": "/repository/content/dependabot/version_update_target_errors",
+          "operator": "empty"
+        },
+        {
           "path": "/repository/content/dependabot/updates_present",
           "operator": "equal",
           "expected": true

@@ -15,6 +15,7 @@ from typing import Any
 from .dependency_common import (
     PR_ID_RE,
     PR_URL_RE,
+    RELEASE_BRANCH,
     REPO_FIELDS,
     TERMINAL_MERGE_STATES,
     WorkflowError,
@@ -71,17 +72,16 @@ def head_binding_blocker(
     """Block live dependency content that differs from preflight approval."""
 
     live_head = live.get("head_oid")
-    if live_head == approved_head:
-        return None
-    return {
-        "repo": repo,
-        "pr": number,
-        "check": "preflight_head",
-        "message": (
+    if live_head != approved_head:
+        return {"repo": repo, "pr": number, "check": "preflight_head", "message": (
             f"PR head changed from preflight-approved commit {approved_head!r} "
             f"to {live_head!r}; run a new preflight and approval"
-        ),
-    }
+        )}
+    if live.get("base_ref") != RELEASE_BRANCH:
+        return {"repo": repo, "pr": number, "check": "dependabot_release_target", "message": (
+            f"PR targets {live.get('base_ref')!r}; retarget to {RELEASE_BRANCH} and run preflight again"
+        )}
+    return None
 
 
 def fetch_repo_policy(repo: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
@@ -237,15 +237,17 @@ def review_dependency_source(
 
     url = f"https://github.com/{repo}/pull/{number}"
     first = merge._validate_readiness(url, checkout, allow_admin_review_bypass=admin)
-    if first.get("head_oid") != expected_head:
-        raise WorkflowError("dependency PR changed before its review gate")
+    if first.get("head_oid") != expected_head or first.get("base") != RELEASE_BRANCH:
+        raise WorkflowError("dependency PR head or release target changed before its review gate")
     review = codex_review.wait_for_codex_threads(
         url, repo, wait_seconds=wait_seconds, interval_seconds=interval_seconds,
         authors=codex_review.DEFAULT_CODEX_AUTHORS, cwd=checkout,
     )
     final = merge._validate_readiness(url, checkout, allow_admin_review_bypass=admin)
-    if any(item.get("head_oid") != expected_head for item in (review, final)):
-        raise WorkflowError("dependency PR changed during its review gate")
+    if final.get("base") != RELEASE_BRANCH or any(
+        item.get("head_oid") != expected_head for item in (review, final)
+    ):
+        raise WorkflowError("dependency PR head or release target changed during its review gate")
     if int(review.get("active_codex_thread_count") or 0):
         raise WorkflowError("dependency PR has active Codex review threads")
     if int(review.get("unresolved_review_thread_count") or 0):
@@ -380,9 +382,11 @@ def publish_dependency_batch(
         worktree = primary.parent / "worktrees" / primary.name / task
         result.update(worktree=str(worktree), release_branch="release/local")
         dependency_command(primary, "git", "fetch", "origin")
-        base_ref = str(items[0]["live"].get("base_ref") or "main")
-        if any(str(item["live"].get("base_ref") or "main") != base_ref for item in items):
-            raise WorkflowError("approved updates use different release base branches")
+        base_ref = items[0]["default_branch"]
+        if not base_ref or base_ref == RELEASE_BRANCH or any(
+            item["default_branch"] != base_ref for item in items
+        ):
+            raise WorkflowError("approved updates require one default branch distinct from release/local")
         base = dependency_command(primary, "git", "rev-parse", f"origin/{base_ref}")
         probe = run_command(["git", "rev-parse", "--verify", "refs/heads/release/local"], cwd=primary)
         if probe.returncode:
@@ -790,6 +794,11 @@ def finalize(args: argparse.Namespace) -> int:
         head_blocker = head_binding_blocker(
             repo, number, approved_head, live
         )
+        if head_blocker is None and approved_live.get("base_ref") != RELEASE_BRANCH:
+            head_blocker = {
+                "repo": repo, "pr": number, "check": "dependabot_release_target",
+                "message": "approval is missing preflight evidence against release/local",
+            }
         if head_blocker:
             blockers.append(head_blocker)
             results.append({**head_blocker, "status": "blocked"})
@@ -879,6 +888,7 @@ def finalize(args: argparse.Namespace) -> int:
         ready_batches.setdefault(repo, []).append({
             "repo": repo, "pr": number, "approved_head": approved_head,
             "live": live, "checkout": str(checkout_path),
+            "default_branch": as_object(policy.get("defaultBranchRef")).get("name"),
         })
 
     ready_batches, review_blockers = review_dependency_batches(ready_batches, args)
