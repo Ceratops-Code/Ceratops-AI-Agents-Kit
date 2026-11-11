@@ -27,6 +27,9 @@ from .command import (
     run_command,
 )
 
+# A UTF-8 byte cap also fits GitHub's character limit for multibyte text.
+GITHUB_PR_BODY_MAX_BYTES = 65_536
+
 
 class EnsurePrError(RuntimeError):
     """Raised when a prepared branch cannot be published safely."""
@@ -156,8 +159,8 @@ def _default_metadata(
 ) -> tuple[str, str]:
     """Describe the prepared commit range without assuming a repository domain.
 
-    Merge subjects describe integration rather than the shipped changes. Keep
-    every non-merge message in the body even when the title needs shortening.
+    Merge subjects describe integration rather than the shipped changes.
+    Include non-merge messages up to the body limit.
     """
 
     raw = require_output(
@@ -176,6 +179,11 @@ def _default_metadata(
     if len(title) > 120:
         title = title[:117].rstrip() + "..."
     body = "\n\n".join("- " + message.replace("\n", "\n  ") for message in messages)
+    encoded_body = body.encode("utf-8")
+    if len(encoded_body) > GITHUB_PR_BODY_MAX_BYTES:
+        notice = "\n\n_Description shortened. See the PR commits for the full messages._"
+        available = GITHUB_PR_BODY_MAX_BYTES - len(notice.encode("utf-8"))
+        body = encoded_body[:available].decode("utf-8", errors="ignore").rstrip() + notice
     return title, body
 
 

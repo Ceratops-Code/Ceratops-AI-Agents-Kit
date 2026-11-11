@@ -289,8 +289,9 @@ worktree and source subdirectory paths, checks receipt ownership against the
 primary checkout, and removes only the selected report without replaying work.
 
 New shipping PRs use non-merge commit subjects from the base-to-head range for
-their title, shortened to 120 characters, and all those commit messages for
-their description. Both direct shipping and promotion with
+their title, shortened to 120 characters. The generated description is capped
+at 65,536 UTF-8 bytes and points to the PR commits when shortened. Both direct
+shipping and promotion with
 `--ship-after-promotion` accept independent `--title` and `--body` overrides.
 Supplied text, including an empty body, is preserved; existing PR fields change
 only when explicitly supplied. A range without change commits requires both
@@ -1085,6 +1086,10 @@ Before Git removal, exact matching promotion sources become `deleting`; after
 their branch is gone, cleanup retires those entries through the promotion owner.
 Unrelated entries stay intact, and interrupted removal cannot leave a missing
 `retained` source blocking the next Ship.
+If a selected source head has moved since promotion, scoped cleanup retires
+its stale entry and leaves the branch to repository-wide cleanup, which checks
+the live head independently. An unfinished worktree cleanup record still
+blocks retirement of the stale entry.
 
 ### Governance proposal construction
 

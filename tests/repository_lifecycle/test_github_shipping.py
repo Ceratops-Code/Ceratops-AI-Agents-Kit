@@ -196,6 +196,27 @@ def test_ensure_pr_metadata_bounds_title_without_dropping_description(
         ensure_pr._default_metadata(metadata_repo, "HEAD", "HEAD")
 
 
+@pytest.mark.parametrize("character", ["a", "\U0001F642"])
+def test_ensure_pr_metadata_limits_generated_body(
+    metadata_repo: pathlib.Path, monkeypatch: pytest.MonkeyPatch, character: str,
+) -> None:
+    ensure_pr = load_pr_workflow_module(monkeypatch, "ensure_pr")
+    message_file = metadata_repo / ".git" / "large-message"
+    message_file.write_text(
+        "A large change\n\n" + character * 65_536 + "\nEnd of the message.\n",
+        encoding="utf-8",
+    )
+    result = run_git(metadata_repo, "commit", "--allow-empty", "-F", str(message_file))
+    assert result.returncode == 0, result.stderr
+    title, body = ensure_pr._default_metadata(metadata_repo, "main", "HEAD")
+    assert title == "A large change"
+    assert body.startswith("- A large change\n")
+    assert len(body.encode("utf-8")) <= 65_536
+    assert body.endswith("_Description shortened. See the PR commits for the full messages._")
+    assert "End of the message." not in body
+    assert ensure_pr._default_metadata(metadata_repo, "main", "HEAD") == (title, body)
+
+
 @pytest.mark.parametrize("existing", [False, True])
 @pytest.mark.parametrize(
     ("title", "body"),
