@@ -632,6 +632,59 @@ def test_compatibility_materializer_preserves_existing_bundle_contract(
     assert all(groups[name]["check-results"]["result-owner"] == "operation" for name in source_groups)
 
 
+def test_compatibility_routes_existing_dependabot_version_updates(
+    tmp_path: pathlib.Path,
+) -> None:
+    repo = tmp_path / "dependabot-migration"
+    create_compatible_repo(repo, "example/dependabot-migration", ["alpha-tool"])
+    _write_current_sdlc(repo)
+    (repo / ".git").write_text("gitdir: test\n", encoding="utf-8")
+    path = repo / ".github" / "dependabot.yml"
+    path.parent.mkdir(exist_ok=True)
+    legacy_version = {
+        "package-ecosystem": "uv",
+        "directories": ["/scripts", "/packages/custom"],
+        "schedule": {"interval": "monthly"},
+        "labels": ["dependencies"],
+    }
+    custom_version = {
+        "package-ecosystem": "npm",
+        "directory": "/extras",
+        "target-branch": "maintenance",
+        "schedule": {"interval": "weekly"},
+    }
+    security = {
+        "package-ecosystem": "github-actions",
+        "directory": "/",
+        "open-pull-requests-limit": 0,
+        "schedule": {"interval": "weekly"},
+        "groups": {"security": {"applies-to": "security-updates", "patterns": ["*"]}},
+    }
+    path.write_text(
+        yaml.safe_dump({"version": 2, "updates": [legacy_version, custom_version, security]}),
+        encoding="utf-8",
+        newline="\r\n",
+    )
+    for _ in range(2):
+        result = run_compatibility_engine(
+            REPOSITORY_LIFECYCLE_SCRIPTS, "apply", "--target-repo-root", str(repo),
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        raw = path.read_bytes()
+        assert b"\r\n" in raw and b"\n" not in raw.replace(b"\r\n", b"")
+        updates = yaml.safe_load(raw)["updates"]
+        assert updates[:3] == [
+            {**legacy_version, "target-branch": "release/local"},
+            {**custom_version, "target-branch": "release/local"},
+            security,
+        ]
+        assert [item for item in updates if item["package-ecosystem"] == "uv"] == [updates[0]]
+        actions = [item for item in updates if item["package-ecosystem"] == "github-actions"]
+        assert len(actions) == 2
+        assert actions[1]["directory"] == "/"
+        assert actions[1]["target-branch"] == "release/local"
+
+
 def test_non_python_skill_needs_no_shared_skill_runtime(
     tmp_path: pathlib.Path,
 ) -> None:
