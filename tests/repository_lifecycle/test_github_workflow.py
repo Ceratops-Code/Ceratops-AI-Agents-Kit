@@ -76,12 +76,13 @@ class EnsurePrTests(unittest.TestCase):
                     "state": "OPEN", "mergeable": "MERGEABLE", "reviewDecision": "APPROVED",
                 }
                 with mock.patch.object(ship.readiness, "gh_pr_view", return_value=payload):
-                    _, findings = ship.readiness.pr_readiness("12", pathlib.Path.cwd())
-                release_errors = [
-                    finding for finding in findings
-                    if finding.check == "pr.release_source" and finding.level == "ERROR"
+                    _, findings = ship.readiness.validate_readiness(
+                        "12", pathlib.Path.cwd(), ship.readiness.default_contract_path()
+                    )
+                release_levels = [
+                    finding.level for finding in findings if finding.check == "pr.release_source"
                 ]
-                self.assertEqual(bool(release_errors), blocked)
+                self.assertEqual(release_levels, ["ERROR" if blocked else "PASS"])
 
     def test_waits_until_github_reports_the_pushed_head(self) -> None:
         responses = [
