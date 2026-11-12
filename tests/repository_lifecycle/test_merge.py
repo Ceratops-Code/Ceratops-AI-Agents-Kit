@@ -1083,6 +1083,8 @@ def test_dependency_automation_public_entrypoint_keeps_scope_options_and_reports
     options = ["--output", str(selected)] if custom else []
     if phase == "finalize":
         options += ["--approved-pr", "https://github.com/scope-owner/repo/pull/1", "--admin", "--wait-seconds", "7"]
+    elif custom:
+        options.append("--retarget-dependabot-prs")
     def handler(args: argparse.Namespace) -> int:
         assert args.org == "scope-owner" and args.output == selected
         assert args.snapshot_helper == root / "dependabot-repository-queue-snapshot.py"
@@ -1093,6 +1095,7 @@ def test_dependency_automation_public_entrypoint_keeps_scope_options_and_reports
             assert args.sync_helper == root / "sync-local-repo-checkouts.py"
         else:
             assert not final.exists()
+            assert args.retarget_dependabot_prs
         selected.write_text(json.dumps(report(phase)))
         return 0
     monkeypatch.setattr(queue, phase, handler)

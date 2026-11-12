@@ -271,7 +271,7 @@ def retarget_dependabot_prs(
 
 
 def preflight(args: argparse.Namespace) -> int:
-    """Build queue evidence after any explicitly requested Dependabot retargeting."""
+    """Build queue evidence after any scheduled or explicitly requested retargeting."""
 
     workspace_root = args.workspace_root.resolve()
     checkout_overrides = parse_checkout_overrides(args.checkout)
@@ -668,7 +668,7 @@ def build_parser() -> argparse.ArgumentParser:
     preflight_parser.add_argument("--automation-dir", type=pathlib.Path, help="Supply scope and required adapter/output paths from this directory; explicit options override defaults.")
     preflight_parser.add_argument(
         "--retarget-dependabot-prs", action="store_true",
-        help="Move eligible open Dependabot PRs to published release/local before collecting PR evidence.",
+        help="Move eligible open Dependabot PRs to published release/local before collecting PR evidence. Enabled by --automation-dir.",
     )
     preflight_parser.add_argument("--org", required=True)
     preflight_parser.add_argument("--exclude-repo", action="append", default=[])
@@ -711,8 +711,9 @@ def build_parser() -> argparse.ArgumentParser:
 def automation_arguments(arguments: list[str], root: pathlib.Path) -> list[str]:
     """Bind caller-owned scope and adapter paths inside an automation directory.
 
-    The skill owns execution; the automation supplies data and independent
-    snapshot/sync adapters. Explicit CLI options follow these defaults and win.
+    The skill owns execution and preflight routing. The automation supplies
+    data and independent snapshot/sync adapters. Explicit CLI options follow
+    these defaults and win.
     No installed skill discovery, subprocess launch, or Python path changes occur.
     """
 
@@ -726,7 +727,10 @@ def automation_arguments(arguments: list[str], root: pathlib.Path) -> list[str]:
         "--snapshot", str(root / "dependabot-repository-queue-snapshot.json"),
     ]
     if arguments[0] == "preflight":
-        defaults += ["--output", str(root / "dependabot-repository-preflight.json")]
+        defaults += [
+            "--retarget-dependabot-prs",
+            "--output", str(root / "dependabot-repository-preflight.json"),
+        ]
     else:
         defaults += [
             "--task-name", root.name,

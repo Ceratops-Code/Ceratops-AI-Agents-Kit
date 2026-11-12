@@ -165,6 +165,9 @@ def test_dependency_preflight_collects_evidence_after_rebase_wait(
 
     monkeypatch.setattr(queue, "dependency_tree_evidence", tree)
     monkeypatch.setattr(queue, "emit_result", lambda *_: None)
+    monkeypatch.setattr(queue, "retarget_dependabot_prs", lambda *_: pytest.fail(
+        "Standalone preflight must not retarget without explicit authorization.",
+    ))
     output = tmp_path / "preflight.json"
     args = queue.build_parser().parse_args([
         "preflight", "--org", "owner",

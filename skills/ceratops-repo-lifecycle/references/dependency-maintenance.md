@@ -41,6 +41,7 @@ first.
   from the default branch to the repository's published `release/local`.
   It refreshes the moved PRs before collecting readiness evidence. Use this
   option when the caller authorizes the target changes.
+  The automation entrypoint enables this option during preflight.
 - Queue preflight owns dependency and exact-CI evidence. Finalization binds
   each approval to its exact PR head, stages eligible updates through
   `release/local`, and delegates publication to the repository's shipping
