@@ -6,7 +6,7 @@ dependencies = [
   "filelock==4.2.9",
   "PyYAML==6.0.3",
   "jsonschema==4.26.0",
-  "markdown-it-py==4.2.0",
+  "markdown-it-py==4.3.0",
   "packaging==26.3",
   "tzdata==2026.6",
   "tomlkit==0.15.2",
