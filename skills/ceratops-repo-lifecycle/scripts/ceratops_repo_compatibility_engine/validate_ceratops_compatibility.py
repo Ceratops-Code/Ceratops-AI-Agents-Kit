@@ -35,7 +35,10 @@ from .generate_repository_checks import (
 )
 from .generate_test_script import discover_python_tests
 from .python_tool_configuration import ruff_policy_errors
-from .repository_validation_contract import load_validation_contract
+from .repository_validation_contract import (
+    is_test_temporary_root,
+    load_validation_contract,
+)
 from .sdlc_contract_validation import (
     operation_category,
     operation_entries,
@@ -52,6 +55,32 @@ class CompatibilityResult(TypedDict):
     applicable: bool
     valid: bool | None
     errors: list[str]
+
+
+def _test_temporary_root_errors(
+    root: pathlib.Path, entries: Mapping[str, Mapping[str, Any]], runner: str,
+) -> list[str]:
+    """Check the declared Python runner arguments without running tests."""
+    errors = []
+    option = "--temporary-root"
+    for location, operation in entries.items():
+        if operation_category(location) not in {"pre-build-checks", "post-build-checks"}:
+            continue
+        for step in operation.get("steps", []):
+            argv = step.get("run", [])
+            if not any(pathlib.PurePosixPath(arg.replace("\\", "/")).as_posix() == runner for arg in argv):
+                continue
+            values = [
+                argv[index + 1] if arg == option and index + 1 < len(argv) else arg.partition("=")[2]
+                for index, arg in enumerate(argv)
+                if arg == option or arg.startswith(option + "=")
+            ]
+            if len(values) == 1 and is_test_temporary_root(values[0]):
+                path = root / values[0].replace("\\", "/")
+                if not any(part.is_symlink() or part.is_junction() for part in (path, *path.parents) if part != root):
+                    continue
+            errors.append(f"{location}: {runner} requires one {option} naming a directory inside the checkout.")
+    return errors
 
 
 def _repository_entrypoint(root: pathlib.Path, operation: Mapping[str, Any]) -> bool:
@@ -482,6 +511,7 @@ def validate_ceratops_compatibility(
             # The shared loader has already accepted a schema-valid supported
             # SDLC declaration; compatibility requirements are version-neutral.
             errors.extend(_validation_coverage_errors(root, sdlc, validation_contract))
+            errors.extend(_test_temporary_root_errors(root, entries, test_runner_relative))
             expected = load_compatibility_contract()["runtime"]["project"]
             # uv supports project discovery from the script path and explicit
             # project selection for existing repository commands.
@@ -648,7 +678,8 @@ def _probe_test_scratch(root: pathlib.Path, probe: pathlib.Path, runner_relative
 
     def invocation(name: str, child: list[str]) -> list[str]:
         return [
-            sys.executable, str(runner), "--result-file", str(probe / (name + ".json")),
+            sys.executable, str(runner), "--temporary-root", str(parent),
+            "--result-file", str(probe / (name + ".json")),
             "--result-id", name, "--candidate-id", "scratch-probe", "--check-id", "scratch-recovery",
             "--check-version", "1", "--probe-command", json.dumps(child),
         ]

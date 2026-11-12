@@ -29,7 +29,6 @@ import shutil
 import stat
 import subprocess
 import sys
-import tempfile
 import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
@@ -1067,14 +1066,13 @@ def execute_check(args: argparse.Namespace, targets: list[str], inherited: list[
             path = (ROOT / target.split("::", 1)[0]).resolve()
             if not path.is_relative_to(ROOT) or not path.exists():
                 raise ValueError(f"test target must exist inside this repository: {target}")
-    parent = pathlib.Path(tempfile.gettempdir()).resolve()
-    inherited_parent = os.environ.get("CERATOPS_PYTEST_SCRATCH_PARENT")
-    if inherited_parent and os.environ.get("CERATOPS_PYTEST_SCRATCH_ROOT") == str(parent):
-        parent = pathlib.Path(inherited_parent).resolve()
+    parent = args.temporary_root
+    parent.mkdir(parents=True, exist_ok=True)
     with _owned_test_scratch(parent, ".repo-tests") as scratch:
         temporary = scratch.path
         environment = os.environ.copy()
         environment.pop(CHECK_CONTEXT_ENV, None)
+        environment.update(dict.fromkeys(("TEMP", "TMP", "TMPDIR"), str(temporary)))
         environment["PYTHONPYCACHEPREFIX"] = str(temporary / "python-cache")
         environment["PYTEST_ADDOPTS"] = shlex.join(inherited)
         test_command = [
@@ -1135,6 +1133,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("targets", nargs="*", help="Repository-relative test files or directories.")
     parser.add_argument("--pytest-arg", action="append", default=[], help="Repeat using --pytest-arg=VALUE.")
     parser.add_argument("--check-group", help="One suite ID from tests/test-impact.json.")
+    parser.add_argument("--temporary-root", type=pathlib.Path,
+                        help="Required for execution. Parent for owned test files; relative to the repository.")
     parser.add_argument("--artifacts", default="{}", help="JSON mapping deliverable references to selected file-path arrays.")
     parser.add_argument("--diagnostic-output", type=pathlib.Path,
                         help="Full failure report; files outside .build/test-diagnostics are caller-retained.")
@@ -1143,7 +1143,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.describe_test_results:
         describe_result_contract()
         return 0
+    if args.temporary_root is None:
+        parser.error("--temporary-root is required for test execution")
     try:
+        parent = pathlib.Path(os.path.abspath(ROOT / args.temporary_root))
+        if any(path.is_symlink() or path.is_junction() for path in (parent, *parent.parents)):
+            raise ValueError(f"--temporary-root must not pass through a directory link: {parent}")
+        args.temporary_root = parent
         args.artifacts = json.loads(args.artifacts)
         support = test_support() if args.probe_command is None or args.artifacts or args.check_group else None
         if support is not None:

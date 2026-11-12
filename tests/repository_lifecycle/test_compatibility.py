@@ -821,6 +821,30 @@ def test_explicit_app_test_ownership_does_not_generate_python_test_runner(
         assert "detected Python tests require an executable SDLC tests operation" in checked["errors"]
 
 
+@pytest.mark.parametrize(("arguments", "accepted"), [
+    ([], False),
+    (["--temporary-root"], False),
+    (["--temporary-root", ".."], False),
+    (["--temporary-root", "C:/external"], False),
+    (["--temporary-root=.build/alternate", "--temporary-root", ".build/other"], False),
+    (["--temporary-root=.build/alternate"], True),
+    (None, True),
+])
+def test_python_runner_scratch_in_sdlc(tmp_path, arguments, accepted):
+    generator = importlib.import_module("ceratops_repo_compatibility_engine.generate_test_script")
+    compatibility = importlib.import_module("ceratops_repo_compatibility_engine.validate_ceratops_compatibility")
+    location = "repository.actions.pre-build-checks.check-groups.tests"
+    runner = "scripts/run-tests.py"
+    operation = generator.test_operation(runner)
+    if arguments is not None:
+        operation["steps"][0]["run"] = ["uv", "run", "--locked", runner, *arguments]
+    errors = compatibility._test_temporary_root_errors(tmp_path, {location: operation}, runner)
+    if accepted:
+        assert not errors
+    else:
+        assert errors == [f"{location}: {runner} requires one --temporary-root naming a directory inside the checkout."]
+
+
 def test_compatibility_materializer_preserves_existing_validator_and_ci(
     tmp_path: pathlib.Path,
 ) -> None:

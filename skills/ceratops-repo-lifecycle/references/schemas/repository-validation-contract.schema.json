@@ -4,7 +4,7 @@
   "title": "Repository validation generation contract",
   "type": "object",
   "additionalProperties": false,
-  "required": ["contract_format_version", "kind", "name", "source_docs_ref", "source_doc_scopes", "node_bootstrap_launcher", "ruff_policy", "coverage_requirements", "checks"],
+  "required": ["contract_format_version", "kind", "name", "source_docs_ref", "source_doc_scopes", "node_bootstrap_launcher", "test_temporary_root", "ruff_policy", "coverage_requirements", "checks"],
   "properties": {
     "contract_format_version": {"const": 1},
     "kind": {"const": "repository_validation_contract"},
@@ -25,6 +25,10 @@
     "node_bootstrap_launcher": {
       "description": "Portable Python launcher used in generated SDLC Node package-manager bootstrap commands.",
       "$ref": "#/$defs/text"
+    },
+    "test_temporary_root": {
+      "description": "Repository-relative scratch parent passed explicitly to the generated Python test command.",
+      "$ref": "#/$defs/path"
     },
     "ruff_policy": {
       "description": "Required Ruff settings consumed by python_tool_configuration during generation and compatibility checks. Ruff expands selectors and ignores using the selected tool runtime.",

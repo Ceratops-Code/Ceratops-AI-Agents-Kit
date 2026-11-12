@@ -98,9 +98,9 @@ def test_generated_python_runner_cleans_owned_temp_even_with_overrides(
         monkeypatch.setenv(variable, str(tmp_path))
     link = f"    (tmp_path / 'linked-object').hardlink_to(pathlib.Path({str(external)!r}))\n" if readonly else ""
     (repo / "test_probe.py").write_text(
-        "import json, pathlib\n"
+        "import json, pathlib, tempfile\n"
         "def test_probe(tmp_path):\n"
-        f"    pathlib.Path({str(marker)!r}).write_text(json.dumps(str(tmp_path)))\n"
+        f"    pathlib.Path({str(marker)!r}).write_text(json.dumps([str(tmp_path), tempfile.gettempdir()]))\n"
         f"{link}"
         "    assert False\n"
     )
@@ -116,10 +116,13 @@ def test_generated_python_runner_cleans_owned_temp_even_with_overrides(
     try:
         result = subprocess.run([
             "uv", "run", "--locked", str(runner), "--pytest-arg=--basetemp", "--pytest-arg=" + str(outside),
-            "--pytest-arg=--basetemp=" + str(repo),
+            "--pytest-arg=--basetemp=" + str(repo), "--temporary-root", ".build/selected",
         ], cwd=repo, capture_output=True, text=True, check=False)
         assert result.returncode == 1, result.stderr
-        observed = pathlib.Path(json.loads(marker.read_text()))
+        observed, process_temp = map(pathlib.Path, json.loads(marker.read_text()))
+        assert observed.is_relative_to(process_temp)
+        assert process_temp.is_relative_to(repo / ".build/selected")
+        assert not process_temp.exists()
         assert not observed.exists()
         assert not outside.exists()
         assert external.read_bytes() == b"git object"
@@ -146,7 +149,25 @@ def _result_arguments(path: pathlib.Path, identity: str = "result-1") -> list[st
 
 
 def _run_result_runner(root: pathlib.Path, runner: pathlib.Path, args: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run([sys.executable, str(runner), *args], cwd=root, capture_output=True, text=True, check=False)
+    return subprocess.run(
+        [sys.executable, str(runner), "--temporary-root", ".build/test-tmp", *args],
+        cwd=root, capture_output=True, text=True, check=False,
+    )
+
+
+def test_generated_runner_requires_explicit_temporary_root(tmp_path):
+    root, runner, output = _result_runner(tmp_path)
+    result_file = output / "result.json"
+    marker = output / "executed"
+    args = [*_result_arguments(result_file), "--probe-command",
+            json.dumps([sys.executable, "-c", "from pathlib import Path; import sys; Path(sys.argv[1]).touch()",
+                        str(marker)])]
+    missing = subprocess.run([sys.executable, str(runner), *args], cwd=root, capture_output=True,
+                             text=True, check=False)
+    assert missing.returncode == 2 and "--temporary-root is required" in missing.stderr
+    assert not result_file.exists() and not marker.exists()
+    assert _run_result_runner(root, runner, args).returncode == 0
+    assert marker.exists() and json.loads(result_file.read_bytes())["status"] == "passed"
 
 
 def _mapped_generated_runner(tmp_path):
@@ -284,7 +305,7 @@ def test_generated_report_deletion_interruption_needs_no_test_rerun(tmp_path, wh
         + "  raise OSError('report deletion interrupted')\n"
         " return original(path,*args,**kwargs)\n"
         "pathlib.Path.unlink=interrupted\n"
-        "raise SystemExit(ns['main'](['tests/test_a.py']))\n"
+        "raise SystemExit(ns['main'](['tests/test_a.py', '--temporary-root', '.build/test-tmp']))\n"
     )
     stopped = subprocess.run([sys.executable, "-c", launcher, str(script)], cwd=root,
                              capture_output=True, text=True, check=False)
@@ -441,7 +462,7 @@ def test_result_io_error_preserves_bytes_and_never_runs_the_check(tmp_path: path
 
     monkeypatch.setattr(pathlib.Path, "read_bytes", denied)
     monkeypatch.setitem(main.__globals__, "execute_check", lambda *args: pytest.fail("ran after I/O failure"))
-    assert main([*_result_arguments(path), "--repair-unaccepted-result"]) == 2
+    assert main([*_result_arguments(path), "--repair-unaccepted-result", "--temporary-root", ".build/test-tmp"]) == 2
     assert path.read_text() == "{"
 
 
@@ -455,7 +476,7 @@ def test_generated_runner_records_interrupt_and_preserves_saved_attempt(tmp_path
 
     monkeypatch.setitem(main.__globals__, "execute_check", interrupt)
     result = output / "interrupt.json"
-    args = _result_arguments(result)
+    args = [*_result_arguments(result), "--temporary-root", ".build/test-tmp"]
     assert main(args) == 130
     interrupted = result.read_bytes()
     assert json.loads(interrupted)["status"] == "interrupted"
@@ -496,18 +517,20 @@ def test_test_result_probe_accepts_generated_and_custom_compliant_runners(tmp_pa
     module = importlib.import_module("ceratops_repo_compatibility_engine.validate_ceratops_compatibility")
     caller_file = output / "caller-owned.txt"
     caller_file.write_text("keep", encoding="utf-8")
-    assert module.probe_test_results(root, [sys.executable, str(runner)], output, qualify_scratch=False) == []
+    command = [sys.executable, str(runner), "--temporary-root", ".build/test-tmp"]
+    assert module.probe_test_results(root, command, output, qualify_scratch=False) == []
     custom = root / "scripts/custom_tests.py"
     custom.write_text(
         "import runpy\n"
         f"runner = runpy.run_path({str(runner)!r})\n"
         "raise SystemExit(runner['main']())\n", encoding="utf-8",
     )
-    assert module.probe_test_results(root, [sys.executable, str(custom)], output, qualify_scratch=False) == []
+    command[1] = str(custom)
+    assert module.probe_test_results(root, command, output, qualify_scratch=False) == []
     assert list(output.iterdir()) == [caller_file]
     cli = run_compatibility_engine(
         REPOSITORY_LIFECYCLE_SCRIPTS, "check-test-results", "--repo-root", str(root),
-        "--runner-command", json.dumps([sys.executable, str(custom)]), "--result-directory", str(output),
+        "--runner-command", json.dumps(command), "--result-directory", str(output),
     )
     assert cli.returncode == 0 and cli.stdout.strip() == "OK", cli.stdout + cli.stderr
     assert list(output.iterdir()) == [caller_file]
@@ -526,8 +549,9 @@ def test_managed_runner_qualification_rejects_scratch_cleanup_while_worker_is_li
         encoding="utf-8",
     )
     module = importlib.import_module("ceratops_repo_compatibility_engine.validate_ceratops_compatibility")
-    assert module.probe_test_results(root, [sys.executable, str(runner)], output, qualify_scratch=False) == []
-    errors = module.probe_test_results(root, [sys.executable, str(runner)], output)
+    command = [sys.executable, str(runner), "--temporary-root", ".build/test-tmp"]
+    assert module.probe_test_results(root, command, output, qualify_scratch=False) == []
+    errors = module.probe_test_results(root, command, output)
     assert len(errors) == 1 and "removed scratch still in use" in errors[0]
     assert not list(output.iterdir())
 
@@ -564,7 +588,7 @@ def test_test_result_probe_rejects_observable_custom_runner_violations(tmp_path:
         program += "raise SystemExit(main())\n"
     custom.write_text(program, encoding="utf-8")
     module = importlib.import_module("ceratops_repo_compatibility_engine.validate_ceratops_compatibility")
-    errors = module.probe_test_results(root, [sys.executable, str(custom)], output)
+    errors = module.probe_test_results(root, [sys.executable, str(custom), "--temporary-root", ".build/test-tmp"], output)
     assert len(errors) == 1 and "probe failed" in errors[0]
     assert not list(output.iterdir())
 

@@ -845,7 +845,7 @@ invocations still run disposable tests; they do not create reusable acceptance.
 The retained-result invocation is:
 
 ```text
-uv run --project scripts --locked python scripts/run-tests.py [TEST_TARGET ...] --result-file RESULT --result-id RESULT_ID --candidate-id CANDIDATE_ID --check-id CHECK_ID --check-version CHECK_VERSION
+uv run --project scripts --locked python scripts/run-tests.py --temporary-root .build/test-tmp [TEST_TARGET ...] --result-file RESULT --result-id RESULT_ID --candidate-id CANDIDATE_ID --check-id CHECK_ID --check-version CHECK_VERSION
 ```
 
 The caller supplies all identities and the final path together, serializes its
@@ -909,9 +909,14 @@ operation's check-context environment values before launching its own command;
 it does not read the repository's local result store. Both the generated runner
 and Ceratops's runner finish pending report deletion when they reuse a saved
 successful command, without running that command again.
-Pytest basetemp/cache directories are disposable
-execution scratch and never copied or moved into results. Collection snapshots
-and failure diagnostics remain regenerable reports, not acceptance records.
+SDLC passes `--temporary-root .build/test-tmp` to the generated runner. The
+runner owns a private namespace there and uses a separate directory per live
+run for pytest and subprocess temporary files. It deletes each finished run
+and reclaims abandoned directories on the next run. The compatibility checker
+flags missing or unsafe roots on SDLC commands that invoke the standard
+`scripts/run-tests.py` path. Pytest temporary directories never enter results.
+Collection snapshots and failure diagnostics remain regenerable reports, not
+acceptance records.
 
 ## Exact-artifact bundle transaction
 
