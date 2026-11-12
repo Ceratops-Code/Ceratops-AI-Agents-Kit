@@ -684,13 +684,19 @@ def _probe_test_scratch(root: pathlib.Path, probe: pathlib.Path, runner_relative
             "--check-version", "1", "--probe-command", json.dumps(child),
         ]
 
-    def start_fresh(name: str) -> None:
+    def start_fresh(name: str, *, live_scratch: pathlib.Path | None = None) -> None:
         result = subprocess.run(
             invocation(name, [sys.executable, "-c", "pass"]), cwd=root,
             env=environment, capture_output=True, text=True, check=False, timeout=15,
         )
+        # Windows can report a busy directory after deleting part of its
+        # contents. Check the active worker's marker even if that launch fails.
+        if live_scratch is not None and not (live_scratch / "worker-active").is_file():
+            detail = ": " + _probe_command_evidence(root, result) if result.returncode else ""
+            raise ValueError(f"Managed runner removed scratch still in use: {live_scratch}{detail}")
         if result.returncode:
-            raise ValueError("Fresh managed runner failed: " + _probe_command_evidence(root, result))
+            boundary = " while the earlier worker was live" if live_scratch is not None else ""
+            raise ValueError(f"Fresh managed runner failed{boundary}: " + _probe_command_evidence(root, result))
 
     child = [sys.executable, "-c", worker, str(ready), str(release)]
     interrupted = invocation("scratch-interrupted", child)
@@ -713,9 +719,7 @@ def _probe_test_scratch(root: pathlib.Path, probe: pathlib.Path, runner_relative
                 raise ValueError(f"Managed runner used scratch outside its probe scope: {scratch}")
             launcher.kill()
             launcher.wait(timeout=5)
-            start_fresh("scratch-worker-live")
-            if not (scratch / "worker-active").is_file():
-                raise ValueError(f"Managed runner removed scratch still in use: {scratch}")
+            start_fresh("scratch-worker-live", live_scratch=scratch)
         finally:
             release.touch()
             if launcher.poll() is None:

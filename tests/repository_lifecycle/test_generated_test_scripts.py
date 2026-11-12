@@ -552,7 +552,9 @@ def test_managed_runner_qualification_rejects_scratch_cleanup_while_worker_is_li
     command = [sys.executable, str(runner), "--temporary-root", ".build/test-tmp"]
     assert module.probe_test_results(root, command, output, qualify_scratch=False) == []
     errors = module.probe_test_results(root, command, output)
-    assert len(errors) == 1 and "removed scratch still in use" in errors[0]
+    assert len(errors) == 1 and any(message in errors[0] for message in (
+        "removed scratch still in use", "failed while the earlier worker was live",
+    )), errors
     assert not list(output.iterdir())
 
 
