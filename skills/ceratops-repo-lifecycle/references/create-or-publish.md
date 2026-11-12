@@ -14,6 +14,10 @@ release semantics.
 - (D) GitHub, code, and artifact setup check, run from the lifecycle skill's
   `scripts` folder: `python -m github_contract_engine validate repo
   --repo OWNER/REPO --surface all --subset create --local-repo-path PATH`
+- The `create` subset checks `process.release_branch_retention`. An active
+  deletion rule on `release/local` satisfies the check. For an exposed release
+  branch, `--surface repo --check-id process.release_branch_retention --apply`
+  turns off automatic head-branch deletion.
 - (D) Optional org posture check, run from the same folder:
   `python -m github_contract_engine validate org
   --org ORG`

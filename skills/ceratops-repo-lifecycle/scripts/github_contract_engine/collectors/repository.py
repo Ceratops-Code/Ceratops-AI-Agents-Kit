@@ -819,6 +819,23 @@ def collect_repository(
         "/repos/${owner}/${repo}/dependency-graph/compare/${default_branch}...${default_branch}",
         parameters,
     )
+    release_branch = _result(
+        fetched, "/repos/${owner}/${repo}/branches/release%2Flocal", parameters
+    )
+    release_rules = _result(
+        fetched, "/repos/${owner}/${repo}/rules/branches/release%2Flocal?per_page=100",
+        parameters,
+    )
+    # A failed lookup cannot establish that release/local is absent or protected.
+    release_exists = None
+    if release_branch.status == 404:
+        release_exists = False
+    elif (
+        release_branch.ok
+        and isinstance(release_branch.data, dict)
+        and release_branch.data.get("name") == "release/local"
+    ):
+        release_exists = True
 
     return {
         "repo": repo,
@@ -851,6 +868,13 @@ def collect_repository(
         },
         "protection": protection_data,
         "protection_facts": protection_facts,
+        "release_branch": {
+            "exists": release_exists,
+            "deletion_restricted": release_rules.ok and any(
+                isinstance(rule, dict) and rule.get("type") == "deletion"
+                for rule in _items(release_rules.data)
+            ),
+        },
         "rulesets": {
             **_ruleset_facts(
                 active_rulesets,
