@@ -1381,7 +1381,8 @@ def test_create_contract_keeps_release_branch_after_merges(
     contract = PR_WORKFLOW_SCRIPTS.parent / "references/contracts/github-repo-deterministic-contract.json"
     check = "process.release_branch_retention"
     contracts = {"repo": json.loads(contract.read_text(encoding="utf-8")), "code": {}, "artifact": {}}
-    assert check in repo_subset_ids(contracts, "create")["repo"]
+    create_checks = repo_subset_ids(contracts, "create")["repo"]
+    assert create_checks is not None and check in create_checks
     desired = compose_desired_state(
         {"repo": str(contract)}, {"owner": "owner", "repo": "repo"}, {"repo": {check}},
     )
