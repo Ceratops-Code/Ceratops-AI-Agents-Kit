@@ -503,7 +503,7 @@ def test_versioned_allocation_propagates_permission_errors_and_requires_final_ve
         patch.setattr(pathlib.Path, "mkdir", denied)
         with pytest.raises(PermissionError, match="output denied"):
             storage.allocate_artifact_version(repository, **selection)
-    store = repository / ".git/ceratops/artifacts/claims"
+    store = storage._artifact_store_path(repository, temporary=True) / "claims"
     assert not list(store.iterdir())
     first = storage.allocate_artifact_version(repository, **{**selection, "version": "1.2.3"})
     with pytest.raises(storage.OperationError, match="choose another final version"):
@@ -550,7 +550,7 @@ def test_versioned_competing_processes_allocate_while_retention_is_busy(tmp_path
             record = json.loads(output)
             versions.add(record["version"])
             assert (path / "version.txt").read_text() == record["version"]
-            saved = json.loads((store / "claims" / record["version"] / "build_request.json").read_text())
+            saved = json.loads((storage._artifact_store_path(path, temporary=True) / "claims" / record["version"] / "build_request.json").read_text())
             assert saved["preTestCommit"] == record["commit"]
             assert saved["requiredTargets"] == ["linux", "windows"]
         assert versions == {"1.2.3b1", "1.2.3b2"}

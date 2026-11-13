@@ -460,8 +460,9 @@ Git bytes and the final result commit. It does not duplicate test acceptance.
 New committed receipts use `.build/<unit>/<version>/build_receipt.json`, adding
 `<target>` below the version for separately qualified targets. Artifact
 receipts live beside retained output under
-`<shared-git-directory>/ceratops/artifacts/<unit>/<version>/artifact-receipt.json`,
-adding the same optional target component before the filename. Versions such as
+`<shared-git-directory>/ceratops/artifacts/worktrees/<checkout>/<unit>/<version>/<target>/artifact-receipt.json`.
+`<checkout>` is the registered worktree name, or `release-local` for that branch.
+Versions such as
 `1.2.3a1` and `1.2.3b1` identify separate builds rather than channel aliases.
 Record fields allow only logical repository, tool and runtime identities plus
 `git`- or `store`-rooted safe relative file references; they do not accept
@@ -500,46 +501,45 @@ bounded artifact-store lifetime. The internal route creates no temporary log;
 future callers that create one must own and remove it. The readers create,
 rotate and clean up nothing.
 
-The internal versioned route selects its final directory before preparing source
-versions or commit B. `store_artifacts.allocate_artifact_version` exclusively creates
-`<git-common-dir>/ceratops/artifacts/<unit>/<version>/` for all required targets.
-An occupied directory or existing version tag advances an alpha/beta number;
-other filesystem errors retain their cause. An occupied final version requires
-a new explicit version choice. No allocation lock, hash suffix or separate
-reservation file is used.
+The versioned build route writes unfinished output under
+`<git-common-dir>/ceratops/artifacts/worktrees/<checkout>/_building/<unit>/<version>/`.
+`<checkout>` is the linked worktree's Git registration name, `release-local`
+for the release branch, or `primary` for another primary checkout.
+Multiple targets use separate target subdirectories there. Promotion builds and
+tests in its task worktree before updating `release/local`; direct release builds
+use the sibling `worktrees/release-local/_building/` directory.
 
-The caller embeds the selected version in its sources, commits B, then calls
-`store_artifacts.bind_artifact_inputs` before writing artifacts. The version directory's
-`build_request.json` records repository, registered worktree, branch, unit,
-version, targets, the existing receipt attempt identity, allocation commit,
-declared input paths and B. Before binding, B is null. A fresh allocation call
-reuses an unfinished same-worktree request only when its requested selection
-and current inputs match; changed inputs select another prerelease directory.
-Unreadable ownership remains untouched and is returned in
-`uncertain_directories`. These are observations, not saved execution progress.
+`store_artifacts.allocate_artifact_version()` uses a short allocation lock
+while choosing a repository-wide version and creating its directory. It checks
+only that exact version's paths in the worktree folders; no other worktree's
+history is read or cleaned. Builders and tests run outside that store lock.
+An occupied directory or version tag advances an alpha/beta number; an occupied
+final version requires a new version choice. There is no reservation file.
 
-`store_artifacts.py` owns allocation and storage.
-`complete_artifact_builds.py` owns prepared receipts and result-only commit C,
-artifact receipts and the immutable tag. Completion uses `complete_artifact_builds.read_artifact_build`
-to select existing requests/receipts without allocating or rebuilding.
-Successful tag completion removes `build_request.json` and resolved diagnostics;
-a cleanup-only call preserves the accepted files, commit and tag. One bounded
-failure report per version/target lives at
-`<version>/.diagnostics/<target>.json`; it is not acceptance evidence.
+The caller prepares source versions and commits them before writing artifacts.
+`build_request.json` describes those inputs and lets an unchanged interrupted
+build continue. Failed-build output and one diagnostic per target stay in its
+temporary version directory. Startup keeps the requested attempt and at most two
+other attempts in that deliverable folder. A success removes its temporary files
+and older failed attempts. They are not accepted artifacts.
 
-Only cross-version retention uses the short store lock. Startup tries cleanup
-without waiting; completion performs remaining cleanup under that lock.
-Unfinished requests and untagged directories are excluded.
-The scoped policy below owns retention; there is no second global rotation.
-Immutable tags prevent version reuse after package bytes are pruned. Release and
-installation-destination locks are
-unchanged.
+After the required checks pass, `complete_artifact_builds.py` copies the measured
+files to `worktrees/<checkout>/<unit>/<version>/<target>/`, records the completed
+receipt and tag, and deletes that version's temporary directory. An interrupted
+copy can finish from the temporary files. An interruption after the tag needs
+only the remaining cleanup; it does not repeat the build or tests.
+`.build/` receipts and check summaries remain committed in Git.
+
+Cleanup examines only the requested checkout, deliverable or bundle, and target.
+It never asks for file-usage information. Retained-output rotation uses the short
+store lock; Promote/Ship and installers keep their existing release/destination
+locks.
 
 The internal `retain_artifact_versions.py` library implements 4F's scoped policy.
 `store_artifacts.retain_completed_artifacts()` supplies the existing cleanup lock
 for one unit, target and worktree or shared pool. The caller supplies accepted
-builds, successful installations in completion order, and information about files
-still in use. It does not scan other worktrees, destinations or units.
+builds and successful installations in completion order. Cleanup does not detect
+file usage or scan other worktrees, destinations or units.
 
 - Shared `artifacts/beta-stable/<unit>/<version>/<target>/`: two most recently
   successfully deployed distinct beta/stable versions plus the latest approved
@@ -547,16 +547,17 @@ still in use. It does not scan other worktrees, destinations or units.
 - `<destination>/deployed/<unit>/<existing-generation>/<target>/`: current and
   previous successful installations plus the latest successfully deployed
   beta/stable version, including the installer's recorded runnable files.
-- Original `artifacts/<unit>/<version>/[<target>/]`: the named worktree's latest
-  approved build, including alpha. Other worktrees have separate selections.
+- `artifacts/worktrees/<checkout>/<unit>/<version>/<target>/`: that checkout's
+  latest approved build, including alpha. Other checkouts have separate folders.
 
 A bundle uses its release-bundle directory instead of separate member directories.
 Slot overlaps keep one copy. Original receipt bytes, commit, check versions and
 result identities remain unchanged; readers return the retained package paths.
 Copying goes directly to the final directory and finishes before prior copies
-are deleted. Running users or missing ownership information keep affected files
-with an explanation. Later calls finish incomplete copying or deletion, without
-rebuilding or rerunning checks. Successful results and Git receipts are not pruned.
+are deleted. Obsolete directories are removed within the requested folder;
+cleanup requires no ownership or usage record. Later calls finish incomplete
+copying or deletion, without rebuilding or rerunning checks. Successful results
+and Git receipts are not pruned.
 Build approval (7/16), installation (17–19), promotion replacement (22), and Codex
 adoption (31) connect these internal functions in their own steps; 4F does not
 activate those public flows early.
@@ -944,7 +945,7 @@ policy. These are the runtime paths used by the foundation and update workflow:
 | Sibling `check_summary.json` | Compact original check outcomes and input facts; build completion | Written directly after required checks pass and committed with the receipt that names its hash. An interrupted partial is repaired from the same accepted outcomes; exact bytes are reused. Git retains completed historical versions. Check reuse reads the tagged blob without needing packages or full logs. |
 | `artifacts/<unit>/<version>/.diagnostics/<target>.json` | One bounded current failure report per version/target; `complete_artifact_builds.py` | Direct writes replace older or interrupted diagnostics. Receipt/tag completion removes resolved reports. No temporary copy or cross-version write lock. |
 | `artifacts/<unit>/<version>/` with optional `<target>/` | Final output; allocator, builder and completion owner | Exclusive directory creation selects the version before source version preparation and B. Existing tags stay occupied after byte pruning. Untagged directories and outstanding requests stay out of retention. Scoped originals keep the named worktree's latest approved build. |
-| `artifacts/beta-stable/<unit>/<version>/<target>/` and `<destination>/deployed/<unit>/<existing-generation>/<target>/` | Complete retained copies; `retain_artifact_versions.py`, called by the store or installer owner | At scoped retention calls, keep the finite slots above plus files still used or whose ownership is uncertain. Copy first, record the complete choice, then remove obsolete owned copies. No scan of unrelated groups and no deletion of historical Git acceptance. |
+| `artifacts/beta-stable/<unit>/<version>/<target>/` and `<destination>/deployed/<unit>/<existing-generation>/<target>/` | Complete retained copies; `retain_artifact_versions.py`, called by the store or installer owner | At scoped retention calls, keep the finite slots above within the requested group; no file-use information is required. Copy first, record the complete choice, then remove obsolete owned copies. No scan of unrelated groups and no deletion of historical Git acceptance. |
 | Each managed copy's `.retained-files.json`, `.build_receipt.json`, and deployed `.installation_receipt.json`; each group's `.retention/<target>/<pool-or-worktree>.json` | Exact file inventory, original receipt bytes and current selection; scoped retention library | Written directly, without temporary copies or generations. Inventory survives interrupted deletion until that copy is gone. Selection lists only retained copies and unresolved deletion candidates; ordinary calls retry those candidates. Original receipt bytes and identities are never regenerated. Worktree-removal cleanup remains in 21. |
 | `artifacts/.locks/store.lock` | Persistent native cross-version cleanup lock; `store_artifacts.py` and `filelock` | Protects retention selection/deletion only. Allocation never waits on it; request, receipt and tag writes do not hold it. Not a worktree lock or allocation reservation. |
 | `<shared-git-directory>/ceratops/operations/skill-updates/<worktree-id>/` | Disposable skill-change records; `manage_checkpoints.py` | One unfinished request per worktree, without a request lock. Immutable direct records retain the original baseline and successful checks; outermost completion deletes only its own records. Dedicated removed-worktree cleanup is connected in 20C. Artifact operations do not use this directory. |

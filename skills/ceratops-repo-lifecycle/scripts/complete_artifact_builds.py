@@ -891,7 +891,18 @@ def _write_version_artifact_receipts(
     for target in transaction.required_targets:
         item, receipt = prepared[target]
         raw = _artifact_receipt_bytes(item, receipt, final_commit)
+        # Tests have finished. Copy their exact output into this checkout's
+        # retained folder; an artifact receipt is written only after all bytes.
+        from retain_artifact_versions import _copy_file
         path = transaction.artifact_receipt(target)
+        destination = path.parent
+        records = [*receipt["artifactInputs"], *receipt["checkInputs"],
+                   *receipt["artifacts"], *receipt["supportingFiles"],
+                   *(record for dependency in receipt["dependencies"] for record in dependency["artifacts"])]
+        for record in records:
+            if record["root"] == "store":
+                relative = sdlc_results._bundle_relative_path(record["path"])
+                _copy_file(transaction.target_output(target) / relative, destination / relative, record)
         _persist_exact_bytes(
             path,
             raw,
@@ -962,21 +973,22 @@ def _create_artifact_tag(
     return tag
 
 
-def _remove_build_request(transaction: ArtifactVersionTransaction) -> None:
-    if not transaction.request_path.exists():
+def _remove_completed_build_temp(transaction: ArtifactVersionTransaction) -> None:
+    """Remove this completed version's temporary output, never a sibling's files."""
+    from store_artifacts import _artifact_store_path, _remove_versioned_tree
+    parent = _artifact_store_path(transaction.repo_root, temporary=True) / transaction.release_bundle
+    from store_artifacts import FULL_VERSION_RE
+    from packaging.version import Version
+    directory = transaction.request_path.parent
+    if directory != parent / transaction.version:
+        raise OperationError("Completed-build cleanup escapes this checkout's temporary directory.")
+    if not parent.exists():
         return
-    _require_build_request(transaction)
-    transaction.request_path.unlink()
-
-
-def _clear_versioned_diagnostics(transaction: ArtifactVersionTransaction) -> None:
-    for target in transaction.required_targets:
-        path = transaction.diagnostic_root / f"{target}.json"
-        if path.exists() or path.is_symlink():
-            sdlc_results._plain_path(path, label="Artifact diagnostic")
-            path.unlink()
-    if transaction.diagnostic_root.exists() and not any(transaction.diagnostic_root.iterdir()):
-        transaction.diagnostic_root.rmdir()
+    # A success supersedes older failed attempts in this same deliverable folder.
+    # A later attempt is left alone when an older completed build is reopened.
+    for path in parent.iterdir():
+        if FULL_VERSION_RE.fullmatch(path.name) and Version(path.name) <= Version(transaction.version):
+            _remove_versioned_tree(path, parent, label="Completed build temporary output")
 
 
 def complete_versioned_artifacts(
@@ -1000,8 +1012,7 @@ def complete_versioned_artifacts(
     completed = [_completed_versioned_result(item) for item, _ in group]
     if all(value is not None for value in completed):
         for item, _ in group:
-            _clear_versioned_diagnostics(item)
-            _remove_build_request(item)
+            _remove_completed_build_temp(item)
         final = completed[-1]
         assert final is not None
         return CompletedArtifactVersion(
@@ -1028,8 +1039,7 @@ def complete_versioned_artifacts(
     # Keep requests until all group tags exist, so interruption cannot strand
     # an untagged member after its sibling has discarded the group inputs.
     for item, _ in group:
-        _clear_versioned_diagnostics(item)
-        _remove_build_request(item)
+        _remove_completed_build_temp(item)
     return CompletedArtifactVersion(
         final_commit=final_commit, tag=tags[-1],
         build_receipts=tuple(value[0].worktree_path for prepared in prepared_groups for value in prepared.values()),
@@ -1057,7 +1067,7 @@ def read_artifact_build(
     version, classification = _version_classification(version)
     targets = _validated_targets(required_targets)
     store = _artifact_store_path(root)
-    directory = store / unit / version
+    directory = _artifact_store_path(root, temporary=True) / unit / version
     request = directory / "build_request.json"
     branch = _git_text(root, ["symbolic-ref", "--quiet", "--short", "HEAD"], label="branch")
     registration = _git_text(root, ["rev-parse", "--absolute-git-dir"], label="Git registration")

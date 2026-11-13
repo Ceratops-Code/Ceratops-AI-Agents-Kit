@@ -1749,20 +1749,27 @@ explicit, separate target-specific purpose; it must not repeat the artifact's
 acceptance tests under another name.
 
 The operation runner owns qualification. The internal artifact route now has
-three imported owners: `store_artifacts.py` allocates final directories and provides
+three imported owners: `store_artifacts.py` allocates temporary build directories
+and provides
 store protection, `retain_artifact_versions.py` selects and retains scoped copies,
 and `complete_artifact_builds.py` prepares accepted receipts and completes
 the result-only commit, artifact receipts and immutable tags. Public package
 Build callers use these owners through `execute_build()`; other native build
 categories retain their declared actions until their package conversion.
 
-The caller first invokes `store_artifacts.allocate_artifact_version`. Exclusive
-`Path.mkdir(exist_ok=False)` selects
-`<git-common-dir>/ceratops/artifacts/<unit>/<version>/` for every required
-target. A collision or existing unit/version tag advances only alpha/beta;
-permission and I/O errors do not change the chosen number. An exact final-version
-collision requires an explicit replacement-version decision. There is no
-allocation lock or separate reservation file.
+The caller first invokes `store_artifacts.allocate_artifact_version`.
+The allocated path is
+`<git-common-dir>/ceratops/artifacts/worktrees/<checkout>/_building/<unit>/<version>/`.
+The checkout component is the Git worktree registration name, `release-local`
+for that branch, or `primary` for another primary checkout. The allocation
+lock covers only choosing a unique version and creating the directory. A
+collision in an exact version path or existing tag advances alpha/beta; builds
+and tests run outside that short lock. Final-version collisions require another
+version choice. The lock file is `artifacts/.locks/allocation.lock`; retention uses
+`artifacts/.locks/store.lock`. No reservation or file-usage record is created.
+Startup keeps the requested temporary version and at most two predecessors in
+its own deliverable folder. Completion removes that version and older failed
+attempts; later attempts and other checkout folders remain untouched.
 
 Immediately after creation, `build_request.json` records repository, worktree
 path and Git registration, branch, unit/version, all targets, the existing
@@ -1781,8 +1788,11 @@ of durable request identity. No new UUID or explicit resume flag is introduced.
 
 Prepared receipts remain at `.build/<unit>/<version>/build_receipt.json`, with
 a target subdirectory for separately qualified targets. Artifacts are produced
-directly at the final version/target path and retain their original checks and
-identity. Each version/target's bounded latest failure report is
+inside that checkout's temporary directory. After their required checks pass,
+completion copies them to `worktrees/<checkout>/<unit>/<version>/<target>/`
+and writes the artifact receipt last. It removes temporary output after the
+result commit and all required tags exist. Copies retain their original checks
+and identity. Each version/target's bounded latest failure report is
 `<version>/.diagnostics/<target>.json`; receipt preparation ignores these
 producer-owned diagnostics and `build_request.json` as artifact payload.
 There is no temporary publication tree.
@@ -1838,27 +1848,25 @@ supporting files and original receipt bytes directly to
 `<git-common-dir>/ceratops/artifacts/beta-stable/<unit>/<version>/<target>/`, or
 `<destination>/deployed/<unit>/<existing-generation>/<target>/`. Destination
 copies also include the installer's recorded runnable files and successful
-installation result. Original worktree output stays at the 4E allocated path.
-The caller holds its existing release/destination ownership and supplies current
-facts and file-use information; this is not a new worktree lock or process manager.
+installation result. Accepted worktree files live under
+`artifacts/worktrees/<checkout>/<unit>/<version>/<target>/`.
+The caller uses its existing release/destination protection and supplies current
+successful build and installation records. Retention does not inspect processes.
 
-Each copy's `.retained-files.json` records its exact files and ownership.
-`.build_receipt.json` contains the unchanged committed receipt, and destination
-copies also contain `.installation_receipt.json`. The original artifact receipt
-is copied last. The group's `.retention/<target>/<pool-or-worktree>.json` records
-only selected copies and unresolved deletion candidates, not worker progress.
-There are no temporary copies, timestamp-based choices or growing history.
-`store_artifacts.retain_completed_artifacts()` uses the existing short cleanup
-lock for selection-record changes and deletion, not copying or builds.
+Each copy's `.retained-files.json` describes the bytes used to finish an
+interrupted copy. `.build_receipt.json` contains the unchanged committed receipt;
+destination copies also contain `.installation_receipt.json`. The artifact
+receipt is copied last. `.retention/<target>.json` reports selected copies and
+remaining deletion candidates, without controlling cleanup ownership.
 
-Only the named group and its supplied record paths are read. File-use information
-is required before changing incomplete bytes or deleting a candidate. Running or
-pending installations protect their generations even when the recorded current
-selection differs. Unknown ownership, changed files, missing use information or
-unrecorded files leave the affected copy intact and return its path and cause.
-An incomplete replacement never displaces the previous successful selection.
-Repeated ordinary calls finish missing copy/delete effects; an unreadable ownership
-record remains explicit unresolved data, not guessed permission to remove files.
+Cleanup enumerates only version directories below the requested group's folder.
+A successful new selection makes older directories disposable according to the
+retention slots above, even if their inventory is missing or malformed. Cleanup
+does not hash obsolete files or inspect running processes. It refuses links
+that could redirect deletion outside that directory. A worktree caller cannot
+name another worktree's folder through `retain_completed_artifacts()`.
+An incomplete replacement leaves the previous successful selection intact.
+Repeated calls finish missing copying and deletion.
 
 The current receipt reader accepts identical original/shared copies and reports
 the selected shared paths. `complete_artifact_builds.read_artifact_build()`
@@ -1938,8 +1946,9 @@ release/store/destination locks; it adds no startup migration or recurring scan.
 `repository_operation.py` calls directory allocation and input binding in
 `store_artifacts.py`, and receipt/commit/tag completion in
 `complete_artifact_builds.py`. Neither opens an empty checkpoint directory or
-per-worktree lock. Build requests live beside their final output; the short
-store lock protects cross-version deletion only. Promote/Ship retain their outer
+per-worktree lock. Build requests live beside their temporary output; the short
+allocation lock protects version allocation separately from the cleanup lock.
+Promote/Ship retain their outer
 release lock. A completed receipt/tag chain permits cleanup-only
 retries without mutable worktree receipts, repeated builds/tests, new commits,
 rewritten receipts or moved tags. At the next authorized deployment, retire old

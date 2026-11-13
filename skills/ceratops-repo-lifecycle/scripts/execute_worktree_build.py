@@ -100,11 +100,6 @@ def _finish(transaction, prepared=None, *, diagnostic_output=None, completed=Non
         'artifact_receipts': [str(path) for path in completed.artifact_receipts],
     }
     maintenance: list[str] = []
-    registration = pathlib.Path(transaction.worktree_registration).name
-    # Primary checkout has no linked-worktree name; its one Git directory is
-    # still a distinct registration. Task callers normally use a named worktree.
-    if registration == '.git':
-        registration = 'primary'
     for target in transaction.required_targets:
         try:
             selected = sdlc_results.read_artifact_receipt_chain(
@@ -114,7 +109,7 @@ def _finish(transaction, prepared=None, *, diagnostic_output=None, completed=Non
             )
             retained = store_artifacts.retain_completed_artifacts(
                 transaction.repo_root, unit=transaction.release_bundle, target=target,
-                pool='worktree', worktree=registration,
+                pool='worktree',
                 approved=retain_artifact_versions.RetentionVersion(selected),
             )
             maintenance.extend(f'{path}: {cause}' for path, cause in retained.deferred.items())
@@ -247,7 +242,7 @@ def execute_build(
                                        if step.get("result", {}).get("schema") == sdlc_results.COMMITTED_BUILD_RECEIPT_SCHEMA)
                         identity = receipt["identity"]
                         key = sdlc_results.receipt_storage_key(identity)
-                        request = store_artifacts._artifact_store_path(root) / key / identity["version"] / "build_request.json"
+                        request = store_artifacts._artifact_store_path(root, temporary=True) / key / identity["version"] / "build_request.json"
                         if key not in pending and request.is_file():
                             transaction = complete_artifact_builds.read_artifact_build(
                                 root, repository=identity["repository"], release_bundle=key,
@@ -291,7 +286,7 @@ def execute_build(
                                 if sdlc_results.receipt_storage_key(value["receipt"]["identity"]) == bundle_key), None)
                             if previous and previous["receipt"].get("members") == members:
                                 identity = previous["receipt"]["identity"]
-                                request = store_artifacts._artifact_store_path(root) / bundle_key / identity["version"] / "build_request.json"
+                                request = store_artifacts._artifact_store_path(root, temporary=True) / bundle_key / identity["version"] / "build_request.json"
                                 if request.is_file():
                                     transaction = complete_artifact_builds.read_artifact_build(
                                         root, repository=identity["repository"], release_bundle=bundle_key,
@@ -339,6 +334,20 @@ def execute_build(
                     result.update(final_commit=completed.final_commit, tag=completed.tag, version=transaction.version,
                                   build_receipts=[str(path) for path in completed.build_receipts])
                     for transaction, _ in pending_builds:
+                        # Delivery receives retained files. The tested temporary
+                        # copies have been removed after completion.
+                        for batch in finished:
+                            target = batch["target"] or "native"
+                            if target not in transaction.required_targets:
+                                continue
+                            temporary = transaction.target_output(target)
+                            retained = transaction.artifact_receipt(target).parent
+                            batch["artifacts"] = {
+                                reference: [str(retained / pathlib.Path(path).relative_to(temporary))
+                                            if pathlib.Path(path).is_relative_to(temporary) else path
+                                            for path in paths]
+                                for reference, paths in batch.get("artifacts", {}).items()
+                            }
                         maintenance = _finish(transaction, diagnostic_output=diagnostic_output,
                                 completed=replace(completed, tag=f"{transaction.release_bundle}/{transaction.version}"))
                         if maintenance.get("maintenance_errors"):

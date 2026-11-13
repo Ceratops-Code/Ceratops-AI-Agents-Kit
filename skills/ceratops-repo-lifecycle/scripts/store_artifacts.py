@@ -13,9 +13,11 @@ import stat
 import subprocess
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from typing import Any
+
+from packaging.version import Version
 
 import retain_artifact_versions
 import sdlc_results
@@ -48,7 +50,7 @@ class RecoveryRequired(OperationError):
 
 @dataclass(frozen=True)
 class ArtifactVersionAllocation:
-    """Final directory selected before source versions and checkpoint B exist.
+    """Private temporary directory allocated before source versions are prepared.
 
     The request describes desired inputs, not execution progress. Occupied paths
     without readable ownership remain untouched and are returned for cleanup.
@@ -90,6 +92,10 @@ class ArtifactVersionAllocation:
         )
 
     def artifact_receipt(self, target: str) -> pathlib.Path:
+        _require_transaction_target(self, target)
+        if self.version_root == self.request_path.parent:
+            return (_artifact_store_path(self.repo_root, worktree=True)
+                    / self.release_bundle / self.version / target / "artifact-receipt.json")
         return self.target_output(target) / "artifact-receipt.json"
 
 
@@ -142,10 +148,26 @@ def _git_common_path(repo_root: pathlib.Path) -> pathlib.Path:
     return common
 
 
-def _artifact_store_path(repo_root: pathlib.Path) -> pathlib.Path:
-    """Resolve the versioned artifact store without creating it."""
+def _artifact_store_path(
+    repo_root: pathlib.Path, *, worktree: bool = False, temporary: bool = False,
+) -> pathlib.Path:
+    """Locate shared storage or this checkout's own build directories.
 
-    return _git_common_path(repo_root) / "ceratops" / "artifacts"
+    Linked worktrees use their Git registration name. The release checkout uses
+    release-local beside them. No process or usage record determines this path.
+    """
+    common = _git_common_path(repo_root)
+    store = common / "ceratops" / "artifacts"
+    if not worktree and not temporary:
+        return store
+    branch = _git_text(repo_root, ["symbolic-ref", "--quiet", "--short", "HEAD"], label="branch")
+    registration = pathlib.Path(_git_text(
+        repo_root, ["rev-parse", "--absolute-git-dir"], label="Git registration"))
+    name = "release-local" if branch == "release/local" else (
+        "primary" if registration == common else registration.name)
+    _require_identifier(name, label="worktree directory", pattern=LOGICAL_ID_RE)
+    directory = store / "worktrees" / name
+    return directory / "_building" if temporary else directory
 
 
 def measure_build_file(
@@ -339,7 +361,7 @@ def _artifact_infrastructure(
 
 @contextmanager
 def _locked_artifact_store(lock_path: pathlib.Path, *, timeout: float = 30) -> Iterator[None]:
-    """Protect cross-version deletion only; allocation never waits on this lock."""
+    """Protect short version allocation and scoped deletion, never builds or tests."""
 
     from filelock import FileLock
 
@@ -533,11 +555,12 @@ def allocate_artifact_version(
     required_targets: Sequence[str], attempt_id: str | None = None,
     declared_input_paths: Sequence[str] = (),
 ) -> ArtifactVersionAllocation:
-    """Choose one final directory for every target before preparing source versions.
+    """Allocate temporary output inside this checkout before preparing source versions.
 
     Exclusive mkdir is the allocation primitive. Only a collision increments an
     alpha/beta number. Permission/I/O errors propagate. A matching unfinished
-    request is reused from current inputs; no resume flag or allocation lock.
+    request is reused from current inputs. A short allocation lock covers directory
+    allocation, so different worktrees still build and test independently.
     """
     root = _validated_worktree(pathlib.Path(repo_root))
     repository = _validated_repository(repository)
@@ -551,54 +574,75 @@ def allocate_artifact_version(
     registration = _git_text(root, ["rev-parse", "--absolute-git-dir"], label="Git registration")
     head = _git_text(root, ["rev-parse", "HEAD"], label="allocation commit")
     store, lock_path = _artifact_infrastructure(root)
-    _build_directory(store / unit)
+    temporary = _artifact_store_path(root, temporary=True)
+    _build_directory(temporary / unit)
     uncertain: list[pathlib.Path] = []
-    while True:
-        directory = store / unit / version
-        allocation = ArtifactVersionAllocation(
-            repo_root=root, repository=repository, worktree_registration=registration,
-            branch=branch, release_bundle=unit, version=version, version_class=classification,
-            attempt_id=attempt_id or "", allocation_commit=head, required_targets=targets,
-            declared_input_paths=paths, store=store, request_path=directory / "build_request.json",
-            version_root=directory, diagnostic_root=directory / ".diagnostics",
-            lock_path=lock_path, uncertain_directories=tuple(uncertain),
-        )
-        if _artifact_tag_exists(root, unit, version):
-            version = _next_prerelease(version)
-            continue
-        if attempt_id is None:
-            if directory.exists():
-                try:
-                    reused = _read_reusable_allocation(allocation, explicit_attempt=None)
-                except (RecoveryRequired, StepResultError, OperationError, OSError):
-                    reused = None
-                if reused is not None:
-                    _prune_completed_artifacts(allocation, wait=False)
-                    return reused
-                uncertain.append(directory)
+    with _locked_artifact_store(lock_path.with_name("allocation.lock")):
+        while True:
+            # Keep this checkout's requested attempt plus two recent failed attempts.
+            # Successful completion removes obsolete temporary versions altogether.
+            previous = sorted(
+                ((Version(path.name), path) for path in (temporary / unit).iterdir()
+                 if FULL_VERSION_RE.fullmatch(path.name) and path.name != version),
+                reverse=True,
+            )
+            for _version, obsolete in previous[2:]:
+                _remove_versioned_tree(obsolete, temporary / unit, label="Obsolete build temporary output")
+            directory = temporary / unit / version
+            allocation = ArtifactVersionAllocation(
+                repo_root=root, repository=repository, worktree_registration=registration,
+                branch=branch, release_bundle=unit, version=version, version_class=classification,
+                attempt_id=attempt_id or "", allocation_commit=head, required_targets=targets,
+                declared_input_paths=paths, store=store, request_path=directory / "build_request.json",
+                version_root=directory, diagnostic_root=directory / ".diagnostics",
+                lock_path=lock_path, uncertain_directories=tuple(uncertain),
+            )
+            if _artifact_tag_exists(root, unit, version):
                 version = _next_prerelease(version)
                 continue
-            allocation = replace(allocation, attempt_id=str(uuid.uuid4()))
-        try:
-            directory.mkdir(exist_ok=False)
-        except FileExistsError:
+            # Tags name versions repository-wide. Reserve by directory under the
+            # short store lock; only inspect exact version paths in sibling folders.
+            # This is version allocation, never permission to clean another folder.
+            occupied = any(
+                candidate.exists()
+                for checkout in (store / "worktrees").iterdir()
+                for candidate in (checkout / unit / version, checkout / "_building" / unit / version)
+                if candidate != directory and not (
+                    directory.exists() and candidate == temporary.parent / unit / version)
+            )
+            if occupied:
+                version = _next_prerelease(version)
+                continue
+            if attempt_id is None:
+                if directory.exists():
+                    try:
+                        reused = _read_reusable_allocation(allocation, explicit_attempt=None)
+                    except (RecoveryRequired, StepResultError, OperationError, OSError):
+                        reused = None
+                    if reused is not None:
+                        return reused
+                    uncertain.append(directory)
+                    version = _next_prerelease(version)
+                    continue
+                allocation = replace(allocation, attempt_id=str(uuid.uuid4()))
             try:
-                sdlc_results._plain_path(directory, directory=True, label="Artifact version")
-                reused = _read_reusable_allocation(allocation, explicit_attempt=attempt_id)
-            except (RecoveryRequired, StepResultError, OperationError, OSError):
-                uncertain.append(directory)
-                reused = None
-            if reused is not None:
-                _prune_completed_artifacts(allocation, wait=False)
-                return reused
-            version = _next_prerelease(version)
-            continue
-        _write_transaction_record(
-            allocation.request_path, _build_request_record(allocation),
-            replace=False, label="artifact build request",
-        )
-        _prune_completed_artifacts(allocation, wait=False)
-        return allocation
+                directory.mkdir(exist_ok=False)
+            except FileExistsError:
+                try:
+                    sdlc_results._plain_path(directory, directory=True, label="Artifact version")
+                    reused = _read_reusable_allocation(allocation, explicit_attempt=attempt_id)
+                except (RecoveryRequired, StepResultError, OperationError, OSError):
+                    uncertain.append(directory)
+                    reused = None
+                if reused is not None:
+                    return reused
+                version = _next_prerelease(version)
+                continue
+            _write_transaction_record(
+                allocation.request_path, _build_request_record(allocation),
+                replace=False, label="artifact build request",
+            )
+            return allocation
 
 
 def bind_artifact_inputs(
@@ -676,23 +720,6 @@ def _remove_versioned_tree(
         raise OperationError(f"{label.capitalize()} cleanup did not complete.")
 
 
-def _prune_completed_artifacts(allocation: ArtifactVersionAllocation, *, wait: bool = True) -> None:
-    """Retire only this worktree's previously recorded copies for this member."""
-    from filelock import Timeout
-    registration = pathlib.Path(allocation.worktree_registration).name
-    if registration == ".git":
-        registration = "primary"
-    try:
-        with _locked_artifact_store(allocation.lock_path, timeout=30 if wait else 0):
-            for target in allocation.required_targets:
-                scope = retain_artifact_versions.RetentionScope(
-                    allocation.store, allocation.release_bundle, target, "worktree", registration)
-                retain_artifact_versions.retain_artifact_versions(scope, protection=nullcontext)
-    except Timeout:
-        if wait:
-            raise
-
-
 
 def measure_versioned_artifact(
     transaction: ArtifactVersionTransaction,
@@ -719,7 +746,6 @@ def retain_completed_artifacts(
     worktree: str = "",
     approved: retain_artifact_versions.RetentionVersion | None = None,
     deployments: Sequence[retain_artifact_versions.RetentionVersion] = (),
-    file_use: retain_artifact_versions.FileUse | None = None,
     release_replacement: retain_artifact_versions.RetentionVersion | None = None,
 ) -> retain_artifact_versions.RetentionResult:
     """Apply 4F to the named store group, never discover other owners/results.
@@ -730,13 +756,18 @@ def retain_completed_artifacts(
     if pool not in {"worktree", "beta-stable"}:
         raise OperationError("Installation destinations belong to their installer.")
     store, lock_path = _artifact_infrastructure(repo_root)
+    if pool == "worktree":
+        own_directory = _artifact_store_path(repo_root, worktree=True).name
+        if worktree and worktree != own_directory:
+            raise OperationError("A worktree can retain or clean only its own artifact directory.")
+        worktree = own_directory
     scope = retain_artifact_versions.RetentionScope(store, unit, target, pool, worktree)
     if release_replacement is not None:
         current = _git_text(repo_root, ["rev-parse", "refs/heads/release/local"], label="release branch")
         if current != release_replacement.build.final_commit:
             raise OperationError("Release does not select the retained replacement commit.")
     return retain_artifact_versions.retain_artifact_versions(
-        scope, approved=approved, deployments=deployments, file_use=file_use,
+        scope, approved=approved, deployments=deployments,
         protection=lambda: _locked_artifact_store(lock_path),
         release_replacement=release_replacement,
     )

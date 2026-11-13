@@ -100,14 +100,30 @@ def _worktree_build_case(tmp_path):
     return repository, options
 
 
-def test_worktree_build_commits_selected_source_and_finishes_once(tmp_path):
+@pytest.mark.parametrize("checkout", ["primary", "release-local", "task-worktree"])
+def test_worktree_build_commits_selected_source_and_finishes_once(tmp_path, checkout):
     repository, options = _worktree_build_case(tmp_path)
+    if checkout == "release-local":
+        assert run_git(repository, "branch", "-m", "release/local").returncode == 0
+    elif checkout == "task-worktree":
+        source = repository
+        repository = tmp_path / "task-worktree"
+        assert run_git(source, "worktree", "add", "-b", "task", str(repository)).returncode == 0
+        (repository / "unrelated.txt").write_bytes(b"keep staged change")
+        assert run_git(repository, "add", "unrelated.txt").returncode == 0
     result = runner.execute_build(repository, **options)
     assert result["status"] == "completed", result
     assert 'version="1.2.20b1"' in run_git(repository, "show", result["tag"] + ":pyproject.toml").stdout
     assert run_git(repository, "show", result["tag"] + ":unrelated.txt").stdout == "original"
     assert run_git(repository, "diff", "--cached", "--name-only").stdout.strip() == "unrelated.txt"
     assert (repository / ".build-count").read_text() == "x"
+    scoped_root = storage._artifact_store_path(repository, worktree=True)
+    assert scoped_root.name == checkout
+    assert storage._artifact_store_path(repository, temporary=True) == scoped_root / "_building"
+    assert all(pathlib.Path(path).is_relative_to(scoped_root) and pathlib.Path(path).is_file()
+               for paths in result["artifacts"].values() for path in paths)
+    assert not list((scoped_root / "_building").rglob("build_request.json"))
+    assert not list((scoped_root / "_building").rglob("*.whl"))
 
     selected = results.read_build_check_summary(repository, result["tag"],
                                                 pathlib.Path(result["build_receipts"][0]).relative_to(repository).as_posix())
@@ -158,9 +174,17 @@ def test_worktree_build_failure_preserves_cause_without_receipt_or_tag(tmp_path)
     assert "compiler rejected source" in json.dumps(result)
     assert run_git(repository, "tag", "--list").stdout == ""
     assert not list((repository / ".build").glob("**/build_receipt.json"))
+    assert list(storage._artifact_store_path(repository, temporary=True).rglob("build_request.json"))
+    assert not list(storage._artifact_store_path(repository, worktree=True).glob("members/*/*/*/*/artifact-receipt.json"))
+    temporary = storage._artifact_store_path(repository, temporary=True) / "members/packages/claims"
+    for version in ("1.1.0b1", "1.1.0b2", "1.1.0b3"):
+        stale = temporary / version
+        stale.mkdir(parents=True)
+        (stale / "failed-output.bin").write_bytes(b"old failed output")
     (repository / ".fail-build").unlink()
     fixed = runner.execute_build(repository, **options)
     assert fixed["status"] == "completed", fixed
+    assert not list(temporary.iterdir())
     assert (repository / ".build-count").read_text() == "x"
 
 
@@ -439,7 +463,7 @@ def test_versioned_receipt_rejects_changed_tested_artifact(tmp_path) -> None:
 
 
 @pytest.mark.parametrize("effect", ["_create_result_commit", "_write_version_artifact_receipts",
-                                  "_create_artifact_tag", "_remove_build_request"])
+                                  "_create_artifact_tag", "_remove_completed_build_temp"])
 @pytest.mark.parametrize("timing", ["before", "after"])
 def test_versioned_completion_repeats_before_and_after_each_effect(tmp_path, monkeypatch, effect, timing):
     repository, checkpoint, transaction, prepared, _receipts = _prepared_versioned_completion(tmp_path)
@@ -473,8 +497,8 @@ def test_versioned_completion_commits_only_results_and_binds_every_target(
     )
     unrelated = _write_fixture_bytes(repository, "notes.txt", b"keep staged\n")
     assert run_git(repository, "add", "notes.txt").returncode == 0
-    artifact_mtimes = {
-        path: path.stat().st_mtime_ns
+    tested_bytes = {
+        (target, path.relative_to(transaction.target_output(target))): path.read_bytes()
         for target in transaction.required_targets
         for path in transaction.target_output(target).rglob("*")
         if path.is_file()
@@ -515,7 +539,9 @@ def test_versioned_completion_commits_only_results_and_binds_every_target(
         == completed.final_commit
         for path in completed.artifact_receipts
     )
-    assert all(path.stat().st_mtime_ns == mtime for path, mtime in artifact_mtimes.items())
+    assert not transaction.version_root.exists()
+    assert all((transaction.artifact_receipt(target).parent / relative).read_bytes() == raw
+               for (target, relative), raw in tested_bytes.items())
     for path in completed.artifact_receipts:
         selected = results.read_artifact_receipt_chain(
             repository, artifact_receipt_path=path
@@ -578,12 +604,13 @@ def test_versioned_cleanup_failure_retries_without_repeating_completed_effects(t
     with monkeypatch.context() as patch:
         def failed_cleanup(*args):
             raise storage.OperationError("cleanup interrupted")
-        patch.setattr(completion, "_clear_versioned_diagnostics", failed_cleanup)
+        patch.setattr(completion, "_remove_completed_build_temp", failed_cleanup)
         with pytest.raises(storage.OperationError, match="cleanup interrupted"):
             completion.complete_versioned_artifacts(transaction, prepared)
     final = run_git(repository, "rev-parse", "HEAD").stdout.strip()
     assert transaction.request_path.exists()
-    mtimes = {path: path.stat().st_mtime_ns for path in transaction.version_root.rglob("*") if path.is_file()}
+    retained_root = storage._artifact_store_path(repository, worktree=True) / transaction.release_bundle / transaction.version
+    mtimes = {path: path.stat().st_mtime_ns for path in retained_root.rglob("*") if path.is_file()}
     # Completed results are Git data; a cleanup retry must not need the mutable
     # worktree receipt, let alone rewrite it or repeat a build/test/finalization.
     prepared[0].worktree_path.write_bytes(b"unrelated subsequent work")
@@ -616,8 +643,8 @@ def test_versioned_completion_resumes_effects_without_duplicate_commit(
             attempt_id=f"attempt-{interruption}",
         )
     )
-    artifact_mtimes = {
-        path: path.stat().st_mtime_ns
+    tested_bytes = {
+        (target, path.relative_to(transaction.target_output(target))): path.read_bytes()
         for target in transaction.required_targets
         for path in transaction.target_output(target).rglob("*")
         if path.is_file()
@@ -627,7 +654,7 @@ def test_versioned_completion_resumes_effects_without_duplicate_commit(
     elif interruption == "after-receipts":
         name = "_create_artifact_tag"
     else:
-        name = "_remove_build_request"
+        name = "_remove_completed_build_temp"
     original = getattr(completion, name)
 
     def interrupted(*args, **kwargs):
@@ -639,7 +666,9 @@ def test_versioned_completion_resumes_effects_without_duplicate_commit(
     created = run_git(repository, "rev-parse", "HEAD").stdout.strip()
     assert created != checkpoint
     if interruption == "after-commit":
-        transaction.artifact_receipt(transaction.required_targets[0]).write_bytes(b"{")
+        interrupted_receipt = transaction.artifact_receipt(transaction.required_targets[0])
+        interrupted_receipt.parent.mkdir(parents=True, exist_ok=True)
+        interrupted_receipt.write_bytes(b"{")
         assert not storage._artifact_tag_exists(
             repository, transaction.release_bundle, transaction.version
         )
@@ -672,7 +701,9 @@ def test_versioned_completion_resumes_effects_without_duplicate_commit(
     assert run_git(
         repository, "rev-parse", f"refs/tags/{completed.tag}^{{commit}}"
     ).stdout.strip() == created
-    assert all(path.stat().st_mtime_ns == mtime for path, mtime in artifact_mtimes.items())
+    assert not transaction.version_root.exists()
+    assert all((transaction.artifact_receipt(target).parent / relative).read_bytes() == raw
+               for (target, relative), raw in tested_bytes.items())
 
 
 @pytest.mark.parametrize("change", ["unstaged", "staged-only", "new-file"])
@@ -813,7 +844,7 @@ def test_grouped_completion_interruption(tmp_path, monkeypatch, effect):
     assert run_git(repository, "commit", "--only", "-m", "bundle", "--", "sdlc/sdlc.yml").returncode == 0
     name = {"result-commit": "_create_result_commit", "artifact-receipt": "_write_version_artifact_receipts",
             "first-tag": "_create_artifact_tag", "second-tag": "_create_artifact_tag",
-            "cleanup": "_remove_build_request"}[effect]
+            "cleanup": "_remove_completed_build_temp"}[effect]
     sequence = [DEFAULT, KeyboardInterrupt("group interrupted")] if effect == "second-tag" else [
         KeyboardInterrupt("group interrupted")]
     with monkeypatch.context() as patch:
