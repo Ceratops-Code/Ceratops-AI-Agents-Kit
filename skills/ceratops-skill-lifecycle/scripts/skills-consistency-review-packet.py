@@ -26,7 +26,7 @@ from typing import Any
 scripts_root = str(pathlib.Path(__file__).resolve().parent)
 sys.path.insert(0, scripts_root)
 try:
-    from runtime import retain_skill_sources as source_provenance
+    from runtime import read_skill_sources as source_provenance
 finally:
     sys.path.remove(scripts_root)
 
@@ -344,7 +344,7 @@ def packet(args: argparse.Namespace) -> dict[str, Any]:
     if runtime["schema"] != RUNTIME_SCHEMA or runtime["skill"] != skill:
         raise PacketError("direct runtime manifest identity is unsupported")
     repo, retained_paths, source_origin = source_provenance.resolve_review_source(
-        runtime, installed_skill, args.repo_root, args.output.resolve())
+        runtime, args.repo_root, args.output.resolve())
 
     source_value = str(runtime["source_path"])
     source_pure = pathlib.PurePosixPath(source_value)

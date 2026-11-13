@@ -517,13 +517,15 @@ An occupied directory or version tag advances an alpha/beta number; an occupied
 final version requires a new version choice. There is no reservation file.
 
 The caller prepares source versions and commits them before writing artifacts.
-`build_request.json` describes those inputs and lets an unchanged interrupted
-build continue. Failed-build output and one diagnostic per target stay in its
-temporary version directory. Startup keeps the requested attempt and at most two
-other attempts in that deliverable folder. A success removes its temporary files
-and older failed attempts. They are not accepted artifacts. After a crash,
-cleanup waits for the next build of that item in the same checkout; no background
-cleanup runs while the checkout is idle.
+At the start of each new build, allocation deletes every unfinished build of
+that item from this checkout's `_in-test` folder, including an earlier attempt
+at the same version and output with a damaged request file. It then creates a
+fresh `build_request.json` for this call. A crash leaves temporary output until
+the same checkout next builds that item. Successful completion removes its
+temporary output. Uncommitted receipts for discarded attempts are removed too;
+committed build history keeps its version. Other items, other checkouts and
+accepted artifacts are outside this cleanup. A committed passing receipt can
+finish its missing copy or tags before another build is allocated.
 
 After the required checks pass, `complete_artifact_builds.py` copies the measured
 files to `worktrees/<checkout>/<unit>/<version>/<target>/` for a task checkout,
@@ -1792,33 +1794,19 @@ is removed with the stage after success or on the next matching fresh call.
 
 Both installers build Python packages and render skills directly from the
 selected checkout. Builds and installation from the primary or release checkout
-stay inside the managed installer's existing release-source lock. Temporary
-source views supply deployment evidence; they are never build inputs.
-Completed files still use temporary deployment staging. Runtime manifests record
-the
-repository identity, primary checkout path, full Git commit when present, and
-relative skill path. Source snapshots are compressed `.source-<sha256>.zip` files
-under `<install-root-parent>/artifacts/<install-root-name>/sources/<skill>/`,
-outside installed skills and Python runtimes. They contain the exact source
-inputs, including dirty or unpacked sources; they are not installable skill
-packages. Git supplies clean
-commits directly; dirty snapshots include tracked and nonignored working files.
-The manifest records the archive digest and whether local changes were present.
-Source history changes publish the immutable archive before switching the
-manifest, preserving open skill directories and the previous source identity
-if publication is interrupted. Startup and successful activation retain the
-current archive and at most two predecessors per installed skill. Removing a
-managed skill removes its source-archive group too.
+stay inside the managed installer's existing release-source lock. Completed
+files use temporary deployment staging. Runtime manifests record the repository
+identity, primary checkout path, relative skill path and the full Git commit
+when the installed source has no local changes. Uncommitted and non-Git source
+can still be installed, but has no exact commit for later source comparison.
 
-`retain_skill_sources.py` owns managed source snapshots. Disposable views live
-under `<repo-parent>/tmp/<repo-name>/<task>`; OS locks protect active workers,
-and fresh calls remove inactive views in that task group. Bootstrap views stay
-inside its reserved staging tree. Review packets own a source view beside the
-packet, `.<packet-name>.source`, until their `--cleanup-output <packet>` call.
-Audits use retained bytes even after a checkout disappears; a missing clean
-archive can be reconstructed from its exact commit in the explicitly selected
-checkout. Dirty source needs its archive. Earlier installations without source
-evidence need redeployment if their recorded checkout is gone.
+`read_skill_sources.py` reads the recorded commit from the repository named by
+the comparison request. It reads Git blobs directly without changing the branch
+or index. Its temporary comparison files live beside the caller's report at
+`.<packet-name>.source` and are removed by `--cleanup-output <packet>`.
+An unavailable commit or an installation with no recorded clean commit blocks
+exact comparison; the current checkout never substitutes for the installed
+source. Installers create no source archives or additional source-history store.
 
 For another Ceratops-compatible repo, run its versioned repository installer:
 

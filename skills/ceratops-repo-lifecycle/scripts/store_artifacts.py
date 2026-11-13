@@ -52,8 +52,8 @@ class RecoveryRequired(OperationError):
 class ArtifactVersionAllocation:
     """Private temporary directory allocated before source versions are prepared.
 
-    The request describes desired inputs, not execution progress. Occupied paths
-    without readable ownership remain untouched and are returned for cleanup.
+    The request describes this call's inputs. A later build of the same item
+    clears its unfinished directory before allocating fresh temporary output.
     """
 
     repo_root: pathlib.Path
@@ -72,7 +72,6 @@ class ArtifactVersionAllocation:
     version_root: pathlib.Path
     diagnostic_root: pathlib.Path
     lock_path: pathlib.Path
-    uncertain_directories: tuple[pathlib.Path, ...]
 
     def target_output(self, target: str) -> pathlib.Path:
         _require_transaction_target(self, target)
@@ -511,46 +510,6 @@ def _next_prerelease(version: str) -> str:
     return f"{match[1]}{int(match[2]) + 1}{match[3] or ''}"
 
 
-def _read_reusable_allocation(
-    allocation: ArtifactVersionAllocation, *, explicit_attempt: str | None,
-) -> ArtifactVersionAllocation | ArtifactVersionTransaction | None:
-    record = _read_transaction_record(allocation.request_path, "Artifact build request")
-    # Another worktree or another declared input set owns an independent build.
-    expected = _build_request_record(allocation)
-    for key in ("repository", "worktree", "worktreeRegistration", "branch",
-                "releaseBundle", "version", "requiredTargets", "declaredInputPaths"):
-        if record.get(key) != expected[key]:
-            return None
-    if explicit_attempt is not None and record.get("attemptId") != explicit_attempt:
-        return None
-    attempt = _require_identifier(record.get("attemptId"), label="attempt ID", pattern=LOGICAL_ID_RE)
-    allocated_at = _validated_commit(allocation.repo_root, record.get("allocationCommit"))
-    values = {**allocation.__dict__, "attempt_id": attempt, "allocation_commit": allocated_at}
-    checkpoint = record.get("preTestCommit")
-    if checkpoint is None:
-        if allocation.allocation_commit != allocated_at:
-            # Source preparation can commit successfully before input binding is
-            # interrupted. Recognize that exact direct child, not an arbitrary
-            # later commit or a saved execution step.
-            head = allocation.allocation_commit
-            parents = _git_text(allocation.repo_root, ["rev-list", "--parents", "-n", "1", head], label="prepared source parents").split()
-            message = _git_text(allocation.repo_root, ["show", "-s", "--format=%B", head], label="prepared source identity", single_line=False)
-            trailer = f"Ceratops-Source-Build: {allocation.release_bundle}/{allocation.version} {attempt}"
-            changed = _git_text(allocation.repo_root, ["diff-tree", "--no-commit-id", "--name-only", "-r", allocated_at, head], label="prepared source paths", single_line=False).splitlines()
-            if (parents != [head, allocated_at] or trailer not in message.splitlines()
-                    or not set(changed).issubset(allocation.declared_input_paths)
-                    or not _inputs_match_commit(allocation.repo_root, head, allocation.declared_input_paths)):
-                return None
-        reused: ArtifactVersionAllocation = ArtifactVersionAllocation(**values)
-    else:
-        checkpoint = _validated_commit(allocation.repo_root, checkpoint)
-        if not _inputs_match_commit(allocation.repo_root, checkpoint, allocation.declared_input_paths):
-            return None
-        reused = ArtifactVersionTransaction(**values, pre_test_commit=checkpoint)
-    _require_build_request(reused)
-    return reused
-
-
 def allocate_artifact_version(
     repo_root: pathlib.Path, *, repository: str, release_bundle: str, version: str,
     required_targets: Sequence[str], attempt_id: str | None = None,
@@ -559,9 +518,9 @@ def allocate_artifact_version(
     """Allocate temporary output inside this checkout before preparing source versions.
 
     Exclusive mkdir is the allocation primitive. Only a collision increments an
-    alpha/beta number. Permission/I/O errors propagate. A matching unfinished
-    request is reused from current inputs. A short allocation lock covers directory
-    allocation, so different worktrees still build and test independently.
+    alpha/beta number. Permission/I/O errors propagate. Before allocating, remove
+    every unfinished build of this item in this checkout. A short allocation lock
+    covers cleanup and allocation; other checkouts' directories are never removed.
     """
     root = _validated_worktree(pathlib.Path(repo_root))
     repository = _validated_repository(repository)
@@ -577,28 +536,53 @@ def allocate_artifact_version(
     store, lock_path = _artifact_infrastructure(root)
     temporary = _artifact_store_path(root, temporary=True)
     _build_directory(temporary / unit)
-    uncertain: list[pathlib.Path] = []
     with _locked_artifact_store(lock_path.with_name("allocation.lock")):
-        while True:
-            # Keep this checkout's requested attempt plus two recent failed attempts.
-            # Successful completion removes obsolete temporary versions altogether.
-            previous = sorted(
-                ((Version(path.name), path) for path in (temporary / unit).iterdir()
-                 if FULL_VERSION_RE.fullmatch(path.name) and path.name != version),
-                reverse=True,
+        # A committed passing receipt means testing finished. Its remaining tags
+        # or retained copy can still need completion after interruption; that is
+        # completion of finished work, not another build of unfinished output.
+        result_directory = f".build/{unit}/{version}"
+        committed = set(_git_text(
+            root, ["ls-tree", "-r", "--name-only", "HEAD", "--", result_directory],
+            label="committed build results", single_line=False,
+        ).splitlines())
+        receipt_paths = ({f"{result_directory}/build_receipt.json"} if len(targets) == 1 else
+                         {f"{result_directory}/{target}/build_receipt.json" for target in targets})
+        if receipt_paths <= committed and (temporary / unit / version / "build_request.json").is_file():
+            from complete_artifact_builds import read_artifact_build
+            finished = read_artifact_build(
+                root, repository=repository, release_bundle=unit, version=version,
+                required_targets=targets,
             )
-            for _version, obsolete in previous[2:]:
-                _remove_versioned_tree(obsolete, temporary / unit, label="Obsolete build temporary output")
+            if (finished.declared_input_paths == paths
+                    and _inputs_match_commit(root, finished.pre_test_commit, paths)):
+                return finished
+        for obsolete in (temporary / unit).iterdir():
+            # Uncommitted receipts belong to the discarded attempt too. Keeping
+            # them would make a new build read results for bytes just removed.
+            # Committed history stays in Git and occupies its original version.
+            if FULL_VERSION_RE.fullmatch(obsolete.name):
+                records = root / ".build" / unit / obsolete.name
+                if records.exists() and not _artifact_tag_exists(root, unit, obsolete.name):
+                    tracked = _git_text(
+                        root, ["ls-files", "--", records.relative_to(root).as_posix()],
+                        label="unfinished result paths", single_line=False,
+                    )
+                    if not tracked:
+                        _remove_versioned_tree(records, root / ".build" / unit,
+                                               label="Uncommitted unfinished build results")
+            _remove_versioned_tree(obsolete, temporary / unit, label="Unfinished build output")
+        while True:
             directory = temporary / unit / version
             allocation = ArtifactVersionAllocation(
                 repo_root=root, repository=repository, worktree_registration=registration,
                 branch=branch, release_bundle=unit, version=version, version_class=classification,
-                attempt_id=attempt_id or "", allocation_commit=head, required_targets=targets,
+                attempt_id=attempt_id or str(uuid.uuid4()), allocation_commit=head, required_targets=targets,
                 declared_input_paths=paths, store=store, request_path=directory / "build_request.json",
                 version_root=directory, diagnostic_root=directory / ".diagnostics",
-                lock_path=lock_path, uncertain_directories=tuple(uncertain),
+                lock_path=lock_path,
             )
-            if _artifact_tag_exists(root, unit, version):
+            if (_artifact_tag_exists(root, unit, version)
+                    or (root / ".build" / unit / version).exists()):
                 version = _next_prerelease(version)
                 continue
             # Tags name versions repository-wide. Reserve by directory under the
@@ -608,39 +592,15 @@ def allocate_artifact_version(
                 candidate.exists()
                 for checkout in (store / "worktrees").iterdir()
                 for candidate in (checkout / unit / version, checkout / "_in-test" / unit / version)
-                if candidate != directory and not (
-                    directory.exists() and candidate == temporary.parent / unit / version)
+                if candidate != directory
             )
-            occupied = occupied or (
-                (store / "beta-stable" / unit / version).exists()
-                and not (branch == "release/local" and directory.exists())
-            )
+            occupied = occupied or (store / "beta-stable" / unit / version).exists()
             if occupied:
                 version = _next_prerelease(version)
                 continue
-            if attempt_id is None:
-                if directory.exists():
-                    try:
-                        reused = _read_reusable_allocation(allocation, explicit_attempt=None)
-                    except (RecoveryRequired, StepResultError, OperationError, OSError):
-                        reused = None
-                    if reused is not None:
-                        return reused
-                    uncertain.append(directory)
-                    version = _next_prerelease(version)
-                    continue
-                allocation = replace(allocation, attempt_id=str(uuid.uuid4()))
             try:
                 directory.mkdir(exist_ok=False)
             except FileExistsError:
-                try:
-                    sdlc_results._plain_path(directory, directory=True, label="Artifact version")
-                    reused = _read_reusable_allocation(allocation, explicit_attempt=attempt_id)
-                except (RecoveryRequired, StepResultError, OperationError, OSError):
-                    uncertain.append(directory)
-                    reused = None
-                if reused is not None:
-                    return reused
                 version = _next_prerelease(version)
                 continue
             _write_transaction_record(

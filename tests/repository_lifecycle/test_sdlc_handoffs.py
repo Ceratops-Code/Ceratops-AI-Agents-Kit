@@ -435,13 +435,12 @@ def test_versioned_allocation_repeats_after_directory_and_request_effects(tmp_pa
                 storage.bind_artifact_inputs(allocation, pre_test_commit=commit)
     assert fired
     fresh = storage.allocate_artifact_version(repository, **selection)
-    uncertain = (stage == "mkdir" and timing == "after") or (stage == "request" and timing == "before")
-    assert fresh.version == ("1.2.3b2" if uncertain else "1.2.3b1")
+    assert fresh.version == "1.2.3b1"
     bound = storage.bind_artifact_inputs(fresh, pre_test_commit=commit)
     assert json.loads(bound.request_path.read_text())["preTestCommit"] == commit
     assert all(bound.target_output(target).is_dir() for target in bound.required_targets)
     repeated = storage.allocate_artifact_version(repository, **{**selection, "version": bound.version})
-    assert storage._build_request_record(repeated) == storage._build_request_record(bound)
+    assert storage._build_request_record(repeated)["preTestCommit"] is None
     assert repeated.request_path == bound.request_path
 
 
@@ -461,18 +460,20 @@ def test_versioned_allocation_precedes_embedded_versions_and_commit_b(tmp_path):
     bound = storage.bind_artifact_inputs(allocation, pre_test_commit=checkpoint)
     assert bound.pre_test_commit != before
     assert (repository / "version.txt").read_text() == bound.version
-    assert storage.allocate_artifact_version(repository, **selection) == bound
+    fresh = storage.allocate_artifact_version(repository, **selection)
+    assert fresh.version == bound.version
+    assert storage._build_request_record(fresh)["preTestCommit"] is None
 
 
 @pytest.mark.parametrize("change", ["worktree", "index", "new-file"])
-def test_versioned_changed_inputs_select_another_directory(tmp_path, change):
+def test_versioned_changed_inputs_discard_unfinished_output(tmp_path, change):
     repository, commit = _versioned_repository(tmp_path)
     selection = dict(repository="example/project", release_bundle="claims", version="1.2.3a1",
                      required_targets=["linux"], attempt_id="attempt-inputs",
                      declared_input_paths=["src"])
     original = _bound_test_build(repository, pre_test_commit=commit, **selection)
-    sentinel = original.version_root / "accepted.bin"
-    sentinel.write_bytes(b"keep successful work")
+    sentinel = original.version_root / "partial.bin"
+    sentinel.write_bytes(b"unfinished work")
     source = repository / "src/claims.py"
     if change == "new-file":
         (source.parent / "new.py").write_text("changed")
@@ -482,8 +483,8 @@ def test_versioned_changed_inputs_select_another_directory(tmp_path, change):
             assert run_git(repository, "add", "src/claims.py").returncode == 0
             source.write_bytes(b"print('claims')\n")
     fresh = storage.allocate_artifact_version(repository, **selection)
-    assert fresh.version == "1.2.3a2"
-    assert sentinel.read_bytes() == b"keep successful work"
+    assert fresh.version == "1.2.3a1"
+    assert not sentinel.exists()
     with pytest.raises(storage.OperationError, match="committed"):
         storage.bind_artifact_inputs(fresh, pre_test_commit=commit)
 
@@ -506,9 +507,10 @@ def test_versioned_allocation_propagates_permission_errors_and_requires_final_ve
     store = storage._artifact_store_path(repository, temporary=True) / "claims"
     assert not list(store.iterdir())
     first = storage.allocate_artifact_version(repository, **{**selection, "version": "1.2.3"})
+    assert run_git(repository, "tag", "claims/1.2.3").returncode == 0
     with pytest.raises(storage.OperationError, match="choose another final version"):
         storage.allocate_artifact_version(repository, **{**selection, "version": "1.2.3", "attempt_id": "another"})
-    assert first.request_path.is_file()
+    assert not first.request_path.exists()
 
 
 def test_versioned_competing_processes_allocate_while_retention_is_busy(tmp_path):
@@ -561,41 +563,43 @@ def test_versioned_competing_processes_allocate_while_retention_is_busy(tmp_path
             worker.wait(timeout=10)
 
 
-def test_versioned_requests_preserve_owners_and_coordinate_targets(tmp_path) -> None:
+def test_versioned_requests_clear_only_same_checkout_and_item(tmp_path) -> None:
     repository, commit = _versioned_repository(tmp_path)
     targets = ["python-3.14-windows", "python-3.14-linux"]
     selection = dict(repository="example/project", release_bundle="claims", version="1.2.3a1",
                      required_targets=targets, attempt_id="attempt-alpha-001")
     transaction = _bound_test_build(repository, pre_test_commit=commit, **selection)
-    sentinel = transaction.target_output(targets[0]) / "owned.bin"
-    sentinel.write_bytes(b"preserve this attempt")
-    assert all(transaction.target_output(target).is_dir() for target in targets)
-    repeated = storage.allocate_artifact_version(repository, **selection)
-    assert repeated.request_path == transaction.request_path
-    assert repeated.pre_test_commit == commit
-    independent = _bound_test_build(
-        repository, pre_test_commit=commit, **{**selection, "attempt_id": "another-build"},
-    )
-    assert independent.version == "1.2.3a2"
+    sentinel = transaction.target_output(targets[0]) / "partial.bin"
+    sentinel.write_bytes(b"discard unfinished output")
+    other_item = storage._artifact_store_path(repository, temporary=True) / "other-item/1.0.0a1"
+    other_item.mkdir(parents=True)
+    unrelated = other_item / "keep.bin"
+    unrelated.write_bytes(b"other item")
     second_worktree = tmp_path / "parallel-worktree"
     assert run_git(repository, "worktree", "add", "-b", "parallel-versioned-test",
                    str(second_worktree), commit).returncode == 0
     foreign = _bound_test_build(second_worktree, pre_test_commit=commit, **selection)
-    assert foreign.version == "1.2.3a3"
-    assert sentinel.read_bytes() == b"preserve this attempt"
-    assert not (transaction.store / ".reservations").exists()
-    diagnostic = completion.write_versioned_failure_diagnostic(transaction, targets[0], "first failure")
-    assert diagnostic.parent == transaction.version_root / ".diagnostics"
-    completion.write_versioned_failure_diagnostic(transaction, targets[0], "replacement failure")
+    assert foreign.version == "1.2.3a2"
+    foreign_file = foreign.target_output(targets[0]) / "keep.bin"
+    foreign_file.write_bytes(b"another checkout")
+    repeated = _bound_test_build(repository, pre_test_commit=commit, **selection)
+    assert repeated.version == "1.2.3a1"
+    assert repeated.pre_test_commit == commit
+    assert all(repeated.target_output(target).is_dir() for target in targets)
+    assert not sentinel.exists()
+    assert unrelated.read_bytes() == b"other item"
+    assert foreign_file.read_bytes() == b"another checkout"
+    diagnostic = completion.write_versioned_failure_diagnostic(repeated, targets[0], "first failure")
+    assert diagnostic.parent == repeated.version_root / ".diagnostics"
+    completion.write_versioned_failure_diagnostic(repeated, targets[0], "replacement failure")
     assert json.loads(diagnostic.read_text())["error"] == "replacement failure"
-    diagnostic.write_bytes(b"interrupted diagnostic")
-    completion.write_versioned_failure_diagnostic(transaction, targets[0], "recovered diagnostic")
-    assert json.loads(diagnostic.read_text())["error"] == "recovered diagnostic"
-    transaction.request_path.write_bytes(b"interrupted request")
+    repeated.request_path.write_bytes(b"interrupted request")
     replacement = _bound_test_build(repository, pre_test_commit=commit, **selection)
-    assert replacement.version == "1.2.3a4"
-    assert transaction.version_root in replacement.uncertain_directories
-    assert sentinel.read_bytes() == b"preserve this attempt"
+    assert replacement.version == "1.2.3a1"
+    assert not diagnostic.exists()
+    assert unrelated.read_bytes() == b"other item"
+    assert foreign_file.read_bytes() == b"another checkout"
+    assert not (transaction.store / ".reservations").exists()
 
 
 def _prepared_versioned_completion(

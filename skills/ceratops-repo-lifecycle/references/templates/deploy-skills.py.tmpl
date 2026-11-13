@@ -24,7 +24,6 @@ import sys
 import tempfile
 import tomllib
 import uuid
-import zipfile
 from collections.abc import Mapping, MutableMapping, Sequence
 from typing import Any, cast
 
@@ -835,7 +834,6 @@ def build_skill(
     skill: str,
     python_runtime: pathlib.Path | None,
     source_record: Mapping[str, object] | None = None,
-    source_archive: pathlib.Path | None = None,
 ) -> None:
     """Fully resolve and stage one skill without touching its destination."""
 
@@ -844,8 +842,6 @@ def build_skill(
     if not skill_md.is_file() or unsafe_link(source) or unsafe_link(skill_md):
         raise ValueError(f"{skill}: missing or unsafe source SKILL.md")
     validate_tree(source)
-    if any(re.fullmatch(r"\.source-[0-9a-f]{64}\.zip", path.name) for path in source.iterdir()):
-        raise ValueError("source payload uses the installer's reserved source archive name")
     target = staging / skill
     shutil.copytree(
         source,
@@ -883,12 +879,8 @@ def build_skill(
     }
     if python_runtime is not None:
         metadata["python_runtime"] = str(python_runtime)
-    if source_record is not None and source_archive is not None:
+    if source_record is not None:
         metadata.update(source_record)
-        archive_name = cast(Mapping[str, str], source_record["source_snapshot"])["archive"]
-        if (target / archive_name).exists():
-            raise ValueError("source payload collides with the retained source archive")
-        shutil.copyfile(source_archive, target / archive_name)
     (target / MANIFEST_NAME).write_text(
         json.dumps(metadata, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -1050,87 +1042,22 @@ def bootstrap_git(repo: pathlib.Path, *arguments: str, detect: bool = False) -> 
     return result.stdout
 
 
-def freeze_bootstrap_source(repo: pathlib.Path, install_root: pathlib.Path, staging: pathlib.Path
-                            ) -> tuple[pathlib.Path, pathlib.Path, dict[str, object]]:
-    """Retain one exact source archive inside the existing owned staging tree.
+def read_bootstrap_source_identity(repo: pathlib.Path) -> dict[str, object]:
+    """Record the clean Git commit without creating another source copy."""
 
-    Clean Git inputs come from HEAD, dirty inputs from tracked and nonignored
-    files, and unpacked sources exclude build/cache and destination directories.
-    The extracted view is deployment evidence only. Rendering and runtime
-    preparation read the selected checkout. The bootstrap remains independent
-    and never loads installed lifecycle implementation.
-    """
-
-    archive, frozen = staging / "_source.zip", staging / "_source"
     git = bootstrap_git(repo, "rev-parse", "--git-dir", detect=True) is not None
     head = bootstrap_git(repo, "rev-parse", "--revs-only", "HEAD") if git else None
     commit = head.strip() if head and head.strip() else None
-    dirty = bool(bootstrap_git(repo, "status", "--porcelain", "-z")) if git else True
     primary = repo
     if git:
-        common = pathlib.Path(str(bootstrap_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")).strip())
+        common = pathlib.Path(str(bootstrap_git(
+            repo, "rev-parse", "--path-format=absolute", "--git-common-dir",
+        )).strip())
         if common.name == ".git":
             primary = common.parent.resolve()
-    if commit is not None and not dirty:
-        bootstrap_git(repo, "archive", "--format=zip", "--output", str(archive), commit)
-    else:
-        if git:
-            listing = bootstrap_git(repo, "ls-files", "-z", "--cached", "--others", "--exclude-standard")
-            paths = [repo / value for value in sorted(set(str(listing).split("\0")) - {""})]
-        else:
-            paths = []
-            for directory, names, files in os.walk(repo, followlinks=False):
-                names[:] = sorted(name for name in names
-                                  if name not in IGNORED_NAMES | {".venv", "build", "dist"})
-                paths.extend(pathlib.Path(directory) / name for name in sorted(files))
-        with zipfile.ZipFile(archive, "x", compression=zipfile.ZIP_DEFLATED) as output:
-            for path in paths:
-                if path.resolve().is_relative_to(install_root) or not path.exists():
-                    continue
-                if unsafe_link(path):
-                    raise ValueError(f"source archive cannot retain a link: {path}")
-                info = zipfile.ZipInfo(path.relative_to(repo).as_posix(), (1980, 1, 1, 0, 0, 0))
-                info.create_system, info.compress_type = 3, zipfile.ZIP_DEFLATED
-                info.external_attr = (stat.S_IFREG | (0o755 if path.stat().st_mode & 0o111 else 0o644)) << 16
-                output.writestr(info, path.read_bytes())
-    frozen.mkdir()
-    with zipfile.ZipFile(archive) as source:
-        for entry in source.infolist():
-            if not safe_relative(entry.filename) or stat.S_ISLNK(entry.external_attr >> 16):
-                raise ValueError(f"unsafe retained source path: {entry.filename!r}")
-        source.extractall(frozen)
-        if os.name != "nt":
-            for entry in source.infolist():
-                if not entry.is_dir():
-                    (frozen / entry.filename).chmod(0o755 if (entry.external_attr >> 16) & 0o111 else 0o644)
-    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-    return frozen, archive, {"source_repository_root": str(primary), "source_commit": commit,
-                             "source_snapshot": {"archive": f".source-{digest}.zip", "sha256": digest,
-                                                 "dirty": dirty if commit is not None else True}}
-
-
-def prune_bootstrap_sources(skill: pathlib.Path) -> None:
-    """Bound this producer's archives to the current source plus two predecessors."""
-
-    directory = skill.parent.parent / "artifacts" / skill.parent.name / "sources" / skill.name
-    if not directory.exists():
-        return
-    if directory.resolve() != directory.absolute():
-        raise ValueError(f"retained source directory cannot contain links: {directory}")
-    try:
-        metadata = json.loads((skill / MANIFEST_NAME).read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError):
-        metadata = {}
-    record = metadata.get("source_snapshot") if isinstance(metadata, dict) else None
-    current = record.get("archive") if isinstance(record, dict) else None
-    if current is not None and (not isinstance(current, str) or re.fullmatch(r"\.source-[0-9a-f]{64}\.zip", current) is None):
-        raise ValueError("retained source archive name is malformed")
-    candidates = [path for path in directory.iterdir()
-                  if re.fullmatch(r"\.source-[0-9a-f]{64}\.zip", path.name) and path.name != current]
-    if any(unsafe_link(path) or not path.is_file() for path in candidates):
-        raise ValueError(f"unsafe retained source archive: {skill}")
-    for obsolete in sorted(candidates, key=lambda path: (path.stat().st_mtime_ns, path.name), reverse=True)[2:]:
-        obsolete.unlink()
+        if bootstrap_git(repo, "status", "--porcelain", "-z"):
+            commit = None
+    return {"source_repository_root": str(primary), "source_commit": commit}
 
 
 def install_batch(
@@ -1158,10 +1085,8 @@ def install_batch(
         for abandoned in install_root.iterdir():
             if STAGE_RE.fullmatch(abandoned.name):
                 remove_stage(abandoned, install_root)
-        for skill in skills:
-            prune_bootstrap_sources(install_root / skill)
         staging.mkdir()
-        _, source_archive, source_record = freeze_bootstrap_source(repo_root, install_root, staging)
+        source_record = read_bootstrap_source_identity(repo_root)
         manifest = read_manifest(repo_root)
         python_skills = declared_python_skills(repo_root, manifest, skills)
         if python_skills and python_runtime is None:
@@ -1172,7 +1097,7 @@ def install_batch(
             build_skill(
                 repo_root, staging, manifest, skill,
                 python_runtime if skill in python_skills else None,
-                source_record, source_archive,
+                source_record,
             )
         # Inspect only paths being written; retained files are not audited.
         for skill in skills:
@@ -1183,26 +1108,11 @@ def install_batch(
                     raise ValueError(f"bootstrap destination cannot be a link: {target}")
         for skill in skills:
             staged, canonical = staging / skill, install_root / skill
-            metadata = json.loads((staged / MANIFEST_NAME).read_text(encoding="utf-8"))
-            source_name = metadata["source_snapshot"]["archive"]
             canonical.mkdir(exist_ok=True)
-            # Preserve the previous archive until its manifest is replaced.
-            # A directory iteration order must never control source publication.
-            archives = install_root.parent / "artifacts" / install_root.name / "sources" / skill
-            if archives.resolve() != archives.absolute() or ((archives / source_name).exists() and unsafe_link(archives / source_name)):
-                raise ValueError(f"retained source archive destination cannot contain links: {archives}")
-            archives.mkdir(parents=True, exist_ok=True)
-            os.replace(staged / source_name, archives / source_name)
             shutil.copytree(staged, canonical, dirs_exist_ok=True,
                             ignore=shutil.ignore_patterns(MANIFEST_NAME))
             remove_legacy_skill_runtime(canonical)
             os.replace(staged / MANIFEST_NAME, canonical / MANIFEST_NAME)
-            prune_bootstrap_sources(canonical)
-            for obsolete in canonical.glob(".source-*.zip"):
-                if re.fullmatch(r"\.source-[0-9a-f]{64}\.zip", obsolete.name):
-                    if unsafe_link(obsolete) or not obsolete.is_file():
-                        raise ValueError(f"unsafe source file inside skill runtime: {obsolete}")
-                    obsolete.unlink()
         write_codex_root_settings(staging, root_settings)
         if python_runtime is not None:
             try:

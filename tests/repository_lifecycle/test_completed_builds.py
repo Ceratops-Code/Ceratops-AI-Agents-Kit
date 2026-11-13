@@ -181,14 +181,17 @@ def test_worktree_build_failure_preserves_cause_without_receipt_or_tag(tmp_path)
     assert list(storage._artifact_store_path(repository, temporary=True).rglob("build_request.json"))
     assert not list(storage._artifact_store_path(repository, worktree=True).glob("members/*/*/*/*/artifact-receipt.json"))
     temporary = storage._artifact_store_path(repository, temporary=True) / "members/packages/claims"
+    previous = next(temporary.iterdir()) / "partial.bin"
+    previous.write_bytes(b"discard even the same unfinished version")
     for version in ("1.1.0b1", "1.1.0b2", "1.1.0b3"):
         stale = temporary / version
         stale.mkdir(parents=True)
         (stale / "failed-output.bin").write_bytes(b"old failed output")
     failed_again = runner.execute_build(repository, **options)
     assert failed_again["status"] in runner.FAILED_STATUSES
-    assert not (temporary / "1.1.0b1").exists()
-    assert len(list(temporary.iterdir())) == 3
+    assert not previous.exists()
+    assert not list(temporary.rglob("failed-output.bin"))
+    assert len(list(temporary.iterdir())) == 1
     (repository / ".fail-build").unlink()
     fixed = runner.execute_build(repository, **options)
     assert fixed["status"] == "completed", fixed
@@ -196,7 +199,7 @@ def test_worktree_build_failure_preserves_cause_without_receipt_or_tag(tmp_path)
     assert (repository / ".build-count").read_text() == "x"
 
 
-@pytest.mark.parametrize("effect", ["source-commit", "completion"])
+@pytest.mark.parametrize("effect", ["source-commit", "completion", "temporary-cleanup"])
 @pytest.mark.parametrize("timing", ["before", "after"])
 @pytest.mark.parametrize("release", [False, True])
 def test_worktree_build_repeats_commit_and_completion_handoffs(tmp_path, monkeypatch, effect, timing, release):
@@ -204,14 +207,19 @@ def test_worktree_build_repeats_commit_and_completion_handoffs(tmp_path, monkeyp
     if release:
         assert run_git(repository, "branch", "-m", "release/local").returncode == 0
     flow = importlib.import_module("execute_worktree_build")
-    owner = flow if effect == "source-commit" else completion
-    name = "_git" if effect == "source-commit" else "complete_versioned_artifacts"
+    owner = flow if effect == "source-commit" else storage if effect == "temporary-cleanup" else completion
+    name = ("_git" if effect == "source-commit" else "_remove_versioned_tree"
+            if effect == "temporary-cleanup" else "complete_versioned_artifacts")
+    if effect == "temporary-cleanup":
+        stale = storage._artifact_store_path(repository, temporary=True) / "members/packages/claims/1.1.0b1"
+        stale.mkdir(parents=True)
+        (stale / "partial.bin").write_bytes(b"unfinished")
     original = getattr(owner, name)
     fired = False
 
     def interrupted(*args, **kwargs):
         nonlocal fired
-        match = not fired and (effect == "completion" or "commit" in args[1:])
+        match = not fired and (effect != "source-commit" or "commit" in args[1:])
         if match:
             fired = True
         if match and timing == "before":
@@ -228,8 +236,10 @@ def test_worktree_build_repeats_commit_and_completion_handoffs(tmp_path, monkeyp
     assert fired
     result = runner.execute_build(repository, **options)
     assert result["status"] == "completed", result
-    assert (repository / ".build-count").read_text() == "x"
-    assert run_git(repository, "log", "--format=%s").stdout.count("Prepare members/packages/claims") == 1
+    # Before acceptance, a fresh call discards unfinished bytes and builds again.
+    expected_count = "xx" if effect == "completion" and timing == "before" else "x"
+    assert (repository / ".build-count").read_text() == expected_count
+    assert not list(storage._artifact_store_path(repository, temporary=True).rglob("partial.bin"))
 
 
 @pytest.fixture(params=["installed", "portable", "generated", "reference"])
@@ -581,14 +591,16 @@ def test_versioned_fresh_instance_discovers_attempt_and_reuses_prepared_results(
         version=transaction.version, required_targets=transaction.required_targets,
         pre_test_commit=checkpoint,
     )
-    assert repeated.attempt_id == transaction.attempt_id
-    # New unrelated commits do not invalidate the exact B inputs.
+    assert repeated.attempt_id != transaction.attempt_id
+    assert not any(path.exists() for path in mtimes)
+    # A fresh build also discards an uncommitted attempt after unrelated commits.
     assert run_git(repository, "commit", "--allow-empty", "-m", "unrelated").returncode == 0
     reused = storage.allocate_artifact_version(
         repository, repository=transaction.repository, release_bundle=transaction.release_bundle,
         version=transaction.version, required_targets=transaction.required_targets,
     )
-    assert reused == repeated
+    assert reused.attempt_id != repeated.attempt_id
+    assert storage._build_request_record(reused)["preTestCommit"] is None
 
 
 def test_versioned_completion_needs_no_checkpoint_directory(tmp_path) -> None:
@@ -871,6 +883,6 @@ def test_grouped_completion_interruption(tmp_path, monkeypatch, effect):
         expected=results.artifact_identity(repository.name, "bundles/suite", "2.0.0b1", "python-3.14-windows"))
     assert len(selected.members) == 1
     assert selected.members[0].final_commit == selected.final_commit
-    assert (repository / ".build-count").read_text() == "x"
+    assert (repository / ".build-count").read_text() == ("xx" if effect == "result-commit" else "x")
     assert len(run_git(repository, "tag", "--list").stdout.splitlines()) == 2
     assert not list((repository / ".git/ceratops/artifacts").rglob("build_request.json"))

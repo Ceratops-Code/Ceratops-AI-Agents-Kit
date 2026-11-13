@@ -1096,7 +1096,7 @@ def read_artifact_build(
         attempt_id=attempt, allocation_commit=allocation_commit, pre_test_commit=commit,
         required_targets=targets, declared_input_paths=paths, store=store, request_path=request,
         version_root=directory, diagnostic_root=directory / ".diagnostics",
-        lock_path=store / ".locks/store.lock", uncertain_directories=(),
+        lock_path=store / ".locks/store.lock",
     )
     if request.exists():
         _require_build_request(transaction)

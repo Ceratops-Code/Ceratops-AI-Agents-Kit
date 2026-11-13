@@ -83,29 +83,19 @@ policy: the environment owner keeps the selected version and two predecessors,
 preserving versions referenced by installed manifests or running interpreters.
 Its foreground commands use the same command-stop tracking as the installer.
 
-`retain_skill_sources.py` owns the source evidence coupled to each installed
-skill. A manifest names the primary repository, exact commit when available,
-relative skill path, dirty flag and digest-addressed source ZIP. Source checks,
-Python package builds and skill rendering read the selected checkout directly;
-the managed installer holds its release-source lock throughout primary or release
-checkout builds and installation. Temporary source
-views supply deployment evidence only, and completed files still use deployment
-staging. Clean commits come from Git;
-dirty and unpacked inputs retain their actual bytes. A source-only change
-publishes the immutable ZIP before atomically changing the manifest, leaving
-the watched skill directory in place and preserving the previous identity on
-interruption. The archives live outside runtime folders at
-`<install-root-parent>/artifacts/<install-root-name>/sources/<skill>/`. Startup
-and successful activation retain the current archive plus two predecessors;
-removing a managed skill removes that archive group. Staged archives are moved
-out before the skill is activated, so runtime folders contain no source ZIPs.
+Runtime manifests record the primary repository, relative skill path and exact
+Git commit for clean source. Uncommitted or non-Git source remains installable,
+but is recorded without a commit. Source checks, Python package builds and skill
+rendering read the selected checkout directly; the managed installer holds its
+release-source lock throughout primary or release checkout builds and
+installation. No installer creates a retained source copy.
 
-Managed source views belong to the task's repository temp group and use OS
-locks for live ownership. Fresh calls remove abandoned views only in that
-group. Independent bootstraps retain their views inside reserved staging.
-Review views belong to one caller-selected packet and survive until its public
-cleanup call. Review resolves the retained ZIP, or an exact clean commit when
-the ZIP is missing, without substituting the selected branch's current tip.
+`read_skill_sources.py` prepares comparisons from the recorded Git commit using
+one batch of blob reads. It changes no branch, index or repository configuration
+and creates no archive. The temporary files belong to the caller's report at
+`.<packet-name>.source`; the report's cleanup call removes them. A missing commit
+or source that was installed with local changes cannot produce an exact Git
+comparison. The current checkout is never used as a substitute.
 
 One environment does not need both requirements files and a pyproject dependency
 list. The thread selected pyproject plus its lockfile and removal of the root
@@ -1786,20 +1776,27 @@ initially null. The caller prepares source versions/pins, commits B, then calls
 A bound request cannot be rebound. When explicit input paths are omitted, the
 tracked input paths exclude `.build/` result records.
 
-Fresh calls inspect current inputs, not a phase journal. A same-worktree request
-with the same selection and unchanged inputs can reuse its output. Input
-differences in source, index or declared untracked paths select a new prerelease
-directory. Unreadable ownership occupies the old directory; allocation reports
-it in `uncertain_directories` and skips it. This observational list is not part
-of durable request identity. No new UUID or explicit resume flag is introduced.
+A fresh build removes all unfinished versions of the requested item from this
+checkout's `_in-test` directory before allocating its new output. This includes
+the same requested version and a directory with an incomplete request record.
+Deletion depends on that directory boundary, not saved ownership or usage
+information. A failed deletion stops this build before allocation. Other items,
+other checkouts and accepted versions remain untouched. A crash leaves this
+temporary output for the next build of the same item; success removes it.
+Uncommitted receipts belonging to discarded attempts are removed before their
+temporary bytes. Committed receipt history remains in Git and its version is
+not reassigned to a new attempt. If its passing receipt is already committed and
+its source inputs still match, finish missing copies or tags from those files
+instead of allocating another build.
 
 Prepared receipts remain at `.build/<unit>/<version>/build_receipt.json`, with
 a target subdirectory for separately qualified targets. Artifacts are produced
 inside that checkout's temporary directory. After their required checks pass,
 completion copies them to `worktrees/<checkout>/<unit>/<version>/<target>/`
-and writes the artifact receipt last. It removes temporary output after the
-result commit and all required tags exist. Copies retain their original checks
-and identity. Each version/target's bounded latest failure report is
+for a task checkout or `beta-stable/<unit>/<version>/<target>/` for
+`release/local`, and writes the artifact receipt last. It removes temporary output
+after the result commit and all required tags exist. Copies retain their original
+checks and identity. Each version/target's bounded latest failure report is
 `<version>/.diagnostics/<target>.json`; receipt preparation ignores these
 producer-owned diagnostics and `build_request.json` as artifact payload.
 There is no temporary publication tree.

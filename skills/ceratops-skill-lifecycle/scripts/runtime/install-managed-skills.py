@@ -32,7 +32,7 @@ sys.path.insert(0, scripts_root)
 try:
     from runtime import managed_runtime_builder as runtime_builder
     from runtime import prepare_python_runtime as python_environments
-    from runtime import retain_skill_sources as source_provenance
+    from runtime import read_skill_sources as source_provenance
 finally:
     sys.path.remove(scripts_root)
 
@@ -62,7 +62,7 @@ GLOBAL_RUNTIME_PATHS = {
     "scripts/deploy-skills.py",
     "skills/ceratops-skill-lifecycle/scripts/runtime/install-managed-skills.py",
     "skills/ceratops-skill-lifecycle/scripts/runtime/managed_runtime_builder.py",
-    "skills/ceratops-skill-lifecycle/scripts/runtime/retain_skill_sources.py",
+    "skills/ceratops-skill-lifecycle/scripts/runtime/read_skill_sources.py",
 }
 FULL_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 PayloadDeclaration = str | tuple[str, str]
@@ -858,23 +858,19 @@ def deploy_managed_skills(args: DeployOptions) -> dict[str, Any] | str:
                                                   repo_root, install_root, commit)
                     receipt["status"] = "no_op"
                     return receipt
-                # Build from the selected checkout while its release lock is
-                # held. The frozen copy supplies deployment evidence only.
-                # Leave any installed directory being retired for Windows.
+                # The release lock covers source checks and installation from this checkout.
                 os.chdir(repo_root)
-                with source_provenance.capture_source(repo_root, install_root) as captured:
-                    _check_deployment_sources(repo_root, affected)
-                    if _source_commit(repo_root) != commit:
-                        raise InstallerError("source changed during source checks", phase="source_check", status="source_changed")
-                    result = runtime_builder.install_transaction(
-                        repo_root, install_root,
-                        selected=() if affected.all_managed else affected.deploy,
-                        remove=affected.remove, all_managed=affected.all_managed,
-                        previous_runtime_source_id=args.previous_runtime_source_id,
-                        source_snapshot=captured,
-                    )
+                _check_deployment_sources(repo_root, affected)
+                if _source_commit(repo_root) != commit:
+                    raise InstallerError("source changed during source checks", phase="source_check", status="source_changed")
+                result = runtime_builder.install_transaction(
+                    repo_root, install_root,
+                    selected=() if affected.all_managed else affected.deploy,
+                    remove=affected.remove, all_managed=affected.all_managed,
+                    previous_runtime_source_id=args.previous_runtime_source_id,
+                )
             except source_provenance.SourceError as exc:
-                return InstallerError(str(exc), phase="source_capture", details=exc.details).result()
+                return InstallerError(str(exc), phase="source_identity", details=exc.details).result()
             except (InstallerError, runtime_builder.TransactionError, OSError, ValueError) as exc:
                 if getattr(exc, "local_commands_stopped", None) is False:
                     raise  # Preserve uncertain command shutdown for the release owner.
@@ -882,9 +878,6 @@ def deploy_managed_skills(args: DeployOptions) -> dict[str, Any] | str:
                     return exc.result()
                 return InstallerError(str(exc)).result()
             receipt = _completion_receipt(result, repo_root, install_root, commit)
-            if captured.cleanup_debt:
-                receipt["status"] = "cleanup_blocked"
-                receipt["cleanup_debt"].extend(captured.cleanup_debt)
             try:
                 if _source_commit(repo_root) != commit:
                     receipt["status"] = "source_changed"
