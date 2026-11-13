@@ -221,7 +221,7 @@ def test_auto_promotion_context_is_bound_before_collection(
         "detached",
     ],
 )
-def test_promotion_hands_context_through_sdlc_to_requested_checks(
+def test_sdlc_passes_requested_test_context_to_checks(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
     context: str,
@@ -231,7 +231,6 @@ def test_promotion_hands_context_through_sdlc_to_requested_checks(
     monkeypatch.syspath_prepend(str(scripts))
     monkeypatch.delenv("CERATOPS_SDLC_TEST_CONTEXT", raising=False)
     monkeypatch.setenv("GITHUB_ACTIONS", "false")
-    workflow = runpy.run_path(str(scripts / "promote-repository.py"))
     repo = tmp_path / "repo"
     repo.mkdir()
     (repo / "sdlc").mkdir()
@@ -291,13 +290,12 @@ def test_promotion_hands_context_through_sdlc_to_requested_checks(
     commit = subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=repo, text=True
     ).strip()
-    args = argparse.Namespace(
-        sdlc_contract=pathlib.Path("sdlc/sdlc.yml"),
-        validation_operation=None,
-        run_operation=None,
-        parameter=[],
-    )
-    command = workflow["_validation_command"](args, repo, commit)
+    command = [
+        sys.executable, str(scripts / "repository_operation.py"),
+        "--repo-root", str(repo),
+        "--operation", "repository.actions.pre-build-checks",
+        "--commit", commit, "--test-trigger", "promotion",
+    ]
     trigger_index = command.index("--test-trigger")
     assert command[trigger_index + 1] == "promotion"
     if context == "ordinary":

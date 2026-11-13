@@ -1478,16 +1478,15 @@ def test_sdlc_invalid_capability_stops_public_runner_before_effects(tmp_path, sc
     assert (tmp_path / "ran").is_file()
 
 
-def test_capability_changes_preserve_artifact_release_version_and_channel():
+def test_capability_changes_preserve_artifact_version():
     schema_path = REPOSITORY_LIFECYCLE_SOURCE / "references/schemas/operation-result.v1.schema.json"
     schema = json.loads(schema_path.read_text(encoding="utf-8"))
-    schema = {"$ref": "#/$defs/buildSelection", "$defs": schema["$defs"]}
+    schema = {"$ref": "#/$defs/receiptIdentity", "$defs": schema["$defs"]}
     record = {
-        "repository": "example/project", "sourceCommit": "a" * 40,
-        "releaseBundle": "example", "channel": "beta", "version": "7.2.0b1", "target": "any",
+        "repository": "example/project", "attemptId": "attempt-1",
+        "releaseBundle": "example", "version": "7.2.0b1", "target": "any",
     }
     jsonschema.Draft202012Validator(schema).validate(record)
-    assert record["channel"] == "beta"
     assert record["version"] == "7.2.0b1"
 
 

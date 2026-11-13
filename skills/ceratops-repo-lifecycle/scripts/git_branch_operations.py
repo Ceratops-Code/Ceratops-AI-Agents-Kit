@@ -209,8 +209,15 @@ def _restore_release_checkout(
         current[branch] = head
         if head != previous and (branch not in written_heads or head != written_heads[branch]):
             raise PromotionError(f"Checkout setup cannot undo another writer's change to {branch}.")
-    _clean(repo_root, "before undoing failed release setup")
     checked_out = require_output(_git(repo_root, "branch", "--show-current"), cwd=repo_root).strip()
+    previous_head = originals.get(checked_out)
+    written_head = written_heads.get(checked_out)
+    if (previous_head is not None and written_head is not None
+            and current.get(checked_out) == written_head):
+        # Finish our interrupted ref/index update before undoing initial setup.
+        # The shared updater refuses changed working files or an outside ref.
+        fast_forward_branch(repo_root, written_head, expected_old_commit=previous_head)
+    _clean(repo_root, "before undoing failed release setup")
     if checked_out != state.branch:
         require_success(_git(repo_root, "switch", state.branch), cwd=repo_root)
     for branch, old in originals.items():

@@ -273,8 +273,8 @@ def promote(args: argparse.Namespace, *, timings: dict[str, float] | None = None
         if not args.prepare_release_only:
             checked_out = require_output(git_branches._git(
                 repo_root, "branch", "--show-current"), cwd=repo_root).strip()
-            if checked_out == args.release_branch:
-                current = git_branches._branch_head(repo_root, args.release_branch)
+            if checked_out in {args.main_branch, args.release_branch}:
+                current = git_branches._branch_head(repo_root, checked_out)
                 # The shared updater checks current Git/index/file state before
                 # finishing an interrupted checkout; it never resets this ref.
                 git_branches.fast_forward_branch(repo_root, current, expected_old_commit=current)
@@ -409,7 +409,7 @@ def promote(args: argparse.Namespace, *, timings: dict[str, float] | None = None
             _remap_repo_owned_path(contract, requested_root=task_root, effective_root=repo_root),
             context="skill", artifacts=validation.get("artifacts", {}),
         ) if args.run_operation else []
-        prepared_operations = [item for item in prepared_operations
+        prepared_operations = [replace(item, qualification_level="beta") for item in prepared_operations
                                if item.category in {"deploy-local", "publish", "verify-publish"}]
         for index, item in enumerate(prepared_operations):
             reference = item.operation.rsplit(".actions.", 1)[0]
