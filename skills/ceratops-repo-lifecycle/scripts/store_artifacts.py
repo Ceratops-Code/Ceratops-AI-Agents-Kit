@@ -94,8 +94,9 @@ class ArtifactVersionAllocation:
     def artifact_receipt(self, target: str) -> pathlib.Path:
         _require_transaction_target(self, target)
         if self.version_root == self.request_path.parent:
-            return (_artifact_store_path(self.repo_root, worktree=True)
-                    / self.release_bundle / self.version / target / "artifact-receipt.json")
+            retained = (self.store / "beta-stable" if self.branch == "release/local"
+                        else _artifact_store_path(self.repo_root, worktree=True))
+            return retained / self.release_bundle / self.version / target / "artifact-receipt.json"
         return self.target_output(target) / "artifact-receipt.json"
 
 
@@ -167,7 +168,7 @@ def _artifact_store_path(
         "primary" if registration == common else registration.name)
     _require_identifier(name, label="worktree directory", pattern=LOGICAL_ID_RE)
     directory = store / "worktrees" / name
-    return directory / "_building" if temporary else directory
+    return directory / "_in-test" if temporary else directory
 
 
 def measure_build_file(
@@ -606,9 +607,13 @@ def allocate_artifact_version(
             occupied = any(
                 candidate.exists()
                 for checkout in (store / "worktrees").iterdir()
-                for candidate in (checkout / unit / version, checkout / "_building" / unit / version)
+                for candidate in (checkout / unit / version, checkout / "_in-test" / unit / version)
                 if candidate != directory and not (
                     directory.exists() and candidate == temporary.parent / unit / version)
+            )
+            occupied = occupied or (
+                (store / "beta-stable" / unit / version).exists()
+                and not (branch == "release/local" and directory.exists())
             )
             if occupied:
                 version = _next_prerelease(version)

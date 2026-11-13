@@ -502,12 +502,12 @@ future callers that create one must own and remove it. The readers create,
 rotate and clean up nothing.
 
 The versioned build route writes unfinished output under
-`<git-common-dir>/ceratops/artifacts/worktrees/<checkout>/_building/<unit>/<version>/`.
+`<git-common-dir>/ceratops/artifacts/worktrees/<checkout>/_in-test/<unit>/<version>/`.
 `<checkout>` is the linked worktree's Git registration name, `release-local`
 for the release branch, or `primary` for another primary checkout.
 Multiple targets use separate target subdirectories there. Promotion builds and
 tests in its task worktree before updating `release/local`; direct release builds
-use the sibling `worktrees/release-local/_building/` directory.
+use the sibling `worktrees/release-local/_in-test/` directory.
 
 `store_artifacts.allocate_artifact_version()` uses a short allocation lock
 while choosing a repository-wide version and creating its directory. It checks
@@ -521,13 +521,20 @@ The caller prepares source versions and commits them before writing artifacts.
 build continue. Failed-build output and one diagnostic per target stay in its
 temporary version directory. Startup keeps the requested attempt and at most two
 other attempts in that deliverable folder. A success removes its temporary files
-and older failed attempts. They are not accepted artifacts.
+and older failed attempts. They are not accepted artifacts. After a crash,
+cleanup waits for the next build of that item in the same checkout; no background
+cleanup runs while the checkout is idle.
 
 After the required checks pass, `complete_artifact_builds.py` copies the measured
-files to `worktrees/<checkout>/<unit>/<version>/<target>/`, records the completed
-receipt and tag, and deletes that version's temporary directory. An interrupted
+files to `worktrees/<checkout>/<unit>/<version>/<target>/` for a task checkout,
+or directly to `beta-stable/<unit>/<version>/<target>/` for `release/local`.
+It records the completed receipt and tag, then deletes that version's temporary
+directory. An interrupted
 copy can finish from the temporary files. An interruption after the tag needs
-only the remaining cleanup; it does not repeat the build or tests.
+only the remaining cleanup; it does not repeat the build or tests. A new release
+build preserves the two successful deployment versions recorded in that
+deliverable's retention record while replacing its latest approved-build slot.
+Old flat artifact-store locations are no longer read.
 `.build/` receipts and check summaries remain committed in Git.
 
 Cleanup examines only the requested checkout, deliverable or bundle, and target.
@@ -1790,14 +1797,18 @@ source views supply deployment evidence; they are never build inputs.
 Completed files still use temporary deployment staging. Runtime manifests record
 the
 repository identity, primary checkout path, full Git commit when present, and
-relative skill path. Each skill owns a compressed `.source-<sha256>.zip` with
-the exact source inputs, including dirty or unpacked sources. Git supplies clean
+relative skill path. Source snapshots are compressed `.source-<sha256>.zip` files
+under `<install-root-parent>/artifacts/<install-root-name>/sources/<skill>/`,
+outside installed skills and Python runtimes. They contain the exact source
+inputs, including dirty or unpacked sources; they are not installable skill
+packages. Git supplies clean
 commits directly; dirty snapshots include tracked and nonignored working files.
 The manifest records the archive digest and whether local changes were present.
 Source history changes publish the immutable archive before switching the
 manifest, preserving open skill directories and the previous source identity
 if publication is interrupted. Startup and successful activation retain the
-current archive and at most two predecessors per installed skill.
+current archive and at most two predecessors per installed skill. Removing a
+managed skill removes its source-archive group too.
 
 `retain_skill_sources.py` owns managed source snapshots. Disposable views live
 under `<repo-parent>/tmp/<repo-name>/<task>`; OS locks protect active workers,

@@ -778,7 +778,7 @@ def required_skill_change(target: pathlib.Path, desired: ExpectedSkillContent) -
             directories.add(relative)
         else:
             files[relative] = path
-    payload_files = {name: path for name, path in files.items() if not source_provenance.is_source_archive(name)}
+    payload_files = files
     desired_payloads = {name: data for name, data in desired.files.items() if not source_provenance.is_source_archive(name)}
     if payload_files.keys() != desired_payloads.keys() or directories != desired.directories:
         return "replace"
@@ -788,7 +788,8 @@ def required_skill_change(target: pathlib.Path, desired: ExpectedSkillContent) -
             return "replace"
     actual_manifest = files[manifest_path].read_bytes()
     expected_manifest = desired.files[manifest_path]
-    archives_current = all(name in files and files[name].read_bytes() == data
+    archives = target.parent.parent / "artifacts" / target.parent.name / "sources" / target.name
+    archives_current = all((archives / name).is_file() and (archives / name).read_bytes() == data
                            for name, data in desired.files.items() if source_provenance.is_source_archive(name))
     if actual_manifest == expected_manifest and archives_current:
         return "current"
@@ -1257,8 +1258,9 @@ def _install_snapshot_transaction(
                 raise TransactionError(
                     error, phase="preflight", skill=skill
                 )
-            if (install_root / skill).is_dir():
-                source_provenance.prune_source_archives(install_root / skill)
+            source_provenance.prune_source_archives(
+                install_root / skill, removed=skill in remove_names and not (install_root / skill).exists(),
+            )
 
         try:
             python_skills = selected_python_skills(manifest, deploy_names)
@@ -1328,6 +1330,10 @@ def _install_snapshot_transaction(
             phase = "activation"
             for skill in sorted(replace_names):
                 current_skill = skill
+                source_provenance.publish_source_archive(
+                    deployed_paths[skill], install_root / skill,
+                    json.loads(desired[skill].files[pathlib.PurePosixPath(MANIFEST_NAME)]),
+                )
                 rename_with_retry(deployed_paths[skill], install_root / skill)
                 activated.append(skill)
             for skill in sorted(metadata_names):
@@ -1346,9 +1352,9 @@ def _install_snapshot_transaction(
 
             phase = "cleanup"
             retained: list[str] = []
-            for skill in sorted(deploy_names):
+            for skill in sorted(deploy_names | remove_names):
                 try:
-                    source_provenance.prune_source_archives(install_root / skill)
+                    source_provenance.prune_source_archives(install_root / skill, removed=skill in remove_names)
                 except (OSError, RuntimeError, ValueError) as exc:
                     retained.append(f"{skill}: source archive cleanup: {exc}")
             for skill, retired in {**retired_paths, **{

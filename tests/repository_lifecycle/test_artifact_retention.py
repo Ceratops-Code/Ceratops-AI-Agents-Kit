@@ -130,13 +130,19 @@ def test_new_approved_version_does_not_evict_two_deployed_versions(accepted):
     first, second = [_version(base, v, installed=True) for v in ("1.0.0b1", "1.0.0")]
     old, new = [_version(base, v) for v in ("2.0.0b1", "2.0.0b2")]
     initial = _run(scope, approved=old, deployments=[first, second])
-    result = _run(scope, approved=new, deployments=[first, second])
+    result = _run(scope, approved=new)
     assert result.deferred == {}
     assert set(result.paths) == {first.version, second.version, new.version}
     assert initial.paths[old.version] in result.removed
     assert not initial.paths[old.version].exists()
     saved = json.loads(scope.record.read_text())
     assert set(saved["copies"]) == set(result.paths)
+    assert saved["deployed"] == [second.version, first.version]
+    pending = scope.record.with_name(f".{scope.record.name}.in-process")
+    pending.write_text("{")
+    again = _run(scope, approved=new)
+    assert set(again.paths) == set(result.paths) and not again.removed
+    assert not pending.exists()
 
 
 def test_repeated_retention_neither_rewrites_accepted_files_nor_calls_checks(accepted, monkeypatch):
@@ -315,19 +321,23 @@ def test_retained_permissions_survive_copy_repair_and_interruption(
     assert target.stat().st_mtime_ns == before
 
 
-@pytest.mark.parametrize("effect", ["copy", "owner", "selection", "delete"])
+@pytest.mark.parametrize("effect", ["copy", "owner", "selection", "record-replace", "delete"])
 @pytest.mark.parametrize("timing", ["before", "after"])
 def test_repeat_after_copy_record_selection_or_delete_interruption(accepted, monkeypatch, effect, timing):
     _case, base, scope = accepted
     initial = _run(scope, approved=base)
     newer = _version(base, "5.0.0b1")
-    name = {"copy": "_copy_file", "owner": "_write_record", "selection": "_write_record", "delete": "_remove_copy"}[effect]
-    original = getattr(retention, name)
+    owner = retention.os if effect == "record-replace" else retention
+    name = {"copy": "_copy_file", "owner": "_write_record", "selection": "_write_record",
+            "record-replace": "replace", "delete": "_remove_copy"}[effect]
+    original = getattr(owner, name)
     stopped = False
 
     def interrupted(*args, **kwargs):
         nonlocal stopped
-        selected_effect = effect not in {"owner", "selection"} or (args[0].name == retention.INVENTORY_FILE if effect == "owner" else args[0] == scope.record)
+        selected_effect = (args[1] == scope.record if effect == "record-replace" else
+                           effect not in {"owner", "selection"} or
+                           (args[0].name == retention.INVENTORY_FILE if effect == "owner" else args[0] == scope.record))
         should_stop = selected_effect and not stopped
         if should_stop and timing == "before":
             stopped = True
@@ -339,9 +349,10 @@ def test_repeat_after_copy_record_selection_or_delete_interruption(accepted, mon
         return result
 
     with monkeypatch.context() as context:
-        context.setattr(retention, name, interrupted)
+        context.setattr(owner, name, interrupted)
         with pytest.raises(StopAttempt):
             _run(scope, approved=newer)
+    assert isinstance(json.loads(scope.record.read_text()), dict)
     again = _run(scope, approved=newer)
     assert not again.deferred
     assert again.paths[newer.version].exists()
@@ -398,10 +409,10 @@ def test_short_cleanup_protection_does_not_cover_copying(accepted, monkeypatch):
         assert not protected
         return original_copy(*args, **kwargs)
 
-    def write(path, record):
+    def write(path, record, **kwargs):
         if path == scope.record:
-            assert protected
-        return original_write(path, record)
+            assert protected and kwargs.get("atomic") is True
+        return original_write(path, record, **kwargs)
 
     monkeypatch.setattr(retention, "_copy_file", copy)
     monkeypatch.setattr(retention, "_write_record", write)

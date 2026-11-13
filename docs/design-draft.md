@@ -94,8 +94,11 @@ staging. Clean commits come from Git;
 dirty and unpacked inputs retain their actual bytes. A source-only change
 publishes the immutable ZIP before atomically changing the manifest, leaving
 the watched skill directory in place and preserving the previous identity on
-interruption. Each installed skill retains its current archive and at most two
-predecessors; startup and successful activation prune older owned archives.
+interruption. The archives live outside runtime folders at
+`<install-root-parent>/artifacts/<install-root-name>/sources/<skill>/`. Startup
+and successful activation retain the current archive plus two predecessors;
+removing a managed skill removes that archive group. Staged archives are moved
+out before the skill is activated, so runtime folders contain no source ZIPs.
 
 Managed source views belong to the task's repository temp group and use OS
 locks for live ownership. Fresh calls remove abandoned views only in that
@@ -1759,7 +1762,7 @@ categories retain their declared actions until their package conversion.
 
 The caller first invokes `store_artifacts.allocate_artifact_version`.
 The allocated path is
-`<git-common-dir>/ceratops/artifacts/worktrees/<checkout>/_building/<unit>/<version>/`.
+`<git-common-dir>/ceratops/artifacts/worktrees/<checkout>/_in-test/<unit>/<version>/`.
 The checkout component is the Git worktree registration name, `release-local`
 for that branch, or `primary` for another primary checkout. The allocation
 lock covers only choosing a unique version and creating the directory. A
@@ -1769,7 +1772,11 @@ version choice. The lock file is `artifacts/.locks/allocation.lock`; retention u
 `artifacts/.locks/store.lock`. No reservation or file-usage record is created.
 Startup keeps the requested temporary version and at most two predecessors in
 its own deliverable folder. Completion removes that version and older failed
-attempts; later attempts and other checkout folders remain untouched.
+attempts; later attempts and other checkout folders remain untouched. After a
+crash, the next build of that item performs this cleanup; there is no background
+sweeper. Completed `release/local` files go directly to
+`artifacts/beta-stable/<unit>/<version>/<target>/`. Only unfinished files use
+`worktrees/release-local/_in-test/`.
 
 Immediately after creation, `build_request.json` records repository, worktree
 path and Git registration, branch, unit/version, all targets, the existing

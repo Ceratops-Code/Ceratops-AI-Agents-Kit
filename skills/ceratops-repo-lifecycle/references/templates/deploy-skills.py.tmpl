@@ -31,7 +31,7 @@ from typing import Any, cast
 import tomlkit
 from tomlkit.exceptions import ParseError
 
-INSTALLER_VERSION = 22
+INSTALLER_VERSION = 23
 MANIFEST_NAME = ".runtime-manifest.json"
 RUNTIME_MANIFEST_SCHEMA = "ceratops-runtime-skill.v3"
 START = "<!-- CERATOPS_SHARED_SECTIONS_START -->"
@@ -1112,15 +1112,20 @@ def freeze_bootstrap_source(repo: pathlib.Path, install_root: pathlib.Path, stag
 def prune_bootstrap_sources(skill: pathlib.Path) -> None:
     """Bound this producer's archives to the current source plus two predecessors."""
 
+    directory = skill.parent.parent / "artifacts" / skill.parent.name / "sources" / skill.name
+    if not directory.exists():
+        return
+    if directory.resolve() != directory.absolute():
+        raise ValueError(f"retained source directory cannot contain links: {directory}")
     try:
         metadata = json.loads((skill / MANIFEST_NAME).read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError):
-        return  # A legacy overlay owns no retained source until publication.
+        metadata = {}
     record = metadata.get("source_snapshot") if isinstance(metadata, dict) else None
     current = record.get("archive") if isinstance(record, dict) else None
-    if not isinstance(current, str) or re.fullmatch(r"\.source-[0-9a-f]{64}\.zip", current) is None:
-        return
-    candidates = [path for path in skill.iterdir()
+    if current is not None and (not isinstance(current, str) or re.fullmatch(r"\.source-[0-9a-f]{64}\.zip", current) is None):
+        raise ValueError("retained source archive name is malformed")
+    candidates = [path for path in directory.iterdir()
                   if re.fullmatch(r"\.source-[0-9a-f]{64}\.zip", path.name) and path.name != current]
     if any(unsafe_link(path) or not path.is_file() for path in candidates):
         raise ValueError(f"unsafe retained source archive: {skill}")
@@ -1154,8 +1159,7 @@ def install_batch(
             if STAGE_RE.fullmatch(abandoned.name):
                 remove_stage(abandoned, install_root)
         for skill in skills:
-            if (install_root / skill).is_dir():
-                prune_bootstrap_sources(install_root / skill)
+            prune_bootstrap_sources(install_root / skill)
         staging.mkdir()
         _, source_archive, source_record = freeze_bootstrap_source(repo_root, install_root, staging)
         manifest = read_manifest(repo_root)
@@ -1184,12 +1188,21 @@ def install_batch(
             canonical.mkdir(exist_ok=True)
             # Preserve the previous archive until its manifest is replaced.
             # A directory iteration order must never control source publication.
-            os.replace(staged / source_name, canonical / source_name)
+            archives = install_root.parent / "artifacts" / install_root.name / "sources" / skill
+            if archives.resolve() != archives.absolute() or ((archives / source_name).exists() and unsafe_link(archives / source_name)):
+                raise ValueError(f"retained source archive destination cannot contain links: {archives}")
+            archives.mkdir(parents=True, exist_ok=True)
+            os.replace(staged / source_name, archives / source_name)
             shutil.copytree(staged, canonical, dirs_exist_ok=True,
                             ignore=shutil.ignore_patterns(MANIFEST_NAME))
             remove_legacy_skill_runtime(canonical)
             os.replace(staged / MANIFEST_NAME, canonical / MANIFEST_NAME)
             prune_bootstrap_sources(canonical)
+            for obsolete in canonical.glob(".source-*.zip"):
+                if re.fullmatch(r"\.source-[0-9a-f]{64}\.zip", obsolete.name):
+                    if unsafe_link(obsolete) or not obsolete.is_file():
+                        raise ValueError(f"unsafe source file inside skill runtime: {obsolete}")
+                    obsolete.unlink()
         write_codex_root_settings(staging, root_settings)
         if python_runtime is not None:
             try:

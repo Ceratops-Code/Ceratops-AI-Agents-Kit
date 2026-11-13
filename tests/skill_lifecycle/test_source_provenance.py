@@ -70,20 +70,25 @@ def test_public_installers_retain_exact_source_after_checkout_disappears(tmp_pat
     destination = tmp_path / "profile/skills"
     command = [sys.executable, str(entrypoint), "--repo-root", str(repo),
                "--install-root", str(destination), "--skill", "alpha-tool"]
-    for _ in range(2):
+    for attempt in range(2):
         result = subprocess.run(command, capture_output=True, text=True, check=False)
         assert result.returncode == 0, result.stderr
+        if attempt == 0:
+            old_name = owner(destination / "alpha-tool")["source_snapshot"]["archive"]
+            (destination / "alpha-tool" / old_name).write_bytes(b"obsolete runtime source copy")
     installed = destination / "alpha-tool"
     metadata = owner(installed)
     assert metadata["source_repository_root"] == str(repo)
     assert metadata["source_commit"] == commit
     record = metadata["source_snapshot"]
     assert record["dirty"] is dirty
-    archive = installed / record["archive"]
+    archive = destination.parent / "artifacts" / destination.name / "sources" / installed.name / record["archive"]
     assert hashlib.sha256(archive.read_bytes()).hexdigest() == record["sha256"]
+    assert not list(installed.glob(".source-*.zip"))
+    assert not archive.is_relative_to(destination)
     with zipfile.ZipFile(archive) as retained:
         assert retained.read("skills/alpha-tool/SKILL.md") == expected
-    assert len(list(installed.glob(".source-*.zip"))) == 1
+    assert len(list((destination.parent / "artifacts" / destination.name / "sources" / installed.name).glob(".source-*.zip"))) == 1
     repo.rename(tmp_path / "retired-source")
     output = tmp_path / "packet.json"
     result = packet_call(repo, installed, output)
@@ -161,7 +166,7 @@ def test_worktree_install_records_primary_and_reads_exact_old_commit(tmp_path):
     old = source.read_bytes()
     source.write_bytes(old + b"\nA newer branch is not installed source.\n")
     assert run_git(repo, "commit", "-am", "newer").returncode == 0
-    (installed / metadata["source_snapshot"]["archive"]).unlink()
+    (destination.parent / "artifacts" / destination.name / "sources" / installed.name / metadata["source_snapshot"]["archive"]).unlink()
     output = tmp_path / "packet.json"
     result = packet_call(repo, installed, output)
     assert result.returncode == 0, result.stderr
@@ -183,7 +188,7 @@ def test_missing_or_damaged_evidence_blocks_comparison_without_using_head(tmp_pa
     builder["install_transaction"](repo, destination, selected=["alpha-tool"])
     installed = destination / "alpha-tool"
     metadata = owner(installed)
-    archive = installed / metadata["source_snapshot"]["archive"]
+    archive = destination.parent / "artifacts" / destination.name / "sources" / installed.name / metadata["source_snapshot"]["archive"]
     if damage == "missing-dirty":
         archive.unlink()
     elif damage == "corrupt":
@@ -206,8 +211,9 @@ class LostWorker(BaseException):
 
 @pytest.mark.parametrize("after_effect", [False, True])
 @pytest.mark.parametrize("failure", [OSError, LostWorker])
+@pytest.mark.parametrize("payload_change", [False, True])
 def test_source_archive_publication_converges_with_manifest_after_interruption(
-    tmp_path, monkeypatch, after_effect, failure,
+    tmp_path, monkeypatch, after_effect, failure, payload_change,
 ):
     repo = source_repo(tmp_path, committed=False)
     builder = load_runtime_builder()
@@ -216,8 +222,8 @@ def test_source_archive_publication_converges_with_manifest_after_interruption(
     builder["install_transaction"](repo, destination, all_managed=True)
     installed = destination / "alpha-tool"
     before, identity = owner(installed), installed.stat().st_ino
-    sibling = repo / "skills/beta-tool/SKILL.md"
-    sibling.write_bytes(sibling.read_bytes() + b"\nSibling changed.\n")
+    sibling = repo / ("skills/alpha-tool/SKILL.md" if payload_change else "skills/beta-tool/SKILL.md")
+    sibling.write_bytes(sibling.read_bytes() + b"\nSource changed.\n")
     original = provenance.publish_source_archive
     triggered = False
 
@@ -235,12 +241,15 @@ def test_source_archive_publication_converges_with_manifest_after_interruption(
         with pytest.raises(builder["TransactionError"] if failure is OSError else LostWorker):
             builder["install_transaction"](repo, destination, all_managed=True)
     assert triggered
-    assert owner(installed) == before
-    assert (installed / before["source_snapshot"]["archive"]).is_file()
+    if installed.exists():
+        assert owner(installed) == before
+    assert (destination.parent / "artifacts" / destination.name / "sources" / installed.name / before["source_snapshot"]["archive"]).is_file()
     builder["install_transaction"](repo, destination, all_managed=True)
-    assert installed.stat().st_ino == identity
+    if not payload_change:
+        assert installed.stat().st_ino == identity
+    assert not list(installed.glob(".source-*.zip"))
     assert builder["install_transaction"](repo, destination, all_managed=True).status == "no_op"
-    assert len(list(installed.glob(".source-*.zip"))) <= 3
+    assert len(list((destination.parent / "artifacts" / destination.name / "sources" / installed.name).glob(".source-*.zip"))) <= 3
 
 
 def test_archive_retention_and_disposable_source_cleanup_are_bounded(tmp_path):
@@ -257,12 +266,15 @@ def test_archive_retention_and_disposable_source_cleanup_are_bounded(tmp_path):
         (repo / "README.md").write_text(f"Source {index}\n", encoding="utf-8")
         builder["install_transaction"](repo, destination, selected=["alpha-tool"])
     installed = destination / "alpha-tool"
-    assert len(list(installed.glob(".source-*.zip"))) == 3
-    assert (installed / owner(installed)["source_snapshot"]["archive"]).is_file()
+    assert len(list((destination.parent / "artifacts" / destination.name / "sources" / installed.name).glob(".source-*.zip"))) == 3
+    assert (destination.parent / "artifacts" / destination.name / "sources" / installed.name / owner(installed)["source_snapshot"]["archive"]).is_file()
     assert not stale.exists()
     assert not list(parent.glob("_skill-source-*"))
     assert not [path for path in parent.glob("._skill-source-*.lock")
                 if provenance.VIEW_RE.fullmatch(path.name)]
+    (repo / "skills/alpha-tool/SKILL.md").unlink()
+    builder["install_transaction"](repo, destination, selected=[], remove=["alpha-tool"])
+    assert not (destination.parent / "artifacts" / destination.name / "sources" / installed.name).exists()
 
 
 def test_source_view_cleanup_keeps_another_active_owner(tmp_path):
@@ -390,8 +402,9 @@ def test_bootstrap_source_publication_repeats_after_interruption(
     def interrupted(source, target):
         nonlocal triggered
         target = pathlib.Path(target)
-        selected = target.parent == installed and (
-            target.name == ".runtime-manifest.json" if boundary == "manifest" else target.name.startswith(".source-"))
+        archive_parent = destination.parent / "artifacts" / destination.name / "sources" / installed.name
+        selected = ((target.parent == installed and target.name == ".runtime-manifest.json")
+                    if boundary == "manifest" else target.parent == archive_parent and target.name.startswith(".source-"))
         if not selected or triggered:
             return original(source, target)
         triggered = True
@@ -405,13 +418,13 @@ def test_bootstrap_source_publication_repeats_after_interruption(
             module["main"]()
     assert triggered
     active = owner(installed)
-    assert (installed / active["source_snapshot"]["archive"]).is_file()
+    assert (destination.parent / "artifacts" / destination.name / "sources" / installed.name / active["source_snapshot"]["archive"]).is_file()
     if boundary == "archive" or not after_effect:
         assert active == old
     for _ in range(2):
         assert module["main"]() == 0
     assert owner(installed) != old
-    assert len(list(installed.glob(".source-*.zip"))) <= 3
+    assert len(list((destination.parent / "artifacts" / destination.name / "sources" / installed.name).glob(".source-*.zip"))) <= 3
 
 
 @pytest.mark.parametrize("mode", ["all", "selected", "base", "base-global", "remove-only", "empty", "inventory", "all-empty"])

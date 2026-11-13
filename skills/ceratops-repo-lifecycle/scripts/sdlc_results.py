@@ -932,15 +932,13 @@ def _artifact_receipt_locations(
     )
     worktrees = store_root / "worktrees"
     # Find this exact tagged version, never another worktree's build history.
-    # Unfinished _building directories cannot supply accepted artifacts.
+    # Unfinished _in-test directories cannot supply accepted artifacts.
     local = tuple(
         path for checkout in sorted(worktrees.iterdir()) if checkout.is_dir()
         for path in (checkout.joinpath(*direct.parts), checkout.joinpath(*targeted.parts))
     ) if worktrees.is_dir() else ()
     return (
         *local,
-        store_root.joinpath(*direct.parts),
-        store_root.joinpath(*targeted.parts),
         store_root.joinpath("beta-stable", *direct.parts),
         store_root.joinpath("beta-stable", *targeted.parts),
     )

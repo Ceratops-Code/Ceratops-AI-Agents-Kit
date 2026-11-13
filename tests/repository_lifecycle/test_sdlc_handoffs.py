@@ -693,7 +693,7 @@ def _receipt_chain_fixture(
         repository
         / ".git"
         / "ceratops"
-        / "artifacts"
+        / "artifacts/worktrees/receipt-producer"
         / identity["releaseBundle"]
         / identity["version"]
         / identity["target"]

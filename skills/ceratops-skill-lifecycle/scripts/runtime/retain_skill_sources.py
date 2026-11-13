@@ -352,30 +352,42 @@ def publish_source_archive(staged: pathlib.Path, canonical: pathlib.Path, metada
     if errors:
         raise SourceError(errors[0])
     name = record["archive"]
-    source, target = staged / name, canonical / name
+    directory = canonical.parent.parent / "artifacts" / canonical.parent.name / "sources" / canonical.name
+    if directory.resolve() != directory.absolute():
+        raise SourceError(f"Retained source directory cannot contain links: {directory}")
+    directory.mkdir(parents=True, exist_ok=True)
+    source, target = staged / name, directory / name
     if target.is_symlink() or (target.exists() and not target.is_file()):
         raise SourceError(f"Retained source destination is unsafe: {target}")
     if target.is_file() and hashlib.sha256(target.read_bytes()).hexdigest() == record["sha256"]:
+        source.unlink(missing_ok=True)
         return
     # The owned stage and canonical tree share a filesystem. An atomic rename
     # never exposes partially written ZIP bytes to source reviewers.
     os.replace(source, target)
 
 
-def prune_source_archives(skill: pathlib.Path) -> None:
-    """Keep the manifest's current source and at most two archive predecessors."""
+def prune_source_archives(skill: pathlib.Path, *, removed: bool = False) -> None:
+    """Bound source archives outside the runtime; removal retires their whole group."""
 
-    manifest = skill / ".runtime-manifest.json"
-    if not manifest.is_file():
+    directory = skill.parent.parent / "artifacts" / skill.parent.name / "sources" / skill.name
+    if not directory.exists():
         return
-    metadata = json.loads(manifest.read_text(encoding="utf-8"))
+    if directory.resolve() != directory.absolute():
+        raise SourceError(f"Retained source directory cannot contain links: {directory}")
+    if removed:
+        _remove_owned(directory, directory.parent)
+        return
+    manifest = skill / ".runtime-manifest.json"
+    metadata = json.loads(manifest.read_text(encoding="utf-8")) if manifest.is_file() else {}
+
     if not isinstance(metadata, Mapping):
         raise SourceError(f"Retained source manifest is not an object: {skill}")
-    errors = manifest_source_errors(metadata)
+    errors = manifest_source_errors(metadata) if metadata else []
     if errors:
         raise SourceError(errors[0])
     current = metadata.get("source_snapshot", {}).get("archive")
-    candidates = [path for path in skill.iterdir() if is_source_archive(pathlib.PurePath(path.name))]
+    candidates = [path for path in directory.iterdir() if is_source_archive(pathlib.PurePath(path.name))]
     if any(path.is_symlink() or not path.is_file() for path in candidates):
         raise SourceError(f"Retained source archive path is unsafe: {skill}")
     predecessors = sorted((path for path in candidates if path.name != current),
@@ -434,10 +446,11 @@ def resolve_review_source(runtime: Mapping[str, Any], installed: pathlib.Path,
     (directory / OWNER_NAME).write_text(json.dumps(
         {"schema": OWNER_SCHEMA, "packet": str(output.resolve())}), encoding="utf-8")
     archive = directory / "source.zip"
-    supplied = installed / str(record["archive"]) if record is not None else installed / ".source-absent.zip"
+    archives = installed.parent.parent / "artifacts" / installed.parent.name / "sources" / installed.name
+    supplied = archives / str(record["archive"]) if record is not None else archives / ".source-absent.zip"
     if record is not None and (supplied.exists() or supplied.is_symlink()):
-        if not supplied.is_file() or supplied.is_symlink() or supplied.resolve().parent != installed.resolve():
-            raise SourceError("Retained source archive escapes the installed skill")
+        if not supplied.is_file() or supplied.is_symlink() or supplied.resolve().parent != archives.absolute():
+            raise SourceError("Retained source archive escapes its archive directory")
         data = supplied.read_bytes()
         if hashlib.sha256(data).hexdigest() != record["sha256"]:
             raise SourceError("Retained source archive digest differs; exact-source review is blocked")

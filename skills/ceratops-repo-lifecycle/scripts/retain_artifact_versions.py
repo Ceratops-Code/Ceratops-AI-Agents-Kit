@@ -164,18 +164,30 @@ def _json_bytes(value: Any) -> bytes:
     return (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n").encode("utf-8")
 
 
-def _write_record(path: pathlib.Path, value: Mapping[str, Any]) -> None:
-    """Record retained copies; cleanup derives its boundary from the directory."""
+def _write_record(path: pathlib.Path, value: Mapping[str, Any], *, atomic: bool = False) -> None:
+    """Write immutable inventories or atomically replace the locked retention record."""
     _make_directory(path.parent)
+    # The mutable retention record is written under the existing store lock.
+    # Its one in-process file can therefore be discarded after an interrupted call.
+    destination = path.with_name(f".{path.name}.in-process") if atomic else path
+    if atomic and os.path.lexists(destination):
+        _plain_path(destination, label="Interrupted retention record")
+        destination.unlink()
     raw = _json_bytes(value)
     if os.path.lexists(path):
         _plain_path(path, label="Retention record")
         if path.read_bytes() == raw:
             return
-    with path.open("wb") as stream:
-        stream.write(raw)
-        stream.flush()
-        os.fsync(stream.fileno())
+    try:
+        with destination.open("wb") as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if atomic:
+            os.replace(destination, path)
+    finally:
+        if atomic:
+            destination.unlink(missing_ok=True)
 
 
 def _read_record(path: pathlib.Path) -> dict[str, Any]:
@@ -449,6 +461,30 @@ def retain_artifact_versions(
     with protection():
         try:
             copies = dict(copied)
+            retained_keys = list(selected)
+            deployed_keys: list[str] = []
+            if scope.pool == "beta-stable":
+                # A build supplies a new approval, not a replacement deployment
+                # history. Keep the two successful deployments already recorded
+                # for this directory without reopening or retesting their files.
+                deployed_keys = list(select_retained_versions(scope, deployments=deployments))
+                if scope.record.exists():
+                    try:
+                        recorded = _read_record(scope.record).get("deployed", [])
+                    except (ValueError, TypeError):
+                        recorded = []
+                    if isinstance(recorded, list):
+                        deployed_keys.extend(key for key in recorded if isinstance(key, str))
+                deployed_keys = list(dict.fromkeys(deployed_keys))[:2]
+                for key in deployed_keys:
+                    raw = {"key": key, "path": f"{key}/{scope.target}"}
+                    path = _retained_copy_path(scope, raw)
+                    if not path.is_dir():
+                        raise ValueError(f"Recorded deployed artifact directory is missing: {path}")
+                    if key not in retained_keys:
+                        retained_keys.append(key)
+                    copies.setdefault(key, raw)
+                    result.paths.setdefault(key, path)
             # Enumerate only this deliverable's versions and this target. The
             # current successful selection, not an ownership manifest, determines
             # which directories remain. Other worktrees are outside scope.group.
@@ -459,13 +495,15 @@ def retain_artifact_versions(
                 if candidate.exists() and directory.name not in copies:
                     copies[directory.name] = {"key": directory.name,
                                               "path": candidate.relative_to(scope.group).as_posix()}
-            record = {"schema": SCHEMA, "scope": scope.identity, "selected": list(selected), "copies": copies}
-            _write_record(scope.record, record)
+            record = {"schema": SCHEMA, "scope": scope.identity, "selected": retained_keys, "copies": copies}
+            if scope.pool == "beta-stable":
+                record["deployed"] = deployed_keys
+            _write_record(scope.record, record, atomic=True)
         except (OSError, ValueError, TypeError, StepResultError) as exc:
             result.deferred[str(scope.record)] = str(exc)
             return result
         for key in tuple(copies):
-            if key in selected:
+            if key in retained_keys:
                 continue
             raw = copies[key]
             try:
@@ -479,7 +517,7 @@ def retain_artifact_versions(
             except (OSError, ValueError, TypeError, KeyError, StepResultError) as exc:
                 result.deferred[str(scope.record)] = str(exc)
         try:
-            _write_record(scope.record, record)
+            _write_record(scope.record, record, atomic=True)
         except (OSError, ValueError, StepResultError) as exc:
             result.deferred[str(scope.record)] = str(exc)
     return result

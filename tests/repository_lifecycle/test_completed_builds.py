@@ -119,11 +119,15 @@ def test_worktree_build_commits_selected_source_and_finishes_once(tmp_path, chec
     assert (repository / ".build-count").read_text() == "x"
     scoped_root = storage._artifact_store_path(repository, worktree=True)
     assert scoped_root.name == checkout
-    assert storage._artifact_store_path(repository, temporary=True) == scoped_root / "_building"
-    assert all(pathlib.Path(path).is_relative_to(scoped_root) and pathlib.Path(path).is_file()
+    assert storage._artifact_store_path(repository, temporary=True) == scoped_root / "_in-test"
+    accepted_root = (storage._artifact_store_path(repository) / "beta-stable"
+                     if checkout == "release-local" else scoped_root)
+    assert all(pathlib.Path(path).is_relative_to(accepted_root) and pathlib.Path(path).is_file()
                for paths in result["artifacts"].values() for path in paths)
-    assert not list((scoped_root / "_building").rglob("build_request.json"))
-    assert not list((scoped_root / "_building").rglob("*.whl"))
+    if checkout == "release-local":
+        assert not (scoped_root / "members").exists()
+    assert not list((scoped_root / "_in-test").rglob("build_request.json"))
+    assert not list((scoped_root / "_in-test").rglob("*.whl"))
 
     selected = results.read_build_check_summary(repository, result["tag"],
                                                 pathlib.Path(result["build_receipts"][0]).relative_to(repository).as_posix())
@@ -181,6 +185,10 @@ def test_worktree_build_failure_preserves_cause_without_receipt_or_tag(tmp_path)
         stale = temporary / version
         stale.mkdir(parents=True)
         (stale / "failed-output.bin").write_bytes(b"old failed output")
+    failed_again = runner.execute_build(repository, **options)
+    assert failed_again["status"] in runner.FAILED_STATUSES
+    assert not (temporary / "1.1.0b1").exists()
+    assert len(list(temporary.iterdir())) == 3
     (repository / ".fail-build").unlink()
     fixed = runner.execute_build(repository, **options)
     assert fixed["status"] == "completed", fixed
@@ -190,8 +198,11 @@ def test_worktree_build_failure_preserves_cause_without_receipt_or_tag(tmp_path)
 
 @pytest.mark.parametrize("effect", ["source-commit", "completion"])
 @pytest.mark.parametrize("timing", ["before", "after"])
-def test_worktree_build_repeats_commit_and_completion_handoffs(tmp_path, monkeypatch, effect, timing):
+@pytest.mark.parametrize("release", [False, True])
+def test_worktree_build_repeats_commit_and_completion_handoffs(tmp_path, monkeypatch, effect, timing, release):
     repository, options = _worktree_build_case(tmp_path)
+    if release:
+        assert run_git(repository, "branch", "-m", "release/local").returncode == 0
     flow = importlib.import_module("execute_worktree_build")
     owner = flow if effect == "source-commit" else completion
     name = "_git" if effect == "source-commit" else "complete_versioned_artifacts"

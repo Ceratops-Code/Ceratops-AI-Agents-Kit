@@ -109,7 +109,7 @@ def _finish(transaction, prepared=None, *, diagnostic_output=None, completed=Non
             )
             retained = store_artifacts.retain_completed_artifacts(
                 transaction.repo_root, unit=transaction.release_bundle, target=target,
-                pool='worktree',
+                pool='beta-stable' if transaction.branch == 'release/local' else 'worktree',
                 approved=retain_artifact_versions.RetentionVersion(selected),
             )
             maintenance.extend(f'{path}: {cause}' for path, cause in retained.deferred.items())
