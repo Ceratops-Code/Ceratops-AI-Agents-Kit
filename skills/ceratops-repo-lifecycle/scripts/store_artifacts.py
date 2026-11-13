@@ -563,11 +563,18 @@ def allocate_artifact_version(
             if FULL_VERSION_RE.fullmatch(obsolete.name):
                 records = root / ".build" / unit / obsolete.name
                 if records.exists() and not _artifact_tag_exists(root, unit, obsolete.name):
-                    tracked = _git_text(
-                        root, ["ls-files", "--", records.relative_to(root).as_posix()],
+                    result_path = records.relative_to(root).as_posix()
+                    committed_results = _git_text(
+                        root, ["ls-tree", "-r", "--name-only", "HEAD", "--", result_path],
                         label="unfinished result paths", single_line=False,
                     )
-                    if not tracked:
+                    if not committed_results:
+                        # Staging is not completion. Remove only this discarded
+                        # result directory from the index before deleting it.
+                        _git_text(
+                            root, ["reset", "--quiet", "HEAD", "--", result_path],
+                            label="discarded staged build results", single_line=False,
+                        )
                         _remove_versioned_tree(records, root / ".build" / unit,
                                                label="Uncommitted unfinished build results")
             _remove_versioned_tree(obsolete, temporary / unit, label="Unfinished build output")

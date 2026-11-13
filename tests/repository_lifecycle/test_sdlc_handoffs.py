@@ -563,7 +563,8 @@ def test_versioned_competing_processes_allocate_while_retention_is_busy(tmp_path
             worker.wait(timeout=10)
 
 
-def test_versioned_requests_clear_only_same_checkout_and_item(tmp_path) -> None:
+@pytest.mark.parametrize("stage_results", [False, True])
+def test_versioned_requests_clear_only_same_checkout_and_item(tmp_path, stage_results) -> None:
     repository, commit = _versioned_repository(tmp_path)
     targets = ["python-3.14-windows", "python-3.14-linux"]
     selection = dict(repository="example/project", release_bundle="claims", version="1.2.3a1",
@@ -582,11 +583,26 @@ def test_versioned_requests_clear_only_same_checkout_and_item(tmp_path) -> None:
     assert foreign.version == "1.2.3a2"
     foreign_file = foreign.target_output(targets[0]) / "keep.bin"
     foreign_file.write_bytes(b"another checkout")
+    unfinished_path = ".build/claims/1.2.3a1/build_receipt.json"
+    unfinished = repository / unfinished_path
+    unfinished.parent.mkdir(parents=True)
+    unfinished.write_text("{}", encoding="utf-8")
+    if stage_results:
+        assert run_git(repository, "add", "--", unfinished_path).returncode == 0
+    unrelated_result_path = ".build/other/1.0.0a1/build_receipt.json"
+    unrelated_result = repository / unrelated_result_path
+    unrelated_result.parent.mkdir(parents=True)
+    unrelated_result.write_text("{}", encoding="utf-8")
+    assert run_git(repository, "add", "--", unrelated_result_path).returncode == 0
     repeated = _bound_test_build(repository, pre_test_commit=commit, **selection)
     assert repeated.version == "1.2.3a1"
     assert repeated.pre_test_commit == commit
     assert all(repeated.target_output(target).is_dir() for target in targets)
     assert not sentinel.exists()
+    assert not unfinished.exists()
+    assert not run_git(repository, "ls-files", "--", unfinished_path).stdout.strip()
+    assert unrelated_result.read_text(encoding="utf-8") == "{}"
+    assert run_git(repository, "ls-files", "--", unrelated_result_path).stdout.strip()
     assert unrelated.read_bytes() == b"other item"
     assert foreign_file.read_bytes() == b"another checkout"
     diagnostic = completion.write_versioned_failure_diagnostic(repeated, targets[0], "first failure")
