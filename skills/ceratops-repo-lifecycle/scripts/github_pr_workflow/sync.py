@@ -42,70 +42,67 @@ def sync_main(args: argparse.Namespace) -> dict[str, Any]:
         affected_worktrees=affected_worktrees,
         confirm_stopped=getattr(args, "confirm_previous_commands_stopped", False),
     ) as owned:
-        result = _sync_main(args)
+        repo_root = args.repo_root.expanduser().resolve(strict=True)
+        if not repo_root.is_dir():
+            raise SyncError(f"repository root is not a directory: {repo_root}")
+        worktrees = git_branches._branch_worktrees(repo_root)
+        for branch in args.align_branch:
+            if not branch.strip():
+                raise SyncError("--align-branch entries must not be empty.")
+            if branch == args.main_branch:
+                raise SyncError("--align-branch must not include the main branch.")
+
+        main_worktree = git_branches._required_worktree(worktrees, args.main_branch)
+        checked_worktrees = [repo_root]
+        for branch in args.align_branch:
+            branch_worktree = git_branches._required_worktree(worktrees, branch)
+            if branch_worktree is not None:
+                worktrees[branch] = branch_worktree
+            if branch_worktree is not None and branch_worktree not in checked_worktrees:
+                checked_worktrees.append(branch_worktree)
+        if main_worktree is not None and main_worktree not in checked_worktrees:
+            checked_worktrees.append(main_worktree)
+        for worktree in checked_worktrees:
+            _assert_clean(worktree, f"before synchronization in {worktree}")
+
+        require_success(_git(repo_root, "fetch", "--prune", args.remote_name), cwd=repo_root)
+        if main_worktree is None:
+            require_success(_git(repo_root, "switch", args.main_branch), cwd=repo_root)
+            main_worktree = repo_root
+            worktrees = {
+                branch: worktree
+                for branch, worktree in worktrees.items()
+                if worktree != repo_root
+            }
+            worktrees[args.main_branch] = repo_root
+        git_branches.fast_forward_branch(
+            main_worktree, f"{args.remote_name}/{args.main_branch}",
+            expected_old_commit=git_branches._branch_head(main_worktree, "HEAD"),
+        )
+        _assert_clean(main_worktree, f"after fast-forwarding {args.main_branch}")
+
+        aligned: list[str] = []
+        for branch in args.align_branch:
+            branch_worktree = worktrees.get(branch)
+            git_branches.align_branch(repo_root, branch, args.main_branch, branch_worktree)
+            if branch_worktree is not None:
+                _assert_clean(branch_worktree, f"after aligning {branch}")
+            aligned.append(branch)
+        head = require_output(
+            _git(repo_root, "rev-parse", args.main_branch), cwd=repo_root
+        ).splitlines()[0]
+        result = {
+            "status": "synced",
+            "main": args.main_branch,
+            "remote": args.remote_name,
+            "head": head.strip(),
+            "aligned_branches": aligned,
+        }
         if owned is not None and owned.outermost:
             owned.complete(commands_stopped=True)
         return result
 
 
-def _sync_main(args: argparse.Namespace) -> dict[str, Any]:
-    """Sync main in its owning worktree and align explicitly named branches."""
-
-    repo_root = args.repo_root.expanduser().resolve(strict=True)
-    if not repo_root.is_dir():
-        raise SyncError(f"repository root is not a directory: {repo_root}")
-    worktrees = git_branches._branch_worktrees(repo_root)
-    for branch in args.align_branch:
-        if not branch.strip():
-            raise SyncError("--align-branch entries must not be empty.")
-        if branch == args.main_branch:
-            raise SyncError("--align-branch must not include the main branch.")
-
-    main_worktree = git_branches._required_worktree(worktrees, args.main_branch)
-    checked_worktrees = [repo_root]
-    for branch in args.align_branch:
-        branch_worktree = git_branches._required_worktree(worktrees, branch)
-        if branch_worktree is not None:
-            worktrees[branch] = branch_worktree
-        if branch_worktree is not None and branch_worktree not in checked_worktrees:
-            checked_worktrees.append(branch_worktree)
-    if main_worktree is not None and main_worktree not in checked_worktrees:
-        checked_worktrees.append(main_worktree)
-    for worktree in checked_worktrees:
-        _assert_clean(worktree, f"before synchronization in {worktree}")
-
-    require_success(_git(repo_root, "fetch", "--prune", args.remote_name), cwd=repo_root)
-    if main_worktree is None:
-        require_success(_git(repo_root, "switch", args.main_branch), cwd=repo_root)
-        main_worktree = repo_root
-        worktrees = {
-            branch: worktree
-            for branch, worktree in worktrees.items()
-            if worktree != repo_root
-        }
-        worktrees[args.main_branch] = repo_root
-    git_branches.fast_forward_branch(
-        main_worktree, f"{args.remote_name}/{args.main_branch}",
-    )
-    _assert_clean(main_worktree, f"after fast-forwarding {args.main_branch}")
-
-    aligned: list[str] = []
-    for branch in args.align_branch:
-        branch_worktree = worktrees.get(branch)
-        git_branches.align_branch(repo_root, branch, args.main_branch, branch_worktree)
-        if branch_worktree is not None:
-            _assert_clean(branch_worktree, f"after aligning {branch}")
-        aligned.append(branch)
-    head = require_output(
-        _git(repo_root, "rev-parse", args.main_branch), cwd=repo_root
-    ).splitlines()[0]
-    return {
-        "status": "synced",
-        "main": args.main_branch,
-        "remote": args.remote_name,
-        "head": head.strip(),
-        "aligned_branches": aligned,
-    }
 
 
 def build_parser() -> argparse.ArgumentParser:

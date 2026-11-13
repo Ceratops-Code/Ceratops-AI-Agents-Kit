@@ -8,6 +8,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from contextlib import nullcontext
 from typing import Any
 from unittest import mock
 
@@ -36,7 +37,7 @@ class EnsurePrTests(unittest.TestCase):
         )
         with mock.patch.object(ensure_pr, "_publication_target") as bind:
             with self.assertRaisesRegex(ensure_pr.EnsurePrError, "repository's release/local"):
-                ensure_pr._ensure_pr(args)
+                ensure_pr.ensure_pr(args)
             bind.assert_not_called()
 
     def test_main_binds_implicit_repository_and_rejects_fork_push(self) -> None:
@@ -141,6 +142,8 @@ class SyncTests(unittest.TestCase):
             dirty_worktree = worktrees[dirty_owner]
 
             def status_output(command: list[str], *, cwd: pathlib.Path) -> str:
+                if command[-2:] == ["branch", "--show-current"]:
+                    return "task"
                 self.assertEqual(command[-2:], ["status", "--porcelain"])
                 return "dirty" if cwd == dirty_worktree else ""
 
@@ -159,9 +162,11 @@ class SyncTests(unittest.TestCase):
                     side_effect=status_output,
                 ),
                 mock.patch.object(sync, "require_success") as run,
+                mock.patch.object(sync.git_branches, "_selected_worktree", return_value=None),
+                mock.patch.object(sync, "release_write_context", return_value=nullcontext()),
                 self.assertRaisesRegex(sync.SyncError, "worktree is dirty"),
             ):
-                sync._sync_main(
+                sync.sync_main(
                     argparse.Namespace(
                         repo_root=worktrees["caller"],
                         main_branch="main",
@@ -198,11 +203,13 @@ class SyncTests(unittest.TestCase):
                         for branch, owner in branch_owners.items()
                     },
                 ),
-                mock.patch.object(sync, "require_output") as output,
+                mock.patch.object(sync, "require_output", return_value="task") as output,
                 mock.patch.object(sync, "require_success") as run,
+                mock.patch.object(sync.git_branches, "_selected_worktree", return_value=None),
+                mock.patch.object(sync, "release_write_context", return_value=nullcontext()),
                 self.assertRaisesRegex(sync.SyncError, "is unavailable"),
             ):
-                sync._sync_main(
+                sync.sync_main(
                     argparse.Namespace(
                         repo_root=worktrees["caller"],
                         main_branch="main",
@@ -211,7 +218,10 @@ class SyncTests(unittest.TestCase):
                     )
                 )
 
-            output.assert_not_called()
+            output.assert_called_once_with(
+                sync._git(worktrees["caller"], "branch", "--show-current"),
+                cwd=worktrees["caller"],
+            )
             run.assert_not_called()
 
     def test_sync_uses_existing_main_and_aligned_branch_worktrees(self) -> None:
@@ -274,8 +284,12 @@ class SyncTests(unittest.TestCase):
                 mock.patch.object(sync, "require_success") as run,
                 mock.patch.object(sync.git_branches, "require_success", new=run),
                 mock.patch.object(sync, "require_output", return_value="a" * 40),
+                mock.patch.object(sync.git_branches, "_selected_worktree", return_value=None),
+                mock.patch.object(sync.git_branches, "_branch_head", return_value="a" * 40),
+                mock.patch.object(sync.git_branches, "fast_forward_branch") as fast_forward,
+                mock.patch.object(sync, "release_write_context", return_value=nullcontext()),
             ):
-                sync._sync_main(
+                sync.sync_main(
                     argparse.Namespace(
                         repo_root=repo_root,
                         main_branch="main",
@@ -284,6 +298,9 @@ class SyncTests(unittest.TestCase):
                     )
                 )
 
+        fast_forward.assert_called_once_with(
+            repo_root, "origin/main", expected_old_commit="a" * 40,
+        )
         commands = [call.args[0] for call in run.call_args_list]
         self.assertIn(sync._git(repo_root, "switch", "main"), commands)
         self.assertIn(
@@ -343,6 +360,8 @@ class SyncTests(unittest.TestCase):
             )
 
             def command_output(command: list[str], *, cwd: pathlib.Path) -> str:
+                if command[-2:] == ["branch", "--show-current"]:
+                    return "main"
                 if command[-4:] == ["worktree", "list", "--porcelain", "-z"]:
                     return porcelain
                 if command[-2:] == ["status", "--porcelain"]:
@@ -360,8 +379,12 @@ class SyncTests(unittest.TestCase):
                 mock.patch.object(sync.git_branches, "require_output", side_effect=command_output),
                 mock.patch.object(sync, "require_success") as run,
                 mock.patch.object(sync.git_branches, "require_success", new=run),
+                mock.patch.object(sync.git_branches, "_selected_worktree", return_value=None),
+                mock.patch.object(sync.git_branches, "_branch_head", return_value=head),
+                mock.patch.object(sync.git_branches, "fast_forward_branch") as fast_forward,
+                mock.patch.object(sync, "release_write_context", return_value=nullcontext()),
             ):
-                result = sync._sync_main(
+                result = sync.sync_main(
                     argparse.Namespace(
                         repo_root=main_worktree,
                         main_branch="main",
@@ -371,7 +394,12 @@ class SyncTests(unittest.TestCase):
                 )
 
             self.assertEqual(result["head"], head)
-            self.assertEqual(run.call_count, 2)
+            run.assert_called_once_with(
+                sync._git(main_worktree, "fetch", "--prune", "origin"), cwd=main_worktree,
+            )
+            fast_forward.assert_called_once_with(
+                main_worktree, "origin/main", expected_old_commit=head,
+            )
 
     def test_stale_selected_main_worktree_blocks_before_fetch(self) -> None:
         self.assert_stale_worktree_blocks(
@@ -424,6 +452,12 @@ class ShipTests(unittest.TestCase):
         return completed.stdout.strip()
 
     def args(self, repo_root: pathlib.Path) -> argparse.Namespace:
+        # The public Ship operation uses its real native release lock.
+        if not (repo_root / ".git").exists():
+            self.git(repo_root, "init", "-b", "release/local")
+            self.git(repo_root, "config", "user.email", "test@example.invalid")
+            self.git(repo_root, "config", "user.name", "Ship Test")
+            self.git(repo_root, "commit", "--allow-empty", "-m", "base")
         return argparse.Namespace(
             repo_root=repo_root,
             repo="owner/repo",
@@ -712,7 +746,7 @@ class ShipTests(unittest.TestCase):
                 mock.patch.object(ship.merge, "merge_verified_pr") as merge_pr,
                 mock.patch.object(ship.sync, "sync_main") as sync_main,
             ):
-                result = ship._ship(args)
+                result = ship.ship(args)
 
         self.assertEqual(
             result,
@@ -1541,7 +1575,7 @@ class ShipTests(unittest.TestCase):
                     },
                 ),
             ):
-                result = ship._ship(args)
+                result = ship.ship(args)
             checkpoint_removed = not checkpoint.exists()
             checkpoint_temporary_removed = not checkpoint_temporary.exists()
             same_pr_removed = not same_pr_checkpoint.exists()
@@ -1649,7 +1683,7 @@ class ShipTests(unittest.TestCase):
                     },
                 ),
             ):
-                result = ship._ship(args)
+                result = ship.ship(args)
 
         self.assertEqual(result["status"], "shipped")
         self.assertEqual(result["phase"], "synchronized")
@@ -1736,7 +1770,7 @@ class ShipTests(unittest.TestCase):
                     },
                 ),
             ):
-                result = ship._ship(args)
+                result = ship.ship(args)
 
         self.assertEqual(result["status"], "shipped")
         self.assertEqual(result["phase"], "synchronized")
@@ -1786,7 +1820,7 @@ class ShipTests(unittest.TestCase):
                     side_effect=ship.ShipError("gate failed"),
                 ),self.assertRaisesRegex(ship.ShipError, "gate failed")
             ):
-                ship._ship(args)
+                ship.ship(args)
 
             self.assertTrue(checkpoint.exists())
 
@@ -1838,7 +1872,7 @@ class ShipTests(unittest.TestCase):
                 mock.patch.object(ship.merge, "merge_verified_pr") as merge_pr,
                 self.assertRaisesRegex(ship.ShipError, "pending checks appeared"),
             ):
-                ship._ship(args)
+                ship.ship(args)
 
             self.assertEqual(gates.call_count, 2)
             merge_pr.assert_not_called()
@@ -1950,7 +1984,7 @@ class ShipTests(unittest.TestCase):
                     },
                 ),
             ):
-                result = ship._ship(args)
+                result = ship.ship(args)
             checkpoint_removed = not checkpoint.exists()
 
         self.assertEqual(result["status"], "shipped")

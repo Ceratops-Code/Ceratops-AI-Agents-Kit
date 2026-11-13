@@ -214,7 +214,7 @@ def _normalize_legacy_scope(
         "target_commit": recorded_commit,
         "sources": normalized_sources,
     }
-    _write_scope(path, normalized)
+    preserve_check_references.write_scope(path, normalized)
     return normalized
 
 
@@ -239,7 +239,7 @@ def _validated_scope(
     if scope is None:
         raise PendingWorkError("Pending-work scope unexpectedly disabled its check.")
     if _read_scope(path) != scope:
-        _write_scope(path, scope)
+        preserve_check_references.write_scope(path, scope)
     return scope
 
 
@@ -360,7 +360,7 @@ def _recover_completed_deletions(
         return scope
     if retained:
         recovered = _scope_with_sources(scope, retained)
-        _write_scope(path, recovered)
+        preserve_check_references.write_scope(path, recovered)
         return recovered
     _remove_completed_state_file(path)
     return None
@@ -389,7 +389,7 @@ def _set_source_state(
     if not found:
         raise PendingWorkError(f"Pending-work source is missing: {branch!r}")
     transitioned = _scope_with_sources(scope, updated)
-    _write_scope(path, transitioned)
+    preserve_check_references.write_scope(path, transitioned)
     return transitioned
 
 
@@ -413,7 +413,7 @@ def _remove_source_record(
         raise PendingWorkError(f"Pending-work source is missing: {branch!r}")
     if remaining:
         updated = _scope_with_sources(scope, remaining)
-        _write_scope(path, updated)
+        preserve_check_references.write_scope(path, updated)
         return updated
     _remove_completed_state_file(path)
     return None
@@ -668,7 +668,7 @@ def record_scope(
                 candidate_existing["sources"],
             )
             if preserved_existing != existing:
-                _write_scope(path, preserved_existing)
+                preserve_check_references.write_scope(path, preserved_existing)
                 existing = preserved_existing
             existing_findings = ship._pending_work_findings(
                 repo_root, candidate_existing
@@ -711,7 +711,7 @@ def record_scope(
         "target_commit": target_commit,
         "sources": merged,
     }
-    _write_scope(path, scope)
+    preserve_check_references.write_scope(path, scope)
     _validated_scope(
         repo_root,
         path,

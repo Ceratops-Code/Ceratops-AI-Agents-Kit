@@ -1,13 +1,5 @@
 #!/usr/bin/env python3
-"""Own v2 bundles and resumable artifact-version transactions.
-
-The repository operation runner owns build and test selection. This module owns
-the shared Git store and the byte-level storage transaction it calls. The
-supported v2 transaction retains its original staging and full-lifetime lock.
-The internal artifact-version route writes directly to final paths, validates
-found bytes before reuse, and uses the immutable version tag as its completion
-barrier. It keeps no helper-owned staging, pending, or temporary copy.
-"""
+"""Own allocated artifact versions, measured output files and scoped retention."""
 
 from __future__ import annotations
 
@@ -19,19 +11,16 @@ import re
 import shutil
 import stat
 import subprocess
+import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
-from copy import deepcopy
-from dataclasses import dataclass
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass, replace
 from typing import Any
 
 import retain_artifact_versions
 import sdlc_results
 from sdlc_results import StepResultError
 
-BUILD_BUNDLE_RETENTION = 3
-VERSIONED_ARTIFACT_RETENTION = 3
-BUILD_KEY_RE = re.compile(r"^[a-f0-9]{64}$")
 RELEASE_BUNDLE_RE = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
 LOGICAL_ID_RE = re.compile(
     r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$"
@@ -55,67 +44,6 @@ class RecoveryRequired(OperationError):
     """An unresolved versioned-store owner requires explicit recovery."""
 
     status = "recovery_required"
-
-
-@dataclass(frozen=True)
-class BuildProduct:
-    """Adapter outputs relative to the supplied bundle directory.
-
-    File descriptors contain type/path and, for artifacts, deliverable. The
-    transaction measures size/hash itself before handing those bytes to tests.
-    Dependencies pair an exact receipt identity with their copied artifacts.
-    Scratch source trees and test environments belong in the separate work dir.
-    """
-
-    artifacts: Sequence[Mapping[str, Any]]
-    dependencies: Sequence[Mapping[str, Any]] = ()
-    supporting_files: Sequence[Mapping[str, Any]] = ()
-
-
-@dataclass(frozen=True)
-class CompletedDependency:
-    """One recorded dependency identity and its exact stored artifact paths."""
-
-    identity: Mapping[str, str]
-    artifacts: tuple[pathlib.Path, ...]
-
-
-@dataclass(frozen=True)
-class CompletedBuild:
-    """A verified completed v2 build selected for downstream consumption."""
-
-    receipt_path: pathlib.Path
-    receipt: Mapping[str, Any]
-    artifacts: tuple[pathlib.Path, ...]
-    dependencies: tuple[CompletedDependency, ...]
-    supporting_files: tuple[pathlib.Path, ...]
-
-
-@dataclass(frozen=True)
-class BuildStorage:
-    """Resolved paths for one v2 store transaction.
-
-    The build key is derived from the validated identity. Every mutable path is
-    helper-owned and remains below the resolved shared Git store.
-    """
-
-    identity: Mapping[str, str]
-    key: str
-    store: pathlib.Path
-    staging_root: pathlib.Path
-    diagnostics: pathlib.Path
-    completed: pathlib.Path
-    staging: pathlib.Path
-    diagnostic_path: pathlib.Path
-    lock_path: pathlib.Path
-
-    @property
-    def bundle(self) -> pathlib.Path:
-        return self.staging / "bundle"
-
-    @property
-    def work(self) -> pathlib.Path:
-        return self.staging / "work"
 
 
 @dataclass(frozen=True)
@@ -214,37 +142,10 @@ def _git_common_path(repo_root: pathlib.Path) -> pathlib.Path:
     return common
 
 
-def _build_store_path(repo_root: pathlib.Path) -> pathlib.Path:
-    """Resolve the v2 shared store without creating reader-visible state."""
-
-    return _git_common_path(repo_root) / "ceratops" / "builds"
-
-
 def _artifact_store_path(repo_root: pathlib.Path) -> pathlib.Path:
     """Resolve the versioned artifact store without creating it."""
 
     return _git_common_path(repo_root) / "ceratops" / "artifacts"
-
-
-def _build_store(repo_root: pathlib.Path) -> pathlib.Path:
-    return _build_directory(_build_store_path(repo_root))
-
-
-def validated_build_selection(selection: Mapping[str, str]) -> dict[str, str]:
-    """Return one canonical v2 build identity after schema validation."""
-
-    result_validator = sdlc_results._operation_result_validator()
-    validator = result_validator.evolve(
-        schema={
-            "$ref": "#/$defs/buildSelection",
-            "$defs": result_validator.schema["$defs"],
-        }
-    )
-    errors = list(validator.iter_errors(dict(selection)))
-    if errors:
-        raise OperationError(f"Invalid build selection: {errors[0].message}")
-    identity = json.loads(canonical_json(dict(selection)))
-    return {field: identity[field] for field in sdlc_results.BUILD_SELECTION_FIELDS}
 
 
 def measure_build_file(
@@ -272,509 +173,40 @@ def measure_build_file(
     return record
 
 
-def require_recorded_acceptance(receipt: Mapping[str, Any]) -> None:
-    """Require passed tests with evidence covering every primary artifact."""
-
-    tests = receipt["tests"]
-    if (
-        receipt["status"] != "passed"
-        or not tests
-        or any(
-            test["status"] != "passed" or not test["evidence"] for test in tests
-        )
-    ):
-        raise OperationError(
-            "Every required artifact test must pass with recorded evidence."
-        )
-    tested = {item["path"] for test in tests for item in test["artifacts"]}
-    if not {item["path"] for item in receipt["artifacts"]}.issubset(tested):
-        raise OperationError(
-            "Required tests do not cover every built artifact."
-        )
-
-
-def _completed_build_gate(receipt: Mapping[str, Any]) -> None:
-    """Require recorded successful acceptance without consulting today's tests."""
-
-    require_recorded_acceptance(receipt)
-    if not any(
-        item["type"] == "build-inputs"
-        and item["path"] == "supporting-files/build-inputs.json"
-        for item in receipt["supportingFiles"]
-    ):
-        raise OperationError("Completed build lacks its recorded build inputs.")
-
-
-def _build_inventory(root: pathlib.Path, receipt: Mapping[str, Any]) -> None:
-    """Do not publish unlisted scratch, environments, or linked payloads."""
-
-    expected = {
-        "receipt.json",
-        *(item["path"] for item in sdlc_results._build_files(receipt)),
-    }
-    actual: set[str] = set()
-    for parent, directories, files in os.walk(root, followlinks=False):
-        for name in directories:
-            sdlc_results._plain_path(pathlib.Path(parent) / name, directory=True)
-        for name in files:
-            path = pathlib.Path(parent) / name
-            sdlc_results._plain_path(path)
-            actual.add(path.relative_to(root).as_posix())
-    if actual != expected:
-        raise OperationError("Build bundle contains missing or unlisted files.")
-
-
-def _recorded_build_path(
-    root: pathlib.Path, record: Mapping[str, Any]
-) -> pathlib.Path:
-    """Resolve a previously verified record without repeating its byte checks."""
-
-    path = root.joinpath(*sdlc_results._bundle_relative_path(record["path"]).parts)
-    path, _info = sdlc_results._plain_path(path)
-    if not path.is_relative_to(root):
-        raise OperationError("Build receipt path escapes its completed bundle.")
-    return path
-
-
 def build_result_artifact_paths(
-    repo_root: pathlib.Path, receipt: Mapping[str, Any], reference: str,
-) -> dict[str, list[str]]:
-    """Return the exact files of a successful v1/v2/v3 build for phased checks.
+    repo_root: pathlib.Path, receipt: Mapping[str, Any], reference: str, *,
+    output_directory: pathlib.Path | None = None,
+) -> dict[str, Any]:
+    """Return reported files and their measured records, without granting acceptance.
 
-    Paths follow each receipt format's producer: v1 is repository-relative,
-    v2 uses its identity-keyed build bundle, and v3 uses its allocated version
-    and target directory. No latest-build or installed-package lookup occurs.
-    Byte checks protect integrity; recorded test acceptance is not repeated.
+    Native builders name files inside the allocated directory. Completed builds
+    instead open their immutable receipt through the shared saved-file reader.
+    Post-build checks receive these exact paths; only Build can complete a version.
     """
     if receipt.get("status") != "passed":
-        return {}
-    schema = receipt.get("schema")
-    if schema == "ceratops-build-result.v1":
-        bundle, records = repo_root, [receipt["artifact"]]
-    elif schema == sdlc_results.BUILD_RECEIPT_SCHEMA:
-        identity = validated_build_selection(receipt["identity"])
-        bundle = _build_store_path(repo_root) / hashlib.sha256(canonical_json(identity)).hexdigest()
-        records = receipt["artifacts"]
-    elif schema == sdlc_results.COMMITTED_BUILD_RECEIPT_SCHEMA:
+        return {"paths": {}, "records": []}
+    if receipt.get("schema") == "ceratops-builder-output":
+        if output_directory is None:
+            raise OperationError("Builder output requires its allocated output directory.")
+        root = sdlc_results._plain_path(pathlib.Path(output_directory), directory=True)[0]
+        records = [measure_build_file(root, descriptor) for descriptor in receipt["artifacts"]]
+        installation = receipt["installationArtifactPath"]
+        if sum(record["path"] == installation for record in records) != 1:
+            raise OperationError("Builder must name exactly one reported installation artifact.")
+        if len({record["path"] for record in records}) != len(records):
+            raise OperationError("Builder output repeats a file.")
+        paths = {reference: [str(root / record["path"]) for record in records]}
+        return {"paths": paths, "records": [dict(record, root="store") for record in records],
+                "installationArtifactPath": installation}
+    if receipt.get("schema") == sdlc_results.COMMITTED_BUILD_RECEIPT_SCHEMA:
         identity = receipt["identity"]
-        relative = f"{identity['releaseBundle']}/{identity['version']}"
-        if len(receipt["requiredTargets"]) > 1:
-            relative += f"/{identity['target']}"
-        bundle = _artifact_store_path(repo_root) / sdlc_results._bundle_relative_path(relative)
-        records = receipt["artifacts"]
-        if any(record["root"] != "store" for record in records):
-            raise OperationError("Built artifacts must name stored files.")
-    else:
-        return {}
-    selected: dict[str, list[str]] = {}
-    for record in records:
-        path = str(sdlc_results._verify_bundle_file(bundle, record))
-        selected.setdefault(reference, []).append(path)
-    return selected
-
-
-def read_completed_build(
-    repo_root: pathlib.Path,
-    *,
-    selection: Mapping[str, str] | None = None,
-    receipt_path: pathlib.Path | None = None,
-) -> CompletedBuild:
-    """Read one explicitly selected completed v2 build without building or testing.
-
-    Callers select either the six-field build identity or an absolute saved
-    ``receipt.json`` path in this repository's shared store. The v2 reader checks
-    identity plus every recorded file once here. Returned paths come only from
-    that verified record, so nested consumers need not reopen or reinterpret it.
-    """
-
-    if (selection is None) == (receipt_path is None):
-        raise OperationError(
-            "Select a completed build by identity or receipt path, not both."
-        )
-    try:
-        store = sdlc_results._plain_path(
-            _build_store_path(repo_root), directory=True
-        )[0]
-        if receipt_path is None:
-            assert selection is not None
-            identity = validated_build_selection(selection)
-            key = hashlib.sha256(canonical_json(identity)).hexdigest()
-            bundle = store / key
-            selected_receipt = bundle / "receipt.json"
-        else:
-            selected_receipt = pathlib.Path(receipt_path)
-            if not selected_receipt.is_absolute():
-                raise OperationError(
-                    "An explicit completed-build receipt path must be absolute."
-                )
-            selected_receipt, _info = sdlc_results._plain_path(selected_receipt)
-            bundle = sdlc_results._plain_path(
-                selected_receipt.parent, directory=True
-            )[0]
-            if selected_receipt.name != "receipt.json" or bundle.parent != store:
-                raise OperationError(
-                    "Completed-build receipt is outside the shared build store."
-                )
-            identity = validated_build_selection(
-                sdlc_results._read_build_receipt(selected_receipt)["identity"]
-            )
-            key = hashlib.sha256(canonical_json(identity)).hexdigest()
-        if bundle.parent != store or bundle.name != key:
-            raise OperationError(
-                "Completed build directory does not match its identity."
-            )
-        receipt = sdlc_results.verify_release_bundle_build(
-            selected_receipt, bundle, expected=identity
-        )
-        _completed_build_gate(receipt)
-        _build_inventory(bundle, receipt)
-    except (OSError, UnicodeError, ValueError, RecursionError) as exc:
-        if isinstance(exc, (OperationError, StepResultError)):
-            raise
-        raise OperationError(f"Cannot read completed build: {exc}"[:1024]) from exc
-
-    return CompletedBuild(
-        receipt_path=selected_receipt,
-        receipt=receipt,
-        artifacts=tuple(
-            _recorded_build_path(bundle, item) for item in receipt["artifacts"]
-        ),
-        dependencies=tuple(
-            CompletedDependency(
-                identity=deepcopy(item["identity"]),
-                artifacts=tuple(
-                    _recorded_build_path(bundle, artifact)
-                    for artifact in item["artifacts"]
-                ),
-            )
-            for item in receipt["dependencies"]
-        ),
-        supporting_files=tuple(
-            _recorded_build_path(bundle, item)
-            for item in receipt["supportingFiles"]
-        ),
-    )
-
-
-def _remove_build_tree(
-    path: pathlib.Path, parent: pathlib.Path, label: str
-) -> None:
-    """Remove one helper-owned hash directory without following links."""
-
-    if path.parent != parent or BUILD_KEY_RE.fullmatch(path.name) is None:
-        raise OperationError(f"Unsafe {label} cleanup target.")
-    if path.exists() or path.is_symlink():
-        sdlc_results._plain_path(path, directory=True)
-
-        def remove_readonly(
-            function: Callable[..., Any], name: str, error: BaseException
-        ) -> None:
-            target = pathlib.Path(name).absolute()
-            if not isinstance(error, PermissionError) or not target.is_relative_to(path):
-                raise error
-            # Git copies and test environments can contain read-only files on
-            # Windows. Never chmod a link/hardlink or an unrelated target.
-            _resolved, info = sdlc_results._plain_path(
-                target, directory=target.is_dir()
-            )
-            if info.st_mode & stat.S_IWRITE:
-                raise error
-            target.chmod(info.st_mode | stat.S_IWRITE)
-            function(name)
-
-        # Python rmtree does not traverse directory junctions or symlink entries.
-        shutil.rmtree(path, onexc=remove_readonly)
-    if path.exists() or path.is_symlink():
-        raise OperationError(f"{label.capitalize()} cleanup did not complete.")
-
-
-def _discard_build_work(staging: pathlib.Path, staging_root: pathlib.Path) -> None:
-    _remove_build_tree(staging, staging_root, "build staging")
-
-
-def _cleanup_build_staging(staging_root: pathlib.Path) -> None:
-    """Remove every recognizable orphan after the repository lock is held."""
-
-    for path in staging_root.iterdir():
-        if BUILD_KEY_RE.fullmatch(path.name):
-            _discard_build_work(path, staging_root)
-
-
-def _build_group(identity: Mapping[str, str]) -> dict[str, str]:
-    """Group successive local builds that serve the same release purpose."""
-
-    return {
-        name: identity[name]
-        for name in ("repository", "releaseBundle", "channel", "target")
-    }
-
-
-def _build_group_key(identity: Mapping[str, str]) -> str:
-    return hashlib.sha256(canonical_json(_build_group(identity))).hexdigest()
-
-
-def _build_diagnostic_path(
-    diagnostics: pathlib.Path, identity: Mapping[str, str]
-) -> pathlib.Path:
-    return diagnostics / f"{_build_group_key(identity)}.json"
-
-
-def _clear_build_diagnostic(path: pathlib.Path) -> None:
-    if path.exists() or path.is_symlink():
-        sdlc_results._plain_path(path)
-        path.unlink()
-
-
-def _cleanup_build_diagnostic_temps(diagnostics: pathlib.Path) -> None:
-    """Discard interrupted writes; stable reports are overwritten by group."""
-
-    for path in diagnostics.iterdir():
-        if re.fullmatch(r"[a-f0-9]{64}\.tmp", path.name):
-            sdlc_results._plain_path(path)
-            path.unlink()
-
-
-def _completed_build_groups(
-    store: pathlib.Path, validator: Any
-) -> dict[str, list[tuple[int, str, pathlib.Path]]]:
-    """Classify well-formed completed bundles without reading artifact bytes."""
-
-    groups: dict[str, list[tuple[int, str, pathlib.Path]]] = {}
-    for path in store.iterdir():
-        if BUILD_KEY_RE.fullmatch(path.name) is None:
-            continue
-        _resolved, info = sdlc_results._plain_path(path, directory=True)
-        receipt_path, receipt_info = sdlc_results._plain_path(path / "receipt.json")
-        if receipt_info.st_size > sdlc_results.STEP_RESULT_BYTES:
-            raise OperationError(
-                "Completed build receipt is too large for retention."
-            )
-        try:
-            receipt = json.loads(
-                receipt_path.read_bytes(),
-                object_pairs_hook=sdlc_results._unique_result_object,
-            )
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise OperationError(
-                f"Completed build receipt is unreadable: {path.name}"
-            ) from exc
-        errors = list(validator.iter_errors(receipt))
-        if errors or receipt.get("schema") != sdlc_results.BUILD_RECEIPT_SCHEMA:
-            detail = errors[0].message if errors else "unexpected schema"
-            raise OperationError(f"Completed build receipt is invalid: {detail}")
-        identity = receipt["identity"]
-        if path.name != hashlib.sha256(canonical_json(identity)).hexdigest():
-            raise OperationError(
-                "Completed build directory does not match its identity."
-            )
-        group = _build_group_key(identity)
-        groups.setdefault(group, []).append((info.st_mtime_ns, path.name, path))
-    return groups
-
-
-def _prune_completed_builds(
-    store: pathlib.Path, validator: Any, *, current_key: str | None = None
-) -> None:
-    """Keep the current bundle and two predecessors for every release group."""
-
-    for entries in _completed_build_groups(store, validator).values():
-        entries.sort(
-            key=lambda item: (item[1] == current_key, item[0], item[1]),
-            reverse=True,
-        )
-        for _mtime, _key, path in entries[BUILD_BUNDLE_RETENTION:]:
-            _remove_build_tree(path, store, "completed build")
-
-
-def _build_diagnostic(
-    destination: pathlib.Path,
-    identity: Mapping[str, str],
-    error: str,
-    required_tests: Sequence[str],
-    tests: Sequence[Mapping[str, Any]],
-    bundle: pathlib.Path,
-) -> None:
-    """Preserve bounded failure evidence before private test files are removed.
-
-    Diagnostic excerpts are not verification evidence. Unsafe/missing evidence
-    remains an error description, never a reason to read outside the bundle.
-    """
-
-    excerpts = []
-    for result in tests[:20]:
-        if not isinstance(result, Mapping):
-            continue
-        entry: dict[str, Any] = {
-            "id": str(result.get("id", ""))[:256],
-            "status": str(result.get("status", ""))[:32],
-        }
-        evidence = result.get("evidence")
-        if isinstance(evidence, Mapping) and isinstance(evidence.get("path"), str):
-            try:
-                path = bundle.joinpath(
-                    *sdlc_results._bundle_relative_path(evidence["path"]).parts
-                )
-                path, _info = sdlc_results._plain_path(path)
-                if not path.is_relative_to(bundle):
-                    raise OperationError(
-                        "Diagnostic evidence escapes the bundle."
-                    )
-                with path.open("rb") as stream:
-                    raw = stream.read(16385)
-                entry["evidence"] = raw[:16384].decode("utf-8", errors="replace")
-                entry["truncated"] = len(raw) > 16384
-            except (OSError, StepResultError, OperationError) as exc:
-                entry["evidence_error"] = str(exc)[:1024]
-        excerpts.append(entry)
-    temporary = destination.with_suffix(".tmp")
-    if temporary.exists() or temporary.is_symlink():
-        sdlc_results._plain_path(temporary)
-        temporary.unlink()
-    with temporary.open("xb") as stream:
-        stream.write(
-            canonical_json(
-                {
-                    "identity": identity,
-                    "error": error[:4096],
-                    "requiredTests": list(required_tests),
-                    "tests": excerpts,
-                    "omittedTests": max(0, len(tests) - 20),
-                }
-            )
-        )
-        stream.flush()
-        os.fsync(stream.fileno())
-    if destination.exists() or destination.is_symlink():
-        sdlc_results._plain_path(destination)
-    temporary.replace(destination)
-
-
-def prepare_build_storage(
-    repo_root: pathlib.Path, identity: Mapping[str, str]
-) -> BuildStorage:
-    """Resolve and create the unchanged v2 store infrastructure."""
-
-    key = hashlib.sha256(canonical_json(identity)).hexdigest()
-    store = _build_store(repo_root)
-    staging_root = _build_directory(store / ".staging")
-    locks = _build_directory(store / ".locks")
-    diagnostics = _build_directory(store / ".diagnostics")
-    lock_path = locks / "store.lock"
-    if lock_path.exists() or lock_path.is_symlink():
-        sdlc_results._plain_path(lock_path)
-    return BuildStorage(
-        identity=deepcopy(identity),
-        key=key,
-        store=store,
-        staging_root=staging_root,
-        diagnostics=diagnostics,
-        completed=store / key,
-        staging=staging_root / key,
-        diagnostic_path=_build_diagnostic_path(diagnostics, identity),
-        lock_path=lock_path,
-    )
-
-
-@contextmanager
-def locked_build_storage(storage: BuildStorage) -> Iterator[None]:
-    """Hold the persistent store lock for the caller's full transaction."""
-
-    from filelock import FileLock
-
-    # One persistent lock avoids unlink/recreate races and makes cleanup of
-    # earlier transactions safe. OS ownership ends when a process dies.
-    with FileLock(
-        storage.lock_path,
-        timeout=30,
-        fallback_to_soft=False,
-        preserve_lock_file=True,
-    ):
-        yield
-
-
-def start_build_storage(
-    storage: BuildStorage, validator: Any
-) -> tuple[pathlib.Path, pathlib.Path]:
-    """Clean prior owned state and create this identity's private directories.
-
-    The caller must hold ``locked_build_storage``. Cleanup deliberately retains
-    the v2 rule of removing every recognizable staging directory on entry.
-    """
-
-    _cleanup_build_staging(storage.staging_root)
-    _cleanup_build_diagnostic_temps(storage.diagnostics)
-    _prune_completed_builds(storage.store, validator)
-    if storage.completed.exists() or storage.completed.is_symlink():
-        raise OperationError(
-            "Completed build identity already exists; read it explicitly or use a new identity."
-        )
-    work = _build_directory(storage.work)
-    bundle = _build_directory(storage.bundle)
-    return bundle, work
-
-
-def write_build_inputs(storage: BuildStorage, locked_inputs: bytes) -> dict[str, Any]:
-    """Persist and measure the canonical build-input record in private staging."""
-
-    inputs_path = storage.bundle / "supporting-files" / "build-inputs.json"
-    _build_directory(inputs_path.parent)
-    with inputs_path.open("xb") as stream:
-        stream.write(locked_inputs)
-    return measure_build_file(
-        storage.bundle,
-        {"type": "build-inputs", "path": "supporting-files/build-inputs.json"},
-    )
-
-
-def publish_completed_build(
-    storage: BuildStorage, receipt: Mapping[str, Any], validator: Any
-) -> pathlib.Path:
-    """Write one verified receipt and atomically publish its complete directory."""
-
-    receipt_path = storage.bundle / "receipt.json"
-    with receipt_path.open("xb") as stream:
-        stream.write(canonical_json(receipt))
-        stream.flush()
-        os.fsync(stream.fileno())
-    sdlc_results.verify_release_bundle_build(
-        receipt_path, storage.bundle, expected=storage.identity
-    )
-    _build_inventory(storage.bundle, receipt)
-    if storage.completed.exists() or storage.completed.is_symlink():
-        raise OperationError(
-            "Completed build appeared during the reserved transaction."
-        )
-    storage.bundle.rename(storage.completed)
-    os.utime(storage.completed, None)
-    _prune_completed_builds(
-        storage.store, validator, current_key=storage.key
-    )
-    _clear_build_diagnostic(storage.diagnostic_path)
-    return storage.completed / "receipt.json"
-
-
-def write_failure_diagnostic(
-    storage: BuildStorage,
-    error: str,
-    required_tests: Sequence[str],
-    tests: Sequence[Mapping[str, Any]],
-) -> None:
-    """Atomically replace this release group's bounded latest-failure report."""
-
-    _build_diagnostic(
-        storage.diagnostic_path,
-        storage.identity,
-        error,
-        required_tests,
-        tests,
-        storage.bundle,
-    )
-
-
-def discard_build_storage(storage: BuildStorage) -> None:
-    """Remove only this transaction's recognizable private staging tree."""
-
-    _discard_build_work(storage.staging, storage.staging_root)
+        accepted = sdlc_results.read_artifact_receipt_chain(
+            repo_root, tag=sdlc_results.receipt_storage_key(identity) + "/" + identity["version"],
+            expected=identity)
+        return {"paths": {reference: [str(path) for path in accepted.artifacts]},
+                "records": accepted.build_receipt.value["artifacts"],
+                "installationArtifactPath": accepted.build_receipt.value.get("installationArtifactPath")}
+    raise OperationError("Unsupported build output format.")
 
 
 # The artifact-version route below is intentionally additive. Existing live
@@ -782,16 +214,6 @@ def discard_build_storage(storage: BuildStorage) -> None:
 # this route. Direct final paths are incomplete until their immutable tag exists.
 
 
-@dataclass(frozen=True)
-class _CompletedArtifactOutput:
-    repository: str
-    release_bundle: str
-    version: str
-    target: str
-    version_class: str
-    root: pathlib.Path
-    version_root: pathlib.Path
-    mtime_ns: int
 
 
 def _require_identifier(
@@ -1119,7 +541,7 @@ def allocate_artifact_version(
     """
     root = _validated_worktree(pathlib.Path(repo_root))
     repository = _validated_repository(repository)
-    unit = _require_identifier(release_bundle, label="release bundle", pattern=RELEASE_BUNDLE_RE)
+    unit = sdlc_results.receipt_storage_key({"storageKey": release_bundle})
     version, classification = _version_classification(version)
     targets = _validated_targets(required_targets)
     paths = _input_paths(root, declared_input_paths)
@@ -1145,11 +567,18 @@ def allocate_artifact_version(
             version = _next_prerelease(version)
             continue
         if attempt_id is None:
-            reused = _read_reusable_allocation(allocation, explicit_attempt=None)
-            if reused is None:
-                raise OperationError("A new artifact build requires its receipt attempt ID.")
-            _prune_completed_artifacts(root, store, lock_path, wait=False)
-            return reused
+            if directory.exists():
+                try:
+                    reused = _read_reusable_allocation(allocation, explicit_attempt=None)
+                except (RecoveryRequired, StepResultError, OperationError, OSError):
+                    reused = None
+                if reused is not None:
+                    _prune_completed_artifacts(allocation, wait=False)
+                    return reused
+                uncertain.append(directory)
+                version = _next_prerelease(version)
+                continue
+            allocation = replace(allocation, attempt_id=str(uuid.uuid4()))
         try:
             directory.mkdir(exist_ok=False)
         except FileExistsError:
@@ -1160,7 +589,7 @@ def allocate_artifact_version(
                 uncertain.append(directory)
                 reused = None
             if reused is not None:
-                _prune_completed_artifacts(root, store, lock_path, wait=False)
+                _prune_completed_artifacts(allocation, wait=False)
                 return reused
             version = _next_prerelease(version)
             continue
@@ -1168,7 +597,7 @@ def allocate_artifact_version(
             allocation.request_path, _build_request_record(allocation),
             replace=False, label="artifact build request",
         )
-        _prune_completed_artifacts(root, store, lock_path, wait=False)
+        _prune_completed_artifacts(allocation, wait=False)
         return allocation
 
 
@@ -1217,110 +646,8 @@ def _artifact_tag_exists(
     return result.returncode == 0
 
 
-def _completed_artifact_record(
-    receipt_path: pathlib.Path,
-    *,
-    unit: str,
-    version: str,
-    target: str | None,
-    root: pathlib.Path,
-    version_root: pathlib.Path,
-) -> _CompletedArtifactOutput:
-    try:
-        receipt = sdlc_results.read_artifact_receipt(receipt_path).value
-    except (OSError, StepResultError) as exc:
-        raise OperationError("Completed artifact receipt is invalid.") from exc
-    identity = receipt["identity"]
-    if (
-        identity["releaseBundle"] != unit
-        or identity["version"] != version
-        or (target is not None and identity["target"] != target)
-    ):
-        raise OperationError("Completed artifact location does not match its identity.")
-    _version, version_class = _version_classification(version)
-    return _CompletedArtifactOutput(
-        repository=_validated_repository(identity["repository"]),
-        release_bundle=unit,
-        version=version,
-        target=identity["target"],
-        version_class=version_class,
-        root=root,
-        version_root=version_root,
-        mtime_ns=sdlc_results._plain_path(
-            root, directory=True, label="Completed artifact output"
-        )[1].st_mtime_ns,
-    )
 
 
-def _completed_artifact_outputs(
-    repo_root: pathlib.Path, store: pathlib.Path,
-) -> list[_CompletedArtifactOutput]:
-    outputs: list[_CompletedArtifactOutput] = []
-    for unit_path in store.iterdir():
-        if unit_path.name.startswith(".") or unit_path.name == "beta-stable":
-            continue
-        if not unit_path.is_dir() or unit_path.is_symlink():
-            raise OperationError("Artifact store contains an invalid release bundle.")
-        unit = _require_identifier(
-            unit_path.name, label="stored release bundle", pattern=RELEASE_BUNDLE_RE
-        )
-        for version_path in unit_path.iterdir():
-            if version_path.name.startswith("."):
-                continue
-            if not version_path.is_dir() or version_path.is_symlink():
-                raise OperationError("Artifact store contains an invalid version.")
-            version, _version_class = _version_classification(version_path.name)
-            # Requests and missing tags protect unfinished and uncertain bytes.
-            # A tag is permanent even when retention removes the package bytes.
-            if (version_path / "build_request.json").exists() or not _artifact_tag_exists(repo_root, unit, version):
-                continue
-            if (version_path / retain_artifact_versions.OWNER_FILE).exists():
-                continue
-            direct_receipt = version_path / "artifact-receipt.json"
-            if direct_receipt.exists() or direct_receipt.is_symlink():
-                if any(
-                    child.is_dir()
-                    and not child.is_symlink()
-                    and (child / "artifact-receipt.json").exists()
-                    for child in version_path.iterdir()
-                ):
-                    raise OperationError("Completed artifact layout is ambiguous.")
-                outputs.append(
-                    _completed_artifact_record(
-                        direct_receipt,
-                        unit=unit,
-                        version=version,
-                        target=None,
-                        root=version_path,
-                        version_root=version_path,
-                    )
-                )
-                continue
-            target_paths = list(version_path.iterdir())
-            if not target_paths:
-                raise OperationError("Completed artifact version has no receipt.")
-            for target_path in target_paths:
-                if not target_path.is_dir() or target_path.is_symlink():
-                    raise OperationError("Targeted artifact layout is invalid.")
-                target = _require_identifier(
-                    target_path.name, label="stored target", pattern=LOGICAL_ID_RE
-                )
-                if (target_path / retain_artifact_versions.OWNER_FILE).exists():
-                    continue
-                receipt_path = target_path / "artifact-receipt.json"
-                if not receipt_path.exists() or receipt_path.is_symlink():
-                    raise OperationError("Targeted artifact output has no receipt.")
-                outputs.append(
-                    _completed_artifact_record(
-                        receipt_path,
-                        unit=unit,
-                        version=version,
-                        target=target,
-                        root=target_path,
-                        version_root=version_path,
-                    )
-                )
-    return outputs
 
 
 def _remove_versioned_tree(
@@ -1349,48 +676,21 @@ def _remove_versioned_tree(
         raise OperationError(f"{label.capitalize()} cleanup did not complete.")
 
 
-def _prune_completed_artifacts(
-    repo_root: pathlib.Path, store: pathlib.Path, lock_path: pathlib.Path, *, wait: bool = True,
-) -> None:
-    """Rotate completed bytes under a short lock; allocation skips busy cleanup."""
+def _prune_completed_artifacts(allocation: ArtifactVersionAllocation, *, wait: bool = True) -> None:
+    """Retire only this worktree's previously recorded copies for this member."""
     from filelock import Timeout
-
+    registration = pathlib.Path(allocation.worktree_registration).name
+    if registration == ".git":
+        registration = "primary"
     try:
-        with _locked_artifact_store(lock_path, timeout=30 if wait else 0):
-            groups: dict[
-                tuple[str, str, str, str], list[_CompletedArtifactOutput]
-            ] = {}
-            for output in _completed_artifact_outputs(repo_root, store):
-                group = (
-                    output.repository,
-                    output.release_bundle,
-                    output.target,
-                    output.version_class,
-                )
-                groups.setdefault(group, []).append(output)
-            for entries in groups.values():
-                entries.sort(
-                    key=lambda item: (item.mtime_ns, item.version), reverse=True
-                )
-                retained = 0
-                for output in entries:
-                    retained += 1
-                    if retained <= VERSIONED_ARTIFACT_RETENTION:
-                        continue
-                    if output.root == output.version_root:
-                        _remove_versioned_tree(
-                            output.root, output.version_root.parent, label="artifact output"
-                        )
-                    else:
-                        _remove_versioned_tree(
-                            output.root, output.version_root, label="artifact target"
-                        )
-                        if not any(output.version_root.iterdir()):
-                            output.version_root.rmdir()
+        with _locked_artifact_store(allocation.lock_path, timeout=30 if wait else 0):
+            for target in allocation.required_targets:
+                scope = retain_artifact_versions.RetentionScope(
+                    allocation.store, allocation.release_bundle, target, "worktree", registration)
+                retain_artifact_versions.retain_artifact_versions(scope, protection=nullcontext)
     except Timeout:
         if wait:
             raise
-
 
 
 
@@ -1425,8 +725,7 @@ def retain_completed_artifacts(
     """Apply 4F to the named store group, never discover other owners/results.
 
     Build/install/promotion callers connect their authoritative records in their
-    adoption steps. The directory allocation and existing unconnected v2 route
-    are unchanged. Only selection/deletion holds the store's cleanup lock.
+    adoption steps. Only deletion holds the store's cleanup lock.
     """
     if pool not in {"worktree", "beta-stable"}:
         raise OperationError("Installation destinations belong to their installer.")

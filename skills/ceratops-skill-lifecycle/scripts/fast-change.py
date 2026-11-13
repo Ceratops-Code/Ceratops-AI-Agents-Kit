@@ -758,145 +758,141 @@ def _release_write_context(repo_root, *, confirm_stopped=False):
 def execute(spec: ChangeSpec) -> dict[str, object]:
     """Protect direct callers as well as the full command's nested invocation."""
     with _release_write_context(spec.repo_root):
-        return _execute(spec)
-
-
-def _execute(spec: ChangeSpec) -> dict[str, object]:
-    """Apply, test, install, stage, and commit one classified change."""
-
-    patch_applied = False
-    staged = False
-    runtime_activated = False
-    committed = False
-    phase = "apply"
-    try:
-        _git(
-            spec.repo_root,
-            "apply",
-            "-",
-            input_text=spec.patch,
-            failure="generated diff application failed",
-        )
-        patch_applied = True
-        changed = _working_paths(spec.repo_root)
-        if changed != set(spec.paths):
-            raise FastChangeError(
-                "applied diff escaped the declared edit paths"
+        patch_applied = False
+        staged = False
+        runtime_activated = False
+        committed = False
+        phase = "apply"
+        try:
+            _git(
+                spec.repo_root,
+                "apply",
+                "-",
+                input_text=spec.patch,
+                failure="generated diff application failed",
             )
-        _git(
-            spec.repo_root,
-            "diff",
-            "--check",
-            failure="git diff --check failed",
-        )
-        if spec.markdown_lint_directory is not None:
-            phase = "markdown_lint"
-            _checked(
-                [
-                    "npm.cmd" if sys.platform == "win32" else "npm",
-                    "run",
-                    "lint:markdown",
-                ],
-                cwd=spec.markdown_lint_directory,
-                failure="repository Markdown lint failed",
+            patch_applied = True
+            changed = _working_paths(spec.repo_root)
+            if changed != set(spec.paths):
+                raise FastChangeError(
+                    "applied diff escaped the declared edit paths"
+                )
+            _git(
+                spec.repo_root,
+                "diff",
+                "--check",
+                failure="git diff --check failed",
             )
-        if spec.classification == "helper":
-            phase = "tests"
-            _checked(
-                [sys.executable, "-m", "pytest", "-q", *spec.tests],
-                cwd=spec.repo_root,
-                failure="targeted helper tests failed",
+            if spec.markdown_lint_directory is not None:
+                phase = "markdown_lint"
+                _checked(
+                    [
+                        "npm.cmd" if sys.platform == "win32" else "npm",
+                        "run",
+                        "lint:markdown",
+                    ],
+                    cwd=spec.markdown_lint_directory,
+                    failure="repository Markdown lint failed",
+                )
+            if spec.classification == "helper":
+                phase = "tests"
+                _checked(
+                    [sys.executable, "-m", "pytest", "-q", *spec.tests],
+                    cwd=spec.repo_root,
+                    failure="targeted helper tests failed",
+                )
+            phase = "installation"
+            runtime_activated = _run_installer(spec)
+            phase = "staging"
+            if _working_paths(spec.repo_root) != set(spec.paths):
+                raise FastChangeError(
+                    "tests or installation changed undeclared working-tree paths"
+                )
+            _git(
+                spec.repo_root,
+                "add",
+                "--",
+                *spec.paths,
+                failure="could not stage declared paths",
             )
-        phase = "installation"
-        runtime_activated = _run_installer(spec)
-        phase = "staging"
-        if _working_paths(spec.repo_root) != set(spec.paths):
-            raise FastChangeError(
-                "tests or installation changed undeclared working-tree paths"
+            staged = True
+            cached = set(
+                _git(spec.repo_root, "diff", "--cached", "--name-only").splitlines()
             )
-        _git(
-            spec.repo_root,
-            "add",
-            "--",
-            *spec.paths,
-            failure="could not stage declared paths",
-        )
-        staged = True
-        cached = set(
-            _git(spec.repo_root, "diff", "--cached", "--name-only").splitlines()
-        )
-        unstaged = set(
-            _git(spec.repo_root, "diff", "--name-only").splitlines()
-        )
-        if (
-            cached != set(spec.paths)
-            or unstaged
-            or _working_paths(spec.repo_root) != set(spec.paths)
-        ):
-            raise FastChangeError(
-                "Git staging contains undeclared or unstaged edit paths"
+            unstaged = set(
+                _git(spec.repo_root, "diff", "--name-only").splitlines()
             )
-        phase = "commit"
-        _git(
-            spec.repo_root,
-            "commit",
-            "-m",
-            spec.commit_message,
-            failure="commit failed",
-        )
-        committed = True
-        commit = _git(spec.repo_root, "rev-parse", "HEAD").splitlines()[0]
-        return {
-            "status": "committed",
-            "branch": spec.release_branch,
-            "commit": commit,
-            "skills": list(spec.selected_skills),
-        }
-    except (FastChangeError, OSError, subprocess.SubprocessError) as exc:
-        if not _release_lock_module().local_commands_stopped():
-            # Reversing files while an interrupted launcher may still have a
-            # writer alive can race that writer. Preserve the request and flag.
-            raise FastChangeError(json.dumps({
-                "phase": phase, "reason": getattr(exc, "command_failure", str(exc)),
-                "compensation": ["not_attempted_while_commands_may_be_running"],
-            }, separators=(",", ":"))) from exc
-        if committed:
+            if (
+                cached != set(spec.paths)
+                or unstaged
+                or _working_paths(spec.repo_root) != set(spec.paths)
+            ):
+                raise FastChangeError(
+                    "Git staging contains undeclared or unstaged edit paths"
+                )
+            phase = "commit"
+            _git(
+                spec.repo_root,
+                "commit",
+                "-m",
+                spec.commit_message,
+                failure="commit failed",
+            )
+            committed = True
+            commit = _git(spec.repo_root, "rev-parse", "HEAD").splitlines()[0]
+            return {
+                "status": "committed",
+                "branch": spec.release_branch,
+                "commit": commit,
+                "skills": list(spec.selected_skills),
+            }
+        except (FastChangeError, OSError, subprocess.SubprocessError) as exc:
+            if not _release_lock_module().local_commands_stopped():
+                # Reversing files while an interrupted launcher may still have a
+                # writer alive can race that writer. Preserve the request and flag.
+                raise FastChangeError(json.dumps({
+                    "phase": phase, "reason": getattr(exc, "command_failure", str(exc)),
+                    "compensation": ["not_attempted_while_commands_may_be_running"],
+                }, separators=(",", ":"))) from exc
+            if committed:
+                raise FastChangeError(
+                    json.dumps(
+                        {
+                            "phase": "post_commit",
+                            "reason": str(exc),
+                            "compensation": ["not_attempted_after_commit"],
+                        },
+                        separators=(",", ":"),
+                    )
+                ) from exc
+            runtime_activated = runtime_activated or bool(
+                getattr(exc, "runtime_activated", False)
+            )
+            compensation: list[str] = []
+            if patch_applied:
+                try:
+                    _reverse_patch(spec, staged=staged)
+                    compensation.append("source_restored")
+                except (FastChangeError, OSError, subprocess.SubprocessError):
+                    compensation.append("source_restore_failed")
+            if runtime_activated and "source_restored" in compensation:
+                try:
+                    _run_installer(spec)
+                    compensation.append("runtime_restored")
+                except (FastChangeError, OSError, subprocess.SubprocessError):
+                    compensation.append("runtime_restore_failed")
             raise FastChangeError(
                 json.dumps(
                     {
-                        "phase": "post_commit",
+                        "phase": phase,
                         "reason": str(exc),
-                        "compensation": ["not_attempted_after_commit"],
+                        "compensation": compensation,
                     },
                     separators=(",", ":"),
                 )
             ) from exc
-        runtime_activated = runtime_activated or bool(
-            getattr(exc, "runtime_activated", False)
-        )
-        compensation: list[str] = []
-        if patch_applied:
-            try:
-                _reverse_patch(spec, staged=staged)
-                compensation.append("source_restored")
-            except (FastChangeError, OSError, subprocess.SubprocessError):
-                compensation.append("source_restore_failed")
-        if runtime_activated and "source_restored" in compensation:
-            try:
-                _run_installer(spec)
-                compensation.append("runtime_restored")
-            except (FastChangeError, OSError, subprocess.SubprocessError):
-                compensation.append("runtime_restore_failed")
-        raise FastChangeError(
-            json.dumps(
-                {
-                    "phase": phase,
-                    "reason": str(exc),
-                    "compensation": compensation,
-                },
-                separators=(",", ":"),
-            )
-        ) from exc
+
+
 
 
 def build_parser() -> argparse.ArgumentParser:

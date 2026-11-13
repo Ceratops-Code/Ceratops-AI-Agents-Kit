@@ -183,12 +183,6 @@ def _plain(path: pathlib.Path) -> None:
         raise PendingScopeError("Candidate scope must be one regular file.")
 
 
-def _write_scope(path: pathlib.Path, scope: dict[str, Any]) -> None:
-    _plain(path)
-    _plain(path.with_suffix(".tmp"))
-    _cleanup["_write_scope"](path, scope)
-
-
 def write_scope(path: pathlib.Path, scope: dict[str, Any]) -> None:
     """Write the selected source cleanup scope under the existing release lock."""
     # Every manager scope path is <common>/codex/repository-lifecycle/promotions/file.
@@ -197,7 +191,8 @@ def write_scope(path: pathlib.Path, scope: dict[str, Any]) -> None:
         raise PendingScopeError("Candidate scope changed its owner.")
     _plain(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    _write_scope(path, scope)
+    _plain(path.with_suffix(".tmp"))
+    _cleanup["_write_scope"](path, scope)
 
 
 def discard_check_references(repo_root: pathlib.Path, branch: str) -> dict[str, Any]:

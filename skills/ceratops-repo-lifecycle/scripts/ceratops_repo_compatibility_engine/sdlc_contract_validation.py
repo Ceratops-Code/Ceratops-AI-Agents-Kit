@@ -48,7 +48,7 @@ ACTION_CATEGORIES = {
 RESULT_SCHEMAS = {
     "pre-build-checks": ("ceratops-repository-stage-result.v1",),
     "post-build-checks": ("ceratops-repository-stage-result.v1",),
-    "build": ("ceratops-build-result.v1", "ceratops-build-result.v2", "ceratops-build-result.v3"),
+    "build": ("ceratops-builder-output", "ceratops-build-result.v4"),
     "install": ("ceratops-deployment-result.v1",),
 }
 

@@ -9,6 +9,7 @@ import runpy
 import subprocess
 import sys
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 
@@ -109,6 +110,9 @@ def test_promote_repository_runs_explicit_operation_ids_in_order(
     assert run_git(repo, "add", ".").returncode == 0
     assert run_git(repo, "commit", "-m", "add ordered operations").returncode == 0
 
+    assert run_git(repo, "switch", "main").returncode == 0
+    task = tmp_path / "task"
+    assert run_git(repo, "worktree", "add", str(task), "approved").returncode == 0
     task_temp = repo.parent / "tmp" / repo.name / "promotion-results"
     task_temp.mkdir(parents=True)
     result_file = task_temp / "promotion-result.json"
@@ -166,7 +170,7 @@ def test_promote_repository_runs_explicit_operation_ids_in_order(
             "--result-file",
             str(result_file),
             "--repo-root",
-            str(repo),
+            str(task),
             "--source-branch",
             "approved",
             "--run-operation",
@@ -184,7 +188,7 @@ def test_promote_repository_runs_explicit_operation_ids_in_order(
     if validation_mode == "invalid-selection":
         assert promoted.returncode == 1
         failure = json.loads(promoted.stderr)
-        assert failure["phase"] == "promotion_validation"
+        assert failure["phase"] == "promotion_checks"
         assert "deliverables.apps.missing.actions.install" in failure["message"]
         assert not log.exists()
         return
@@ -194,7 +198,7 @@ def test_promote_repository_runs_explicit_operation_ids_in_order(
     assert summary["status"] == result["status"]
     assert summary["result_file"] == str(result_file)
     assert summary["result_sha256"] == hashlib.sha256(result_file.read_bytes()).hexdigest()
-    assert set(result["timings_seconds"]) == {"validation", "deployment", "total"}
+    assert set(result["timings_seconds"]) == {"checks-and-builds", "deployment", "total"}
     assert all(
         0 <= value <= result["timings_seconds"]["total"]
         for value in result["timings_seconds"].values()
@@ -584,6 +588,9 @@ def test_release_preparation_failure_restores_original_checkout_and_refs(
     repo, approved_head, _log, _environment = prepare_repository_lifecycle_repo(
         tmp_path
     )
+    assert run_git(repo, "switch", "main").returncode == 0
+    task = tmp_path / "task"
+    assert run_git(repo, "worktree", "add", str(task), "approved").returncode == 0
     original_main = run_git(repo, "rev-parse", "main").stdout.strip()
     remote = run_git(repo, "remote", "get-url", "origin").stdout.strip()
     writer = tmp_path / "remote-writer"
@@ -617,7 +624,7 @@ def test_release_preparation_failure_restores_original_checkout_and_refs(
     args = loaded["build_parser"]().parse_args(
         [
             "--repo-root",
-            str(repo),
+            str(task),
             "--source-branch",
             "approved",
             "--no-run-operation",
@@ -630,8 +637,9 @@ def test_release_preparation_failure_restores_original_checkout_and_refs(
         finally:
             loaded["git_branches"]._clean = original_clean
 
-    assert run_git(repo, "branch", "--show-current").stdout.strip() == "approved"
-    assert run_git(repo, "rev-parse", "HEAD").stdout.strip() == approved_head
+    assert run_git(repo, "branch", "--show-current").stdout.strip() == "main"
+    assert run_git(repo, "rev-parse", "HEAD").stdout.strip() == original_main
+    assert run_git(task, "rev-parse", "HEAD").stdout.strip() == approved_head
     assert run_git(repo, "rev-parse", "main").stdout.strip() == original_main
     assert (
         run_git(repo, "show-ref", "--verify", "refs/heads/release/local").returncode
@@ -640,45 +648,23 @@ def test_release_preparation_failure_restores_original_checkout_and_refs(
     assert run_git(repo, "status", "--porcelain").stdout == ""
 
 
-def test_validation_failure_restores_original_checkout_and_refs(
-    tmp_path: pathlib.Path,
-) -> None:
-    repo, approved_head, _log, _environment = prepare_repository_lifecycle_repo(
-        tmp_path
-    )
+def test_failed_checks_leave_release_unchanged(tmp_path: pathlib.Path) -> None:
+    repo, approved_head, _, _ = prepare_repository_lifecycle_repo(tmp_path)
     original_main = run_git(repo, "rev-parse", "main").stdout.strip()
+    assert run_git(repo, "switch", "main").returncode == 0
+    task = tmp_path / "task"
+    assert run_git(repo, "worktree", "add", str(task), "approved").returncode == 0
     loaded = runpy.run_path(str(PROMOTE_REPOSITORY))
     promote = loaded["promote"]
-    original_run_command_for_json = promote.__globals__["run_command_for_json"]
-
-    def fail_validation(
-        command: list[str], cwd: pathlib.Path
-    ) -> tuple[int, dict[str, Any]]:
-        if pathlib.Path(command[1]) == MANAGE_PENDING_WORK:
-            return original_run_command_for_json(command, cwd)
-        return 1, {"status": "validation_failed", "message": "forced failure"}
-
-    promote.__globals__["run_command_for_json"] = fail_validation
-    args = loaded["build_parser"]().parse_args(
-        [
-            "--repo-root",
-            str(repo),
-            "--source-branch",
-            "approved",
-            "--no-run-operation",
-        ]
-    )
-
+    promote.__globals__["execute_build"] = Mock(return_value={
+        "status": "validation_failed", "message": "forced failure"})
+    args = loaded["build_parser"]().parse_args([
+        "--repo-root", str(task), "--source-branch", "approved", "--no-run-operation"])
     with pytest.raises(loaded["PromotionError"], match="forced failure"):
         promote(args)
-
-    assert run_git(repo, "branch", "--show-current").stdout.strip() == "approved"
-    assert run_git(repo, "rev-parse", "HEAD").stdout.strip() == approved_head
-    assert run_git(repo, "rev-parse", "main").stdout.strip() == original_main
-    assert (
-        run_git(repo, "show-ref", "--verify", "refs/heads/release/local").returncode
-        != 0
-    )
+    assert run_git(repo, "branch", "--show-current").stdout.strip() == "release/local"
+    assert run_git(repo, "rev-parse", "release/local").stdout.strip() == original_main
+    assert run_git(task, "rev-parse", "HEAD").stdout.strip() == approved_head
     assert run_git(repo, "status", "--porcelain").stdout == ""
 
 
@@ -751,145 +737,6 @@ def test_promote_repository_rejects_noncanonical_release_branch_before_mutation(
     )
     assert run_git(repo, "branch", "--show-current").stdout.strip() == "approved"
     assert run_git(repo, "branch", "--list", "release/task").stdout == ""
-    conflict_root = tmp_path / "automatic-rebase-conflict"
-    (
-        conflict_repo,
-        conflict_worktree,
-        conflict_source_head,
-        conflict_release_head,
-        conflict_environment,
-    ) = prepare_divergent_promotion_repo(conflict_root, conflict=True)
-    conflicted = subprocess.run(
-        [
-            sys.executable,
-            str(PROMOTE_REPOSITORY),
-            "--repo-root",
-            str(conflict_repo),
-            "--source-branch",
-            "approved",
-            "--no-run-operation",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-        env=conflict_environment,
-    )
-
-    assert conflicted.returncode == 1
-    conflict_message = json.loads(conflicted.stderr)["message"]
-    assert "original head" in conflict_message
-    assert "conflicting paths: README.md" in conflict_message
-    assert run_git(conflict_worktree, "rev-parse", "HEAD").stdout.strip() == (
-        conflict_source_head
-    )
-    assert run_git(conflict_worktree, "status", "--porcelain").stdout == ""
-    assert run_git(conflict_repo, "rev-parse", "release/local").stdout.strip() == (
-        conflict_release_head
-    )
-
-    published_root = tmp_path / "automatic-rebase-published"
-    (
-        published_repo,
-        published_worktree,
-        published_source_head,
-        _,
-        published_environment,
-    ) = prepare_divergent_promotion_repo(published_root, published=True)
-    published = subprocess.run(
-        [
-            sys.executable,
-            str(PROMOTE_REPOSITORY),
-            "--repo-root",
-            str(published_repo),
-            "--source-branch",
-            "approved",
-            "--no-run-operation",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-        env=published_environment,
-    )
-
-    assert published.returncode == 1
-    assert json.loads(published.stderr)["message"] == (
-        "Automatic rebase refuses published branch: approved"
-    )
-    assert run_git(published_worktree, "rev-parse", "HEAD").stdout.strip() == (
-        published_source_head
-    )
-    assert run_git(published_worktree, "status", "--porcelain").stdout == ""
-
-    assert run_git(published_repo, "merge", "--no-edit", "approved").returncode == 0
-    included_release_head = run_git(published_repo, "rev-parse", "HEAD").stdout.strip()
-    for keep_worktree in (True, False):
-        if not keep_worktree:
-            assert (
-                run_git(
-                    published_repo, "worktree", "remove", str(published_worktree)
-                ).returncode
-                == 0
-            )
-        included = subprocess.run(
-            [
-                sys.executable,
-                str(PROMOTE_REPOSITORY),
-                "--repo-root",
-                str(published_repo),
-                "--source-branch",
-                "approved",
-                "--no-run-operation",
-                "--confirm-previous-commands-stopped",
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-            env=published_environment,
-        )
-        assert included.returncode == 0, included.stderr
-        included_result = json.loads(included.stdout)
-        assert included_result["head"] == included_release_head
-        assert included_result["rebased_branches"] == []
-        assert (
-            run_git(published_repo, "rev-parse", "approved").stdout.strip()
-            == published_source_head
-        )
-        assert run_git(published_repo, "status", "--porcelain").stdout == ""
-        if keep_worktree:
-            assert run_git(published_worktree, "status", "--porcelain").stdout == ""
-
-    nonlinear_root = tmp_path / "automatic-rebase-nonlinear"
-    (
-        nonlinear_repo,
-        nonlinear_worktree,
-        nonlinear_source_head,
-        _,
-        nonlinear_environment,
-    ) = prepare_divergent_promotion_repo(nonlinear_root, nonlinear=True)
-    nonlinear = subprocess.run(
-        [
-            sys.executable,
-            str(PROMOTE_REPOSITORY),
-            "--repo-root",
-            str(nonlinear_repo),
-            "--source-branch",
-            "approved",
-            "--no-run-operation",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-        env=nonlinear_environment,
-    )
-
-    assert nonlinear.returncode == 1
-    assert json.loads(nonlinear.stderr)["message"] == (
-        "Automatic rebase requires linear source history: approved"
-    )
-    assert run_git(nonlinear_worktree, "rev-parse", "HEAD").stdout.strip() == (
-        nonlinear_source_head
-    )
-    assert run_git(nonlinear_worktree, "status", "--porcelain").stdout == ""
 
 
 def test_promote_repository_rejects_release_namespace_conflict_before_mutation(
@@ -941,6 +788,9 @@ def test_promote_preserves_structured_operation_failure_evidence(
     assert run_git(repo, "commit", "-m", "make deployment fail").returncode == 0
     target_commit = run_git(repo, "rev-parse", "HEAD").stdout.strip()
 
+    assert run_git(repo, "switch", "main").returncode == 0
+    task = tmp_path / "task"
+    assert run_git(repo, "worktree", "add", str(task), "approved").returncode == 0
     result_file = tmp_path / "promotion-result.json"
     promoted = subprocess.run(
         [
@@ -949,7 +799,7 @@ def test_promote_preserves_structured_operation_failure_evidence(
             "--result-file",
             str(result_file),
             "--repo-root",
-            str(repo),
+            str(task),
             "--source-branch",
             "approved",
             "--run-operation",
@@ -967,7 +817,7 @@ def test_promote_preserves_structured_operation_failure_evidence(
     assert summary["status"] == result["status"]
     assert summary["result_file"] == str(result_file)
     assert summary["result_sha256"] == hashlib.sha256(result_file.read_bytes()).hexdigest()
-    assert set(result["timings_seconds"]) == {"validation", "deployment", "total"}
+    assert set(result["timings_seconds"]) == {"checks-and-builds", "deployment", "total"}
     assert all(
         0 <= value <= result["timings_seconds"]["total"]
         for value in result["timings_seconds"].values()
@@ -993,7 +843,7 @@ def test_promote_preserves_structured_operation_failure_evidence(
             sys.executable,
             str(PROMOTE_REPOSITORY),
             "--repo-root",
-            str(repo),
+            str(task),
             "--finalize-result",
             "--result-file",
             str(saved),
@@ -1016,7 +866,7 @@ def test_promote_preserves_structured_operation_failure_evidence(
 
 @pytest.mark.parametrize("gate", ["validate", "tests"])
 @pytest.mark.parametrize("mutation", ["none", "dirty", "head"])
-def test_promotion_repairs_and_revalidates_the_final_commit_before_deployment(
+def test_promotion_checks_corrected_task_and_blocks_later_changes(
     tmp_path: pathlib.Path,
     mutation: str,
     gate: str,
@@ -1061,11 +911,14 @@ def test_promotion_repairs_and_revalidates_the_final_commit_before_deployment(
         assert run_git(repo, "add", ".").returncode == 0
         assert run_git(repo, "commit", "-m", "separate test gate").returncode == 0
     broken = run_git(repo, "rev-parse", "HEAD").stdout.strip()
+    assert run_git(repo, "switch", "main").returncode == 0
+    task = tmp_path / "task"
+    assert run_git(repo, "worktree", "add", str(task), "approved").returncode == 0
     command = [
         sys.executable,
         str(PROMOTE_REPOSITORY),
         "--repo-root",
-        str(repo),
+        str(task),
         "--source-branch",
         "approved",
         "--run-operation",
@@ -1077,42 +930,34 @@ def test_promotion_repairs_and_revalidates_the_final_commit_before_deployment(
     evidence = json.loads(failed.stderr)
     assert failed.returncode == 1
     assert evidence["status"] == "validation_failed"
-    assert evidence["phase"] == "promotion_validation"
+    assert evidence["phase"] == "promotion_checks"
     assert evidence["commit"] == broken
-    assert pathlib.Path(evidence["pending_work_scope"]).is_file()
+    assert "pending_work_scope" not in evidence
+    assert run_git(repo, "rev-parse", "release/local").stdout.strip() == run_git(repo, "rev-parse", "main").stdout.strip()
     assert not deployment_log.exists()
-    command.append("--confirm-previous-commands-stopped")
-
-    assert run_git(repo, "switch", "approved").returncode == 0
-    (repo / "quality.txt").write_text("good", encoding="utf-8")
-    assert run_git(repo, "add", "quality.txt").returncode == 0
-    assert run_git(repo, "commit", "-m", "repair").returncode == 0
-    repaired = run_git(repo, "rev-parse", "HEAD").stdout.strip()
+    (task / "quality.txt").write_text("good", encoding="utf-8")
+    assert run_git(task, "add", "quality.txt").returncode == 0
+    assert run_git(task, "commit", "-m", "repair").returncode == 0
+    repaired = run_git(task, "rev-parse", "HEAD").stdout.strip()
     if mutation != "none":
         promotion = runpy.run_path(str(PROMOTE_REPOSITORY))
-        original_run_command_for_json = promotion["run_command_for_json"]
+        original_execute_build = promotion["execute_build"]
 
-        def change_after_validation(
-            argv: list[str],
-            cwd: pathlib.Path,
-        ) -> tuple[int, dict[str, Any]]:
-            code, result = original_run_command_for_json(argv, cwd)
-            if "--test-trigger" in argv and code == 0:
-                (repo / "quality.txt").write_text("changed", encoding="utf-8")
+        def change_after_checks(*args, **kwargs):
+            result = original_execute_build(*args, **kwargs)
+            if result["status"] == "completed":
+                (task / "quality.txt").write_text("changed", encoding="utf-8")
                 if mutation == "head":
-                    assert run_git(repo, "add", "quality.txt").returncode == 0
-                    assert (
-                        run_git(repo, "commit", "-m", "concurrent change").returncode
-                        == 0
-                    )
-            return code, result
+                    assert run_git(task, "add", "quality.txt").returncode == 0
+                    assert run_git(task, "commit", "-m", "concurrent change").returncode == 0
+            return result
 
-        promotion["promote"].__globals__["run_command_for_json"] = change_after_validation
+        promotion["promote"].__globals__["execute_build"] = change_after_checks
         args = promotion["build_parser"]().parse_args(command[2:])
         with pytest.raises(promotion["PromotionError"]) as caught:
             promotion["promote"](args)
-        assert caught.value.payload["phase"] == "deployment"
-        assert caught.value.payload["status"] == "error"
+        assert caught.value.payload["phase"] == "promotion_checks"
+        assert caught.value.payload["status"] == "state_changed"
         assert ("HEAD changed" if mutation == "head" else "clean") in str(caught.value)
         assert checks.read_text().splitlines() == [broken, repaired]
         assert not deployment_log.exists()
@@ -1138,7 +983,7 @@ def test_promotion_repairs_and_revalidates_the_final_commit_before_deployment(
         "unfetched-unrelated",
     ],
 )
-def test_automatic_rebase_checks_live_publication_of_the_task_range(
+def test_task_merge_preserves_published_and_unpublished_commits(
     tmp_path: pathlib.Path,
     publication: str,
 ) -> None:
@@ -1218,7 +1063,7 @@ def test_automatic_rebase_checks_live_publication_of_the_task_range(
             sys.executable,
             str(PROMOTE_REPOSITORY),
             "--repo-root",
-            str(repo),
+            str(source),
             "--source-branch",
             "approved",
             "--no-run-operation",
@@ -1228,21 +1073,11 @@ def test_automatic_rebase_checks_live_publication_of_the_task_range(
         text=True,
         check=False,
     )
-    if publication in {"inherited", "stale-tracking", "unfetched-unrelated"}:
-        assert result.returncode == 0, result.stderr
-        new_head = json.loads(result.stdout)["head"]
-        assert new_head != head
-        assert (
-            run_git(
-                repo, "rev-list", "--count", f"{release}..{new_head}"
-            ).stdout.strip()
-            == "2"
-        )
-    else:
-        assert result.returncode != 0
-        assert "published" in result.stderr or "remote publication" in result.stderr
-        assert run_git(repo, "rev-parse", "release/local").stdout.strip() == release
-        assert run_git(source, "rev-parse", "HEAD").stdout.strip() == head
+    assert result.returncode == 0, result.stderr
+    new_head = json.loads(result.stdout)["head"]
+    assert new_head != head
+    for ancestor in (release, head):
+        assert run_git(source, "merge-base", "--is-ancestor", ancestor, new_head).returncode == 0
     assert run_git(source, "status", "--porcelain").stdout == ""
     assert run_git(repo, "rev-parse", "preserve-sibling").stdout.strip() == old_head
     if publication == "unfetched-unrelated":
@@ -1250,7 +1085,7 @@ def test_automatic_rebase_checks_live_publication_of_the_task_range(
 
 
 @pytest.mark.parametrize("conflict", [False, True])
-def test_automatic_rebase_preserves_main_merges_outside_task_changes(
+def test_task_merge_preserves_main_merges_and_reports_conflicts(
     tmp_path: pathlib.Path,
     conflict: bool,
 ) -> None:
@@ -1284,7 +1119,7 @@ def test_automatic_rebase_preserves_main_merges_outside_task_changes(
             sys.executable,
             str(PROMOTE_REPOSITORY),
             "--repo-root",
-            str(repo),
+            str(source),
             "--source-branch",
             "approved",
             "--no-run-operation",
@@ -1295,26 +1130,13 @@ def test_automatic_rebase_preserves_main_merges_outside_task_changes(
         check=False,
     )
     if conflict:
-        assert result.returncode != 0 and "shared task history" in result.stderr
+        assert result.returncode != 0 and "merge_conflict" in result.stderr
         assert run_git(source, "rev-parse", "HEAD").stdout.strip() == old_head
         assert run_git(repo, "rev-parse", "HEAD").stdout.strip() == release
     else:
         assert result.returncode == 0, result.stderr
-        evidence = json.loads(result.stdout)["rebased_branches"][0]
-        assert evidence["shared_base"] == shared
-        assert evidence["release_head"] == release
-        target = evidence["onto"]
-        assert run_git(
-            repo, "show", "-s", "--format=%P", target
-        ).stdout.strip().split() == [release, shared]
-        assert (
-            run_git(repo, "rev-list", "--count", f"{target}..approved").stdout.strip()
-            == "2"
-        )
-        assert (
-            run_git(repo, "rev-list", "--merges", f"{target}..approved").stdout.strip()
-            == ""
-        )
+        target = json.loads(result.stdout)["head"]
+        assert run_git(source, "merge-base", "--is-ancestor", old_head, target).returncode == 0
         for parent in (shared, release):
             assert (
                 run_git(
@@ -1327,74 +1149,79 @@ def test_automatic_rebase_preserves_main_merges_outside_task_changes(
     assert run_git(source, "status", "--porcelain").stdout == ""
 
 
-@pytest.mark.parametrize(
-    "query",
-    [
-        "ambiguous-base",
-        "history-failure",
-        "ancestry-failure",
-        "post-rebase-failure",
-        "post-head-failure",
-    ],
-)
-def test_automatic_rebase_refuses_uncertain_git_evidence(
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
-    query: str,
-) -> None:
-    repo, source, head, release, _ = prepare_divergent_promotion_repo(tmp_path / "case")
-    monkeypatch.syspath_prepend(str(PROMOTE_REPOSITORY.parent))
-    loaded = runpy.run_path(str(PROMOTE_REPOSITORY))
-    run = loaded["run_command"]
-    rebased = False
-
-    def probe(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        nonlocal rebased
-        if "rebase" in argv and "--onto" in argv:
-            rebased = True
-        if query == "ambiguous-base" and "--all" in argv and "merge-base" in argv:
-            return subprocess.CompletedProcess(argv, 0, f"{head}\n{release}\n", "")
-        if (
-            (query == "history-failure" and "rev-list" in argv)
-            or (query == "ancestry-failure" and "--is-ancestor" in argv)
-            or (
-                query == "post-rebase-failure"
-                and rebased
-                and "diff" in argv
-                and "--check" in argv
-            )
-        ):
-            return subprocess.CompletedProcess(
-                argv, 128, "", "injected Git query failure"
-            )
-        return run(argv, **kwargs)
-
-    original_head = loaded["git_branches"]._branch_head
-    failed_head_query = False
-
-    def branch_head(*args: Any) -> str:
-        nonlocal failed_head_query
-        if query == "post-head-failure" and rebased and not failed_head_query:
-            failed_head_query = True
-            raise loaded["PromotionError"]("post-rebase head query failed")
-        return original_head(*args)
-
-    monkeypatch.setitem(
-        vars(loaded["git_branches"]),
-        "_branch_head",
-        branch_head,
+@pytest.mark.parametrize("case", ["success", "failure", "outside-writer", "interrupted-checkout"])
+def test_checks_finish_before_release_moves(tmp_path, case):
+    fails = case == "failure"
+    repo, task, submitted, release_head, _ = prepare_divergent_promotion_repo(tmp_path / "checked")
+    log = tmp_path / "checks.log"
+    code = (
+        "import json,os,pathlib,subprocess,sys\n"
+        "context=json.loads(os.environ['CERATOPS_SDLC_TEST_CONTEXT'])\n"
+        "assert context['trigger']=='promotion'\n"
+        "assert context['branch']==subprocess.check_output(['git','branch','--show-current'],text=True).strip()\n"
+        "assert context['commit']==subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()\n"
+        "root=pathlib.Path(sys.argv[1]); p=pathlib.Path(sys.argv[3])\n"
+        "head=subprocess.check_output(['git','-C',str(root),'rev-parse','release/local'],text=True).strip()\n"
+        "if sys.argv[5]=='outside-writer' and p.exists():\n"
+        "    assert subprocess.check_output(['git','-C',str(root),'log','-1','--format=%s'],text=True).strip()=='external writer'\n"
+        "else:\n"
+        "    assert head==sys.argv[2], 'release moved before checks'\n"
+        "if sys.argv[5]=='outside-writer' and not p.exists():\n"
+        "    (root/'external.md').write_text('external source change')\n"
+        "    subprocess.run(['git','-C',str(root),'add','external.md'],check=True)\n"
+        "    subprocess.run(['git','-C',str(root),'commit','-m','external writer'],check=True,capture_output=True)\n"
+        "p.write_text((p.read_text() if p.exists() else '')+'x')\n"
+        "sys.exit(int(sys.argv[4]))"
     )
-    monkeypatch.setitem(
-        vars(loaded["git_branches"]), "run_command", probe
-    )
-    with pytest.raises(loaded["PromotionError"]):
-        loaded["_prepare_source_for_fast_forward"](
-            repo,
-            release,
-            "approved",
-            loaded["SourceState"](head, source),
-            run_git(repo, "rev-parse", "main").stdout.strip(),
-        )
-    assert rebased == (query in {"post-rebase-failure", "post-head-failure"})
-    assert run_git(source, "rev-parse", "HEAD").stdout.strip() == head
-    assert run_git(source, "status", "--porcelain").stdout == ""
+    path = task / "sdlc/sdlc.yml"
+    contract = {
+        "version": 5, "kind": "ceratops-sdlc",
+        "repository": {"tools": {}, "actions": {"pre-build-checks": {"check-groups": {"release-still-unchanged": {
+            "requires": {"tools": []},
+            "check-results": {"result-owner": "operation", "product-inputs": ["*.md"],
+                              "check-inputs": ["sdlc/sdlc.yml"]},
+            "steps": [{"run": [sys.executable, "-c", code, str(repo), release_head, str(log), str(int(fails)), case]}],
+        }}}}}, "deliverables": {"apps": {"sample": {
+            "root-dir": ".", "manifest": "README.md", "build-after": [],
+            "actions": {"pre-build-checks": {"check-groups": {"source": {
+                "requires": {"tools": []}, "no-op": "The repository check covers these sources."
+            }}}, "install": {"requires": {"tools": []}, "no-op": "No installation in this check fixture."}}
+        }}},
+    }
+    path.write_text(json.dumps(contract))
+    assert run_git(task, "add", "sdlc/sdlc.yml").returncode == 0
+    assert run_git(task, "commit", "-m", "checks must precede release movement").returncode == 0
+    selected = run_git(task, "rev-parse", "HEAD").stdout.strip()
+    module = runpy.run_path(str(PROMOTE_REPOSITORY))
+    args = module["build_parser"]().parse_args([
+        "--repo-root", str(task), "--source-branch", "approved", "--no-run-operation"])
+    if fails:
+        with pytest.raises(module["PromotionError"]):
+            module["promote"](args)
+        assert run_git(repo, "rev-parse", "release/local").stdout.strip() == release_head
+        assert log.read_text() == "x"
+        return
+
+    result = module["promote"](args)
+    assert result["status"] == "ready", result
+    head = run_git(repo, "rev-parse", "release/local").stdout.strip()
+    assert head == run_git(task, "rev-parse", "HEAD").stdout.strip()
+    assert result["submitted_commits"] == {"approved": selected}
+    assert result["tested_commit"] == result["accepted_commit"] == head
+    for ancestor in (submitted, selected, release_head):
+        assert run_git(task, "merge-base", "--is-ancestor", ancestor, head).returncode == 0
+    if case == "interrupted-checkout":
+        (task / "extra.txt").write_text("next source file")
+        assert run_git(task, "add", "extra.txt").returncode == 0
+        assert run_git(task, "commit", "-m", "source unrelated to the named check").returncode == 0
+        next_head = run_git(task, "rev-parse", "HEAD").stdout.strip()
+        assert run_git(repo, "update-ref", "-m", "ceratops: accepted fast-forward",
+                       "refs/heads/release/local", next_head, head).returncode == 0
+        assert not (repo / "extra.txt").exists()
+        head = next_head
+    again = module["promote"](args)
+    assert again["status"] == "ready" and again["head"] == head
+    assert log.read_text() == ("xx" if case == "outside-writer" else "x")
+    assert run_git(repo, "status", "--porcelain").stdout == ""
+    if case == "interrupted-checkout":
+        assert (repo / "extra.txt").read_text() == "next source file"

@@ -2,13 +2,12 @@
 
 ## Goal
 
-Fast-forward selected committed task branches into local `release/local` and
-apply the lifecycle helper's promotion gate to the assembled commit. If
-`refs/heads/release` occupies that branch namespace, stop and report the
-repository as incompatible; never substitute another promotion branch. For
-`promote-and-deploy`, run selected `deploy-local` entries in order. Composed
-shipping validates again at its own boundary and owns selected post-merge
-publication, deployment and repository-wide shipped-task cleanup.
+Merge the selected task commits with current `release/local` in the promoting
+chat's task worktree. Run the required SDLC checks and builds there, then advance
+release to that accepted commit. Reject `refs/heads/release` occupying the branch
+namespace. For `promote-and-deploy`, install the accepted files through the
+requested `deploy-local` actions after release advances. Composed shipping owns
+its remote checks, publication, deployment and shipped-task cleanup.
 
 ## Context
 
@@ -19,16 +18,18 @@ publication, deployment and repository-wide shipped-task cleanup.
   `<skill-root>/scripts/promote-repository.py` once before the first call.
   Invoke that exact path with the working directory equal to its `--repo-root`
   value; stop if it is absent and never resolve it relative to that repository.
-  A linked-worktree `--repo-root` is routed automatically to the primary
-  checkout, including an absolute repo-owned `--sdlc-contract` path.
+  Pass the promoting chat's selected task worktree as `--repo-root`.
+  The helper merges and checks there; only its guarded release update and
+  installation use the primary checkout. Repo-owned contract paths follow
+  the checkout where that phase runs.
 - (D) Promotion helper:
   `python
-  "<skill-root>/scripts/promote-repository.py" --repo-root PATH
+  "<skill-root>/scripts/promote-repository.py" --repo-root TASK_WORKTREE
   --source-branch BRANCH [--source-branch BRANCH...] --main-branch main
   --release-branch release/local --remote-name origin --no-run-operation`.
 - (D) Promotion plus deployment:
   `python
-  "<skill-root>/scripts/promote-repository.py" --repo-root PATH
+  "<skill-root>/scripts/promote-repository.py" --repo-root TASK_WORKTREE
   --source-branch BRANCH [--source-branch BRANCH...] --main-branch main
   --release-branch release/local --remote-name origin
   --run-operation ID [--run-operation ID...]
@@ -58,7 +59,7 @@ result. Owner information never permits recovery or bypasses the unfinished flag
 The current helper calls `github_pr_workflow.ship_repository.ship_repository()`
 directly for composed shipping, passing `ShipOptions` and the repository path.
 The standalone Ship CLI uses that same implementation. External pending-work
-and operation-runner commands use `command.py::run_command_for_json()`, which
+commands use `command.py::run_command_for_json()`, which
 always launches a program; no filename selects a different calling mechanism.
 The outer release lock covers the automatic attempt, including composed Ship's
 CI wait. Once local commands are known to have stopped, it unlocks before a
@@ -68,28 +69,28 @@ and the existing explicit recovery requirement. Clearing it neither accepts
 failed work nor deletes checkpoints. Complete report forwarding is implemented;
 receipt-driven remote work remains a later step.
 
-Declared builds and install prerequisites run through
-`repository_operation.execute_release_builds()`. It expands the requested SDLC
-actions' dependencies, runs source checks, builds dependencies before consumers,
-and runs output tests against the exact new or reused files before delivery.
-The same callable serves direct release builds and Ship's local build phase.
-It acquires the release lock before preparing commands; a promotion caller keeps
-its already-held lock. Required promotion source checks remain in place, and
-applicable successful results pass into the existing reuse code. Failed builds
-block dependent installation while preserving completed promotion and outputs.
+The public `promote()` owns the complete locked attempt.
+`execute_worktree_build.execute_build()` prepares declared work, expands required
+builds, and uses `run_build_operations.execute_sdlc_operations()` to run checks
+and builders in dependency order. Applicable accepted packages and passing
+results are reused. A failure before the guarded release update leaves release
+unchanged. Direct Build and Ship use that same Build implementation.
 
-Installation runs after promotion has completed, outside the code that can
-restore the previous release commit. Plain Promote finishes local cleanup and
-unlocks. Promote-and-deploy retains the lock while today's installer reads the
-already selected commit; it does not select a newer one. Installation failure
-reports the completed promotion and original cause without undoing promotion
-or retrying installation. Composed Ship keeps the outer lock through its own
-installation and cleanup. Standalone skill/MCP installation protects a release
-source too, never a task worktree. Installers take their destination locks only
-after release protection, and never invoke Promote/Ship inside them. Explicit
-Python action declarations call the same installer used by its CLI, sharing
-outer ownership without filename-based dispatch. Artifact-only installation
-and earlier release unlock remain steps 17–19/22/27B.
+After success, `fast_forward_branch(expected_old_commit=...)` advances release
+only from the commit read before integration. If another writer changed release,
+the helper incorporates that commit in the task worktree and checks the affected
+work before another update. It never rolls release back over another writer.
+Original task commits remain intact; no automatic rebase is performed.
+
+`_deploy_completed_promotion()` receives the accepted files, receipts and prepared
+installation operations. It runs those installation operations only. A failed
+installation retains completed promotion and reports its original cause.
+Promote-and-deploy retains the release lock while current installers read that
+checkout. Artifact-only installer conversion and earlier unlock remain separate.
+Composed Ship keeps the outer lock through its installation and cleanup.
+Installers acquire destination protection after release protection and never
+invoke Promote or Ship inside it. Explicit Python action declarations call the
+same installer as its CLI.
 
 Each task worktree belongs to one thread; ordinary editing, checks and builds
 take no worktree or checkpoint lock. Shared request storage now removes only
@@ -172,26 +173,26 @@ abandonment/replacement and worktree removal rather than matching-work success.
   repository-wide cleanup through its cleanup helper's eligibility gates.
 - Supply the promotion trigger, tested release branch, and exact assembled
   commit to the SDLC test phase; leave test selection to the repository runner.
-- Before promotion, identify the selected task's unique linear commit range
-  beyond main and release. Check live remote branch and commit publication
-  before rewriting it. Preserve shared main and release history; abort a failed
-  rebase and verify restoration of the original clean source state. Apply the
-  parent's local repair/retry rule to ordinary check failures.
+- Use the promoting chat's task worktree for all submitted commits and the
+  current release commit. Preserve those commits through normal merges.
+  Conflicts return their filenames after aborting only the helper's unfinished
+  merge. Corrections run in the owning task; the next normal call reads current
+  Git state and reuses applicable results.
 
 ### Workflow
 
-1. Require clean selected worktrees. Through the promotion helper, reject an
-   existing `refs/heads/release`, establish Git ancestry with the eligible
-   automatic rebase, run `git diff --check`, and pass
-   `--release-branch release/local` to execution and result finalization.
+1. Require clean selected worktrees and pass the promoting task's path.
+   The helper merges submitted commits and current release, runs required
+   checks/builds, then advances `release/local` to the accepted commit.
 2. For `promote`, run the helper with `--no-run-operation`.
 3. For `promote-and-deploy`, repeat `--run-operation LOCATION` in order.
    Repeat `--parameter name=value` for required operation inputs; it is invalid
    without `--run-operation`.
    The helper accepts only `deliverables.<kind>.<name>.actions.install`,
-   prepares the entire selection before commands, applies its promotion gate,
-   and executes the prepared operations only while the checked
-   commit stays clean and unchanged. Explicit missing locations are errors;
+   prepares the requested work, completes its checks/builds in the task worktree,
+   and installs only after the guarded release update. Installation uses the
+   accepted commit and exact returned artifacts.
+   Explicit missing locations are errors;
    v4/v5 tests require declared commands, handoffs, or reasoned no-ops.
 4. For composed shipping, use `--ship-after-promotion`, one optional
    `--sdlc-contract PATH`, and repeated `--publish-operation LOCATION` or
@@ -220,28 +221,19 @@ abandonment/replacement and worktree removal rather than matching-work success.
    it leaves a worktree and branch untouched when the worktree's parent chain
    has no `worktrees` directory component and reports the exact preserved path.
 
-The helper reuses an existing release batch without fetching the remote,
-updating main or checking it out. When the release branch is absent, it refreshes
-the remote, fast-forwards main and creates the release branch from it. Existing
-local main history remains available for task-only rebase comparisons. It checks
-live remote heads and tags for the branch and any task commit that would be
-rewritten; an inherited upstream alone is not publication.
-The unique task boundary excludes history shared with main or release. If that
-boundary contains main history absent from release, Git merges the shared bases
-without changing either worktree before rebasing only task commits. Ambiguous
-ancestry, task merge commits, conflicts, and failed Git queries
-block. A failed attempt must restore the original branch head and
-clean worktree before it reports the failure and conflicting paths. The helper
-then runs `git diff --check`, fast-forwards each selected branch, records the
-scope, and applies its promotion gate. A failed check returns its YAML location,
-checked commit and bounded diagnostics while preserving the scope for repair.
-In composed mode, shipping repeats validation before remote mutation; successful
-promotion checks never suppress that boundary. Check results cannot authorize a
-different or dirty commit. Deployment and publication commands come only from
-the repository's declared entries, not from helper-selected script names.
-Preparation-only requires a clean `main` checkout and exits immediately after
-the selected local promotion branch is ready, before source preflight,
-promotion, scope records, or deployment.
+The helper uses an existing release batch without fetching or updating main.
+If release is absent, it fetches current remote main, advances main through the
+same expected-old-commit guard and creates release. Setup repair undoes only
+changes made by that setup while their refs still have the values it wrote.
+`--prepare-release-only` requires clean main and stops after this baseline setup.
+
+Every submitted branch is merged into the task worktree before checks start.
+The returned result distinguishes submitted commits, the tested commit and the
+accepted commit. A failure returns its operation, cause and promoting worktree;
+an isolated branch failure can be assigned to that branch's owner only when
+evidence identifies that branch. Combined failures and merge conflicts remain
+with the promoting chat. A fresh call incorporates corrections and current
+release. Installation uses repository-declared operations, never a guessed script.
 
 Use `--result-file PATH` outside the repository to atomically retain the
 JSON outcome, operation receipts and phase durations. The
@@ -304,8 +296,8 @@ artifacts, and pending-work state. Success prints `OK`; failure reports
 
 - The checkout is clean on the reported local promotion branch.
 - Every selected branch is contained in the reported release commit.
-- Every attempted automatic rebase either completed and reported both heads or
-  restored the original clean source state before blocking.
+- Original task commits remain intact. Failed checks or integration do not move
+  release; a completed release update is not undone by installation failure.
 - The final assembled commit passed applicable validation and tests before continuation;
   deployment ran during promotion only when requested. In composed mode,
   shipping repeated both gates and ran only the selected post-merge work.
@@ -319,7 +311,8 @@ artifacts, and pending-work state. Success prints `OK`; failure reports
 
 Report only:
 
-- local promotion branch, exact head, promoted branches, and automatic rebase results
+- local promotion branch, submitted commits, tested/accepted commit and
+  promoted branches
 - ordered operation outcomes and advisory handoffs when selected
 - pending-work scope
 - blockers or intentionally retained state

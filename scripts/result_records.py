@@ -571,7 +571,7 @@ def read_build_check_summary(root: pathlib.Path, tag: str, receipt_path: str) ->
     parent = f'.build/{identity["releaseBundle"]}/{identity["version"]}'
     expected_paths = {parent + "/build_receipt.json",
                       parent + "/" + identity["target"] + "/build_receipt.json"}
-    if (receipt.get("schema") != "ceratops-build-result.v3" or receipt.get("status") != "passed"
+    if (receipt.get("schema") != "ceratops-build-result.v4" or receipt.get("status") != "passed"
             or receipt.get("receiptPath") != receipt_path or receipt_path not in expected_paths
             or tag != expected_tag or receipt.get("tag", tag) != tag):
         raise ValueError("Build tag, identity and committed receipt path disagree.")
@@ -619,6 +619,8 @@ def select_build_check_summaries(
                 raise ValueError("Local build receipt exceeds its size limit.")
             try:
                 receipt = json.loads(path.read_bytes())
+                if receipt.get("schema") != "ceratops-build-result.v4":
+                    continue
                 identity = receipt["identity"]
                 name, destination, version = identity["releaseBundle"], identity["target"], identity["version"]
                 level = build_qualification(version)

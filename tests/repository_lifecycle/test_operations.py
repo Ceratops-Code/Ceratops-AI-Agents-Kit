@@ -78,17 +78,13 @@ RECEIPT = {
             },
         ),
         (
-            "ceratops-build-result.v1",
+            "ceratops-builder-output",
             None,
             {
-                "schema": "ceratops-build-result.v1",
+                "schema": "ceratops-builder-output",
                 "status": "passed",
-                "artifact": {
-                    "type": "android-apk",
-                    "path": "app/build/app.apk",
-                    "sha256": "3" * 64,
-                    "size": 1,
-                },
+                "artifacts": [{"type": "android-apk", "path": "app/build/app.apk"}],
+                "installationArtifactPath": "app/build/app.apk",
             },
         ),
         (
@@ -122,14 +118,15 @@ def test_canonical_operation_results_are_enforced(
 
 def test_canonical_operation_result_rejects_incomplete_artifact() -> None:
     payload = {
-        "schema": "ceratops-build-result.v1",
+        "schema": "ceratops-builder-output",
         "status": "passed",
-        "artifact": {"path": "app/build/app.apk"},
+        "artifacts": [{"path": "app/build/app.apk"}],
+        "installationArtifactPath": "app/build/app.apk",
     }
     with pytest.raises(results.StepResultError, match="canonical schema"):
         results.capture_step_result(
             json.dumps(payload),
-            expected_schema="ceratops-build-result.v1",
+            expected_schema="ceratops-builder-output",
         )
 
 

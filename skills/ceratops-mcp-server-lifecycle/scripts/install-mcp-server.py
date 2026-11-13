@@ -15,8 +15,13 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
+import tomllib
+
+import tomlkit
+from filelock import FileLock, Timeout
 from typing import Any, NamedTuple
 
 SKILL_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -26,7 +31,7 @@ if str(shared_scripts) not in sys.path:
     sys.path.insert(0, str(shared_scripts))
 source_locks = importlib.import_module("hold_write_lock")
 
-INSTALL_ROOT = pathlib.Path.home() / ".codex" / "mcp"
+INSTALL_ROOT = pathlib.Path(os.environ.get("CODEX_HOME", pathlib.Path.home() / ".codex")) / "mcp"
 MANAGER = (
     INSTALL_ROOT
     / "ceratops_mcp_server_manager"
@@ -62,6 +67,7 @@ class InstallOptions(NamedTuple):
     package_lock: pathlib.Path | None = None
     manager_result: pathlib.Path | None = None
     evidence_output: pathlib.Path | None = None
+    client_refresh_result: pathlib.Path | None = None
 
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -164,6 +170,71 @@ def _install(args: InstallOptions, repo_root: pathlib.Path) -> subprocess.Comple
             failure, command=command, target=repo_root,
         )
         raise failure
+    name = args.mcp_server_name
+    if name is None:
+        native = tomllib.loads((source / "pyproject.toml").read_text(encoding="utf-8"))
+        name = native.get("project", {}).get("name")
+    if not isinstance(name, str) or IDENTITY_RE.fullmatch(name) is None:
+        raise InstallCompletionError("Installation requires the exact MCP server name.")
+    config = INSTALL_ROOT.parent / "config.toml"
+    launcher = INSTALL_ROOT / name / "bin" / (name + ".py")
+    entry = {"command": getattr(sys, "_base_executable", sys.executable), "args": ["-I", "-B", str(launcher), "--mcp"], "enabled": True}
+    if not config.is_file():
+        raise InstallCompletionError(f"Codex configuration is missing: {config}; add [mcp_servers.{name}] with {entry}")
+    # All installer calls share this one profile lock and replacement path.
+    # A leftover replacement belongs to a stopped writer once this lock is held.
+    with FileLock(str(config.with_name(".mcp-config.lock")), timeout=60):
+        pending = config.with_name(".config.toml.in_process")
+        pending.unlink(missing_ok=True)
+        raw = _plain_file(config, "Codex configuration").read_bytes()
+        document = tomlkit.parse(raw.decode("utf-8"))
+        servers = document.get("mcp_servers", {})
+        if name not in servers:
+            raise InstallCompletionError(f"Codex registration is missing: [mcp_servers.{name}] in {config}; add {entry}")
+        declared = servers[name]
+        if not isinstance(declared, dict):
+            raise InstallCompletionError(f"Codex registration [mcp_servers.{name}] must be a table.")
+        configured_python = declared.get("command")
+        if (isinstance(configured_python, str) and pathlib.Path(configured_python).stem.lower() in {"python", "python3", "pythonw"}
+                and (pathlib.Path(configured_python).is_file() or shutil.which(configured_python))):
+            entry["command"] = configured_python
+        inventory_command = [sys.executable, "-I", "-B", str(MANAGER), "versions", name]
+        try:
+            inventory = source_locks.run_protected_command(
+                inventory_command, cwd=repo_root, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", check=False)
+        except OSError as exc:
+            exc.__dict__["command_failure"] = source_locks.command_failure_details(exc, command=inventory_command, target=repo_root)
+            raise
+        if inventory.returncode:
+            failure = InstallCompletionError(f"Could not read installed versions of {name}.")
+            failure.command_failure = source_locks.command_failure_details(inventory, target=repo_root)
+            raise failure
+        try:
+            versions = _json_object(inventory.stdout, "installed versions")
+            if versions.get("mcp_server_name") != name or "installed_version" not in versions:
+                raise InstallCompletionError(f"Installed-version response does not identify {name}.")
+        except InstallCompletionError as exc:
+            exc.command_failure = source_locks.command_failure_details(inventory, target=repo_root)
+            raise
+        # A first installation and an update require the same existing registration.
+        # Never infer client availability from a launcher or version directory.
+        if any(declared.get(key) != value for key, value in entry.items()):
+            for key, value in entry.items():
+                declared[key] = value
+            content = tomlkit.dumps(document).encode("utf-8")
+            if b"\r\n" in raw:
+                content = content.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+            try:
+                if config.read_bytes() != raw:
+                    raise InstallCompletionError("Codex configuration changed before its registration update.")
+                with pending.open("wb") as stream:
+                    stream.write(content)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(pending, config)
+            finally:
+                pending.unlink(missing_ok=True)
     return source_locks.run_protected_command(
         command,
         cwd=repo_root,
@@ -342,6 +413,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Completed manager result to attest without reinstalling.",
     )
     parser.add_argument("--evidence-output", type=pathlib.Path)
+    parser.add_argument("--client-refresh-result", type=pathlib.Path,
+                        help="Current Codex reload/status response; never installation evidence.")
     return parser
 
 
@@ -369,6 +442,8 @@ def install_mcp_server(args: InstallOptions) -> dict[str, Any]:
                         raise InstallCompletionError(
                             "evidence output cannot overwrite an installation input"
                         )
+                if args.client_refresh_result is not None and args.manager_result is None:
+                    raise InstallCompletionError("client-refresh-result requires manager-result; installation is not repeated.")
                 if args.manager_result is not None:
                     if any(
                         value is not None
@@ -399,7 +474,7 @@ def install_mcp_server(args: InstallOptions) -> dict[str, Any]:
                     payload = _json_object(process.stdout, "mcp-server-manager result")
                 phase = "installation_receipt"
                 mcp_server_name, transaction_id = _selected_transaction(payload)
-                receipt = {
+                receipt: dict[str, Any] = {
                     "schema": "ceratops-deployment-completion.v1",
                     "producer": "ceratops-mcp-server-lifecycle/install",
                     "status": "completed",
@@ -411,6 +486,43 @@ def install_mcp_server(args: InstallOptions) -> dict[str, Any]:
                     "transaction_id": transaction_id,
                     "cleanup_debt": list(payload.get("maintenance", {}).get("errors", [])),
                 }
+                thread = os.environ.get("CODEX_THREAD_ID")
+                refresh: dict[str, Any] = {
+                    "status": "pending", "thread_id": thread, "server_name": mcp_server_name,
+                    "manager_result": payload,
+                    "requests": [
+                        {"method": "config/mcpServer/reload", "params": {}},
+                        {"method": "mcpServerStatus/list",
+                         "params": {"threadId": thread, "serverName": mcp_server_name}},
+                    ],
+                    "message": "Installation completed. The initiating Codex client must reload and report this server's tools.",
+                }
+                phase = "completion_receipt"
+                if args.client_refresh_result is not None:
+                    try:
+                        observed = _manager_payload(args.client_refresh_result)
+                        status = observed.get("server_status", {})
+                        expected_tools = observed.get("expected_tools")
+                        if (observed.get("thread_id") == thread and thread
+                                and observed.get("reload_completed") is True
+                                and status.get("name") == mcp_server_name
+                                and status.get("serverCapabilities") is not None
+                                and isinstance(status.get("tools"), dict)
+                                and isinstance(expected_tools, list) and expected_tools
+                                and all(isinstance(name, str) and name in status["tools"] for name in expected_tools)):
+                            refresh = {"status": "completed", "thread_id": thread,
+                                       "server_name": mcp_server_name, "tools": sorted(status["tools"])}
+                        elif observed.get("deferred") is True:
+                            refresh.update(status="pending", message="Codex will apply the refresh on the next turn.")
+                        else:
+                            refresh.update(status="failed", message="Reload or the expected tools were not confirmed in the initiating thread.")
+                            if "error" in observed:
+                                refresh["diagnostics"] = source_locks.command_failure_details(
+                                    InstallCompletionError(str(observed["error"])), target=mcp_server_name)
+                    except (InstallCompletionError, OSError, ValueError, TypeError) as exc:
+                        refresh.update(status="failed", message="Client refresh response could not be read.",
+                                       diagnostics=source_locks.command_failure_details(exc, target=mcp_server_name))
+                receipt["client_refresh"] = refresh
                 if "maintenance" in payload:
                     receipt["maintenance"] = payload["maintenance"]
                 phase = "completion_receipt"
@@ -420,7 +532,7 @@ def install_mcp_server(args: InstallOptions) -> dict[str, Any]:
             finally:
                 os.chdir(entry_directory)
     except (
-        InstallCompletionError, OSError, ValueError, KeyError, TypeError,
+        InstallCompletionError, OSError, ValueError, KeyError, TypeError, Timeout,
         source_locks.WriteLockError, subprocess.SubprocessError,
     ) as exc:
         return _installation_failure(args, repo_root, exc, process, payload, phase)

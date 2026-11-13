@@ -193,70 +193,39 @@ def _preflight_release_checkout(
 
 
 def _restore_release_checkout(
-    repo_root: pathlib.Path,
-    main_branch: str,
-    release_branch: str,
-    state: ReleaseCheckoutState,
+    repo_root: pathlib.Path, main_branch: str, release_branch: str,
+    state: ReleaseCheckoutState, *, written_heads: dict[str, str],
 ) -> None:
-    """Restore every local ref changed while preparing the release checkout."""
+    """Undo only initial checkout setup while its exact ref values still hold.
 
-    current_branch = require_output(
-        _git(repo_root, "branch", "--show-current"),
-        cwd=repo_root,
-    ).strip()
-    if current_branch != state.branch:
-        require_success(
-            _git(repo_root, "switch", state.branch),
-            cwd=repo_root,
-        )
-    require_success(
-        _git(repo_root, "reset", "--hard", state.head),
-        cwd=repo_root,
-    )
-
-    if state.release_head is None and state.main_head is not None and state.branch != main_branch:
-        require_success(
-            _git(repo_root, "branch", "--force", main_branch, state.main_head),
-            cwd=repo_root,
-        )
-    if state.release_head is None:
-        if _ref_exists(repo_root, f"refs/heads/{release_branch}"):
-            require_success(
-                _git(repo_root, "branch", "--delete", "--force", release_branch),
-                cwd=repo_root,
-            )
-    elif state.branch != release_branch:
-        require_success(
-            _git(
-                repo_root,
-                "branch",
-                "--force",
-                release_branch,
-                state.release_head,
-            ),
-            cwd=repo_root,
-        )
-
-    restored_branch = require_output(
-        _git(repo_root, "branch", "--show-current"),
-        cwd=repo_root,
-    ).strip()
-    if restored_branch != state.branch:
-        raise PromotionError("Could not restore the original checkout branch.")
-    if _branch_head(repo_root, state.branch) != state.head:
-        raise PromotionError("Could not restore the original checkout commit.")
-    if state.release_head is None and _branch_head(repo_root, main_branch) != state.main_head:
-        raise PromotionError("Could not restore the original main commit.")
-    release_exists = _ref_exists(repo_root, f"refs/heads/{release_branch}")
-    if state.release_head is None:
-        if release_exists:
-            raise PromotionError("Could not remove the newly created release branch.")
-    elif (
-        not release_exists
-        or _branch_head(repo_root, release_branch) != state.release_head
-    ):
-        raise PromotionError("Could not restore the original release commit.")
-    _clean(repo_root, "after restoring failed release preparation")
+    Another writer's newer ref is never reset or deleted. A failed compare or
+    dirty checkout leaves repair to the caller with the original cause intact.
+    This function does not surround task checks or completed promotion.
+    """
+    originals = {main_branch: state.main_head, release_branch: state.release_head}
+    current = {}
+    for branch, previous in originals.items():
+        head = _branch_head(repo_root, branch) if _ref_exists(repo_root, f"refs/heads/{branch}") else None
+        current[branch] = head
+        if head != previous and (branch not in written_heads or head != written_heads[branch]):
+            raise PromotionError(f"Checkout setup cannot undo another writer's change to {branch}.")
+    _clean(repo_root, "before undoing failed release setup")
+    checked_out = require_output(_git(repo_root, "branch", "--show-current"), cwd=repo_root).strip()
+    if checked_out != state.branch:
+        require_success(_git(repo_root, "switch", state.branch), cwd=repo_root)
+    for branch, old in originals.items():
+        new = current[branch]
+        if new == old:
+            continue
+        if new is None:
+            raise PromotionError(f"Checkout setup lost the branch it changed: {branch}")
+        if old is None:
+            require_success(_git(repo_root, "update-ref", "-d", f"refs/heads/{branch}", new), cwd=repo_root)
+        else:
+            require_success(_git(repo_root, "update-ref", f"refs/heads/{branch}", old, new), cwd=repo_root)
+            if branch == state.branch:
+                require_success(_git(repo_root, "read-tree", "-u", "-m", new, old), cwd=repo_root)
+    _clean(repo_root, "after undoing failed release setup")
 
 
 def _prepare_release_checkout(
@@ -266,8 +235,8 @@ def _prepare_release_checkout(
     remote_main: str,
     state: ReleaseCheckoutState,
 ) -> None:
-    """Prepare the release checkout as one rollback-safe local transaction."""
-
+    """Prepare the initial checkout; preserve independent writers on failure."""
+    written_heads: dict[str, str] = {}
     try:
         if state.release_head is not None:
             if state.branch != release_branch:
@@ -280,7 +249,11 @@ def _prepare_release_checkout(
                 _git(repo_root, "switch", main_branch),
                 cwd=repo_root,
             )
-            fast_forward_branch(repo_root, remote_main)
+            if state.main_head is None:
+                raise PromotionError("Initial release setup requires an existing main branch.")
+            written_heads[main_branch] = _branch_head(repo_root, remote_main)
+            fast_forward_branch(repo_root, remote_main, expected_old_commit=state.main_head)
+            written_heads[release_branch] = written_heads[main_branch]
             require_success(
                 _git(
                     repo_root,
@@ -298,7 +271,7 @@ def _prepare_release_checkout(
                 repo_root,
                 main_branch,
                 release_branch,
-                state,
+                state, written_heads=written_heads,
             )
         except Exception as restore_exc:  # noqa: BLE001 - preserve rollback evidence
             raise PromotionError(
@@ -364,195 +337,11 @@ def _is_ancestor(repo_root: pathlib.Path, older: str, newer: str) -> bool:
     return result.returncode == 0
 
 
-def _unique_merge_base(repo_root: pathlib.Path, left: str, right: str) -> str:
-    result = run_command(
-        _git(repo_root, "merge-base", "--all", left, right), cwd=repo_root
-    )
-    bases = result.stdout.splitlines()
-    if result.returncode or len(bases) != 1:
-        raise PromotionError("Automatic rebase requires unambiguous shared ancestry.")
-    return bases[0]
-
-
-def _task_commits(
-    repo_root: pathlib.Path,
-    release_head: str,
-    main_head: str,
-    branch: str,
-    head: str,
-) -> tuple[str, list[str]]:
-    """Find the one contiguous task range, excluding shared main/release history.
-
-    Comparable unique bases are required; selecting an arbitrary merge base or
-    merely filtering merge commits could omit part of the source's changes.
-    Parent checks prove that the exact --onto range is linear and contiguous.
-    """
-    release_base = _unique_merge_base(repo_root, release_head, head)
-    main_base = _unique_merge_base(repo_root, main_head, head)
-    if _is_ancestor(repo_root, release_base, main_base):
-        base = main_base
-    elif _is_ancestor(repo_root, main_base, release_base):
-        base = release_base
-    else:
-        raise PromotionError("Automatic rebase cannot identify one task-only boundary.")
-    result = run_command(
-        _git(
-            repo_root,
-            "rev-list",
-            "--reverse",
-            "--topo-order",
-            "--parents",
-            f"{base}..{head}",
-        ),
-        cwd=repo_root,
-    )
-    if result.returncode:
-        raise PromotionError(f"Could not inspect source history: {branch}")
-    commits: list[str] = []
-    parent = base
-    for row in result.stdout.splitlines():
-        fields = row.split()
-        if len(fields) != 2 or fields[1] != parent:
-            raise PromotionError(
-                f"Automatic rebase requires linear source history: {branch}"
-            )
-        parent = fields[0]
-        commits.append(parent)
-    if not commits or commits[-1] != head:
-        raise PromotionError(
-            "Automatic rebase cannot identify a nonempty task-only range."
-        )
-    return base, commits
-
-
-def _rebase_target(repo_root: pathlib.Path, release_head: str, task_base: str) -> str:
-    """Preserve both shared histories without rewriting either or touching a ref.
-
-    A release batch can predate main's dependency merges. Replaying only the
-    task range onto that release would drop inherited changes. Git builds their
-    conflict-free merge as the rebase target; the release ref moves only after
-    the source rebase succeeds. Unreferenced objects remain Git-GC-owned.
-    """
-    if _is_ancestor(repo_root, task_base, release_head):
-        return release_head
-    _unique_merge_base(repo_root, release_head, task_base)
-    merged = run_command(
-        _git(
-            repo_root,
-            "merge-tree",
-            "--write-tree",
-            "--name-only",
-            release_head,
-            task_base,
-        ),
-        cwd=repo_root,
-    )
-    if merged.returncode:
-        raise PromotionError(
-            "Could not merge shared task history; source and release preserved: "
-            + _command_detail(merged)
-        )
-    tree = merged.stdout.strip()
-    if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", tree):
-        raise PromotionError("Git returned an invalid shared-history merge tree.")
-    return require_output(
-        _git(
-            repo_root,
-            "commit-tree",
-            tree,
-            "-p",
-            release_head,
-            "-p",
-            task_base,
-            "-m",
-            "Merge shared task base with the existing release batch",
-        ),
-        cwd=repo_root,
-    ).strip()
-
-
-def _rebase_in_progress(
-    worktree: pathlib.Path,
-    repo_root: pathlib.Path,
-) -> bool:
-    """Return whether Git records an active rebase in the selected worktree."""
-
-    for state_name in ("rebase-merge", "rebase-apply"):
-        result = run_command(
-            _git(worktree, "rev-parse", "--git-path", state_name),
-            cwd=repo_root,
-        )
-        if result.returncode:
-            raise PromotionError("Could not inspect automatic rebase state.")
-        state_path = pathlib.Path(result.stdout.strip())
-        if not state_path.is_absolute():
-            state_path = worktree / state_path
-        if state_path.exists():
-            return True
-    return False
-
-
-def _restore_source_after_rebase(
-    repo_root: pathlib.Path,
-    branch: str,
-    state: SourceState,
-) -> str | None:
-    """Restore the exact clean source snapshot after an unsuccessful rebase."""
-
-    worktree = state.worktree
-    if worktree is None:
-        return "source worktree disappeared"
-    in_progress = _rebase_in_progress(worktree, repo_root)
-    current = run_command(
-        _git(worktree, "branch", "--show-current"),
-        cwd=repo_root,
-    )
-    if current.returncode:
-        return "could not read the source worktree branch"
-    if not in_progress and current.stdout.strip() != branch:
-        return "source worktree no longer has the selected branch checked out"
-    if in_progress:
-        aborted = run_command(
-            _git(worktree, "rebase", "--abort"),
-            cwd=repo_root,
-        )
-        if aborted.returncode:
-            return f"git rebase --abort failed: {_command_detail(aborted)}"
-
-    current = run_command(
-        _git(worktree, "branch", "--show-current"),
-        cwd=repo_root,
-    )
-    if current.returncode or current.stdout.strip() != branch:
-        return "source branch was not restored after abort"
-
-    head = _branch_head(repo_root, branch)
-    status = _worktree_status(worktree, repo_root)
-    if head != state.head or status:
-        reset = run_command(
-            _git(worktree, "reset", "--hard", state.head),
-            cwd=repo_root,
-        )
-        if reset.returncode:
-            return f"git reset --hard failed: {_command_detail(reset)}"
-
-    restored_head = _branch_head(repo_root, branch)
-    restored_status = _worktree_status(worktree, repo_root)
-    if _rebase_in_progress(worktree, repo_root):
-        return "rebase state remains after rollback"
-    if restored_head != state.head:
-        return f"restored head is {restored_head}, expected {state.head}"
-    if restored_status:
-        count = len(restored_status.splitlines())
-        return f"restored worktree has {count} status entries"
-    return None
-
-
 def _conflicting_paths(
     worktree: pathlib.Path,
     repo_root: pathlib.Path,
 ) -> list[str]:
-    """Return sorted unmerged paths from an unsuccessful rebase."""
+    """Return sorted unmerged paths from an unsuccessful merge."""
 
     result = run_command(
         _git(worktree, "diff", "--name-only", "--diff-filter=U"),
@@ -561,93 +350,6 @@ def _conflicting_paths(
     if result.returncode:
         return []
     return sorted({line for line in result.stdout.splitlines() if line})
-
-
-def _automatic_rebase(
-    repo_root: pathlib.Path,
-    release_head: str,
-    branch: str,
-    merge_base: str,
-    state: SourceState,
-) -> dict[str, str]:
-    """Rebase one eligible source and compensate every unsuccessful attempt."""
-
-    worktree = state.worktree
-    assert worktree is not None
-    result = run_command(
-        _git(
-            worktree,
-            "rebase",
-            "--no-autostash",
-            "--no-gpg-sign",
-            "--no-update-refs",
-            "--no-rebase-merges",
-            "--no-fork-point",
-            "--onto",
-            release_head,
-            merge_base,
-            branch,
-        ),
-        cwd=repo_root,
-    )
-    if result.returncode:
-        conflicts = _conflicting_paths(worktree, repo_root)
-        rollback_error = _restore_source_after_rebase(repo_root, branch, state)
-        if rollback_error is not None:
-            raise PromotionError(
-                f"Automatic rebase and rollback failed for {branch}: {rollback_error}"
-            )
-        if conflicts:
-            raise PromotionError(
-                f"Automatic rebase conflicted for {branch}; original head "
-                f"{state.head} restored; conflicting paths: {', '.join(conflicts)}"
-            )
-        raise PromotionError(
-            f"Automatic rebase failed for {branch}; original head {state.head} "
-            f"restored: {_command_detail(result)}"
-        )
-
-    new_head = state.head
-    validation_error: str | None = None
-    try:
-        new_head = _branch_head(repo_root, branch)
-        if _worktree_status(worktree, repo_root):
-            validation_error = "rebased worktree is dirty"
-        else:
-            ancestor = run_command(
-                _git(repo_root, "merge-base", "--is-ancestor", release_head, branch),
-                cwd=repo_root,
-            )
-            if ancestor.returncode:
-                validation_error = "release head is not an ancestor after rebase"
-        if validation_error is None:
-            checked = run_command(
-                _git(repo_root, "diff", "--check", release_head, branch),
-                cwd=repo_root,
-            )
-            if checked.returncode:
-                validation_error = (
-                    f"git diff --check failed: {_command_detail(checked)}"
-                )
-    except (CommandError, PromotionError, OSError) as exc:
-        validation_error = str(exc)
-    if validation_error is not None:
-        rollback_error = _restore_source_after_rebase(repo_root, branch, state)
-        if rollback_error is not None:
-            raise PromotionError(
-                f"Automatic rebase validation and rollback failed for {branch}: "
-                f"{validation_error}; {rollback_error}"
-            )
-        raise PromotionError(
-            f"Automatic rebase validation failed for {branch}; original head "
-            f"{state.head} restored: {validation_error}"
-        )
-    return {
-        "branch": branch,
-        "old_head": state.head,
-        "new_head": new_head,
-        "onto": release_head,
-    }
 
 
 class SyncError(RuntimeError):
@@ -727,10 +429,73 @@ def _local_branch_head(repo_root: pathlib.Path, branch: str) -> str | None:
     return lines[0]
 
 
+def fast_forward_branch(worktree: pathlib.Path, revision: str, *, expected_old_commit: str) -> None:
+    """Advance exactly the observed branch, then bring its clean files along.
 
-def fast_forward_branch(worktree: pathlib.Path, revision: str) -> None:
-    """Fast-forward the checked-out branch and files, never create a merge."""
-    require_success(_git(worktree, "merge", "--ff-only", revision), cwd=worktree)
+    Git's compare-and-swap prevents an external writer from being overwritten.
+    If checkout fails after the ref moves, report that completed effect; never
+    reset the branch or discard the other writer's changes.
+    """
+    branch = require_output(_git(worktree, "symbolic-ref", "--quiet", "HEAD"), cwd=worktree).strip()
+    head = _branch_head(worktree, branch)
+    target = _branch_head(worktree, revision)
+    if head == target:
+        if head == expected_old_commit:
+            # A fresh caller knows the current ref, not the interrupted old ref.
+            # Git identifies our own last ref update; the index and working-file
+            # comparisons below establish that only its checkout is unfinished.
+            entry = run_command(_git(worktree, "reflog", "-1", "--format=%gs", branch), cwd=worktree)
+            if entry.returncode == 0 and entry.stdout.strip() == "ceratops: accepted fast-forward":
+                previous = run_command(_git(worktree, "rev-parse", f"{branch}@{{1}}"), cwd=worktree)
+                if previous.returncode == 0:
+                    expected_old_commit = previous.stdout.strip()
+        if head != expected_old_commit:
+            # Complete a ref update interrupted before read-tree only when the
+            # caller's exact old tree still owns the index and working files.
+            old_tree = require_output(_git(worktree, "rev-parse", f"{expected_old_commit}^{{tree}}"), cwd=worktree).strip()
+            index_tree = require_output(_git(worktree, "write-tree"), cwd=worktree).strip()
+            unchanged = run_command(_git(worktree, "diff-files", "--quiet"), cwd=worktree)
+            if index_tree == old_tree and unchanged.returncode == 0 and _is_ancestor(worktree, expected_old_commit, target):
+                require_success(_git(worktree, "read-tree", "-u", "-m", expected_old_commit, target), cwd=worktree)
+        _clean(worktree, "after completed fast-forward")
+        return
+    if head != expected_old_commit:
+        raise PromotionError("Branch changed before fast-forward.", {
+            "status": "state_changed", "expected_head": expected_old_commit, "actual_head": head})
+    if not _is_ancestor(worktree, head, target):
+        raise PromotionError("Fast-forward requires the current branch to be an ancestor.")
+    _clean(worktree, "before fast-forward")
+    require_success(_git(worktree, "update-ref", "-m", "ceratops: accepted fast-forward", branch, target, expected_old_commit), cwd=worktree)
+    copied = run_command(_git(worktree, "read-tree", "-u", "-m", head, target), cwd=worktree)
+    current = _branch_head(worktree, branch)
+    if copied.returncode or current != target:
+        raise PromotionError("Branch advanced but checkout did not finish; inspect the current checkout before retrying.", {
+            "status": "state_changed", "ref_updated_to": target, "actual_head": current,
+            "checkout_error": _command_detail(copied) if copied.returncode else None})
+    _clean(worktree, "after fast-forward")
+
+
+def merge_release_into_task(worktree: pathlib.Path, release_commit: str) -> str:
+    """Merge one exact commit into the task, preserving both histories."""
+    _clean(worktree, "before merging required history")
+    head = _branch_head(worktree, "HEAD")
+    if _is_ancestor(worktree, release_commit, head):
+        return head
+    if _is_ancestor(worktree, head, release_commit):
+        fast_forward_branch(worktree, release_commit, expected_old_commit=head)
+        return release_commit
+    if run_command(_git(worktree, "rev-parse", "--verify", "MERGE_HEAD"), cwd=worktree).returncode == 0:
+        raise PromotionError("An existing merge must be completed before promotion.")
+    merged = run_command(_git(worktree, "merge", "--no-edit", "--no-gpg-sign", release_commit), cwd=worktree)
+    if merged.returncode:
+        conflicts = _conflicting_paths(worktree, worktree)
+        active = run_command(_git(worktree, "rev-parse", "--verify", "MERGE_HEAD"), cwd=worktree)
+        if active.returncode == 0 and active.stdout.strip() == release_commit:
+            require_success(_git(worktree, "merge", "--abort"), cwd=worktree)
+        raise PromotionError("Task merge did not finish; release is unchanged.", {
+            "status": "merge_conflict" if conflicts else "operation_failed",
+            "conflict_paths": conflicts, "message": _command_detail(merged)})
+    return _branch_head(worktree, "HEAD")
 
 
 def align_branch(

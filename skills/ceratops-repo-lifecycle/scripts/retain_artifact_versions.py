@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from packaging.version import Version
-from sdlc_results import CompletedArtifactSelection, StepResultError, _plain_path
+from sdlc_results import CompletedArtifactSelection, StepResultError, _plain_path, receipt_storage_key
 
 SCHEMA = "ceratops-artifact-retention.v1"
 OWNER_FILE = ".retained-files.json"
@@ -49,7 +49,8 @@ class RetentionScope:
     def __post_init__(self) -> None:
         if self.pool not in {"worktree", "beta-stable", "deployed"}:
             raise ValueError("Unknown artifact retention pool.")
-        for value in (self.unit, self.target, self.worktree or "unused"):
+        receipt_storage_key({"storageKey": self.unit})
+        for value in (self.target, self.worktree or "unused"):
             if not SEGMENT.fullmatch(value) or value in {".", ".."}:
                 raise ValueError("Retention requires a single safe path segment.")
         if (self.pool == "worktree") != bool(self.worktree):
@@ -134,7 +135,7 @@ def select_retained_versions(
         if value is None:
             return
         identity = value.build.identity
-        if identity["releaseBundle"] != scope.unit or identity["target"] != scope.target:
+        if receipt_storage_key(identity) != scope.unit or identity["target"] != scope.target:
             raise ValueError("Retention input belongs to another unit or target.")
         selected.setdefault(value.key(scope), value)
 
@@ -245,6 +246,13 @@ def _inventory(value: RetentionVersion, *, installed: bool = False) -> tuple[dic
             raise ValueError("Accepted package uses a reserved retained-receipt path.")
         records[name] = {"size": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
         sources[name] = raw
+    for member in build.members:
+        child_records, child_sources = _inventory(RetentionVersion(member))
+        identity = member.build_receipt.value["identity"]
+        prefix = f"{receipt_storage_key(identity)}/{identity['version']}/{identity['target']}/"
+        for name, record in child_records.items():
+            records[prefix + name] = record
+            sources[prefix + name] = child_sources[name]
     for item in value.runnable_files if installed else ():
         if value.installation_root is None or not value.successful_installation():
             raise ValueError("Runnable files require their successful installation and source root.")

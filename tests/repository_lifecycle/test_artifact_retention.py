@@ -25,7 +25,7 @@ from tests.support.repositories import run_git
 retention = importlib.import_module("retain_artifact_versions")
 results = importlib.import_module("sdlc_results")
 storage = importlib.import_module("store_artifacts")
-runner = importlib.import_module("repository_operation")
+completion = importlib.import_module("complete_artifact_builds")
 
 
 @pytest.fixture
@@ -592,7 +592,7 @@ def test_missing_approval_cannot_discard_previous_accepted_copy(accepted):
 
 def test_completed_multi_target_reader_uses_retained_packages_after_original_removal(tmp_path):
     repo, _commit, transaction, prepared, _receipts = _prepared_versioned_completion(tmp_path)
-    completed = runner.complete_versioned_build(transaction, prepared)
+    completed = completion.complete_versioned_artifacts(transaction, prepared)
     assert run_git(repo, "branch", "release/local", completed.final_commit).returncode == 0
     kept = {}
     for target in transaction.required_targets:
@@ -612,12 +612,12 @@ def test_completed_multi_target_reader_uses_retained_packages_after_original_rem
             repo, pool="worktree", worktree="producer", release_replacement=replacement, **arguments,
         )
         assert not removed.deferred and not selected.receipt_path.exists()
-    repeated = runner.read_versioned_build(
+    repeated = completion.read_artifact_build(
         repo, repository=transaction.repository, release_bundle=transaction.release_bundle,
         version=transaction.version, required_targets=transaction.required_targets,
     )
     assert {target: repeated.artifact_receipt(target) for target in transaction.required_targets} == kept
-    assert runner.complete_versioned_build(repeated).artifact_receipts == tuple(kept.values())
+    assert completion.complete_versioned_artifacts(repeated).artifact_receipts == tuple(kept.values())
 
 
 def test_changed_original_is_preserved_instead_of_copying_it_onto_itself(accepted):

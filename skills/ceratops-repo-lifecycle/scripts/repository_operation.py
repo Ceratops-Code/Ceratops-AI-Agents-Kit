@@ -22,13 +22,12 @@ import re
 import shutil
 import subprocess
 import sys
-from collections.abc import Callable, Mapping, Sequence
-from copy import deepcopy
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
-import complete_artifact_builds
 import execute_skill_actions
+from execute_worktree_build import execute_build
 import reuse_operation_checks
 import sdlc_results
 import store_artifacts
@@ -42,7 +41,6 @@ from ceratops_repo_compatibility_engine.sdlc_contract_validation import (
 from ceratops_repo_compatibility_engine.sdlc_contract_validation import (
     operation_category as contract_operation_category,
 )
-from complete_artifact_builds import CompletedArtifactVersion, PreparedBuildReceipt
 from github_pr_workflow.command import (
     CommandError,
     completed_operation_report_ids,
@@ -59,22 +57,15 @@ from github_pr_workflow.command import (
 )
 from run_build_operations import (
     build_operation_context,
-    execute_check_phases,
-    execute_release_builds,
+    execute_sdlc_operations,
 )
 from sdlc_results import StepResultError, capture_step_result
 from store_artifacts import (
-    ArtifactVersionTransaction,
-    BuildProduct,
     OperationError,
 )
 
 # Public storage types and reader; storage remains their implementation owner.
-BUILD_BUNDLE_RETENTION = store_artifacts.BUILD_BUNDLE_RETENTION
-CompletedBuild = store_artifacts.CompletedBuild
-CompletedDependency = store_artifacts.CompletedDependency
 RecoveryRequired = store_artifacts.RecoveryRequired
-read_completed_build = store_artifacts.read_completed_build
 
 DEFAULT_CONTRACT = pathlib.Path("sdlc/sdlc.yml")
 PARAMETER_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
@@ -145,6 +136,8 @@ class PreparedOperation:
     selected_artifacts: Mapping[str, list[str]] | None = None
     build_check_artifacts: Mapping[str, dict[str, list[str]]] | None = None
     build_source_files: tuple[str, ...] = ()
+    build_target: str | None = None
+    automatic_check: bool = False
 
     @property
     def artifact_references(self) -> tuple[str, ...]:
@@ -192,195 +185,6 @@ class PreparedOperation:
         )
 
 
-def _build_test_gate(receipt: Mapping[str, Any], required_tests: Sequence[str]) -> None:
-    if sorted(test["id"] for test in receipt["tests"]) != sorted(required_tests):
-        raise OperationError("Every required artifact test must pass with recorded evidence.")
-    store_artifacts.require_recorded_acceptance(receipt)
-
-
-def build_bundle(
-    repo_root: pathlib.Path,
-    *,
-    selection: Mapping[str, str],
-    inputs: Mapping[str, Any],
-    required_tests: Sequence[str],
-    build: Callable[[pathlib.Path, pathlib.Path], BuildProduct],
-    test: Callable[[pathlib.Path, Sequence[Mapping[str, Any]], pathlib.Path],
-                   Sequence[Mapping[str, Any]]],
-) -> pathlib.Path:
-    """Internal build/test/store transaction; no public Build or deploy command.
-
-    Callers resolve the complete identity, exact dependency/build inputs and
-    required test IDs before entry. Build writes to bundle and scratch paths;
-    test receives the measured artifact inventory and returns v2 test records,
-    with evidence paths relative to the bundle. Callbacks must finish their
-    subprocesses before returning. Only all-passed results create a receipt.
-
-    One repository lock protects publication, bounded retention and startup
-    recovery. Each identity has private staging, removed on exit; the next caller
-    removes recognizable staging left by any killed transaction. Completed
-    bundles are grouped by repository, release bundle, channel and target, retaining
-    the newest three by completion time. One helper-owned diagnostic per group is
-    atomically overwritten on failure and removed after a successful new publication.
-    Diagnostic excerpts are never test evidence.
-    This is process-crash recovery, not a power-loss durability guarantee.
-    """
-    validator = sdlc_results._operation_result_validator()
-    if (isinstance(required_tests, (str, bytes)) or not required_tests
-            or any(not isinstance(item, str) or not item.strip() for item in required_tests)
-            or len(set(required_tests)) != len(required_tests)):
-        raise OperationError("Build requires a nonempty unique list of required test IDs.")
-    identity = store_artifacts.validated_build_selection(selection)
-    locked_inputs = store_artifacts.canonical_json({
-        "inputs": inputs, "requiredTests": sorted(required_tests),
-    })
-    storage = store_artifacts.prepare_build_storage(repo_root, identity)
-    # The storage helper owns the unchanged full-lifetime v2 lock. Build and
-    # test orchestration deliberately stays inside its critical section.
-    with store_artifacts.locked_build_storage(storage):
-        tests: list[Mapping[str, Any]] = []
-        failure = ""
-        bundle = storage.bundle
-        try:
-            bundle, work = store_artifacts.start_build_storage(storage, validator)
-            product = build(bundle, work)
-            artifacts = [
-                store_artifacts.measure_build_file(bundle, item)
-                for item in product.artifacts
-            ]
-            dependencies = [
-                {
-                    "identity": deepcopy(item["identity"]),
-                    "artifacts": [
-                        store_artifacts.measure_build_file(bundle, artifact)
-                        for artifact in item["artifacts"]
-                    ],
-                }
-                for item in product.dependencies
-            ]
-            supporting = [
-                store_artifacts.measure_build_file(bundle, item)
-                for item in product.supporting_files
-            ]
-            all_artifacts = artifacts + [
-                artifact for dependency in dependencies for artifact in dependency["artifacts"]
-            ]
-            receipt = {
-                "schema": sdlc_results.BUILD_RECEIPT_SCHEMA, "status": "passed",
-                "identity": identity, "artifacts": artifacts, "dependencies": dependencies,
-                "supportingFiles": supporting, "tests": [],
-            }
-            # Malformed adapter inventories never start tests. The final receipt
-            # is still absent until required evidence has passed the gate.
-            errors = list(validator.iter_errors(receipt))
-            if errors:
-                raise OperationError(f"Invalid adapter output: {errors[0].message}")
-            sdlc_results._build_files(receipt)
-            tests = list(test(bundle, deepcopy(all_artifacts), work))
-            # Tests bind their reported outcomes to the pre-test artifact hashes.
-            receipt["tests"] = tests
-            _build_test_gate(receipt, required_tests)
-            for evidence_path in sorted({item["evidence"]["path"] for item in tests}):
-                supporting.append(store_artifacts.measure_build_file(
-                    bundle, {"type": "test-evidence", "path": evidence_path},
-                ))
-            supporting.append(
-                store_artifacts.write_build_inputs(storage, locked_inputs)
-            )
-            return store_artifacts.publish_completed_build(
-                storage, receipt, validator,
-            )
-        except BaseException as exc:
-            failure = f"{type(exc).__name__}: {exc}"
-            store_artifacts.write_failure_diagnostic(
-                storage, failure, required_tests, tests,
-            )
-            raise
-        finally:
-            try:
-                store_artifacts.discard_build_storage(storage)
-            except (OSError, StepResultError, OperationError) as cleanup_error:
-                store_artifacts.write_failure_diagnostic(
-                    storage,
-                    f"{failure}\nStaging cleanup failed: {cleanup_error}".strip(),
-                    required_tests,
-                    tests,
-                )
-                raise
-
-
-def allocate_versioned_build(
-    repo_root: pathlib.Path, *, repository: str, release_bundle: str, version: str,
-    required_targets: Sequence[str], attempt_id: str | None = None,
-    declared_input_paths: Sequence[str] = (),
-) -> store_artifacts.ArtifactVersionAllocation:
-    """Choose the final version before source version/pin preparation and commit B.
-
-    The caller uses the returned version in every member, commits B, then calls
-    bind_versioned_build_inputs before building. Public adoption is in 16/22.
-    """
-    return store_artifacts.allocate_artifact_version(
-        repo_root, repository=repository, release_bundle=release_bundle, version=version,
-        required_targets=required_targets, attempt_id=attempt_id,
-        declared_input_paths=declared_input_paths,
-    )
-
-
-def bind_versioned_build_inputs(
-    allocation: store_artifacts.ArtifactVersionAllocation, *, pre_test_commit: str,
-) -> ArtifactVersionTransaction:
-    """Bind checkpoint B before any adapter writes outputs for this version."""
-    return store_artifacts.bind_artifact_inputs(allocation, pre_test_commit=pre_test_commit)
-
-
-def read_versioned_build(
-    repo_root: pathlib.Path, *, repository: str, release_bundle: str, version: str,
-    required_targets: Sequence[str],
-) -> ArtifactVersionTransaction:
-    """Read a request or completed receipts for completion-only work; never allocate."""
-    return complete_artifact_builds.read_artifact_build(
-        repo_root, repository=repository, release_bundle=release_bundle,
-        version=version, required_targets=required_targets,
-    )
-
-
-def measure_versioned_artifact(
-    transaction: ArtifactVersionTransaction,
-    target: str,
-    descriptor: Mapping[str, Any],
-) -> dict[str, Any]:
-    """Measure an owned output before the operation starts artifact tests."""
-
-    return store_artifacts.measure_versioned_artifact(
-        transaction, target, descriptor
-    )
-
-
-def prepare_versioned_receipt(
-    transaction: ArtifactVersionTransaction,
-    target: str,
-    receipt: Mapping[str, Any],
-    *,
-    check_summaries: Sequence[Mapping[str, Any]] = (),
-) -> PreparedBuildReceipt:
-    """Write one qualified target receipt to its final worktree path."""
-
-    return complete_artifact_builds.prepare_versioned_build_receipt(
-        transaction, target, receipt, check_summaries=check_summaries,
-    )
-
-
-def complete_versioned_build(
-    transaction: ArtifactVersionTransaction,
-    prepared_receipts: Sequence[PreparedBuildReceipt] | None = None,
-) -> CompletedArtifactVersion:
-    """Create or recover C, bind every target, and create the version tag."""
-
-    return complete_artifact_builds.complete_versioned_artifacts(transaction, prepared_receipts)
-
-
-
-
 def operation_category(operation: str) -> str:
     """Validate a complete versioned YAML location and return its category."""
 
@@ -390,12 +194,6 @@ def operation_category(operation: str) -> str:
         raise OperationError(str(exc)) from exc
 
 
-def execute_worktree_build(repo_root: pathlib.Path, **kwargs: Any) -> dict[str, Any]:
-    """Run the internal source-commit, SDLC checks/build and receipt/tag sequence."""
-    from execute_worktree_build import execute_worktree_build as execute
-
-    with build_operation_context(repo_root):
-        return execute(repo_root, **kwargs)
 
 
 def read_repository_contract(
@@ -563,7 +361,7 @@ def prepare_operations(
                 raise OperationError(f"SDLC operation is not declared: {request.operation}")
             prepared.append(PreparedOperation(root, request.operation, category, commit, (), {}, "operation_not_declared"))
         for location in locations:
-            if location in included:
+            if location in included and category not in {"deploy-local", "publish", "verify-publish"}:
                 previous = included[location]
                 if (previous.parameters, previous.parameters_if_declared) != (request.parameters, request.parameters_if_declared):
                     raise OperationError(f"Repeated operation has different parameters: {location}")
@@ -1107,7 +905,7 @@ def execute_prepared_operations(
     """Run in order, stopping at the first failure with a bounded pending ledger."""
 
     if any(item.check_phase or item.build_check_groups for item in prepared):
-        return execute_check_phases(
+        return execute_sdlc_operations(
             prepared, diagnostic_output=diagnostic_output,
             diagnostic_owner=diagnostic_owner, successful_results=successful_results,
         )
@@ -1284,7 +1082,7 @@ def main(argv: list[str] | None = None) -> int:
             root, requests, args.sdlc_contract, context=context, artifacts=artifacts,
         )
         if scheduled or any(item.check_phase == "pre-build" and item.artifact_references for item in prepared):
-            result = execute_release_builds(
+            result = execute_build(
                 root, requests, args.sdlc_contract, context=context, artifacts=artifacts,
                 qualification_level=level, expected_commit=args.commit,
                 validation_operations=args.validation_operation, test_context=test_context,

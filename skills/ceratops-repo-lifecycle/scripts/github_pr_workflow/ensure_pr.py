@@ -414,121 +414,117 @@ def ensure_pr(args: argparse.Namespace) -> dict[str, object]:
         args.repo_root, required="release/local" in {args.head_branch, current}, operation="PR preparation",
         confirm_stopped=getattr(args, "confirm_previous_commands_stopped", False),
     ) as owned:
-        result = _ensure_pr(args)
+        repo_root = args.repo_root.expanduser().resolve(strict=True)
+        args.repo_root = repo_root
+        args.publication_phase = "preflight"
+        if args.base_branch == "main" and args.head_branch != "release/local":
+            raise EnsurePrError("Pull requests to main must come from this repository's release/local.")
+        _publication_target(args)
+        if getattr(args, "prepare", False):
+            args.publication_phase = "preparation_pending"
+            _prepare_branch(args)
+        elif getattr(args, "path", None) or getattr(args, "commit_message", None):
+            raise EnsurePrError("--path and --commit-message require --prepare")
+        status = require_output(_git(repo_root, "status", "--porcelain"), cwd=repo_root)
+        if status:
+            raise EnsurePrError("Refusing to publish because the worktree is dirty.")
+        current_branch = require_output(
+            _git(repo_root, "branch", "--show-current"), cwd=repo_root
+        ).strip()
+        if current_branch != args.head_branch:
+            raise EnsurePrError(
+                f"Expected active branch {args.head_branch!r}, got {current_branch!r}."
+            )
+        local_head = require_output(
+            _git(repo_root, "rev-parse", "HEAD"), cwd=repo_root
+        ).splitlines()[0].strip()
+        args.local_head = local_head
+        args.publication_phase = "prepared"
+        # Pin the fetched remote base so readiness and metadata describe the
+        # same commit range GitHub will compare, even when local main is behind.
+        base_remote = getattr(args, "base_remote", None) or args.remote_name
+        remote_base = f"refs/remotes/{base_remote}/{args.base_branch}"
+        require_success(
+            _git(
+                repo_root, "fetch", "--no-tags", base_remote,
+                f"+refs/heads/{args.base_branch}:{remote_base}",
+            ),
+            cwd=repo_root,
+        )
+        base_head = require_output(
+            _git(repo_root, "rev-parse", "--verify", f"{remote_base}^{{commit}}"),
+            cwd=repo_root,
+        ).strip()
+        ahead_raw = require_output(
+            _git(repo_root, "rev-list", "--count", f"{base_head}..HEAD"),
+            cwd=repo_root,
+        )
+        if int(ahead_raw.splitlines()[0]) <= 0:
+            raise EnsurePrError(
+                f"Branch {args.head_branch!r} is not ahead of {args.base_branch!r}."
+            )
+
+        for command in getattr(args, "check_command", []):
+            require_success(command, cwd=repo_root)
+        if getattr(args, "check_command", []):
+            if (
+                require_output(_git(repo_root, "status", "--porcelain"), cwd=repo_root)
+                or require_output(_git(repo_root, "rev-parse", "HEAD"), cwd=repo_root) != local_head
+                or require_output(_git(repo_root, "branch", "--show-current"), cwd=repo_root) != args.head_branch
+            ):
+                raise EnsurePrError("Validation changed the prepared state; inspect it before publishing")
+        args.publication_phase = "validated"
+        require_success(
+            _git(
+                repo_root,
+                "push",
+                "-u",
+                args.remote_name,
+                f"{args.head_branch}:{args.head_branch}",
+            ),
+            cwd=repo_root,
+        )
+        args.publication_phase = "pushed"
+        pr = _open_pr(args)
+        if pr is None:
+            title, body = args.title, args.body
+            if title is None or body is None:
+                default_title, default_body = _default_metadata(
+                    repo_root, base_head, local_head
+                )
+                if title is None:
+                    title = default_title
+                if body is None:
+                    body = default_body
+            _create_pr(args, title, body)
+        elif args.title is not None or args.body is not None:
+            command = ["gh", "pr", "edit", str(pr["number"])]
+            if getattr(args, "repo", None):
+                command.extend(("--repo", args.repo))
+            _publish_metadata(
+                command,
+                repo_root=repo_root,
+                title=args.title,
+                body=args.body,
+            )
+
+        pr = wait_for_pr_head(args, local_head)
+        args.publication_phase = "pr_verified"
+        result = {
+            "status": "pr_ready",
+            "pr": pr.get("number"),
+            "url": pr.get("url"),
+            "head": pr.get("headRefOid"),
+            "changed_files": pr.get("changedFiles"),
+            "state": pr.get("state"),
+            "draft": pr.get("isDraft"),
+            "checks": _check_summary(pr.get("statusCheckRollup")),
+        }
         if owned is not None and owned.outermost:
             owned.complete(commands_stopped=True)
         return result
 
 
-def _ensure_pr(args: argparse.Namespace) -> dict[str, object]:
-    """Verify, push, create or update, and observe one prepared branch PR."""
-
-    repo_root = args.repo_root.expanduser().resolve(strict=True)
-    args.repo_root = repo_root
-    args.publication_phase = "preflight"
-    if args.base_branch == "main" and args.head_branch != "release/local":
-        raise EnsurePrError("Pull requests to main must come from this repository's release/local.")
-    _publication_target(args)
-    if getattr(args, "prepare", False):
-        args.publication_phase = "preparation_pending"
-        _prepare_branch(args)
-    elif getattr(args, "path", None) or getattr(args, "commit_message", None):
-        raise EnsurePrError("--path and --commit-message require --prepare")
-    status = require_output(_git(repo_root, "status", "--porcelain"), cwd=repo_root)
-    if status:
-        raise EnsurePrError("Refusing to publish because the worktree is dirty.")
-    current_branch = require_output(
-        _git(repo_root, "branch", "--show-current"), cwd=repo_root
-    ).strip()
-    if current_branch != args.head_branch:
-        raise EnsurePrError(
-            f"Expected active branch {args.head_branch!r}, got {current_branch!r}."
-        )
-    local_head = require_output(
-        _git(repo_root, "rev-parse", "HEAD"), cwd=repo_root
-    ).splitlines()[0].strip()
-    args.local_head = local_head
-    args.publication_phase = "prepared"
-    # Pin the fetched remote base so readiness and metadata describe the
-    # same commit range GitHub will compare, even when local main is behind.
-    base_remote = getattr(args, "base_remote", None) or args.remote_name
-    remote_base = f"refs/remotes/{base_remote}/{args.base_branch}"
-    require_success(
-        _git(
-            repo_root, "fetch", "--no-tags", base_remote,
-            f"+refs/heads/{args.base_branch}:{remote_base}",
-        ),
-        cwd=repo_root,
-    )
-    base_head = require_output(
-        _git(repo_root, "rev-parse", "--verify", f"{remote_base}^{{commit}}"),
-        cwd=repo_root,
-    ).strip()
-    ahead_raw = require_output(
-        _git(repo_root, "rev-list", "--count", f"{base_head}..HEAD"),
-        cwd=repo_root,
-    )
-    if int(ahead_raw.splitlines()[0]) <= 0:
-        raise EnsurePrError(
-            f"Branch {args.head_branch!r} is not ahead of {args.base_branch!r}."
-        )
-
-    for command in getattr(args, "check_command", []):
-        require_success(command, cwd=repo_root)
-    if getattr(args, "check_command", []):
-        if (
-            require_output(_git(repo_root, "status", "--porcelain"), cwd=repo_root)
-            or require_output(_git(repo_root, "rev-parse", "HEAD"), cwd=repo_root) != local_head
-            or require_output(_git(repo_root, "branch", "--show-current"), cwd=repo_root) != args.head_branch
-        ):
-            raise EnsurePrError("Validation changed the prepared state; inspect it before publishing")
-    args.publication_phase = "validated"
-    require_success(
-        _git(
-            repo_root,
-            "push",
-            "-u",
-            args.remote_name,
-            f"{args.head_branch}:{args.head_branch}",
-        ),
-        cwd=repo_root,
-    )
-    args.publication_phase = "pushed"
-    pr = _open_pr(args)
-    if pr is None:
-        title, body = args.title, args.body
-        if title is None or body is None:
-            default_title, default_body = _default_metadata(
-                repo_root, base_head, local_head
-            )
-            if title is None:
-                title = default_title
-            if body is None:
-                body = default_body
-        _create_pr(args, title, body)
-    elif args.title is not None or args.body is not None:
-        command = ["gh", "pr", "edit", str(pr["number"])]
-        if getattr(args, "repo", None):
-            command.extend(("--repo", args.repo))
-        _publish_metadata(
-            command,
-            repo_root=repo_root,
-            title=args.title,
-            body=args.body,
-        )
-
-    pr = wait_for_pr_head(args, local_head)
-    args.publication_phase = "pr_verified"
-    return {
-        "status": "pr_ready",
-        "pr": pr.get("number"),
-        "url": pr.get("url"),
-        "head": pr.get("headRefOid"),
-        "changed_files": pr.get("changedFiles"),
-        "state": pr.get("state"),
-        "draft": pr.get("isDraft"),
-        "checks": _check_summary(pr.get("statusCheckRollup")),
-    }
 
 
 def build_parser() -> argparse.ArgumentParser:
