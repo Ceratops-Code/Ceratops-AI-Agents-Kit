@@ -186,16 +186,16 @@ def execute_build(
                 if len(receipt_paths) != 1 or None in receipt_paths:
                     raise operations.OperationError(f"Supplied files for {reference} require one completed artifact receipt.")
                 accepted = sdlc_results.read_artifact_receipt_chain(root, artifact_receipt_path=receipt_paths.pop())
-                receipt = accepted.build_receipt.value
-                if receipt.get("commandsAndSettings", {}).get("operation") != reference + ".actions.build":
+                supplier_receipt = accepted.build_receipt.value
+                if supplier_receipt.get("commandsAndSettings", {}).get("operation") != reference + ".actions.build":
                     raise operations.OperationError(f"Supplied receipt does not belong to {reference}.")
                 if not set(paths).issubset({path.resolve() for path in accepted.artifacts}):
                     raise operations.OperationError(f"Supplied files are not recorded outputs of {reference}.")
                 supplied_results.append({
                     "operation": reference + ".actions.build", "status": "completed",
-                    "artifact_identity": receipt["identity"], "artifact_records": receipt["artifacts"],
+                    "artifact_identity": supplier_receipt["identity"], "artifact_records": supplier_receipt["artifacts"],
                     "artifacts": {reference: [str(path) for path in accepted.artifacts]},
-                    "step_results": [{"step": "supplied-build", "result": receipt}],
+                    "step_results": [{"step": "supplied-build", "result": supplier_receipt}],
                 })
             if prepare_only:
                 return {"status": "prepared", "operations": requested_operations,
