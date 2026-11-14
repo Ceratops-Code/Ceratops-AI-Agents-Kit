@@ -444,6 +444,10 @@ directories, relevant parameters and fingerprints of declared environment values
 used by the builder. Unset and empty environment values differ; secret values are
 not stored. `artifactInputs` names source files, while `dependencies` records
 consumed artifacts with their original versions and acceptance identities.
+For a build using `--artifacts`, supplied dependency files stay beside their
+completed artifact receipt. Build reads that receipt before running commands and
+records the dependency's original version and acceptance without rebuilding it.
+Files without that completed receipt cannot supply a build dependency.
 `installationArtifactPath` identifies one entry in `artifacts`; that entry alone
 owns its size and hash.
 
@@ -452,6 +456,8 @@ Member identities use `storageKey: members/<kind>/<name>`. Bundle identities use
 member versions, tags, receipt hashes, outputs and dependencies. It can retain
 an unchanged member alongside a newly built member. Bundle membership alone
 does not rebuild a member.
+All test-result readers recognize both member and bundle folders when reading
+the tagged check summaries, even after local test-result files are removed.
 
 The committed receipt and its check summary use canonical UTF-8 JSON with one
 LF terminator. The artifact receipt beside the package links to those exact

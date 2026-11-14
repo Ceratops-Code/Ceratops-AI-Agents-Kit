@@ -32,12 +32,35 @@ from tests.repository_lifecycle.test_sdlc_handoffs import (
 )
 
 
-def _tag_summary(repository, version, summary, *, target="python-3.14-windows", tagged=True):
+def _tag_summary(repository, version, summary, *, target="python-3.14-windows", tagged=True, key="claims"):
     """Create committed receipt bytes without packages, receipts in a store or logs."""
     fixture = repository / ".git/receipt-fixture"
     fixture.mkdir(parents=True, exist_ok=True)
     _, receipt, *_ = _new_receipt_fixtures(fixture, version=version, target=target, required_targets=[target])
-    tag = "claims/" + version
+    tag = key + "/" + version
+    if key != "claims":
+        receipt["identity"].pop("releaseBundle")
+        receipt["identity"]["storageKey"] = key
+        old_path = receipt["receiptPath"]
+        receipt["receiptPath"] = old_path.replace(".build/claims/", f".build/{key}/")
+        receipt["committedResultPaths"] = [receipt["receiptPath"] if name == old_path else name
+                                           for name in receipt["committedResultPaths"]]
+    if key.startswith("bundles/"):
+        member_key = "members/packages/claims"
+        receipt["members"] = [{
+            "deliverable": "deliverables.packages.claims",
+            "identity": {**receipt["identity"], "storageKey": member_key},
+            "tag": member_key + "/" + version,
+            "buildReceipt": {"root": "git", "path": f".build/{member_key}/{version}/build_receipt.json",
+                             "size": 1, "sha256": "0" * 64},
+            "artifacts": receipt["artifacts"], "dependencies": receipt["dependencies"],
+        }]
+        for name in ("installationArtifactPath", "commandsAndSettings", "platformAndTools"):
+            receipt.pop(name)
+        for name in ("artifactInputs", "checkInputs", "artifacts", "dependencies", "requiredChecks",
+                     "sourceChecks", "artifactTests", "supportingFiles"):
+            receipt[name] = []
+        receipt["committedResultPaths"] = [receipt["receiptPath"]]
     path = repository / receipt["receiptPath"]
     path.parent.mkdir(parents=True, exist_ok=True)
     if summary is not None:
@@ -101,7 +124,8 @@ def _worktree_build_case(tmp_path):
 
 
 @pytest.mark.parametrize("checkout", ["primary", "release-local", "task-worktree"])
-def test_worktree_build_commits_selected_source_and_finishes_once(tmp_path, checkout):
+@pytest.mark.parametrize("deletion", ["unstaged", "staged"])
+def test_worktree_build_commits_selected_source_and_finishes_once(tmp_path, checkout, deletion):
     repository, options = _worktree_build_case(tmp_path)
     if checkout == "release-local":
         assert run_git(repository, "branch", "-m", "release/local").returncode == 0
@@ -111,6 +135,9 @@ def test_worktree_build_commits_selected_source_and_finishes_once(tmp_path, chec
         assert run_git(source, "worktree", "add", "-b", "task", str(repository)).returncode == 0
         (repository / "unrelated.txt").write_bytes(b"keep staged change")
         assert run_git(repository, "add", "unrelated.txt").returncode == 0
+    (repository / "src/claims.py").unlink()
+    if deletion == "staged":
+        assert run_git(repository, "add", "src/claims.py").returncode == 0
     result = runner.execute_build(repository, **options)
     assert result["status"] == "completed", result
     assert 'version="1.2.20b1"' in run_git(repository, "show", result["tag"] + ":pyproject.toml").stdout
@@ -133,6 +160,9 @@ def test_worktree_build_commits_selected_source_and_finishes_once(tmp_path, chec
                                                 pathlib.Path(result["build_receipts"][0]).relative_to(repository).as_posix())
     assert selected["summary"]["checks"]
     assert selected["receipt"]["identity"]["storageKey"] == "members/packages/claims"
+    assert not run_git(repository, "ls-tree", selected["receipt"]["preTestCommit"], "--", "src/claims.py").stdout
+    assert "src/claims.py" not in {record["path"] for record in selected["receipt"]["artifactInputs"]}
+    assert not run_git(repository, "diff", "--name-only", "HEAD", "--", "src/claims.py").stdout
     assert "releaseUnit" not in selected["receipt"]["identity"]
     again = runner.execute_build(repository, **options)
     assert again["status"] == "completed" and again["final_commit"] == result["final_commit"], again
@@ -257,18 +287,19 @@ def build_reader(request, tmp_path):
     return runpy.run_path(str(path))
 
 
-def test_build_selection_uses_checkout_records_and_levels_not_other_tags(tmp_path, build_reader):
+@pytest.mark.parametrize("key", ["claims", "members/packages/claims", "bundles/claims"])
+def test_build_selection_uses_checkout_records_and_levels_not_other_tags(tmp_path, build_reader, key):
     repository, _ = _versioned_repository(tmp_path)
     for version in ("1.2.0", "1.3.0rc1", "1.3.0b1", "1.3.0a1"):
-        _tag_summary(repository, version, _empty_summary())
+        _tag_summary(repository, version, _empty_summary(), key=key)
     # A newer unfinished preparation and a completed build from another branch
     # cannot replace this checkout's previous completed build.
-    _tag_summary(repository, "1.4.0a1", _empty_summary(), tagged=False)
-    _, unrelated = _tag_summary(repository, "9.0.0", _empty_summary())
+    _tag_summary(repository, "1.4.0a1", _empty_summary(), tagged=False, key=key)
+    _, unrelated = _tag_summary(repository, "9.0.0", _empty_summary(), key=key)
     shutil.rmtree(unrelated.parent)
     for level, version in {"alpha": "1.3.0rc1", "beta": "1.3.0rc1", "rc": "1.3.0rc1", "final": "1.2.0"}.items():
         selected = build_reader["select_build_check_summaries"](repository, qualification_level=level)
-        assert [item["tag"] for item in selected] == ["claims/" + version]
+        assert [item["tag"] for item in selected] == [key + "/" + version]
     assert build_reader["select_build_check_summaries"](repository, target="absent") == []
 
 
@@ -801,7 +832,7 @@ def test_receipt_identities_require_release_bundle_without_an_old_name_alias(
         read(wrong)
 
 
-def test_build_recipe_and_independent_member_versions(tmp_path):
+def test_build_recipe_and_independent_member_versions(tmp_path, capsys):
     repository, _ = _worktree_build_case(tmp_path)
     path = repository / runner.DEFAULT_CONTRACT
     contract = json.loads(path.read_text())
@@ -853,6 +884,45 @@ def test_build_recipe_and_independent_member_versions(tmp_path):
     assert repeated["bundles"][0]["decision"] == "reused"
     assert (repository / ".engine-count").read_text() == "x"
     assert (repository / ".build-count").read_text() == "xx"
+
+    # Supplying an accepted dependency omits its build operation, while its
+    # original identity and acceptance still belong in the consumer's receipt.
+    reference = "deliverables.packages.engine"
+    tool["actions"]["build"]["uses-artifacts"] = [reference]
+    path.write_text(json.dumps(contract))
+    assert run_git(repository, "add", "sdlc/sdlc.yml").returncode == 0
+    assert run_git(repository, "commit", "--only", "-m", "consume engine", "--", "sdlc/sdlc.yml").returncode == 0
+    files = {reference: first["artifacts"][reference]}
+    request = runner.OperationRequest(requests[0].operation, {"version": "1.4.2", "target": "native"})
+    supplied = runner.execute_build(repository, [request], artifacts=files, qualification_level="final")
+    assert supplied["status"] == "completed", supplied
+    assert reference + ".actions.build" not in supplied["completed_operations"]
+    receipt = json.loads(pathlib.Path(supplied["build_receipts"][0]).read_text())
+    dependency = receipt["dependencies"][0]
+    original = json.loads(original_engine)
+    assert dependency["version"] == "3.2.0"
+    assert dependency["acceptanceId"] == original["acceptance"]["id"]
+    assert [record["sha256"] for record in dependency["artifacts"]] == [record["sha256"] for record in original["artifacts"]]
+    assert (repository / ".engine-count").read_text() == "x"
+    assert (repository / ".build-count").read_text() == "xxx"
+
+    # The public parser follows the same route, and repeating it reuses both
+    # the consumer and its explicitly supplied dependency.
+    argv = ["--repo-root", str(repository), "--operation", request.operation,
+            "--artifacts", json.dumps(files), "--parameter", "version=1.4.2",
+            "--parameter", "target=native", "--qualification-level", "final"]
+    capsys.readouterr()
+    for _ in range(2):
+        assert runner.main(argv) == 0
+        returned = json.loads(capsys.readouterr().out)
+        assert returned["status"] == "completed"
+        assert (repository / ".engine-count").read_text() == "x"
+        assert (repository / ".build-count").read_text() == "xxx"
+    raw = repository / ".git/unaccepted-engine.whl"
+    raw.write_bytes(b"no receipt")
+    refused = runner.execute_build(repository, [request], artifacts={reference: [str(raw)]}, qualification_level="final")
+    assert refused["status"] in runner.FAILED_STATUSES and "completed artifact receipt" in refused["message"]
+    assert (repository / ".build-count").read_text() == "xxx"
 
 
 @pytest.mark.parametrize("effect", ["result-commit", "artifact-receipt", "first-tag", "second-tag", "cleanup"])

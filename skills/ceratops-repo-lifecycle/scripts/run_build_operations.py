@@ -540,7 +540,7 @@ def execute_sdlc_operations(
         if item.operation not in comparisons:
             comparison = recorded_build(item.with_artifacts(available), {
                 ref: available[ref] for ref in item.artifact_references if ref in available},
-                supplier_results=results)
+                supplier_results=[*results, *(build_context or {}).get("supplied_results", [])])
             comparisons[item.operation] = comparison
             if (comparison["result"] is None and item.result_schema == "ceratops-builder-output"
                     and build_context is not None):
@@ -555,7 +555,10 @@ def execute_sdlc_operations(
                     allocation = None
                 if allocation is None:
                     parameters = dict(item.parameters)
-                    paths = tuple(item.build_source_files)
+                    contract = operations.read_repository_contract(item.repo_root, item.contract_path)
+                    owner = reference.split(".")
+                    product = contract["deliverables"][owner[1]][owner[2]]
+                    paths = tuple(deliverable_source_files(item.repo_root, product, include_deleted=True))
                     allocation = store_artifacts.allocate_artifact_version(
                         item.repo_root, repository=pathlib.Path(reuse_operation_checks._git(
                             item.repo_root, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()).parent.name,
@@ -563,9 +566,6 @@ def execute_sdlc_operations(
                         version=parameters["version"], required_targets=build_context["targets"][reference],
                         declared_input_paths=paths)
                     if not isinstance(allocation, store_artifacts.ArtifactVersionTransaction):
-                        contract = operations.read_repository_contract(item.repo_root, item.contract_path)
-                        owner = reference.split(".")
-                        product = contract["deliverables"][owner[1]][owner[2]]
                         project = product.get("project", product.get("manifest"))
                         commit = _commit_source(allocation, paths, project=project)
                         allocation = store_artifacts.bind_artifact_inputs(allocation, pre_test_commit=commit)

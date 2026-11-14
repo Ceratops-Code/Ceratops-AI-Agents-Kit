@@ -918,8 +918,12 @@ def read_build_check_summary(root: pathlib.Path, tag: str, receipt_path: str) ->
     raw = _build_blob(root, commit, receipt_path, 1024 * 1024)
     receipt = json.loads(raw)
     identity = receipt["identity"]
-    expected_tag = identity["releaseBundle"] + "/" + identity["version"]
-    parent = f'.build/{identity["releaseBundle"]}/{identity["version"]}'
+    key = identity.get("storageKey", identity.get("releaseBundle"))
+    slug = r"[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*"
+    if not isinstance(key, str) or not re.fullmatch(rf"(?:{slug}|members/{slug}/{slug}|bundles/{slug})", key):
+        raise ValueError("Receipt storage key has invalid path segments.")
+    expected_tag = key + "/" + identity["version"]
+    parent = f'.build/{key}/{identity["version"]}'
     expected_paths = {parent + "/build_receipt.json",
                       parent + "/" + identity["target"] + "/build_receipt.json"}
     if (receipt.get("schema") != "ceratops-build-result.v4" or receipt.get("status") != "passed"
@@ -962,7 +966,9 @@ def select_build_check_summaries(
     if not history.is_dir():
         return []
     candidates: list[tuple[Any, str, str, pathlib.Path, str]] = []
-    for pattern in ("*/*/build_receipt.json", "*/*/*/build_receipt.json"):
+    for pattern in ("*/*/build_receipt.json", "*/*/*/build_receipt.json",
+                    "members/*/*/*/build_receipt.json", "members/*/*/*/*/build_receipt.json",
+                    "bundles/*/*/build_receipt.json", "bundles/*/*/*/build_receipt.json"):
         for path in history.glob(pattern):
             if any(parent.is_symlink() or parent.is_junction() for parent in (path, *path.parents)):
                 raise ValueError("Build history cannot traverse directory links.")
@@ -973,7 +979,8 @@ def select_build_check_summaries(
                 if receipt.get("schema") != "ceratops-build-result.v4":
                     continue
                 identity = receipt["identity"]
-                name, destination, version = identity["releaseBundle"], identity["target"], identity["version"]
+                name = identity.get("storageKey", identity.get("releaseBundle"))
+                destination, version = identity["target"], identity["version"]
                 level = build_qualification(version)
                 if (unit is not None and name != unit) or (target is not None and destination != target):
                     continue
@@ -995,7 +1002,7 @@ def select_build_check_summaries(
             continue
         selected = read_build_check_summary(root, tag, path.relative_to(root).as_posix())
         identity = selected["receipt"]["identity"]
-        if (identity["releaseBundle"], identity["target"]) != (name, destination):
+        if (identity.get("storageKey", identity.get("releaseBundle")), identity["target"]) != (name, destination):
             raise ValueError("Local build selector differs from the tagged identity.")
         chosen[(name, destination)] = selected
     return [chosen[key] for key in sorted(chosen)]

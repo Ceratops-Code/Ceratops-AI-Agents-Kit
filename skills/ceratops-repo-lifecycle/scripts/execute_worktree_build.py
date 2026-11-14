@@ -55,7 +55,13 @@ def _commit_source(allocation: store_artifacts.ArtifactVersionAllocation, paths:
                 text = text.replace("\r\n", "\n").replace("\n", "\r\n")
             manifest.write_bytes(text.encode("utf-8"))
     if paths:
-        _require_command(_git(root, 'add', '--', *paths), root=root)
+        indexed = _git(root, 'ls-files', '-z', '--', *paths)
+        _require_command(indexed, root=root)
+        # A staged deletion has no index entry left for `git add`; retain it
+        # in the commit pathspec without trying to stage the missing file again.
+        stage_paths = [path for path in paths if (root / path).exists() or path in indexed.stdout.split('\0')]
+        if stage_paths:
+            _require_command(_git(root, 'add', '--', *stage_paths), root=root)
         changed = _git(root, 'diff', '--cached', '--quiet', '--', *paths)
         if changed.returncode not in (0, 1):
             _require_command(changed, root=root)
@@ -164,6 +170,33 @@ def execute_build(
                 qualification_level=qualification_level, validation_operations=validation_operations,
                 include_checks=include_checks,
             )) for target, group in groups.items()]
+            # Explicit supplier files suppress their build operation. Read their
+            # existing acceptance before effects and retain it for the consumer's
+            # receipt; do not invent a supplier build that never ran here.
+            supplied_results = []
+            supplied_references = {reference for _, batch in batches for item in batch
+                                   if item.result_schema == "ceratops-builder-output"
+                                   for reference in item.artifact_references if reference in (artifacts or {})}
+            for reference in sorted(supplied_references):
+                paths = [(root / path).resolve() for path in artifacts[reference]]
+                store = store_artifacts._artifact_store_path(root)
+                receipt_paths = {next((parent / "artifact-receipt.json" for parent in path.parents
+                                      if parent.is_relative_to(store) and (parent / "artifact-receipt.json").is_file()), None)
+                                 for path in paths}
+                if len(receipt_paths) != 1 or None in receipt_paths:
+                    raise operations.OperationError(f"Supplied files for {reference} require one completed artifact receipt.")
+                accepted = sdlc_results.read_artifact_receipt_chain(root, artifact_receipt_path=receipt_paths.pop())
+                receipt = accepted.build_receipt.value
+                if receipt.get("commandsAndSettings", {}).get("operation") != reference + ".actions.build":
+                    raise operations.OperationError(f"Supplied receipt does not belong to {reference}.")
+                if not set(paths).issubset({path.resolve() for path in accepted.artifacts}):
+                    raise operations.OperationError(f"Supplied files are not recorded outputs of {reference}.")
+                supplied_results.append({
+                    "operation": reference + ".actions.build", "status": "completed",
+                    "artifact_identity": receipt["identity"], "artifact_records": receipt["artifacts"],
+                    "artifacts": {reference: [str(path) for path in accepted.artifacts]},
+                    "step_results": [{"step": "supplied-build", "result": receipt}],
+                })
             if prepare_only:
                 return {"status": "prepared", "operations": requested_operations,
                         "prerequisites": operations._combined_prerequisites([item for _, batch in batches for item in batch])}
@@ -171,7 +204,7 @@ def execute_build(
                 operations.require_clean_commit(root, expected_commit)
             result = {"status": "completed", "results": [], "completed_operations": [], "pending_operations": []}
             build_context: dict[str, Any] = {"transactions": {}, "prepared": {}, "receipts": {}, "contract_path": contract_path,
-                             "targets": {}}
+                             "targets": {}, "supplied_results": supplied_results}
             for target, batch in batches:
                 for item in batch:
                     if item.category == "build":
@@ -211,7 +244,7 @@ def execute_build(
                                  if value.get("status") == "completed" and value.get("operation", "").endswith(".build")]
                     build_context["receipts"][key] = complete_artifact_builds.prepare_versioned_build_receipt(
                         transaction, item.build_target, None, prepared_operation=item,
-                        command_result=produced, completed_results=[*checks, *suppliers],
+                        command_result=produced, completed_results=[*checks, *suppliers, *supplied_results],
                         check_summaries=_summaries({"results": [produced, *checks]}))
                 if result["status"] in operations.FAILED_STATUSES:
                     owner, action = diagnostic_owner or (root, "build")
@@ -227,7 +260,7 @@ def execute_build(
                     produced = next(value for value in batch["results"] if value.get("operation") == item.operation)
                     receipt = build_context["receipts"].get(key) or complete_artifact_builds.prepare_versioned_build_receipt(
                         transaction, item.build_target, None, prepared_operation=item,
-                        command_result=produced, completed_results=batch["results"],
+                        command_result=produced, completed_results=[*batch["results"], *supplied_results],
                         check_summaries=_summaries(batch),
                     )
                     pending.setdefault(transaction.release_bundle, (transaction, []))[1].append(receipt)

@@ -661,6 +661,13 @@ SDLC results; no caller-supplied second receipt exists. One result commit contai
 all required targets and bundle/member receipts, followed by member and bundle
 tags. A fresh call finishes missing effects from current files and Git state.
 Unrelated staged files remain outside the source/result commits.
+Source preparation includes staged and unstaged deletions under the declared
+source paths; the receipt's blob list contains only files present in that commit.
+Explicit dependency files suppress their producer's build. Before running the
+consumer, Build reads the artifact receipt beside those exact files and passes
+the supplier's recorded version, file records and acceptance to completion.
+The portable and generated test runners discover both member and bundle receipt
+folders when reading the completed builds' tagged check summaries.
 
 `ND.COMPATIBILITY.TEST_RESULT_REUSE` reviews independently reusable units using
 saved outcomes and behavior evidence, including interruption and partial fixes.
