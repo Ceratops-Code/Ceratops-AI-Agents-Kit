@@ -108,7 +108,7 @@ def prepare_build_operations(root, requests, contract_path=None, *, context="ski
             parameters.setdefault("artifact_directory", str(root / ".pending-build-output"))
             request = replace(request, parameters_if_declared={key: value for key, value in parameters.items()
                               if key not in (request.parameters or {})})
-        items = operations.prepare_operations(root, [request], contract_path, context=context, artifacts=artifacts)
+        items = operations.prepare_operations(root, [request], contract_path, context=context, artifacts=artifacts, defer_install_inputs=True)
         prepared[request.operation] = [replace(item, qualification_level=qualification_level) for item in items]
         references: set[str] = set()
         for item in items:
@@ -123,6 +123,9 @@ def prepare_build_operations(root, requests, contract_path=None, *, context="ski
                 request_parameters = {key: value for key, value in {
                     **(request.parameters_if_declared or {}), **(request.parameters or {})}.items()
                     if key not in {"version", "artifact_directory"}}
+                if action.get("install-inputs") == "accepted-build" and reference == request.operation.rsplit(".actions.", 1)[0]:
+                    if "version" in (request.parameters or {}):
+                        request_parameters["version"] = request.parameters["version"]
                 dependency = operations.OperationRequest(location, parameters_if_declared=request_parameters)
                 requested[location] = dependency
                 pending.append(dependency)

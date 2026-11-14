@@ -4,6 +4,10 @@ kind: ceratops-sdlc
 # Ceratops records native source checks and reuses applicable passes.
 # Test runners can supply case-level evidence through their result contract.
 # Keep source scans and tests in separate check-groups; each group owns its command.
+# Package-based Install actions use install-inputs: accepted-build, declare
+# target/destination parameters, and return ceratops-deployment-result.v1 with
+# version/destination. Commands receive {artifact_receipt}, {package_file},
+# {installer_dependencies} (JSON array), or {install_input_file} (all values).
 repository:
   tools:
     # Point version-from.file at this target's native version metadata; use key

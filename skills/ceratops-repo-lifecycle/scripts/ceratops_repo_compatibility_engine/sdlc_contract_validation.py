@@ -34,7 +34,7 @@ OPERATION_RE = re.compile(
     rf"(?:\.check-groups\.(?P<group>{NAME}))?$"
 )
 ACTIONS_BY_KIND = {
-    "packages": CHECK_ACTIONS | {"build", "publish", "verify-publish"},
+    "packages": CHECK_ACTIONS | {"build", "install", "publish", "verify-publish"},
     "apps": CHECK_ACTIONS | {"build", "install", "publish", "verify-publish"},
     "mcp-servers": CHECK_ACTIONS | {"build", "install", "publish", "verify-publish"},
     "skills": CHECK_ACTIONS | {"build", "install"},
@@ -384,6 +384,16 @@ def _find_sdlc_declaration_errors(
         handoff_positions = [position for position, step in enumerate(steps, 1) if "handoff" in step]
         if handoff_positions and handoff_positions != [len(steps)]:
             errors.append(f"handoff must be the single final step at {location}")
+        if action.get("install-inputs") is not None:
+            if action_name != "install" or owner not in records:
+                errors.append(f"{location}.install-inputs is supported only on a deliverable Install action")
+            if (not steps or handoff_positions or action.get("result-schema") != "ceratops-deployment-result.v1"):
+                errors.append(f"{location}.install-inputs requires commands returning ceratops-deployment-result.v1")
+            declared = set(action.get("parameters", []))
+            if not {"target", "destination"}.issubset(declared):
+                errors.append(f"{location}.install-inputs requires target and destination parameters")
+            if declared & {"version", "tag", "artifact_receipt", "package_file", "installer_dependencies", "install_input_file"}:
+                errors.append(f"{location}.install-inputs supplies receipt/package fields and optional version/tag selectors itself")
         groups = action.get("checks", {})
         if groups and action_name != "build":
             errors.append(f"{location}.checks is supported only inside a build")

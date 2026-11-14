@@ -403,7 +403,10 @@
           "description": "Environment variables whose values affect the builder output; receipts retain fingerprints only.",
           "type": "array",
           "uniqueItems": true,
-          "items": {"type": "string", "minLength": 1}
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
         },
         "checks": {
           "description": "Checks executed and reported by this builder, without additional commands.",
@@ -482,6 +485,10 @@
               }
             }
           }
+        },
+        "install-inputs": {
+          "description": "Install consumes one accepted build, supplying its receipt, package, recorded dependencies and destination to declared command arguments.",
+          "const": "accepted-build"
         }
       },
       "oneOf": [
@@ -580,6 +587,9 @@
           "$ref": "#/$defs/nonBuildAction"
         },
         "verify-publish": {
+          "$ref": "#/$defs/nonBuildAction"
+        },
+        "install": {
           "$ref": "#/$defs/nonBuildAction"
         }
       }

@@ -275,6 +275,42 @@ artifact receipt to its tagged Git receipt and checks recorded files against
 their sizes and hashes. Returning the installation path reuses the already read
 artifact entry. It does not run acceptance checks.
 
+An Install action opts into package consumption with `install-inputs:
+accepted-build`. It declares `target` and `destination` in `parameters` and
+returns the existing `ceratops-deployment-result.v1` result with `version` and
+`destination`. `target` identifies the built platform; `destination` identifies
+where to install it. Package deliverables can declare this Install action too.
+The action's commands can use these whole-argument placeholders:
+
+| Argument | Value supplied by `prepare_operations()` |
+|---|---|
+| `{artifact_receipt}` | The retained receipt for the requested accepted build. |
+| `{package_file}` | Its `installationArtifactPath` file. |
+| `{installer_dependencies}` | A JSON array of the receipt's recorded dependency file paths. |
+| `{version}`, `{tag}`, `{target}` | The accepted build's exact version, tag and platform. |
+| `{destination}` | The requested installation directory, made absolute from the repository root. |
+| `{install_input_file}` | Optional JSON file containing these same values and the operation name. |
+
+`execute_build()` returns accepted receipt identities alongside output paths.
+After advancing `release/local`, Promote passes those identities to the same
+`prepare_operations()` call used by standalone Install. Standalone callers pass
+`--parameter version=VERSION` or `--parameter tag=TAG`, plus `target` and
+`destination`. No caller searches for the newest package. A wrong deliverable,
+target, tag or package file stops preparation before an installer writes its
+destination. The existing receipt reader checks the saved files once at this
+boundary; it does not repeat their tests.
+
+The optional command-input file has one stable location per checkout/action:
+`<git-common>/ceratops/install-inputs/<checkout-hash>/<operation-hash>.json`.
+The operation runner owns it. Preparation replaces any interrupted document;
+execution removes it in `finally`, including failed commands. Prepare-only
+removes it before returning. It is neither history nor recovery progress.
+Installer commands inspect their destination on each call and finish missing
+effects. An unsuccessful or malformed result reports that installation may have
+completed; the runner never repeats the command merely to recover its report.
+Current source-based skill/MCP installer declarations remain unchanged until
+their package producers and installers adopt this interface together.
+
 The final direction removes generated repository `sdlc.py`, a local copy of the
 operation engine, and `scripts/runtime`. Those proposed extra layers were
 rejected. Installed skill bindings remain in the skills; target repositories

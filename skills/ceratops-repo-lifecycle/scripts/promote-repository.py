@@ -404,11 +404,31 @@ def promote(args: argparse.Namespace, *, timings: dict[str, float] | None = None
         if record_code:
             raise PromotionError(str(record.get("message", "Scope recording failed.")))
 
-        prepared_operations = prepare_operations(
-            repo_root, [OperationRequest(name, parameters=parameters) for name in (args.run_operation or [])],
-            _remap_repo_owned_path(contract, requested_root=task_root, effective_root=repo_root),
-            context="skill", artifacts=validation.get("artifacts", {}),
-        ) if args.run_operation else []
+        result: dict[str, object] = {
+            "status": "ready",
+            "release_branch": args.release_branch,
+            "head": target_commit,
+            "submitted_commits": {name: state.head for name, state in source_states.items()},
+            "tested_commit": target_commit, "accepted_commit": target_commit,
+            "release_start": release_start,
+            "merged_branches": merged,
+            "pending_work_scope": record["pending_work_scope"],
+            "operations": None,
+        }
+        try:
+            prepared_operations = prepare_operations(
+                repo_root, [OperationRequest(name, parameters=parameters) for name in (args.run_operation or [])],
+                _remap_repo_owned_path(contract, requested_root=task_root, effective_root=repo_root),
+                context="skill", artifacts=validation.get("artifacts", {}),
+                accepted_builds=validation.get("accepted_builds", ()),
+            ) if args.run_operation else []
+        except (OperationError, OSError, ValueError) as exc:
+            raise PromotionError(str(exc), {
+                "status": "error", "phase": "deployment", "remote_mutation": False,
+                "promotion": result, "pending_work_scope": record["pending_work_scope"],
+                "operations": {"status": "error", "message": str(exc), "completed_operations": [],
+                               "pending_operations": list(args.run_operation or []), "results": []},
+            }) from exc
         prepared_operations = [replace(item, qualification_level="beta") for item in prepared_operations
                                if item.category in {"deploy-local", "publish", "verify-publish"}]
         for index, item in enumerate(prepared_operations):
@@ -430,17 +450,6 @@ def promote(args: argparse.Namespace, *, timings: dict[str, float] | None = None
                 target_commit=target_commit,
                 pending_work_scope=pending_work_scope,
             )
-        result: dict[str, object] = {
-            "status": "ready",
-            "release_branch": args.release_branch,
-            "head": target_commit,
-            "submitted_commits": {name: state.head for name, state in source_states.items()},
-            "tested_commit": target_commit, "accepted_commit": target_commit,
-            "release_start": release_start,
-            "merged_branches": merged,
-            "pending_work_scope": pending_work_scope,
-            "operations": None,
-        }
         if record.get("preserved_sources"):
             result["preserved_sources"] = record["preserved_sources"]
         validation_handoffs = validation.get("deferred_handoffs", [])

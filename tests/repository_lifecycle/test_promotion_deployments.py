@@ -1150,3 +1150,63 @@ def test_non_deployment_handoff_does_not_offer_installer_receipt_return(tmp_path
     assert pending["status"] == "handoff_required"
     assert "report_completion" not in pending
     assert not (repo / "calls.jsonl").exists()
+
+
+
+def test_promotion_passes_accepted_package_to_install(tmp_path, monkeypatch):
+    """Plain Promote builds; deployment and standalone Install use that receipt."""
+    from unittest.mock import Mock
+    from tests.repository_lifecycle.test_completed_builds import _worktree_build_case, runner
+    from tests.repository_lifecycle.test_operations import INSTALLER_PROBE
+    from tests.repository_lifecycle.support import run_operation_cli
+
+    repo, _options = _worktree_build_case(tmp_path)
+    assert run_git(repo, "restore", "--staged", "--worktree", "unrelated.txt").returncode == 0
+    (repo / "scripts/install.py").write_text(INSTALLER_PROBE, encoding="utf-8")
+    contract_path = repo / "sdlc/sdlc.yml"
+    contract = json.loads(contract_path.read_text())
+    operation = "deliverables.packages.claims.actions.install"
+    contract["deliverables"]["packages"]["claims"]["actions"]["install"] = {
+        "requires": {"tools": []}, "install-inputs": "accepted-build",
+        "parameters": ["target", "destination"], "result-schema": "ceratops-deployment-result.v1",
+        "steps": [{"run": [sys.executable, "scripts/install.py", "file", "{install_input_file}"]}],
+    }
+    contract_path.write_text(json.dumps(contract), encoding="utf-8")
+    assert run_git(repo, "add", ".").returncode == 0
+    assert run_git(repo, "commit", "-m", "package Install").returncode == 0
+    assert run_git(repo, "branch", "release/local").returncode == 0
+    task = tmp_path / "task"
+    assert run_git(repo, "worktree", "add", "-b", "approved", str(task)).returncode == 0
+    command = [sys.executable, str(PROMOTE_REPOSITORY), "--repo-root", str(task), "--source-branch", "approved"]
+    plain = subprocess.run([*command, "--no-run-operation"], capture_output=True, text=True, check=False)
+    assert plain.returncode == 0, plain.stderr
+    assert json.loads(plain.stdout)["operations"] is None
+    assert (task / ".build-count").read_text() == "x"
+    destination = tmp_path / "installed package"
+    parameters = ["--parameter", "target=native", "--parameter", "destination=" + str(destination)]
+    promoted = subprocess.run([*command, "--run-operation", operation, *parameters], capture_output=True, text=True, check=False)
+    assert promoted.returncode == 0, promoted.stderr
+    payload = json.loads(promoted.stdout)
+    assert payload["status"] == "ready"
+    expected = json.loads((destination / "inputs.json").read_text())
+    assert expected["version"] == "1.2.19b1"
+    assert (task / ".build-count").read_text() == "x"
+    assert (destination / "effects").read_text() == "x"
+    standalone = run_operation_cli(repo, operation, parameters=(
+        "tag=" + expected["tag"], "target=native", "destination=" + str(destination)))
+    assert standalone.returncode == 0, standalone.stderr
+    assert json.loads((destination / "inputs.json").read_text()) == expected
+    assert (destination / "effects").read_text() == "x"
+    assert not (repo / ".build-count").exists()
+    module = runpy.run_path(str(PROMOTE_REPOSITORY))
+    args = module["build_parser"]().parse_args(["--repo-root", str(task), "--source-branch", "approved",
+        "--run-operation", operation, *parameters])
+    with monkeypatch.context() as scoped:
+        scoped.setitem(module["promote"].__globals__, "prepare_operations",
+                       Mock(side_effect=runner.OperationError("Install receipt unavailable")))
+        with pytest.raises(module["PromotionError"]) as error:
+            module["promote"](args)
+    assert error.value.payload["promotion"]["status"] == "ready"
+    assert error.value.payload["phase"] == "deployment"
+    assert run_git(repo, "rev-parse", "release/local").stdout.strip() == error.value.payload["promotion"]["head"]
+    assert (destination / "effects").read_text() == "x"

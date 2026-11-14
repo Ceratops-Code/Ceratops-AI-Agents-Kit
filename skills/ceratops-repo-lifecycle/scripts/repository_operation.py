@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import hashlib
 import json
 import os
 import pathlib
@@ -138,6 +139,9 @@ class PreparedOperation:
     build_source_files: tuple[str, ...] = ()
     build_target: str | None = None
     automatic_check: bool = False
+    install_from_build: bool = False
+    installation: Mapping[str, Any] | None = None
+    install_input_file: pathlib.Path | None = None
 
     @property
     def artifact_references(self) -> tuple[str, ...]:
@@ -235,11 +239,14 @@ def parse_parameters(values: Sequence[str]) -> dict[str, str]:
     return result
 
 
-def _parameters(
+def _collect_operation_parameters(
     selected: Mapping[str, Any],
     request: OperationRequest,
 ) -> dict[str, str]:
+    """Collect caller values; accepted-package selectors are optional until Build finishes."""
     declared = set(selected.get("parameters", []))
+    selectors = {"version", "tag"} if selected.get("install-inputs") == "accepted-build" else set()
+    allowed = declared | selectors
     supplied = dict(request.parameters or {})
     conditional = dict(request.parameters_if_declared or {})
     duplicated = sorted(set(supplied) & set(conditional))
@@ -248,10 +255,10 @@ def _parameters(
             "Parameter supplied more than once: " + ", ".join(duplicated)
         )
     supplied.update(
-        (name, value) for name, value in conditional.items() if name in declared
+        (name, value) for name, value in conditional.items() if name in allowed
     )
     missing = sorted(declared - set(supplied))
-    extra = sorted(set(request.parameters or {}) - declared)
+    extra = sorted(set(request.parameters or {}) - allowed)
     if missing or extra:
         detail = []
         if missing:
@@ -259,10 +266,12 @@ def _parameters(
         if extra:
             detail.append("unexpected " + ", ".join(extra))
         raise OperationError("SDLC parameter mismatch: " + "; ".join(detail))
+    if any(not isinstance(value, str) or not value.strip() for value in supplied.values()):
+        raise OperationError("SDLC parameter values must be nonempty strings.")
     return supplied
 
 
-def _expanded_argv(
+def _substitute_command_parameters(
     argv: Sequence[str], parameters: Mapping[str, str]
 ) -> tuple[str, ...]:
     """Substitute only whole-argument declared placeholders."""
@@ -299,7 +308,7 @@ def _prepared_step(
         return PreparedStep(position, None, repo_root, dict(step["handoff"]))
     return PreparedStep(
         step.get("id", position),
-        _expanded_argv(step["run"], parameters),
+        _substitute_command_parameters(step["run"], parameters),
         _working_directory(repo_root, step.get("cwd", ".")),
     )
 
@@ -342,6 +351,8 @@ def prepare_operations(
     *,
     context: str = "skill",
     artifacts: Mapping[str, list[str]] | None = None,
+    accepted_builds: Sequence[Mapping[str, Any]] = (),
+    defer_install_inputs: bool = False,
 ) -> list[PreparedOperation]:
     """Validate all selected commands, parameters and cwd values before execution."""
 
@@ -368,15 +379,93 @@ def prepare_operations(
                 continue
             included[location] = request
             selected = entries[location]
-            parameters = _parameters(selected, request)
+            parameters = _collect_operation_parameters(selected, request)
+            install_from_build = selected.get("install-inputs") == "accepted-build"
+            installation: dict[str, Any] | None = None
+            input_file = None
+            derived_parameters: dict[str, str] = {}
+            if install_from_build and not defer_install_inputs:
+                reference = location.rsplit(".actions.", 1)[0]
+                target = parameters["target"]
+                key = sdlc_results.artifact_storage_key(deliverable=reference)
+                records = [record for record in accepted_builds
+                           if record["operation"] == reference + ".actions.build"
+                           and record["identity"]["target"] == target]
+                if len(records) > 1:
+                    raise OperationError(f"More than one accepted build supplied for {reference} on {target}.")
+                record = records[0] if records else None
+                tag = parameters.get("tag")
+                version = parameters.get("version")
+                if record is not None:
+                    if ((tag is not None and tag != record["tag"])
+                            or (version is not None and version != record["identity"]["version"])):
+                        raise OperationError(f"Requested Install version differs from the accepted build of {reference}.")
+                    tag = record["tag"]
+                    version = record["identity"]["version"]
+                elif tag is not None:
+                    prefix = key + "/"
+                    if not tag.startswith(prefix) or (version is not None and tag != prefix + version):
+                        raise OperationError(f"Install tag does not identify the requested version of {reference}.")
+                    version = tag[len(prefix):]
+                if version is None:
+                    raise OperationError(f"Install requires an explicit version or tag for {reference}.")
+                if not store_artifacts.FULL_VERSION_RE.fullmatch(version):
+                    raise OperationError(f"Invalid Install version: {version}")
+                tag = tag or key + "/" + version
+                if record is None:
+                    # The tag fixes the receipt, including its repository identity.
+                    # No latest-version search or installed-version fallback occurs.
+                    commit_at_tag = sdlc_results._resolve_git_tag(root, tag)
+                    directory = f".build/{key}/{version}"
+                    paths = sdlc_results._build_git(root, "ls-tree", "-r", "--name-only", commit_at_tag,
+                                                   "--", directory).decode().splitlines()
+                    paths = [path for path in paths if path in {
+                        directory + "/build_receipt.json", directory + f"/{target}/build_receipt.json"}]
+                    if len(paths) != 1:
+                        raise OperationError(f"Install receipt is missing or ambiguous for {tag} on {target}.")
+                    saved = sdlc_results.read_build_check_summary(root, tag, paths[0])
+                    identity = saved["receipt"]["identity"]
+                else:
+                    identity = record["identity"]
+                if identity.get("storageKey") != key or identity["target"] != target:
+                    raise OperationError(f"Install receipt belongs to a different deliverable or target: {reference}.")
+                accepted = sdlc_results.read_artifact_receipt_chain(root, tag=tag, expected=identity)
+                receipt = accepted.build_receipt.value
+                if receipt["commandsAndSettings"]["operation"] != reference + ".actions.build":
+                    raise OperationError(f"Install receipt does not belong to {reference}.")
+                if accepted.installation_artifact is None:
+                    raise OperationError(f"Build {tag} has no installation package.")
+                supplied_files = (artifacts or {}).get(reference)
+                if supplied_files is not None and {str((root / name).resolve()) for name in supplied_files} != {
+                        str(path.resolve()) for path in accepted.artifacts}:
+                    raise OperationError(f"Install files differ from the accepted receipt for {reference}.")
+                destination = str((root / parameters["destination"]).resolve())
+                installation = {
+                    "operation": location, "tag": tag, "version": version, "target": target,
+                    "artifact_receipt": str(accepted.receipt_path),
+                    "package_file": str(accepted.installation_artifact),
+                    "installer_dependencies": [str(path) for path in accepted.dependencies],
+                    "destination": destination,
+                }
+                derived_parameters = {name: json.dumps(value, ensure_ascii=False) if isinstance(value, list) else value
+                                      for name, value in installation.items() if name != "operation"}
+                if any("{install_input_file}" in step.get("run", []) for step in selected.get("steps", [])):
+                    # One replaceable command-input document per checkout/action.
+                    # It is not progress or a receipt. A fresh preparation replaces
+                    # an interrupted write; command execution removes it in finally.
+                    checkout_key = hashlib.sha256(str(root).encode()).hexdigest()
+                    operation_key = hashlib.sha256(location.encode()).hexdigest()
+                    input_file = store_artifacts._git_common_path(root) / "ceratops" / "install-inputs" / checkout_key / (operation_key + ".json")
+                    derived_parameters["install_input_file"] = str(input_file)
             group = location.split(".check-groups.", 1)[1] if ".check-groups." in location else None
             # Artifact paths become known after prerequisite builds. Only explicit
             # whole-argument placeholders are supplied; native scans get no extra flags.
-            command_parameters = {**parameters, "artifacts": "{artifacts}"}
+            command_parameters = {**parameters, **derived_parameters, "artifacts": "{artifacts}"}
             if group:
                 command_parameters["check_group"] = group
-            steps = tuple(_prepared_step(root, step, position, command_parameters)
-                          for position, step in enumerate(selected.get("steps", []), 1))
+            steps = () if install_from_build and defer_install_inputs else tuple(
+                _prepared_step(root, step, position, command_parameters)
+                for position, step in enumerate(selected.get("steps", []), 1))
             prerequisites = operation_prerequisites(contract, location)
             owner = location.split(".actions.", 1)[0].split(".")
             deliverable = contract["deliverables"][owner[1]][owner[2]] if len(owner) == 3 else {}
@@ -387,6 +476,7 @@ def prepare_operations(
                 result_commit_field=selected.get("result-commit-field"),
                 mcp_source=deliverable.get("root-dir") if owner[:2] == ["deliverables", "mcp-servers"] else None,
                 check_group=group,
+                install_from_build=install_from_build, installation=installation, install_input_file=input_file,
                 check_phase=category.removesuffix("-checks") if category in {"pre-build-checks", "post-build-checks"} else None,
                 build_source_files=tuple(deliverable_source_files(root, deliverable))
                 if category == "build" and commit else (),
@@ -394,6 +484,13 @@ def prepare_operations(
             prepared.append(item.with_artifacts(artifacts or {}))
     if any(item.result_commit_field for item in prepared[:-1]):
         raise OperationError("A build returning its final commit must be the last selected operation.")
+    # All receipts and commands must be ready before producing any command-input
+    # file. These bounded, disposable files live only in the Git common directory.
+    for item in prepared:
+        if item.install_input_file is not None:
+            assert item.installation is not None
+            store_artifacts._write_transaction_record(item.install_input_file, item.installation,
+                                                      replace=True, label="Install command input")
     return prepared
 
 
@@ -481,90 +578,187 @@ def execute_prepared_operation(
     runs in another checkout. No tests are selected or repeated for reporting.
     """
 
-    base: dict[str, object] = {
-        "operation": prepared.operation,
-        "commit": prepared.commit,
-        "qualification_level": prepared.qualification_level,
-        "parameters": dict(prepared.parameters),
-        "steps": [],
-    }
-    if prepared.check_group is not None:
-        base["check_group"] = prepared.check_group
-    failure_id = prepared.operation
-    owner_root, action = diagnostic_owner or (prepared.repo_root, "operation")
-    report_options = {
-        "diagnostic_output": diagnostic_output, "repo_root": owner_root,
-        "action": action, "failure_id": failure_id,
-        "successful_results": successful_results, "output_root": prepared.repo_root,
-    }
-    remove_resolved_failures(base, diagnostic_output=diagnostic_output,
-                             repo_root=owner_root, action=action, resolved_failures=())
-    if prepared.test_context is not None:
-        base["test_context"] = dict(prepared.test_context)
-    if prepared.prerequisites and any(prepared.prerequisites.values()):
-        base["prerequisites"] = dict(prepared.prerequisites)
-    if prepared.no_op_reason is not None:
-        return {**base, "status": "no_op", "reason": prepared.no_op_reason}
-    if prepared.result_commit_field and not re.fullmatch(r"[0-9a-f]{40}", prepared.commit or ""):
-        return report_failure({**base, "status": "result_invalid", "message":
-            f"A commit-reporting build requires an existing 40-character Git HEAD in {prepared.repo_root}."}, **report_options)
-    report_phase(prepared.operation, enabled=diagnostic_output is not None)
-    if repository_commit(prepared.repo_root) != prepared.commit:
-        return report_failure({
-            **base,
-            "status": "state_changed",
-            "message": "HEAD changed after preparation.",
-        }, **report_options)
     try:
-        if prepared.check_group is not None or prepared.category == "build":
-            missing = set(prepared.artifact_references) - set(prepared.selected_artifacts or {})
-            for group, references in prepared.build_check_references.items():
-                missing.update(set(references) - set((prepared.build_check_artifacts or {}).get(group, {})))
-            if missing:
-                raise ValueError(f"Required artifacts are not ready for {prepared.operation}: " + ", ".join(sorted(missing)))
-            reuse_operation_checks.artifact_inputs(prepared.repo_root, dict(prepared.selected_artifacts or {}))
-            for files in (prepared.build_check_artifacts or {}).values():
-                reuse_operation_checks.artifact_inputs(prepared.repo_root, files)
-        check_plan = prepared.check_plan
-        if prepared.check_results is not None and check_plan is None:
-            check_plan = reuse_operation_checks.decide_check_reuse(prepared)
-        if check_plan is not None:
-            if prepared.check_results is None:
-                raise ValueError("Check plan has no current owned input declaration.")
-            # An earlier callback may have changed declared inputs after the batch
-            # preflight. Read current inputs before consuming that original pass.
-            current = reuse_operation_checks.collect_check_inputs(prepared, prepared.check_results)
-            if current["fingerprint"] != check_plan.context["fingerprint"]:
+        base: dict[str, object] = {
+            "operation": prepared.operation,
+            "commit": prepared.commit,
+            "qualification_level": prepared.qualification_level,
+            "parameters": dict(prepared.parameters),
+            "steps": [],
+        }
+        if prepared.install_from_build and prepared.installation is None:
+            raise OperationError("Install has no accepted package; prepare it after Build completes.")
+        if prepared.installation is not None:
+            base["installation"] = dict(prepared.installation)
+        if prepared.check_group is not None:
+            base["check_group"] = prepared.check_group
+        failure_id = prepared.operation
+        owner_root, action = diagnostic_owner or (prepared.repo_root, "operation")
+        report_options = {
+            "diagnostic_output": diagnostic_output, "repo_root": owner_root,
+            "action": action, "failure_id": failure_id,
+            "successful_results": successful_results, "output_root": prepared.repo_root,
+        }
+        remove_resolved_failures(base, diagnostic_output=diagnostic_output,
+                                 repo_root=owner_root, action=action, resolved_failures=())
+        if prepared.test_context is not None:
+            base["test_context"] = dict(prepared.test_context)
+        if prepared.prerequisites and any(prepared.prerequisites.values()):
+            base["prerequisites"] = dict(prepared.prerequisites)
+        if prepared.no_op_reason is not None:
+            return {**base, "status": "no_op", "reason": prepared.no_op_reason}
+        if prepared.result_commit_field and not re.fullmatch(r"[0-9a-f]{40}", prepared.commit or ""):
+            return report_failure({**base, "status": "result_invalid", "message":
+                f"A commit-reporting build requires an existing 40-character Git HEAD in {prepared.repo_root}."}, **report_options)
+        report_phase(prepared.operation, enabled=diagnostic_output is not None)
+        if repository_commit(prepared.repo_root) != prepared.commit:
+            return report_failure({
+                **base,
+                "status": "state_changed",
+                "message": "HEAD changed after preparation.",
+            }, **report_options)
+        try:
+            if prepared.check_group is not None or prepared.category == "build":
+                missing = set(prepared.artifact_references) - set(prepared.selected_artifacts or {})
+                for group, references in prepared.build_check_references.items():
+                    missing.update(set(references) - set((prepared.build_check_artifacts or {}).get(group, {})))
+                if missing:
+                    raise ValueError(f"Required artifacts are not ready for {prepared.operation}: " + ", ".join(sorted(missing)))
+                reuse_operation_checks.artifact_inputs(prepared.repo_root, dict(prepared.selected_artifacts or {}))
+                for files in (prepared.build_check_artifacts or {}).values():
+                    reuse_operation_checks.artifact_inputs(prepared.repo_root, files)
+            check_plan = prepared.check_plan
+            if prepared.check_results is not None and check_plan is None:
                 check_plan = reuse_operation_checks.decide_check_reuse(prepared)
-            else:
-                check_plan.decision = check_plan.store.select(
-                    current, check_id=current["group"],
-                    builds=sdlc_results.select_build_check_summaries(
-                        prepared.repo_root, qualification_level=prepared.qualification_level,
-                    ),
+            if check_plan is not None:
+                if prepared.check_results is None:
+                    raise ValueError("Check plan has no current owned input declaration.")
+                # An earlier callback may have changed declared inputs after the batch
+                # preflight. Read current inputs before consuming that original pass.
+                current = reuse_operation_checks.collect_check_inputs(prepared, prepared.check_results)
+                if current["fingerprint"] != check_plan.context["fingerprint"]:
+                    check_plan = reuse_operation_checks.decide_check_reuse(prepared)
+                else:
+                    check_plan.decision = check_plan.store.select(
+                        current, check_id=current["group"],
+                        builds=sdlc_results.select_build_check_summaries(
+                            prepared.repo_root, qualification_level=prepared.qualification_level,
+                        ),
+                    )
+                    if check_plan.decision["decision"] == "blocked":
+                        raise ValueError("Recorded check evidence blocks reuse: " + check_plan.decision["reason"])
+                if check_plan.decision["decision"] == "reuse":
+                    result = check_plan.reused_result(prepared)
+                    if prepared.check_group:
+                        result["check_group"] = prepared.check_group
+                    remove_operation_failures(
+                        result, diagnostic_output=diagnostic_output,
+                        diagnostic_owner=(owner_root, action),
+                    )
+                    return result
+                base.update(check_decision="executed", check_reason=check_plan.decision["reason"])
+        except (OSError, ValueError) as exc:
+            return report_failure({**base, "status": "result_invalid", "message": str(exc)}, **report_options)
+        completed: list[int | str] = []
+        step_results: list[dict[str, Any]] = []
+        operation_records_check = (prepared.check_results or {}).get("result-owner") == "operation"
+        for step in prepared.steps:
+            if step.handoff is not None:
+                if prepared.commit and prepared.category in MUTATION_CATEGORIES:
+                    try:
+                        require_clean_commit(prepared.repo_root, prepared.commit)
+                    except OperationError as exc:
+                        return report_failure({
+                            **base,
+                            "steps": completed,
+                            "status": "state_changed",
+                            "message": str(exc),
+                        }, **report_options)
+                if prepared.handoff_mode != "skill":
+                    return {
+                        **base,
+                        "steps": completed,
+                        "status": "deferred_handoff"
+                        if prepared.handoff_mode == "ci"
+                        else "handoff_required",
+                        "handoff": dict(step.handoff),
+                        **(handoff_report_completion(prepared)
+                           if prepared.handoff_mode == "return" else {}),
+                    }
+                route = f"{step.handoff['lifecycle']}/{step.handoff['action']}"
+                inputs = dict(step.handoff.get("inputs", {}))
+                # Declared package prerequisites are authoritative even when the
+                # handoff names only its server. Keep them out of user-authored argv.
+                mcp_package_context = None
+                package_records = prepared.mcp_package_records()
+                if route == "ceratops-mcp-server-lifecycle/install" and package_records:
+                    mcp_package_context = {
+                        "source": prepared.mcp_source,
+                        "packages": package_records,
+                        "artifacts": dict(prepared.selected_artifacts or {}),
+                    }
+                outcome = execute_skill_actions.execute_handoff(
+                    route,
+                    prepared.repo_root,
+                    inputs=inputs,
+                    mcp_package_context=mcp_package_context,
+                    expected_commit=prepared.commit
+                    if prepared.category in MUTATION_CATEGORIES
+                    else None,
+                    diagnostic_output=diagnostic_output,
+                    diagnostic_owner=diagnostic_owner,
+                    failure_id=f"{failure_id}:{step.position}",
+                    successful_results=(successful_results, step_results),
+                    require_clean_commit=require_clean_commit,
+                    repository_commit=repository_commit,
                 )
-                if check_plan.decision["decision"] == "blocked":
-                    raise ValueError("Recorded check evidence blocks reuse: " + check_plan.decision["reason"])
-            if check_plan.decision["decision"] == "reuse":
-                result = check_plan.reused_result(prepared)
-                if prepared.check_group:
-                    result["check_group"] = prepared.check_group
+                # A structured handoff is the final SDLC step. Preserve preceding
+                # command evidence and number each executed lifecycle step in order
+                # so the existing finalizer can bind the actual deployment receipt.
+                offset = len(completed)
+                action_steps = outcome.get("steps", [])
+                action_receipts = outcome.get("step_results", [])
+                assert isinstance(action_steps, list) and isinstance(action_receipts, list)
+                combined = [*completed, *(offset + position for position in action_steps)]
+                receipts = [
+                    *step_results,
+                    *({**item, "step": offset + item["step"]} for item in action_receipts),
+                ]
+                handoff_result = {
+                    **base,
+                    **outcome,
+                    "steps": combined,
+                    "handoff": route
+                    if outcome["status"] == "completed"
+                    else dict(step.handoff),
+                    "handoff_inputs": inputs,
+                }
+                if receipts:
+                    handoff_result["step_results"] = receipts
+                if outcome["status"] == "handoff_required":
+                    handoff_result.update(handoff_report_completion(prepared))
+                if outcome["status"] == "completed":
+                    handoff_result["handoff_completed"] = True
+                if repository_commit(prepared.repo_root) != prepared.commit:
+                    handoff_result.update(
+                        status="state_changed",
+                        message="HEAD changed during the skill action.",
+                    )
+                if handoff_result["status"] in FAILED_STATUSES - {"handoff_required"}:
+                    return report_failure(handoff_result, **report_options)
                 remove_operation_failures(
-                    result, diagnostic_output=diagnostic_output,
+                    handoff_result, diagnostic_output=diagnostic_output,
                     diagnostic_owner=(owner_root, action),
                 )
-                return result
-            base.update(check_decision="executed", check_reason=check_plan.decision["reason"])
-    except (OSError, ValueError) as exc:
-        return report_failure({**base, "status": "result_invalid", "message": str(exc)}, **report_options)
-    completed: list[int | str] = []
-    step_results: list[dict[str, Any]] = []
-    operation_records_check = (prepared.check_results or {}).get("result-owner") == "operation"
-    for step in prepared.steps:
-        if step.handoff is not None:
+                return handoff_result
             if prepared.commit and prepared.category in MUTATION_CATEGORIES:
                 try:
-                    require_clean_commit(prepared.repo_root, prepared.commit)
+                    if prepared.source_input_paths is None:
+                        require_clean_commit(prepared.repo_root, prepared.commit)
+                    elif (repository_commit(prepared.repo_root) != prepared.commit or not store_artifacts._inputs_match_commit(
+                            prepared.repo_root, prepared.commit, prepared.source_input_paths)):
+                        raise OperationError("Build source inputs changed after the source commit: "
+                                             + ", ".join(prepared.source_input_paths))
                 except OperationError as exc:
                     return report_failure({
                         **base,
@@ -572,173 +766,118 @@ def execute_prepared_operation(
                         "status": "state_changed",
                         "message": str(exc),
                     }, **report_options)
-            if prepared.handoff_mode != "skill":
-                return {
-                    **base,
-                    "steps": completed,
-                    "status": "deferred_handoff"
-                    if prepared.handoff_mode == "ci"
-                    else "handoff_required",
-                    "handoff": dict(step.handoff),
-                    **(handoff_report_completion(prepared)
-                       if prepared.handoff_mode == "return" else {}),
-                }
-            route = f"{step.handoff['lifecycle']}/{step.handoff['action']}"
-            inputs = dict(step.handoff.get("inputs", {}))
-            # Declared package prerequisites are authoritative even when the
-            # handoff names only its server. Keep them out of user-authored argv.
-            mcp_package_context = None
-            package_records = prepared.mcp_package_records()
-            if route == "ceratops-mcp-server-lifecycle/install" and package_records:
-                mcp_package_context = {
-                    "source": prepared.mcp_source,
-                    "packages": package_records,
-                    "artifacts": dict(prepared.selected_artifacts or {}),
-                }
-            outcome = execute_skill_actions.execute_handoff(
-                route,
-                prepared.repo_root,
-                inputs=inputs,
-                mcp_package_context=mcp_package_context,
-                expected_commit=prepared.commit
-                if prepared.category in MUTATION_CATEGORIES
-                else None,
-                diagnostic_output=diagnostic_output,
-                diagnostic_owner=diagnostic_owner,
-                failure_id=f"{failure_id}:{step.position}",
-                successful_results=(successful_results, step_results),
-                require_clean_commit=require_clean_commit,
-                repository_commit=repository_commit,
-            )
-            # A structured handoff is the final SDLC step. Preserve preceding
-            # command evidence and number each executed lifecycle step in order
-            # so the existing finalizer can bind the actual deployment receipt.
-            offset = len(completed)
-            action_steps = outcome.get("steps", [])
-            action_receipts = outcome.get("step_results", [])
-            assert isinstance(action_steps, list) and isinstance(action_receipts, list)
-            combined = [*completed, *(offset + position for position in action_steps)]
-            receipts = [
-                *step_results,
-                *({**item, "step": offset + item["step"]} for item in action_receipts),
-            ]
-            handoff_result = {
-                **base,
-                **outcome,
-                "steps": combined,
-                "handoff": route
-                if outcome["status"] == "completed"
-                else dict(step.handoff),
-                "handoff_inputs": inputs,
-            }
-            if receipts:
-                handoff_result["step_results"] = receipts
-            if outcome["status"] == "handoff_required":
-                handoff_result.update(handoff_report_completion(prepared))
-            if outcome["status"] == "completed":
-                handoff_result["handoff_completed"] = True
-            if repository_commit(prepared.repo_root) != prepared.commit:
-                handoff_result.update(
-                    status="state_changed",
-                    message="HEAD changed during the skill action.",
+            started = datetime.datetime.now(datetime.UTC)
+            try:
+                assert step.argv is not None
+                argv = [json.dumps(dict(prepared.selected_artifacts or {}), sort_keys=True)
+                        if argument == "{artifacts}" else argument for argument in step.argv]
+                if check_plan is not None and not operation_records_check:
+                    argv.extend(check_plan.arguments())
+                # CreateProcess does not apply PATHEXT to bare npm/pnpm commands.
+                # Resolve a bare executable while leaving repository-relative paths
+                # bound to the declared cwd and preserving shell-free arguments.
+                if os.name == "nt" and not any(
+                    separator in argv[0] for separator in ("/", "\\")
+                ):
+                    argv[0] = shutil.which(argv[0]) or argv[0]
+                # Context belongs only to this test command, never the parent
+                # process or later deployment commands.
+                process_options: dict[str, Any] = {}
+                repository_uv = (
+                    pathlib.Path(argv[0]).stem.lower() == "uv"
+                    and len(argv) > 1 and argv[1] in {"run", "sync", "lock"}
+                    and "--active" not in argv and "--no-project" not in argv
                 )
-            if handoff_result["status"] in FAILED_STATUSES - {"handoff_required"}:
-                return report_failure(handoff_result, **report_options)
-            remove_operation_failures(
-                handoff_result, diagnostic_output=diagnostic_output,
-                diagnostic_owner=(owner_root, action),
-            )
-            return handoff_result
-        if prepared.commit and prepared.category in MUTATION_CATEGORIES:
-            try:
-                if prepared.source_input_paths is None:
-                    require_clean_commit(prepared.repo_root, prepared.commit)
-                elif (repository_commit(prepared.repo_root) != prepared.commit or not store_artifacts._inputs_match_commit(
-                        prepared.repo_root, prepared.commit, prepared.source_input_paths)):
-                    raise OperationError("Build source inputs changed after the source commit: "
-                                         + ", ".join(prepared.source_input_paths))
-            except OperationError as exc:
-                return report_failure({
-                    **base,
-                    "steps": completed,
-                    "status": "state_changed",
-                    "message": str(exc),
-                }, **report_options)
-        started = datetime.datetime.now(datetime.UTC)
-        try:
-            assert step.argv is not None
-            argv = [json.dumps(dict(prepared.selected_artifacts or {}), sort_keys=True)
-                    if argument == "{artifacts}" else argument for argument in step.argv]
-            if check_plan is not None and not operation_records_check:
-                argv.extend(check_plan.arguments())
-            # CreateProcess does not apply PATHEXT to bare npm/pnpm commands.
-            # Resolve a bare executable while leaving repository-relative paths
-            # bound to the declared cwd and preserving shell-free arguments.
-            if os.name == "nt" and not any(
-                separator in argv[0] for separator in ("/", "\\")
-            ):
-                argv[0] = shutil.which(argv[0]) or argv[0]
-            # Context belongs only to this test command, never the parent
-            # process or later deployment commands.
-            process_options: dict[str, Any] = {}
-            repository_uv = (
-                pathlib.Path(argv[0]).stem.lower() == "uv"
-                and len(argv) > 1 and argv[1] in {"run", "sync", "lock"}
-                and "--active" not in argv and "--no-project" not in argv
-            )
-            if (repository_uv or prepared.test_context is not None or check_plan is not None
-                    or prepared.selected_artifacts or prepared.check_phase or prepared.category == "build"):
-                environment = dict(os.environ)
-                if repository_uv:
-                    # Repository-selected environments must not inherit the
-                    # installed lifecycle helper's unrelated active venv.
-                    environment.pop("VIRTUAL_ENV", None)
-                if prepared.test_context is not None:
-                    environment["CERATOPS_SDLC_TEST_CONTEXT"] = json.dumps(
-                        dict(prepared.test_context)
+                if (repository_uv or prepared.test_context is not None or check_plan is not None
+                        or prepared.selected_artifacts or prepared.check_phase or prepared.category == "build"):
+                    environment = dict(os.environ)
+                    if repository_uv:
+                        # Repository-selected environments must not inherit the
+                        # installed lifecycle helper's unrelated active venv.
+                        environment.pop("VIRTUAL_ENV", None)
+                    if prepared.test_context is not None:
+                        environment["CERATOPS_SDLC_TEST_CONTEXT"] = json.dumps(
+                            dict(prepared.test_context)
+                        )
+                    if check_plan is not None:
+                        environment[reuse_operation_checks.CONTEXT_ENV] = json.dumps(check_plan.context)
+                    if prepared.build_check_groups:
+                        environment["CERATOPS_BUILD_CHECK_GROUPS"] = json.dumps(prepared.build_check_groups)
+                        environment["CERATOPS_BUILD_CHECK_ARTIFACTS"] = json.dumps(prepared.build_check_artifacts or {})
+                    if prepared.selected_artifacts or prepared.check_phase or prepared.category == "build":
+                        environment["CERATOPS_TEST_ARTIFACTS"] = json.dumps(prepared.selected_artifacts or {})
+                    process_options["env"] = environment
+                with release_lock_module().track_command_completion():
+                    result = run_progress_command(argv, cwd=step.cwd, **process_options)
+                code, stdout, stderr = result.returncode, result.stdout, result.stderr
+            except KeyboardInterrupt:
+                if check_plan is None or not operation_records_check:
+                    raise
+                code, stdout, stderr = 130, "", "Source check interrupted."
+            except OSError as exc:
+                code, stdout, stderr = None, "", str(exc)
+            except ValueError as exc:
+                return report_failure({**base, "status": "result_invalid", "message": str(exc)}, **report_options)
+            if check_plan is not None and (code is not None or operation_records_check):
+                try:
+                    if operation_records_check:
+                        inputs_changed = check_plan.inputs_changed(prepared)
+                        reported_code = 127 if code is None else code
+                        if inputs_changed and reported_code == 0:
+                            reported_code = 1
+                        check_plan.record_tool_result(prepared, argv, started, reported_code)
+                        if inputs_changed:
+                            raise ValueError("Source check inputs changed during execution.")
+                    base["check_result"] = check_plan.completed(prepared, passed=code == 0)
+                    if check_plan.summary is not None:
+                        base["check_summary"] = check_plan.summary
+                except (OSError, ValueError) as exc:
+                    failure = {
+                        **base, "status": "result_invalid", "steps": completed,
+                        "failed_step": step.position,
+                        "message": f"Declared check result is missing or conflicting: {exc}",
+                        "diagnostic": {
+                            "exit_code": code,
+                            "message": failure_excerpt(f"{stderr}\n{stdout}"),
+                        },
+                    }
+                    return report_failure(
+                        failure, diagnostic_output=diagnostic_output,
+                        repo_root=owner_root, action=action,
+                        failure_id=f"{failure_id}:{step.position}",
+                        stdout=stdout, stderr=stderr, successful_results=successful_results,
+                        output_root=step.cwd,
                     )
-                if check_plan is not None:
-                    environment[reuse_operation_checks.CONTEXT_ENV] = json.dumps(check_plan.context)
-                if prepared.build_check_groups:
-                    environment["CERATOPS_BUILD_CHECK_GROUPS"] = json.dumps(prepared.build_check_groups)
-                    environment["CERATOPS_BUILD_CHECK_ARTIFACTS"] = json.dumps(prepared.build_check_artifacts or {})
-                if prepared.selected_artifacts or prepared.check_phase or prepared.category == "build":
-                    environment["CERATOPS_TEST_ARTIFACTS"] = json.dumps(prepared.selected_artifacts or {})
-                process_options["env"] = environment
-            with release_lock_module().track_command_completion():
-                result = run_progress_command(argv, cwd=step.cwd, **process_options)
-            code, stdout, stderr = result.returncode, result.stdout, result.stderr
-        except KeyboardInterrupt:
-            if check_plan is None or not operation_records_check:
-                raise
-            code, stdout, stderr = 130, "", "Source check interrupted."
-        except OSError as exc:
-            code, stdout, stderr = None, "", str(exc)
-        except ValueError as exc:
-            return report_failure({**base, "status": "result_invalid", "message": str(exc)}, **report_options)
-        if check_plan is not None and (code is not None or operation_records_check):
-            try:
-                if operation_records_check:
-                    inputs_changed = check_plan.inputs_changed(prepared)
-                    reported_code = 127 if code is None else code
-                    if inputs_changed and reported_code == 0:
-                        reported_code = 1
-                    check_plan.record_tool_result(prepared, argv, started, reported_code)
-                    if inputs_changed:
-                        raise ValueError("Source check inputs changed during execution.")
-                base["check_result"] = check_plan.completed(prepared, passed=code == 0)
-                if check_plan.summary is not None:
-                    base["check_summary"] = check_plan.summary
-            except (OSError, ValueError) as exc:
+            if code != 0:
+                child_results = {}
+                for stream, output in (("stdout", stdout), ("stderr", stderr)):
+                    captured = capture_step_result(output, require_identity=False)
+                    if "result_omitted" in captured:
+                        captured["result_omitted"] = "output_limit"
+                    if captured:
+                        child_results[stream] = captured
+                cause = failure_excerpt(f"{stderr}\n{stdout}") or (
+                    f"Command exited with code {code}." if code is not None else "Command could not start."
+                )
                 failure = {
-                    **base, "status": "result_invalid", "steps": completed,
+                    **base,
+                    "status": "validation_failed"
+                    if prepared.category == "pre-build-checks"
+                    else "tests_failed"
+                    if prepared.category == "post-build-checks"
+                    else "operation_failed",
+                    "message": f"SDLC step failed: {prepared.operation} step {step.position}\n{cause}",
+                    "steps": completed,
                     "failed_step": step.position,
-                    "message": f"Declared check result is missing or conflicting: {exc}",
                     "diagnostic": {
                         "exit_code": code,
-                        "message": failure_excerpt(f"{stderr}\n{stdout}"),
+                        "message": cause,
+                        "stdout_tail": _bounded_tail(stdout),
+                        "stderr_tail": _bounded_tail(stderr),
+                        **({"child_results": child_results} if child_results else {}),
                     },
                 }
+                owner_root, action = diagnostic_owner or (prepared.repo_root, "operation")
                 return report_failure(
                     failure, diagnostic_output=diagnostic_output,
                     repo_root=owner_root, action=action,
@@ -746,106 +885,76 @@ def execute_prepared_operation(
                     stdout=stdout, stderr=stderr, successful_results=successful_results,
                     output_root=step.cwd,
                 )
-        if code != 0:
-            child_results = {}
-            for stream, output in (("stdout", stdout), ("stderr", stderr)):
-                captured = capture_step_result(output, require_identity=False)
-                if "result_omitted" in captured:
-                    captured["result_omitted"] = "output_limit"
-                if captured:
-                    child_results[stream] = captured
-            cause = failure_excerpt(f"{stderr}\n{stdout}") or (
-                f"Command exited with code {code}." if code is not None else "Command could not start."
+            completed.append(step.position)
+            expected_schema = prepared.result_schema if step is prepared.steps[-1] else None
+            # Source scans and tests can share a phase. The declared result schema
+            # checks their own stage; the action name must not invent a result stage.
+            expected_stage = None
+            try:
+                captured = capture_step_result(
+                    stdout,
+                    expected_schema=expected_schema,
+                    expected_stage=expected_stage if expected_schema else None,
+                )
+                if prepared.installation is not None and step is prepared.steps[-1]:
+                    installed = captured.get("result", {})
+                    if any(installed.get(name) != prepared.installation[name] for name in ("version", "destination")):
+                        raise StepResultError("Installer result must report the requested version and destination; installation may have completed.")
+                if prepared.result_commit_field and step is prepared.steps[-1]:
+                    base["result_commit"] = require_build_result_commit(prepared, captured)
+                if prepared.build_check_groups and step is prepared.steps[-1]:
+                    base["check_summary"] = reuse_operation_checks.completed_build_checks(captured, prepared.build_check_groups)
+            except StepResultError as exc:
+                failure = {
+                    **base,
+                    "status": "result_invalid",
+                    "message": (
+                        f"SDLC step completed but its required result is invalid: "
+                        f"{prepared.operation} step {step.position}. Do not replay a "
+                        "side effect solely to recover this result."
+                    ),
+                    "steps": completed,
+                    "failed_step": step.position,
+                    "diagnostic": {"message": str(exc)},
+                }
+                owner_root, action = diagnostic_owner or (prepared.repo_root, "operation")
+                return report_failure(
+                    failure, diagnostic_output=diagnostic_output,
+                    repo_root=owner_root, action=action,
+                    failure_id=f"{failure_id}:{step.position}",
+                    stdout=stdout, stderr=stderr, successful_results=successful_results,
+                    output_root=step.cwd,
+                )
+            if captured:
+                step_results.append({"step": step.position, **captured})
+                # The shared list also preserves earlier receipts on later failures
+                # or commit drift, before any subsequent side effect is attempted.
+                base["step_results"] = step_results
+            expected_commit = base.get("result_commit", prepared.commit)
+            if repository_commit(prepared.repo_root) != expected_commit:
+                return report_failure({
+                    **base,
+                    "steps": completed,
+                    "status": "state_changed",
+                    "message": "HEAD changed during operation; prepare and validate the new commit.",
+                }, **report_options)
+            remove_resolved_failures(
+                base, diagnostic_output=diagnostic_output, repo_root=owner_root,
+                action=action, resolved_failures=(f"{prepared.operation}:{step.position}",),
             )
-            failure = {
-                **base,
-                "status": "validation_failed"
-                if prepared.category == "pre-build-checks"
-                else "tests_failed"
-                if prepared.category == "post-build-checks"
-                else "operation_failed",
-                "message": f"SDLC step failed: {prepared.operation} step {step.position}\n{cause}",
-                "steps": completed,
-                "failed_step": step.position,
-                "diagnostic": {
-                    "exit_code": code,
-                    "message": cause,
-                    "stdout_tail": _bounded_tail(stdout),
-                    "stderr_tail": _bounded_tail(stderr),
-                    **({"child_results": child_results} if child_results else {}),
-                },
-            }
-            owner_root, action = diagnostic_owner or (prepared.repo_root, "operation")
-            return report_failure(
-                failure, diagnostic_output=diagnostic_output,
-                repo_root=owner_root, action=action,
-                failure_id=f"{failure_id}:{step.position}",
-                stdout=stdout, stderr=stderr, successful_results=successful_results,
-                output_root=step.cwd,
-            )
-        completed.append(step.position)
-        expected_schema = prepared.result_schema if step is prepared.steps[-1] else None
-        # Source scans and tests can share a phase. The declared result schema
-        # checks their own stage; the action name must not invent a result stage.
-        expected_stage = None
-        try:
-            captured = capture_step_result(
-                stdout,
-                expected_schema=expected_schema,
-                expected_stage=expected_stage if expected_schema else None,
-            )
-            if prepared.result_commit_field and step is prepared.steps[-1]:
-                base["result_commit"] = require_build_result_commit(prepared, captured)
-            if prepared.build_check_groups and step is prepared.steps[-1]:
-                base["check_summary"] = reuse_operation_checks.completed_build_checks(captured, prepared.build_check_groups)
-        except StepResultError as exc:
-            failure = {
-                **base,
-                "status": "result_invalid",
-                "message": (
-                    f"SDLC step completed but its required result is invalid: "
-                    f"{prepared.operation} step {step.position}. Do not replay a "
-                    "side effect solely to recover this result."
-                ),
-                "steps": completed,
-                "failed_step": step.position,
-                "diagnostic": {"message": str(exc)},
-            }
-            owner_root, action = diagnostic_owner or (prepared.repo_root, "operation")
-            return report_failure(
-                failure, diagnostic_output=diagnostic_output,
-                repo_root=owner_root, action=action,
-                failure_id=f"{failure_id}:{step.position}",
-                stdout=stdout, stderr=stderr, successful_results=successful_results,
-                output_root=step.cwd,
-            )
-        if captured:
-            step_results.append({"step": step.position, **captured})
-            # The shared list also preserves earlier receipts on later failures
-            # or commit drift, before any subsequent side effect is attempted.
-            base["step_results"] = step_results
-        expected_commit = base.get("result_commit", prepared.commit)
-        if repository_commit(prepared.repo_root) != expected_commit:
-            return report_failure({
-                **base,
-                "steps": completed,
-                "status": "state_changed",
-                "message": "HEAD changed during operation; prepare and validate the new commit.",
-            }, **report_options)
-        remove_resolved_failures(
-            base, diagnostic_output=diagnostic_output, repo_root=owner_root,
-            action=action, resolved_failures=(f"{prepared.operation}:{step.position}",),
+        result_value = {
+            **base,
+            "status": "completed" if prepared.steps else "advisory",
+            "steps": completed,
+        }
+        remove_operation_failures(
+            result_value, diagnostic_output=diagnostic_output,
+            diagnostic_owner=(owner_root, action),
         )
-    result_value = {
-        **base,
-        "status": "completed" if prepared.steps else "advisory",
-        "steps": completed,
-    }
-    remove_operation_failures(
-        result_value, diagnostic_output=diagnostic_output,
-        diagnostic_owner=(owner_root, action),
-    )
-    return result_value
+        return result_value
+    finally:
+        if prepared.install_input_file is not None:
+            prepared.install_input_file.unlink(missing_ok=True)
 
 
 def remove_operation_failures(

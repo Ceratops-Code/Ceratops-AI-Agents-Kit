@@ -155,6 +155,22 @@ def execute_build(
     result: dict[str, Any]
     try:
         with build_operation_context(root, confirm_stopped=confirm_stopped, wait_seconds=wait_seconds):
+            declaration = operations.read_repository_contract(root, contract_path)
+            entries = operations.operation_entries(declaration)
+            if run_delivery and requests and all(
+                    entries.get(request.operation, {}).get("install-inputs") == "accepted-build" for request in requests):
+                # Standalone Install consumes an explicit accepted version. It is
+                # never a request for prerequisite builds or source/test checks.
+                installs = operations.prepare_operations(root, requests, contract_path, context=context, artifacts=artifacts)
+                if expected_commit is not None:
+                    operations.require_clean_commit(root, expected_commit)
+                if prepare_only:
+                    for item in installs:
+                        if item.install_input_file is not None:
+                            item.install_input_file.unlink(missing_ok=True)
+                    return {"status": "prepared", "operations": requested_operations}
+                return operations.execute_prepared_operations(installs, diagnostic_output=diagnostic_output,
+                    diagnostic_owner=diagnostic_owner, successful_results=successful_results)
             reuse_operation_checks.artifact_inputs(root, artifacts or {})
             if not requests and include_checks:
                 requests = [operations.OperationRequest(name) for name in operations.validation_operations(
@@ -395,6 +411,12 @@ def execute_build(
                     result.update(final_commit=last["build_result_commit"], tag=last["build_tag"])
                 result["artifacts"] = {reference: paths for batch in finished
                                        for reference, paths in batch.get("artifacts", {}).items()}
+                result["accepted_builds"] = [
+                    {"operation": outcome["operation"], "identity": outcome["artifact_identity"],
+                     "tag": sdlc_results.receipt_storage_key(outcome["artifact_identity"]) + "/" + outcome["artifact_identity"]["version"]}
+                    for batch in finished for outcome in batch["results"]
+                    if outcome.get("artifact_identity") and outcome.get("status") == "completed"
+                ]
                 if run_delivery:
                     for (target, batch), built in zip(batches, finished, strict=True):
                         installs = [item for item in batch
@@ -405,7 +427,7 @@ def execute_build(
                             root, [operations.OperationRequest(item.operation, parameters=dict(item.parameters),
                                 if_declared=item.no_op_reason == "operation_not_declared")
                                    for item in installs], contract_path, context=context,
-                            artifacts=built["artifacts"])
+                            artifacts=built["artifacts"], accepted_builds=result["accepted_builds"])
                         refreshed = [replace(item, selected_artifacts=built["artifacts"]) for item in refreshed]
                         delivered = execute_sdlc_operations(
                             refreshed, diagnostic_output=diagnostic_output, diagnostic_owner=diagnostic_owner,

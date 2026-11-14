@@ -191,7 +191,23 @@ abandonment/replacement and worktree removal rather than matching-work success.
    The helper accepts only `deliverables.<kind>.<name>.actions.install`,
    prepares the requested work, completes its checks/builds in the task worktree,
    and installs only after the guarded release update. Installation uses the
-   accepted commit and exact returned artifacts.
+   accepted commit and exact returned artifacts. For an Install action
+   declaring `install-inputs: accepted-build`, Build also returns the accepted
+   receipt identity. Promotion passes it to Install automatically along with
+   `--parameter target=TARGET --parameter destination=DESTINATION`; these values
+   come from the requested build platform and installation directory. The
+   installer receives that receipt's package and recorded dependency files.
+   A standalone installation of the same version uses `uv run --no-project
+   --python "PYTHON_RUNTIME" python "SKILL_ROOT/scripts/repository_operation.py"
+   --repo-root REPO --operation INSTALL --parameter version=VERSION
+   --parameter target=TARGET --parameter destination=DESTINATION`, with
+   `PYTHON_RUNTIME` from this skill's runtime manifest, `INSTALL` from the
+   repository's Install declaration, and `VERSION` from the requested completed
+   build. `--parameter tag=TAG` can replace `version=VERSION`. This path consumes
+   accepted files without invoking a builder or test runner. An unavailable or
+   mismatched receipt stops before the destination changes. Installer results
+   include the installed version and destination; failure to report them does
+   not establish that installation failed.
    Explicit missing locations are errors;
    v4/v5 tests require declared commands, handoffs, or reasoned no-ops.
 4. For composed shipping, use `--ship-after-promotion`, one optional
