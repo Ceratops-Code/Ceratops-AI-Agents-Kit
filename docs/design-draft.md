@@ -283,7 +283,7 @@ where to install it. Package deliverables can declare this Install action too.
 The action's commands can use these whole-argument placeholders:
 
 | Argument | Value supplied by `prepare_operations()` |
-|---|---|
+| --- | --- |
 | `{artifact_receipt}` | The retained receipt for the requested accepted build. |
 | `{package_file}` | Its `installationArtifactPath` file. |
 | `{installer_dependencies}` | A JSON array of the receipt's recorded dependency file paths. |
