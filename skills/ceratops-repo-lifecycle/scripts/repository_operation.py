@@ -47,6 +47,7 @@ from github_pr_workflow.command import (
     completed_operation_report_ids,
     failure_excerpt,
     handoff_report_completion,
+    project_task_temp_root,
     release_lock_module,
     remove_resolved_failures,
     report_failure,
@@ -354,7 +355,13 @@ def prepare_operations(
     accepted_builds: Sequence[Mapping[str, Any]] = (),
     defer_install_inputs: bool = False,
 ) -> list[PreparedOperation]:
-    """Validate all selected commands, parameters and cwd values before execution."""
+    """Prepare declared commands, arguments and working directories.
+
+    The existing temp-base settings supply {temporary_root} as
+    <repo-parent>/tmp/<primary-repo>/<checkout-name>. Preparation creates no
+    scratch folders; the test runner owns per-run allocation and cleanup.
+    Results and JUnit keep their independently declared output locations.
+    """
 
     if context not in {"skill", "ci", "return"}:
         raise OperationError("Unknown SDLC execution context")
@@ -364,6 +371,7 @@ def prepare_operations(
     commit = repository_commit(root)
     prepared: list[PreparedOperation] = []
     included: dict[str, OperationRequest] = {}
+    temporary_root: pathlib.Path | None = None
     for request in requests:
         category = operation_category(request.operation)
         locations = [name for name in entries if name == request.operation or name.startswith(request.operation + ".check-groups.")]
@@ -461,6 +469,18 @@ def prepare_operations(
             # Artifact paths become known after prerequisite builds. Only explicit
             # whole-argument placeholders are supplied; native scans get no extra flags.
             command_parameters = {**parameters, **derived_parameters, "artifacts": "{artifacts}"}
+            if any("{temporary_root}" in step.get("run", []) for step in selected.get("steps", [])):
+                if temporary_root is None:
+                    # Linked worktrees share the primary repository's temp base;
+                    # their own folder names keep test scratch in separate tasks.
+                    primary = store_artifacts._git_common_path(root).parent
+                    temporary_root = project_task_temp_root(primary) / root.name
+                    if (temporary_root.resolve() != temporary_root
+                            or temporary_root.is_relative_to(root) or root.is_relative_to(temporary_root)
+                            or (temporary_root.exists() and not temporary_root.is_dir())):
+                        raise OperationError("Test temporary root must be an unredirected directory outside the checkout: "
+                                             + str(temporary_root))
+                command_parameters["temporary_root"] = str(temporary_root)
             if group:
                 command_parameters["check_group"] = group
             steps = () if install_from_build and defer_install_inputs else tuple(

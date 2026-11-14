@@ -22,6 +22,7 @@ from tests.repository_lifecycle.support import (
     REPOSITORY_LIFECYCLE_SOURCE,
     SDLC_CONTRACT_TEMPLATE,
     SECTION_MANIFEST_TEMPLATE,
+    run_operation_cli,
 )
 from tests.skill_lifecycle.support import add_action_sections
 from tests.support.processes import (
@@ -32,6 +33,7 @@ from tests.support.repositories import (
     ROOT,
     create_compatible_repo,
     run_git,
+    write_sdlc_contract,
 )
 
 
@@ -111,17 +113,21 @@ def test_generated_python_runner_cleans_owned_temp_even_with_overrides(
     )
     subprocess.run(["uv", "lock", "--project", str(repo / "scripts")], check=True, capture_output=True)
     outside = tmp_path / "caller-temp"
+    task_temp = tmp_path / "task-temp"
+    junit = tmp_path / "junit.xml"
     inherited = f'--basetemp="{tmp_path}"' if inherited_form == "joined" else f'--basetemp "{tmp_path}"'
     monkeypatch.setenv("PYTEST_ADDOPTS", "-q " + inherited)
     try:
         result = subprocess.run([
             "uv", "run", "--locked", str(runner), "--pytest-arg=--basetemp", "--pytest-arg=" + str(outside),
-            "--pytest-arg=--basetemp=" + str(repo), "--temporary-root", ".build/selected",
+            "--pytest-arg=--basetemp=" + str(repo), "--temporary-root", str(task_temp),
+            "--pytest-arg=--junitxml=" + str(junit),
         ], cwd=repo, capture_output=True, text=True, check=False)
         assert result.returncode == 1, result.stderr
         observed, process_temp = map(pathlib.Path, json.loads(marker.read_text()))
         assert observed.is_relative_to(process_temp)
-        assert process_temp.is_relative_to(repo / ".build/selected")
+        assert process_temp.is_relative_to(task_temp)
+        assert junit.is_file()
         assert not process_temp.exists()
         assert not observed.exists()
         assert not outside.exists()
@@ -155,19 +161,88 @@ def _run_result_runner(root: pathlib.Path, runner: pathlib.Path, args: list[str]
     )
 
 
-def test_generated_runner_requires_explicit_temporary_root(tmp_path):
-    root, runner, output = _result_runner(tmp_path)
+@pytest.mark.parametrize("linked", [False, True])
+@pytest.mark.parametrize("ci", [False, True])
+def test_generated_runner_requires_explicit_temporary_root(tmp_path, monkeypatch, linked, ci):
+    root, script, output = _result_runner(tmp_path)
     result_file = output / "result.json"
     marker = output / "executed"
     args = [*_result_arguments(result_file), "--probe-command",
             json.dumps([sys.executable, "-c", "from pathlib import Path; import sys; Path(sys.argv[1]).touch()",
                         str(marker)])]
-    missing = subprocess.run([sys.executable, str(runner), *args], cwd=root, capture_output=True,
+    missing = subprocess.run([sys.executable, str(script), *args], cwd=root, capture_output=True,
                              text=True, check=False)
     assert missing.returncode == 2 and "--temporary-root is required" in missing.stderr
     assert not result_file.exists() and not marker.exists()
-    assert _run_result_runner(root, runner, args).returncode == 0
-    assert marker.exists() and json.loads(result_file.read_bytes())["status"] == "passed"
+    primary = root
+    operation = "repository.actions.pre-build-checks.check-groups.tests"
+    probe = (
+        "import json, pathlib, subprocess, sys, tempfile; "
+        "scratch = pathlib.Path(tempfile.mkdtemp()); "
+        "before = subprocess.run(['git', 'rev-parse', '--show-toplevel'], cwd=scratch, capture_output=True); "
+        "assert before.returncode != 0, before.stdout; "
+        "subprocess.run(['git', 'init', str(scratch)], check=True, capture_output=True); "
+        "found = subprocess.run(['git', 'rev-parse', '--show-toplevel'], cwd=scratch, "
+        "check=True, capture_output=True, text=True); "
+        "assert pathlib.Path(found.stdout.strip()).resolve() == scratch.resolve(); "
+        "pathlib.Path(sys.argv[1]).write_text(json.dumps([tempfile.gettempdir(), str(scratch)]))"
+    )
+    write_sdlc_contract(root, repository={"capabilities": {}, "actions": {
+        "pre-build-checks": {"check-groups": {"tests": {
+            "requires": {"capabilities": []}, "steps": [{"run": [
+                sys.executable, "scripts/run-tests.py", "--temporary-root", "{temporary_root}",
+                *_result_arguments(result_file), "--probe-command",
+                json.dumps([sys.executable, "-c", probe, str(marker)]),
+            ]}],
+        }}},
+    }})
+    for arguments in (("init",), ("add", "."),
+                      ("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "fixture")):
+        git = run_git(root, *arguments)
+        assert git.returncode == 0, git.stderr
+    if linked:
+        root = tmp_path / "worktrees" / primary.name / "linked-task"
+        git = run_git(primary, "worktree", "add", "-b", "linked-task", str(root))
+        assert git.returncode == 0, git.stderr
+    monkeypatch.delenv("CERATOPS_PROJECTS_ROOT", raising=False)
+    monkeypatch.delenv("CERATOPS_TASK_TEMP_ROOT", raising=False)
+    base = tmp_path / ("ci-temp" if ci else "tmp")
+    if ci:
+        monkeypatch.setenv("CERATOPS_TASK_TEMP_ROOT", str(base))
+    expected = base / primary.name / root.name
+    expected.mkdir(parents=True)
+    unrelated = expected / "caller-owned.txt"
+    unrelated.write_text("keep")
+    previous = None
+    for attempt in range(2):
+        if attempt:
+            # A distinct request must execute; an identical request reuses its pass.
+            contract_path = root / "sdlc/sdlc.yml"
+            declaration = yaml.safe_load(contract_path.read_text())
+            command = declaration["repository"]["actions"]["pre-build-checks"]["check-groups"]["tests"]["steps"][0]["run"]
+            result_file = output / "second-result.json"
+            command[command.index("--result-file") + 1] = str(result_file)
+            command[command.index("--result-id") + 1] = "result-2"
+            command[-1] = json.dumps([sys.executable, "-c", probe, str(marker), "second"])
+            contract_path.write_text(yaml.safe_dump(declaration))
+        result = run_operation_cli(root, operation, ci=ci)
+        assert result.returncode == 0, result.stderr
+        assert json.loads(result_file.read_bytes())["status"] == "passed"
+        process_temp, nested_repo = map(pathlib.Path, json.loads(marker.read_text()))
+        assert process_temp.is_relative_to(expected)
+        assert not process_temp.is_relative_to(root)
+        assert process_temp != previous
+        assert not process_temp.exists() and not nested_repo.exists()
+        assert unrelated.read_text() == "keep"
+        previous = process_temp
+    result = run_operation_cli(root, operation, ci=ci)
+    assert result.returncode == 0, result.stderr
+    assert pathlib.Path(json.loads(marker.read_text())[0]) == previous
+    # A caller's base setting must not put scratch back inside either checkout.
+    monkeypatch.setenv("CERATOPS_TASK_TEMP_ROOT", str(root / "scratch"))
+    result = run_operation_cli(root, operation, ci=ci)
+    assert result.returncode == 1 and "checkout" in result.stderr
+    assert not (root / "scratch").exists()
 
 
 def _mapped_generated_runner(tmp_path):

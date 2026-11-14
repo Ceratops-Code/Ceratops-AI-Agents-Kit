@@ -35,10 +35,7 @@ from .generate_repository_checks import (
 )
 from .generate_test_script import discover_python_tests
 from .python_tool_configuration import ruff_policy_errors
-from .repository_validation_contract import (
-    is_test_temporary_root,
-    load_validation_contract,
-)
+from .repository_validation_contract import load_validation_contract
 from .sdlc_contract_validation import (
     latest_sdlc_version,
     operation_category,
@@ -59,11 +56,12 @@ class CompatibilityResult(TypedDict):
 
 
 def _test_temporary_root_errors(
-    root: pathlib.Path, entries: Mapping[str, Mapping[str, Any]], runner: str,
+    entries: Mapping[str, Mapping[str, Any]], runner: str,
 ) -> list[str]:
     """Check the declared Python runner arguments without running tests."""
     errors = []
     option = "--temporary-root"
+    expected = load_validation_contract()["test_temporary_root"]
     for location, operation in entries.items():
         if operation_category(location) not in {"pre-build-checks", "post-build-checks"}:
             continue
@@ -76,11 +74,10 @@ def _test_temporary_root_errors(
                 for index, arg in enumerate(argv)
                 if arg == option or arg.startswith(option + "=")
             ]
-            if len(values) == 1 and is_test_temporary_root(values[0]):
-                path = root / values[0].replace("\\", "/")
-                if not any(part.is_symlink() or part.is_junction() for part in (path, *path.parents) if part != root):
-                    continue
-            errors.append(f"{location}: {runner} requires one {option} naming a directory inside the checkout.")
+            # Whole-argument substitution supplies this path at execution time.
+            if values == [expected] and option in argv:
+                continue
+            errors.append(f"{location}: {runner} requires one {option} followed by {expected} as a separate argument.")
     return errors
 
 
@@ -511,7 +508,7 @@ def validate_ceratops_compatibility(
         errors.extend(sdlc_errors)
         if sdlc:
             errors.extend(_validation_coverage_errors(root, sdlc, validation_contract))
-            errors.extend(_test_temporary_root_errors(root, entries, test_runner_relative))
+            errors.extend(_test_temporary_root_errors(entries, test_runner_relative))
             if sdlc["version"] == latest_sdlc_version():
                 errors.extend(_direct_source_errors(root, entries))
             else:

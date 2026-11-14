@@ -346,6 +346,7 @@ def test_deploy_operation_requires_and_expands_exact_declared_parameters(
     for parameters, conditional, message in (
         ((), (), "missing base_revision"),
         (("base_revision=x", "unexpected=x"), (), "unexpected unexpected"),
+        (("base_revision=x", "temporary_root=outside"), (), "unexpected temporary_root"),
         (("base_revision=x",), ("base_revision=y",), "supplied more than once"),
         (("base_revision=x", "base_revision=y"), (), "Duplicate"),
     ):
@@ -377,6 +378,12 @@ def test_deploy_operation_requires_and_expands_exact_declared_parameters(
     )
     assert result.returncode == 0
     assert (tmp_path / "value.txt").read_text() == "literal"
+    write_sdlc_contract(tmp_path, deliverables={"apps": {"strict": _app({"install": {
+        **_step("parameter.py", "{temporary_root}"), "parameters": ["temporary_root"],
+    }})}})
+    result = run_operation_cli(tmp_path, "deliverables.apps.strict.actions.install",
+                               parameters=("temporary_root=outside",))
+    assert result.returncode == 1 and "cannot declare temporary_root" in result.stderr
 
 
 @pytest.mark.parametrize(

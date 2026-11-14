@@ -27,8 +27,8 @@
       "$ref": "#/$defs/text"
     },
     "test_temporary_root": {
-      "description": "Repository-relative scratch parent passed explicitly to the generated Python test command.",
-      "$ref": "#/$defs/path"
+      "description": "SDLC parameter for the external task scratch parent passed explicitly to the generated Python test command.",
+      "const": "{temporary_root}"
     },
     "ruff_policy": {
       "description": "Required Ruff settings consumed by python_tool_configuration during generation and compatibility checks. Ruff expands selectors and ignores using the selected tool runtime.",

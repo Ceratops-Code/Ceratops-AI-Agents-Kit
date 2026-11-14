@@ -369,6 +369,8 @@ def _find_sdlc_declaration_errors(
         assert match is not None
         action_name = match.group("repository") or match.group("action")
         owner = location.split(".actions.", 1)[0]
+        if "temporary_root" in action.get("parameters", []):
+            errors.append(f"{location}.parameters cannot declare temporary_root; SDLC supplies the task temp directory")
         for tool in action["requires"][key]:
             if tool not in tools:
                 errors.append(f"unknown {tool_label} {tool} at {location}.requires.{key}")

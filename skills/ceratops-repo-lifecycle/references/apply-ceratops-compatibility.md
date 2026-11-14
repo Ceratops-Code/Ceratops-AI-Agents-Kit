@@ -115,10 +115,11 @@ Infer the source identity from stable repository evidence before asking.
 - Generate `scripts/run-tests.py` when compatibility infers repository test
   ownership and selects that runner in SDLC. Preserve explicit SDLC test
   ownership without creating an unused runner; generated Python test commands
-  use the scripts project and pass `--temporary-root .build/test-tmp`. The
-  runner requires this option for execution. SDLC commands using the standard
-  runner path must supply a directory inside the checkout. CI runs source
-  checks and tests without executing skill handoffs.
+  use the scripts project and pass `--temporary-root "{temporary_root}"`. The
+  runner requires this option for execution. SDLC supplies the external
+  project/task temp directory; the runner owns its per-run folders and cleanup.
+  CI uses the same parameter and runs source checks and tests without executing
+  skill handoffs.
 - Review custom validators and configuration-defined scripts to ensure they
   never run tests. Move test execution into SDLC test operations without losing
   target behavior before claiming compatibility. Detection cannot prove this

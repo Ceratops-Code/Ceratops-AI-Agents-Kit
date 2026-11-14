@@ -1143,7 +1143,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--pytest-arg", action="append", default=[], help="Repeat using --pytest-arg=VALUE.")
     parser.add_argument("--check-group", help="One suite ID from tests/test-impact.json.")
     parser.add_argument("--temporary-root", type=pathlib.Path,
-                        help="Required for execution. Parent for owned test files; relative to the repository.")
+                        help="Required for execution. Parent for owned test files; SDLC supplies the external task temp directory.")
     parser.add_argument("--artifacts", default="{}", help="JSON mapping deliverable references to selected file-path arrays.")
     parser.add_argument("--diagnostic-output", type=pathlib.Path,
                         help="Full failure report; files outside .build/test-diagnostics are caller-retained.")

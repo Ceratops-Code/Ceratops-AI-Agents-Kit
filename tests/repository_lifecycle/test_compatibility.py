@@ -815,7 +815,10 @@ def test_explicit_app_test_ownership_does_not_generate_python_test_runner(
     (["--temporary-root", ".."], False),
     (["--temporary-root", "C:/external"], False),
     (["--temporary-root=.build/alternate", "--temporary-root", ".build/other"], False),
-    (["--temporary-root=.build/alternate"], True),
+    (["--temporary-root=.build/alternate"], False),
+    (["--temporary-root={temporary_root}"], False),
+    (["--temporary-root", "{temporary_root}"], True),
+    (["--temporary-root", "{temporary_root}", "--temporary-root", "{temporary_root}"], False),
     (None, True),
 ])
 def test_python_runner_scratch_in_sdlc(tmp_path, arguments, accepted):
@@ -826,11 +829,11 @@ def test_python_runner_scratch_in_sdlc(tmp_path, arguments, accepted):
     operation = generator.test_operation(runner)
     if arguments is not None:
         operation["steps"][0]["run"] = ["uv", "run", "--locked", runner, *arguments]
-    errors = compatibility._test_temporary_root_errors(tmp_path, {location: operation}, runner)
+    errors = compatibility._test_temporary_root_errors({location: operation}, runner)
     if accepted:
         assert not errors
     else:
-        assert errors == [f"{location}: {runner} requires one --temporary-root naming a directory inside the checkout."]
+        assert errors == [f"{location}: {runner} requires one --temporary-root followed by {{temporary_root}} as a separate argument."]
 
 
 def test_compatibility_materializer_preserves_existing_check_and_ci(
