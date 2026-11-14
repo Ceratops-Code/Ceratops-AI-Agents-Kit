@@ -314,7 +314,7 @@
       "applies_when": "local_repo_path is provided",
       "assertions": [
         {
-          "path": "/local/repository_validation/validator_present",
+          "path": "/local/repository_validation/sdlc_present",
           "operator": "equal",
           "expected": true
         },

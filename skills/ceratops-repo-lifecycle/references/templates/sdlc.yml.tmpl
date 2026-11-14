@@ -25,6 +25,9 @@ repository:
         # validation contract when the repository owns a package lockfile.
     pre-build-checks:
       check-groups:
+        # Compatibility adds one source group for each applicable catalog check:
+        # Ruff, mypy, Actionlint, shellcheck, YAML lint, or package scripts.
+        # Each runs directly and records its own result and input paths.
         tests:
           requires:
             tools: []

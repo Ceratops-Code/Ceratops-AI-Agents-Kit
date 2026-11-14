@@ -144,8 +144,22 @@ def test_release_builds_expand_all_kinds_and_pass_exact_outputs(tmp_path, monkey
         result = json.loads(process.stdout if process.returncode == 0 else process.stderr)
         assert process.returncode == 0, result
     elif entry == "promotion":
+        path = tmp_path / runner.DEFAULT_CONTRACT
+        document = json.loads(path.read_text())
+        engine = document["deliverables"]["packages"]["engine"]
+        document["deliverables"]["packages"]["lifecycle"] = {
+            **engine,
+            "actions": {**engine["actions"], "pre-build-checks": {"check-groups": {
+                "tests": {"requires": {"tools": []}, "steps": [{"run": [sys.executable, "-c", "pass"]}]},
+            }}},
+        }
+        path.write_text(json.dumps(document))
+        assert run_git(tmp_path, "add", str(path)).returncode == 0
+        assert run_git(tmp_path, "commit", "-m", "declare independent lifecycle tests").returncode == 0
+        lifecycle = "deliverables.packages.lifecycle.actions.pre-build-checks.check-groups.tests"
         module = runpy.run_path(str(ROOT / "skills/ceratops-repo-lifecycle/scripts/promote-repository.py"))
-        built = runner.execute_build(tmp_path, [runner.OperationRequest(name, {"target": "one"})], run_delivery=False)
+        built = runner.execute_build(tmp_path, [runner.OperationRequest(name, {"target": "one"})],
+                                     run_delivery=False, validation_operations=[lifecycle])
         assert built["status"] == "completed", built
         prepared = runner.prepare_operations(tmp_path, [runner.OperationRequest(name, {"target": "one"})],
                                              artifacts=built["artifacts"])
@@ -153,7 +167,9 @@ def test_release_builds_expand_all_kinds_and_pass_exact_outputs(tmp_path, monkey
         accepted = module["CompletedPromotion"](
             {"status": "ready", "head": runner.repository_commit(tmp_path), "pending_work_scope": "fixture"},
             tmp_path, prepared, built)
-        args = module["build_parser"]().parse_args(["--repo-root", str(tmp_path)])
+        args = module["build_parser"]().parse_args([
+            "--repo-root", str(tmp_path), "--validation-operation", lifecycle,
+        ])
         from github_pr_workflow.command import release_write_context
         with release_write_context(tmp_path):
             promoted = module["_deploy_completed_promotion"](args, accepted)
@@ -161,6 +177,10 @@ def test_release_builds_expand_all_kinds_and_pass_exact_outputs(tmp_path, monkey
         module["_completed_deployment"](promoted, accepted.result["head"], repo_root=tmp_path)
         assert [item["operation"] for item in result["results"]] == [name]
         assert any(item["operation"].endswith(".actions.build") for item in result["build_results"])
+        assert any(item["operation"] == lifecycle and item["status"] == "completed"
+                   for item in result["build_results"])
+        assert not any(item["operation"] == "deliverables.packages.lifecycle.actions.build"
+                       for item in result["build_results"])
     elif entry == "ship":
         # Ship has no per-operation parameter arguments. Bind this repository's
         # target in its commands, keeping the same declared build graph.

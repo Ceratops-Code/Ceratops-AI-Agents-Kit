@@ -160,8 +160,8 @@ Infer the source identity from stable repository evidence before asking.
   source skills exist, write `skills/skill-sections.json`, copy canonical shared
   sections to `skills/sections/`, and remove generated section blocks from
   source skills.
-- Create or update `sdlc/sdlc.yml` from the owned template, preserving target
-  capabilities and separate source/test commands in `pre-build-checks`
+- Create or update the current `sdlc/sdlc.yml` from the owned template, preserving
+  target tools and separate source/test commands in `pre-build-checks`
   groups. For each source skill, add `deliverables.skills.<name>` with
   `actions.pre-build-checks.check-groups.source` handing off to
   `ceratops-skill-lifecycle/source-validate` and `actions.install` handing off
@@ -171,16 +171,17 @@ Infer the source identity from stable repository evidence before asking.
   `skills/<name>/agents/openai.yaml`, and align the README Skills table without
   changing skill behavior.
 
-### 3. Create repository validation and bootstrap
+### 3. Set up source checks, CI and bootstrap
 
 - Generate Ruff and mypy defaults in the scripts project from its template.
-  Generated validation uses those defaults unless the repository supplies its
-  own configuration; preserve existing settings and custom validators.
+  Generated check groups use those defaults unless the repository supplies its
+  own configuration. Preserve existing settings and target-owned checks.
 
-- Create a missing `scripts/validate-repository.py` and
-  `.github/workflows/validate.yml` for every repository, including repositories
-  with no skills. CI invokes this skill's GitHub action to select validation and
-  tests separately. Preserve an existing action commit pin; otherwise resolve a
+- Generate one SDLC group per applicable source check from the repository
+  check contract. Create a missing `.github/workflows/validate.yml` for every
+  repository, including repositories with no skills. CI invokes this skill's
+  GitHub action to run source checks and tests separately. Preserve an existing
+  action commit pin; otherwise resolve a
   published revision or use `--ci-action-revision <commit>`.
 - When skills exist, the compatibility apply helper synchronizes the
   independent `scripts/deploy-skills.py`. Retain a same- or

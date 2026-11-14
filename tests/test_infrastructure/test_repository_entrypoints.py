@@ -20,7 +20,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
     "scripts/deploy-hooks.py", "scripts/deploy-skills.py",
     "scripts/testing/run-tests.py",
     *["skills/ceratops-repo-lifecycle/references/templates/" + name + ".py.tmpl"
-      for name in ("deploy-skills", "run-tests", "validate-repository")],
+      for name in ("deploy-skills", "run-tests")],
 ])
 def test_repository_entrypoints_run_through_uv(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, entrypoint: str,
@@ -48,7 +48,7 @@ def test_repository_entrypoints_run_through_uv(
         scripts.mkdir(parents=True)
         template = script.read_text(encoding="utf-8")
         script = scripts / script.stem
-        script.write_text(template.replace("__TEST_TARGETS__", "[]").replace("__CHECK_DEFINITIONS__", "[]"), encoding="utf-8")
+        script.write_text(template.replace("__TEST_TARGETS__", "[]"), encoding="utf-8")
         project_template = ROOT / "skills/ceratops-repo-lifecycle/references/templates/validation-pyproject.toml.tmpl"
         (scripts / "pyproject.toml").write_text(
             project_template.read_text(encoding="utf-8").replace(

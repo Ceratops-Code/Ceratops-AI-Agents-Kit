@@ -5,11 +5,6 @@
   "non_deterministic_review_file": "ceratops-compatibility-nondeterministic-contract.json",
   "managed_python_test_scratch_recovery": true,
   "surfaces": {
-    "validator": {
-      "path": "scripts/validate-repository.py",
-      "template": "validate-repository.py.tmpl",
-      "required": "always"
-    },
     "workflow": {
       "path": ".github/workflows/validate.yml",
       "template": "validate.yml.tmpl",

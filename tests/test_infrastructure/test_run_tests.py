@@ -20,8 +20,8 @@ HEAD = "2" * 40
 @pytest.mark.parametrize(
     "target",
     [
-        "tests/test_infrastructure/test_repository_validator.py::test_runtime_dependencies_supply_timezones_without_an_os_database",
-        "tests/test_infrastructure/test_repository_validator.py",
+        "tests/test_infrastructure/test_repository_entrypoints.py::test_runtime_dependencies_supply_timezones_without_an_os_database",
+        "tests/test_infrastructure/test_repository_entrypoints.py",
     ],
 )
 def test_explicit_targets_collect_and_run_only_requested_cases(

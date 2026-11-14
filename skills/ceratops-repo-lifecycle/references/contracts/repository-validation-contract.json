@@ -126,6 +126,7 @@
   "checks": [
     {
       "id": "shellcheck",
+      "result-inputs": ["**/*.sh", "**/.shellcheckrc"],
       "when": [{"kind": "path-any", "value": ["**/*.sh"]}],
       "command": ["shellcheck", "--severity=error", "--"],
       "cwd": "."
@@ -260,6 +261,7 @@
     },
     {
       "id": "ruff",
+      "result-inputs": ["**/*.py", "**/*.pyi", "**/*.ipynb", "**/pyproject.toml", "**/ruff.toml", "**/.ruff.toml", "**/.gitignore"],
       "when": [
         {
           "kind": "path-any",
@@ -300,6 +302,7 @@
     },
     {
       "id": "mypy",
+      "result-inputs": ["**/*.py", "**/*.pyi", "**/pyproject.toml", "**/mypy.ini", "**/.mypy.ini", "**/setup.cfg"],
       "when": [
         {
           "kind": "path-any",
@@ -361,6 +364,7 @@
     },
     {
       "id": "actionlint",
+      "result-inputs": [".github/**", "scripts/run-actionlint.py"],
       "when": [
         {
           "kind": "path-any",

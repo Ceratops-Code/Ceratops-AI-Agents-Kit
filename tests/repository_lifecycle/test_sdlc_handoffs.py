@@ -198,8 +198,8 @@ def _new_receipt_fixtures(
         "requiredChecks": [
             {
                 "kind": "source-check",
-                "id": "repository-validation",
-                "version": "validate-repository.v5",
+                "id": "ruff",
+                "version": "ruff-0.12.0+fixture-v1",
             },
             {
                 "kind": "artifact-test",
@@ -209,8 +209,8 @@ def _new_receipt_fixtures(
         ],
         "sourceChecks": [
             {
-                "id": "repository-validation",
-                "version": "validate-repository.v5",
+                "id": "ruff",
+                "version": "ruff-0.12.0+fixture-v1",
                 "status": "passed",
                 "inputs": ["source", "dependency-lock", "tests", "test-config"],
                 "evidence": [
