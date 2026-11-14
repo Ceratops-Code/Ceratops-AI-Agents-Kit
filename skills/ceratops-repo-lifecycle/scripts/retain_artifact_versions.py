@@ -1,10 +1,10 @@
 """Retain completed packages in one explicitly selected local storage group.
 
 This library does not discover worktrees, installations, or test results. Its
-caller supplies current successful records and file-use information for this
-group, under the existing store/destination protection. Copies go directly to
+caller supplies current successful records for this group, under the existing
+store/destination protection. Copies go directly to
 their final directories. Their original artifact receipt is written last.
-The small ownership manifests describe files, not execution progress; normal
+The file inventories describe accepted copies, not cleanup ownership; normal
 calls compute the desired selection again from authoritative inputs.
 """
 
@@ -23,12 +23,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from packaging.version import Version
-from sdlc_results import CompletedArtifactSelection, StepResultError, _plain_path
+from sdlc_results import CompletedArtifactSelection, StepResultError, _plain_path, receipt_storage_key
 
 SCHEMA = "ceratops-artifact-retention.v1"
-OWNER_FILE = ".retained-files.json"
+INVENTORY_FILE = ".retained-files.json"
 SEGMENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
-FileUse = Callable[[pathlib.Path], str | None]
 
 
 @dataclass(frozen=True)
@@ -37,7 +36,7 @@ class RetentionScope:
 
     root is the artifact store for worktree/beta-stable, or a PC-local destination
     for deployed. Installed generation names are retained, not newly allocated.
-    The caller establishes that the selected worktree still owns its build.
+    Each worktree has its own directory; cleanup never crosses that boundary.
     """
 
     root: pathlib.Path
@@ -49,7 +48,8 @@ class RetentionScope:
     def __post_init__(self) -> None:
         if self.pool not in {"worktree", "beta-stable", "deployed"}:
             raise ValueError("Unknown artifact retention pool.")
-        for value in (self.unit, self.target, self.worktree or "unused"):
+        receipt_storage_key({"storageKey": self.unit})
+        for value in (self.target, self.worktree or "unused"):
             if not SEGMENT.fullmatch(value) or value in {".", ".."}:
                 raise ValueError("Retention requires a single safe path segment.")
         if (self.pool == "worktree") != bool(self.worktree):
@@ -59,12 +59,12 @@ class RetentionScope:
 
     @property
     def group(self) -> pathlib.Path:
-        return self.root / self.unit if self.pool == "worktree" else self.root / self.pool / self.unit
+        return (self.root / "worktrees" / self.worktree / self.unit if self.pool == "worktree"
+                else self.root / self.pool / self.unit)
 
     @property
     def record(self) -> pathlib.Path:
-        owner = f"worktree-{self.worktree}" if self.worktree else self.pool
-        return self.group / ".retention" / self.target / f"{owner}.json"
+        return self.group / ".retention" / f"{self.target}.json"
 
     @property
     def identity(self) -> dict[str, str]:
@@ -126,7 +126,6 @@ def select_retained_versions(
 
     Callers supply the current records by reference, not a log of this worker's
     steps. A failed installation cannot advance any successful deployment slot.
-    Running or pending generations are deletion constraints supplied separately.
     """
     selected: dict[str, RetentionVersion] = {}
 
@@ -134,7 +133,7 @@ def select_retained_versions(
         if value is None:
             return
         identity = value.build.identity
-        if identity["releaseBundle"] != scope.unit or identity["target"] != scope.target:
+        if receipt_storage_key(identity) != scope.unit or identity["target"] != scope.target:
             raise ValueError("Retention input belongs to another unit or target.")
         selected.setdefault(value.key(scope), value)
 
@@ -165,18 +164,30 @@ def _json_bytes(value: Any) -> bytes:
     return (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n").encode("utf-8")
 
 
-def _write_record(path: pathlib.Path, value: Mapping[str, Any]) -> None:
-    """Write desired ownership/selection directly; never create a temporary copy."""
+def _write_record(path: pathlib.Path, value: Mapping[str, Any], *, atomic: bool = False) -> None:
+    """Write immutable inventories or atomically replace the locked retention record."""
     _make_directory(path.parent)
+    # The mutable retention record is written under the existing store lock.
+    # Its one in-process file can therefore be discarded after an interrupted call.
+    destination = path.with_name(f".{path.name}.in-process") if atomic else path
+    if atomic and os.path.lexists(destination):
+        _plain_path(destination, label="Interrupted retention record")
+        destination.unlink()
     raw = _json_bytes(value)
     if os.path.lexists(path):
         _plain_path(path, label="Retention record")
         if path.read_bytes() == raw:
             return
-    with path.open("wb") as stream:
-        stream.write(raw)
-        stream.flush()
-        os.fsync(stream.fileno())
+    try:
+        with destination.open("wb") as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if atomic:
+            os.replace(destination, path)
+    finally:
+        if atomic:
+            destination.unlink(missing_ok=True)
 
 
 def _read_record(path: pathlib.Path) -> dict[str, Any]:
@@ -245,11 +256,18 @@ def _inventory(value: RetentionVersion, *, installed: bool = False) -> tuple[dic
             raise ValueError("Accepted package uses a reserved retained-receipt path.")
         records[name] = {"size": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
         sources[name] = raw
+    for member in build.members:
+        child_records, child_sources = _inventory(RetentionVersion(member))
+        identity = member.build_receipt.value["identity"]
+        prefix = f"{receipt_storage_key(identity)}/{identity['version']}/{identity['target']}/"
+        for name, record in child_records.items():
+            records[prefix + name] = record
+            sources[prefix + name] = child_sources[name]
     for item in value.runnable_files if installed else ():
         if value.installation_root is None or not value.successful_installation():
             raise ValueError("Runnable files require their successful installation and source root.")
         relative = str(_relative_path(str(item["path"])))
-        if relative in records or relative in {OWNER_FILE, ".installation_receipt.json"}:
+        if relative in records or relative in {INVENTORY_FILE, ".installation_receipt.json"}:
             raise ValueError("Installation inventory collides with retained package metadata.")
         records[relative] = {"size": item["size"], "sha256": item["sha256"]}
         sources[relative] = value.installation_root / relative
@@ -261,13 +279,7 @@ def _inventory(value: RetentionVersion, *, installed: bool = False) -> tuple[dic
 
 
 def _copy_location(scope: RetentionScope, value: RetentionVersion) -> pathlib.Path:
-    if scope.pool == "worktree":
-        root = value.build.receipt_path.parent
-        expected = scope.group / value.version
-        if root not in {expected, expected / scope.target}:
-            raise ValueError("Worktree retention must use the original 4E build directory.")
-        return root
-    # A target subfolder keeps independently qualified targets in separate groups.
+    # Each target has a directory; cleanup never infers targets from file contents.
     return scope.group / value.key(scope) / scope.target
 
 
@@ -293,7 +305,7 @@ def _foreign_files(root: pathlib.Path, records: Mapping[str, Any]) -> list[str]:
             path = base / name
             relative = path.relative_to(root).as_posix()
             _plain_path(path, label="Retained file")
-            if relative not in records and relative != OWNER_FILE:
+            if relative not in records and relative != INVENTORY_FILE:
                 extras.append(relative)
     return extras
 
@@ -331,14 +343,14 @@ def _copy_file(source: pathlib.Path | bytes, destination: pathlib.Path, record: 
     shutil.copymode(source, destination, follow_symlinks=False)
 
 
-def copy_retained_version(scope: RetentionScope, value: RetentionVersion, *, file_use: FileUse) -> tuple[pathlib.Path, dict[str, Any]]:
+def copy_retained_version(scope: RetentionScope, value: RetentionVersion) -> tuple[pathlib.Path, dict[str, Any]]:
     """Copy unchanged accepted bytes; receipt last, no staging or acceptance rerun."""
     root = _copy_location(scope, value)
     records, sources = _inventory(value, installed=scope.pool == "deployed")
     manifest = _copy_manifest(scope, value, records)
     if os.path.lexists(root):
         _plain_path(root, directory=True, label="Retained version")
-        marker = root / OWNER_FILE
+        marker = root / INVENTORY_FILE
         if marker.exists():
             if _read_record(marker) != manifest:
                 raise ValueError(f"Retained directory has different ownership: {root}")
@@ -350,67 +362,48 @@ def copy_retained_version(scope: RetentionScope, value: RetentionVersion, *, fil
     else:
         _make_directory(root.parent)
         root.mkdir()
-    # Permission-only repairs are writes too and require the same file-use gate.
-    needs_writes = any(not _same_file(root / name, record, source=sources[name])
-                       for name, record in records.items())
-    if needs_writes:
-        reason = file_use(root)
-        if reason:
-            raise ValueError(f"Cannot change retained files at {root}: {reason}")
-    _write_record(root / OWNER_FILE, manifest)
+    _write_record(root / INVENTORY_FILE, manifest)
     # The original approval receipt is the last file, never a partial-copy marker.
     for name in sorted(records, key=lambda name: (name == "artifact-receipt.json", name)):
         _copy_file(sources[name], root / name, records[name])
     return root, manifest
 
 
-def _owned_copy(scope: RetentionScope, raw: Mapping[str, Any]) -> pathlib.Path:
+def _retained_copy_path(scope: RetentionScope, raw: Mapping[str, Any]) -> pathlib.Path:
     relative = _relative_path(str(raw["path"]))
     root = scope.group / relative
     allowed = {f"{raw['key']}/{scope.target}"}
-    if scope.pool == "worktree":
-        allowed.add(str(raw["key"]))
     if relative.as_posix() not in allowed:
         raise ValueError("Recorded retained directory escapes the selected group.")
     return root
 
 
-def _remove_copy(scope: RetentionScope, raw: Mapping[str, Any], file_use: FileUse) -> str | None:
-    root = _owned_copy(scope, raw)
+def _remove_copy(scope: RetentionScope, raw: Mapping[str, Any]) -> str | None:
+    """Delete one obsolete version inside the requested directory only.
+
+    No owner record, process lookup or content hash decides whether it belongs
+    here. Links are refused so directory cleanup cannot escape its storage scope.
+    """
+    root = _retained_copy_path(scope, raw)
     if not os.path.lexists(root):
         return None
     _plain_path(root, directory=True, label="Retained deletion candidate")
-    reason = file_use(root)
-    if reason:
-        return reason
-    if not os.path.lexists(root / OWNER_FILE) and not any(root.iterdir()):
-        root.rmdir()
-        return None
-    manifest = _read_record(root / OWNER_FILE)
-    if manifest != raw["manifest"] or manifest["scope"] != scope.identity:
-        return "retained directory ownership changed"
-    extra = _foreign_files(root, manifest["files"])
-    if extra:
-        return f"unrecorded files: {extra}"
-    for name, item in manifest["files"].items():
-        path = root / _relative_path(name)
-        if os.path.lexists(path) and not _same_file(path, item):
-            return f"recorded file changed: {path}"
-    # Remove recorded bytes only; an unexpected file or a new user prevents rmdir.
-    for name in manifest["files"]:
-        path = root / _relative_path(name)
-        if os.path.lexists(path):
-            reason = file_use(root)
-            if reason:
-                return reason
-            _plain_path(path, label="Retained deletion file")
+    # Check directory boundaries before the first deletion, including nested links.
+    for directory, children, files in os.walk(root, followlinks=False):
+        base = pathlib.Path(directory)
+        _plain_path(base, directory=True, label="Retained directory")
+        for name in children:
+            _plain_path(base / name, directory=True, label="Retained directory")
+        for name in files:
+            _plain_path(base / name, label="Retained file")
+    for directory, _children, files in os.walk(root, topdown=False, followlinks=False):
+        base = pathlib.Path(directory)
+        for name in files:
+            path = base / name
+            if not path.stat().st_mode & stat.S_IWRITE:
+                path.chmod(path.stat().st_mode | stat.S_IWRITE)
             path.unlink()
-    for directory, _children, _files in os.walk(root, topdown=False, followlinks=False):
-        path = pathlib.Path(directory)
-        if path != root:
-            path.rmdir()
-    (root / OWNER_FILE).unlink()
-    root.rmdir()
+        base.rmdir()
     if root.parent != scope.group and not any(root.parent.iterdir()):
         root.parent.rmdir()
     return None
@@ -424,7 +417,6 @@ def retain_artifact_versions(
     deployments: Sequence[RetentionVersion] = (),
     current: RetentionVersion | None = None,
     previous: RetentionVersion | None = None,
-    file_use: FileUse | None = None,
     release_replacement: RetentionVersion | None = None,
 ) -> RetentionResult:
     """Keep this group's desired slots and finish only missing copying/deletion.
@@ -432,13 +424,11 @@ def retain_artifact_versions(
     protection is the existing store-cleanup or installation-destination lock;
     copy I/O happens outside the short store lock. The caller supplies current
     acceptance/deployment facts, not a saved execution cursor. Selection records
-    keep at most the selected copies plus live/uncertain deletion candidates.
-    A missing file-use source protects old copies instead of guessing liveness.
-    The caller keeps its normal release/destination ownership while selecting
-    facts and copying, and exposes ongoing file users to the deletion callback.
+    describe copies; directory contents determine obsolete deletion candidates.
+    Cleanup stays inside the explicitly requested storage group. It does not
+    inspect running processes or ask callers for information about file readers.
     """
     result = RetentionResult()
-    check_use: FileUse = file_use or (lambda _path: "file-use information unavailable")
     selected = select_retained_versions(scope, approved=approved, deployments=deployments, current=current, previous=previous)
     if release_replacement is not None:
         if scope.pool != "worktree" or not release_replacement.beta_stable:
@@ -461,7 +451,7 @@ def retain_artifact_versions(
     copied: dict[str, dict[str, Any]] = {}
     for key, value in selected.items():
         try:
-            root, manifest = copy_retained_version(scope, value, file_use=check_use)
+            root, manifest = copy_retained_version(scope, value)
             result.paths[key] = root
             copied[key] = {"key": key, "path": root.relative_to(scope.group).as_posix(), "manifest": manifest}
         except (OSError, ValueError, TypeError, StepResultError) as exc:
@@ -470,25 +460,55 @@ def retain_artifact_versions(
         return result  # No selection advances, and no old copy is deleted.
     with protection():
         try:
-            state = _read_record(scope.record) if os.path.lexists(scope.record) else {}
-            if state and (state.get("schema") != SCHEMA or state.get("scope") != scope.identity):
-                raise ValueError("Retention selection record belongs to another scope.")
-            old = state.get("copies", {})
-            if not isinstance(old, dict):
-                raise TypeError("Retention selection inventory is malformed.")
-            copies = {**old, **copied}
-            record = {"schema": SCHEMA, "scope": scope.identity, "selected": list(selected), "copies": copies}
-            _write_record(scope.record, record)
+            copies = dict(copied)
+            retained_keys = list(selected)
+            deployed_keys: list[str] = []
+            if scope.pool == "beta-stable":
+                # A build supplies a new approval, not a replacement deployment
+                # history. Keep the two successful deployments already recorded
+                # for this directory without reopening or retesting their files.
+                deployed_keys = list(select_retained_versions(scope, deployments=deployments))
+                if scope.record.exists():
+                    try:
+                        recorded = _read_record(scope.record).get("deployed", [])
+                    except (ValueError, TypeError):
+                        recorded = []
+                    if isinstance(recorded, list):
+                        deployed_keys.extend(key for key in recorded if isinstance(key, str))
+                deployed_keys = list(dict.fromkeys(deployed_keys))[:2]
+                for key in deployed_keys:
+                    raw = {"key": key, "path": f"{key}/{scope.target}"}
+                    path = _retained_copy_path(scope, raw)
+                    if not path.is_dir():
+                        raise ValueError(f"Recorded deployed artifact directory is missing: {path}")
+                    if key not in retained_keys:
+                        retained_keys.append(key)
+                    copies.setdefault(key, raw)
+                    result.paths.setdefault(key, path)
+            # Enumerate only this deliverable's versions and this target. The
+            # current successful selection, not an ownership manifest, determines
+            # which directories remain. Other worktrees are outside scope.group.
+            for directory in scope.group.iterdir():
+                if directory.name.startswith((".", "_")) or not directory.is_dir():
+                    continue
+                candidate = directory / scope.target
+                if candidate.exists() and directory.name not in copies:
+                    copies[directory.name] = {"key": directory.name,
+                                              "path": candidate.relative_to(scope.group).as_posix()}
+            record = {"schema": SCHEMA, "scope": scope.identity, "selected": retained_keys, "copies": copies}
+            if scope.pool == "beta-stable":
+                record["deployed"] = deployed_keys
+            _write_record(scope.record, record, atomic=True)
         except (OSError, ValueError, TypeError, StepResultError) as exc:
             result.deferred[str(scope.record)] = str(exc)
             return result
         for key in tuple(copies):
-            if key in selected:
+            if key in retained_keys:
                 continue
             raw = copies[key]
             try:
-                path = _owned_copy(scope, raw)
-                reason = _remove_copy(scope, raw, check_use)
+                path = _retained_copy_path(scope, raw)
+                reason = _remove_copy(scope, raw)
                 if reason:
                     result.deferred[str(path)] = reason
                     continue
@@ -497,7 +517,7 @@ def retain_artifact_versions(
             except (OSError, ValueError, TypeError, KeyError, StepResultError) as exc:
                 result.deferred[str(scope.record)] = str(exc)
         try:
-            _write_record(scope.record, record)
+            _write_record(scope.record, record, atomic=True)
         except (OSError, ValueError, StepResultError) as exc:
             result.deferred[str(scope.record)] = str(exc)
     return result

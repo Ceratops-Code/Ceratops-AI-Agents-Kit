@@ -127,7 +127,7 @@ installed-runtime surface.
   documentation, and explicit automation consumers; it builds the identity map
   and runs the source or installed validator in skill-scoped mode.
 - Read source surfaces from `identity.source_repository_root` in the packet.
-  This may be its retained source view rather than the caller's checkout.
+  This is a temporary view of the recorded Git commit.
 
 ### 2. Review nondeterministic consistency
 

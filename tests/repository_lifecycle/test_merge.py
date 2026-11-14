@@ -6,6 +6,7 @@ import pathlib
 import runpy
 import subprocess
 import sys
+from importlib import import_module
 from typing import Any, Self
 from unittest.mock import Mock
 
@@ -1350,3 +1351,85 @@ def test_auto_merge_applicability_survives_merge_only_contract(
     observed = {"repo": repo, "repository": {"repo": repo}, "owner": {"plan": {"name": "free"}}}
     desired = {"rules": [{**rule, "assertions": [auto]}], "contracts": []}
     assert compare_states(observed, desired)["findings"][0]["level"] == ("WARN" if applies else "PASS")
+
+
+@pytest.mark.parametrize(("automatic", "branch_status", "rules_status", "rules", "archived", "level", "interrupt"), [
+    (False, 200, 200, [], False, "PASS", None),
+    (True, 200, 200, [{"type": "deletion"}], False, "SKIP", None),
+    (True, 200, 200, [{"type": "non_fast_forward"}], False, "ERROR", None),
+    (True, 404, 200, [], False, "SKIP", None),
+    (True, 503, 503, [], False, "ERROR", None),
+    (True, 200, 403, [], False, "ERROR", "before"),
+    (True, 200, 403, [], False, "ERROR", "after"),
+    (True, 200, 200, [], True, "SKIP", None),
+])
+def test_create_contract_keeps_release_branch_after_merges(
+    monkeypatch: pytest.MonkeyPatch, automatic: bool, branch_status: int,
+    rules_status: int, rules: list[dict[str, str]], archived: bool,
+    level: str, interrupt: str | None,
+) -> None:
+    monkeypatch.syspath_prepend(str(PR_WORKFLOW_SCRIPTS))
+    from github_contract_engine.compare_states import compare_states
+    from github_contract_engine.compose_desired_state import (
+        compose_desired_state,
+        repo_subset_ids,
+    )
+    from github_contract_engine.github_api import ApiResult
+    from github_contract_engine.remediations import apply_remediations
+
+    collector = import_module("github_contract_engine.collect_observed_states")
+    contract = PR_WORKFLOW_SCRIPTS.parent / "references/contracts/github-repo-deterministic-contract.json"
+    check = "process.release_branch_retention"
+    contracts = {"repo": json.loads(contract.read_text(encoding="utf-8")), "code": {}, "artifact": {}}
+    create_checks = repo_subset_ids(contracts, "create")["repo"]
+    assert create_checks is not None and check in create_checks
+    desired = compose_desired_state(
+        {"repo": str(contract)}, {"owner": "owner", "repo": "repo"}, {"repo": {check}},
+    )
+    endpoint = "/repos/owner/repo"
+    settings = {"default_branch": "main", "archived": archived, "delete_branch_on_merge": automatic}
+    writes: list[dict[str, Any]] = []
+
+    def api(
+        method: str, path: str, body: dict[str, Any] | None = None,
+        *, paginate: bool = False,
+    ) -> ApiResult:
+        nonlocal interrupt
+        if method == "PATCH":
+            assert path == endpoint and body is not None
+            assert body == {"delete_branch_on_merge": False}
+            fault, interrupt = interrupt, None
+            if fault == "before":
+                raise OSError("interrupted setting update")
+            writes.append(body)
+            settings.update(body)
+            if fault == "after":
+                raise OSError("interrupted setting update")
+            return ApiResult(True, method, path, status=200)
+        if path == endpoint:
+            return ApiResult(True, method, path, data=dict(settings), status=200)
+        assert settings["delete_branch_on_merge"] and not archived
+        if path == endpoint + "/branches/release%2Flocal":
+            return ApiResult(
+                branch_status == 200, method, path,
+                data={"name": "release/local"}, status=branch_status,
+            )
+        assert path == endpoint + "/rules/branches/release%2Flocal?per_page=100"
+        assert paginate
+        return ApiResult(rules_status == 200, method, path, data=rules, status=rules_status)
+
+    monkeypatch.setattr(collector, "run_gh_api", api)
+    monkeypatch.setattr("github_contract_engine.remediations.repository.run_gh_api", api)
+
+    def findings() -> list[dict[str, Any]]:
+        return compare_states(collector.collect_observed_states(desired), desired)["findings"]
+
+    initial = findings()
+    assert [item["level"] for item in initial] == [level]
+    if interrupt is not None:
+        with pytest.raises(OSError, match="interrupted setting update"):
+            apply_remediations(desired, initial)
+    for _ in range(2):
+        apply_remediations(desired, findings())
+    assert writes == ([{"delete_branch_on_merge": False}] if level == "ERROR" else [])
+    assert [item["level"] for item in findings()] == ["PASS" if level == "ERROR" else level]

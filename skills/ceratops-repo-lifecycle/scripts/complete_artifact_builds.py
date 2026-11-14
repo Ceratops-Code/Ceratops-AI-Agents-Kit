@@ -22,12 +22,12 @@ from typing import Any
 import sdlc_results
 from sdlc_results import StepResultError
 from store_artifacts import (
+    _inputs_match_commit,
     ArtifactVersionTransaction,
     OperationError,
     RecoveryRequired,
     _build_directory,
     _git_text,
-    _prune_completed_artifacts,
     _read_transaction_record,
     _require_build_request,
     _require_transaction_target,
@@ -168,13 +168,8 @@ def _validate_prepared_receipt(
         receipt = sdlc_results.parse_committed_build_receipt(raw).value
     except StepResultError as exc:
         raise OperationError(str(exc)) from exc
-    expected_identity = {
-        "repository": transaction.repository,
-        "releaseBundle": transaction.release_bundle,
-        "version": transaction.version,
-        "target": target,
-        "attemptId": transaction.attempt_id,
-    }
+    expected_identity = sdlc_results.artifact_identity(
+        transaction.repository, transaction.release_bundle, transaction.version, target, transaction.attempt_id)
     if receipt["identity"] != expected_identity:
         raise OperationError("Prepared receipt identity does not match its reservation.")
     if tuple(sorted(receipt["requiredTargets"])) != transaction.required_targets:
@@ -234,8 +229,9 @@ def _prepared_result(
 def prepare_versioned_build_receipt(
     transaction: ArtifactVersionTransaction,
     target: str,
-    receipt: Mapping[str, Any],
+    receipt: Mapping[str, Any] | None,
     *,
+    prepared_operation=None, command_result=None, completed_results=(),
     check_summaries: Sequence[Mapping[str, Any]] = (),
 ) -> PreparedBuildReceipt:
     """Verify qualified bytes and write their exact receipt to its Git path.
@@ -246,6 +242,115 @@ def prepare_versioned_build_receipt(
     """
 
     _require_transaction_target(transaction, target)
+    if prepared_operation is not None:
+        from run_build_operations import collect_build_details
+        from store_artifacts import measure_build_file
+        item = prepared_operation
+        if command_result is None or command_result.get("status") != "completed":
+            raise OperationError("Only a completed builder can produce an accepted receipt.")
+        if any(result.get("status") not in {"completed", "no_op"} for result in completed_results):
+            raise OperationError("Required checks must finish before recording acceptance.")
+        records = [{key: value for key, value in record.items() if key != "deliverable"}
+                   for record in command_result.get("artifact_records", [])]
+        if not records:
+            raise OperationError("Builder returned no measured package files.")
+        product_inputs = []
+        for name in item.build_source_files:
+            # Git-root records describe committed blobs, including Git's text
+            # filters. Working-tree CRLF is not the identity of that Git object.
+            raw_source = _git_bytes(transaction.repo_root,
+                                    ["show", f"{transaction.pre_test_commit}:{name}"], label="read committed build source")
+            product_inputs.append({"root": "git", "path": name, "size": len(raw_source),
+                "sha256": hashlib.sha256(raw_source).hexdigest(),
+                "id": "source-" + hashlib.sha256(name.encode()).hexdigest()[:16]})
+        source_checks, artifact_tests, required = [], [], []
+        owner = item.operation.split(".actions.", 1)[0]
+        for result in completed_results:
+            operation = result.get("operation", "")
+            if result.get("status") == "no_op" or not (
+                operation.startswith(owner + ".actions.") or operation.startswith("repository.actions.")
+            ):
+                continue
+            if ".pre-build-checks." not in operation and ".post-build-checks." not in operation:
+                continue
+            check_id = "check-" + hashlib.sha256(operation.encode()).hexdigest()[:24]
+            version = result.get("check_result", {}).get("check_version") or result.get("commit") or transaction.pre_test_commit
+            common: dict[str, Any] = {"id": check_id, "version": version, "status": "passed", "evidence": []}
+            if ".pre-build-checks." in operation:
+                source_checks.append({**common, "inputs": [record["id"] for record in product_inputs]})
+                required.append({"kind": "source-check", "id": check_id, "version": version})
+            else:
+                artifact_tests.append({**common, "artifacts": [
+                    {key: record[key] for key in ("root", "path", "sha256")} for record in records]})
+                required.append({"kind": "artifact-test", "id": check_id, "version": version})
+        for check in command_result.get("check_summary", {}).get("checks", []):
+            if check["id"] not in item.build_check_groups:
+                continue
+            common = {"id": check["id"], "version": check["check_version"],
+                      "status": "passed", "evidence": []}
+            artifact_tests.append({**common, "artifacts": [
+                {key: record[key] for key in ("root", "path", "sha256")} for record in records]})
+            required.append({"kind": "artifact-test", "id": common["id"], "version": common["version"]})
+        dependencies = []
+        for reference, files in (item.selected_artifacts or {}).items():
+            if reference not in item.artifact_references:
+                continue
+            # Consume the exact accepted supplier, preserving its version and
+            # acceptance. Package bytes copied here belong to this version.
+            supplier = next((result for result in completed_results
+                             if result.get("operation") == reference + ".actions.build"), None)
+            if supplier is None:
+                raise OperationError(f"Missing supplier result for {reference}.")
+            identity = supplier.get("artifact_identity")
+            accepted = next((step.get("result") for step in supplier.get("step_results", [])
+                             if step.get("result", {}).get("schema") == sdlc_results.COMMITTED_BUILD_RECEIPT_SCHEMA), None)
+            if identity is None and accepted:
+                identity = accepted["identity"]
+            if identity is None:
+                raise OperationError(f"Supplier {reference} has no version identity.")
+            source_records = supplier.get("artifact_records") or (accepted["artifacts"] if accepted else [])
+            source_paths = supplier.get("artifacts", {}).get(reference, [])
+            if len(source_paths) != len(source_records):
+                raise OperationError(f"Supplier {reference} has incomplete file records.")
+            recorded_files = {pathlib.Path(path).resolve(): record
+                              for path, record in zip(source_paths, source_records, strict=True)}
+            copied = []
+            for filename in files:
+                source = pathlib.Path(filename)
+                original = recorded_files.get(source.resolve())
+                if original is None:
+                    raise OperationError(f"Supplier did not report the required file: {filename}")
+                relative = (f"dependencies/{sdlc_results.receipt_storage_key(identity)}/"
+                            f"{identity['version']}/{identity['target']}/{original['path']}")
+                destination = transaction.target_output(target) / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                record = (measure_build_file(transaction.target_output(target), {"type": "dependency", "path": relative})
+                          if destination.is_file() else None)
+                if record is None or any(record[field] != original[field] for field in ("sha256", "size")):
+                    destination.write_bytes(source.read_bytes())
+                    record = measure_build_file(transaction.target_output(target), {"type": "dependency", "path": relative})
+                if any(record[field] != original[field] for field in ("sha256", "size")):
+                    raise OperationError(f"Supplier file changed since its build: {filename}")
+                record["root"] = "store"
+                copied.append(record)
+            dependencies.append({key: value for key, value in identity.items() if key != "attemptId"} | {
+                "acceptanceId": accepted["acceptance"]["id"] if accepted else identity["attemptId"],
+                "artifacts": copied})
+        receipt = {
+            "schema": sdlc_results.COMMITTED_BUILD_RECEIPT_SCHEMA, "status": "passed",
+            "identity": sdlc_results.artifact_identity(transaction.repository, transaction.release_bundle,
+                                                      transaction.version, target, transaction.attempt_id),
+            "requiredTargets": list(transaction.required_targets), "preTestCommit": transaction.pre_test_commit,
+            "acceptance": {"operation": item.operation, "id": transaction.attempt_id},
+            "receiptPath": transaction.receipt_path(target), "artifactInputs": product_inputs, "checkInputs": [],
+            "dependencies": dependencies, "artifacts": records,
+            "installationArtifactPath": command_result["installationArtifactPath"],
+            "requiredChecks": required, "sourceChecks": source_checks, "artifactTests": artifact_tests,
+            "supportingFiles": [], "committedResultPaths": [transaction.receipt_path(target)],
+            **collect_build_details(item),
+        }
+    if receipt is None:
+        raise OperationError("Receipt preparation requires completed build outputs.")
     value = deepcopy(dict(receipt))
     summary = compose_build_check_summary(value, check_summaries, source_root=transaction.repo_root)
     summary_raw = (json.dumps(summary, sort_keys=True, separators=(",", ":"),
@@ -262,18 +367,15 @@ def prepare_versioned_build_receipt(
     except StepResultError as exc:
         raise OperationError(str(exc)) from exc
     validated = _validate_prepared_receipt(transaction, target, raw)
-    if _git_text(
-        transaction.repo_root, ["rev-parse", "HEAD"], label="worktree HEAD"
-    ) != transaction.pre_test_commit:
-        raise OperationError("Worktree HEAD moved after checkpoint B.")
-
     _require_build_request(transaction)
 
     for record in _receipt_git_inputs(validated):
         sdlc_results._read_git_record(
             transaction.repo_root, transaction.pre_test_commit, record
         )
-        sdlc_results._verify_bundle_file(transaction.repo_root, record)
+    if not _inputs_match_commit(transaction.repo_root, transaction.pre_test_commit,
+                                tuple(record["path"] for record in _receipt_git_inputs(validated))):
+        raise RecoveryRequired("Build source changed after its source commit.")
     _verify_output_inventory(
         transaction.target_output(target), _receipt_store_records(validated)
     )
@@ -392,12 +494,13 @@ def write_versioned_failure_diagnostic(
 
 
 def load_prepared_versioned_receipts(
-    transaction: ArtifactVersionTransaction,
+    transaction: ArtifactVersionTransaction, *, target: str | None = None,
 ) -> tuple[PreparedBuildReceipt, ...]:
     """Reconstruct prepared identities from direct final worktree paths."""
 
     prepared: list[PreparedBuildReceipt] = []
-    for target in transaction.required_targets:
+    for target in ((target,) if target is not None else transaction.required_targets):
+        _require_transaction_target(transaction, target)
         relative = sdlc_results._bundle_relative_path(
             transaction.receipt_path(target), label="Prepared build receipt"
         )
@@ -413,7 +516,7 @@ def load_prepared_versioned_receipts(
 
 def _prepared_receipt_set(
     transaction: ArtifactVersionTransaction,
-    prepared_receipts: Sequence[PreparedBuildReceipt] | None,
+    prepared_receipts: Sequence[PreparedBuildReceipt] | None, *, allow_partial=False,
 ) -> dict[str, tuple[PreparedBuildReceipt, dict[str, Any]]]:
     values = (
         load_prepared_versioned_receipts(transaction)
@@ -449,7 +552,7 @@ def _prepared_receipt_set(
                 "Prepared result bytes changed before completion."
             ) from exc
         by_target[prepared.target] = (prepared, receipt)
-    if set(by_target) != set(transaction.required_targets):
+    if not allow_partial and set(by_target) != set(transaction.required_targets):
         raise OperationError("Every required target must have a prepared receipt.")
     return by_target
 
@@ -535,7 +638,6 @@ def _require_unchanged_inputs(
             sdlc_results._read_git_record(
                 transaction.repo_root, transaction.pre_test_commit, record
             )
-            sdlc_results._verify_bundle_file(transaction.repo_root, record)
     except StepResultError as exc:
         raise RecoveryRequired("Declared inputs changed after checkpoint B.") from exc
     if input_paths:
@@ -789,7 +891,18 @@ def _write_version_artifact_receipts(
     for target in transaction.required_targets:
         item, receipt = prepared[target]
         raw = _artifact_receipt_bytes(item, receipt, final_commit)
+        # Tests have finished. Copy their exact output into this checkout's
+        # retained folder; an artifact receipt is written only after all bytes.
+        from retain_artifact_versions import _copy_file
         path = transaction.artifact_receipt(target)
+        destination = path.parent
+        records = [*receipt["artifactInputs"], *receipt["checkInputs"],
+                   *receipt["artifacts"], *receipt["supportingFiles"],
+                   *(record for dependency in receipt["dependencies"] for record in dependency["artifacts"])]
+        for record in records:
+            if record["root"] == "store":
+                relative = sdlc_results._bundle_relative_path(record["path"])
+                _copy_file(transaction.target_output(target) / relative, destination / relative, record)
         _persist_exact_bytes(
             path,
             raw,
@@ -860,53 +973,77 @@ def _create_artifact_tag(
     return tag
 
 
-def _remove_build_request(transaction: ArtifactVersionTransaction) -> None:
-    if not transaction.request_path.exists():
+def _remove_completed_build_temp(transaction: ArtifactVersionTransaction) -> None:
+    """Remove this completed version's temporary output, never a sibling's files."""
+    from store_artifacts import _artifact_store_path, _remove_versioned_tree
+    parent = _artifact_store_path(transaction.repo_root, temporary=True) / transaction.release_bundle
+    from store_artifacts import FULL_VERSION_RE
+    from packaging.version import Version
+    directory = transaction.request_path.parent
+    if directory != parent / transaction.version:
+        raise OperationError("Completed-build cleanup escapes this checkout's temporary directory.")
+    if not parent.exists():
         return
-    _require_build_request(transaction)
-    transaction.request_path.unlink()
-
-
-def _clear_versioned_diagnostics(transaction: ArtifactVersionTransaction) -> None:
-    for target in transaction.required_targets:
-        path = transaction.diagnostic_root / f"{target}.json"
-        if path.exists() or path.is_symlink():
-            sdlc_results._plain_path(path, label="Artifact diagnostic")
-            path.unlink()
-    if transaction.diagnostic_root.exists() and not any(transaction.diagnostic_root.iterdir()):
-        transaction.diagnostic_root.rmdir()
+    # A success supersedes older failed attempts in this same deliverable folder.
+    # A later attempt is left alone when an older completed build is reopened.
+    for path in parent.iterdir():
+        if FULL_VERSION_RE.fullmatch(path.name) and Version(path.name) <= Version(transaction.version):
+            _remove_versioned_tree(path, parent, label="Completed build temporary output")
 
 
 def complete_versioned_artifacts(
     transaction: ArtifactVersionTransaction,
     prepared_receipts: Sequence[PreparedBuildReceipt] | None = None,
+    *,
+    related_builds: Sequence[tuple[ArtifactVersionTransaction, Sequence[PreparedBuildReceipt] | None]] = (),
 ) -> CompletedArtifactVersion:
-    """Finish only missing receipt/commit/tag effects, then remove the request.
+    """Commit new member/bundle records together and finish member tags first.
 
-    The directory already owns the version. This operation cannot allocate,
-    rebuild or move an immutable tag. Only cross-version cleanup takes a lock.
+    Reused members keep their existing commits and tags and are not included in
+    related_builds. The final transaction is the bundle when one is requested.
+    A fresh call reads final receipts/tags; no phase cursor authorizes an effect.
     """
-    completed = _completed_versioned_result(transaction)
-    if completed is not None:
-        _clear_versioned_diagnostics(transaction)
-        _remove_build_request(transaction)
-        _prune_completed_artifacts(transaction.repo_root, transaction.store, transaction.lock_path)
-        return completed
-    _require_build_request(transaction)
-    prepared = _prepared_receipt_set(transaction, prepared_receipts)
-    records = _completion_records(prepared)
-    final_commit = _resolve_result_commit(transaction, prepared, records)
-    _require_build_request(transaction)
-    artifact_receipts = _write_version_artifact_receipts(transaction, prepared, final_commit)
-    tag = _create_artifact_tag(transaction, final_commit)
-    _clear_versioned_diagnostics(transaction)
-    _remove_build_request(transaction)
-    _prune_completed_artifacts(transaction.repo_root, transaction.store, transaction.lock_path)
+    group = [*related_builds, (transaction, prepared_receipts)]
+    if len({(item.release_bundle, item.version) for item, _ in group}) != len(group):
+        raise OperationError("Completion group repeats a member or bundle.")
+    if any(item.repo_root != transaction.repo_root or item.branch != transaction.branch
+           for item, _ in group):
+        raise OperationError("A completion group must belong to one task worktree.")
+    completed = [_completed_versioned_result(item) for item, _ in group]
+    if all(value is not None for value in completed):
+        for item, _ in group:
+            _remove_completed_build_temp(item)
+        final = completed[-1]
+        assert final is not None
+        return CompletedArtifactVersion(
+            final.final_commit, final.tag,
+            tuple(path for value in completed if value for path in value.build_receipts),
+            tuple(path for value in completed if value for path in value.artifact_receipts))
+    prepared_groups = []
+    combined = {}
+    for item, supplied in group:
+        if _artifact_tag_commit(item) is None:
+            _require_build_request(item)
+        prepared = _prepared_receipt_set(item, supplied)
+        prepared_groups.append(prepared)
+        combined.update({item.release_bundle + "/" + target: value for target, value in prepared.items()})
+    records = _completion_records(combined)
+    # New members may have different source commits. Each file must still match
+    # its recorded source at the final source commit used for this result group.
+    final_commit = _resolve_result_commit(transaction, combined, records)
+    artifact_paths: list[pathlib.Path] = []
+    tags = []
+    for (item, _), prepared in zip(group, prepared_groups, strict=True):
+        artifact_paths.extend(_write_version_artifact_receipts(item, prepared, final_commit))
+        tags.append(_create_artifact_tag(item, final_commit))
+    # Keep requests until all group tags exist, so interruption cannot strand
+    # an untagged member after its sibling has discarded the group inputs.
+    for item, _ in group:
+        _remove_completed_build_temp(item)
     return CompletedArtifactVersion(
-        final_commit=final_commit, tag=tag,
-        build_receipts=tuple(prepared[target][0].worktree_path for target in transaction.required_targets),
-        artifact_receipts=artifact_receipts,
-    )
+        final_commit=final_commit, tag=tags[-1],
+        build_receipts=tuple(value[0].worktree_path for prepared in prepared_groups for value in prepared.values()),
+        artifact_receipts=tuple(artifact_paths))
 
 
 def read_artifact_build(
@@ -920,18 +1057,17 @@ def read_artifact_build(
     """
     from store_artifacts import (
         LOGICAL_ID_RE,
-        RELEASE_BUNDLE_RE,
         _artifact_store_path,
         _require_identifier,
     )
 
     root = _validated_worktree(repo_root)
     repository = _validated_repository(repository)
-    unit = _require_identifier(release_bundle, label="release bundle", pattern=RELEASE_BUNDLE_RE)
+    unit = sdlc_results.receipt_storage_key({"storageKey": release_bundle})
     version, classification = _version_classification(version)
     targets = _validated_targets(required_targets)
     store = _artifact_store_path(root)
-    directory = store / unit / version
+    directory = _artifact_store_path(root, temporary=True) / unit / version
     request = directory / "build_request.json"
     branch = _git_text(root, ["symbolic-ref", "--quiet", "--short", "HEAD"], label="branch")
     registration = _git_text(root, ["rev-parse", "--absolute-git-dir"], label="Git registration")
@@ -943,10 +1079,7 @@ def read_artifact_build(
         paths = _validated_relative_paths(record.get("declaredInputPaths"), label="declared input path")
     else:
         selected = sdlc_results.read_artifact_receipt_chain(
-            root, tag=f"{unit}/{version}", expected={
-                "repository": repository, "releaseBundle": unit,
-                "version": version, "target": targets[0],
-            },
+            root, tag=f"{unit}/{version}", expected=sdlc_results.artifact_identity(repository, unit, version, targets[0]),
         )
         # A completed original may have been retired after an identical copy
         # reached the shared pool. Report that actual location to consumers.
@@ -963,7 +1096,7 @@ def read_artifact_build(
         attempt_id=attempt, allocation_commit=allocation_commit, pre_test_commit=commit,
         required_targets=targets, declared_input_paths=paths, store=store, request_path=request,
         version_root=directory, diagnostic_root=directory / ".diagnostics",
-        lock_path=store / ".locks/store.lock", uncertain_directories=(),
+        lock_path=store / ".locks/store.lock",
     )
     if request.exists():
         _require_build_request(transaction)
@@ -984,8 +1117,8 @@ def _completed_versioned_result(
         selected = sdlc_results.read_artifact_receipt_chain(
             transaction.repo_root,
             tag=f"{transaction.release_bundle}/{transaction.version}",
-            expected={"repository": transaction.repository, "releaseBundle": transaction.release_bundle,
-                      "version": transaction.version, "target": target, "attemptId": transaction.attempt_id},
+            expected=sdlc_results.artifact_identity(
+                transaction.repository, transaction.release_bundle, transaction.version, target, transaction.attempt_id),
         )
         _validate_prepared_receipt(transaction, target, selected.build_receipt.raw)
         if selected.final_commit != final_commit:

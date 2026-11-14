@@ -384,7 +384,7 @@ def test_repository_ship_checkpoints_each_operation_before_the_next(
         args.publish_operation = [PUBLIC, PUBLIC]
     else:
         args.deploy_operation = [LOCAL, LOCAL]
-    original = loaded["execute_release_builds"]
+    original = loaded["execute_build"]
     count = 0
 
     def execute(root: pathlib.Path, requests: Any, contract: Any, **kwargs: Any) -> dict[str, Any]:
@@ -406,13 +406,13 @@ def test_repository_ship_checkpoints_each_operation_before_the_next(
         return original(root, requests, contract, **kwargs)
 
     loaded["_checkpointed_operation_batch"].__globals__[
-        "execute_release_builds"
+        "execute_build"
     ] = execute
     with pytest.raises(RuntimeError, match="interrupted"):
         loaded["ship_repository"](args)
     assert log.read_text().splitlines().count(label) == 1
     loaded["_checkpointed_operation_batch"].__globals__[
-        "execute_release_builds"
+        "execute_build"
     ] = original
     resumed = loaded["ship_repository"](args)
     assert resumed["status"] == "already_shipped"
@@ -509,6 +509,7 @@ def test_repository_ship_blocks_selected_worktree_caller_before_remote_process(
     selected = tmp_path / "worktrees" / "repo" / "thread"
     selected.mkdir(parents=True)
     repo.mkdir()
+    assert run_git(repo, "init").returncode == 0
     scope = tmp_path / "scope.json"
     scope.write_text(
         json.dumps(
@@ -547,7 +548,7 @@ def test_repository_ship_blocks_selected_worktree_caller_before_remote_process(
             "pending_work_scope": str(scope),
         }
 
-    ship_repository = loaded["_ship_repository"]
+    ship_repository = loaded["ship_repository"]
     ship_repository.__globals__["_branch_worktree"] = branch_worktree
     ship_repository.__globals__["run_command_for_json"] = run_json
     ship_repository.__globals__["_local_branch_exists"] = lambda *_args: False

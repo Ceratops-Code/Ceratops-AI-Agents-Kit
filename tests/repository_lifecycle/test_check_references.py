@@ -49,7 +49,7 @@ def test_explicit_reference_removal_repeats_after_each_effect(repository, monkey
     old = {"version": 2, "target_branch": "main", "target_commit": commit,
            "sources": sources, "check_results": [{"result_id": "old-result", "path": "missing.json"}]}
     owner.write_scope(path, old)
-    effect = owner._write_scope if has_sources else pathlib.Path.unlink
+    effect = owner._cleanup["_write_scope"] if has_sources else pathlib.Path.unlink
 
     def interrupt(selected, *args, **kwargs):
         if selected != path:
@@ -60,7 +60,7 @@ def test_explicit_reference_removal_repeats_after_each_effect(repository, monkey
 
     with monkeypatch.context() as patch:
         if has_sources:
-            patch.setattr(owner, "_write_scope", interrupt)
+            patch.setitem(owner._cleanup, "_write_scope", interrupt)
         else:
             patch.setattr(pathlib.Path, "unlink", interrupt)
         with pytest.raises(OSError, match="interrupted conversion"):
@@ -95,13 +95,13 @@ def test_source_scope_write_repeats_after_interruption(repository, monkeypatch, 
     path = owner.scope_path(repo, "main")
     scope = {"version": 2, "target_branch": "main", "target_commit": commit,
              "sources": [{"branch": "codex/task", "commit": commit, "state": "retained"}]}
-    actual = owner._write_scope
+    actual = owner._cleanup["_write_scope"]
     def interrupt(path, value):
         if after:
             actual(path, value)
         raise KeyboardInterrupt()
     with monkeypatch.context() as patch:
-        patch.setattr(owner, "_write_scope", interrupt)
+        patch.setitem(owner._cleanup, "_write_scope", interrupt)
         with pytest.raises(KeyboardInterrupt):
             owner.write_scope(path, scope)
     owner.write_scope(path, scope)

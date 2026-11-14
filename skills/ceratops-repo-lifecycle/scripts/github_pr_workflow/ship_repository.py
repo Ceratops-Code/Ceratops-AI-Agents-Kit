@@ -24,7 +24,7 @@ from repository_operation import (
     FAILED_STATUSES,
     OperationError,
     OperationRequest,
-    execute_release_builds,
+    execute_build,
     execute_prepared_operations,
     operation_category,
     prepare_operations,
@@ -187,7 +187,7 @@ def _prepare_operation_batch(
     """Prepare requested work inside Ship's already-held source lock."""
 
     names = list(dict.fromkeys(operations))
-    result = execute_release_builds(
+    result = execute_build(
         repo_root, [OperationRequest(name) for name in names], contract,
         qualification_level="beta", validation_operations=validation_operations,
         prepare_only=True,
@@ -532,7 +532,7 @@ def _checkpointed_operation_batch(
         pending = operations[first_pending:]
         require_clean_commit(repo_root, synchronized_commit)
         for offset, operation in enumerate(pending):
-            batch = execute_release_builds(
+            batch = execute_build(
                 repo_root, [OperationRequest(operation)], contract,
                 expected_commit=synchronized_commit, qualification_level="beta",
                 validation_operations=validation_operations,
@@ -556,6 +556,7 @@ def _checkpointed_operation_batch(
             # Persist before the next side effect, not after the entire batch returns.
             _write_operation_checkpoint(checkpoints[index], identities[index], result)
             completed_results.append(result)
+            synchronized_commit = batch.get("final_commit", synchronized_commit)
             require_clean_commit(repo_root, synchronized_commit)
         return 0, _completed_operation_batch(operations, completed_results), checkpoints
     except (OperationError, OSError, ValueError) as exc:
@@ -1073,155 +1074,221 @@ def ship_repository(args: ShipOptions) -> dict[str, object]:
         getattr(args, "diagnostic_output", None), repo_root=owner_root, action=action,
         failure_id="ship_repository",
     ):
-        result = _ship_repository(args)
-        if result.get("status") in {"shipped", "already_shipped"}:
-            remove_resolved_failures(
-                result, diagnostic_output=getattr(args, "diagnostic_output", None),
-                repo_root=owner_root, action=action, resolved_failures=("ship_repository",),
+        completed_result = None
+        try:
+            repo_root = args.repo_root.expanduser().resolve(strict=True)
+            if _local_branch_exists(repo_root, "release"):
+                raise RepositoryShipError(
+                    "refs/heads/release blocks the required release/local branch namespace."
+                )
+            _operation_ids(args.validation_operation, "pre-build-checks")
+            release_operations = _operation_ids(args.publish_operation, "publish")
+            deploy_operations = _operation_ids(args.deploy_operation, "deploy-local")
+            _prepare_operation_batch(
+                repo_root=repo_root, contract=args.sdlc_contract,
+                operations=[*release_operations, *deploy_operations,
+                            *(args.validation_operation or [])],
+                validation_operations=args.validation_operation,
             )
-        return result
-
-
-def _ship_repository(args: ShipOptions) -> dict[str, object]:
-    """Run complete shipping, release publication, deployment, and cleanup."""
-
-    repo_root = args.repo_root.expanduser().resolve(strict=True)
-    if _local_branch_exists(repo_root, "release"):
-        raise RepositoryShipError(
-            "refs/heads/release blocks the required release/local branch namespace."
-        )
-    _operation_ids(args.validation_operation, "pre-build-checks")
-    release_operations = _operation_ids(args.publish_operation, "publish")
-    deploy_operations = _operation_ids(args.deploy_operation, "deploy-local")
-    _prepare_operation_batch(
-        repo_root=repo_root, contract=args.sdlc_contract,
-        operations=[*release_operations, *deploy_operations,
-                    *(args.validation_operation or [])],
-        validation_operations=args.validation_operation,
-    )
-    release_publication: dict[str, Any] | None = (
-        None if release_operations else _no_op_operations([], "not_selected")
-    )
-    deployment: dict[str, Any] | None = (
-        None if deploy_operations else _no_op_operations([], "not_selected")
-    )
-    prepare_code, prepared = run_command_for_json(
-        _prepare_pending_command(
-            repo_root=repo_root,
-            target_branch=args.head_branch,
-            target_commit=args.commit,
-        ),
-        cwd=repo_root,
-    )
-    if prepare_code == 2:
-        return prepared
-    if prepare_code:
-        raise RepositoryShipError(
-            str(prepared.get("message", "Pending-work preparation failed.")),
-            prepared,
-        )
-    pending_scope = _prepared_scope(prepared)
-    preserved_worktrees = _prepared_preserved_worktrees(prepared)
-    prepared_target_commit = _prepared_target_commit(
-        prepared,
-        pending_scope,
-        args.commit,
-    )
-    _require_cleanup_safe_caller(
-        repo_root,
-        pending_scope,
-        preserved_worktrees,
-    )
-    validation = _validate_phase(
-        args, repo_root, [*release_operations, *deploy_operations],
-        phase="before_remote", remote_mutation=False,
-    )
-    test_selection = (
-        None if _synchronized_post_merge_resume(args, repo_root, prepared_target_commit)
-        else _test_selection_phase(args, repo_root, prepared_target_commit)
-    )
-    shipped = _call_github_ship(args, repo_root, pending_scope, prepared_target_commit)
-    if shipped.get("status") == "pending_work":
-        return _with_preserved_worktrees(shipped, preserved_worktrees)
-    if shipped.get("status") not in {"shipped", "already_shipped"}:
-        raise RepositoryShipError("GitHub ship returned a non-terminal result.")
-    target_commit = shipped.get("commit")
-    synchronized_head = shipped.get("synchronized_head")
-    if not isinstance(target_commit, str) or not isinstance(synchronized_head, str):
-        raise RepositoryShipError("Shipping result lacks exact commit identity.")
-    if (
-        prepared_target_commit is not None
-        and target_commit.lower() != prepared_target_commit
-    ):
-        raise RepositoryShipError(
-            "Shipping result does not match the prepared target commit."
-        )
-
-    if pending_scope is not None:
-        check_code, checked = run_command_for_json(
-            _pending_command(
-                "check",
-                repo_root=repo_root,
-                scope=pending_scope,
-                target_branch=args.head_branch,
-                target_commit=target_commit,
-            ),
-            cwd=repo_root,
-        )
-        if check_code == 2:
-            return _with_preserved_worktrees({
-                **checked,
-                "phase": "post_sync",
-                "repository": shipped.get("repository"),
-                "commit": target_commit,
-                "pr": shipped.get("pr"),
-                "url": shipped.get("url"),
-                "remote_mutation": True,
-                **_phase_recovery(
-                    args,
+            release_publication: dict[str, Any] | None = (
+                None if release_operations else _no_op_operations([], "not_selected")
+            )
+            deployment: dict[str, Any] | None = (
+                None if deploy_operations else _no_op_operations([], "not_selected")
+            )
+            prepare_code, prepared = run_command_for_json(
+                _prepare_pending_command(
                     repo_root=repo_root,
-                    shipped=shipped,
-                    target_commit=target_commit,
-                    synchronized_head=synchronized_head,
-                    remaining="selected_work_recheck",
-                    release_publication=release_publication,
-                    deployment=deployment,
+                    target_branch=args.head_branch,
+                    target_commit=args.commit,
                 ),
-            }, preserved_worktrees)
-        if check_code:
-            raise RepositoryShipError(
-                str(checked.get("message", "Late pending-work check failed.")),
-                checked,
+                cwd=repo_root,
             )
-        pending_scope = _prepared_scope(checked)
+            if prepare_code == 2:
+                completed_result = prepared
+                return completed_result
+            if prepare_code:
+                raise RepositoryShipError(
+                    str(prepared.get("message", "Pending-work preparation failed.")),
+                    prepared,
+                )
+            pending_scope = _prepared_scope(prepared)
+            preserved_worktrees = _prepared_preserved_worktrees(prepared)
+            prepared_target_commit = _prepared_target_commit(
+                prepared,
+                pending_scope,
+                args.commit,
+            )
+            _require_cleanup_safe_caller(
+                repo_root,
+                pending_scope,
+                preserved_worktrees,
+            )
+            validation = _validate_phase(
+                args, repo_root, [*release_operations, *deploy_operations],
+                phase="before_remote", remote_mutation=False,
+            )
+            test_selection = (
+                None if _synchronized_post_merge_resume(args, repo_root, prepared_target_commit)
+                else _test_selection_phase(args, repo_root, prepared_target_commit)
+            )
+            shipped = _call_github_ship(args, repo_root, pending_scope, prepared_target_commit)
+            if shipped.get("status") == "pending_work":
+                completed_result = _with_preserved_worktrees(shipped, preserved_worktrees)
+                return completed_result
+            if shipped.get("status") not in {"shipped", "already_shipped"}:
+                raise RepositoryShipError("GitHub ship returned a non-terminal result.")
+            target_commit = shipped.get("commit")
+            synchronized_head = shipped.get("synchronized_head")
+            if not isinstance(target_commit, str) or not isinstance(synchronized_head, str):
+                raise RepositoryShipError("Shipping result lacks exact commit identity.")
+            if (
+                prepared_target_commit is not None
+                and target_commit.lower() != prepared_target_commit
+            ):
+                raise RepositoryShipError(
+                    "Shipping result does not match the prepared target commit."
+                )
 
-    operation_checkpoints: list[pathlib.Path] = []
-    if release_publication is None:
-        release_code, release_publication, release_checkpoints = (
-            _checkpointed_operation_batch(
-                repo_root=repo_root,
-                contract=args.sdlc_contract,
-                operations=release_operations,
-                phase="release_publication",
-                target_branch=args.head_branch,
-                target_commit=target_commit,
-                synchronized_commit=synchronized_head,
-                validation_operations=args.validation_operation,
-                diagnostic_output=getattr(args, "diagnostic_output", None),
-                diagnostic_owner=getattr(args, "diagnostic_owner", None) or (args.repo_root, "ship"),
-            )
-        )
-        operation_checkpoints.extend(release_checkpoints)
-        if release_code:
-            raise RepositoryShipError(
-                str(
-                    release_publication.get(
-                        "message", "Release publication failed."
+            if pending_scope is not None:
+                check_code, checked = run_command_for_json(
+                    _pending_command(
+                        "check",
+                        repo_root=repo_root,
+                        scope=pending_scope,
+                        target_branch=args.head_branch,
+                        target_commit=target_commit,
+                    ),
+                    cwd=repo_root,
+                )
+                if check_code == 2:
+                    completed_result = _with_preserved_worktrees({
+                        **checked,
+                        "phase": "post_sync",
+                        "repository": shipped.get("repository"),
+                        "commit": target_commit,
+                        "pr": shipped.get("pr"),
+                        "url": shipped.get("url"),
+                        "remote_mutation": True,
+                        **_phase_recovery(
+                            args,
+                            repo_root=repo_root,
+                            shipped=shipped,
+                            target_commit=target_commit,
+                            synchronized_head=synchronized_head,
+                            remaining="selected_work_recheck",
+                            release_publication=release_publication,
+                            deployment=deployment,
+                        ),
+                    }, preserved_worktrees)
+                    return completed_result
+                if check_code:
+                    raise RepositoryShipError(
+                        str(checked.get("message", "Late pending-work check failed.")),
+                        checked,
                     )
+                pending_scope = _prepared_scope(checked)
+
+            operation_checkpoints: list[pathlib.Path] = []
+            if release_publication is None:
+                release_code, release_publication, release_checkpoints = (
+                    _checkpointed_operation_batch(
+                        repo_root=repo_root,
+                        contract=args.sdlc_contract,
+                        operations=release_operations,
+                        phase="release_publication",
+                        target_branch=args.head_branch,
+                        target_commit=target_commit,
+                        synchronized_commit=synchronized_head,
+                        validation_operations=args.validation_operation,
+                        diagnostic_output=getattr(args, "diagnostic_output", None),
+                        diagnostic_owner=getattr(args, "diagnostic_owner", None) or (args.repo_root, "ship"),
+                    )
+                )
+                operation_checkpoints.extend(release_checkpoints)
+                if release_code:
+                    raise RepositoryShipError(
+                        str(
+                            release_publication.get(
+                                "message", "Release publication failed."
+                            )
+                        ),
+                        {
+                            **release_publication,
+                            "phase": "release_publication",
+                            "remote_mutation": True,
+                            **_phase_recovery(
+                                args,
+                                repo_root=repo_root,
+                                shipped=shipped,
+                                target_commit=target_commit,
+                                synchronized_head=synchronized_head,
+                                remaining="release_publication",
+                                release_publication=release_publication,
+                                deployment=deployment,
+                            ),
+                        },
+                    )
+
+            if deployment is None:
+                deploy_code, deployment, deployment_checkpoints = (
+                    _checkpointed_operation_batch(
+                        repo_root=repo_root,
+                        contract=args.sdlc_contract,
+                        operations=deploy_operations,
+                        phase="deployment",
+                        target_branch=args.head_branch,
+                        target_commit=target_commit,
+                        synchronized_commit=synchronized_head,
+                        validation_operations=args.validation_operation,
+                        diagnostic_output=getattr(args, "diagnostic_output", None),
+                        diagnostic_owner=getattr(args, "diagnostic_owner", None) or (args.repo_root, "ship"),
+                    )
+                )
+                operation_checkpoints.extend(deployment_checkpoints)
+                if deploy_code:
+                    raise RepositoryShipError(
+                        str(deployment.get("message", "Deployment failed.")),
+                        {
+                            **deployment,
+                            "phase": "deployment",
+                            "remote_mutation": True,
+                            **_phase_recovery(
+                                args,
+                                repo_root=repo_root,
+                                shipped=shipped,
+                                target_commit=target_commit,
+                                synchronized_head=synchronized_head,
+                                remaining="deployment",
+                                release_publication=release_publication,
+                                deployment=deployment,
+                            ),
+                        },
+                    )
+
+            finalized: dict[str, Any] | None = None
+            finalize_code, finalized = _run_finalization(
+                _pending_command(
+                    "finalize",
+                    repo_root=repo_root,
+                    scope=pending_scope,
+                    target_branch=args.head_branch,
+                    target_commit=target_commit,
+                    current_branch=args.base_branch,
+                    current_commit=synchronized_head,
                 ),
-                {
-                    **release_publication,
-                    "phase": "release_publication",
+                repo_root=repo_root,
+            )
+            if finalize_code == 2:
+                completed_result = _with_preserved_worktrees({
+                    **finalized,
+                    "phase": "post_operations",
+                    "repository": shipped.get("repository"),
+                    "commit": target_commit,
+                    "pr": shipped.get("pr"),
+                    "url": shipped.get("url"),
+                    "release_publication": release_publication,
+                    "deployment": deployment,
                     "remote_mutation": True,
                     **_phase_recovery(
                         args,
@@ -1229,127 +1296,62 @@ def _ship_repository(args: ShipOptions) -> dict[str, object]:
                         shipped=shipped,
                         target_commit=target_commit,
                         synchronized_head=synchronized_head,
-                        remaining="release_publication",
+                        remaining="finalization",
                         release_publication=release_publication,
                         deployment=deployment,
                     ),
-                },
-            )
+                }, preserved_worktrees)
+                return completed_result
+            if finalize_code:
+                raise RepositoryShipError(
+                    str(finalized.get("message", "Selected-work cleanup failed.")),
+                    {
+                        **finalized,
+                        "phase": "finalization",
+                        "repository": shipped.get("repository"),
+                        "commit": target_commit,
+                        "pr": shipped.get("pr"),
+                        "url": shipped.get("url"),
+                        "release_publication": release_publication,
+                        "deployment": deployment,
+                        "remote_mutation": True,
+                        **_phase_recovery(
+                            args,
+                            repo_root=repo_root,
+                            shipped=shipped,
+                            target_commit=target_commit,
+                            synchronized_head=synchronized_head,
+                            remaining="finalization",
+                            release_publication=release_publication,
+                            deployment=deployment,
+                        ),
+                    },
+                )
+            for checkpoint in operation_checkpoints:
+                _remove_completed_operation_checkpoint(checkpoint)
 
-    if deployment is None:
-        deploy_code, deployment, deployment_checkpoints = (
-            _checkpointed_operation_batch(
-                repo_root=repo_root,
-                contract=args.sdlc_contract,
-                operations=deploy_operations,
-                phase="deployment",
-                target_branch=args.head_branch,
-                target_commit=target_commit,
-                synchronized_commit=synchronized_head,
-                validation_operations=args.validation_operation,
-                diagnostic_output=getattr(args, "diagnostic_output", None),
-                diagnostic_owner=getattr(args, "diagnostic_owner", None) or (args.repo_root, "ship"),
-            )
-        )
-        operation_checkpoints.extend(deployment_checkpoints)
-        if deploy_code:
-            raise RepositoryShipError(
-                str(deployment.get("message", "Deployment failed.")),
-                {
-                    **deployment,
-                    "phase": "deployment",
-                    "remote_mutation": True,
-                    **_phase_recovery(
-                        args,
-                        repo_root=repo_root,
-                        shipped=shipped,
-                        target_commit=target_commit,
-                        synchronized_head=synchronized_head,
-                        remaining="deployment",
-                        release_publication=release_publication,
-                        deployment=deployment,
-                    ),
-                },
-            )
-
-    finalized: dict[str, Any] | None = None
-    finalize_code, finalized = _run_finalization(
-        _pending_command(
-            "finalize",
-            repo_root=repo_root,
-            scope=pending_scope,
-            target_branch=args.head_branch,
-            target_commit=target_commit,
-            current_branch=args.base_branch,
-            current_commit=synchronized_head,
-        ),
-        repo_root=repo_root,
-    )
-    if finalize_code == 2:
-        return _with_preserved_worktrees({
-            **finalized,
-            "phase": "post_operations",
-            "repository": shipped.get("repository"),
-            "commit": target_commit,
-            "pr": shipped.get("pr"),
-            "url": shipped.get("url"),
-            "release_publication": release_publication,
-            "deployment": deployment,
-            "remote_mutation": True,
-            **_phase_recovery(
-                args,
-                repo_root=repo_root,
-                shipped=shipped,
-                target_commit=target_commit,
-                synchronized_head=synchronized_head,
-                remaining="finalization",
-                release_publication=release_publication,
-                deployment=deployment,
-            ),
-        }, preserved_worktrees)
-    if finalize_code:
-        raise RepositoryShipError(
-            str(finalized.get("message", "Selected-work cleanup failed.")),
-            {
-                **finalized,
-                "phase": "finalization",
+            result: dict[str, Any] = {
+                "status": shipped["status"],
                 "repository": shipped.get("repository"),
                 "commit": target_commit,
                 "pr": shipped.get("pr"),
                 "url": shipped.get("url"),
+                "merge_commit": shipped.get("merge_commit"),
+                "synchronized_head": synchronized_head,
                 "release_publication": release_publication,
                 "deployment": deployment,
-                "remote_mutation": True,
-                **_phase_recovery(
-                    args,
-                    repo_root=repo_root,
-                    shipped=shipped,
-                    target_commit=target_commit,
-                    synchronized_head=synchronized_head,
-                    remaining="finalization",
-                    release_publication=release_publication,
-                    deployment=deployment,
-                ),
-            },
-        )
-    for checkpoint in operation_checkpoints:
-        _remove_completed_operation_checkpoint(checkpoint)
-
-    result: dict[str, Any] = {
-        "status": shipped["status"],
-        "repository": shipped.get("repository"),
-        "commit": target_commit,
-        "pr": shipped.get("pr"),
-        "url": shipped.get("url"),
-        "merge_commit": shipped.get("merge_commit"),
-        "synchronized_head": synchronized_head,
-        "release_publication": release_publication,
-        "deployment": deployment,
-        "finalization": finalized,
-    }
-    if test_selection is not None:
-        result["test_selection"] = test_selection
-    validation_handoffs = [item for item in validation["results"] if item.get("handoff") and not item.get("handoff_completed")]
-    if validation_handoffs:
-        result["validation_handoffs"] = validation_handoffs
-    return _with_preserved_worktrees(result, preserved_worktrees)
+                "finalization": finalized,
+            }
+            if test_selection is not None:
+                result["test_selection"] = test_selection
+            validation_handoffs = [item for item in validation["results"] if item.get("handoff") and not item.get("handoff_completed")]
+            if validation_handoffs:
+                result["validation_handoffs"] = validation_handoffs
+            completed_result = _with_preserved_worktrees(result, preserved_worktrees)
+            return completed_result
+        finally:
+            if completed_result is not None and completed_result.get("status") in {"shipped", "already_shipped"}:
+                remove_resolved_failures(
+                    completed_result, diagnostic_output=getattr(args, "diagnostic_output", None),
+                    repo_root=owner_root, action=action, resolved_failures=("ship_repository",),
+                )

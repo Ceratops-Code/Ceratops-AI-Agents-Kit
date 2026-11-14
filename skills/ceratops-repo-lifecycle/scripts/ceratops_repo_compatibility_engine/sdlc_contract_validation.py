@@ -48,7 +48,7 @@ ACTION_CATEGORIES = {
 RESULT_SCHEMAS = {
     "pre-build-checks": ("ceratops-repository-stage-result.v1",),
     "post-build-checks": ("ceratops-repository-stage-result.v1",),
-    "build": ("ceratops-build-result.v1", "ceratops-build-result.v2", "ceratops-build-result.v3"),
+    "build": ("ceratops-builder-output", "ceratops-build-result.v4"),
     "install": ("ceratops-deployment-result.v1",),
 }
 
@@ -275,25 +275,34 @@ def operation_package_names(requirements: Mapping[str, Any]) -> list[str]:
                               if ref.startswith("deliverables.packages.")))
 
 
-def deliverable_source_files(repo_root: pathlib.Path, record: Mapping[str, Any]) -> list[str]:
-    """List tracked and nonignored new source files once in the current worktree."""
+def deliverable_source_files(repo_root: pathlib.Path, record: Mapping[str, Any], *, include_deleted=False) -> list[str]:
+    """List current sources, optionally retaining deleted paths for source commits.
+
+    A staged deletion is absent from the index, so commit preparation also needs
+    deletions relative to HEAD. Blob inventories retain only existing files.
+    """
     root = pathlib.PurePosixPath(record["root-dir"])
     patterns = record.get("additional-source-files", [])
-    command = ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"]
-    result = subprocess.run(command, cwd=repo_root, capture_output=True, check=False)
-    if result.returncode:
-        raise SdlcContractError(
-            f"Cannot list build sources in {repo_root}: {command!r}; exit={result.returncode}; "
-            f"stdout={result.stdout or '<absent>'!r}; stderr={result.stderr or '<absent>'!r}"
-        )
+    commands = [["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"]]
+    if include_deleted:
+        commands.append(["git", "diff", "--name-only", "--diff-filter=D", "--no-renames", "-z", "HEAD", "--"])
+    names = set()
+    for command in commands:
+        result = subprocess.run(command, cwd=repo_root, capture_output=True, check=False)
+        if result.returncode:
+            raise SdlcContractError(
+                f"Cannot list build sources in {repo_root}: {command!r}; exit={result.returncode}; "
+                f"stdout={result.stdout or '<absent>'!r}; stderr={result.stderr or '<absent>'!r}"
+            )
+        names.update(result.stdout.decode("utf-8").split("\0"))
     resolved_root = repo_root.resolve()
     return sorted({
-        name for name in result.stdout.decode("utf-8").split("\0") if name and (
+        name for name in names if name and (
             pathlib.PurePosixPath(name).is_relative_to(root)
             or any(fnmatch.fnmatchcase(name, pattern) or
                    (pattern.startswith("**/") and fnmatch.fnmatchcase(name, pattern[3:]))
                    for pattern in patterns)
-        ) and (repo_root / name).is_file()
+        ) and ((repo_root / name).is_file() or include_deleted and not (repo_root / name).exists())
         and (repo_root / name).resolve().is_relative_to(resolved_root)
     })
 

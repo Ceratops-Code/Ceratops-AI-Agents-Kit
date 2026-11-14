@@ -28,18 +28,19 @@ def test_direct_fast_change_stopped_failure_releases_for_next_call(tmp_path, mon
     module = runpy.run_path(str(FAST_CHANGE))
     execute = module["execute"]
 
-    def failed_check(_spec):
+    def failed_check(*_args, **_kwargs):
         module["_checked"]([sys.executable, "-c", "raise SystemExit(7)"],
                            cwd=repo, failure="fixture failed")
 
-    monkeypatch.setitem(execute.__globals__, "_execute", failed_check)
-    spec = SimpleNamespace(repo_root=repo)
+    monkeypatch.setitem(execute.__globals__, "_git", failed_check)
+    spec = SimpleNamespace(repo_root=repo, patch="fixture")
     for _ in range(2):
         with pytest.raises(module["FastChangeError"], match="fixture failed"):
             execute(spec)
         assert (repo / ".git/ceratops/locks/release-local").read_bytes() == b"0"
-    monkeypatch.setitem(execute.__globals__, "_execute", lambda _spec: {"status": "committed"})
-    assert execute(spec)["status"] == "committed"
+    with module["_release_write_context"](repo):
+        pass
+    assert (repo / ".git/ceratops/locks/release-local").read_bytes() == b"0"
 
 
 @pytest.mark.parametrize("child_effect", [False, True])
@@ -47,7 +48,7 @@ def test_fast_change_does_not_reverse_files_after_interrupted_launcher(tmp_path,
     repo = prepare_fast_change_repo(tmp_path)
     module = runpy.run_path(str(FAST_CHANGE))
     execute = module["execute"]
-    body = module["_execute"]
+    body = execute
     locks = module["_release_lock_module"]()
     path = repo / "skills/alpha-tool/notes.txt"
     effects = []

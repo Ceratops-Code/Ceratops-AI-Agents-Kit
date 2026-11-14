@@ -14,6 +14,8 @@ import tomllib
 from collections.abc import Mapping
 from typing import Any
 
+from .repository_validation_contract import load_validation_contract
+
 
 def discover_python_tests(root: pathlib.Path, rules: Mapping[str, Any]) -> list[str]:
     """Return stable repository-relative candidates, skipping linked directories."""
@@ -45,11 +47,14 @@ def discover_python_tests(root: pathlib.Path, rules: Mapping[str, Any]) -> list[
     return []
 
 
-def test_operation(root: pathlib.Path, runner: str) -> dict[str, Any]:
+def test_operation(runner: str) -> dict[str, Any]:
     """Use the scripts project for generated tests; preserve explicit SDLC operations."""
     return {
         "requires": {"capabilities": ["uv"]},
-        "steps": [{"run": ["uv", "run", "--locked", runner]}],
+        "steps": [{"run": [
+            "uv", "run", "--locked", runner, "--temporary-root",
+            load_validation_contract()["test_temporary_root"],
+        ]}],
     }
 
 

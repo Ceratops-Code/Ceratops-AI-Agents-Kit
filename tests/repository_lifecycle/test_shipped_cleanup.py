@@ -1299,14 +1299,14 @@ def test_repository_ship_prevalidates_and_executes_ordered_phase_selections(
 ) -> None:
     _, loaded, args, log, _, commands = shipping_cases._setup(tmp_path)
     prepare_calls = []
-    execute_builds = loaded["execute_release_builds"]
+    execute_builds = loaded["execute_build"]
 
     def track_builds(*positional, **keywords):
         if keywords.get("prepare_only"):
             prepare_calls.append(keywords)
         return execute_builds(*positional, **keywords)
 
-    monkeypatch.setitem(loaded["ship_repository"].__globals__, "execute_release_builds", track_builds)
+    monkeypatch.setitem(loaded["ship_repository"].__globals__, "execute_build", track_builds)
     args.publish_operation = [shipping_cases.PUBLIC, shipping_cases.PUBLIC]
     result = loaded["ship_repository"](args)
     assert log.read_text().splitlines() == [
@@ -1416,6 +1416,9 @@ def test_composed_promotion_and_shipping_each_run_their_validation_boundary(
     assert run_git(repo, "add", ".").returncode == 0
     assert run_git(repo, "commit", "-m", "alternate validator").returncode == 0
     head = run_git(repo, "rev-parse", "HEAD").stdout.strip()
+    assert run_git(repo, "switch", "main").returncode == 0
+    promoting_task = active.parent / "promoter"
+    assert run_git(repo, "worktree", "add", str(promoting_task), "approved").returncode == 0
     promotion = runpy.run_path(str(PROMOTE_REPOSITORY))
     shipping = shipping_cases._load_ship()
     original_shipping = shipping["run_command_for_json"]
@@ -1447,7 +1450,7 @@ def test_composed_promotion_and_shipping_each_run_their_validation_boundary(
     args = promotion["build_parser"]().parse_args(
         [
             "--repo-root",
-            str(repo),
+            str(promoting_task),
             "--source-branch",
             "approved",
             "--ship-after-promotion",

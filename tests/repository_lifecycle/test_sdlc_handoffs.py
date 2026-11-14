@@ -49,451 +49,38 @@ def _repository(repo: pathlib.Path) -> str:
     return run_git(repo, "rev-parse", "HEAD").stdout.strip()
 
 
-def _bundle_transaction(tmp_path):
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    (repo / "source.txt").write_text("committed input\n", encoding="utf-8")
-    commit = _repository(repo)
-    calls = []
-
-    def build(bundle, work):
-        calls.append("build")
-        (work / "private-environment").mkdir()
-        (bundle / "artifacts").mkdir()
-        (bundle / "artifacts/example.whl").write_bytes(b"exact built artifact")
-        return runner.BuildProduct(artifacts=[{
-            "deliverable": "deliverables.packages.example",
-            "type": "wheel", "path": "artifacts/example.whl",
-        }])
-
-    def test(bundle, artifacts, work):
-        calls.append("test")
-        assert (work / "private-environment").is_dir()
-        evidence = bundle / "supporting-files" / "test.json"
-        evidence.parent.mkdir()
-        evidence.write_bytes(b'{"status":"passed"}\n')
-        return [{
-            "id": "installed-artifact", "status": "passed",
-            "artifacts": [{"path": item["path"], "sha256": item["sha256"]} for item in artifacts],
-            "evidence": {
-                "path": evidence.relative_to(bundle).as_posix(),
-                "sha256": hashlib.sha256(evidence.read_bytes()).hexdigest(),
-            },
-        }]
-
-    return repo, {
-        "selection": {
-            "repository": "https://example.invalid/owner/repo",
-            "sourceCommit": commit, "releaseBundle": "example", "channel": "alpha",
-            "version": "1.0+alpha", "target": "any",
-        },
-        "inputs": {"dependencySelections": [], "lock": "a" * 64, "adapter": "fixture-v1"},
-        "required_tests": ["installed-artifact"],
-        "build": build, "test": test,
-    }, calls
 
 
-def _bundle_diagnostic(repo: pathlib.Path, selection: dict[str, str]) -> pathlib.Path:
-    store = repo / ".git" / "ceratops" / "builds"
-    return storage._build_diagnostic_path(store / ".diagnostics", selection)
 
 
-def test_completed_build_reader_preserves_recorded_acceptance_and_paths(tmp_path) -> None:
-    repo, kwargs, calls = _bundle_transaction(tmp_path)
-    receipt_path = runner.build_bundle(repo, **kwargs)
-    saved = {path.relative_to(receipt_path.parent): path.read_bytes()
-             for path in receipt_path.parent.rglob("*") if path.is_file()}
-    assert calls == ["build", "test"]
-    (repo / "source.txt").write_text("changed working input\n", encoding="utf-8")
-    kwargs["required_tests"] = ["replacement-artifact-test"]
-    selected = runner.read_completed_build(repo, selection=kwargs["selection"])
-    explicit = runner.read_completed_build(repo, receipt_path=receipt_path)
-    assert calls == ["build", "test"]
-    assert selected == explicit
-    assert selected.receipt_path == receipt_path
-    assert selected.artifacts == (receipt_path.parent / "artifacts/example.whl",)
-    assert selected.dependencies == ()
-    assert {path.relative_to(receipt_path.parent).as_posix()
-            for path in selected.supporting_files} == {
-        "supporting-files/build-inputs.json", "supporting-files/test.json",
-    }
-    assert {path.relative_to(receipt_path.parent): path.read_bytes()
-            for path in receipt_path.parent.rglob("*") if path.is_file()} == saved
-    store = receipt_path.parent.parent
-    diagnostic = _bundle_diagnostic(repo, kwargs["selection"])
-    assert not list((store / ".staging").iterdir())
-    assert [path.name for path in (store / ".locks").iterdir()] == ["store.lock"]
-    assert not diagnostic.exists()
-    assert not (receipt_path.parent / "work").exists()
-    assert run_git(repo, "status", "--porcelain").stdout == " M source.txt\n"
-
-    with pytest.raises(runner.OperationError, match="already exists"):
-        runner.build_bundle(repo, **kwargs)
-    conflicting = {**kwargs, "inputs": {**kwargs["inputs"], "lock": "b" * 64}}
-    with pytest.raises(runner.OperationError, match="already exists"):
-        runner.build_bundle(repo, **conflicting)
-    assert calls == ["build", "test"] and diagnostic.is_file()
 
 
-def test_completed_build_reader_returns_recorded_dependency_paths(tmp_path) -> None:
-    repo, kwargs, calls = _bundle_transaction(tmp_path)
-    original_build = kwargs["build"]
-
-    def build_with_dependency(bundle, work):
-        product = original_build(bundle, work)
-        dependency = bundle / "dependencies/example-dependency.whl"
-        dependency.parent.mkdir()
-        dependency.write_bytes(b"exact dependency artifact")
-        return runner.BuildProduct(
-            artifacts=product.artifacts,
-            dependencies=[{
-                "identity": {
-                    **kwargs["selection"],
-                    "sourceCommit": "d" * 40,
-                    "releaseBundle": "example-dependency",
-                    "version": "0.1+alpha",
-                },
-                "artifacts": [{
-                    "deliverable": "deliverables.packages.example-dependency",
-                    "type": "wheel",
-                    "path": "dependencies/example-dependency.whl",
-                }],
-            }],
-        )
-
-    receipt = runner.build_bundle(repo, **{**kwargs, "build": build_with_dependency})
-    completed = runner.read_completed_build(repo, receipt_path=receipt)
-    assert len(completed.dependencies) == 1
-    assert completed.dependencies[0].identity["releaseBundle"] == "example-dependency"
-    assert completed.dependencies[0].artifacts == (
-        receipt.parent / "dependencies/example-dependency.whl",
-    )
-    assert calls == ["build", "test"]
 
 
-@pytest.mark.parametrize("problem", ["failed", "blocked", "skipped", "missing", "evidence", "changed", "unlisted", "coverage"])
-def test_bundle_transaction_never_publishes_bad_or_untested_outputs(tmp_path, problem) -> None:
-    repo, kwargs, calls = _bundle_transaction(tmp_path)
-    good_test = kwargs["test"]
-
-    def bad_test(bundle, artifacts, work):
-        records = good_test(bundle, artifacts, work)
-        if problem in {"failed", "blocked", "skipped"}:
-            records[0]["status"] = problem
-        elif problem == "missing":
-            records = []
-        elif problem == "evidence":
-            (bundle / records[0]["evidence"]["path"]).unlink()
-        elif problem == "changed":
-            (bundle / artifacts[0]["path"]).write_bytes(b"changed after tests")
-        elif problem == "unlisted":
-            (bundle / "unexpected.txt").write_text("not an artifact", encoding="utf-8")
-        elif problem == "coverage":
-            records[0]["artifacts"] = []
-        return records
-
-    with pytest.raises((runner.OperationError, results.StepResultError, OSError)):
-        runner.build_bundle(repo, **{**kwargs, "test": bad_test})
-    store = repo / ".git" / "ceratops" / "builds"
-    assert not list(store.glob("*/receipt.json"))
-    assert not list((store / ".staging").iterdir())
-    diagnostic_path = _bundle_diagnostic(repo, kwargs["selection"])
-    assert diagnostic_path.is_file()
-    diagnostic = json.loads(diagnostic_path.read_text())
-    assert diagnostic["requiredTests"] == ["installed-artifact"]
-    if problem == "failed":
-        assert diagnostic["tests"][0]["id"] == "installed-artifact"
-        assert diagnostic["tests"][0]["status"] == "failed"
-        assert "evidence" in diagnostic["tests"][0]
-    assert runner.build_bundle(repo, **kwargs).is_file()
-    assert calls == ["build", "test", "build", "test"]
-    assert not diagnostic_path.exists()
 
 
-def test_bundle_transaction_corruption_does_not_trigger_rebuild(tmp_path) -> None:
-    repo, kwargs, calls = _bundle_transaction(tmp_path)
-    receipt = runner.build_bundle(repo, **kwargs)
-    artifact = receipt.parent / "artifacts/example.whl"
-    artifact.write_bytes(b"corrupt saved artifact")
-    with pytest.raises(results.StepResultError):
-        runner.read_completed_build(repo, selection=kwargs["selection"])
-    assert calls == ["build", "test"]
-    assert artifact.read_bytes() == b"corrupt saved artifact"
 
 
-@pytest.mark.parametrize(
-    "problem",
-    ["missing", "unfinished", "failed", "malformed", "wrong-build", "missing-file", "modified-file"],
-)
-def test_completed_build_reader_rejects_unusable_records(tmp_path, problem) -> None:
-    repo, kwargs, calls = _bundle_transaction(tmp_path)
-    receipt = runner.build_bundle(repo, **kwargs)
-    selected_receipt = receipt
-    artifact = receipt.parent / "artifacts/example.whl"
-
-    if problem == "missing":
-        receipt.unlink()
-    elif problem == "unfinished":
-        unfinished = receipt.parent.parent / ".staging" / receipt.parent.name
-        shutil.copytree(receipt.parent, unfinished)
-        selected_receipt = unfinished / "receipt.json"
-    elif problem == "failed":
-        record = json.loads(receipt.read_text(encoding="utf-8"))
-        record["status"] = "failed"
-        receipt.write_text(json.dumps(record) + "\n", encoding="utf-8")
-    elif problem == "malformed":
-        receipt.write_text("{\n", encoding="utf-8")
-    elif problem == "wrong-build":
-        wrong = receipt.parent.with_name("f" * 64)
-        receipt.parent.rename(wrong)
-        selected_receipt = wrong / "receipt.json"
-    elif problem == "missing-file":
-        artifact.unlink()
-    elif problem == "modified-file":
-        artifact.write_bytes(b"modified stored artifact")
-
-    with pytest.raises((runner.OperationError, results.StepResultError)):
-        runner.read_completed_build(repo, receipt_path=selected_receipt)
-    assert calls == ["build", "test"]
 
 
-def test_bundle_transaction_requires_test_contract_before_build(tmp_path) -> None:
-    repo, kwargs, calls = _bundle_transaction(tmp_path)
-    with pytest.raises(runner.OperationError, match="required test IDs"):
-        runner.build_bundle(repo, **{**kwargs, "required_tests": []})
-    assert calls == []
-    assert not (repo / ".git" / "ceratops").exists()
 
 
-@pytest.mark.parametrize("problem", ["duplicate", "identity"])
-def test_bundle_transaction_preflights_boundaries_before_tests(tmp_path, problem) -> None:
-    repo, kwargs, calls = _bundle_transaction(tmp_path)
-    if problem == "identity":
-        kwargs["selection"] = {**kwargs["selection"], "sourceCommit": "../unsafe"}
-    else:
-        original = kwargs["build"]
-        def duplicate(bundle, work):
-            product = original(bundle, work)
-            return runner.BuildProduct(artifacts=[*product.artifacts, *product.artifacts])
-        kwargs["build"] = duplicate
-    with pytest.raises((runner.OperationError, results.StepResultError)):
-        runner.build_bundle(repo, **kwargs)
-    assert "test" not in calls
-    assert not list((repo / ".git").glob("ceratops/builds/*/receipt.json"))
 
 
-def test_bundle_transaction_cleans_readonly_scratch_and_interrupted_callbacks(tmp_path) -> None:
-    repo, kwargs, calls = _bundle_transaction(tmp_path)
-    original = kwargs["build"]
-    def interrupted(bundle, work):
-        readonly = work / "readonly.txt"
-        readonly.write_bytes(b"private scratch")
-        readonly.chmod(stat.S_IREAD)
-        raise KeyboardInterrupt("fixture interruption")
-    with pytest.raises(KeyboardInterrupt):
-        runner.build_bundle(repo, **{**kwargs, "build": interrupted})
-    assert not list((repo / ".git/ceratops/builds/.staging").iterdir())
-    diagnostic = _bundle_diagnostic(repo, kwargs["selection"])
-    assert "KeyboardInterrupt" in diagnostic.read_text()
-    assert runner.build_bundle(repo, **{**kwargs, "build": original}).is_file()
-    assert calls == ["build", "test"]
-    assert not diagnostic.exists()
 
 
-def test_bundle_transaction_serializes_concurrent_callers(tmp_path) -> None:
-    repo, kwargs, calls = _bundle_transaction(tmp_path)
-    entered, release = threading.Event(), threading.Event()
-    original = kwargs["build"]
-
-    def paused_build(bundle, work):
-        entered.set()
-        assert release.wait(10)
-        return original(bundle, work)
-
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        first = executor.submit(runner.build_bundle, repo, **{**kwargs, "build": paused_build})
-        try:
-            assert entered.wait(10)
-            second = executor.submit(runner.build_bundle, repo, **kwargs)
-        finally:
-            release.set()
-        assert first.result(timeout=15).is_file()
-        with pytest.raises(runner.OperationError, match="already exists"):
-            second.result(timeout=15)
-    assert calls == ["build", "test"]
 
 
-def test_bundle_transaction_worktrees_share_the_same_store(tmp_path) -> None:
-    repo, kwargs, calls = _bundle_transaction(tmp_path)
-    receipt = runner.build_bundle(repo, **kwargs)
-    worktree = tmp_path / "other-worktree"
-    added = run_git(repo, "worktree", "add", "-b", "another-task", str(worktree))
-    assert added.returncode == 0, added.stderr
-    assert runner.read_completed_build(
-        worktree, selection=kwargs["selection"],
-    ).receipt_path == receipt
-    assert calls == ["build", "test"]
 
 
-def test_bundle_transaction_retains_current_and_two_predecessors_per_group(tmp_path) -> None:
-    repo, kwargs, calls = _bundle_transaction(tmp_path)
-    receipts = []
-    for generation in range(4):
-        selection = {
-            **kwargs["selection"],
-            "sourceCommit": f"{generation + 1:040x}",
-            "version": f"1.0+alpha.{generation + 1}",
-        }
-        receipt = runner.build_bundle(repo, **{**kwargs, "selection": selection})
-        receipts.append(receipt)
-        completed_ns = (generation + 1) * 1_000_000_000
-        os.utime(receipt.parent, ns=(completed_ns, completed_ns))
-
-    store = repo / ".git" / "ceratops" / "builds"
-    assert not receipts[0].exists()
-    assert all(path.is_file() for path in receipts[1:])
-    assert len(list(store.glob("*/receipt.json"))) == storage.BUILD_BUNDLE_RETENTION
-    assert calls == ["build", "test"] * 4
 
 
-def test_bundle_transaction_recovers_all_killed_owner_staging(tmp_path) -> None:
-    repo, kwargs, calls = _bundle_transaction(tmp_path)
-    serializable = {key: value for key, value in kwargs.items() if key not in {"build", "test"}}
-    program = (
-        "import os,pathlib,sys; import repository_operation as r\n"
-        "def build(bundle, work):\n"
-        "    (work / 'unfinished').write_bytes(b'owned scratch')\n"
-        "    os._exit(23)\n"
-        f"r.build_bundle(pathlib.Path({str(repo)!r}), **{serializable!r}, build=build, "
-        "test=lambda *args: [])\n"
-    )
-    child = subprocess.run([sys.executable, "-c", program], cwd=REPOSITORY_LIFECYCLE_SCRIPTS,
-                           capture_output=True, text=True, timeout=15, check=False)
-    assert child.returncode == 23, child.stderr
-    staging_root = repo / ".git/ceratops/builds/.staging"
-    orphan = next(staging_root.iterdir())
-    earlier = staging_root / ("f" * 64)
-    earlier.mkdir()
-    (earlier / "owned-scratch").write_bytes(b"remove")
-    unrelated = staging_root / "manual-note"
-    unrelated.mkdir()
-    sentinel = unrelated / "not-owned"
-    sentinel.write_bytes(b"retain")
-    assert runner.build_bundle(repo, **kwargs).is_file()
-    assert not orphan.exists() and not earlier.exists()
-    assert sentinel.read_bytes() == b"retain"
-    assert calls == ["build", "test"]
 
 
-def test_bundle_transaction_cleanup_failure_retains_diagnostic_and_recovers(tmp_path, monkeypatch) -> None:
-    repo, kwargs, calls = _bundle_transaction(tmp_path)
-    original = storage.shutil.rmtree
-
-    def fail_cleanup(path, *args, **kw):
-        raise PermissionError("fixture cleanup refusal")
-
-    with monkeypatch.context() as patch:
-        patch.setattr(storage.shutil, "rmtree", fail_cleanup)
-        with pytest.raises(PermissionError, match="cleanup refusal"):
-            runner.build_bundle(repo, **kwargs)
-    diagnostic = _bundle_diagnostic(repo, kwargs["selection"])
-    assert "Staging cleanup failed" in diagnostic.read_text()
-    assert storage.shutil.rmtree is original
-    assert runner.read_completed_build(
-        repo, selection=kwargs["selection"],
-    ).receipt_path.is_file()
-    next_selection = {
-        **kwargs["selection"],
-        "sourceCommit": "2" * 40,
-        "version": "1.0+alpha.2",
-    }
-    assert runner.build_bundle(repo, **{**kwargs, "selection": next_selection}).is_file()
-    assert calls == ["build", "test", "build", "test"]
-    assert not diagnostic.exists()
 
 
-def _build_receipt_fixture(tmp_path: pathlib.Path):
-    """The repository runner owns cleanup of all files beneath this pytest root."""
-    bundle = tmp_path / "bundle"
-    bundle.mkdir()
-
-    def file(path: str, content: bytes, kind: str, deliverable: str | None = None):
-        target = bundle / path
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(content)
-        record = {
-            "type": kind,
-            "path": path,
-            "size": len(content),
-            "sha256": hashlib.sha256(content).hexdigest(),
-        }
-        return {**record, **({"deliverable": deliverable} if deliverable else {})}
-
-    identity = {
-        "repository": "example/project",
-        "sourceCommit": "a" * 40,
-        "releaseBundle": "claims",
-        "channel": "beta",
-        "version": "1.2.0b1",
-        "target": "python-3.14-windows",
-    }
-    artifact = file(
-        "wheels/claims.whl",
-        b"primary wheel",
-        "python-wheel",
-        "deliverables.packages.claims",
-    )
-    app = file(
-        "apps/desktop.zip", b"non-python artifact", "zip", "deliverables.apps.desktop"
-    )
-    dependency = file(
-        "dependencies/converter.whl",
-        b"dependency wheel",
-        "python-wheel",
-        "deliverables.packages.converter",
-    )
-    lock = file("locks/pylock.toml", b"", "dependency-lock")
-    evidence = file("tests/results.json", b'{"status":"passed"}\n', "test-evidence")
-
-    def reference(entry):
-        return {key: entry[key] for key in ("path", "sha256")}
-
-    receipt = {
-        "schema": "ceratops-build-result.v2",
-        "status": "passed",
-        "identity": identity,
-        "artifacts": [artifact, app],
-        "dependencies": [
-            {
-                "identity": {
-                    **identity,
-                    "releaseBundle": "converter",
-                    "version": "0.4.0",
-                },
-                "artifacts": [dependency],
-            }
-        ],
-        "supportingFiles": [lock, evidence],
-        "tests": [
-            {
-                "id": "installed-artifact",
-                "status": "passed",
-                "artifacts": [
-                    reference(artifact),
-                    reference(app),
-                    reference(dependency),
-                ],
-                "evidence": reference(evidence),
-            }
-        ],
-    }
-    path = tmp_path / "receipt.json"
-    path.write_text(json.dumps(receipt), encoding="utf-8")
-    return path, bundle, receipt, dict(identity)
 
 
-def _save_build_receipt(path: pathlib.Path, receipt: dict[str, Any]) -> None:
-    path.write_text(json.dumps(receipt), encoding="utf-8")
 
 
 def _new_receipt_fixtures(
@@ -599,12 +186,10 @@ def _new_receipt_fixtures(
                 "sha256": digest(wheel),
             }
         ],
-        "installationArtifact": {
-            "root": "store",
-            "path": artifact_path,
-            "sha256": digest(wheel),
-        },
-        "portableContext": {
+        "installationArtifactPath": artifact_path,
+        "commandsAndSettings": {"operation": "deliverables.packages.claims.actions.build",
+                                "steps": [], "parameters": {}, "environment": {}},
+        "platformAndTools": {
             "os": "windows",
             "architecture": "x86_64",
             "runtimes": [{"id": "python", "version": "3.14.0"}],
@@ -811,8 +396,8 @@ def _checkpoint_child(repository: pathlib.Path, body: str, *arguments: str):
 
 def _bound_test_build(repo_root, *, pre_test_commit, **selection):
     """Existing receipt fixtures already have B; production uses the two calls."""
-    allocation = runner.allocate_versioned_build(repo_root, **selection)
-    return runner.bind_versioned_build_inputs(allocation, pre_test_commit=pre_test_commit)
+    allocation = storage.allocate_artifact_version(repo_root, **selection)
+    return storage.bind_artifact_inputs(allocation, pre_test_commit=pre_test_commit)
 
 
 @pytest.mark.parametrize("stage", ["mkdir", "request", "binding"])
@@ -823,7 +408,7 @@ def test_versioned_allocation_repeats_after_directory_and_request_effects(tmp_pa
                      required_targets=["linux", "windows"], attempt_id="attempt-interruption")
     allocation = None
     if stage == "binding":
-        allocation = runner.allocate_versioned_build(repository, **selection)
+        allocation = storage.allocate_artifact_version(repository, **selection)
     method = pathlib.Path.mkdir if stage == "mkdir" else storage._write_transaction_record
     fired = False
 
@@ -845,18 +430,17 @@ def test_versioned_allocation_repeats_after_directory_and_request_effects(tmp_pa
             patch.setattr(storage, "_write_transaction_record", interrupted)
         with pytest.raises(OSError, match="interrupted allocation"):
             if allocation is None:
-                runner.allocate_versioned_build(repository, **selection)
+                storage.allocate_artifact_version(repository, **selection)
             else:
-                runner.bind_versioned_build_inputs(allocation, pre_test_commit=commit)
+                storage.bind_artifact_inputs(allocation, pre_test_commit=commit)
     assert fired
-    fresh = runner.allocate_versioned_build(repository, **selection)
-    uncertain = (stage == "mkdir" and timing == "after") or (stage == "request" and timing == "before")
-    assert fresh.version == ("1.2.3b2" if uncertain else "1.2.3b1")
-    bound = runner.bind_versioned_build_inputs(fresh, pre_test_commit=commit)
+    fresh = storage.allocate_artifact_version(repository, **selection)
+    assert fresh.version == "1.2.3b1"
+    bound = storage.bind_artifact_inputs(fresh, pre_test_commit=commit)
     assert json.loads(bound.request_path.read_text())["preTestCommit"] == commit
     assert all(bound.target_output(target).is_dir() for target in bound.required_targets)
-    repeated = runner.allocate_versioned_build(repository, **{**selection, "version": bound.version})
-    assert storage._build_request_record(repeated) == storage._build_request_record(bound)
+    repeated = storage.allocate_artifact_version(repository, **{**selection, "version": bound.version})
+    assert storage._build_request_record(repeated)["preTestCommit"] is None
     assert repeated.request_path == bound.request_path
 
 
@@ -865,7 +449,7 @@ def test_versioned_allocation_precedes_embedded_versions_and_commit_b(tmp_path):
     selection = dict(repository="example/project", release_bundle="claims", version="1.2.3b1",
                      required_targets=["linux", "windows"], attempt_id="attempt-before-b",
                      declared_input_paths=["src", "version.txt"])
-    allocation = runner.allocate_versioned_build(repository, **selection)
+    allocation = storage.allocate_artifact_version(repository, **selection)
     record = json.loads(allocation.request_path.read_text())
     assert record["allocationCommit"] == before and record["preTestCommit"] is None
     assert not allocation.target_output("linux").exists()
@@ -873,21 +457,23 @@ def test_versioned_allocation_precedes_embedded_versions_and_commit_b(tmp_path):
     assert run_git(repository, "add", "version.txt").returncode == 0
     assert run_git(repository, "commit", "-m", "prepare selected version").returncode == 0
     checkpoint = run_git(repository, "rev-parse", "HEAD").stdout.strip()
-    bound = runner.bind_versioned_build_inputs(allocation, pre_test_commit=checkpoint)
+    bound = storage.bind_artifact_inputs(allocation, pre_test_commit=checkpoint)
     assert bound.pre_test_commit != before
     assert (repository / "version.txt").read_text() == bound.version
-    assert runner.allocate_versioned_build(repository, **selection) == bound
+    fresh = storage.allocate_artifact_version(repository, **selection)
+    assert fresh.version == bound.version
+    assert storage._build_request_record(fresh)["preTestCommit"] is None
 
 
 @pytest.mark.parametrize("change", ["worktree", "index", "new-file"])
-def test_versioned_changed_inputs_select_another_directory(tmp_path, change):
+def test_versioned_changed_inputs_discard_unfinished_output(tmp_path, change):
     repository, commit = _versioned_repository(tmp_path)
     selection = dict(repository="example/project", release_bundle="claims", version="1.2.3a1",
                      required_targets=["linux"], attempt_id="attempt-inputs",
                      declared_input_paths=["src"])
     original = _bound_test_build(repository, pre_test_commit=commit, **selection)
-    sentinel = original.version_root / "accepted.bin"
-    sentinel.write_bytes(b"keep successful work")
+    sentinel = original.version_root / "partial.bin"
+    sentinel.write_bytes(b"unfinished work")
     source = repository / "src/claims.py"
     if change == "new-file":
         (source.parent / "new.py").write_text("changed")
@@ -896,11 +482,11 @@ def test_versioned_changed_inputs_select_another_directory(tmp_path, change):
         if change == "index":
             assert run_git(repository, "add", "src/claims.py").returncode == 0
             source.write_bytes(b"print('claims')\n")
-    fresh = runner.allocate_versioned_build(repository, **selection)
-    assert fresh.version == "1.2.3a2"
-    assert sentinel.read_bytes() == b"keep successful work"
+    fresh = storage.allocate_artifact_version(repository, **selection)
+    assert fresh.version == "1.2.3a1"
+    assert not sentinel.exists()
     with pytest.raises(storage.OperationError, match="committed"):
-        runner.bind_versioned_build_inputs(fresh, pre_test_commit=commit)
+        storage.bind_artifact_inputs(fresh, pre_test_commit=commit)
 
 
 def test_versioned_allocation_propagates_permission_errors_and_requires_final_version_choice(tmp_path, monkeypatch):
@@ -917,13 +503,14 @@ def test_versioned_allocation_propagates_permission_errors_and_requires_final_ve
     with monkeypatch.context() as patch:
         patch.setattr(pathlib.Path, "mkdir", denied)
         with pytest.raises(PermissionError, match="output denied"):
-            runner.allocate_versioned_build(repository, **selection)
-    store = repository / ".git/ceratops/artifacts/claims"
+            storage.allocate_artifact_version(repository, **selection)
+    store = storage._artifact_store_path(repository, temporary=True) / "claims"
     assert not list(store.iterdir())
-    first = runner.allocate_versioned_build(repository, **{**selection, "version": "1.2.3"})
+    first = storage.allocate_artifact_version(repository, **{**selection, "version": "1.2.3"})
+    assert run_git(repository, "tag", "claims/1.2.3").returncode == 0
     with pytest.raises(storage.OperationError, match="choose another final version"):
-        runner.allocate_versioned_build(repository, **{**selection, "version": "1.2.3", "attempt_id": "another"})
-    assert first.request_path.is_file()
+        storage.allocate_artifact_version(repository, **{**selection, "version": "1.2.3", "attempt_id": "another"})
+    assert not first.request_path.exists()
 
 
 def test_versioned_competing_processes_allocate_while_retention_is_busy(tmp_path):
@@ -935,15 +522,15 @@ def test_versioned_competing_processes_allocate_while_retention_is_busy(tmp_path
         assert run_git(repository, "worktree", "add", "-b", path.name, str(path), commit).returncode == 0
     store, lock_path = storage._artifact_infrastructure(repository)
     program = (
-        "import json,pathlib,subprocess,sys; sys.path.insert(0,sys.argv[1]); import repository_operation as r\n"
+        "import json,pathlib,subprocess,sys; sys.path.insert(0,sys.argv[1]); import repository_operation as r, complete_artifact_builds, store_artifacts\n"
         "root=pathlib.Path(sys.argv[2]); print('ready',flush=True); input()\n"
-        "a=r.allocate_versioned_build(root,repository='example/project',release_bundle='claims',version='1.2.3b1',"
+        "a=store_artifacts.allocate_artifact_version(root,repository='example/project',release_bundle='claims',version='1.2.3b1',"
         "required_targets=['linux','windows'],attempt_id=root.name,declared_input_paths=['src','version.txt'])\n"
         "(root/'version.txt').write_text(a.version)\n"
         "subprocess.run(['git','-C',str(root),'add','version.txt'],check=True,capture_output=True)\n"
         "subprocess.run(['git','-C',str(root),'commit','-m','embed version'],check=True,capture_output=True)\n"
         "b=subprocess.check_output(['git','-C',str(root),'rev-parse','HEAD'],text=True).strip()\n"
-        "t=r.bind_versioned_build_inputs(a,pre_test_commit=b)\n"
+        "t=store_artifacts.bind_artifact_inputs(a,pre_test_commit=b)\n"
         "print(json.dumps({'version':t.version,'commit':b}),flush=True)\n"
     )
     workers = [subprocess.Popen([sys.executable, "-c", program, str(REPOSITORY_LIFECYCLE_SCRIPTS), str(path)],
@@ -965,7 +552,7 @@ def test_versioned_competing_processes_allocate_while_retention_is_busy(tmp_path
             record = json.loads(output)
             versions.add(record["version"])
             assert (path / "version.txt").read_text() == record["version"]
-            saved = json.loads((store / "claims" / record["version"] / "build_request.json").read_text())
+            saved = json.loads((storage._artifact_store_path(path, temporary=True) / "claims" / record["version"] / "build_request.json").read_text())
             assert saved["preTestCommit"] == record["commit"]
             assert saved["requiredTargets"] == ["linux", "windows"]
         assert versions == {"1.2.3b1", "1.2.3b2"}
@@ -976,41 +563,59 @@ def test_versioned_competing_processes_allocate_while_retention_is_busy(tmp_path
             worker.wait(timeout=10)
 
 
-def test_versioned_requests_preserve_owners_and_coordinate_targets(tmp_path) -> None:
+@pytest.mark.parametrize("stage_results", [False, True])
+def test_versioned_requests_clear_only_same_checkout_and_item(tmp_path, stage_results) -> None:
     repository, commit = _versioned_repository(tmp_path)
     targets = ["python-3.14-windows", "python-3.14-linux"]
     selection = dict(repository="example/project", release_bundle="claims", version="1.2.3a1",
                      required_targets=targets, attempt_id="attempt-alpha-001")
     transaction = _bound_test_build(repository, pre_test_commit=commit, **selection)
-    sentinel = transaction.target_output(targets[0]) / "owned.bin"
-    sentinel.write_bytes(b"preserve this attempt")
-    assert all(transaction.target_output(target).is_dir() for target in targets)
-    repeated = runner.allocate_versioned_build(repository, **selection)
-    assert repeated.request_path == transaction.request_path
-    assert repeated.pre_test_commit == commit
-    independent = _bound_test_build(
-        repository, pre_test_commit=commit, **{**selection, "attempt_id": "another-build"},
-    )
-    assert independent.version == "1.2.3a2"
+    sentinel = transaction.target_output(targets[0]) / "partial.bin"
+    sentinel.write_bytes(b"discard unfinished output")
+    other_item = storage._artifact_store_path(repository, temporary=True) / "other-item/1.0.0a1"
+    other_item.mkdir(parents=True)
+    unrelated = other_item / "keep.bin"
+    unrelated.write_bytes(b"other item")
     second_worktree = tmp_path / "parallel-worktree"
     assert run_git(repository, "worktree", "add", "-b", "parallel-versioned-test",
                    str(second_worktree), commit).returncode == 0
     foreign = _bound_test_build(second_worktree, pre_test_commit=commit, **selection)
-    assert foreign.version == "1.2.3a3"
-    assert sentinel.read_bytes() == b"preserve this attempt"
-    assert not (transaction.store / ".reservations").exists()
-    diagnostic = completion.write_versioned_failure_diagnostic(transaction, targets[0], "first failure")
-    assert diagnostic.parent == transaction.version_root / ".diagnostics"
-    completion.write_versioned_failure_diagnostic(transaction, targets[0], "replacement failure")
+    assert foreign.version == "1.2.3a2"
+    foreign_file = foreign.target_output(targets[0]) / "keep.bin"
+    foreign_file.write_bytes(b"another checkout")
+    unfinished_path = ".build/claims/1.2.3a1/build_receipt.json"
+    unfinished = repository / unfinished_path
+    unfinished.parent.mkdir(parents=True)
+    unfinished.write_text("{}", encoding="utf-8")
+    if stage_results:
+        assert run_git(repository, "add", "--", unfinished_path).returncode == 0
+    unrelated_result_path = ".build/other/1.0.0a1/build_receipt.json"
+    unrelated_result = repository / unrelated_result_path
+    unrelated_result.parent.mkdir(parents=True)
+    unrelated_result.write_text("{}", encoding="utf-8")
+    assert run_git(repository, "add", "--", unrelated_result_path).returncode == 0
+    repeated = _bound_test_build(repository, pre_test_commit=commit, **selection)
+    assert repeated.version == "1.2.3a1"
+    assert repeated.pre_test_commit == commit
+    assert all(repeated.target_output(target).is_dir() for target in targets)
+    assert not sentinel.exists()
+    assert not unfinished.exists()
+    assert not run_git(repository, "ls-files", "--", unfinished_path).stdout.strip()
+    assert unrelated_result.read_text(encoding="utf-8") == "{}"
+    assert run_git(repository, "ls-files", "--", unrelated_result_path).stdout.strip()
+    assert unrelated.read_bytes() == b"other item"
+    assert foreign_file.read_bytes() == b"another checkout"
+    diagnostic = completion.write_versioned_failure_diagnostic(repeated, targets[0], "first failure")
+    assert diagnostic.parent == repeated.version_root / ".diagnostics"
+    completion.write_versioned_failure_diagnostic(repeated, targets[0], "replacement failure")
     assert json.loads(diagnostic.read_text())["error"] == "replacement failure"
-    diagnostic.write_bytes(b"interrupted diagnostic")
-    completion.write_versioned_failure_diagnostic(transaction, targets[0], "recovered diagnostic")
-    assert json.loads(diagnostic.read_text())["error"] == "recovered diagnostic"
-    transaction.request_path.write_bytes(b"interrupted request")
+    repeated.request_path.write_bytes(b"interrupted request")
     replacement = _bound_test_build(repository, pre_test_commit=commit, **selection)
-    assert replacement.version == "1.2.3a4"
-    assert transaction.version_root in replacement.uncertain_directories
-    assert sentinel.read_bytes() == b"preserve this attempt"
+    assert replacement.version == "1.2.3a1"
+    assert not diagnostic.exists()
+    assert unrelated.read_bytes() == b"other item"
+    assert foreign_file.read_bytes() == b"another checkout"
+    assert not (transaction.store / ".reservations").exists()
 
 
 def _prepared_versioned_completion(
@@ -1044,12 +649,12 @@ def _prepared_versioned_completion(
             attempt_id=attempt_id,
         )
         _write_versioned_outputs(repository, transaction, receipt)
-        runner.measure_versioned_artifact(
+        storage.measure_versioned_artifact(
             transaction,
             target,
             {"type": "python-wheel", "path": receipt["artifacts"][0]["path"]},
         )
-        prepared.append(runner.prepare_versioned_receipt(transaction, target, receipt))
+        prepared.append(completion.prepare_versioned_build_receipt(transaction, target, receipt))
         receipts[target] = receipt
     return repository, commit, transaction, prepared, receipts
 
@@ -1108,7 +713,7 @@ def _receipt_chain_fixture(
         repository
         / ".git"
         / "ceratops"
-        / "artifacts"
+        / "artifacts/worktrees/receipt-producer"
         / identity["releaseBundle"]
         / identity["version"]
         / identity["target"]
@@ -1220,7 +825,7 @@ def test_new_receipt_readers_preserve_exact_bytes_full_versions_and_targets(
     assert build["identity"]["target"] == target
     assert build["requiredTargets"] == required_targets
     assert build["artifactInputs"] and build["checkInputs"]
-    assert build["portableContext"] == {
+    assert build["platformAndTools"] == {
         "os": "windows",
         "architecture": "x86_64",
         "runtimes": [{"id": "python", "version": "3.14.0"}],
@@ -1244,7 +849,7 @@ def test_new_receipt_readers_preserve_exact_bytes_full_versions_and_targets(
         "required-result-mismatch",
         "unknown-evidence",
         "unexpected-result-path",
-        "installation-hash",
+        "unknown-installation-path",
         "machine-path",
         "log-in-git",
     ],
@@ -1267,10 +872,10 @@ def test_committed_build_receipt_reader_rejects_malformed_records(
         receipt["artifactTests"][0]["evidence"][0]["sha256"] = "d" * 64
     elif problem == "unexpected-result-path":
         receipt["committedResultPaths"].append("tests/test_claims.py")
-    elif problem == "installation-hash":
-        receipt["installationArtifact"]["sha256"] = "d" * 64
+    elif problem == "unknown-installation-path":
+        receipt["installationArtifactPath"] = "artifacts/absent.whl"
     elif problem == "machine-path":
-        receipt["portableContext"]["runtimes"][0]["version"] = (
+        receipt["platformAndTools"]["runtimes"][0]["version"] = (
             "C:\\Python314\\python.exe"
         )
     else:
@@ -1335,10 +940,6 @@ def test_new_receipt_reader_reports_missing_and_unreadable_data(tmp_path) -> Non
         results.read_committed_build_receipt(unreadable)
 
 
-def test_new_receipt_definitions_preserve_native_v2_reading(tmp_path) -> None:
-    path, bundle, receipt, expected = _build_receipt_fixture(tmp_path)
-    assert results.BUILD_RECEIPT_SCHEMA == "ceratops-build-result.v2"
-    assert results.verify_release_bundle_build(path, bundle, expected=expected) == receipt
 
 
 @pytest.mark.parametrize("receipt_name", ["build_receipt.json", "receipt.json"])
@@ -1587,463 +1188,3 @@ def test_receipt_chain_rejects_missing_malformed_or_unsafe_data(
             fixture["repository"],
             artifact_receipt_path=fixture["artifact_path"],
         )
-
-
-def test_build_receipt_verifies_complete_bundle_without_mutation(
-    tmp_path, monkeypatch
-) -> None:
-    path, bundle, receipt, expected = _build_receipt_fixture(tmp_path)
-    before = {
-        item: (item.read_bytes(), item.stat().st_mtime_ns)
-        for item in tmp_path.rglob("*")
-        if item.is_file()
-    }
-    monkeypatch.setattr(
-        subprocess,
-        "run",
-        lambda *a, **k: pytest.fail("Verifier must not execute commands"),
-    )
-    checked = results.verify_release_bundle_build(path, bundle, expected=expected)
-    assert checked == receipt
-    assert {
-        item: (item.read_bytes(), item.stat().st_mtime_ns)
-        for item in tmp_path.rglob("*")
-        if item.is_file()
-    } == before
-
-
-def test_build_receipt_ignores_metadata_only_change_time(tmp_path, monkeypatch) -> None:
-    path, bundle, receipt, expected = _build_receipt_fixture(tmp_path)
-    original_plain_path = results._plain_path
-
-    def changed_metadata(*args, **kwargs):
-        checked, info = original_plain_path(*args, **kwargs)
-        values = {
-            field: getattr(info, field)
-            for field in ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
-        }
-        values["st_ctime_ns"] += 1
-        return checked, SimpleNamespace(**values)
-
-    # Simulate Windows metadata changes without touching file identity or bytes.
-    monkeypatch.setattr(results, "_plain_path", changed_metadata)
-    assert results.verify_release_bundle_build(path, bundle, expected=expected) == receipt
-
-
-@pytest.mark.parametrize("build_status", ["passed", "failed", "blocked"])
-@pytest.mark.parametrize(
-    "test_status", ["passed", "failed", "blocked", "skipped", None]
-)
-def test_build_receipt_integrity_does_not_establish_test_success(
-    tmp_path,
-    build_status: str,
-    test_status: str | None,
-) -> None:
-    path, bundle, receipt, expected = _build_receipt_fixture(tmp_path)
-    receipt["status"] = build_status
-    if test_status is None:
-        receipt["tests"] = []
-    else:
-        receipt["tests"][0]["status"] = test_status
-        if test_status in {"blocked", "skipped"}:
-            receipt["tests"][0]["evidence"] = None
-    _save_build_receipt(path, receipt)
-    assert results.verify_release_bundle_build(path, bundle, expected=expected) == receipt
-
-
-@pytest.mark.parametrize(
-    "field",
-    ["repository", "sourceCommit", "releaseBundle", "channel", "version", "target"],
-)
-def test_build_receipt_checks_each_expected_identity_before_payload_reads(
-    tmp_path, monkeypatch, field
-) -> None:
-    path, bundle, _, expected = _build_receipt_fixture(tmp_path)
-    expected[field] = "different"
-    monkeypatch.setattr(
-        results,
-        "_verify_bundle_file",
-        lambda *a: pytest.fail("Identity must be checked first"),
-    )
-    with pytest.raises(results.StepResultError, match=f"identity mismatch: {field}"):
-        results.verify_release_bundle_build(path, bundle, expected=expected)
-
-
-@pytest.mark.parametrize(
-    "problem", ["missing", "extra", "empty", "non-string", "not-mapping"]
-)
-def test_build_receipt_requires_complete_independent_selection(
-    tmp_path, problem
-) -> None:
-    path, bundle, _, expected = _build_receipt_fixture(tmp_path)
-    if problem == "missing":
-        expected.pop("channel")
-    elif problem == "extra":
-        expected["unexpected"] = "value"
-    elif problem == "empty":
-        expected["target"] = " "
-    elif problem == "non-string":
-        expected["version"] = 1
-    else:
-        expected = None
-    with pytest.raises(results.StepResultError, match="all six"):
-        results.verify_release_bundle_build(path, bundle, expected=expected)
-
-
-@pytest.mark.parametrize(
-    "problem",
-    [
-        "missing-field",
-        "unknown-field",
-        "bad-channel",
-        "bad-commit",
-        "bad-owner",
-        "bad-digest",
-        "negative-size",
-        "boolean-size",
-        "no-artifacts",
-        "missing-test-evidence",
-    ],
-)
-def test_build_receipt_rejects_invalid_schema(tmp_path, problem) -> None:
-    path, bundle, receipt, expected = _build_receipt_fixture(tmp_path)
-    if problem == "missing-field":
-        receipt.pop("dependencies")
-    elif problem == "unknown-field":
-        receipt["extra"] = "value"
-    elif problem in {"bad-channel", "bad-commit"}:
-        receipt["identity"][
-            "channel" if problem == "bad-channel" else "sourceCommit"
-        ] = "invalid"
-    elif problem == "no-artifacts":
-        receipt["artifacts"] = []
-    elif problem == "missing-test-evidence":
-        receipt["tests"][0]["evidence"] = None
-    else:
-        key, value = {
-            "bad-owner": ("deliverable", "packages.claims"),
-            "bad-digest": ("sha256", "xyz"),
-            "negative-size": ("size", -1),
-            "boolean-size": ("size", True),
-        }[problem]
-        receipt["artifacts"][0][key] = value
-    _save_build_receipt(path, receipt)
-    with pytest.raises(results.StepResultError, match="schema"):
-        results.verify_release_bundle_build(path, bundle, expected=expected)
-
-
-@pytest.mark.parametrize(
-    "problem",
-    [
-        "duplicate-artifact",
-        "case-alias",
-        "dependency-path",
-        "support-path",
-        "duplicate-dependency",
-        "competing-version",
-        "self-dependency",
-        "duplicate-test",
-        "unknown-tested-file",
-        "wrong-tested-hash",
-        "duplicate-tested-file",
-        "unknown-evidence",
-        "wrong-evidence-hash",
-        "wrong-evidence-type",
-    ],
-)
-def test_build_receipt_rejects_ambiguous_inventory_before_payload_reads(
-    tmp_path, monkeypatch, problem
-) -> None:
-    path, bundle, receipt, expected = _build_receipt_fixture(tmp_path)
-    artifact = receipt["artifacts"][0]
-    test = receipt["tests"][0]
-    if problem in {"duplicate-artifact", "case-alias"}:
-        duplicate = deepcopy(artifact)
-        if problem == "case-alias":
-            duplicate["path"] = duplicate["path"].upper()
-        receipt["artifacts"].append(duplicate)
-    elif problem == "dependency-path":
-        receipt["dependencies"][0]["artifacts"][0]["path"] = artifact["path"]
-    elif problem == "support-path":
-        receipt["supportingFiles"][0]["path"] = artifact["path"]
-    elif problem in {"duplicate-dependency", "competing-version"}:
-        duplicate = deepcopy(receipt["dependencies"][0])
-        if problem == "competing-version":
-            duplicate["identity"]["version"] = "9.0.0"
-        receipt["dependencies"].append(duplicate)
-    elif problem == "self-dependency":
-        receipt["dependencies"][0]["identity"]["releaseBundle"] = expected["releaseBundle"]
-    elif problem == "duplicate-test":
-        receipt["tests"].append(deepcopy(test))
-    elif problem == "unknown-tested-file":
-        test["artifacts"][0]["path"] = "unknown.whl"
-    elif problem == "wrong-tested-hash":
-        test["artifacts"][0]["sha256"] = "b" * 64
-    elif problem == "duplicate-tested-file":
-        test["artifacts"].append(deepcopy(test["artifacts"][0]))
-    elif problem == "unknown-evidence":
-        test["evidence"]["path"] = "unknown.json"
-    elif problem == "wrong-evidence-hash":
-        test["evidence"]["sha256"] = "b" * 64
-    else:
-        receipt["supportingFiles"][1]["type"] = "dependency-lock"
-    _save_build_receipt(path, receipt)
-    monkeypatch.setattr(
-        results,
-        "_verify_bundle_file",
-        lambda *a: pytest.fail("Inventory must be checked first"),
-    )
-    with pytest.raises(results.StepResultError):
-        results.verify_release_bundle_build(path, bundle, expected=expected)
-
-
-@pytest.mark.parametrize(
-    "bad_path",
-    [
-        "../outside.whl",
-        "/absolute.whl",
-        "C:/absolute.whl",
-        r"C:\absolute.whl",
-        r"\\server\share\wheel.whl",
-        "wheels/../claims.whl",
-        "wheels//claims.whl",
-        "wheels/./claims.whl",
-        "wheels/",
-        "wheels/claims.whl:stream",
-        "wheels/claims.whl.",
-        "wheels/claims.whl ",
-        "wheels/NUL.whl",
-        "wheels/COM1/file.whl",
-        "wheels/a?.whl",
-        "wheels/a\n.whl",
-        "wheels/a\0.whl",
-    ],
-)
-def test_build_receipt_rejects_nonportable_or_escaping_paths(
-    tmp_path, monkeypatch, bad_path
-) -> None:
-    path, bundle, receipt, expected = _build_receipt_fixture(tmp_path)
-    receipt["artifacts"][0]["path"] = bad_path
-    _save_build_receipt(path, receipt)
-    monkeypatch.setattr(
-        results,
-        "_verify_bundle_file",
-        lambda *a: pytest.fail("Unsafe paths must be rejected first"),
-    )
-    with pytest.raises(results.StepResultError):
-        results.verify_release_bundle_build(path, bundle, expected=expected)
-
-
-@pytest.mark.parametrize("group", ["artifact", "dependency", "lock", "evidence"])
-@pytest.mark.parametrize("problem", ["missing", "size", "hash", "directory"])
-def test_build_receipt_verifies_every_file_category(tmp_path, group, problem) -> None:
-    path, bundle, receipt, expected = _build_receipt_fixture(tmp_path)
-    record = {
-        "artifact": receipt["artifacts"][0],
-        "dependency": receipt["dependencies"][0]["artifacts"][0],
-        "lock": receipt["supportingFiles"][0],
-        "evidence": receipt["supportingFiles"][1],
-    }[group]
-    target = bundle / record["path"]
-    if problem in {"missing", "directory"}:
-        target.unlink()
-        if problem == "directory":
-            target.mkdir()
-    elif problem == "size":
-        target.write_bytes(target.read_bytes() + b"x")
-    else:
-        record["sha256"] = "b" * 64
-        if group == "evidence":
-            receipt["tests"][0]["evidence"]["sha256"] = record["sha256"]
-        for reference in receipt["tests"][0]["artifacts"]:
-            if reference["path"] == record["path"]:
-                reference["sha256"] = record["sha256"]
-    _save_build_receipt(path, receipt)
-    with pytest.raises(results.StepResultError):
-        results.verify_release_bundle_build(path, bundle, expected=expected)
-
-
-@pytest.mark.parametrize(
-    "problem",
-    [
-        "json",
-        "duplicate-key",
-        "nonfinite",
-        "depth",
-        "large",
-        "utf8",
-        "array",
-        "old-schema",
-    ],
-)
-def test_build_receipt_rejects_unusable_json(tmp_path, problem) -> None:
-    path, bundle, receipt, expected = _build_receipt_fixture(tmp_path)
-    raw = {
-        "json": b"{",
-        "duplicate-key": b'{"schema":"a","schema":"b","status":"passed"}',
-        "nonfinite": b'{"schema":"a","status":"passed","extra":NaN}',
-        "depth": (
-            '{"schema":"a","status":"passed","extra":' + "[" * 70 + "0" + "]" * 70 + "}"
-        ).encode(),
-        "large": b" " * (results.STEP_RESULT_BYTES + 1),
-        "utf8": b"\xff",
-        "array": b"[]",
-        "old-schema": json.dumps(
-            {**receipt, "schema": "ceratops-build-result.v1"}
-        ).encode(),
-    }[problem]
-    path.write_bytes(raw)
-    with pytest.raises(results.StepResultError):
-        results.verify_release_bundle_build(path, bundle, expected=expected)
-
-
-def test_build_receipt_rejects_hardlinked_payload(tmp_path) -> None:
-    path, bundle, receipt, expected = _build_receipt_fixture(tmp_path)
-    os.link(bundle / receipt["artifacts"][0]["path"], tmp_path / "other-link.whl")
-    with pytest.raises(results.StepResultError, match="regular and unlinked"):
-        results.verify_release_bundle_build(path, bundle, expected=expected)
-
-
-@pytest.mark.parametrize("linked_root", [False, True])
-def test_build_receipt_rejects_directory_links(tmp_path, linked_root) -> None:
-    path, bundle, receipt, expected = _build_receipt_fixture(tmp_path)
-    link = tmp_path / "linked-bundle" if linked_root else bundle / "linked-wheels"
-    target = bundle if linked_root else bundle / "wheels"
-    try:
-        link.symlink_to(target, target_is_directory=True)
-    except OSError:
-        if os.name != "nt":
-            raise
-        made = subprocess.run(
-            ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(target)],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        assert made.returncode == 0, made.stderr
-    try:
-        if linked_root:
-            bundle = link
-        else:
-            receipt["artifacts"][0]["path"] = "linked-wheels/claims.whl"
-            receipt["tests"][0]["artifacts"][0]["path"] = "linked-wheels/claims.whl"
-            _save_build_receipt(path, receipt)
-        with pytest.raises(results.StepResultError, match="traverses a link"):
-            results.verify_release_bundle_build(path, bundle, expected=expected)
-    finally:
-        # Remove only the test-owned link, never its target or descendants.
-        if link.is_symlink():
-            link.unlink()
-        else:
-            link.rmdir()
-
-
-def test_build_receipt_detects_changes_during_hashing(tmp_path, monkeypatch) -> None:
-    path, bundle, receipt, expected = _build_receipt_fixture(tmp_path)
-    target = bundle / receipt["artifacts"][0]["path"]
-    original_hash = hashlib.sha256
-
-    class ChangingHash:
-        def __init__(self):
-            self.digest = original_hash()
-
-        def update(self, data):
-            self.digest.update(data)
-            target.write_bytes(b"changed")
-
-        def hexdigest(self):
-            return self.digest.hexdigest()
-
-    monkeypatch.setattr(results.hashlib, "sha256", ChangingHash)
-    with pytest.raises(results.StepResultError, match="changed while reading"):
-        results.verify_release_bundle_build(path, bundle, expected=expected)
-
-
-@pytest.mark.parametrize(
-    "schema", ["ceratops-build-result.v1", "ceratops-build-result.v2"]
-)
-def test_build_receipt_does_not_add_artifact_reads_to_capture(
-    tmp_path, monkeypatch, schema
-) -> None:
-    _, _, receipt, _ = _build_receipt_fixture(tmp_path)
-    value = (
-        receipt
-        if schema.endswith("v2")
-        else {
-            "schema": schema,
-            "status": "passed",
-            "artifact": {
-                key: receipt["artifacts"][0][key]
-                for key in ("type", "path", "sha256", "size")
-            },
-        }
-    )
-    monkeypatch.setattr(
-        results,
-        "_plain_path",
-        lambda *a, **k: pytest.fail("Capture must not inspect artifacts"),
-    )
-    assert results.capture_step_result(json.dumps(value), expected_schema=schema) == {
-        "result": value
-    }
-
-
-def test_build_receipt_cli_works_from_isolated_skill_and_preserves_inputs(
-    tmp_path,
-) -> None:
-    path, bundle, _, expected = _build_receipt_fixture(tmp_path)
-    installed = tmp_path / "installed-skill"
-    script = installed / "scripts/sdlc_results.py"
-    schema = installed / "references/schemas/operation-result.v1.schema.json"
-    script.parent.mkdir(parents=True)
-    schema.parent.mkdir(parents=True)
-    shutil.copy2(REPOSITORY_LIFECYCLE_SCRIPTS / script.name, script)
-    shutil.copy2(results.OPERATION_RESULT_SCHEMA, schema)
-    argv = [
-        sys.executable,
-        "-B",
-        str(script),
-        "verify-release-bundle-build",
-        "--receipt",
-        str(path),
-        "--bundle-root",
-        str(bundle),
-    ]
-    for field, flag in zip(
-        results.BUILD_SELECTION_FIELDS,
-        [
-            "--repository",
-            "--source-commit",
-            "--release-bundle",
-            "--channel",
-            "--version",
-            "--target",
-        ],
-        strict=True,
-    ):
-        argv.extend([flag, expected[field]])
-    before = {item: item.read_bytes() for item in tmp_path.rglob("*") if item.is_file()}
-    passed = subprocess.run(
-        argv, cwd=tmp_path, capture_output=True, text=True, check=False
-    )
-    assert (passed.returncode, passed.stdout.strip(), passed.stderr) == (
-        0,
-        "RECEIPT_VERIFIED",
-        "",
-    )
-    assert {
-        item: item.read_bytes() for item in tmp_path.rglob("*") if item.is_file()
-    } == before
-    wrong = subprocess.run(
-        [*argv[:-1], "wrong-target"],
-        cwd=tmp_path,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert wrong.returncode == 2 and "identity mismatch: target" in wrong.stderr
-    assert not wrong.stdout
-    missing = subprocess.run(
-        argv[:-2], cwd=tmp_path, capture_output=True, text=True, check=False
-    )
-    assert missing.returncode == 2 and "--target" in missing.stderr

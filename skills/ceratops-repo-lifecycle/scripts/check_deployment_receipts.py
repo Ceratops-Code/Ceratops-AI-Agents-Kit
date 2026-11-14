@@ -43,7 +43,7 @@ def check_deployment_receipt(
     if (
         not isinstance(receipt, dict)
         or not fields.issubset(receipt)
-        or set(receipt) - fields - {"maintenance"}
+        or set(receipt) - fields - {"maintenance", "client_refresh"}
         or receipt.get("schema") != "ceratops-deployment-completion.v1"
         or receipt.get("status") != "completed"
         or receipt.get("cleanup_debt") != []
@@ -94,6 +94,15 @@ def check_deployment_receipt(
         raise error_type(
             "Deployment completion evidence has missing or duplicate deployment identities."
         )
+    if "client_refresh" in receipt:
+        refresh = receipt["client_refresh"]
+        if (receipt["producer"] != "ceratops-mcp-server-lifecycle/install"
+                or not isinstance(refresh, dict)
+                or refresh.get("status") not in {"pending", "completed", "failed"}
+                or refresh.get("server_name") not in receipt["deployed"]):
+            raise error_type("MCP client availability result does not identify the installed server.")
+        # Availability belongs to the initiating client. A pending/failed reload
+        # must never undo or repeat the completed installation.
     if not isinstance(receipt["transaction_id"], str) or not re.fullmatch(
         r"[0-9a-f]{32}", receipt["transaction_id"]
     ):

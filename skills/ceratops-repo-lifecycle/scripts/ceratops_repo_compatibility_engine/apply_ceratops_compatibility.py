@@ -291,9 +291,7 @@ def prepare_sdlc_configuration(
         repo_root, load_compatibility_contract()["python_test_detection"]
     )
     if detected and infer_tests:
-        generated = test_operation(
-            repo_root, surface_path("python_test_runner").as_posix()
-        )
+        generated = test_operation(surface_path("python_test_runner").as_posix())
         test_steps.extend(generated["steps"])
         test_capabilities.extend(generated["requires"]["capabilities"])
     package = repository_checks._package_manifest(repo_root)
@@ -933,9 +931,7 @@ def main(argv: list[str] | None = None) -> int:
             with tempfile.TemporaryDirectory(prefix="ceratops-test-results-") as probe:
                 compatibility = validate_ceratops_compatibility(
                     repo_root, result_directory=pathlib.Path(probe),
-                    runner_command=test_operation(
-                        repo_root, surface_path("python_test_runner").as_posix(),
-                    )["steps"][0]["run"],
+                    runner_command=test_operation(surface_path("python_test_runner").as_posix())["steps"][0]["run"],
                     qualify_scratch=False,
                 )
         else:

@@ -70,7 +70,7 @@ def test_explicit_group_requests_and_whole_phase_run_the_named_commands(tmp_path
             completed = run_ci_action(repo, tmp_path / "evidence.json", tmp_path / "action", operations=locations)
             assert completed.returncode == 0, completed.stdout + completed.stderr
         else:
-            result = runner.execute_release_builds(
+            result = runner.execute_build(
                 repo, [runner.OperationRequest(name) for name in locations.splitlines()], context="ci",
             )
             assert result["status"] == "completed", result
@@ -109,7 +109,7 @@ def test_direct_after_group_receives_own_and_extra_files_without_running_sibling
     extra_file.write_bytes(b"extra")
     name = owner + ".actions.post-build-checks.check-groups.combined"
     for _ in range(2):
-        result = runner.execute_release_builds(tmp_path, [runner.OperationRequest(name)],
+        result = runner.execute_build(tmp_path, [runner.OperationRequest(name)],
             artifacts={owner: [str(own_file)], extra: [str(extra_file)]})
         assert result["status"] == "completed", result
         assert not (tmp_path / "wheel.bin").exists()
@@ -840,7 +840,7 @@ def test_typed_package_build_waits_for_declared_test_gate(tmp_path: pathlib.Path
         (
             lambda x: x["deliverables"]["apps"]["claims-mobile"]["actions"][
                 "install"
-            ].update(**{"result-schema": "ceratops-build-result.v1"}),
+            ].update(**{"result-schema": "ceratops-builder-output"}),
             "result-schema must be ceratops-deployment-result.v1",
         ),
         (

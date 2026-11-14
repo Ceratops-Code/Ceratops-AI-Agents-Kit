@@ -8,12 +8,12 @@ command-output capture remains independent of artifact filesystem access.
 
 from __future__ import annotations
 
-import argparse
 import hashlib
 import json
 import ntpath
 import os
 import pathlib
+import re
 import stat
 import subprocess
 import sys
@@ -27,18 +27,14 @@ import jsonschema
 
 STEP_RESULT_BYTES = 65536
 STEP_RESULT_DEPTH = 64
-BUILD_RECEIPT_SCHEMA = "ceratops-build-result.v2"
-COMMITTED_BUILD_RECEIPT_SCHEMA = "ceratops-build-result.v3"
+COMMITTED_BUILD_RECEIPT_SCHEMA = "ceratops-build-result.v4"
 ARTIFACT_RECEIPT_SCHEMA = "ceratops-artifact-receipt.v1"
 NEW_RECEIPT_BYTES = 1024 * 1024
 NEW_RECEIPT_SCHEMAS = frozenset(
     {COMMITTED_BUILD_RECEIPT_SCHEMA, ARTIFACT_RECEIPT_SCHEMA}
 )
-BUILD_SELECTION_FIELDS = (
-    "repository", "sourceCommit", "releaseBundle", "channel", "version", "target",
-)
 ARTIFACT_IDENTITY_FIELDS = (
-    "repository", "releaseBundle", "version", "target", "attemptId",
+    "repository", "releaseBundle", "storageKey", "version", "target", "attemptId",
 )
 ARTIFACT_SELECTION_FIELDS = frozenset(
     {*ARTIFACT_IDENTITY_FIELDS, "finalCommit", "acceptance"}
@@ -78,6 +74,8 @@ class CompletedArtifactSelection:
     recorded_acceptance: dict[str, Any]
     artifact_receipt: LoadedReceipt
     build_receipt: LoadedReceipt
+    installation_artifact: pathlib.Path | None = None
+    members: tuple[CompletedArtifactSelection, ...] = ()
 
 
 def _unique_result_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -224,37 +222,6 @@ def _file_state(info: os.stat_result) -> tuple[int, ...]:
     return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
 
 
-def _read_build_receipt(path: pathlib.Path) -> dict[str, Any]:
-    """Read one bounded, unambiguous JSON object without interpreting its status."""
-
-    path, before = _plain_path(path)
-    if before.st_size > STEP_RESULT_BYTES:
-        raise StepResultError("Build receipt exceeds the JSON size limit.")
-    with path.open("rb") as stream:
-        if _file_state(os.fstat(stream.fileno())) != _file_state(before):
-            raise StepResultError("Build receipt changed before reading.")
-        raw = stream.read(STEP_RESULT_BYTES + 1)
-        after = os.fstat(stream.fileno())
-    if (_file_state(after) != _file_state(before)
-            or _file_state(_plain_path(path)[1]) != _file_state(before)):
-        raise StepResultError("Build receipt changed while reading.")
-    captured = capture_step_result(raw.decode("utf-8"))
-    value = captured.get("result")
-    if not isinstance(value, dict):
-        raise StepResultError("Build receipt must be one bounded JSON result object.")
-    if value.get("schema") != BUILD_RECEIPT_SCHEMA:
-        raise StepResultError(f"Build receipt schema must be {BUILD_RECEIPT_SCHEMA}.")
-    errors = list(_operation_result_validator().iter_errors(value))
-    if errors:
-        error = jsonschema.exceptions.best_match(errors) or errors[0]
-        location = ".".join(str(part) for part in error.absolute_path)
-        raise StepResultError(
-            f"Build receipt violates its schema at {location or '<root>'}: "
-            f"{error.message}"[:1024]
-        )
-    return value
-
-
 def _bundle_relative_path(
     value: str,
     *,
@@ -311,11 +278,43 @@ def _require_unique(values: Sequence[Any], message: str) -> None:
         raise StepResultError(message)
 
 
+def artifact_storage_key(*, deliverable: str | None = None, bundle: str | None = None) -> str:
+    """Derive a fixed member or bundle location from its declared logical name."""
+    slug = r"[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*"
+    if deliverable is not None and bundle is None:
+        match = re.fullmatch(rf"deliverables\.({slug})\.({slug})", deliverable)
+        if match:
+            return f"members/{match[1]}/{match[2]}"
+    if bundle is not None and deliverable is None and re.fullmatch(slug, bundle):
+        return "bundles/" + bundle
+    raise StepResultError("Supply one declared deliverable or release bundle name.")
+
+
+def receipt_storage_key(identity: Mapping[str, Any]) -> str:
+    """Read the native receipt's location; prior supported receipts keep theirs."""
+    key = identity.get("storageKey")
+    if key is None:
+        key = identity["releaseBundle"]
+    slug = r"[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*"
+    if not isinstance(key, str) or not re.fullmatch(rf"(?:{slug}|members/{slug}/{slug}|bundles/{slug})", key):
+        raise StepResultError("Receipt storage key has invalid path segments.")
+    return key
+
+
+def artifact_identity(repository, key, version, target, attempt_id=None):
+    """Create identities using a structured key; keep native older records readable."""
+    value = {"repository": repository, "storageKey" if "/" in key else "releaseBundle": key,
+             "version": version, "target": target}
+    receipt_storage_key(value)
+    if attempt_id is not None:
+        value["attemptId"] = attempt_id
+    return value
+
 def _expected_build_receipt_paths(identity: Mapping[str, Any]) -> set[str]:
     # Saved records bind their exact historical path. New producers use only
     # build_receipt.json; accepting the recorded old path does not search for,
     # copy, rename, or create an alias for an existing committed receipt.
-    base = f".build/{identity['releaseBundle']}/{identity['version']}"
+    base = f".build/{receipt_storage_key(identity)}/{identity['version']}"
     return {
         f"{base}/build_receipt.json",
         f"{base}/{identity['target']}/build_receipt.json",
@@ -339,7 +338,7 @@ def _validate_committed_build_receipt(value: Mapping[str, Any]) -> None:
     summary = value.get("checkSummary")
     if summary is not None:
         expected = str(pathlib.PurePosixPath(receipt_path).with_name("check_summary.json"))
-        if (value["tag"] != f'{identity["releaseBundle"]}/{identity["version"]}'
+        if (value["tag"] != f'{receipt_storage_key(identity)}/{identity["version"]}'
                 or summary["root"] != "git" or summary["path"] != expected):
             raise StepResultError("Build tag or check-summary path does not match its identity.")
 
@@ -351,7 +350,7 @@ def _validate_committed_build_receipt(value: Mapping[str, Any]) -> None:
     dependency_ids = [
         (
             str(item["repository"]),
-            str(item["releaseBundle"]),
+            receipt_storage_key(item),
             str(item["version"]),
             str(item["target"]),
         )
@@ -364,7 +363,7 @@ def _validate_committed_build_receipt(value: Mapping[str, Any]) -> None:
     for dependency in dependencies:
         if (
             dependency["repository"] == identity["repository"]
-            and dependency["releaseBundle"] == identity["releaseBundle"]
+            and receipt_storage_key(dependency) == receipt_storage_key(identity)
         ):
             raise StepResultError("Committed build receipt cannot depend on itself.")
 
@@ -400,15 +399,22 @@ def _validate_committed_build_receipt(value: Mapping[str, Any]) -> None:
     ):
         raise StepResultError("Committed dependency artifacts must use the store root.")
 
-    installation = value["installationArtifact"]
-    _bundle_relative_path(
-        str(installation["path"]), label="committed build receipt"
-    )
-    installed = artifacts.get(_receipt_file_key(installation))
-    if installed is None or installed["sha256"] != installation["sha256"]:
-        raise StepResultError(
-            "Installation artifact does not identify one recorded build artifact."
-        )
+    if "members" in value:
+        members = value["members"]
+        _require_unique([(item["deliverable"], item["identity"]["target"]) for item in members],
+                        "Bundle repeats a member target.")
+        for member in members:
+            member_key = artifact_storage_key(deliverable=member["deliverable"])
+            if (receipt_storage_key(member["identity"]) != member_key
+                    or member["tag"] != member_key + "/" + member["identity"]["version"]
+                    or member["buildReceipt"]["root"] != "git"
+                    or member["buildReceipt"]["path"] not in _expected_build_receipt_paths(member["identity"])):
+                raise StepResultError("Bundle member reference disagrees with its identity.")
+    else:
+        installation = value["installationArtifactPath"]
+        _bundle_relative_path(installation, label="installation artifact")
+        if ("store", installation) not in artifacts:
+            raise StepResultError("Installation path does not name one recorded artifact.")
 
     source_results = list(value["sourceChecks"])
     artifact_results = list(value["artifactTests"])
@@ -438,7 +444,6 @@ def _validate_committed_build_receipt(value: Mapping[str, Any]) -> None:
             )
 
     tested: set[tuple[str, str]] = set()
-    installation_tested = False
     for result in artifact_results:
         references = [_receipt_file_key(item) for item in result["artifacts"]]
         _require_unique(
@@ -456,13 +461,8 @@ def _validate_committed_build_receipt(value: Mapping[str, Any]) -> None:
                 )
             key = _receipt_file_key(reference)
             tested.add(key)
-            installation_tested = installation_tested or key == _receipt_file_key(
-                installation
-            )
-    if tested != set(artifacts):
+    if artifact_results and tested != set(artifacts):
         raise StepResultError("Artifact tests do not cover every recorded artifact.")
-    if not installation_tested:
-        raise StepResultError("Installation artifact has no recorded passing test.")
 
     supporting = {
         _receipt_file_identity(item)
@@ -500,7 +500,8 @@ def _validate_committed_build_receipt(value: Mapping[str, Any]) -> None:
             "Committed result paths must name only the receipt and Git evidence."
         )
 
-    tools = [*value["portableContext"]["runtimes"], *value["portableContext"]["tools"]]
+    tools = ([] if "members" in value else
+             [*value["platformAndTools"]["runtimes"], *value["platformAndTools"]["tools"]])
     _require_unique(
         [str(item["id"]) for item in tools],
         "Portable receipt context has duplicate tool identities.",
@@ -631,7 +632,7 @@ def _read_new_receipt(
 
 
 def read_committed_build_receipt(path: pathlib.Path) -> LoadedReceipt:
-    """Read one canonical ``ceratops-build-result.v3`` file and hash its bytes."""
+    """Read one canonical ``ceratops-build-result.v4`` file and hash its bytes."""
 
     return _read_new_receipt(
         path,
@@ -648,60 +649,6 @@ def read_artifact_receipt(path: pathlib.Path) -> LoadedReceipt:
         expected_schema=ARTIFACT_RECEIPT_SCHEMA,
         label="Artifact receipt",
     )
-
-
-def _build_files(receipt: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """Validate the entire inventory and evidence references before payload reads."""
-
-    files: dict[str, dict[str, Any]] = {}
-    spellings: set[str] = set()
-    artifacts: dict[str, dict[str, Any]] = {}
-    supporting: dict[str, dict[str, Any]] = {}
-
-    def add(record: dict[str, Any], destination: dict[str, dict[str, Any]]) -> None:
-        path = record["path"]
-        _bundle_relative_path(path)
-        if path.casefold() in spellings:
-            raise StepResultError(f"Duplicate build receipt path: {path}")
-        spellings.add(path.casefold())
-        files[path] = destination[path] = record
-
-    for artifact in receipt["artifacts"]:
-        add(artifact, artifacts)
-    owner = receipt["identity"]
-    dependencies: set[tuple[str, str, str]] = set()
-    for dependency in receipt["dependencies"]:
-        identity = dependency["identity"]
-        key = (identity["repository"], identity["releaseBundle"], identity["target"])
-        if key in dependencies:
-            raise StepResultError("Duplicate or competing build dependency selection.")
-        if key[:2] == (owner["repository"], owner["releaseBundle"]):
-            raise StepResultError("A build receipt cannot depend on its own release bundle.")
-        dependencies.add(key)
-        for artifact in dependency["artifacts"]:
-            add(artifact, artifacts)
-    for support in receipt["supportingFiles"]:
-        add(support, supporting)
-
-    test_ids: set[str] = set()
-    for test in receipt["tests"]:
-        if test["id"] in test_ids:
-            raise StepResultError(f"Duplicate build test ID: {test['id']}")
-        test_ids.add(test["id"])
-        tested: set[str] = set()
-        for reference in test["artifacts"]:
-            path = reference["path"]
-            artifact = artifacts.get(path)
-            if path in tested or artifact is None or reference["sha256"] != artifact["sha256"]:
-                raise StepResultError(f"Build test does not identify one exact artifact: {path}")
-            tested.add(path)
-        evidence = test["evidence"]
-        if evidence is not None:
-            file = supporting.get(evidence["path"])
-            if (file is None or file["type"] != "test-evidence"
-                    or file["sha256"] != evidence["sha256"]):
-                raise StepResultError("Build test evidence must identify a declared test-evidence file.")
-    return list(files.values())
 
 
 def _verify_bundle_file(
@@ -777,7 +724,9 @@ def _validated_artifact_selection(
     if tag is not None and (not isinstance(tag, str) or not tag.strip()):
         raise StepResultError("Artifact selection tag must be nonempty text.")
     if not direct_receipt:
-        required = {"repository", "releaseBundle", "version", "target"}
+        required = {"repository", "version", "target"}
+        if not ({"releaseBundle", "storageKey"} & selection.keys()):
+            raise StepResultError("Selected artifact identity has no storage key.")
         missing = sorted(required - set(selection))
         if missing:
             raise StepResultError(
@@ -973,7 +922,7 @@ def _artifact_receipt_locations(
     store_root: pathlib.Path,
     identity: Mapping[str, Any],
 ) -> tuple[pathlib.Path, ...]:
-    base = f"{identity['releaseBundle']}/{identity['version']}"
+    base = f"{receipt_storage_key(identity)}/{identity['version']}"
     direct = _bundle_relative_path(
         f"{base}/artifact-receipt.json", label="artifact selection"
     )
@@ -981,9 +930,15 @@ def _artifact_receipt_locations(
         f"{base}/{identity['target']}/artifact-receipt.json",
         label="artifact selection",
     )
+    worktrees = store_root / "worktrees"
+    # Find this exact tagged version, never another worktree's build history.
+    # Unfinished _in-test directories cannot supply accepted artifacts.
+    local = tuple(
+        path for checkout in sorted(worktrees.iterdir()) if checkout.is_dir()
+        for path in (checkout.joinpath(*direct.parts), checkout.joinpath(*targeted.parts))
+    ) if worktrees.is_dir() else ()
     return (
-        store_root.joinpath(*direct.parts),
-        store_root.joinpath(*targeted.parts),
+        *local,
         store_root.joinpath("beta-stable", *direct.parts),
         store_root.joinpath("beta-stable", *targeted.parts),
     )
@@ -1157,8 +1112,8 @@ def read_build_check_summary(root: pathlib.Path, tag: str, receipt_path: str) ->
     raw = _build_blob(root, commit, receipt_path, 1024 * 1024)
     receipt = parse_committed_build_receipt(raw).value
     identity = receipt["identity"]
-    expected_tag = identity["releaseBundle"] + "/" + identity["version"]
-    parent = f'.build/{identity["releaseBundle"]}/{identity["version"]}'
+    expected_tag = receipt_storage_key(identity) + "/" + identity["version"]
+    parent = f'.build/{receipt_storage_key(identity)}/{identity["version"]}'
     expected_paths = {parent + "/build_receipt.json",
                       parent + "/" + identity["target"] + "/build_receipt.json"}
     if (receipt.get("schema") != COMMITTED_BUILD_RECEIPT_SCHEMA or receipt.get("status") != "passed"
@@ -1201,7 +1156,9 @@ def select_build_check_summaries(
     if not history.is_dir():
         return []
     candidates: list[tuple[Any, str, str, pathlib.Path, str]] = []
-    for pattern in ("*/*/build_receipt.json", "*/*/*/build_receipt.json"):
+    for pattern in ("*/*/build_receipt.json", "*/*/*/build_receipt.json",
+                    "members/*/*/*/build_receipt.json", "members/*/*/*/*/build_receipt.json",
+                    "bundles/*/*/build_receipt.json", "bundles/*/*/*/build_receipt.json"):
         for path in history.glob(pattern):
             if any(parent.is_symlink() or parent.is_junction() for parent in (path, *path.parents)):
                 raise ValueError("Build history cannot traverse directory links.")
@@ -1209,8 +1166,10 @@ def select_build_check_summaries(
                 raise ValueError("Local build receipt exceeds its size limit.")
             try:
                 receipt = json.loads(path.read_bytes())
+                if receipt.get("schema") != "ceratops-build-result.v4":
+                    continue
                 identity = receipt["identity"]
-                name, destination, version = identity["releaseBundle"], identity["target"], identity["version"]
+                name, destination, version = receipt_storage_key(identity), identity["target"], identity["version"]
                 level = build_qualification(version)
                 if (unit is not None and name != unit) or (target is not None and destination != target):
                     continue
@@ -1232,7 +1191,7 @@ def select_build_check_summaries(
             continue
         selected = read_build_check_summary(root, tag, path.relative_to(root).as_posix())
         identity = selected["receipt"]["identity"]
-        if (identity["releaseBundle"], identity["target"]) != (name, destination):
+        if (receipt_storage_key(identity), identity["target"]) != (name, destination):
             raise ValueError("Local build selector differs from the tagged identity.")
         chosen[(name, destination)] = selected
     return [chosen[key] for key in sorted(chosen)]
@@ -1244,6 +1203,7 @@ def read_artifact_receipt_chain(
     artifact_receipt_path: pathlib.Path | None = None,
     expected: Mapping[str, Any] | None = None,
     tag: str | None = None,
+    _bundle_root: pathlib.Path | None = None,
 ) -> CompletedArtifactSelection:
     """Verify a saved artifact -> Git C -> build receipt -> retained-file chain.
 
@@ -1289,12 +1249,19 @@ def read_artifact_receipt_chain(
             raise StepResultError("Artifact receipt path escapes the artifact store.")
         loaded_artifact = read_artifact_receipt(checked_path)
         artifact = loaded_artifact.value
-        if checked_path not in _artifact_receipt_locations(store_root, artifact["identity"]):
+        locations = _artifact_receipt_locations(store_root, artifact["identity"])
+        if _bundle_root is not None:
+            member_key = receipt_storage_key(artifact["identity"])
+            if not member_key.startswith("members/") or not _bundle_root.is_relative_to(store_root):
+                raise StepResultError("Bundle member copy is outside the managed artifact store.")
+            locations += (_bundle_root / member_key / artifact["identity"]["version"] /
+                          artifact["identity"]["target"] / "artifact-receipt.json",)
+        if checked_path not in locations:
             raise StepResultError(
                 "Artifact receipt location does not match its recorded identity."
             )
         required_tag = (
-            f"{artifact['identity']['releaseBundle']}/{artifact['identity']['version']}"
+            f"{receipt_storage_key(artifact['identity'])}/{artifact['identity']['version']}"
         )
         if tag is not None and tag != required_tag:
             raise StepResultError("The selected tag does not match the artifact version.")
@@ -1335,6 +1302,19 @@ def read_artifact_receipt_chain(
         if recorded_artifacts != set(artifact["artifactPaths"]):
             raise StepResultError("Artifact receipt paths do not match the build receipt.")
 
+        members = []
+        for member in build.get("members", []):
+            member_key = receipt_storage_key(member["identity"])
+            copy_root = checked_path.parent / member_key / member["identity"]["version"] / member["identity"]["target"]
+            child = read_artifact_receipt_chain(
+                repo, tag=member["tag"], expected=member["identity"],
+                artifact_receipt_path=copy_root / "artifact-receipt.json" if copy_root.exists() else None,
+                _bundle_root=checked_path.parent if copy_root.exists() else None)
+            if (child.build_receipt.sha256 != member["buildReceipt"]["sha256"]
+                    or child.build_receipt.value["artifacts"] != member["artifacts"]
+                    or child.build_receipt.value["dependencies"] != member["dependencies"]):
+                raise StepResultError("Bundle member differs from its recorded receipt.")
+            members.append(child)
         artifacts, dependencies, supporting, git_files = _verify_receipt_inventory(
             repo,
             checked_path.parent,
@@ -1358,81 +1338,13 @@ def read_artifact_receipt_chain(
             recorded_acceptance=recorded_acceptance,
             artifact_receipt=loaded_artifact,
             build_receipt=loaded_build,
+            installation_artifact=(artifacts[next(
+                index for index, record in enumerate(build["artifacts"])
+                if record["path"] == build["installationArtifactPath"]
+            )] if "installationArtifactPath" in build else None),
+            members=tuple(members),
         )
     except StepResultError:
         raise
     except (OSError, UnicodeError, ValueError, RecursionError) as exc:
         raise StepResultError(f"Cannot consume artifact receipt chain: {exc}"[:1024]) from exc
-
-
-def verify_release_bundle_build(
-    receipt_path: pathlib.Path,
-    bundle_root: pathlib.Path,
-    *,
-    expected: Mapping[str, str],
-) -> dict[str, Any]:
-    """Verify a saved v2 build receipt and return its unchanged recorded statuses.
-
-    The expected selection must independently supply repository, sourceCommit,
-    releaseBundle, channel, version and target. Every artifact, dependency artifact
-    and supporting file is checked under bundle_root; test references must match
-    that checked inventory. A valid inventory can have absent, skipped, blocked
-    or failed tests. This does not decide test sufficiency or deployment eligibility.
-
-    No command is executed and no file is written. Verification describes the
-    bytes observed during this call, not their provenance or future immutability.
-    The caller must reverify before later consumption or use an immutable store.
-    """
-
-    if (not isinstance(expected, Mapping)
-            or set(expected) != set(BUILD_SELECTION_FIELDS)
-            or not all(isinstance(value, str) and value.strip() for value in expected.values())):
-        raise StepResultError("Expected build selection must supply all six identity fields.")
-    try:
-        receipt = _read_build_receipt(pathlib.Path(receipt_path))
-        for field in BUILD_SELECTION_FIELDS:
-            if receipt["identity"][field] != expected[field]:
-                raise StepResultError(f"Build receipt identity mismatch: {field}")
-        files = _build_files(receipt)
-        root, _ = _plain_path(pathlib.Path(bundle_root), directory=True)
-        for record in files:
-            _verify_bundle_file(root, record)
-    except (OSError, UnicodeError, ValueError, RecursionError) as exc:
-        if isinstance(exc, StepResultError):
-            raise
-        raise StepResultError(f"Cannot verify build receipt: {exc}"[:1024]) from exc
-    return receipt
-
-
-def main(argv: Sequence[str] | None = None) -> int:
-    """Expose receipt verification; success prints RECEIPT_VERIFIED."""
-
-    parser = argparse.ArgumentParser(description=__doc__)
-    commands = parser.add_subparsers(dest="command", required=True)
-    verify = commands.add_parser(
-        "verify-release-bundle-build",
-        help="Check identity and bytes, not test success or deployment permission.",
-    )
-    verify.add_argument("--receipt", type=pathlib.Path, required=True)
-    verify.add_argument("--bundle-root", type=pathlib.Path, required=True)
-    for field, option in (
-        ("repository", "--repository"), ("sourceCommit", "--source-commit"),
-        ("releaseBundle", "--release-bundle"), ("channel", "--channel"),
-        ("version", "--version"), ("target", "--target"),
-    ):
-        verify.add_argument(option, dest=field, required=True)
-    args = parser.parse_args(argv)
-    try:
-        verify_release_bundle_build(
-            args.receipt, args.bundle_root,
-            expected={field: getattr(args, field) for field in BUILD_SELECTION_FIELDS},
-        )
-    except StepResultError as exc:
-        print(" ".join(str(exc).split())[:1024], file=sys.stderr)
-        return 2
-    print("RECEIPT_VERIFIED")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

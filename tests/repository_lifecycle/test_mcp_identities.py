@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import pathlib
+from typing import Any
 import runpy
 import secrets
 import subprocess
@@ -316,6 +317,7 @@ script = pathlib.Path(sys.argv[2])
 sys.path.insert(0, settings['imports'])
 sys.path.insert(0, str(script.parent))
 pathlib.Path.home = classmethod(lambda cls: pathlib.Path(settings['home']))
+os.environ['CODEX_HOME'] = str(pathlib.Path(settings['home']) / '.codex')
 if settings['python_runtime'] is not None:
     sys.executable = settings['python_runtime']
 target = pathlib.Path(settings['target'])
@@ -502,6 +504,10 @@ def _manager_command_case(tmp_path, mode):
                 "payload": payload}
     manager.write_text("import json, os, pathlib, sys\nsettings = " + repr(settings) + "\n" + """
 mode = settings['mode']
+if sys.argv[1] == 'versions':
+    print(json.dumps({'mcp_server_name': settings['payload']['mcp_server_name'],
+                      'installed_version': settings['selection']['version'] if pathlib.Path(settings['current']).exists() else None}))
+    sys.exit(0)
 with pathlib.Path(settings['calls']).open('a', encoding='utf-8') as calls:
     calls.write('install\\n')
 # The observable effect precedes the broken response, including nonzero exits.
@@ -524,6 +530,10 @@ elif mode == 'wrong_fields':
 else:
     print(json.dumps(settings['payload']))
 """, encoding="utf-8")
+    launcher = case.home / ".codex/mcp/source_search_mcp/bin/source_search_mcp.py"
+    (case.home / ".codex/config.toml").write_text(
+        '[mcp_servers.source_search_mcp]\ncommand = ' + json.dumps(sys.executable) +
+        '\nargs = ' + json.dumps(["-I", "-B", str(launcher), "--mcp"]) + '\nenabled = true\n')
     case.launcher = manager
     return case
 
@@ -561,6 +571,8 @@ def test_mcp_install_preserves_command_facts_without_retry(tmp_path, monkeypatch
         assert case.current.exists() == (mode != "launch")
         assert case.accepted.exists() == (mode != "launch")
         if mode == "success":
+            refresh = result.pop("client_refresh")
+            assert refresh["status"] == "pending" and refresh["server_name"] == "source_search_mcp"
             assert result == {
                 "schema": "ceratops-deployment-completion.v1",
                 "producer": "ceratops-mcp-server-lifecycle/install", "status": "completed",
@@ -569,15 +581,17 @@ def test_mcp_install_preserves_command_facts_without_retry(tmp_path, monkeypatch
                 "removed": [], "transaction_id": "b" * 32, "cleanup_debt": [],
                 "maintenance": {"removed": ["retired-version"], "deferred": ["busy-version"], "errors": []},
             }
-            assert json.loads(case.output.read_text()) == result
+            assert json.loads(case.output.read_text()) == {**result, "client_refresh": refresh}
             continue
         assert result["status"] == "failed" and not case.output.exists()
         details = result["diagnostics"]
         assert details["mcp_server_name"] == "source_search_mcp"
         assert details["python_runtime"] == reported_runtime
         assert details["working_directory"] == str(case.repo)
-        assert details["command"] == [reported_runtime, "-I", "-B", str(case.launcher), "install",
-                                      "--source", str(case.repo), "--mcp-server-name", "source_search_mcp"]
+        expected_command = [reported_runtime, "-I", "-B", str(case.launcher)]
+        expected_command += (["versions", "source_search_mcp"] if mode == "launch" else
+                             ["install", "--source", str(case.repo), "--mcp-server-name", "source_search_mcp"])
+        assert details["command"] == expected_command
         assert details["installation_outcome"] == "unknown"
         assert details["causes"][0]["message"] == result["message"]
         if mode == "launch":
@@ -658,3 +672,105 @@ def test_mcp_wrapped_launch_error_keeps_cause_streams_and_uncertain_stop(tmp_pat
     assert details["causes"][1]["type"] == "TimeoutExpired"
     assert details["cleanup_errors"] == ["OSError: cleanup: [REDACTED]"]
     assert credential not in json.dumps(result)
+
+
+@pytest.mark.parametrize("entrypoint", ["callable", "cli"])
+@pytest.mark.parametrize("condition", ["correct", "missing-file", "missing-entry", "disabled", "wrong-launcher", "save-failure"])
+def test_codex_registration_before_install(tmp_path, monkeypatch, entrypoint, condition):
+    import types
+    from unittest.mock import Mock
+    case = _manager_command_case(tmp_path, "success")
+    monkeypatch.setenv("MCP_INSTALL_TEST_TOKEN", "private-test-token")
+    config = case.home / ".codex/config.toml"
+    raw = config.read_text()
+    raw += '\n[features]\nmcp_tool_list_changed = true\n'
+    if condition == "missing-entry":
+        raw = '[features]\nmcp_tool_list_changed = true\n'
+    elif condition in {"disabled", "save-failure"}:
+        raw = raw.replace("enabled = true", "enabled = false")
+    elif condition == "wrong-launcher":
+        raw = raw.replace("source_search_mcp.py", "wrong.py")
+    config.write_bytes(raw.replace("\n", "\r\n").encode())
+    if condition == "missing-file":
+        config.unlink()
+    module = runpy.run_path(str(ROOT / "skills/ceratops-mcp-server-lifecycle/scripts/install-mcp-server.py"))
+    call = module["install_mcp_server"]
+    monkeypatch.setitem(call.__globals__, "INSTALL_ROOT", case.home / ".codex/mcp")
+    monkeypatch.setitem(call.__globals__, "MANAGER", case.launcher)
+    if condition == "save-failure":
+        if entrypoint == "cli":
+            # A directory at the one replacement path makes the real CLI's save
+            # fail without depending on Windows read-only permission semantics.
+            config.with_name(".config.toml.in_process").mkdir()
+        else:
+            substitute = types.SimpleNamespace(**vars(module["os"]))
+            substitute.replace = Mock(side_effect=PermissionError("configuration save denied"))
+            monkeypatch.setitem(call.__globals__, "os", substitute)
+    failed = condition in {"missing-file", "missing-entry", "save-failure"}
+    after = None
+    for attempt in range(2):
+        if entrypoint == "callable":
+            result = call(module["InstallOptions"](repo_root=case.repo, mcp_server_name="source_search_mcp"))
+        else:
+            run = _receipt_cli(case, ROOT / "skills/ceratops-mcp-server-lifecycle/scripts/install-mcp-server.py",
+                ["--repo-root", str(case.repo), "--mcp-server-name", "source_search_mcp"])
+            assert run.returncode == int(failed), run.stderr
+            result = json.loads(run.stderr if failed else run.stdout)
+        if failed:
+            assert result["status"] == "failed", result
+            assert not case.current.exists() and not case.accepted.exists()
+            assert not (case.task / "manager-calls.txt").exists()
+            if condition.startswith("missing"):
+                assert "source_search_mcp" in result["message"] and "config.toml" in result["message"]
+        else:
+            assert result["status"] == "completed", result
+            current = config.read_bytes()
+            assert b"mcp_tool_list_changed = true" in current
+            assert b"enabled = true" in current and b"wrong.py" not in current
+            assert b"\r\n" in current and b"\n" not in current.replace(b"\r\n", b"")
+            if after is not None:
+                assert (current, config.stat().st_mtime_ns) == after
+            after = (current, config.stat().st_mtime_ns)
+            assert case.current.exists() and case.accepted.exists()
+            assert not config.with_name(".config.toml.in_process").exists()
+
+
+@pytest.mark.parametrize("state", ["ready", "deferred", "reload-failed", "missing-tools", "other-thread"])
+def test_client_refresh_after_install(tmp_path, monkeypatch, state):
+    case = _make_mcp_receipt_case(tmp_path, "source_search_mcp")
+    monkeypatch.setenv("CODEX_THREAD_ID", "installing-chat")
+    observation: dict[str, Any] = {"thread_id": "installing-chat", "reload_completed": True,
+                   "expected_tools": ["source_search"],
+                   "server_status": {"name": "source_search_mcp", "serverCapabilities": {"tools": {}},
+                                     "tools": {"source_search": {}}}}
+    if state == "deferred":
+        observation = {"deferred": True}
+    elif state == "reload-failed":
+        observation.update(reload_completed=False, error="client reload rejected")
+    elif state == "missing-tools":
+        observation["server_status"]["tools"] = {}
+    elif state == "other-thread":
+        observation["thread_id"] = "another-chat"
+    feedback = case.task / "client-response.json"
+    feedback.write_text(json.dumps(observation))
+    original = case.current.read_bytes(), case.accepted.read_bytes()
+    script = ROOT / "skills/ceratops-mcp-server-lifecycle/scripts/install-mcp-server.py"
+    initial = _receipt_cli(case, script, _receipt_writer_arguments(case))
+    assert initial.returncode == 0, initial.stderr
+    pending = json.loads(initial.stdout)["client_refresh"]
+    assert pending["status"] == "pending"
+    retained_manager = case.task / "returned-manager.json"
+    retained_manager.write_text(json.dumps(pending["manager_result"]))
+    arguments = _receipt_writer_arguments(case)
+    arguments[arguments.index("--manager-result") + 1] = str(retained_manager)
+    for _ in range(2):
+        run = _receipt_cli(case, script, [
+            *arguments, "--client-refresh-result", str(feedback)])
+        assert run.returncode == 0, run.stderr
+        result = json.loads(run.stdout)
+        assert result["status"] == "completed"
+        assert result["client_refresh"]["status"] == (
+            "completed" if state == "ready" else "pending" if state == "deferred" else "failed")
+        assert (case.current.read_bytes(), case.accepted.read_bytes()) == original
+        if state == "reload-failed":
+            assert "client reload rejected" in json.dumps(result["client_refresh"])

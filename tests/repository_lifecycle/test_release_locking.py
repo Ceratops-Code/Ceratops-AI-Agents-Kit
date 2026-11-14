@@ -13,6 +13,7 @@ import sys
 from typing import Any
 
 import pytest
+from unittest.mock import Mock
 import yaml
 
 from tests.repository_lifecycle.support import (
@@ -74,7 +75,7 @@ def test_release_builds_hold_lock_before_preparation_through_cleanup(tmp_path, m
     monkeypatch.setattr(operations, "remove_operation_failures", cleanup)
     request = operations.OperationRequest(references["desktop"] + ".actions.install", {"target": "one"})
     for attempt in range(2):
-        result = operations.execute_release_builds(tmp_path, [request])
+        result = operations.execute_build(tmp_path, [request])
         assert result["status"] == ("result_invalid" if interrupt and attempt == 0 else "completed"), result
         if interrupt and attempt == 0:
             assert "interrupted build effect" in json.dumps(result)
@@ -93,7 +94,7 @@ def test_direct_build_waits_before_reading_contract_and_task_worktree_stays_unlo
     locks = workflow_command.release_lock_module()
     script = (
         "import json,pathlib,sys;sys.path.insert(0,sys.argv[1]);import repository_operation as r;"
-        "print(json.dumps(r.execute_release_builds(pathlib.Path(sys.argv[2]),"
+        "print(json.dumps(r.execute_build(pathlib.Path(sys.argv[2]),"
         "[r.OperationRequest('deliverables.packages.sample.actions.build')],wait_seconds=.02)))"
     )
     with workflow_command.release_write_context(tmp_path):
@@ -110,7 +111,7 @@ def test_direct_build_waits_before_reading_contract_and_task_worktree_stays_unlo
         pytest.fail("An independent task build acquired the release lock")
 
     monkeypatch.setattr(locks, "hold_write_attempt", unexpected_lock)
-    result = operations.execute_release_builds(task, [operations.OperationRequest("deliverables.packages.sample.actions.build")])
+    result = operations.execute_build(task, [operations.OperationRequest("deliverables.packages.sample.actions.build")], include_checks=False)
     assert result["status"] == "completed", result
 
 
@@ -423,6 +424,9 @@ def test_local_promotion_executes_declared_selected_skill_installer(tmp_path, mo
     assert run_git(repo, "add", "sdlc/sdlc.yml").returncode == 0
     assert run_git(repo, "commit", "-m", "Select installation").returncode == 0
     head = run_git(repo, "rev-parse", "HEAD").stdout.strip()
+    assert run_git(repo, "switch", "main").returncode == 0
+    task = tmp_path / "task"
+    assert run_git(repo, "worktree", "add", str(task), "approved").returncode == 0
     bundle = tmp_path / "codex/skills/ceratops-skill-lifecycle"
     (bundle / "references").mkdir(parents=True)
     (bundle / "scripts").mkdir()
@@ -455,7 +459,7 @@ def install_skill(options):
     module = runpy.run_path(str(PROMOTE_REPOSITORY))
     operation = "deliverables.apps.sample.actions.install"
     args = module["build_parser"]().parse_args([
-        "--repo-root", str(repo), "--source-branch", "approved", "--run-operation", operation,
+        "--repo-root", str(task), "--source-branch", "approved", "--run-operation", operation,
     ])
     for attempt in range(2):
         if ending == "completed":
@@ -483,7 +487,7 @@ def test_promotion_never_turns_an_unexecuted_handoff_into_success(tmp_path, monk
         "operation": "fixture.install", "status": status, "steps": [],
         "handoff": "ceratops-skill-lifecycle/deploy",
     }], "deferred_handoffs": ["fixture.install"]}
-    monkeypatch.setitem(deploy.__globals__, "execute_release_builds", lambda *a, **k: operations)
+    monkeypatch.setitem(deploy.__globals__, "execute_prepared_operations", Mock(return_value=operations))
     accepted = module["CompletedPromotion"]({"status": "ready", "head": head, "pending_work_scope": "fixture"},
                                            repo, [], {"results": []})
     args = argparse.Namespace(repo_root=repo, sdlc_contract=pathlib.Path("sdlc/sdlc.yml"))
@@ -517,7 +521,11 @@ def test_installer_launch_failures_keep_unfinished_flag(tmp_path, monkeypatch, l
 
     if launcher == "mcp":
         module = runpy.run_path(str(PROMOTE_REPOSITORY.parents[2] / "ceratops-mcp-server-lifecycle/scripts/install-mcp-server.py"))
-        call, request = module["install_mcp_server"], module["InstallOptions"](repo_root=repo)
+        call, request = module["install_mcp_server"], module["InstallOptions"](repo_root=repo, mcp_server_name="example")
+        installed_root = tmp_path / "codex" / "mcp-servers"
+        installed_root.mkdir(parents=True)
+        (installed_root.parent / "config.toml").write_text("[mcp_servers.example]\ncommand='python'\nargs=[]\n")
+        monkeypatch.setitem(call.__globals__, "INSTALL_ROOT", installed_root)
         manager = tmp_path / "_manager.py"
         manager.write_text("raise RuntimeError('fixture launcher must be intercepted')\n")
         monkeypatch.setitem(call.__globals__, "MANAGER", manager)
@@ -648,36 +656,40 @@ def test_release_timeout_result_preserves_owner_and_wait(tmp_path):
 
 
 @pytest.mark.parametrize("owner", ["promotion", "ship", "github-ship", "sync", "pr", "fast-change"])
-def test_workflow_owns_lock_for_body_and_releases_on_success(tmp_path, monkeypatch, owner):
+def test_workflow_owns_lock_for_preconditions_and_releases_on_failure(tmp_path, monkeypatch, owner):
     repo, _, _, _ = prepare_repository_lifecycle_repo(tmp_path)
-    args = argparse.Namespace(repo_root=repo, head_branch="release/local",
-                              main_branch="main", align_branch=["release/local"])
+    args = argparse.Namespace(repo_root=repo, head_branch="release/local", base_branch="main",
+                              main_branch="main", align_branch=["release/local"], patch="")
     if owner == "promotion":
         module = runpy.run_path(str(PROMOTE_REPOSITORY))
         args = module["build_parser"]().parse_args(["--repo-root", str(repo), "--prepare-release-only"])
-        call, body, result = module["promote"], "_promote_with_rollback", {"status": "ready"}
+        call, target, boundary = module["promote"], module["git_branches"], "_primary_checkout"
     elif owner == "ship":
         from github_pr_workflow import ship_repository
-        call, body, result = ship_repository.ship_repository, "_ship_repository", {"status": "shipped"}
+        call, target, boundary = ship_repository.ship_repository, ship_repository, "_local_branch_exists"
     elif owner == "github-ship":
         from github_pr_workflow import ship
-        call, body, result = ship.ship, "_ship", {"status": "shipped"}
+        call, target, boundary = ship.ship, ship.merge, "restore_unfinished_checkpoints"
     elif owner == "sync":
         from github_pr_workflow import sync
-        call, body, result = sync.sync_main, "_sync_main", {"status": "synced"}
+        call, target, boundary = sync.sync_main, sync.git_branches, "_branch_worktrees"
     elif owner == "pr":
         from github_pr_workflow import ensure_pr
-        call, body, result = ensure_pr.ensure_pr, "_ensure_pr", {"status": "ready"}
+        call, target, boundary = ensure_pr.ensure_pr, ensure_pr, "_publication_target"
     else:
         module = runpy.run_path(str(FAST_CHANGE))
-        call, body, result = module["execute"], "_execute", {"status": "committed"}
+        call, target, boundary = module["execute"], module["execute"].__globals__, "_git"
 
     def protected(*_args, **_kwargs):
         _compete(repo)
-        return result
+        raise RuntimeError("stopped at protected precondition")
 
-    monkeypatch.setitem(call.__globals__, body, protected)
-    assert call(args) == result
+    if isinstance(target, dict):
+        monkeypatch.setitem(target, boundary, protected)
+    else:
+        monkeypatch.setattr(target, boundary, protected)
+    with pytest.raises(RuntimeError, match="protected precondition"):
+        call(args)
     locks = workflow_command.release_lock_module()
     assert locks.release_lock_path(repo).read_bytes() == b"0"
     with locks.hold_write_lock(locks.release_lock_path(repo)) as owned:
@@ -693,13 +705,15 @@ def test_stopped_promotion_exception_allows_a_fresh_call(tmp_path, monkeypatch):
     def crash(*_args, **_kwargs):
         raise RuntimeError("unexpected controller failure")
 
-    monkeypatch.setitem(promote.__globals__, "_promote_with_rollback", crash)
+    original = module["git_branches"]._primary_checkout
+    monkeypatch.setattr(module["git_branches"], "_primary_checkout", crash)
     with pytest.raises(RuntimeError, match="unexpected"):
         promote(args)
     locks = workflow_command.release_lock_module()
     assert locks.release_lock_path(repo).read_bytes() == b"0"
-    monkeypatch.setitem(promote.__globals__, "_promote_with_rollback", lambda *_a, **_k: {"status": "ready"})
-    assert promote(args)["status"] == "ready"
+    monkeypatch.setattr(module["git_branches"], "_primary_checkout", original)
+    assert run_git(repo, "switch", "main").returncode == 0
+    assert promote(args)["status"] == "prepared"
     assert locks.release_lock_path(repo).read_bytes() == b"0"
 
 
@@ -707,18 +721,20 @@ def test_stopped_promotion_exception_allows_a_fresh_call(tmp_path, monkeypatch):
 def test_installation_cannot_undo_completed_promotion(tmp_path, monkeypatch, ending):
     """The accepted release survives install failures; its source stays locked."""
     repo, approved_head, _, _ = prepare_repository_lifecycle_repo(tmp_path)
+    assert run_git(repo, "switch", "main").returncode == 0
+    task = tmp_path / "task"
+    assert run_git(repo, "worktree", "add", str(task), "approved").returncode == 0
     module = runpy.run_path(str(PROMOTE_REPOSITORY))
     promote = module["promote"]
     operation = "deliverables.apps.sample.actions.install"
     args = module["build_parser"]().parse_args([
-        "--repo-root", str(repo), "--source-branch", "approved",
+        "--repo-root", str(task), "--source-branch", "approved",
         "--run-operation", operation,
     ])
     installed = []
     calls = []
 
-    def install(root, requests, _contract, **_kwargs):
-        prepared = importlib.import_module("repository_operation").prepare_operations(root, requests)
+    def install(prepared, **_kwargs):
         _compete(repo)
         assert len(prepared) == 1
         assert prepared[0].operation == operation
@@ -739,7 +755,7 @@ def test_installation_cannot_undo_completed_promotion(tmp_path, monkeypatch, end
     def unexpected_rollback(*_args, **_kwargs):
         pytest.fail("installation failure rolled back accepted promotion")
 
-    monkeypatch.setitem(promote.__globals__, "execute_release_builds", install)
+    monkeypatch.setitem(promote.__globals__, "execute_prepared_operations", install)
     monkeypatch.setattr(module["git_branches"], "_restore_release_checkout", unexpected_rollback)
     for attempt in range(2):
         if ending == "completed":
@@ -858,23 +874,34 @@ def test_json_command_preserves_bad_output_and_exit_code(tmp_path, output):
 
 def test_nested_ship_retains_outer_promotion_lock(tmp_path, monkeypatch):
     from github_pr_workflow import ship
-    repo, _, _, _ = prepare_repository_lifecycle_repo(tmp_path)
+    repo, head, _, _ = prepare_repository_lifecycle_repo(tmp_path)
+    assert run_git(repo, "switch", "main").returncode == 0
+    task = tmp_path / "task"
+    assert run_git(repo, "worktree", "add", str(task), "approved").returncode == 0
     module = runpy.run_path(str(PROMOTE_REPOSITORY))
     promote = module["promote"]
-    args = module["build_parser"]().parse_args(["--repo-root", str(repo), "--prepare-release-only"])
-    args.head_branch = "release/local"
+    args = module["build_parser"]().parse_args([
+        "--repo-root", str(task), "--source-branch", "approved", "--no-run-operation"])
+    ship_args = argparse.Namespace(repo_root=task, head_branch="release/local", repo="example/repository")
 
-    def github_body(_args):
-        _compete(repo)  # Includes the time spent waiting for CI in this body.
-        return {"status": "shipped"}
+    def github_body(*_args):
+        _compete(repo)
+        return head
 
     def promotion_body(*_args, **_kwargs):
-        assert ship.ship(args)["status"] == "shipped"
-        _compete(repo)  # Nested success cannot release the outer lock.
-        return {"status": "ready"}
+        assert ship.ship(ship_args)["status"] == "already_shipped"
+        _compete(repo)
+        return {"status": "completed", "accepted_commit": head, "results": []}
 
-    monkeypatch.setattr(ship, "_ship", github_body)
-    monkeypatch.setitem(promote.__globals__, "_promote_with_rollback", promotion_body)
+    monkeypatch.setattr(ship.merge, "restore_unfinished_checkpoints", Mock())
+    monkeypatch.setattr(ship.wait_pr_checks, "resolve_repository_name", Mock(return_value="example/repository"))
+    monkeypatch.setattr(ship, "_resolve_commit", github_body)
+    monkeypatch.setattr(ship, "load_pending_work_scope", Mock(return_value=(None, None)))
+    monkeypatch.setattr(ship, "_load_or_create_checkpoint", Mock(return_value=(
+        task / ".ship-checkpoint", {"phase": "synchronized", "pr": 24})))
+    monkeypatch.setattr(ship, "_address_review_replies", Mock(return_value=None))
+    monkeypatch.setattr(ship, "_remove_completed_pr_checkpoints", Mock(return_value=[]))
+    monkeypatch.setitem(promote.__globals__, "execute_build", promotion_body)
     assert promote(args)["status"] == "ready"
     assert workflow_command.release_lock_module().release_lock_path(repo).read_bytes() == b"0"
 
@@ -886,8 +913,7 @@ def test_non_release_sync_does_not_take_repository_wide_lock(tmp_path, monkeypat
     main_worktree, task_worktree = tmp_path / "main", tmp_path / "task"
     assert run_git(repo, "worktree", "add", str(main_worktree), "main").returncode == 0
     assert run_git(repo, "worktree", "add", "-b", "topic", str(task_worktree), "main").returncode == 0
-    args = argparse.Namespace(repo_root=task_worktree, main_branch="main", align_branch=[])
-    monkeypatch.setattr(sync, "_sync_main", lambda _args: {"status": "synced"})
+    args = argparse.Namespace(repo_root=task_worktree, main_branch="main", remote_name="origin", align_branch=[])
     # Ordinary task work does not even create a release lock.
     assert sync.sync_main(args)["status"] == "synced"
     assert not locks.release_lock_path(repo).exists()
@@ -957,11 +983,14 @@ def test_promote_repository_ship_after_promotion_composes_terminal_workflow(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repo, approved_head, log, _ = prepare_repository_lifecycle_repo(tmp_path)
+    assert run_git(repo, "switch", "main").returncode == 0
+    task = tmp_path / "task"
+    assert run_git(repo, "worktree", "add", str(task), "approved").returncode == 0
     loaded = runpy.run_path(str(PROMOTE_REPOSITORY))
     parser = loaded["build_parser"]()
     arguments = [
         "--repo-root",
-        str(repo),
+        str(task),
         "--source-branch",
         "approved",
         "--main-branch",
@@ -1141,7 +1170,7 @@ def test_promote_repository_ship_after_promotion_preserves_blocked_state(
     args = loaded["build_parser"]().parse_args(
         [
             "--repo-root",
-            str(repo),
+            str(source_worktree),
             "--source-branch",
             "approved",
             "--ship-after-promotion",
@@ -1345,9 +1374,11 @@ def test_ship_cli_and_callable_share_inputs_results_and_clean_exit(tmp_path, mon
         "evidence": {"file": "check-result.json"},
         "next_action": {"command": "ship-repository.py", "answer": "corrected source"},
     }
+    head = run_git(repo, "rev-parse", "HEAD").stdout.strip()
+    payload.update(commit=head, synchronized_head=head)
     received = []
 
-    def body(request):
+    def body(request, *_args):
         received.append(vars(request))
         _compete(repo)
         if outcome == "blocked":
@@ -1356,7 +1387,14 @@ def test_ship_cli_and_callable_share_inputs_results_and_clean_exit(tmp_path, mon
             raise ValueError(payload["message"])
         return payload
 
-    monkeypatch.setattr(module, "_ship_repository", body)
+    monkeypatch.setattr(module, "_prepare_operation_batch", Mock())
+    monkeypatch.setattr(module, "run_command_for_json", Mock(return_value=(0, {
+        "status": "ready", "pending_work_scope": "", "source_branches": []})))
+    monkeypatch.setattr(module, "_require_cleanup_safe_caller", Mock())
+    monkeypatch.setattr(module, "_validate_phase", Mock(return_value={"status": "completed", "results": []}))
+    monkeypatch.setattr(module, "_synchronized_post_merge_resume", Mock(return_value=True))
+    monkeypatch.setattr(module, "_call_github_ship", body)
+    monkeypatch.setattr(module, "_run_finalization", Mock(return_value=(0, {"status": "finalized"})))
     for _ in range(2):
         if outcome in {"blocked", "error"}:
             with pytest.raises((module.RepositoryShipError, ValueError)) as raised:
@@ -1409,3 +1447,36 @@ def test_operation_runner_reports_command_shutdown_to_release_owner(tmp_path, mo
         if unknown_stop:
             with workflow_command.release_write_context(repo, confirm_stopped=True):
                 pass
+
+
+@pytest.mark.parametrize("boundary", ["before-read", "after-read", "after-ref"])
+def test_expected_release_commit_blocks_external_changes(tmp_path, monkeypatch, boundary):
+    from unittest.mock import Mock
+    import git_branch_operations as branches
+
+    repo, task, _, release_head, _ = prepare_divergent_promotion_repo(tmp_path / "guarded")
+    target = branches.merge_release_into_task(task, release_head)
+    if boundary == "after-ref":
+        # Exactly the durable state left after update-ref and before read-tree.
+        assert run_git(repo, "update-ref", "refs/heads/release/local", target, release_head).returncode == 0
+        for _ in range(2):
+            branches.fast_forward_branch(repo, target, expected_old_commit=release_head)
+        assert run_git(repo, "status", "--porcelain").stdout == ""
+        assert run_git(repo, "rev-parse", "HEAD").stdout.strip() == target
+        return
+
+    (repo / "external.txt").write_text("another writer\n")
+    assert run_git(repo, "add", "external.txt").returncode == 0
+    assert run_git(repo, "commit", "-m", "external change").returncode == 0
+    external = run_git(repo, "rev-parse", "HEAD").stdout.strip()
+    for _ in range(2):
+        with monkeypatch.context() as patch:
+            if boundary == "after-read":
+                # Simulate another writer after the initial read. The native
+                # update-ref comparison must still reject its stale old value.
+                patch.setattr(branches, "_branch_head", Mock(side_effect=[release_head, target]))
+            with pytest.raises((branches.PromotionError, workflow_command.CommandError)):
+                branches.fast_forward_branch(repo, target, expected_old_commit=release_head)
+        assert run_git(repo, "rev-parse", "HEAD").stdout.strip() == external
+        assert (repo / "external.txt").read_text() == "another writer\n"
+        assert run_git(repo, "status", "--porcelain").stdout == ""

@@ -15,6 +15,7 @@ from contextlib import nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 
@@ -587,16 +588,16 @@ def test_direct_workflows_save_errors_at_selected_path(report_repo, monkeypatch,
         raise failure
 
     if workflow == "promote":
-        module, public, private = promote, promote.promote, "_promote_with_rollback"
+        module, public, private = promote.git_branches, promote.promote, "_primary_checkout"
         args = argparse.Namespace(repo_root=repo, diagnostic_output=path)
-        monkeypatch.setattr(promote, "_promotion_inputs", lambda _args: ())
+        monkeypatch.setattr(promote, "_promotion_inputs", lambda _args: (repo, [], False, {}))
     elif workflow == "ship":
-        module, public, private = ship_repository, ship_repository.ship_repository, "_ship_repository"
+        module, public, private = ship_repository, ship_repository.ship_repository, "_local_branch_exists"
         args = ship_repository.ShipOptions(repo_root=repo, head_branch="release/local", diagnostic_output=path)
     else:
-        module, public, private = ship, ship.ship, "_ship"
+        module, public, private = ship.merge, ship.ship, "restore_unfinished_checkpoints"
         args = argparse.Namespace(repo_root=repo, head_branch="release/local", diagnostic_output=path)
-    monkeypatch.setattr(module, "release_write_context", lambda *_args, **_kwargs: nullcontext())
+    monkeypatch.setitem(public.__globals__, "release_write_context", lambda *_args, **_kwargs: nullcontext())
     monkeypatch.setattr(module, private, fail)
     with pytest.raises(command.CommandError) as caught:
         public(args)
@@ -713,9 +714,7 @@ def test_promote_forwards_path_and_preserves_result_file(report_repo, monkeypatc
         "--repo-root", str(repo), "--source-branch", "feature", "--no-run-operation",
         "--diagnostic-output", str(path), "--result-file", str(result_path),
     ])
-    argv = promote._validation_command(args, repo, "a" * 40)
-    assert argv[argv.index("--diagnostic-output") + 1] == str(path)
-    assert argv[argv.index("--diagnostic-repo-root") + 1] == str(repo)
+    assert args.diagnostic_output == path
 
     def fail(request, **_kwargs):
         assert request.diagnostic_output == path
@@ -945,31 +944,24 @@ def test_promote_retires_check_report_before_reporting_ready(tmp_path, monkeypat
     from tests.repository_lifecycle.support import prepare_repository_lifecycle_repo
 
     repo, _, _, _ = prepare_repository_lifecycle_repo(tmp_path)
-    path = tmp_path / "tmp" / repo.name / repo.name / "_failure.json"
-    save(repo, path, {"tests.unit:1": "failed"})
-    original_json, original_clean = promote.run_command_for_json, promote.git_branches._clean
-    observed = []
+    assert run_git(repo, "switch", "main").returncode == 0
+    task = tmp_path / "task"
+    assert run_git(repo, "worktree", "add", str(task), "approved").returncode == 0
+    path = tmp_path / "tmp" / repo.name / task.name / "_failure.json"
+    save(task, path, {"tests.unit:1": "failed"})
 
-    def run(argv, cwd):
-        if str(OPERATION_RUNNER) in argv:
-            return 0, {"status": "completed", "results": [
-                {"operation": "tests.unit", "status": "completed", "steps": [1]},
-            ]}
-        return original_json(argv, cwd)
+    def run(*_args, **_kwargs):
+        return {"status": "completed",
+                "accepted_commit": run_git(task, "rev-parse", "HEAD").stdout.strip(),
+                "results": [{"operation": "tests.unit", "status": "completed", "steps": [1]}]}
 
-    def clean(root, phase):
-        if phase == "before reporting ready state":
-            observed.append(not path.exists())
-        return original_clean(root, phase)
-
-    monkeypatch.setattr(promote, "run_command_for_json", run)
-    monkeypatch.setattr(promote.git_branches, "_clean", clean)
+    monkeypatch.setattr(promote, "execute_build", run)
     args = promote.build_parser().parse_args([
-        "--repo-root", str(repo), "--source-branch", "approved", "--no-run-operation",
+        "--repo-root", str(task), "--source-branch", "approved", "--no-run-operation",
         "--diagnostic-output", str(path),
     ])
     assert promote.promote(args)["status"] == "ready"
-    assert observed == [True]
+    assert not path.exists()
 
 
 def test_ci_failure_is_retired_before_review_handoff(report_repo, monkeypatch):
@@ -997,21 +989,44 @@ def test_ci_failure_is_retired_before_review_handoff(report_repo, monkeypatch):
 @pytest.mark.parametrize("workflow", ["promote", "ship", "github-ship"])
 def test_terminal_workflow_cleans_only_its_matching_failure(report_repo, monkeypatch, workflow):
     repo, path = report_repo
+    head = run_git(repo, "rev-parse", "HEAD").stdout.strip()
     if workflow == "promote":
-        module, public, private, failure_id, status = promote, promote.promote, "_promote_with_rollback", "promote", "ready"
-        args = argparse.Namespace(repo_root=repo, diagnostic_output=path)
-        monkeypatch.setattr(promote, "_promotion_inputs", lambda _args: ())
+        public, failure_id, status = promote.promote, "promote", "ready"
+        primary = report_primary_checkout(repo)
+        assert run_git(primary, "switch", "-c", "release/local").returncode == 0
+        args = promote.build_parser().parse_args([
+            "--repo-root", str(repo), "--source-branch", "report-task", "--no-run-operation",
+            "--diagnostic-output", str(path)])
+        monkeypatch.setattr(promote, "read_repository_contract", Mock(return_value={
+            "repository": {"actions": {}}, "deliverables": {}}))
+        monkeypatch.setattr(promote, "execute_build", Mock(return_value={
+            "status": "completed", "accepted_commit": head, "results": []}))
     elif workflow == "ship":
-        module, public, private, failure_id, status = ship_repository, ship_repository.ship_repository, "_ship_repository", "ship_repository", "shipped"
-        args = ship_repository.ShipOptions(repo_root=repo, head_branch="release/local", diagnostic_output=path,
-                                            diagnostic_owner=(repo, "promote"))
+        public, failure_id, status = ship_repository.ship_repository, "ship_repository", "shipped"
+        args = ship_repository.ShipOptions(repo_root=repo, head_branch="release/local",
+            diagnostic_output=path, diagnostic_owner=(repo, "promote"))
+        monkeypatch.setattr(ship_repository, "_prepare_operation_batch", Mock())
+        monkeypatch.setattr(ship_repository, "run_command_for_json", Mock(return_value=(0, {
+            "status": "ready", "pending_work_scope": "", "source_branches": []})))
+        monkeypatch.setattr(ship_repository, "_require_cleanup_safe_caller", Mock())
+        monkeypatch.setattr(ship_repository, "_validate_phase", Mock(return_value={"status": "completed", "results": []}))
+        monkeypatch.setattr(ship_repository, "_synchronized_post_merge_resume", Mock(return_value=True))
+        monkeypatch.setattr(ship_repository, "_call_github_ship", Mock(return_value={
+            "status": status, "commit": head, "synchronized_head": head}))
+        monkeypatch.setattr(ship_repository, "_run_finalization", Mock(return_value=(0, {"status": "finalized"})))
     else:
-        module, public, private, failure_id, status = ship, ship.ship, "_ship", "github_ship", "already_shipped"
-        args = argparse.Namespace(repo_root=repo, head_branch="release/local", diagnostic_output=path,
-                                  diagnostic_owner=(repo, "promote"))
+        public, failure_id, status = ship.ship, "github_ship", "already_shipped"
+        args = argparse.Namespace(repo_root=repo, head_branch="release/local", repo="example/repository",
+            diagnostic_output=path, diagnostic_owner=(repo, "promote"))
+        monkeypatch.setattr(ship.merge, "restore_unfinished_checkpoints", Mock())
+        monkeypatch.setattr(ship.wait_pr_checks, "resolve_repository_name", Mock(return_value="example/repository"))
+        monkeypatch.setattr(ship, "_resolve_commit", Mock(return_value=head))
+        monkeypatch.setattr(ship, "load_pending_work_scope", Mock(return_value=(None, None)))
+        monkeypatch.setattr(ship, "_load_or_create_checkpoint", Mock(return_value=(
+            repo / ".git-checkpoint", {"phase": "synchronized", "pr": 24})))
+        monkeypatch.setattr(ship, "_address_review_replies", Mock(return_value=None))
+        monkeypatch.setattr(ship, "_remove_completed_pr_checkpoints", Mock(return_value=[]))
     save(repo, path, {failure_id: "previous error", "other-check": "still needed"})
-    monkeypatch.setattr(module, "release_write_context", lambda *_args, **_kwargs: nullcontext())
-    monkeypatch.setattr(module, private, lambda *_args, **_kwargs: {"status": status})
     assert public(args)["status"] == status
     assert set(json.loads(path.read_text())["failures"]) == {"other-check"}
 
@@ -1025,15 +1040,24 @@ def test_ship_report_cleanup_after_worktree_removal(report_repo, monkeypatch, re
                                      failures={"ship_repository": "earlier shipping failure"})
     original = path.read_bytes() if path.exists() else None
 
-    def finalize(_args):
+    def finalize(_args, **_kwargs):
         if repo.exists():
             assert run_git(primary, "worktree", "remove", str(repo)).returncode == 0
         if report_state == "removed" and path.parent.exists():
             shutil.rmtree(path.parent)
-        return {"status": "shipped", "report_cleanup_error": "previous cleanup warning"}
+        return 0, {"status": "finalized"}
 
     monkeypatch.setattr(ship_repository, "release_write_context", lambda *_args, **_kwargs: nullcontext())
-    monkeypatch.setattr(ship_repository, "_ship_repository", finalize)
+    head = run_git(primary, "rev-parse", "HEAD").stdout.strip()
+    monkeypatch.setattr(ship_repository, "_prepare_operation_batch", Mock())
+    monkeypatch.setattr(ship_repository, "run_command_for_json", Mock(return_value=(0, {
+        "status": "ready", "pending_work_scope": "", "source_branches": []})))
+    monkeypatch.setattr(ship_repository, "_require_cleanup_safe_caller", Mock())
+    monkeypatch.setattr(ship_repository, "_validate_phase", Mock(return_value={"status": "completed", "results": []}))
+    monkeypatch.setattr(ship_repository, "_synchronized_post_merge_resume", Mock(return_value=True))
+    monkeypatch.setattr(ship_repository, "_call_github_ship", Mock(return_value={
+        "status": "shipped", "commit": head, "synchronized_head": head}))
+    monkeypatch.setattr(ship_repository, "_run_finalization", finalize)
     args = ship_repository.ShipOptions(repo_root=primary, head_branch="release/local", diagnostic_output=path)
     for _ in range(2):
         result = ship_repository.ship_repository(args)

@@ -20,8 +20,9 @@ validation.
   installation's result, not a promotion-report binding.
 - (D) A completed installation whose manager result was retained may replace
   installation inputs with `--manager-result <file>`. The helper checks the active
-  selection and immutable receipt against that result before emitting completion
-  evidence; it never reinstalls for this recovery.
+  installation and its receipt before returning completion; it never reinstalls.
+  To report a client refresh, also pass `--client-refresh-result <file>`. Use the
+  actual reload/status responses from the initiating Codex client, as below.
 
 ## SDLC execution
 
@@ -36,6 +37,35 @@ must declare that package at the wheel's exact version. Pass the wheel and the
 package's canonical lockfile to the manager; do not pass package source as MCP
 server source. An MCP server without a package prerequisite keeps the
 source-build path.
+
+## Codex registration and client refresh
+
+The installer reads the intended profile's `$CODEX_HOME/config.toml` before
+installing. A missing file or server entry stops installation and returns the
+exact registration to add. Existing entries are corrected to enable the selected
+server's stable launcher in MCP mode while retaining unrelated settings. A failed
+read or save stops before installation. Correct entries are not rewritten.
+The manager's `versions <server-name>` response distinguishes a first install
+(`installed_version: null`) from an update; both require that registration.
+
+After installation, the returned `client_refresh.requests` identify the calls
+for the initiating Codex client's app-server: `config/mcpServer/reload`, then
+`mcpServerStatus/list` with the returned thread and server names. Use that live
+client's API; starting another app-server cannot refresh the initiating chat.
+If the refresh applies on the next turn, keep it pending until that turn.
+If the client API is unavailable, report completed installation and pending chat
+availability separately. Do not restart Codex or reinstall to finish this check.
+
+For the completion call, save the returned `client_refresh.manager_result`
+as the `--manager-result` input; this lets the same installer finish reporting
+without installing again. The caller-owned refresh JSON file contains `thread_id`
+from `CODEX_THREAD_ID`, `reload_completed` from the actual reload outcome,
+`server_status` from the status response, and `expected_tools` from the
+installed server's tool definitions. Use `deferred: true` only when the client
+reported a next-turn refresh; preserve an available `error`. The helper requires
+that same thread, initialized server capabilities and every expected tool.
+Client failure does not turn successful installation into failed installation.
+The caller removes the refresh input after consuming its result.
 
 ## Workflow
 
@@ -82,9 +112,10 @@ source-build path.
 ## Completion Gate
 
 The installed MCP server name and version match the selected source metadata or
-the explicitly requested registered release. Report reconnection separately.
+the explicitly requested registered release. Report the initiating chat's
+refreshed, pending or failed tool availability separately.
 
 ## Output Contract
 
-Report installed MCP server name and version, required reconnection, or the exact
-failure.
+Report installed MCP server name and version, pending or failed client refresh,
+or the exact installation failure.

@@ -530,7 +530,7 @@ def _closed_fields(
         raise CommandError(f"{label} fields are invalid: {detail}")
 
 
-def _address_request(path: pathlib.Path) -> dict[str, Any]:
+def _read_address_request(path: pathlib.Path) -> dict[str, Any]:
     """Load one closed prepared-reply request without implicit scope."""
 
     expanded = path.expanduser()
@@ -643,7 +643,7 @@ def address_request(
 ) -> dict[str, Any]:
     """Post prepared replies and resolve exact threads without CLI output."""
 
-    request = _address_request(request_path)
+    request = _read_address_request(request_path)
     repo = str(request["repo"])
     owner, name = repo.split("/", 1)
     pr = int(request["pr"])

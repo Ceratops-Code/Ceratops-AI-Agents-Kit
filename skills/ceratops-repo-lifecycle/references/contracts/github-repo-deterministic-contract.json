@@ -138,6 +138,23 @@
       "requests": [
         {
           "method": "GET",
+          "endpoint": "/repos/${owner}/${repo}/branches/release%2Flocal",
+          "applies_when": "repo.archived == false && repo.delete_branch_on_merge == true",
+          "covers_checks": [
+            "process.release_branch_retention"
+          ]
+        },
+        {
+          "method": "GET",
+          "endpoint": "/repos/${owner}/${repo}/rules/branches/release%2Flocal?per_page=100",
+          "applies_when": "repo.archived == false && repo.delete_branch_on_merge == true",
+          "paginate": true,
+          "covers_checks": [
+            "process.release_branch_retention"
+          ]
+        },
+        {
+          "method": "GET",
           "endpoint": "/repos/${owner}/${repo}/rules/branches/${default_branch}?per_page=100",
           "paginate": true,
           "covers_checks": [
@@ -465,13 +482,6 @@
           "when": "repo.archived == false && repo.fork == false && (repo.visibility != private || owner.plan.name != free)"
         },
         {
-          "path": "/repository/repo/delete_branch_on_merge",
-          "operator": "equal",
-          "expected": true,
-          "level": "WARN",
-          "when": "repo.archived == false && repo.fork == false"
-        },
-        {
           "path": "/repository/repo/allow_update_branch",
           "operator": "equal",
           "expected": true,
@@ -495,6 +505,20 @@
           "operator": "equal",
           "expected": false,
           "level": "WARN"
+        }
+      ],
+      "remediation_action": "repository.update_settings"
+    },
+    {
+      "id": "process.release_branch_retention",
+      "kind": "api_composite",
+      "applies_when": "repo.archived == false && repository.release_branch.exists != false && repository.release_branch.deletion_restricted != true",
+      "assertions": [
+        {
+          "path": "/repository/repo/delete_branch_on_merge",
+          "operator": "equal",
+          "expected": false,
+          "level": "ERROR"
         }
       ],
       "remediation_action": "repository.update_settings"

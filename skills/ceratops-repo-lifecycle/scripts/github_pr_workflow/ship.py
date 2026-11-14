@@ -1201,237 +1201,235 @@ def ship(args: argparse.Namespace) -> dict[str, Any]:
         failure_id="github_ship",
     ):
         report_phase("github_ship", enabled=getattr(args, "diagnostic_output", None) is not None)
-        result = _ship(args)
-        if result.get("status") in {"shipped", "already_shipped"}:
-            remove_resolved_failures(
-                result, diagnostic_output=getattr(args, "diagnostic_output", None),
-                repo_root=owner_root, action=action, resolved_failures=("github_ship",),
-            )
-        return result
-
-
-def _ship(args: argparse.Namespace) -> dict[str, Any]:
-    """Advance one exact commit through PR publication, gates, merge, and sync."""
-
-    repo_root = args.repo_root.expanduser().resolve(strict=True)
-    if not repo_root.is_dir():
-        raise ShipError(f"Repository root is not a directory: {repo_root}")
-    args.repo_root = repo_root
-    merge.restore_unfinished_checkpoints(repo_root)
-    repository = wait_pr_checks.resolve_repository_name(repo_root, args.repo)
-    commit = _resolve_commit(args, repo_root, repository)
-    pending_work_identity, pending_work_scope = load_pending_work_scope(
-        args,
-        repo_root,
-        commit,
-        ShipError,
-    )
-    checkpoint_path, state = _load_or_create_checkpoint(
-        args,
-        repo_root,
-        repository,
-        commit,
-        pending_work_identity,
-    )
-    changes: list[str] = []
-    availability_checked = False
-
-    if not _phase_at_least(state, "pr_ready"):
-        _enforce_actions_availability(repository, commit)
-        availability_checked = True
-
-        if pending_work_scope is not None:
-            findings = _pending_work_findings(repo_root, pending_work_scope)
-            if findings:
-                return {
-                    "status": "pending_work",
-                    "phase": "prepared",
-                    "repository": repository,
-                    "commit": commit,
-                    "remote_mutation": False,
-                    "findings": findings,
-                }
-        pr_result = ensure_pr.ensure_pr(
-            argparse.Namespace(
-                repo_root=repo_root,
-                head_branch=args.head_branch,
-                base_branch=args.base_branch,
-                remote_name=args.remote_name,
-                title=args.title,
-                body=args.body,
-            )
-        )
-        state.update(
-            {
-                "phase": "pr_ready",
-                "pr": pr_result.get("pr"),
-                "url": pr_result.get("url"),
-            }
-        )
-        _write_checkpoint(checkpoint_path, state)
-        changes.append("pr_ready")
-
-    pr = str(state["pr"])
-    if not _phase_at_least(state, "merged"):
-        live = _live_pr(repo_root, repository, pr)
-        if live.get("headRefOid") != commit:
-            raise ShipError("Live PR no longer points at the checkpointed commit.")
-        if live.get("state") == "MERGED":
-            merge_commit = live.get("mergeCommit")
-            state.update(
-                {
-                    "phase": "merged",
-                    "merged_at": live.get("mergedAt"),
-                    "merge_commit": (
-                        merge_commit.get("oid")
-                        if isinstance(merge_commit, dict)
-                        else None
-                    ),
-                }
-            )
-            _write_checkpoint(checkpoint_path, state)
-            changes.append("merged_reconciled")
-        elif live.get("state") != "OPEN":
-            raise ShipError(f"Live PR state is {live.get('state')!r}, not OPEN.")
-
-    if not _phase_at_least(state, "merged") and not availability_checked:
-        _enforce_actions_availability(repository, commit)
-
-    had_review_handoff = state.get("review_replies") is not None
-    review_replies = _address_review_replies(
-        args,
-        state=state,
-        checkpoint_path=checkpoint_path,
-        repo_root=repo_root,
-        repository=repository,
-        pr=pr,
-        commit=commit,
-    )
-    if review_replies is not None and not had_review_handoff:
-        changes.append("review_replies_addressed")
-
-    if not _phase_at_least(state, "merged"):
-        gate_result: dict[str, Any]
-        if not _phase_at_least(state, "gates_passed"):
-            run_parallel_gates(
+        completed_result = None
+        try:
+            repo_root = args.repo_root.expanduser().resolve(strict=True)
+            if not repo_root.is_dir():
+                raise ShipError(f"Repository root is not a directory: {repo_root}")
+            args.repo_root = repo_root
+            merge.restore_unfinished_checkpoints(repo_root)
+            repository = wait_pr_checks.resolve_repository_name(repo_root, args.repo)
+            commit = _resolve_commit(args, repo_root, repository)
+            pending_work_identity, pending_work_scope = load_pending_work_scope(
                 args,
-                pr,
-                repository,
-                commit,
-                ci_wait_seconds=args.ci_wait_seconds,
-                review_wait_seconds=args.review_wait_seconds,
-            )
-            # The two waits can finish at different times. Re-read both gates
-            # immediately before recording permission to merge.
-            gate_result = run_parallel_gates(
-                args,
-                pr,
-                repository,
-                commit,
-                ci_wait_seconds=0,
-                review_wait_seconds=0,
-            )
-            state.update(
-                {
-                    "phase": "gates_passed",
-                    "gate_disposition": gate_result["disposition"],
-                }
-            )
-            _write_checkpoint(checkpoint_path, state)
-            changes.append("gates_passed")
-        else:
-            gate_result = run_parallel_gates(
-                args,
-                pr,
-                repository,
-                commit,
-                ci_wait_seconds=0,
-                review_wait_seconds=0,
-            )
-            if state.get("gate_disposition") != gate_result["disposition"]:
-                state["gate_disposition"] = gate_result["disposition"]
-                _write_checkpoint(checkpoint_path, state)
-                changes.append("gate_disposition")
-
-        merge_result = merge.merge_verified_pr(
-            argparse.Namespace(
-                pr=pr,
-                repo_root=repo_root,
-                repo=repository,
-                merge_method=args.merge_method,
-                admin=True,
-                auto=False,
-                delete_branch=args.delete_branch,
-                wait_seconds=0,
-                interval_seconds=args.interval_seconds,
-            ),
-            expected_head=commit,
-            readiness_summary=gate_result["ci"],
-            recover_checkpoints=False,
-        )
-        if merge_result.get("status") != "merged":
-            raise ShipError("Ship requires a verified immediate merge result.")
-        state.update(
-            {
-                "phase": "merged",
-                "merged_at": merge_result.get("merged_at"),
-                "merge_commit": merge_result.get("merge_commit"),
-            }
-        )
-        _write_checkpoint(checkpoint_path, state)
-        changes.append("merged")
-
-    if not _phase_at_least(state, "synchronized"):
-        sync_result = sync.sync_main(
-            argparse.Namespace(
-                repo_root=repo_root,
-                main_branch=args.base_branch,
-                remote_name=args.remote_name,
-                align_branch=[args.head_branch] if args.reusable_head else [],
-            )
-        )
-        branch_result: dict[str, Any] | None = None
-        if args.reusable_head:
-            branch_result = restore_reusable_branch(
                 repo_root,
-                remote_name=args.remote_name,
-                branch=args.head_branch,
-                shipped_commit=commit,
-                synchronized_head=str(sync_result["head"]),
+                commit,
+                ShipError,
             )
-            if branch_result["status"] in {"restored", "aligned"}:
-                changes.append(f"reusable_branch_{branch_result['status']}")
-        state.update(
-            {
-                "phase": "synchronized",
-                "synchronized_head": sync_result.get("head"),
-                "reusable_branch": branch_result,
+            checkpoint_path, state = _load_or_create_checkpoint(
+                args,
+                repo_root,
+                repository,
+                commit,
+                pending_work_identity,
+            )
+            changes: list[str] = []
+            availability_checked = False
+
+            if not _phase_at_least(state, "pr_ready"):
+                _enforce_actions_availability(repository, commit)
+                availability_checked = True
+
+                if pending_work_scope is not None:
+                    findings = _pending_work_findings(repo_root, pending_work_scope)
+                    if findings:
+                        completed_result = {
+                            "status": "pending_work",
+                            "phase": "prepared",
+                            "repository": repository,
+                            "commit": commit,
+                            "remote_mutation": False,
+                            "findings": findings,
+                        }
+                        return completed_result
+                pr_result = ensure_pr.ensure_pr(
+                    argparse.Namespace(
+                        repo_root=repo_root,
+                        head_branch=args.head_branch,
+                        base_branch=args.base_branch,
+                        remote_name=args.remote_name,
+                        title=args.title,
+                        body=args.body,
+                    )
+                )
+                state.update(
+                    {
+                        "phase": "pr_ready",
+                        "pr": pr_result.get("pr"),
+                        "url": pr_result.get("url"),
+                    }
+                )
+                _write_checkpoint(checkpoint_path, state)
+                changes.append("pr_ready")
+
+            pr = str(state["pr"])
+            if not _phase_at_least(state, "merged"):
+                live = _live_pr(repo_root, repository, pr)
+                if live.get("headRefOid") != commit:
+                    raise ShipError("Live PR no longer points at the checkpointed commit.")
+                if live.get("state") == "MERGED":
+                    merge_commit = live.get("mergeCommit")
+                    state.update(
+                        {
+                            "phase": "merged",
+                            "merged_at": live.get("mergedAt"),
+                            "merge_commit": (
+                                merge_commit.get("oid")
+                                if isinstance(merge_commit, dict)
+                                else None
+                            ),
+                        }
+                    )
+                    _write_checkpoint(checkpoint_path, state)
+                    changes.append("merged_reconciled")
+                elif live.get("state") != "OPEN":
+                    raise ShipError(f"Live PR state is {live.get('state')!r}, not OPEN.")
+
+            if not _phase_at_least(state, "merged") and not availability_checked:
+                _enforce_actions_availability(repository, commit)
+
+            had_review_handoff = state.get("review_replies") is not None
+            review_replies = _address_review_replies(
+                args,
+                state=state,
+                checkpoint_path=checkpoint_path,
+                repo_root=repo_root,
+                repository=repository,
+                pr=pr,
+                commit=commit,
+            )
+            if review_replies is not None and not had_review_handoff:
+                changes.append("review_replies_addressed")
+
+            if not _phase_at_least(state, "merged"):
+                gate_result: dict[str, Any]
+                if not _phase_at_least(state, "gates_passed"):
+                    run_parallel_gates(
+                        args,
+                        pr,
+                        repository,
+                        commit,
+                        ci_wait_seconds=args.ci_wait_seconds,
+                        review_wait_seconds=args.review_wait_seconds,
+                    )
+                    # The two waits can finish at different times. Re-read both gates
+                    # immediately before recording permission to merge.
+                    gate_result = run_parallel_gates(
+                        args,
+                        pr,
+                        repository,
+                        commit,
+                        ci_wait_seconds=0,
+                        review_wait_seconds=0,
+                    )
+                    state.update(
+                        {
+                            "phase": "gates_passed",
+                            "gate_disposition": gate_result["disposition"],
+                        }
+                    )
+                    _write_checkpoint(checkpoint_path, state)
+                    changes.append("gates_passed")
+                else:
+                    gate_result = run_parallel_gates(
+                        args,
+                        pr,
+                        repository,
+                        commit,
+                        ci_wait_seconds=0,
+                        review_wait_seconds=0,
+                    )
+                    if state.get("gate_disposition") != gate_result["disposition"]:
+                        state["gate_disposition"] = gate_result["disposition"]
+                        _write_checkpoint(checkpoint_path, state)
+                        changes.append("gate_disposition")
+
+                merge_result = merge.merge_verified_pr(
+                    argparse.Namespace(
+                        pr=pr,
+                        repo_root=repo_root,
+                        repo=repository,
+                        merge_method=args.merge_method,
+                        admin=True,
+                        auto=False,
+                        delete_branch=args.delete_branch,
+                        wait_seconds=0,
+                        interval_seconds=args.interval_seconds,
+                    ),
+                    expected_head=commit,
+                    readiness_summary=gate_result["ci"],
+                    recover_checkpoints=False,
+                )
+                if merge_result.get("status") != "merged":
+                    raise ShipError("Ship requires a verified immediate merge result.")
+                state.update(
+                    {
+                        "phase": "merged",
+                        "merged_at": merge_result.get("merged_at"),
+                        "merge_commit": merge_result.get("merge_commit"),
+                    }
+                )
+                _write_checkpoint(checkpoint_path, state)
+                changes.append("merged")
+
+            if not _phase_at_least(state, "synchronized"):
+                sync_result = sync.sync_main(
+                    argparse.Namespace(
+                        repo_root=repo_root,
+                        main_branch=args.base_branch,
+                        remote_name=args.remote_name,
+                        align_branch=[args.head_branch] if args.reusable_head else [],
+                    )
+                )
+                branch_result: dict[str, Any] | None = None
+                if args.reusable_head:
+                    branch_result = restore_reusable_branch(
+                        repo_root,
+                        remote_name=args.remote_name,
+                        branch=args.head_branch,
+                        shipped_commit=commit,
+                        synchronized_head=str(sync_result["head"]),
+                    )
+                    if branch_result["status"] in {"restored", "aligned"}:
+                        changes.append(f"reusable_branch_{branch_result['status']}")
+                state.update(
+                    {
+                        "phase": "synchronized",
+                        "synchronized_head": sync_result.get("head"),
+                        "reusable_branch": branch_result,
+                    }
+                )
+                _write_checkpoint(checkpoint_path, state)
+                changes.append("synchronized")
+
+            completed_pr = state.get("pr")
+            if not isinstance(completed_pr, (int, str)):
+                raise ShipError("Synchronized ship state is missing its PR identity.")
+            removed_checkpoints = _remove_completed_pr_checkpoints(
+                checkpoint_path,
+                repository,
+                completed_pr,
+            )
+
+            completed_result = {
+                "status": "shipped" if changes else "already_shipped",
+                "phase": state["phase"],
+                "repository": repository,
+                "commit": commit,
+                "pr": state.get("pr"),
+                "url": state.get("url"),
+                "gate_disposition": state.get("gate_disposition", "reconciled"),
+                "authorization_required": False,
+                "merge_commit": state.get("merge_commit"),
+                "synchronized_head": state.get("synchronized_head"),
+                "removed_checkpoints": removed_checkpoints,
+                "review_replies": review_replies,
+                "changes": changes,
             }
-        )
-        _write_checkpoint(checkpoint_path, state)
-        changes.append("synchronized")
-
-    completed_pr = state.get("pr")
-    if not isinstance(completed_pr, (int, str)):
-        raise ShipError("Synchronized ship state is missing its PR identity.")
-    removed_checkpoints = _remove_completed_pr_checkpoints(
-        checkpoint_path,
-        repository,
-        completed_pr,
-    )
-
-    return {
-        "status": "shipped" if changes else "already_shipped",
-        "phase": state["phase"],
-        "repository": repository,
-        "commit": commit,
-        "pr": state.get("pr"),
-        "url": state.get("url"),
-        "gate_disposition": state.get("gate_disposition", "reconciled"),
-        "authorization_required": False,
-        "merge_commit": state.get("merge_commit"),
-        "synchronized_head": state.get("synchronized_head"),
-        "removed_checkpoints": removed_checkpoints,
-        "review_replies": review_replies,
-        "changes": changes,
-    }
+            return completed_result
+        finally:
+            if completed_result is not None and completed_result.get("status") in {"shipped", "already_shipped"}:
+                remove_resolved_failures(
+                    completed_result, diagnostic_output=getattr(args, "diagnostic_output", None),
+                    repo_root=owner_root, action=action, resolved_failures=("github_ship",),
+                )

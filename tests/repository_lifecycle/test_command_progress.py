@@ -211,6 +211,9 @@ def test_promotion_streams_real_pytest_progress_through_every_parent(
     })
     assert run_git(repo, "add", ".").returncode == 0
     assert run_git(repo, "commit", "-m", "add live test fixture").returncode == 0
+    assert run_git(repo, "switch", "main").returncode == 0
+    task = tmp_path / "task"
+    assert run_git(repo, "worktree", "add", str(task), "approved").returncode == 0
     environment.pop("PYTEST_ADDOPTS", None)
     environment["PROGRESS_TEST_GATE"] = str(gate)
     observations: list[bool] = []
@@ -227,10 +230,10 @@ def test_promotion_streams_real_pytest_progress_through_every_parent(
         context.setattr(sys, "stderr", sink)
         result = commands.run_progress_command(
             [
-                sys.executable, str(PROMOTE_REPOSITORY), "--repo-root", str(repo),
+                sys.executable, str(PROMOTE_REPOSITORY), "--repo-root", str(task),
                 "--source-branch", "approved", "--no-run-operation",
             ],
-            cwd=repo, env=environment,
+            cwd=task, env=environment,
         )
     error_result = "\n".join(
         line for line in result.stderr.splitlines() if not line.startswith("[tests] ")

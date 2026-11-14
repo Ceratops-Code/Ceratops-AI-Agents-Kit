@@ -25,7 +25,7 @@ from tests.support.repositories import run_git
 retention = importlib.import_module("retain_artifact_versions")
 results = importlib.import_module("sdlc_results")
 storage = importlib.import_module("store_artifacts")
-runner = importlib.import_module("repository_operation")
+completion = importlib.import_module("complete_artifact_builds")
 
 
 @pytest.fixture
@@ -68,7 +68,7 @@ def _version(base, version, *, installed=False, generation=None, status="complet
 
 
 def _run(scope, **kwargs):
-    return retention.retain_artifact_versions(scope, file_use=lambda _path: None, protection=nullcontext, **kwargs)
+    return retention.retain_artifact_versions(scope, protection=nullcontext, **kwargs)
 
 
 def test_beta_stable_slots_follow_successful_order_not_version_or_time(accepted):
@@ -109,7 +109,7 @@ def test_copy_preserves_receipts_results_dependencies_and_reader_paths(accepted)
     case, base, scope = accepted
     result = storage.retain_completed_artifacts(
         case["repository"], unit=scope.unit, target=scope.target, pool=scope.pool,
-        approved=base, file_use=lambda _path: None,
+        approved=base,
     )
     assert result.deferred == {}
     root = result.paths[base.version]
@@ -130,13 +130,19 @@ def test_new_approved_version_does_not_evict_two_deployed_versions(accepted):
     first, second = [_version(base, v, installed=True) for v in ("1.0.0b1", "1.0.0")]
     old, new = [_version(base, v) for v in ("2.0.0b1", "2.0.0b2")]
     initial = _run(scope, approved=old, deployments=[first, second])
-    result = _run(scope, approved=new, deployments=[first, second])
+    result = _run(scope, approved=new)
     assert result.deferred == {}
     assert set(result.paths) == {first.version, second.version, new.version}
     assert initial.paths[old.version] in result.removed
     assert not initial.paths[old.version].exists()
     saved = json.loads(scope.record.read_text())
     assert set(saved["copies"]) == set(result.paths)
+    assert saved["deployed"] == [second.version, first.version]
+    pending = scope.record.with_name(f".{scope.record.name}.in-process")
+    pending.write_text("{")
+    again = _run(scope, approved=new)
+    assert set(again.paths) == set(result.paths) and not again.removed
+    assert not pending.exists()
 
 
 def test_repeated_retention_neither_rewrites_accepted_files_nor_calls_checks(accepted, monkeypatch):
@@ -151,30 +157,23 @@ def test_repeated_retention_neither_rewrites_accepted_files_nor_calls_checks(acc
     assert not second.removed
 
 
-@pytest.mark.parametrize("problem", ["live", "unknown", "foreign", "ownership", "changed"])
-def test_candidate_deletion_preserves_live_foreign_and_uncertain_files(accepted, problem):
+@pytest.mark.parametrize("problem", ["foreign", "ownership", "changed"])
+def test_obsolete_directory_cleanup_does_not_require_ownership_records(accepted, problem):
     _case, base, scope = accepted
     root = _run(scope, approved=base).paths[base.version]
     next_version = _version(base, "3.0.0b1")
     if problem == "foreign":
-        (root / "user-data.txt").write_text("must remain")
+        (root / "extra-build-output.txt").write_text("obsolete output")
     elif problem == "ownership":
-        owner = json.loads((root / retention.OWNER_FILE).read_text())
+        owner = json.loads((root / retention.INVENTORY_FILE).read_text())
         owner["scope"]["unit"] = "another-unit"
-        (root / retention.OWNER_FILE).write_text(json.dumps(owner))
+        (root / retention.INVENTORY_FILE).write_text(json.dumps(owner))
     elif problem == "changed":
         (root / ".build_receipt.json").write_text("different data")
-    file_use = (lambda path: "test still running" if path == root else None) if problem == "live" else (lambda _path: None)
-    if problem == "unknown":
-        file_use = lambda path: "liveness unavailable" if path == root else None
-    result = retention.retain_artifact_versions(scope, approved=next_version, file_use=file_use, protection=nullcontext)
-    assert root.exists()
-    assert result.deferred
+    result = retention.retain_artifact_versions(scope, approved=next_version, protection=nullcontext)
+    assert not root.exists()
+    assert not result.deferred
     assert next_version.version in result.paths
-    if problem in {"live", "unknown"}:
-        finished = _run(scope, approved=next_version)
-        assert not finished.deferred
-        assert not root.exists()
 
 
 def test_failed_copy_never_replaces_successful_choice(accepted):
@@ -297,9 +296,6 @@ def test_retained_permissions_survive_copy_repair_and_interruption(
         assert not _run(scope, **selection).deferred
         set_mode(target, 0o644)
         before = target.stat().st_mtime_ns
-        blocked = retention.retain_artifact_versions(
-            scope, protection=nullcontext, file_use=lambda _path: "file is running", **selection)
-        assert blocked.deferred and mode(target) == 0o644
 
     def interrupted(original, destination, **kwargs):
         if destination == target and timing == "before":
@@ -325,19 +321,23 @@ def test_retained_permissions_survive_copy_repair_and_interruption(
     assert target.stat().st_mtime_ns == before
 
 
-@pytest.mark.parametrize("effect", ["copy", "owner", "selection", "delete"])
+@pytest.mark.parametrize("effect", ["copy", "owner", "selection", "record-replace", "delete"])
 @pytest.mark.parametrize("timing", ["before", "after"])
 def test_repeat_after_copy_record_selection_or_delete_interruption(accepted, monkeypatch, effect, timing):
     _case, base, scope = accepted
     initial = _run(scope, approved=base)
     newer = _version(base, "5.0.0b1")
-    name = {"copy": "_copy_file", "owner": "_write_record", "selection": "_write_record", "delete": "_remove_copy"}[effect]
-    original = getattr(retention, name)
+    owner = retention.os if effect == "record-replace" else retention
+    name = {"copy": "_copy_file", "owner": "_write_record", "selection": "_write_record",
+            "record-replace": "replace", "delete": "_remove_copy"}[effect]
+    original = getattr(owner, name)
     stopped = False
 
     def interrupted(*args, **kwargs):
         nonlocal stopped
-        selected_effect = effect not in {"owner", "selection"} or (args[0].name == retention.OWNER_FILE if effect == "owner" else args[0] == scope.record)
+        selected_effect = (args[1] == scope.record if effect == "record-replace" else
+                           effect not in {"owner", "selection"} or
+                           (args[0].name == retention.INVENTORY_FILE if effect == "owner" else args[0] == scope.record))
         should_stop = selected_effect and not stopped
         if should_stop and timing == "before":
             stopped = True
@@ -349,9 +349,10 @@ def test_repeat_after_copy_record_selection_or_delete_interruption(accepted, mon
         return result
 
     with monkeypatch.context() as context:
-        context.setattr(retention, name, interrupted)
+        context.setattr(owner, name, interrupted)
         with pytest.raises(StopAttempt):
             _run(scope, approved=newer)
+    assert isinstance(json.loads(scope.record.read_text()), dict)
     again = _run(scope, approved=newer)
     assert not again.deferred
     assert again.paths[newer.version].exists()
@@ -408,22 +409,27 @@ def test_short_cleanup_protection_does_not_cover_copying(accepted, monkeypatch):
         assert not protected
         return original_copy(*args, **kwargs)
 
-    def write(path, record):
+    def write(path, record, **kwargs):
         if path == scope.record:
-            assert protected
-        return original_write(path, record)
+            assert protected and kwargs.get("atomic") is True
+        return original_write(path, record, **kwargs)
 
     monkeypatch.setattr(retention, "_copy_file", copy)
     monkeypatch.setattr(retention, "_write_record", write)
-    result = retention.retain_artifact_versions(scope, approved=base, file_use=lambda _path: None, protection=protection)
+    result = retention.retain_artifact_versions(scope, approved=base, protection=protection)
     assert not result.deferred and not protected
 
 
-def test_no_file_use_information_defers_writes_and_deletion(accepted):
+def test_retention_rotates_without_file_usage_information(accepted):
     _case, base, scope = accepted
     result = retention.retain_artifact_versions(scope, approved=base, protection=nullcontext)
-    assert result.deferred
-    assert not scope.record.exists()
+    assert not result.deferred
+    old = result.paths[base.version]
+    newer = _version(base, "3.0.0b1")
+    rotated = retention.retain_artifact_versions(scope, approved=newer, protection=nullcontext)
+    assert not rotated.deferred and not old.exists()
+    repeated = retention.retain_artifact_versions(scope, approved=newer, protection=nullcontext)
+    assert not repeated.deferred and repeated.paths == rotated.paths
 
 
 def test_failed_installation_does_not_advance_recorded_destination(accepted, tmp_path):
@@ -440,7 +446,7 @@ def test_failed_installation_does_not_advance_recorded_destination(accepted, tmp
 
 def _original_version(base, scope, version):
     value = _version(base, version)
-    root = scope.group / version
+    root = scope.group / version / scope.target
     shutil.copytree(base.build.receipt_path.parent, root)
     (root / "artifact-receipt.json").write_bytes(value.build.artifact_receipt.raw)
     return replace(value, build=replace(value.build, receipt_path=root / "artifact-receipt.json"))
@@ -460,23 +466,32 @@ def test_latest_worktree_build_never_replaces_another_worktrees_build(accepted):
     assert not alpha.build.receipt_path.exists()
     assert other.build.receipt_path.exists() and newer.build.receipt_path.exists()
     assert json.loads(second.record.read_text())["selected"] == [other.version]
+    assert first.group == first.root / "worktrees" / "first" / first.unit
+    release = replace(first, worktree="release-local")
+    release_build = _original_version(base, release, "4.0.0b1")
+    assert not _run(release, approved=release_build).deferred
+    newest = _original_version(base, first, "2.0.0a3")
+    assert not _run(first, approved=newest).deferred
+    assert other.build.receipt_path.exists() and release_build.build.receipt_path.exists()
 
 
 def test_worktree_retirement_requires_completed_release_and_available_copy(accepted):
     case, base, shared = accepted
-    original = replace(shared, pool="worktree", worktree="producer")
-    assert not _run(original, approved=base).deferred
+    original = replace(shared, pool="worktree", worktree="primary")
+    local = _run(original, approved=base)
+    assert not local.deferred
     kept = _run(shared, approved=base).paths[base.version]
     replacement = replace(base, build=replace(base.build, receipt_path=kept / "artifact-receipt.json"))
-    args = {"unit": shared.unit, "target": shared.target, "pool": "worktree", "worktree": "producer",
-            "approved": base, "release_replacement": replacement, "file_use": lambda _path: None}
+    args = {"unit": shared.unit, "target": shared.target, "pool": "worktree", "worktree": "primary",
+            "approved": base, "release_replacement": replacement}
     assert run_git(case["repository"], "branch", "release/local", case["build"]["preTestCommit"]).returncode == 0
     with pytest.raises(storage.OperationError, match="Release does not select"):
         storage.retain_completed_artifacts(case["repository"], **args)
     assert base.build.receipt_path.exists()
     assert run_git(case["repository"], "branch", "-f", "release/local", base.build.final_commit).returncode == 0
     removed = storage.retain_completed_artifacts(case["repository"], **args)
-    assert not removed.deferred and not base.build.receipt_path.exists()
+    assert not removed.deferred and not local.paths[base.version].exists()
+    assert base.build.receipt_path.exists()
     assert replacement.build.receipt_path.exists()
     selected = results.read_artifact_receipt_chain(
         case["repository"], tag=case["tag"], expected=_artifact_identity_selection(case),
@@ -488,8 +503,9 @@ def test_worktree_retirement_requires_completed_release_and_available_copy(accep
 
 def test_incomplete_release_copy_keeps_worktree_output(accepted):
     _case, base, shared = accepted
-    original = replace(shared, pool="worktree", worktree="producer")
-    assert not _run(original, approved=base).deferred
+    original = replace(shared, pool="worktree", worktree="primary")
+    local = _run(original, approved=base)
+    assert not local.deferred
     kept = _run(shared, approved=base).paths[base.version]
     replacement = replace(base, build=replace(base.build, receipt_path=kept / "artifact-receipt.json"))
     (kept / ".build_receipt.json").unlink()
@@ -526,7 +542,7 @@ def test_repeat_after_final_deletion_effects(accepted, monkeypatch, effect, timi
     old = _run(scope, approved=base).paths[base.version]
     new = _version(base, "8.0.0b1")
     name = "unlink" if effect == "marker" else "rmdir"
-    target = old / retention.OWNER_FILE if effect == "marker" else old
+    target = old / retention.INVENTORY_FILE if effect == "marker" else old
     operation = getattr(pathlib.Path, name)
     stopped = False
 
@@ -574,12 +590,12 @@ def test_incomplete_copy_is_repaired_from_accepted_bytes(accepted, monkeypatch):
     assert reread.recorded_acceptance == base.build.recorded_acceptance
 
 
-def test_malformed_selection_keeps_files_and_explains_missing_information(accepted):
+def test_cleanup_uses_directory_contents_when_old_report_is_malformed(accepted):
     _case, base, scope = accepted
     root = _run(scope, approved=base).paths[base.version]
     scope.record.write_text("{")
     result = _run(scope, approved=_version(base, "9.0.0b1"))
-    assert result.deferred and root.exists()
+    assert not result.deferred and not root.exists()
 
 
 def test_missing_approval_cannot_discard_previous_accepted_copy(accepted):
@@ -592,7 +608,7 @@ def test_missing_approval_cannot_discard_previous_accepted_copy(accepted):
 
 def test_completed_multi_target_reader_uses_retained_packages_after_original_removal(tmp_path):
     repo, _commit, transaction, prepared, _receipts = _prepared_versioned_completion(tmp_path)
-    completed = runner.complete_versioned_build(transaction, prepared)
+    completed = completion.complete_versioned_artifacts(transaction, prepared)
     assert run_git(repo, "branch", "release/local", completed.final_commit).returncode == 0
     kept = {}
     for target in transaction.required_targets:
@@ -601,29 +617,29 @@ def test_completed_multi_target_reader_uses_retained_packages_after_original_rem
             "version": transaction.version, "target": target,
         })
         value = retention.RetentionVersion(selected)
-        arguments = {"unit": transaction.release_bundle, "target": target, "approved": value,
-                     "file_use": lambda _path: None}
-        assert not storage.retain_completed_artifacts(repo, pool="worktree", worktree="producer", **arguments).deferred
+        arguments = {"unit": transaction.release_bundle, "target": target, "approved": value}
+        assert not storage.retain_completed_artifacts(repo, pool="worktree", worktree="primary", **arguments).deferred
         copied = storage.retain_completed_artifacts(repo, pool="beta-stable", **arguments)
         assert not copied.deferred
         kept[target] = copied.paths[value.version] / "artifact-receipt.json"
         replacement = replace(value, build=replace(selected, receipt_path=kept[target]))
         removed = storage.retain_completed_artifacts(
-            repo, pool="worktree", worktree="producer", release_replacement=replacement, **arguments,
+            repo, pool="worktree", worktree="primary", release_replacement=replacement, **arguments,
         )
         assert not removed.deferred and not selected.receipt_path.exists()
-    repeated = runner.read_versioned_build(
+    repeated = completion.read_artifact_build(
         repo, repository=transaction.repository, release_bundle=transaction.release_bundle,
         version=transaction.version, required_targets=transaction.required_targets,
     )
     assert {target: repeated.artifact_receipt(target) for target in transaction.required_targets} == kept
-    assert runner.complete_versioned_build(repeated).artifact_receipts == tuple(kept.values())
+    assert completion.complete_versioned_artifacts(repeated).artifact_receipts == tuple(kept.values())
 
 
 def test_changed_original_is_preserved_instead_of_copying_it_onto_itself(accepted):
     _case, base, scope = accepted
     original = replace(scope, pool="worktree", worktree="producer")
-    path = base.build.artifacts[0]
+    base = _original_version(base, original, base.version)
+    path = base.build.receipt_path.parent / base.build.build_receipt.value["artifacts"][0]["path"]
     path.write_bytes(b"damaged but still useful for diagnosis")
     result = _run(original, approved=base)
     assert result.deferred and "Original accepted file" in str(result.deferred)

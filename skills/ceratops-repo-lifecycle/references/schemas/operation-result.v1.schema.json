@@ -14,12 +14,6 @@
       "$ref": "#/$defs/testGroupResult"
     },
     {
-      "$ref": "#/$defs/buildResult"
-    },
-    {
-      "$ref": "#/$defs/buildReceipt"
-    },
-    {
       "$ref": "#/$defs/committedBuildReceipt"
     },
     {
@@ -30,17 +24,19 @@
     },
     {
       "$ref": "#/$defs/repositoryCheckResult"
+    },
+    {
+      "$ref": "#/$defs/builderOutput"
     }
   ],
   "$defs": {
     "schemaIdentifier": {
       "enum": [
         "ceratops-repository-stage-result.v1",
-        "ceratops-build-result.v1",
-        "ceratops-build-result.v2",
-        "ceratops-build-result.v3",
+        "ceratops-build-result.v4",
         "ceratops-artifact-receipt.v1",
-        "ceratops-deployment-result.v1"
+        "ceratops-deployment-result.v1",
+        "ceratops-builder-output"
       ]
     },
     "sha256": {
@@ -351,7 +347,7 @@
       "properties": {
         "type": {
           "type": "string",
-          "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"
+          "pattern": "^[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*$"
         },
         "path": {
           "$ref": "#/$defs/relativePath"
@@ -362,327 +358,6 @@
         "size": {
           "type": "integer",
           "minimum": 1
-        }
-      }
-    },
-    "buildResult": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "schema",
-        "status",
-        "artifact"
-      ],
-      "properties": {
-        "schema": {
-          "const": "ceratops-build-result.v1"
-        },
-        "status": {
-          "$ref": "#/$defs/terminalStatus"
-        },
-        "artifact": {
-          "oneOf": [
-            {
-              "$ref": "#/$defs/artifact"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "check_summary": {
-          "type": "object"
-        }
-      },
-      "allOf": [
-        {
-          "if": {
-            "properties": {
-              "status": {
-                "const": "passed"
-              }
-            },
-            "required": [
-              "status"
-            ]
-          },
-          "then": {
-            "properties": {
-              "artifact": {
-                "$ref": "#/$defs/artifact"
-              }
-            }
-          }
-        }
-      ]
-    },
-    "buildSelection": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "repository",
-        "sourceCommit",
-        "releaseBundle",
-        "channel",
-        "version",
-        "target"
-      ],
-      "properties": {
-        "repository": {
-          "type": "string",
-          "minLength": 1,
-          "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
-        },
-        "sourceCommit": {
-          "$ref": "#/$defs/gitCommit"
-        },
-        "releaseBundle": {
-          "type": "string",
-          "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"
-        },
-        "channel": {
-          "enum": [
-            "alpha",
-            "beta",
-            "release"
-          ]
-        },
-        "version": {
-          "type": "string",
-          "minLength": 1,
-          "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
-        },
-        "target": {
-          "type": "string",
-          "minLength": 1,
-          "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
-        }
-      }
-    },
-    "bundlePath": {
-      "type": "string",
-      "minLength": 1,
-      "pattern": "^[^\\\\:\\u0000-\\u001f\\u007f]+$",
-      "not": {
-        "anyOf": [
-          {
-            "pattern": "^/"
-          },
-          {
-            "pattern": "(^|/)\\.{1,2}(/|$)"
-          },
-          {
-            "pattern": "//|/$"
-          }
-        ]
-      }
-    },
-    "bundleFile": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "type",
-        "path",
-        "sha256",
-        "size"
-      ],
-      "properties": {
-        "type": {
-          "type": "string",
-          "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"
-        },
-        "path": {
-          "$ref": "#/$defs/bundlePath"
-        },
-        "sha256": {
-          "$ref": "#/$defs/sha256"
-        },
-        "size": {
-          "type": "integer",
-          "minimum": 0
-        }
-      }
-    },
-    "buildArtifact": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "deliverable",
-        "type",
-        "path",
-        "sha256",
-        "size"
-      ],
-      "properties": {
-        "deliverable": {
-          "type": "string",
-          "pattern": "^deliverables\\.(packages|apps|mcp-servers|skills|hooks)\\.[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"
-        },
-        "type": {
-          "type": "string",
-          "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"
-        },
-        "path": {
-          "$ref": "#/$defs/bundlePath"
-        },
-        "sha256": {
-          "$ref": "#/$defs/sha256"
-        },
-        "size": {
-          "type": "integer",
-          "minimum": 0
-        }
-      }
-    },
-    "buildFileReference": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "path",
-        "sha256"
-      ],
-      "properties": {
-        "path": {
-          "$ref": "#/$defs/bundlePath"
-        },
-        "sha256": {
-          "$ref": "#/$defs/sha256"
-        }
-      }
-    },
-    "buildDependency": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "identity",
-        "artifacts"
-      ],
-      "properties": {
-        "identity": {
-          "$ref": "#/$defs/buildSelection"
-        },
-        "artifacts": {
-          "type": "array",
-          "minItems": 1,
-          "items": {
-            "$ref": "#/$defs/buildArtifact"
-          }
-        }
-      }
-    },
-    "buildTest": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "id",
-        "status",
-        "artifacts",
-        "evidence"
-      ],
-      "properties": {
-        "id": {
-          "type": "string",
-          "minLength": 1,
-          "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
-        },
-        "status": {
-          "enum": [
-            "passed",
-            "failed",
-            "blocked",
-            "skipped"
-          ]
-        },
-        "artifacts": {
-          "type": "array",
-          "minItems": 1,
-          "items": {
-            "$ref": "#/$defs/buildFileReference"
-          }
-        },
-        "evidence": {
-          "oneOf": [
-            {
-              "$ref": "#/$defs/buildFileReference"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        }
-      },
-      "allOf": [
-        {
-          "if": {
-            "properties": {
-              "status": {
-                "enum": [
-                  "passed",
-                  "failed"
-                ]
-              }
-            },
-            "required": [
-              "status"
-            ]
-          },
-          "then": {
-            "properties": {
-              "evidence": {
-                "$ref": "#/$defs/buildFileReference"
-              }
-            }
-          }
-        }
-      ]
-    },
-    "buildReceipt": {
-      "description": "A release-bundle build inventory. Verification establishes file integrity only; build/test statuses remain producer claims and never authorize deployment.",
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "schema",
-        "status",
-        "identity",
-        "artifacts",
-        "dependencies",
-        "supportingFiles",
-        "tests"
-      ],
-      "properties": {
-        "schema": {
-          "const": "ceratops-build-result.v2"
-        },
-        "status": {
-          "$ref": "#/$defs/terminalStatus"
-        },
-        "identity": {
-          "$ref": "#/$defs/buildSelection"
-        },
-        "artifacts": {
-          "type": "array",
-          "minItems": 1,
-          "items": {
-            "$ref": "#/$defs/buildArtifact"
-          }
-        },
-        "dependencies": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/buildDependency"
-          }
-        },
-        "supportingFiles": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/bundleFile"
-          }
-        },
-        "tests": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/buildTest"
-          }
         }
       }
     },
@@ -725,7 +400,6 @@
       "additionalProperties": false,
       "required": [
         "repository",
-        "releaseBundle",
         "version",
         "target",
         "attemptId"
@@ -736,7 +410,7 @@
         },
         "releaseBundle": {
           "type": "string",
-          "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"
+          "pattern": "^[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*$"
         },
         "version": {
           "$ref": "#/$defs/receiptVersion"
@@ -746,8 +420,34 @@
         },
         "attemptId": {
           "$ref": "#/$defs/receiptLogicalIdentifier"
+        },
+        "storageKey": {
+          "type": "string",
+          "pattern": "^(?:members/[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*/[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*|bundles/[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*)$"
         }
-      }
+      },
+      "oneOf": [
+        {
+          "required": [
+            "releaseBundle"
+          ],
+          "not": {
+            "required": [
+              "storageKey"
+            ]
+          }
+        },
+        {
+          "required": [
+            "storageKey"
+          ],
+          "not": {
+            "required": [
+              "releaseBundle"
+            ]
+          }
+        }
+      ]
     },
     "acceptanceIdentity": {
       "type": "object",
@@ -761,7 +461,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 256,
-          "pattern": "^[a-z][a-z0-9-]*(?:\\.[a-z][a-z0-9-]*)+$"
+          "pattern": "^[a-z][a-z0-9_-]*(?:\\.[a-z][a-z0-9_-]*)+$"
         },
         "id": {
           "$ref": "#/$defs/receiptLogicalIdentifier"
@@ -785,7 +485,7 @@
           ]
         },
         "path": {
-          "$ref": "#/$defs/bundlePath"
+          "$ref": "#/$defs/receiptRelativePath"
         },
         "size": {
           "type": "integer",
@@ -817,7 +517,7 @@
           ]
         },
         "path": {
-          "$ref": "#/$defs/bundlePath"
+          "$ref": "#/$defs/receiptRelativePath"
         },
         "size": {
           "type": "integer",
@@ -841,7 +541,7 @@
       "properties": {
         "type": {
           "type": "string",
-          "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"
+          "pattern": "^[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*$"
         },
         "root": {
           "enum": [
@@ -850,7 +550,7 @@
           ]
         },
         "path": {
-          "$ref": "#/$defs/bundlePath"
+          "$ref": "#/$defs/receiptRelativePath"
         },
         "size": {
           "type": "integer",
@@ -877,7 +577,7 @@
           ]
         },
         "path": {
-          "$ref": "#/$defs/bundlePath"
+          "$ref": "#/$defs/receiptRelativePath"
         },
         "sha256": {
           "$ref": "#/$defs/sha256"
@@ -900,7 +600,7 @@
         }
       }
     },
-    "portableReceiptContext": {
+    "platformAndTools": {
       "type": "object",
       "additionalProperties": false,
       "required": [
@@ -1034,12 +734,11 @@
         }
       }
     },
-    "buildDependencyV3": {
+    "receiptBuildDependency": {
       "type": "object",
       "additionalProperties": false,
       "required": [
         "repository",
-        "releaseBundle",
         "version",
         "target",
         "acceptanceId",
@@ -1051,7 +750,7 @@
         },
         "releaseBundle": {
           "type": "string",
-          "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"
+          "pattern": "^[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*$"
         },
         "version": {
           "$ref": "#/$defs/receiptVersion"
@@ -1068,143 +767,44 @@
           "items": {
             "$ref": "#/$defs/receiptArtifact"
           }
+        },
+        "storageKey": {
+          "type": "string",
+          "pattern": "^(?:members/[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*/[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*|bundles/[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*)$"
         }
-      }
+      },
+      "oneOf": [
+        {
+          "required": [
+            "releaseBundle"
+          ],
+          "not": {
+            "required": [
+              "storageKey"
+            ]
+          }
+        },
+        {
+          "required": [
+            "storageKey"
+          ],
+          "not": {
+            "required": [
+              "releaseBundle"
+            ]
+          }
+        }
+      ]
     },
     "committedBuildReceipt": {
-      "description": "A successful target qualification prepared before the final receipt-only commit. It deliberately omits its own hash and the not-yet-created final commit.",
-      "type": "object",
-      "additionalProperties": false,
-      "dependentRequired": {
-        "tag": [
-          "checkSummary"
-        ],
-        "checkSummary": [
-          "tag"
-        ]
-      },
-      "required": [
-        "schema",
-        "status",
-        "identity",
-        "requiredTargets",
-        "preTestCommit",
-        "acceptance",
-        "receiptPath",
-        "artifactInputs",
-        "checkInputs",
-        "dependencies",
-        "artifacts",
-        "installationArtifact",
-        "portableContext",
-        "requiredChecks",
-        "sourceChecks",
-        "artifactTests",
-        "supportingFiles",
-        "committedResultPaths"
-      ],
-      "properties": {
-        "schema": {
-          "const": "ceratops-build-result.v3"
+      "oneOf": [
+        {
+          "$ref": "#/$defs/memberBuildReceipt"
         },
-        "status": {
-          "const": "passed"
-        },
-        "identity": {
-          "$ref": "#/$defs/receiptIdentity"
-        },
-        "requiredTargets": {
-          "type": "array",
-          "minItems": 1,
-          "uniqueItems": true,
-          "items": {
-            "$ref": "#/$defs/receiptLogicalIdentifier"
-          }
-        },
-        "preTestCommit": {
-          "$ref": "#/$defs/gitCommit"
-        },
-        "acceptance": {
-          "$ref": "#/$defs/acceptanceIdentity"
-        },
-        "receiptPath": {
-          "$ref": "#/$defs/bundlePath"
-        },
-        "tag": {
-          "type": "string",
-          "minLength": 1
-        },
-        "checkSummary": {
-          "$ref": "#/$defs/receiptFile"
-        },
-        "artifactInputs": {
-          "type": "array",
-          "minItems": 1,
-          "items": {
-            "$ref": "#/$defs/receiptNamedFile"
-          }
-        },
-        "checkInputs": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/receiptNamedFile"
-          }
-        },
-        "dependencies": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/buildDependencyV3"
-          }
-        },
-        "artifacts": {
-          "type": "array",
-          "minItems": 1,
-          "items": {
-            "$ref": "#/$defs/receiptArtifact"
-          }
-        },
-        "installationArtifact": {
-          "$ref": "#/$defs/receiptFileReference"
-        },
-        "portableContext": {
-          "$ref": "#/$defs/portableReceiptContext"
-        },
-        "requiredChecks": {
-          "type": "array",
-          "minItems": 1,
-          "items": {
-            "$ref": "#/$defs/requiredReceiptCheck"
-          }
-        },
-        "sourceChecks": {
-          "type": "array",
-          "minItems": 1,
-          "items": {
-            "$ref": "#/$defs/sourceCheckResult"
-          }
-        },
-        "artifactTests": {
-          "type": "array",
-          "minItems": 1,
-          "items": {
-            "$ref": "#/$defs/artifactTestResult"
-          }
-        },
-        "supportingFiles": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/receiptArtifact"
-          }
-        },
-        "committedResultPaths": {
-          "type": "array",
-          "minItems": 1,
-          "uniqueItems": true,
-          "items": {
-            "$ref": "#/$defs/bundlePath"
-          }
+        {
+          "$ref": "#/$defs/bundleBuildReceipt"
         }
-      }
+      ]
     },
     "artifactReceipt": {
       "description": "The immutable-store link from retained artifact locations to one final commit and the exact committed build-receipt bytes.",
@@ -1240,10 +840,10 @@
         },
         "artifactPaths": {
           "type": "array",
-          "minItems": 1,
+          "minItems": 0,
           "uniqueItems": true,
           "items": {
-            "$ref": "#/$defs/bundlePath"
+            "$ref": "#/$defs/receiptRelativePath"
           }
         }
       }
@@ -1659,6 +1259,450 @@
           }
         }
       ]
+    },
+    "commandsAndSettings": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation",
+        "steps",
+        "parameters",
+        "environment"
+      ],
+      "properties": {
+        "operation": {
+          "type": "string",
+          "pattern": "^deliverables\\.[a-z-]+\\.[a-z0-9-]+\\.actions\\.build$"
+        },
+        "steps": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "parameters": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "environment": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/sha256"
+          }
+        }
+      }
+    },
+    "memberBuildReceipt": {
+      "description": "A successful target qualification prepared before the final receipt-only commit. It deliberately omits its own hash and the not-yet-created final commit.",
+      "type": "object",
+      "additionalProperties": false,
+      "dependentRequired": {
+        "tag": [
+          "checkSummary"
+        ],
+        "checkSummary": [
+          "tag"
+        ]
+      },
+      "required": [
+        "schema",
+        "status",
+        "identity",
+        "requiredTargets",
+        "preTestCommit",
+        "acceptance",
+        "receiptPath",
+        "artifactInputs",
+        "checkInputs",
+        "dependencies",
+        "artifacts",
+        "installationArtifactPath",
+        "platformAndTools",
+        "requiredChecks",
+        "sourceChecks",
+        "artifactTests",
+        "supportingFiles",
+        "committedResultPaths",
+        "commandsAndSettings"
+      ],
+      "properties": {
+        "schema": {
+          "const": "ceratops-build-result.v4"
+        },
+        "status": {
+          "const": "passed"
+        },
+        "identity": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/receiptIdentity"
+            },
+            {
+              "properties": {
+                "storageKey": {
+                  "pattern": "^members/[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*/[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*$"
+                }
+              }
+            }
+          ]
+        },
+        "requiredTargets": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/receiptLogicalIdentifier"
+          }
+        },
+        "preTestCommit": {
+          "$ref": "#/$defs/gitCommit"
+        },
+        "acceptance": {
+          "$ref": "#/$defs/acceptanceIdentity"
+        },
+        "receiptPath": {
+          "$ref": "#/$defs/receiptRelativePath"
+        },
+        "tag": {
+          "type": "string",
+          "minLength": 1
+        },
+        "checkSummary": {
+          "$ref": "#/$defs/receiptFile"
+        },
+        "artifactInputs": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/receiptNamedFile"
+          }
+        },
+        "checkInputs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/receiptNamedFile"
+          }
+        },
+        "dependencies": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/receiptBuildDependency"
+          }
+        },
+        "artifacts": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/receiptArtifact"
+          }
+        },
+        "platformAndTools": {
+          "$ref": "#/$defs/platformAndTools"
+        },
+        "requiredChecks": {
+          "type": "array",
+          "minItems": 0,
+          "items": {
+            "$ref": "#/$defs/requiredReceiptCheck"
+          }
+        },
+        "sourceChecks": {
+          "type": "array",
+          "minItems": 0,
+          "items": {
+            "$ref": "#/$defs/sourceCheckResult"
+          }
+        },
+        "artifactTests": {
+          "type": "array",
+          "minItems": 0,
+          "items": {
+            "$ref": "#/$defs/artifactTestResult"
+          }
+        },
+        "supportingFiles": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/receiptArtifact"
+          }
+        },
+        "committedResultPaths": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/receiptRelativePath"
+          }
+        },
+        "installationArtifactPath": {
+          "$ref": "#/$defs/receiptRelativePath"
+        },
+        "commandsAndSettings": {
+          "$ref": "#/$defs/commandsAndSettings"
+        }
+      }
+    },
+    "bundleMember": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "deliverable",
+        "identity",
+        "tag",
+        "buildReceipt",
+        "artifacts",
+        "dependencies"
+      ],
+      "properties": {
+        "deliverable": {
+          "type": "string",
+          "pattern": "^deliverables\\.[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*\\.[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*$"
+        },
+        "identity": {
+          "$ref": "#/$defs/receiptIdentity"
+        },
+        "tag": {
+          "type": "string",
+          "minLength": 1
+        },
+        "buildReceipt": {
+          "$ref": "#/$defs/receiptFile"
+        },
+        "artifacts": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/receiptArtifact"
+          }
+        },
+        "dependencies": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/receiptBuildDependency"
+          }
+        }
+      }
+    },
+    "bundleBuildReceipt": {
+      "description": "A completed composition of exact independently versioned members and their combined checks.",
+      "type": "object",
+      "additionalProperties": false,
+      "dependentRequired": {
+        "tag": [
+          "checkSummary"
+        ],
+        "checkSummary": [
+          "tag"
+        ]
+      },
+      "required": [
+        "schema",
+        "status",
+        "identity",
+        "requiredTargets",
+        "preTestCommit",
+        "acceptance",
+        "receiptPath",
+        "artifactInputs",
+        "checkInputs",
+        "dependencies",
+        "artifacts",
+        "requiredChecks",
+        "sourceChecks",
+        "artifactTests",
+        "supportingFiles",
+        "committedResultPaths",
+        "members"
+      ],
+      "properties": {
+        "schema": {
+          "const": "ceratops-build-result.v4"
+        },
+        "status": {
+          "const": "passed"
+        },
+        "identity": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/receiptIdentity"
+            },
+            {
+              "required": [
+                "storageKey"
+              ],
+              "properties": {
+                "storageKey": {
+                  "pattern": "^bundles/[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*$"
+                }
+              }
+            }
+          ]
+        },
+        "requiredTargets": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/receiptLogicalIdentifier"
+          }
+        },
+        "preTestCommit": {
+          "$ref": "#/$defs/gitCommit"
+        },
+        "acceptance": {
+          "$ref": "#/$defs/acceptanceIdentity"
+        },
+        "receiptPath": {
+          "$ref": "#/$defs/receiptRelativePath"
+        },
+        "tag": {
+          "type": "string",
+          "minLength": 1
+        },
+        "checkSummary": {
+          "$ref": "#/$defs/receiptFile"
+        },
+        "artifactInputs": {
+          "type": "array",
+          "minItems": 0,
+          "items": {
+            "$ref": "#/$defs/receiptNamedFile"
+          }
+        },
+        "checkInputs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/receiptNamedFile"
+          }
+        },
+        "dependencies": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/receiptBuildDependency"
+          }
+        },
+        "artifacts": {
+          "type": "array",
+          "minItems": 0,
+          "items": {
+            "$ref": "#/$defs/receiptArtifact"
+          }
+        },
+        "requiredChecks": {
+          "type": "array",
+          "minItems": 0,
+          "items": {
+            "$ref": "#/$defs/requiredReceiptCheck"
+          }
+        },
+        "sourceChecks": {
+          "type": "array",
+          "minItems": 0,
+          "items": {
+            "$ref": "#/$defs/sourceCheckResult"
+          }
+        },
+        "artifactTests": {
+          "type": "array",
+          "minItems": 0,
+          "items": {
+            "$ref": "#/$defs/artifactTestResult"
+          }
+        },
+        "supportingFiles": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/receiptArtifact"
+          }
+        },
+        "committedResultPaths": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/receiptRelativePath"
+          }
+        },
+        "members": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/bundleMember"
+          }
+        }
+      }
+    },
+    "builderOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "status",
+        "artifacts",
+        "installationArtifactPath"
+      ],
+      "properties": {
+        "schema": {
+          "const": "ceratops-builder-output"
+        },
+        "status": {
+          "enum": [
+            "passed",
+            "failed"
+          ]
+        },
+        "artifacts": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "type",
+              "path"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "minLength": 1
+              },
+              "path": {
+                "$ref": "#/$defs/relativePath"
+              },
+              "deliverable": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        },
+        "installationArtifactPath": {
+          "$ref": "#/$defs/relativePath"
+        },
+        "check_summary": {
+          "type": "object"
+        }
+      }
+    },
+    "receiptRelativePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[^\\\\:\\u0000-\\u001f\\u007f]+$",
+      "not": {
+        "anyOf": [
+          {
+            "pattern": "^/"
+          },
+          {
+            "pattern": "(^|/)\\.{1,2}(/|$)"
+          },
+          {
+            "pattern": "//|/$"
+          }
+        ]
+      }
     }
   }
 }

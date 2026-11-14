@@ -19,13 +19,16 @@ from tests.support.repositories import run_git
 
 
 @pytest.mark.parametrize("main_state", ["remote-advanced", "missing", "other-worktree", "offline"])
-@pytest.mark.parametrize("initial_branch", ["approved", "release/local"])
+@pytest.mark.parametrize("initial_branch", ["parked", "release/local"])
 def test_existing_release_promotes_without_refreshing_main(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
     main_state: str, initial_branch: str,
 ) -> None:
     repo, approved_head, _log, _environment = prepare_repository_lifecycle_repo(tmp_path)
     main_head = run_git(repo, "rev-parse", "main").stdout.strip()
+    assert run_git(repo, "switch", "-c", "parked", "main").returncode == 0
+    task = tmp_path / "task"
+    assert run_git(repo, "worktree", "add", str(task), "approved").returncode == 0
     assert run_git(repo, "branch", "release/local", "main").returncode == 0
     main_worktree = tmp_path / "main-worktree"
     if main_state == "remote-advanced":
@@ -50,13 +53,13 @@ def test_existing_release_promotes_without_refreshing_main(
 
     monkeypatch.setattr(branches, "_git", track_git)
     args = loaded["build_parser"]().parse_args([
-        "--repo-root", str(repo), "--source-branch", "approved", "--no-run-operation",
+        "--repo-root", str(task), "--source-branch", "approved", "--no-run-operation",
     ])
     for _ in range(2):
         result = loaded["promote"](args)
         assert result["status"] == "ready"
         assert result["head"] == approved_head
-        assert result["rebased_branches"] == []
+        assert run_git(task, "rev-parse", "HEAD").stdout.strip() == approved_head
         assert run_git(repo, "branch", "--show-current").stdout.strip() == "release/local"
         assert run_git(repo, "status", "--porcelain").stdout == ""
         if main_state == "missing":
@@ -70,27 +73,33 @@ def test_existing_release_promotes_without_refreshing_main(
 
 
 @pytest.mark.parametrize("effect", [
-    "existing-switch", "existing-merge", "existing-missing-main",
-    "new-fetch", "new-switch", "new-main-merge", "new-release",
+    "existing-switch", "existing-advance", "existing-missing-main",
+    "new-fetch", "new-switch", "new-main-advance", "new-release",
 ])
 @pytest.mark.parametrize("after", [False, True])
-def test_release_preparation_retries_interrupted_effects(
+def test_promotion_repeats_interrupted_git_effects(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, effect: str, after: bool,
 ) -> None:
     repo, approved_head, _log, _environment = prepare_repository_lifecycle_repo(tmp_path)
     main_head = run_git(repo, "rev-parse", "main").stdout.strip()
+    assert run_git(repo, "switch", "-c", "parked", "main").returncode == 0
+    task = tmp_path / "task"
+    assert run_git(repo, "worktree", "add", str(task), "approved").returncode == 0
     existing = effect.startswith("existing-")
     if existing:
         assert run_git(repo, "branch", "release/local", "main").returncode == 0
     if effect == "existing-missing-main":
         assert run_git(repo, "branch", "-D", "main").returncode == 0
+    if effect == "new-main-advance":
+        assert run_git(repo, "push", "origin", "approved:main").returncode == 0
+    advance = ("update-ref", "-m", "ceratops: accepted fast-forward")
     commands = {
         "existing-switch": ("switch", "release/local"),
-        "existing-merge": ("merge", "--ff-only", "approved"),
-        "existing-missing-main": ("merge", "--ff-only", "approved"),
+        "existing-advance": (*advance, "refs/heads/release/local", approved_head, main_head),
+        "existing-missing-main": (*advance, "refs/heads/release/local", approved_head, main_head),
         "new-fetch": ("fetch", "--prune", "origin"),
         "new-switch": ("switch", "main"),
-        "new-main-merge": ("merge", "--ff-only", "origin/main"),
+        "new-main-advance": (*advance, "refs/heads/main", approved_head, main_head),
         "new-release": ("switch", "-c", "release/local", "main"),
     }
     loaded = runpy.run_path(str(PROMOTE_REPOSITORY))
@@ -108,29 +117,33 @@ def test_release_preparation_retries_interrupted_effects(
         return original_run(command, **kwargs)
 
     monkeypatch.setattr(branches, "require_success", interrupt)
-    # Fetch is owned by the promotion workflow; branch effects by its Git adapter.
     monkeypatch.setitem(loaded["promote"].__globals__, "require_success", interrupt)
     args = loaded["build_parser"]().parse_args([
-        "--repo-root", str(repo), "--source-branch", "approved", "--no-run-operation",
+        "--repo-root", str(task), "--source-branch", "approved", "--no-run-operation",
     ])
     with pytest.raises(loaded["PromotionError"], match="interrupted Git effect"):
         loaded["promote"](args)
     assert not armed
-    assert run_git(repo, "branch", "--show-current").stdout.strip() == "approved"
-    assert run_git(repo, "rev-parse", "HEAD").stdout.strip() == approved_head
-    assert run_git(repo, "status", "--porcelain").stdout == ""
+    assert run_git(task, "branch", "--show-current").stdout.strip() == "approved"
+    assert run_git(task, "rev-parse", "HEAD").stdout.strip() == approved_head
+    assert run_git(task, "status", "--porcelain").stdout == ""
     if effect == "existing-missing-main":
         assert run_git(repo, "show-ref", "--verify", "refs/heads/main").returncode != 0
     else:
         assert run_git(repo, "rev-parse", "main").stdout.strip() == main_head
     release = run_git(repo, "rev-parse", "--verify", "refs/heads/release/local")
-    assert release.stdout.strip() == main_head if existing else release.returncode != 0
+    if existing:
+        expected = approved_head if after and effect != "existing-switch" else main_head
+        assert release.stdout.strip() == expected
+    else:
+        assert release.returncode != 0
     for _ in range(2):
         result = loaded["promote"](args)
         assert result["status"] == "ready"
         assert result["head"] == approved_head
         assert run_git(repo, "branch", "--show-current").stdout.strip() == "release/local"
         assert run_git(repo, "status", "--porcelain").stdout == ""
+        assert run_git(task, "rev-parse", "HEAD").stdout.strip() == approved_head
 
 
 @pytest.mark.parametrize(
@@ -209,6 +222,9 @@ def test_promote_repository_requires_an_explicit_deployment_choice(
         managed_skills=managed_skills,
         handoff=declared_handoff,
     )
+    assert run_git(repo, "switch", "main").returncode == 0
+    task = tmp_path / "task"
+    assert run_git(repo, "worktree", "add", str(task), "approved").returncode == 0
     release_start = run_git(repo, "rev-parse", "main").stdout.strip()
     task_temp = repo.parent / "tmp" / repo.name / "non-json-deployment"
     task_temp.mkdir(parents=True)
@@ -221,7 +237,7 @@ def test_promote_repository_requires_an_explicit_deployment_choice(
             "--result-file",
             str(result_file),
             "--repo-root",
-            str(repo),
+            str(task),
             "--source-branch",
             "approved",
             *operation_arguments,
@@ -466,12 +482,15 @@ def test_promote_and_deploy_does_not_inject_base_revision(
         tmp_path,
         managed_skills=True,
     )
+    assert run_git(repo, "switch", "main").returncode == 0
+    task = tmp_path / "task"
+    assert run_git(repo, "worktree", "add", str(task), "approved").returncode == 0
     first = subprocess.run(
         [
             sys.executable,
             str(PROMOTE_REPOSITORY),
             "--repo-root",
-            str(repo),
+            str(task),
             "--source-branch",
             "approved",
             "--no-run-operation",
@@ -484,11 +503,7 @@ def test_promote_and_deploy_does_not_inject_base_revision(
     assert first.returncode == 0, first.stderr
     assert not log.exists()
 
-    retained_worktree = tmp_path / "approved-retained"
-    assert (
-        run_git(repo, "worktree", "add", str(retained_worktree), "approved").returncode
-        == 0
-    )
+    retained_worktree = task
     retained_file = retained_worktree / "uncommitted.txt"
     retained_file.write_text("preserve me\n", encoding="utf-8", newline="\n")
 
@@ -503,12 +518,15 @@ def test_promote_and_deploy_does_not_inject_base_revision(
     )
     assert run_git(repo, "add", "README.md").returncode == 0
     assert run_git(repo, "commit", "-m", "approved second change").returncode == 0
+    assert run_git(repo, "switch", "release/local").returncode == 0
+    second_task = tmp_path / "second-task"
+    assert run_git(repo, "worktree", "add", str(second_task), "approved-second").returncode == 0
     second = subprocess.run(
         [
             sys.executable,
             str(PROMOTE_REPOSITORY),
             "--repo-root",
-            str(repo),
+            str(second_task),
             "--source-branch",
             "approved-second",
             "--run-operation",
@@ -559,20 +577,20 @@ def test_promote_and_deploy_does_not_inject_base_revision(
     assert retained_file.read_text(encoding="utf-8") == "preserve me\n"
     assert log.read_text(encoding="utf-8") == "no-base\n"
 
-    divergent = tmp_path / "automatic-rebase-success"
+    divergent = tmp_path / "divergent-promotion"
     (
-        rebase_repo,
+        merge_repo,
         source_worktree,
         source_head,
         release_head,
-        rebase_environment,
+        merge_environment,
     ) = prepare_divergent_promotion_repo(divergent)
-    rebased = subprocess.run(
+    promoted = subprocess.run(
         [
             sys.executable,
             str(PROMOTE_REPOSITORY),
             "--repo-root",
-            str(rebase_repo),
+            str(source_worktree),
             "--source-branch",
             "approved",
             "--no-run-operation",
@@ -580,25 +598,18 @@ def test_promote_and_deploy_does_not_inject_base_revision(
         capture_output=True,
         text=True,
         check=False,
-        env=rebase_environment,
+        env=merge_environment,
     )
 
-    assert rebased.returncode == 0, rebased.stderr
-    rebase_result = json.loads(rebased.stdout)
+    assert promoted.returncode == 0, promoted.stderr
+    merge_result = json.loads(promoted.stdout)
     new_source_head = run_git(source_worktree, "rev-parse", "HEAD").stdout.strip()
     assert new_source_head != source_head
-    assert rebase_result["head"] == new_source_head
-    assert rebase_result["rebased_branches"] == [
-        {
-            "branch": "approved",
-            "old_head": source_head,
-            "new_head": new_source_head,
-            "onto": release_head,
-        }
-    ]
+    assert merge_result["head"] == new_source_head
+    assert run_git(source_worktree, "merge-base", "--is-ancestor", source_head, new_source_head).returncode == 0
     assert (
         run_git(
-            rebase_repo,
+            merge_repo,
             "merge-base",
             "--is-ancestor",
             release_head,
@@ -628,12 +639,15 @@ def test_promote_and_deploy_rejects_operation_created_repository_work(
     assert run_git(repo, "add", "deploy-probe.py").returncode == 0
     assert run_git(repo, "commit", "-m", "create deploy output").returncode == 0
 
+    assert run_git(repo, "switch", "main").returncode == 0
+    task = tmp_path / "task"
+    assert run_git(repo, "worktree", "add", str(task), "approved").returncode == 0
     promoted = subprocess.run(
         [
             sys.executable,
             str(PROMOTE_REPOSITORY),
             "--repo-root",
-            str(repo),
+            str(task),
             "--source-branch",
             "approved",
             "--run-operation",

@@ -54,10 +54,9 @@
           "description": "Required structured stdout from the final run step. The repository operation runner validates the complete object and requires a passed terminal status.",
           "enum": [
             "ceratops-repository-stage-result.v1",
-            "ceratops-build-result.v1",
-            "ceratops-build-result.v2",
-            "ceratops-build-result.v3",
-            "ceratops-deployment-result.v1"
+            "ceratops-build-result.v4",
+            "ceratops-deployment-result.v1",
+            "ceratops-builder-output"
           ]
         },
         "steps": {
@@ -380,10 +379,9 @@
           "description": "Required structured stdout from the final run step. The repository operation runner validates the complete object and requires a passed terminal status.",
           "enum": [
             "ceratops-repository-stage-result.v1",
-            "ceratops-build-result.v1",
-            "ceratops-build-result.v2",
-            "ceratops-build-result.v3",
-            "ceratops-deployment-result.v1"
+            "ceratops-build-result.v4",
+            "ceratops-deployment-result.v1",
+            "ceratops-builder-output"
           ]
         },
         "steps": {
@@ -400,6 +398,12 @@
         },
         "uses-artifacts": {
           "$ref": "#/$defs/buildAfter"
+        },
+        "environment-variables": {
+          "description": "Environment variables whose values affect the builder output; receipts retain fingerprints only.",
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
         },
         "checks": {
           "description": "Checks executed and reported by this builder, without additional commands.",

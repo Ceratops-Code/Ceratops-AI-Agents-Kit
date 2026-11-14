@@ -1,17 +1,13 @@
-"""Exercise retained source through installers, review packets and interruptions."""
+"""Exercise Git source identity through installers, comparisons and interruptions."""
 
 from __future__ import annotations
 
-import hashlib
-import io
 import json
 import os
 import pathlib
 import runpy
 import subprocess
 import sys
-import zipfile
-from contextlib import contextmanager
 
 import pytest
 
@@ -59,13 +55,17 @@ def packet_call(repo, installed, output, *, cleanup=False):
 
 @pytest.mark.parametrize("entrypoint", [BOOTSTRAP, INSTALLER_TEMPLATE, BUILDER, RUNTIME_INSTALLER],
                          ids=["repository-bootstrap", "compatible-bootstrap", "builder", "managed"])
-@pytest.mark.parametrize("dirty", [False, True], ids=["commit", "working-tree"])
-def test_public_installers_retain_exact_source_after_checkout_disappears(tmp_path, entrypoint, dirty):
-    repo = source_repo(tmp_path)
-    commit = run_git(repo, "rev-parse", "HEAD").stdout.strip()
+@pytest.mark.parametrize("state", ["clean", "dirty", "untracked", "non-git"])
+def test_public_installers_record_git_source_without_archives(tmp_path, entrypoint, state):
+    repo = source_repo(tmp_path, committed=state != "non-git")
+    commit = run_git(repo, "rev-parse", "HEAD").stdout.strip() if state != "non-git" else None
     source = repo / "skills/alpha-tool/SKILL.md"
-    if dirty:
-        source.write_bytes(source.read_bytes() + b"\nLocal changes belong to this install.\n")
+    if state == "dirty":
+        source.write_bytes(source.read_bytes() + b"\nLocal source change.\n")
+    elif state == "untracked":
+        added = repo / "skills/alpha-tool/references/new.md"
+        added.parent.mkdir(exist_ok=True)
+        added.write_text("new source", encoding="utf-8")
     expected = source.read_bytes()
     destination = tmp_path / "profile/skills"
     command = [sys.executable, str(entrypoint), "--repo-root", str(repo),
@@ -76,74 +76,56 @@ def test_public_installers_retain_exact_source_after_checkout_disappears(tmp_pat
     installed = destination / "alpha-tool"
     metadata = owner(installed)
     assert metadata["source_repository_root"] == str(repo)
-    assert metadata["source_commit"] == commit
-    record = metadata["source_snapshot"]
-    assert record["dirty"] is dirty
-    archive = installed / record["archive"]
-    assert hashlib.sha256(archive.read_bytes()).hexdigest() == record["sha256"]
-    with zipfile.ZipFile(archive) as retained:
-        assert retained.read("skills/alpha-tool/SKILL.md") == expected
-    assert len(list(installed.glob(".source-*.zip"))) == 1
-    repo.rename(tmp_path / "retired-source")
+    assert metadata["source_commit"] == (commit if state == "clean" else None)
+    assert "source_snapshot" not in metadata
+    assert not list(tmp_path.rglob(".source-*.zip"))
+    assert not (destination.parent / "artifacts").exists()
     output = tmp_path / "packet.json"
     result = packet_call(repo, installed, output)
-    assert result.returncode == 0, result.stderr
-    packet = json.loads(output.read_text(encoding="utf-8"))
-    assert packet["identity"]["source_resolution"] == "retained_archive"
-    selected = pathlib.Path(packet["identity"]["source_repository_root"])
-    assert (selected / "skills/alpha-tool/SKILL.md").read_bytes() == expected
-    for _ in range(2):
-        assert packet_call(repo, installed, output, cleanup=True).returncode == 0
-    assert not output.exists()
-    assert not selected.exists()
+    if state != "clean":
+        assert result.returncode == 2 and "no recorded clean Git commit" in result.stderr
+        assert not output.exists()
+    else:
+        assert result.returncode == 0, result.stderr
+        packet = json.loads(output.read_text(encoding="utf-8"))
+        assert packet["identity"]["source_resolution"] == "git_commit"
+        selected = pathlib.Path(packet["identity"]["source_repository_root"])
+        assert (selected / "skills/alpha-tool/SKILL.md").read_bytes() == expected
+        assert not list(selected.parent.glob("*.zip"))
+        for _ in range(2):
+            assert packet_call(repo, installed, output, cleanup=True).returncode == 0
+        assert not output.exists() and not selected.exists()
+        repo.rename(tmp_path / "retired-source")
+        result = packet_call(repo, installed, output)
+        assert result.returncode == 2
+        assert not output.exists()
 
 
 @pytest.mark.parametrize("entrypoint", [BOOTSTRAP, INSTALLER_TEMPLATE, BUILDER, RUNTIME_INSTALLER],
                          ids=["repository-bootstrap", "compatible-bootstrap", "builder", "managed"])
-def test_public_installers_render_checkout_instead_of_deployment_copy(tmp_path, monkeypatch, entrypoint):
-    """A deployment-only source copy cannot become a skill build input."""
+def test_public_installers_render_checkout_without_source_copy(tmp_path, monkeypatch, entrypoint):
     repo = source_repo(tmp_path, committed=False)
     destination = tmp_path / "profile/skills"
     module = (load_runtime_installer() if entrypoint == RUNTIME_INSTALLER else
               load_runtime_builder() if entrypoint == BUILDER else runpy.run_path(str(entrypoint)))
-    marker = "This content exists only in the deployment source copy."
-
-    def change_copy(root):
-        source = root / "skills/alpha-tool/SKILL.md"
-        source.write_text(source.read_text(encoding="utf-8") + "\n" + marker + "\n", encoding="utf-8")
-
-    if entrypoint in {BOOTSTRAP, INSTALLER_TEMPLATE}:
-        namespace = module["main"].__globals__
-        freeze = namespace["freeze_bootstrap_source"]
-
-        def capture_bootstrap(*args, **kwargs):
-            result = freeze(*args, **kwargs)
-            change_copy(result[0])
-            return result
-
-        monkeypatch.setitem(namespace, "freeze_bootstrap_source", capture_bootstrap)
-    else:
-        provenance = module["source_provenance"]
-        freeze = provenance.capture_source
-
-        @contextmanager
-        def capture_managed_source(*args, **kwargs):
-            with freeze(*args, **kwargs) as snapshot:
-                change_copy(snapshot.root)
-                yield snapshot
-
-        monkeypatch.setattr(provenance, "capture_source", capture_managed_source)
     monkeypatch.setattr(sys, "argv", [str(entrypoint), "--repo-root", str(repo),
                                     "--install-root", str(destination), "--skill", "alpha-tool"])
-    for _ in range(2):
+    source = repo / "skills/alpha-tool/SKILL.md"
+    for attempt in range(2):
+        marker = f"Source content from attempt {attempt}."
+        source.write_text(source.read_text(encoding="utf-8") + "\n" + marker + "\n", encoding="utf-8")
         assert module["main"]() == 0
-        installed = destination / "alpha-tool/SKILL.md"
-        assert installed.is_file()
-        assert marker not in installed.read_text(encoding="utf-8")
+        assert marker in (destination / "alpha-tool/SKILL.md").read_text(encoding="utf-8")
+        assert not list(tmp_path.rglob(".source-*.zip"))
 
 
 def test_worktree_install_records_primary_and_reads_exact_old_commit(tmp_path):
     repo = source_repo(tmp_path)
+    binary = repo / "skills/alpha-tool/assets/binary.bin"
+    binary.parent.mkdir(exist_ok=True)
+    binary.write_bytes(bytes(range(256)) + b"\r\n\n")
+    assert run_git(repo, "add", ".").returncode == 0
+    assert run_git(repo, "commit", "-m", "binary source").returncode == 0
     commit = run_git(repo, "rev-parse", "HEAD").stdout.strip()
     task = tmp_path / "worktrees/source/task"
     task.parent.mkdir(parents=True)
@@ -161,7 +143,6 @@ def test_worktree_install_records_primary_and_reads_exact_old_commit(tmp_path):
     old = source.read_bytes()
     source.write_bytes(old + b"\nA newer branch is not installed source.\n")
     assert run_git(repo, "commit", "-am", "newer").returncode == 0
-    (installed / metadata["source_snapshot"]["archive"]).unlink()
     output = tmp_path / "packet.json"
     result = packet_call(repo, installed, output)
     assert result.returncode == 0, result.stderr
@@ -169,13 +150,15 @@ def test_worktree_install_records_primary_and_reads_exact_old_commit(tmp_path):
     assert packet["identity"]["source_resolution"] == "git_commit"
     materialized = pathlib.Path(packet["identity"]["source_repository_root"])
     assert (materialized / "skills/alpha-tool/SKILL.md").read_bytes() == old
+    assert (materialized / "skills/alpha-tool/assets/binary.bin").read_bytes() == binary.read_bytes()
+    assert not list(materialized.parent.glob("*.zip"))
     assert packet_call(repo, installed, output, cleanup=True).returncode == 0
 
 
-@pytest.mark.parametrize("damage", ["missing-dirty", "corrupt", "malformed"])
-def test_missing_or_damaged_evidence_blocks_comparison_without_using_head(tmp_path, damage):
+@pytest.mark.parametrize("damage", ["dirty", "missing-commit", "malformed"])
+def test_unavailable_git_source_blocks_comparison_without_using_head(tmp_path, damage):
     repo = source_repo(tmp_path)
-    if damage == "missing-dirty":
+    if damage == "dirty":
         source = repo / "skills/alpha-tool/SKILL.md"
         source.write_bytes(source.read_bytes() + b"\nDirty source.\n")
     builder = load_runtime_builder()
@@ -183,14 +166,10 @@ def test_missing_or_damaged_evidence_blocks_comparison_without_using_head(tmp_pa
     builder["install_transaction"](repo, destination, selected=["alpha-tool"])
     installed = destination / "alpha-tool"
     metadata = owner(installed)
-    archive = installed / metadata["source_snapshot"]["archive"]
-    if damage == "missing-dirty":
-        archive.unlink()
-    elif damage == "corrupt":
-        archive.write_bytes(b"damaged")
-    else:
-        metadata["source_commit"] = "main"
+    if damage != "dirty":
+        metadata["source_commit"] = "f" * 40 if damage == "missing-commit" else "main"
         (installed / ".runtime-manifest.json").write_text(json.dumps(metadata), encoding="utf-8")
+    if damage == "malformed":
         inventory = load_runtime_installer()["runtime_inventory"](destination)
         assert inventory["managed"] == 0 and len(inventory["blockers"]) == 1
     output = tmp_path / "packet.json"
@@ -206,95 +185,59 @@ class LostWorker(BaseException):
 
 @pytest.mark.parametrize("after_effect", [False, True])
 @pytest.mark.parametrize("failure", [OSError, LostWorker])
-def test_source_archive_publication_converges_with_manifest_after_interruption(
-    tmp_path, monkeypatch, after_effect, failure,
+@pytest.mark.parametrize("payload_change", [False, True])
+def test_git_identity_publication_repeats_after_interruption(
+    tmp_path, monkeypatch, after_effect, failure, payload_change,
 ):
-    repo = source_repo(tmp_path, committed=False)
+    repo = source_repo(tmp_path)
     builder = load_runtime_builder()
-    provenance = builder["source_provenance"]
     destination = tmp_path / "profile/skills"
     builder["install_transaction"](repo, destination, all_managed=True)
     installed = destination / "alpha-tool"
     before, identity = owner(installed), installed.stat().st_ino
-    sibling = repo / "skills/beta-tool/SKILL.md"
-    sibling.write_bytes(sibling.read_bytes() + b"\nSibling changed.\n")
-    original = provenance.publish_source_archive
+    changed = repo / ("skills/alpha-tool/SKILL.md" if payload_change else "skills/beta-tool/SKILL.md")
+    changed.write_bytes(changed.read_bytes() + b"\nSource changed.\n")
+    assert run_git(repo, "commit", "-am", "changed").returncode == 0
+    expected_commit = run_git(repo, "rev-parse", "HEAD").stdout.strip()
+    namespace = builder["install_transaction"].__globals__
+    name = "rename_with_retry" if payload_change else "replace_runtime_manifest"
+    original = namespace[name]
     triggered = False
 
-    def interrupted(staged, canonical, metadata):
+    def interrupted(staged, canonical, *args):
         nonlocal triggered
         if canonical != installed or triggered:
-            return original(staged, canonical, metadata)
+            return original(staged, canonical, *args)
         triggered = True
         if after_effect:
-            original(staged, canonical, metadata)
-        raise failure("publication interrupted")
+            original(staged, canonical, *args)
+        raise failure("identity publication interrupted")
 
     with monkeypatch.context() as patch:
-        patch.setattr(provenance, "publish_source_archive", interrupted)
+        patch.setitem(namespace, name, interrupted)
         with pytest.raises(builder["TransactionError"] if failure is OSError else LostWorker):
             builder["install_transaction"](repo, destination, all_managed=True)
     assert triggered
-    assert owner(installed) == before
-    assert (installed / before["source_snapshot"]["archive"]).is_file()
+    if installed.exists() and (failure is OSError or not after_effect):
+        assert owner(installed) == before
     builder["install_transaction"](repo, destination, all_managed=True)
-    assert installed.stat().st_ino == identity
+    assert owner(installed)["source_commit"] == expected_commit
+    if not payload_change:
+        assert installed.stat().st_ino == identity
     assert builder["install_transaction"](repo, destination, all_managed=True).status == "no_op"
-    assert len(list(installed.glob(".source-*.zip"))) <= 3
+    assert not list(tmp_path.rglob(".source-*.zip"))
 
 
-def test_archive_retention_and_disposable_source_cleanup_are_bounded(tmp_path):
-    repo = source_repo(tmp_path, committed=False)
+@pytest.mark.parametrize("after_effect", [False, True])
+def test_git_comparison_repeats_after_interruption(tmp_path, monkeypatch, after_effect):
+    repo = source_repo(tmp_path)
     builder = load_runtime_builder()
     provenance = builder["source_provenance"]
     destination = tmp_path / "profile/skills"
-    parent = provenance.source_temp_parent(repo, repo)
-    parent.mkdir(parents=True)
-    stale = parent / ("_skill-source-" + "a" * 32)
-    stale.mkdir()
-    (parent / ("._skill-source-" + "a" * 32 + ".lock")).write_bytes(b"\0")
-    for index in range(5):
-        (repo / "README.md").write_text(f"Source {index}\n", encoding="utf-8")
-        builder["install_transaction"](repo, destination, selected=["alpha-tool"])
-    installed = destination / "alpha-tool"
-    assert len(list(installed.glob(".source-*.zip"))) == 3
-    assert (installed / owner(installed)["source_snapshot"]["archive"]).is_file()
-    assert not stale.exists()
-    assert not list(parent.glob("_skill-source-*"))
-    assert not [path for path in parent.glob("._skill-source-*.lock")
-                if provenance.VIEW_RE.fullmatch(path.name)]
-
-
-def test_source_view_cleanup_keeps_another_active_owner(tmp_path):
-    repo = source_repo(tmp_path, committed=False)
-    provenance = load_runtime_builder()["source_provenance"]
-    destination = tmp_path / "profile/skills"
-    with provenance.capture_source(repo, destination) as first:
-        with provenance.capture_source(repo, destination) as second:
-            assert first.root.is_dir() and second.root.is_dir()
-        assert first.root.is_dir() and not second.root.exists()
-    assert not first.root.exists()
-
-
-@pytest.mark.parametrize("entrypoint", [BOOTSTRAP, INSTALLER_TEMPLATE, BUILDER])
-def test_source_cannot_claim_installer_archive_names(tmp_path, entrypoint):
-    repo = source_repo(tmp_path, committed=False)
-    (repo / "skills/alpha-tool" / (".source-" + "a" * 64 + ".zip")).write_bytes(b"unrelated source")
-    destination = tmp_path / "profile/skills"
-    result = subprocess.run([sys.executable, str(entrypoint), "--repo-root", str(repo),
-                             "--install-root", str(destination), "--skill", "alpha-tool"],
-                            capture_output=True, text=True, check=False)
-    assert result.returncode == 1 and "reserved source archive name" in result.stderr
-    assert not (destination / "alpha-tool").exists()
-
-
-@pytest.mark.parametrize("boundary", ["_write_working_archive", "extract_archive"])
-@pytest.mark.parametrize("after_effect", [False, True])
-def test_source_capture_repeats_after_interruption(tmp_path, monkeypatch, boundary, after_effect):
-    repo = source_repo(tmp_path, committed=False)
-    provenance = load_runtime_builder()["source_provenance"]
-    destination = tmp_path / "profile/skills"
-    original = getattr(provenance, boundary)
+    builder["install_transaction"](repo, destination, selected=["alpha-tool"])
+    metadata = owner(destination / "alpha-tool")
+    output = tmp_path / "packet.json"
+    original = provenance.read_commit_files
 
     def interrupted(*args, **kwargs):
         if after_effect:
@@ -302,19 +245,22 @@ def test_source_capture_repeats_after_interruption(tmp_path, monkeypatch, bounda
         raise LostWorker()
 
     with monkeypatch.context() as patch:
-        patch.setattr(provenance, boundary, interrupted)
-        with pytest.raises(LostWorker), provenance.capture_source(repo, destination):
-            pytest.fail("interrupted capture yielded source")
+        patch.setattr(provenance, "read_commit_files", interrupted)
+        with pytest.raises(LostWorker):
+            provenance.resolve_review_source(metadata, repo, output)
     for _ in range(2):
-        with provenance.capture_source(repo, destination) as captured:
-            assert (captured.root / "skills/alpha-tool/SKILL.md").is_file()
-        assert not captured.root.exists()
+        materialized, paths, origin = provenance.resolve_review_source(metadata, repo, output)
+        assert origin == "git_commit"
+        assert "skills/alpha-tool/SKILL.md" in paths
+        assert (materialized / "skills/alpha-tool/SKILL.md").is_file()
+        provenance.remove_review_source(output)
+        assert not materialized.exists()
 
 
 @pytest.mark.parametrize("after_effect", [False, True])
 @pytest.mark.parametrize("boundary", ["write", "source-cleanup", "packet-cleanup"])
 def test_packet_and_cleanup_repeat_after_interruption(tmp_path, monkeypatch, after_effect, boundary):
-    repo = source_repo(tmp_path, committed=False)
+    repo = source_repo(tmp_path)
     builder = load_runtime_builder()
     destination = tmp_path / "profile/skills"
     builder["install_transaction"](repo, destination, selected=["alpha-tool"])
@@ -357,25 +303,27 @@ def test_packet_and_cleanup_repeat_after_interruption(tmp_path, monkeypatch, aft
 
 
 @pytest.mark.parametrize("name", ["../outside.txt", "C:/outside.txt", "a/../../outside.txt"])
-def test_retained_archive_cannot_write_outside_its_owned_view(tmp_path, name):
+def test_git_source_links_cannot_escape_comparison_directory(tmp_path, name):
+    repo = source_repo(tmp_path)
+    result = subprocess.run(["git", "-C", str(repo), "hash-object", "-w", "--stdin"],
+                            input=name.encode(), capture_output=True, check=False)
+    assert result.returncode == 0, result.stderr
+    object_id = result.stdout.decode().strip()
+    assert run_git(repo, "update-index", "--add", "--cacheinfo", "120000", object_id, "unsafe-link").returncode == 0
+    assert run_git(repo, "commit", "-m", "link").returncode == 0
+    commit = run_git(repo, "rev-parse", "HEAD").stdout.strip()
     provenance = load_runtime_builder()["source_provenance"]
-    stream = io.BytesIO()
-    with zipfile.ZipFile(stream, "w") as archive:
-        archive.writestr(name, "unsafe")
-    supplied = tmp_path / "source.zip"
-    supplied.write_bytes(stream.getvalue())
     with pytest.raises(provenance.SourceError):
-        provenance.extract_archive(supplied, tmp_path / "owned")
+        provenance.read_commit_files(repo, commit, tmp_path / "owned")
     assert not (tmp_path / "outside.txt").exists()
 
 
 @pytest.mark.parametrize("entrypoint", [BOOTSTRAP, INSTALLER_TEMPLATE], ids=["repository", "compatible"])
-@pytest.mark.parametrize("boundary", ["archive", "manifest"])
 @pytest.mark.parametrize("after_effect", [False, True])
-def test_bootstrap_source_publication_repeats_after_interruption(
-    tmp_path, monkeypatch, entrypoint, boundary, after_effect,
+def test_bootstrap_git_identity_repeats_after_interruption(
+    tmp_path, monkeypatch, entrypoint, after_effect,
 ):
-    repo = source_repo(tmp_path, committed=False)
+    repo = source_repo(tmp_path)
     destination = tmp_path / "profile/skills"
     installed = destination / "alpha-tool"
     module = runpy.run_path(str(entrypoint))
@@ -390,8 +338,7 @@ def test_bootstrap_source_publication_repeats_after_interruption(
     def interrupted(source, target):
         nonlocal triggered
         target = pathlib.Path(target)
-        selected = target.parent == installed and (
-            target.name == ".runtime-manifest.json" if boundary == "manifest" else target.name.startswith(".source-"))
+        selected = target == installed / ".runtime-manifest.json"
         if not selected or triggered:
             return original(source, target)
         triggered = True
@@ -405,13 +352,12 @@ def test_bootstrap_source_publication_repeats_after_interruption(
             module["main"]()
     assert triggered
     active = owner(installed)
-    assert (installed / active["source_snapshot"]["archive"]).is_file()
-    if boundary == "archive" or not after_effect:
+    if not after_effect:
         assert active == old
     for _ in range(2):
         assert module["main"]() == 0
     assert owner(installed) != old
-    assert len(list(installed.glob(".source-*.zip"))) <= 3
+    assert not list(tmp_path.rglob(".source-*.zip"))
 
 
 @pytest.mark.parametrize("mode", ["all", "selected", "base", "base-global", "remove-only", "empty", "inventory", "all-empty"])
@@ -452,7 +398,7 @@ def test_managed_deploy_callable_and_cli_share_exact_source_scope(tmp_path, monk
 
     def install(source, target, **kwargs):
         events.append("install")
-        assert source == repo and source != kwargs["source_snapshot"].root and target == destination
+        assert source == repo and target == destination
         assert (source / "skills/skill-sections.json").is_file()
         assert kwargs["previous_runtime_source_id"] is None
         assert kwargs["all_managed"] == (mode in {"all", "base-global", "all-empty"})
