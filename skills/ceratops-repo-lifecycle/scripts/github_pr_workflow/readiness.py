@@ -804,9 +804,12 @@ def pr_readiness(selector: str | None, cwd: pathlib.Path, *, allow_admin_review_
     pr_data = gh_pr_view(selector, cwd)
     findings: list[Finding] = []
 
+    base = pr_data.get("baseRefName")
     head = pr_data.get("headRefName")
     cross_repository = pr_data.get("isCrossRepository")
-    if pr_data.get("baseRefName") != "main":
+    if not isinstance(base, str) or not base:
+        add(findings, "ERROR", "pr.release_source", "PR base branch is unavailable.", actual=base)
+    elif base != "main":
         add(findings, "PASS", "pr.release_source", "PR targets a branch other than main.")
     elif head == "release/local" and cross_repository is False:
         add(findings, "PASS", "pr.release_source", "PR comes from this repository's release/local.")

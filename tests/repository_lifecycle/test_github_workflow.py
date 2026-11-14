@@ -72,6 +72,7 @@ class EnsurePrTests(unittest.TestCase):
 
     def test_main_readiness_requires_same_repository_release(self) -> None:
         for base, head, fork, blocked in (
+            (None, "release/local", False, True),
             ("main", "task", False, True),
             ("main", "release/local", True, True),
             ("main", "release/local", None, True),
