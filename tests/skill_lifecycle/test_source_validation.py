@@ -67,6 +67,7 @@ def test_consistency_review_packet_resolves_one_installed_skill(
                 "runtime_source_id": source_manifest["runtime_source_id"],
                 "source_path": f"skills/{skill}",
                 "source_repository_root": str(ROOT),
+                "source_commit": run_git(ROOT, "rev-parse", "HEAD").stdout.strip(),
                 "validation_profile": source_manifest["validation_profile"],
                 "payload_patterns": [],
             }
@@ -149,6 +150,8 @@ def test_consistency_review_packet_uses_tracked_helpers_and_repo_resources(
     validator.write_text("raise SystemExit(0)\n", encoding="utf-8", newline="\n")
     subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
     subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    assert run_git(repo, "-c", "user.name=Tests", "-c", "user.email=tests@example.invalid",
+                   "commit", "-m", "Recorded skill source").returncode == 0
 
     (scripts / "untracked.py").write_text("print('untracked')\n", encoding="utf-8")
     cache = scripts / "__pycache__"
@@ -165,6 +168,7 @@ def test_consistency_review_packet_uses_tracked_helpers_and_repo_resources(
                 "runtime_source_id": "test-source",
                 "source_path": f"skills/{skill}",
                 "source_repository_root": str(repo),
+                "source_commit": run_git(repo, "rev-parse", "HEAD").stdout.strip(),
                 "validation_profile": "ceratops-compatible",
                 "payload_patterns": [],
             }

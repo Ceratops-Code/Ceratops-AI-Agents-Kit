@@ -87,13 +87,14 @@ def test_current_skill_keeps_watched_directory_and_only_needed_effects(
             assert getattr(blocked.value, "winerror", None) == 5
         for attempt in range(2):
             result = builder["install_transaction"](repo, destination, all_managed=True)
-            affected = {"alpha-tool", "beta-tool"} if other_source_root or changed_sibling else set()
+            affected = ({"alpha-tool", "beta-tool"} if other_source_root else
+                        {"beta-tool"} if changed_sibling else set())
             assert set(result.deployed) == (affected if attempt == 0 else set())
             assert result.status == ("ok" if affected and attempt == 0 else "no_op")
         assert directory_identity == (alpha.stat().st_ino, (alpha / "references").stat().st_ino)
         for relative, (data, mtime) in before.items():
             current = alpha / relative
-            if (other_source_root or changed_sibling) and relative.as_posix() == RUNTIME_MANIFEST:
+            if other_source_root and relative.as_posix() == RUNTIME_MANIFEST:
                 assert json.loads(current.read_bytes())["source_repository_root"] == str(repo)
             else:
                 assert (current.read_bytes(), current.stat().st_mtime_ns) == (data, mtime)

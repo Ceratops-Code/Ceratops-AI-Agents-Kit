@@ -342,12 +342,17 @@ def execute_build(
                                 continue
                             temporary = transaction.target_output(target)
                             retained = transaction.artifact_receipt(target).parent
-                            batch["artifacts"] = {
-                                reference: [str(retained / pathlib.Path(path).relative_to(temporary))
-                                            if pathlib.Path(path).is_relative_to(temporary) else path
-                                            for path in paths]
-                                for reference, paths in batch.get("artifacts", {}).items()
-                            }
+                            # Both the batch and each producer return usable
+                            # paths. Preserve receipt hashes and check identities;
+                            # only the files' temporary location has changed.
+                            for outcome in (batch, *batch["results"]):
+                                if "artifacts" in outcome:
+                                    outcome["artifacts"] = {
+                                        reference: [str(retained / pathlib.Path(path).relative_to(temporary))
+                                                    if pathlib.Path(path).is_relative_to(temporary) else path
+                                                    for path in paths]
+                                        for reference, paths in outcome["artifacts"].items()
+                                    }
                         maintenance = _finish(transaction, diagnostic_output=diagnostic_output,
                                 completed=replace(completed, tag=f"{transaction.release_bundle}/{transaction.version}"))
                         if maintenance.get("maintenance_errors"):

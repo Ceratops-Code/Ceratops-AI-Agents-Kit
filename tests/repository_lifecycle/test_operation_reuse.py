@@ -212,7 +212,9 @@ def test_release_build_failure_ignores_stale_output_and_can_repeat(tmp_path, mon
     result = runner.execute_build(tmp_path, [request])
     assert result["status"] == "completed", result
     order = (tmp_path / ".order").read_text().splitlines()
-    assert order.count("build:engine:one") == order.count("build:core:one") == 1
+    # No result commit/tag accepted the failed batch. Its temporary files are
+    # discarded before the next build, including its unfinished dependencies.
+    assert order.count("build:engine:one") == order.count("build:core:one") == 2
     assert order.count("build:bridge:one") == 2
     assert order[-1] == "install:desktop:one"
 
@@ -250,6 +252,8 @@ def test_release_builds_preserve_accepted_bytes_receipts_and_original_results(tm
         new_ids = {value.get("result_id", value.get("resultId")) for value in new["check_summary"]["checks"]}
         assert old_ids <= new_ids
         assert new["artifacts"] == old["artifacts"]
+        assert all(pathlib.Path(path).is_file()
+                   for paths in old["artifacts"].values() for path in paths)
         assert new["qualification_level"] == "beta"
     for original in first["results"]:
         if (original["operation"].startswith("deliverables.")
