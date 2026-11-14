@@ -10,6 +10,9 @@ import sys
 import time
 
 import pytest
+import yaml
+
+from tests.repository_lifecycle.support import fixture_with_tools
 
 from tests.skill_lifecycle.support import (
     BOOTSTRAP,
@@ -123,6 +126,11 @@ def test_bootstrap_full_install_materializes_lifecycle_bundle_with_source_runtim
         assert checked.returncode == 0, checked.stderr
     target_repo = tmp_path / "installed-bundle-target"
     create_compatible_repo(target_repo, "stale/source", ["alpha-tool"])
+    contract_path = target_repo / "sdlc/sdlc.yml"
+    contract = fixture_with_tools(yaml.safe_load(contract_path.read_text(encoding="utf-8")))
+    template = REPOSITORY_LIFECYCLE_SOURCE / "references/templates/sdlc.yml.tmpl"
+    contract["version"] = yaml.safe_load(template.read_text(encoding="utf-8"))["version"]
+    contract_path.write_text(yaml.safe_dump(contract, sort_keys=False), encoding="utf-8")
     prepare_script_environment(target_repo)
     (target_repo / ".git").write_text(
         "gitdir: test\n", encoding="utf-8", newline="\n"
@@ -221,6 +229,11 @@ def test_lifecycle_only_installed_bundle_materializes_compatible_repo(
     )
     assert installed.returncode == 0, installed.stderr
     create_compatible_repo(target_repo, "stale/source", ["alpha-tool"])
+    contract_path = target_repo / "sdlc/sdlc.yml"
+    contract = fixture_with_tools(yaml.safe_load(contract_path.read_text(encoding="utf-8")))
+    template = REPOSITORY_LIFECYCLE_SOURCE / "references/templates/sdlc.yml.tmpl"
+    contract["version"] = yaml.safe_load(template.read_text(encoding="utf-8"))["version"]
+    contract_path.write_text(yaml.safe_dump(contract, sort_keys=False), encoding="utf-8")
     prepare_script_environment(target_repo)
     (target_repo / ".git").write_text(
         "gitdir: test\n", encoding="utf-8", newline="\n"
