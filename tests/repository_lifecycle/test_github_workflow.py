@@ -32,13 +32,20 @@ class EnsurePrTests(unittest.TestCase):
         return argparse.Namespace(head_branch="release/local")
 
     def test_main_requires_release_branch_before_publication(self) -> None:
-        args = argparse.Namespace(
-            repo_root=pathlib.Path.cwd(), head_branch="task", base_branch="main",
-        )
-        with mock.patch.object(ensure_pr, "_publication_target") as bind:
-            with self.assertRaisesRegex(ensure_pr.EnsurePrError, "repository's release/local"):
-                ensure_pr.ensure_pr(args)
-            bind.assert_not_called()
+        # Ship already holds the real checkout's lock while running these tests.
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repo_root = pathlib.Path(temporary_directory)
+            subprocess.run(
+                ["git", "init", "--initial-branch=task", str(repo_root)],
+                check=True, capture_output=True,
+            )
+            args = argparse.Namespace(
+                repo_root=repo_root, head_branch="task", base_branch="main",
+            )
+            with mock.patch.object(ensure_pr, "_publication_target") as bind:
+                with self.assertRaisesRegex(ensure_pr.EnsurePrError, "repository's release/local"):
+                    ensure_pr.ensure_pr(args)
+                bind.assert_not_called()
 
     def test_main_binds_implicit_repository_and_rejects_fork_push(self) -> None:
         for push_repo in ("owner/repo", "fork/repo"):
