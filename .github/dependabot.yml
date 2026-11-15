@@ -1,6 +1,7 @@
 version: 2
 updates:
   - package-ecosystem: github-actions
+    open-pull-requests-limit: 0
     directory: /
     target-branch: release/local
     schedule:
@@ -14,6 +15,7 @@ updates:
       - dependencies
       - github-actions
   - package-ecosystem: npm
+    open-pull-requests-limit: 0
     directory: /scripts
     target-branch: release/local
     schedule:
@@ -22,6 +24,7 @@ updates:
       - dependencies
       - npm
   - package-ecosystem: uv
+    open-pull-requests-limit: 0
     directory: /scripts
     target-branch: release/local
     schedule:
