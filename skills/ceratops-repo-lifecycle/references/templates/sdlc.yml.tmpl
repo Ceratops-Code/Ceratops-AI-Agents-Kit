@@ -8,6 +8,11 @@ kind: ceratops-sdlc
 # target/destination parameters, and return ceratops-deployment-result.v1 with
 # version/destination. Commands receive {artifact_receipt}, {package_file},
 # {installer_dependencies} (JSON array), or {install_input_file} (all values).
+# Versioned deliverables and release bundles declare the same version source:
+# version: {file: path/to/pyproject.toml, field: project.version}
+# or version: {file: path/to/package.json, field: version}
+# or version: {read: [tool, read], write: [tool, write, "{version}"], files: [owned-file]}
+# Without a native version file, use version: {mode: receipt-only}.
 repository:
   tools:
     # Point version-from.file at this target's native version metadata; use key

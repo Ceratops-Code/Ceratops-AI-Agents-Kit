@@ -13,7 +13,6 @@ import json
 import os
 import pathlib
 import subprocess
-import tomllib
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import replace
@@ -89,16 +88,22 @@ def prepare_build_operations(root, requests, contract_path=None, *, context="ski
     while pending:
         request = pending.pop(0)
         action = entries.get(request.operation, {})
+        current_version = None
+        version_explicit = False
         if action.get("result-schema") == "ceratops-builder-output":
+            from execute_worktree_build import read_declared_version
+
             parameters = {**(request.parameters_if_declared or {}), **(request.parameters or {})}
             owner = request.operation.split(".")
             product = contract["deliverables"][owner[1]][owner[2]]
+            reference = request.operation.split('.actions.', 1)[0]
+            current_version = read_declared_version(root, product, reference=reference)
+            version_explicit = "version" in parameters
             if "version" not in parameters:
-                project = root / product.get("project", product.get("manifest", "pyproject.toml"))
-                native = json.loads(project.read_text()) if project.suffix == ".json" else tomllib.loads(project.read_text())
-                version = native.get("version", native.get("project", {}).get("version"))
-                if not isinstance(version, str):
-                    raise operations.OperationError(f"{request.operation} requires an explicit version.")
+                # Missing initial versions remain a model decision. This value
+                # permits read-only command preparation and never reaches a
+                # builder until execute_build has obtained that decision.
+                version = current_version or "0.0.0"
                 if (qualification_level in {"alpha", "beta"}
                         and (match := store_artifacts.FULL_VERSION_RE.fullmatch(version))
                         and match.group("class") is None):
@@ -109,7 +114,8 @@ def prepare_build_operations(root, requests, contract_path=None, *, context="ski
             request = replace(request, parameters_if_declared={key: value for key, value in parameters.items()
                               if key not in (request.parameters or {})})
         items = operations.prepare_operations(root, [request], contract_path, context=context, artifacts=artifacts, defer_install_inputs=True)
-        prepared[request.operation] = [replace(item, qualification_level=qualification_level) for item in items]
+        prepared[request.operation] = [replace(item, qualification_level=qualification_level,
+            current_version=current_version, version_explicit=version_explicit) for item in items]
         references: set[str] = set()
         for item in items:
             references.update(build_dependencies(item))
@@ -327,6 +333,11 @@ def recorded_build(item, inputs, *, supplier_results=()):
     build = max(candidates, key=lambda value: Version(value["receipt"]["identity"]["version"]))
     receipt = build["receipt"]
     decision["previous_receipt"] = receipt
+    if item.version_explicit and Version(parameters['version']).release != Version(receipt['identity']['version']).release:
+        # The allocator advances alpha/beta counters for changed source. A
+        # repeat of the original request can reuse its completed later counter;
+        # a different requested base requires a newly versioned artifact.
+        reasons.append('Requested a different base version: ' + parameters['version'])
     owner = reference.split(".")
     declaration = contract["deliverables"][owner[1]][owner[2]]
     current = {name for name in deliverable_source_files(item.repo_root, declaration)
@@ -530,9 +541,13 @@ def execute_sdlc_operations(
         return (result.get("qualification_level") in levels
                 and levels.index(result["qualification_level"]) >= levels.index(item.qualification_level))
 
-    comparisons: dict[str, dict[str, Any]] = {}
+    comparisons: dict[str, dict[str, Any]] = {
+        item.operation: value for item in builds
+        if (value := (build_context or {}).get('comparisons', {}).get((item.operation, item.build_target))) is not None
+        and value['result'] is not None
+    }
 
-    def comparison_for(item):
+    def prepare_build_or_reuse(item):
         reference = item.operation.split(".actions.", 1)[0]
         current_commit = operations.repository_commit(item.repo_root)
         if (item.operation in comparisons
@@ -569,8 +584,7 @@ def execute_sdlc_operations(
                         version=parameters["version"], required_targets=build_context["targets"][reference],
                         declared_input_paths=paths)
                     if not isinstance(allocation, store_artifacts.ArtifactVersionTransaction):
-                        project = product.get("project", product.get("manifest"))
-                        commit = _commit_source(allocation, paths, project=project)
+                        commit = _commit_source(allocation, paths, declaration=product, reference=reference)
                         allocation = store_artifacts.bind_artifact_inputs(allocation, pre_test_commit=commit)
                     build_context["allocations"][reference] = allocation
                 parameters = {**dict(item.parameters), "version": allocation.version,
@@ -579,7 +593,8 @@ def execute_sdlc_operations(
                     operations.OperationRequest(item.operation, parameters_if_declared=parameters)
                 ], item.contract_path, context=item.handoff_mode, artifacts=available)[0]
                 refreshed = replace(refreshed, qualification_level=item.qualification_level, build_target=target,
-                                    source_input_paths=allocation.declared_input_paths, test_context=item.test_context)
+                                    source_input_paths=allocation.declared_input_paths, test_context=item.test_context,
+                                    current_version=allocation.version, version_explicit=item.version_explicit)
                 commands[item.operation] = refreshed
                 by_reference[reference] = refreshed
                 build_context["transactions"][key] = allocation
@@ -617,7 +632,7 @@ def execute_sdlc_operations(
         if (item.automatic_check and producer is not None
                 and not (set(item.artifact_references) - {owner})
                 and not (set(producer.artifact_references) - available.keys())
-                and comparison_for(producer)["result"] is not None):
+                and prepare_build_or_reuse(producer)["result"] is not None):
             # The original artifact acceptance remains attached to its original
             # check versions. This records a skipped automatic gate, not a new pass.
             automatic_result: dict[str, Any] = {"operation": item.operation, "status": "no_op",
@@ -631,7 +646,7 @@ def execute_sdlc_operations(
             results.append(original)
             return original
         if producer is not None:
-            comparison_for(producer)
+            prepare_build_or_reuse(producer)
         current_commit = operations.repository_commit(item.repo_root)
         if item.commit != current_commit:
             item = replace(item, commit=current_commit, check_plan=None)
@@ -652,7 +667,7 @@ def execute_sdlc_operations(
                 if operation.startswith("repository.") and not item.artifact_references:
                     for producer in list(by_reference.values()):
                         if not (build_dependencies(producer) - available.keys()):
-                            comparison_for(producer)
+                            prepare_build_or_reuse(producer)
                 if run_check(item)["status"] not in operations.FAILED_STATUSES:
                     completed_work.add(operation)
                 elif operation.startswith("repository.") and not item.artifact_references:
@@ -673,7 +688,7 @@ def execute_sdlc_operations(
                 }
                 comparison = None
                 if original is None or build_context is not None:
-                    comparison = comparison_for(item)
+                    comparison = prepare_build_or_reuse(item)
                     item = replace(commands[operation], commit=operations.repository_commit(item.repo_root)).with_artifacts(available)
                     original = comparison["result"]
                     if original is not None:

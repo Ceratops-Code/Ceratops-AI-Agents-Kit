@@ -282,7 +282,9 @@ def deliverable_source_files(repo_root: pathlib.Path, record: Mapping[str, Any],
     deletions relative to HEAD. Blob inventories retain only existing files.
     """
     root = pathlib.PurePosixPath(record["root-dir"])
-    patterns = record.get("additional-source-files", [])
+    version = record.get("version", {})
+    patterns = [*record.get("additional-source-files", []),
+                *([version["file"]] if "file" in version else version.get("files", []))]
     commands = [["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"]]
     if include_deleted:
         commands.append(["git", "diff", "--name-only", "--diff-filter=D", "--no-renames", "-z", "HEAD", "--"])
@@ -364,6 +366,28 @@ def _find_sdlc_declaration_errors(
             )
     deliverables = value.get("deliverables", {})
     records = _deliverable_records(value)
+    version_owners = {**records, **{
+        "repository.release-bundles." + name: record
+        for name, record in repository.get("release-bundles", {}).items()
+    }}
+    for reference, record in version_owners.items():
+        version = record.get("version", {})
+        version_files = [version["file"]] if "file" in version else version.get("files", [])
+        for version_file in version_files:
+            if not _relative_path(version_file):
+                errors.append(f"{reference}.version must name repository-relative files")
+            elif repo_root is not None:
+                path = (repo_root / version_file).resolve()
+                if not path.is_relative_to(repo_root.resolve()) or not path.is_file():
+                    errors.append(f"{reference}.version file must exist inside the repository: {version_file}")
+                else:
+                    tracked = subprocess.run(
+                        ["git", "--literal-pathspecs", "ls-files", "--error-unmatch", "--", version_file],
+                        cwd=repo_root, capture_output=True, check=False,
+                    )
+                    if tracked.returncode:
+                        errors.append(f"{reference}.version file must be Git-tracked: {version_file}")
+
     for location, action in operation_entries(value).items():
         match = OPERATION_RE.fullmatch(location)
         assert match is not None

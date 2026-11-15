@@ -720,6 +720,9 @@
         },
         "actions": {
           "$ref": "#/$defs/packageActions"
+        },
+        "version": {
+          "$ref": "#/$defs/declaredVersion"
         }
       },
       "allOf": [
@@ -741,6 +744,37 @@
           "then": {
             "required": [
               "project"
+            ]
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "actions"
+            ],
+            "properties": {
+              "actions": {
+                "required": [
+                  "build"
+                ],
+                "properties": {
+                  "build": {
+                    "required": [
+                      "result-schema"
+                    ],
+                    "properties": {
+                      "result-schema": {
+                        "const": "ceratops-builder-output"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "version"
             ]
           }
         }
@@ -787,6 +821,9 @@
         },
         "artifact": {
           "$ref": "#/$defs/artifact"
+        },
+        "version": {
+          "$ref": "#/$defs/declaredVersion"
         }
       },
       "allOf": [
@@ -811,6 +848,37 @@
           "then": {
             "required": [
               "project"
+            ]
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "actions"
+            ],
+            "properties": {
+              "actions": {
+                "required": [
+                  "build"
+                ],
+                "properties": {
+                  "build": {
+                    "required": [
+                      "result-schema"
+                    ],
+                    "properties": {
+                      "result-schema": {
+                        "const": "ceratops-builder-output"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "version"
             ]
           }
         }
@@ -851,6 +919,9 @@
         },
         "artifact": {
           "$ref": "#/$defs/artifact"
+        },
+        "version": {
+          "$ref": "#/$defs/declaredVersion"
         }
       },
       "allOf": [
@@ -875,6 +946,37 @@
           "then": {
             "required": [
               "project"
+            ]
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "actions"
+            ],
+            "properties": {
+              "actions": {
+                "required": [
+                  "build"
+                ],
+                "properties": {
+                  "build": {
+                    "required": [
+                      "result-schema"
+                    ],
+                    "properties": {
+                      "result-schema": {
+                        "const": "ceratops-builder-output"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "version"
             ]
           }
         }
@@ -910,6 +1012,9 @@
         },
         "artifact": {
           "$ref": "#/$defs/artifact"
+        },
+        "version": {
+          "$ref": "#/$defs/declaredVersion"
         }
       },
       "allOf": [
@@ -934,6 +1039,37 @@
           "then": {
             "required": [
               "project"
+            ]
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "actions"
+            ],
+            "properties": {
+              "actions": {
+                "required": [
+                  "build"
+                ],
+                "properties": {
+                  "build": {
+                    "required": [
+                      "result-schema"
+                    ],
+                    "properties": {
+                      "result-schema": {
+                        "const": "ceratops-builder-output"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "version"
             ]
           }
         }
@@ -969,6 +1105,9 @@
         },
         "artifact": {
           "$ref": "#/$defs/artifact"
+        },
+        "version": {
+          "$ref": "#/$defs/declaredVersion"
         }
       },
       "allOf": [
@@ -993,6 +1132,37 @@
           "then": {
             "required": [
               "project"
+            ]
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "actions"
+            ],
+            "properties": {
+              "actions": {
+                "required": [
+                  "build"
+                ],
+                "properties": {
+                  "build": {
+                    "required": [
+                      "result-schema"
+                    ],
+                    "properties": {
+                      "result-schema": {
+                        "const": "ceratops-builder-output"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "version"
             ]
           }
         }
@@ -1100,7 +1270,8 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "members"
+        "members",
+        "version"
       ],
       "properties": {
         "members": {
@@ -1110,6 +1281,9 @@
           "items": {
             "$ref": "#/$defs/deliverableReference"
           }
+        },
+        "version": {
+          "$ref": "#/$defs/declaredVersion"
         }
       }
     },
@@ -1126,6 +1300,79 @@
       "additionalProperties": {
         "$ref": "#/$defs/releaseBundle"
       }
+    },
+    "declaredVersion": {
+      "description": "The authoritative version source used by the shared Build operation.",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "file",
+            "field"
+          ],
+          "properties": {
+            "file": {
+              "$ref": "#/$defs/relativePath",
+              "pattern": "\\.(?:json|toml)$"
+            },
+            "field": {
+              "type": "string",
+              "pattern": "^[^.\\s]+(?:\\.[^.\\s]+)*$"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "read",
+            "write",
+            "files"
+          ],
+          "properties": {
+            "read": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "write": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "contains": {
+                "const": "{version}"
+              }
+            },
+            "files": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "$ref": "#/$defs/relativePath"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "mode"
+          ],
+          "properties": {
+            "mode": {
+              "const": "receipt-only"
+            }
+          }
+        }
+      ]
     }
   },
   "description": "Opt-in release-bundle declarations. Membership and package prerequisites are resolved by sdlc_contract_validation; loading this data never builds or deploys."

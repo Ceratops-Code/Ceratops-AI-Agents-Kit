@@ -7,6 +7,7 @@ import argparse
 import json
 import pathlib
 import sys
+from typing import Any
 
 from github_pr_workflow.command import CommandError, describe_command_failure
 from github_pr_workflow.ship_repository import (
@@ -40,6 +41,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-branch", default=defaults.base_branch)
     parser.add_argument("--remote-name", default=defaults.remote_name)
     parser.add_argument("--commit")
+    parser.add_argument("--version-choices", type=json.loads)
+    parser.add_argument("--version-source-commit")
     parser.add_argument("--title")
     parser.add_argument("--body")
     parser.add_argument(
@@ -114,8 +117,13 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
+    if result.get("status") == "version_decision_required":
+        answer: Any = result["answer_schema"]
+        result["next_command"] = [sys.executable, str(pathlib.Path(__file__).resolve()),
+            *(argv if argv is not None else sys.argv[1:]), "--version-source-commit",
+            result["source_commit"], "--version-choices", json.dumps(answer["version_choices"])]
     print(json.dumps(result, separators=(",", ":")))
-    return 2 if result.get("status") == "pending_work" else 0
+    return 2 if result.get("status") in {"pending_work", "version_decision_required"} else 0
 
 
 if __name__ == "__main__":

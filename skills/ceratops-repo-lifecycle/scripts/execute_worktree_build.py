@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import pathlib
 import json
+import os
+import sys
 import tomlkit
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping, MutableMapping, Sequence
 from dataclasses import replace
 from typing import Any
 
@@ -23,37 +25,135 @@ from github_pr_workflow.command import release_lock_module
 
 
 
-def _git(root: pathlib.Path, *arguments: str):
+def _git(root: pathlib.Path, *arguments: str, input: str | None = None):
     return release_lock_module().run_protected_command(
         ['git', '--literal-pathspecs', '-C', str(root), *arguments],
-        cwd=root, capture_output=True, text=True, check=False,
+        cwd=root, capture_output=True, text=True, check=False, input=input,
     )
 
 
 def _require_command(result: Any, *, root: pathlib.Path) -> None:
     if result.returncode:
         error = store_artifacts.OperationError('Build preparation command failed.')
-        error.__dict__['command_failure'] = release_lock_module().command_failure_details(result, target=root)
+        error.__dict__['payload'] = {'command_failure': release_lock_module().command_failure_details(result, target=root)}
         raise error
 
 
-def _commit_source(allocation: store_artifacts.ArtifactVersionAllocation, paths: Sequence[str], *, project=None) -> str:
+def read_declared_version(root: pathlib.Path, declaration: Mapping[str, Any], *, reference: str) -> str | None:
+    """Read a member or bundle's declared source without changing any files.
+
+    Repository commands print one complete version. Receipt-only declarations
+    read this checkout's completed Git records, never another checkout's store.
+    """
+    source = declaration['version']
+    if source.get('mode') == 'receipt-only':
+        from packaging.version import Version
+
+        key = (sdlc_results.artifact_storage_key(bundle=reference.removeprefix('repository.release-bundles.'))
+               if reference.startswith('repository.release-bundles.')
+               else sdlc_results.artifact_storage_key(deliverable=reference))
+        records = sdlc_results.select_build_check_summaries(root, unit=key)
+        return max((item['receipt']['identity']['version'] for item in records), key=Version, default=None)
+    if 'file' in source:
+        path = (root / source['file']).resolve()
+        if not path.is_relative_to(root.resolve()):
+            raise store_artifacts.OperationError(f'{reference}: version file escapes the checkout.')
+        raw = path.read_bytes()
+        value = json.loads(raw) if path.suffix == '.json' else tomlkit.parse(raw.decode('utf-8'))
+        for part in source['field'].split('.'):
+            if not isinstance(value, Mapping) or part not in value:
+                raise store_artifacts.OperationError(f"{reference}: missing version field {source['field']}.")
+            value = value[part]
+    else:
+        import repository_operation as operations
+
+        argv = operations._substitute_command_parameters(source['read'], {'python': sys.executable, 'repo_root': str(root)})
+        result = release_lock_module().run_protected_command(
+            argv, cwd=root, capture_output=True, text=True, check=False,
+        )
+        _require_command(result, root=root)
+        value = result.stdout.strip()
+    # Native metadata may use an integer, four components or a vendor suffix.
+    # Reading/writing the declaration must not impose the artifact allocator's
+    # release numbering on repositories whose builders own another format.
+    if isinstance(value, int) and not isinstance(value, bool):
+        value = str(value)
+    if not isinstance(value, str) or not value or any(char.isspace() for char in value):
+        raise store_artifacts.OperationError(f'{reference}: version source must return one version without whitespace.')
+    return value
+
+
+def write_declared_version(root: pathlib.Path, declaration: Mapping[str, Any], version: str, *, reference: str) -> list[str]:
+    """Write the chosen version through its declared owner and return owned paths.
+
+    Native file replacement leaves the previous complete file readable on
+    interruption. This writer owns its one adjacent .in_process file, removes
+    any unfinished replacement on its next write, and removes it after success.
+    Repository write commands must set the desired version on repeated calls,
+    including every declared companion file after a partially completed call.
+    Receipt-only versions are written by the existing receipt/tag completer.
+    """
+    if not isinstance(version, str) or not version or any(char.isspace() for char in version):
+        raise store_artifacts.OperationError(f'{reference}: expected one version without whitespace, got {version!r}.')
+    source = declaration['version']
+    if source.get('mode') == 'receipt-only':
+        return []
+    if 'file' in source:
+        path = (root / source['file']).resolve()
+        if not path.is_relative_to(root.resolve()):
+            raise store_artifacts.OperationError(f'{reference}: version file escapes the checkout.')
+        raw = path.read_bytes()
+        document = json.loads(raw) if path.suffix == '.json' else tomlkit.parse(raw.decode('utf-8'))
+        section = document
+        parts = source['field'].split('.')
+        for part in parts[:-1]:
+            if not isinstance(section, MutableMapping) or part not in section:
+                raise store_artifacts.OperationError(f"{reference}: missing version field {source['field']}.")
+            section = section[part]
+        if not isinstance(section, MutableMapping) or parts[-1] not in section:
+            raise store_artifacts.OperationError(f"{reference}: missing version field {source['field']}.")
+        replacement: str | int = version
+        if isinstance(section[parts[-1]], int) and not isinstance(section[parts[-1]], bool):
+            if not version.isdecimal():
+                raise store_artifacts.OperationError(f'{reference}: the declared native field requires an integer version.')
+            replacement = int(version)
+        temporary = path.with_name('.' + path.name + '.in_process')
+        temporary.unlink(missing_ok=True)
+        if section[parts[-1]] != replacement:
+            section[parts[-1]] = replacement
+            text = json.dumps(document, indent=2, ensure_ascii=False) + '\n' if path.suffix == '.json' else tomlkit.dumps(document)
+            if b'\r\n' in raw:
+                text = text.replace('\r\n', '\n').replace('\n', '\r\n')
+            try:
+                with temporary.open('xb') as stream:
+                    stream.write(text.encode('utf-8'))
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, path)
+            finally:
+                temporary.unlink(missing_ok=True)
+        paths = [source['file']]
+    else:
+        import repository_operation as operations
+
+        argv = operations._substitute_command_parameters(source['write'], {
+            'version': version, 'python': sys.executable, 'repo_root': str(root),
+        })
+        result = release_lock_module().run_protected_command(argv, cwd=root, capture_output=True, text=True, check=False)
+        _require_command(result, root=root)
+        paths = list(source['files'])
+    observed = read_declared_version(root, declaration, reference=reference)
+    if observed != version:
+        raise store_artifacts.OperationError(f'{reference}: version writer returned {observed!r}; expected {version!r}.')
+    return paths
+
+
+def _commit_source(allocation: store_artifacts.ArtifactVersionAllocation, paths: Sequence[str], *, declaration=None, reference=None) -> str:
     """Commit only the caller's paths; unrelated staged/unstaged files stay intact."""
     root = allocation.repo_root
-    if project is not None:
-        if project not in paths:
-            raise store_artifacts.OperationError("The package project must belong to its declared build sources.")
-        manifest = root / project
-        raw = manifest.read_bytes()
-        document = json.loads(raw) if manifest.suffix == ".json" else tomlkit.parse(raw.decode("utf-8"))
-        section = document if manifest.suffix == ".json" else document.get("project", {})
-        if "version" in section and section["version"] != allocation.version:
-            section["version"] = allocation.version
-            text = (json.dumps(document, indent=2) + "\n" if manifest.suffix == ".json"
-                    else tomlkit.dumps(document))
-            if b"\r\n" in raw:
-                text = text.replace("\r\n", "\n").replace("\n", "\r\n")
-            manifest.write_bytes(text.encode("utf-8"))
+    if declaration is not None:
+        paths = tuple(dict.fromkeys([*paths, *write_declared_version(
+            root, declaration, allocation.version, reference=reference)]))
     if paths:
         indexed = _git(root, 'ls-files', '-z', '--', *paths)
         _require_command(indexed, root=root)
@@ -136,7 +236,8 @@ def execute_build(
     validation_operations=None, diagnostic_output=None, diagnostic_owner=None,
     successful_results=(), confirm_stopped=False, prepare_only=False, include_checks=True,
     wait_seconds=60, test_context=None, delivery_baseline=None, run_delivery=True,
-    bundle_versions: Mapping[str, str] | None = None,
+    bundles: Sequence[str] = (), version_choices: Mapping[str, Mapping[str, str]] | None = None,
+    version_source_commit: str | None = None,
 ) -> dict[str, Any]:
     """Run one fresh build/delivery request against source read under its lock.
 
@@ -146,7 +247,9 @@ def execute_build(
     """
     import repository_operation as operations
     import reuse_operation_checks
-    from run_build_operations import build_operation_context, prepare_build_operations, execute_sdlc_operations
+    from run_build_operations import (build_dependencies, build_operation_context, prepare_build_operations,
+                                     execute_sdlc_operations, recorded_build)
+    from packaging.version import Version
     from github_pr_workflow.command import CommandError, report_failure
 
     root = pathlib.Path(repo_root).resolve()
@@ -157,6 +260,16 @@ def execute_build(
         with build_operation_context(root, confirm_stopped=confirm_stopped, wait_seconds=wait_seconds):
             declaration = operations.read_repository_contract(root, contract_path)
             entries = operations.operation_entries(declaration)
+            bundle_declarations = declaration.get('repository', {}).get('release-bundles', {})
+            requests = list(requests)
+            for name in dict.fromkeys(bundles):
+                if name not in bundle_declarations:
+                    raise operations.OperationError(f'Unknown release bundle: {name}')
+                for member in bundle_declarations[name]['members']:
+                    location = member + '.actions.build'
+                    if not any(request.operation == location for request in requests):
+                        requests.append(operations.OperationRequest(location))
+            requested_operations = [item.operation for item in requests]
             if run_delivery and requests and all(
                     entries.get(request.operation, {}).get("install-inputs") == "accepted-build" for request in requests):
                 # Standalone Install consumes an explicit accepted version. It is
@@ -218,9 +331,206 @@ def execute_build(
                         "prerequisites": operations._combined_prerequisites([item for _, batch in batches for item in batch])}
             if expected_commit is not None:
                 operations.require_clean_commit(root, expected_commit)
+            # The model decides version intent before this call writes versions
+            # or starts builders. Reuse is evaluated with the existing comparer;
+            # its accepted results are passed to the scheduler, not hashed again.
+            version_choices = dict(version_choices or {})
+            owners = {item.operation.rsplit('.actions.', 1)[0]:
+                      declaration['deliverables'][item.operation.split('.')[1]][item.operation.split('.')[2]]
+                      for _, batch in batches for item in batch if item.result_schema == 'ceratops-builder-output'}
+            owners.update({'repository.release-bundles.' + name: bundle_declarations[name] for name in bundles})
+            declared_owners = {f'deliverables.{kind}.{name}' for kind, products in declaration.get('deliverables', {}).items()
+                               for name, product in products.items() if 'version' in product}
+            declared_owners.update('repository.release-bundles.' + name for name in bundle_declarations)
+            if set(version_choices) - declared_owners:
+                raise operations.OperationError('Version choices name undeclared products: ' + ', '.join(sorted(set(version_choices) - declared_owners)))
+            # Promote/Ship may pass the complete decision into several phases.
+            # A phase writes only the products whose builds it actually needs.
+            version_choices = {reference: choice for reference, choice in version_choices.items() if reference in owners}
+            current_commit = operations.repository_commit(root)
+            selected_versions = {}
+            current_versions = {}
+            for reference, product in owners.items():
+                member = next((item for _, batch in batches for item in batch
+                               if item.operation == reference + '.actions.build'), None)
+                current = member.current_version if member is not None else read_declared_version(root, product, reference=reference)
+                current_versions[reference] = current
+                choice = version_choices.get(reference)
+                if choice is not None:
+                    if (not isinstance(choice, Mapping) or set(choice) - {'version', 'bump', 'base_version'}
+                            or ('version' in choice) == ('bump' in choice)):
+                        raise operations.OperationError(f'{reference}: supply version or bump, with optional base_version for a bump.')
+                    if 'version' in choice:
+                        version = choice['version']
+                    else:
+                        base = choice.get('base_version', current)
+                        if base is None:
+                            raise operations.OperationError(f'{reference}: the first build requires an exact version.')
+                        numbers = list(Version(base).release)
+                        if len(numbers) != 3 or choice['bump'] not in {'keep-base', 'patch', 'minor', 'major'}:
+                            raise operations.OperationError(f'{reference}: unsupported version bump.')
+                        if choice['bump'] != 'keep-base':
+                            position = {'major': 0, 'minor': 1, 'patch': 2}[choice['bump']]
+                            numbers[position] += 1
+                            numbers[position + 1:] = [0] * (2 - position)
+                        version = '.'.join(map(str, numbers))
+                        version += {'alpha': 'a1', 'beta': 'b1'}.get(qualification_level, '')
+                    if not isinstance(version, str) or not store_artifacts.FULL_VERSION_RE.fullmatch(version):
+                        raise operations.OperationError(f'{reference}: unsupported requested version {version!r}.')
+                    selected_versions[reference] = version
+                elif current:
+                    selected_versions[reference] = current + ({'alpha': 'a1', 'beta': 'b1'}.get(qualification_level, '')
+                        if Version(current).pre is None else '')
+            version_paths = {path for product in owners.values() for path in (
+                [product['version']['file']] if 'file' in product['version'] else product['version'].get('files', []))}
+            stale_choice = False
+            if version_source_commit is not None and version_source_commit != current_commit:
+                ancestor = _git(root, 'merge-base', '--is-ancestor', version_source_commit, 'HEAD')
+                if ancestor.returncode not in (0, 1):
+                    _require_command(ancestor, root=root)
+                changes = _git(root, 'diff', '--name-only', '-z', version_source_commit, 'HEAD', '--')
+                _require_command(changes, root=root)
+                # Own version preparation and receipt commits are direct target
+                # state, so retrying the same answer can finish interrupted work.
+                stale_choice = bool(ancestor.returncode or any(path and path not in version_paths
+                    and not path.startswith('.build/') for path in changes.stdout.split('\0')))
+            comparisons = {}
+            accepted_members = {}
+            needs_decision = set()
+            rebuilt: set[str] = set()
+            adjusted_batches = []
+            for target, batch in batches:
+                adjusted = []
+                for item in batch:
+                    reference = item.operation.rsplit('.actions.', 1)[0]
+                    if item.result_schema == 'ceratops-builder-output':
+                        if reference in version_choices and not stale_choice:
+                            parameters = {**dict(item.parameters), 'version': selected_versions[reference]}
+                            prepared_choice = operations.prepare_operations(root, [operations.OperationRequest(item.operation, parameters)],
+                                contract_path, context=context, artifacts=artifacts)[0]
+                            item = replace(prepared_choice, qualification_level=item.qualification_level,
+                                current_version=item.current_version, version_explicit=True)
+                        item = replace(item, build_target=target or dict(item.parameters).get('target', 'native'))
+                    adjusted.append(item)
+                adjusted_batches.append((target, adjusted))
+                available = dict(artifacts or {})
+                remaining = {item.operation.rsplit('.actions.', 1)[0]: item for item in adjusted
+                             if item.result_schema == 'ceratops-builder-output'}
+                while remaining:
+                    ready = [reference for reference, item in remaining.items() if not (build_dependencies(item) & remaining.keys())]
+                    if not ready:
+                        raise operations.OperationError('Build dependency cycle prevents version preparation.')
+                    for reference in ready:
+                        item = remaining.pop(reference)
+                        comparison = recorded_build(item.with_artifacts(available), {
+                            ref: available[ref] for ref in item.artifact_references if ref in available},
+                            supplier_results=supplied_results)
+                        comparison['compared_commit'] = current_commit
+                        comparisons[(item.operation, item.build_target)] = comparison
+                        accepted = comparison['result']
+                        if accepted is not None and not (build_dependencies(item) & rebuilt):
+                            available.update(accepted['artifacts'])
+                            accepted_members[(reference, item.build_target)] = accepted
+                        else:
+                            comparison['result'] = None
+                            rebuilt.add(reference)
+                            if stale_choice or (not item.version_explicit and
+                                    (not item.current_version or Version(item.current_version).pre is None)):
+                                needs_decision.add(reference)
+            batches = adjusted_batches
+            for name in dict.fromkeys(bundles):
+                reference = 'repository.release-bundles.' + name
+                current = current_versions[reference]
+                if reference not in version_choices and (not current or Version(current).pre is None):
+                    previous_builds = sdlc_results.select_build_check_summaries(root, unit=sdlc_results.artifact_storage_key(bundle=name))
+                    unchanged = bool(previous_builds) and not (set(bundle_declarations[name]['members']) & rebuilt)
+                    if unchanged:
+                        unchanged = all({member['deliverable'] for member in record['receipt']['members']}
+                            == set(bundle_declarations[name]['members']) for record in previous_builds)
+                    if not unchanged:
+                        needs_decision.add(reference)
+                if stale_choice:
+                    needs_decision.add(reference)
+            if needs_decision:
+                questions = []
+                for reference in sorted(needs_decision):
+                    key = (sdlc_results.artifact_storage_key(bundle=reference.removeprefix('repository.release-bundles.'))
+                           if reference.startswith('repository.release-bundles.')
+                           else sdlc_results.artifact_storage_key(deliverable=reference))
+                    previous_builds = sdlc_results.select_build_check_summaries(root, qualification_level='final', unit=key)
+                    release = max(previous_builds, key=lambda record: Version(record['receipt']['identity']['version']), default=None)
+                    # With no release, show all tracked source as the initial
+                    # product, not just the most recent commit's changes.
+                    from ceratops_repo_compatibility_engine.sdlc_contract_validation import deliverable_source_files
+
+                    related = (bundle_declarations[reference.removeprefix('repository.release-bundles.')]['members']
+                               if reference.startswith('repository.release-bundles.') else [reference])
+                    owned_paths = {path for member in related for path in deliverable_source_files(root,
+                        declaration['deliverables'][member.split('.')[1]][member.split('.')[2]], include_deleted=True)}
+                    source = owners[reference]['version']
+                    paths = sorted(owned_paths | set([source['file']] if 'file' in source else source.get('files', []))
+                                   | {str(contract_path or operations.DEFAULT_CONTRACT)})
+                    if release:
+                        paths = sorted(set(paths) | {item['path'] for item in release['receipt']['artifactInputs'] if item['root'] == 'git'})
+                    if release:
+                        base = release['tag']
+                    else:
+                        empty = _git(root, 'hash-object', '-t', 'tree', '--stdin', input='')
+                        _require_command(empty, root=root)
+                        base = empty.stdout.strip()
+                    files = _git(root, 'diff', '--name-status', '--no-renames', base, '--', *paths)
+                    diff = _git(root, 'diff', '--no-ext-diff', '--no-renames', base, '--', *paths)
+                    _require_command(files, root=root)
+                    _require_command(diff, root=root)
+                    untracked = _git(root, 'ls-files', '--others', '--exclude-standard', '-z', '--', *paths)
+                    _require_command(untracked, root=root)
+                    questions.append({'reference': reference, 'current_version': current_versions[reference],
+                        'previous_release': None if release is None else {'version': release['receipt']['identity']['version'], 'tag': release['tag']},
+                        'changed_files': files.stdout.splitlines() + ['A\t' + name for name in untracked.stdout.split('\0') if name],
+                        'diff': diff.stdout, 'new_files': {name: (root / name).read_text(encoding='utf-8', errors='replace')
+                            for name in untracked.stdout.split('\0') if name},
+                        'choices': ['keep-base', 'patch', 'minor', 'major', 'exact-version']})
+                return {'status': 'version_decision_required', 'source_commit': current_commit,
+                    'message': 'Recommend whether to bump and the exact version for each requested decision.',
+                    'version_decisions': questions, 'completed_operations': [], 'pending_operations': requested_operations,
+                    'answer_schema': {'version_source_commit': current_commit,
+                        'version_choices': {question['reference']: {'version': '<recommended complete version>'} for question in questions}}}
             result = {"status": "completed", "results": [], "completed_operations": [], "pending_operations": []}
             build_context: dict[str, Any] = {"transactions": {}, "prepared": {}, "receipts": {}, "contract_path": contract_path,
-                             "targets": {}, "supplied_results": supplied_results}
+                             "targets": {}, "supplied_results": supplied_results, 'comparisons': comparisons}
+            bundle_versions = {name: selected_versions['repository.release-bundles.' + name] for name in bundles}
+            bundle_transactions = {}
+            for name, version in bundle_versions.items():
+                reference = 'repository.release-bundles.' + name
+                product = bundle_declarations[name]
+                key = sdlc_results.artifact_storage_key(bundle=name)
+                targets = [target or 'native' for target, _ in batches]
+                unchanged = True
+                for target in targets:
+                    previous_builds = sdlc_results.select_build_check_summaries(root, unit=key, target=target,
+                                                                        qualification_level=qualification_level)
+                    old = previous_builds[0]['receipt'] if previous_builds else None
+                    unchanged = unchanged and old is not None and (
+                        reference not in version_choices or old['identity']['version'] == version)
+                    if old is not None:
+                        unchanged = unchanged and {item['deliverable']: item['identity'] for item in old['members']} == {
+                            member: accepted_members.get((member, target), {}).get('artifact_identity') for member in product['members']}
+                if unchanged:
+                    continue
+                source = product['version']
+                paths = [source['file']] if 'file' in source else list(source.get('files', []))
+                contract_relative = (root / (contract_path or operations.DEFAULT_CONTRACT)).resolve().relative_to(root).as_posix()
+                allocation = store_artifacts.allocate_artifact_version(root,
+                    repository=pathlib.Path(reuse_operation_checks._git(root, 'rev-parse', '--path-format=absolute', '--git-common-dir').strip()).parent.name,
+                    release_bundle=key, version=version, required_targets=targets,
+                    declared_input_paths=[contract_relative, *paths])
+                if not isinstance(allocation, store_artifacts.ArtifactVersionTransaction):
+                    _commit_source(allocation, paths, declaration=product, reference=reference)
+                    # Members still have to write their own independent versions.
+                    # Bind the bundle's source commit when gathering the finished
+                    # members, so it contains the version files they built from.
+                bundle_transactions[name] = allocation
+                bundle_versions[name] = allocation.version
             for target, batch in batches:
                 for item in batch:
                     if item.category == "build":
@@ -301,9 +611,9 @@ def execute_build(
                 # versions. Membership alone never starts an extra build or check.
                 if bundle_versions:
                     contract = operations.read_repository_contract(root, contract_path)
-                    bundles = contract.get("repository", {}).get("release-bundles", {})
+                    bundle_declarations = contract.get("repository", {}).get("release-bundles", {})
                     for name, version in bundle_versions.items():
-                        declaration = bundles.get(name)
+                        declaration = bundle_declarations.get(name)
                         if declaration is None:
                             raise operations.OperationError(f"Unknown release bundle: {name}")
                         bundle_key = sdlc_results.artifact_storage_key(bundle=name)
@@ -333,7 +643,8 @@ def execute_build(
                             previous = next((value for value in sdlc_results.select_build_check_summaries(
                                 root, qualification_level=qualification_level, target=target)
                                 if sdlc_results.receipt_storage_key(value["receipt"]["identity"]) == bundle_key), None)
-                            if previous and previous["receipt"].get("members") == members:
+                            if (name not in bundle_transactions and previous
+                                    and previous["receipt"].get("members") == members):
                                 identity = previous["receipt"]["identity"]
                                 request = store_artifacts._artifact_store_path(root, temporary=True) / bundle_key / identity["version"] / "build_request.json"
                                 if request.is_file():
@@ -344,14 +655,14 @@ def execute_build(
                                 result.setdefault("bundles", []).append({"name": name, "target": target,
                                     "version": previous["receipt"]["identity"]["version"], "tag": previous["tag"], "decision": "reused"})
                                 continue
-                            allocation = store_artifacts.allocate_artifact_version(
-                                root, repository=pathlib.Path(reuse_operation_checks._git(
-                                    root, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()).parent.name,
-                                release_bundle=bundle_key, version=version,
-                                required_targets=[value["target"] or "native" for value in finished],
-                                declared_input_paths=[pathlib.Path(contract_path or operations.DEFAULT_CONTRACT).as_posix()])
-                            transaction = allocation if isinstance(allocation, store_artifacts.ArtifactVersionTransaction) else store_artifacts.bind_artifact_inputs(
-                                allocation, pre_test_commit=operations.repository_commit(root) or "")
+                            transaction = bundle_transactions[name]
+                            if not isinstance(transaction, store_artifacts.ArtifactVersionTransaction):
+                                bundle_commit = operations.repository_commit(root)
+                                if bundle_commit is None:
+                                    raise operations.OperationError('Bundle completion requires its committed source.')
+                                transaction = store_artifacts.bind_artifact_inputs(
+                                    transaction, pre_test_commit=bundle_commit)
+                                bundle_transactions[name] = transaction
                             receipt_path = transaction.receipt_path(target)
                             receipt = {
                                 "schema": sdlc_results.COMMITTED_BUILD_RECEIPT_SCHEMA, "status": "passed",
@@ -370,8 +681,16 @@ def execute_build(
                                 if saved["members"] != members:
                                     raise operations.OperationError("Prepared bundle names a different member combination.")
                             else:
+                                # Member receipts already keep each package's
+                                # original test results. Combining those with
+                                # today's repository checks would give one test
+                                # several different input versions. The bundle
+                                # references the members and saves only the
+                                # checks from this bundle assembly here.
                                 prepared_receipt = complete_artifact_builds.prepare_versioned_build_receipt(
-                                    transaction, target, receipt, check_summaries=_summaries(batch))
+                                    transaction, target, receipt, check_summaries=_summaries({"results": [
+                                        value for value in batch["results"]
+                                        if not value.get("operation", "").endswith(".actions.build")]}))
                             pending.setdefault(bundle_key, (transaction, []))[1].append(prepared_receipt)
                             result.setdefault("bundles", []).append({"name": name, "target": target,
                                 "version": transaction.version, "tag": f"{bundle_key}/{transaction.version}", "decision": "built"})

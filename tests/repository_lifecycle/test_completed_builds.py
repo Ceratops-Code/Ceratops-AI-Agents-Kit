@@ -15,6 +15,120 @@ from unittest.mock import DEFAULT, Mock
 
 import pytest
 
+
+@pytest.mark.parametrize("mode", ["json", "toml", "command", "shell", "receipt-only"])
+@pytest.mark.parametrize("owner", ["deliverables.packages.claims", "repository.release-bundles.suite"])
+def test_declared_version_source_and_decision(tmp_path, capsys, mode, owner):
+    flow = importlib.import_module("execute_worktree_build")
+    if mode == "shell" and not shutil.which("pwsh"):
+        pytest.skip("PowerShell declaration requires pwsh")
+    root, _ = _worktree_build_case(tmp_path)
+    path = root / "version.json"
+    path.write_text('{"release":{"version":"1.2.3b1"},"unrelated":42}\n', encoding="utf-8")
+    declaration = {"version": {"file": path.name, "field": "release.version"}}
+    if mode == "toml":
+        path = root / "release.toml"
+        path.write_text('# retained comment\n[release]\nversion="1.2.3b1"\nother=42\n', encoding="utf-8")
+        declaration["version"] = {"file": path.name, "field": "release.version"}
+    elif mode in {"command", "shell"}:
+        if mode == "command":
+            (root / "scripts/version.py").write_text(
+                "import json,pathlib,sys\np=pathlib.Path('version.json'); d=json.loads(p.read_text())\n"
+                "if sys.argv[1]=='write':\n d['release']['version']=sys.argv[2]; p.write_text(json.dumps(d))\n"
+                "else: print(d['release']['version'])\n", encoding="utf-8")
+            read = ["{python}", "scripts/version.py", "read"]
+            write = ["{python}", "scripts/version.py", "write", "{version}"]
+        else:
+            (root / "scripts/version.ps1").write_text(
+                "param([string]$Version)\n$d=Get-Content -Raw version.json | ConvertFrom-Json\n"
+                "$d.release.version=$Version; $d | ConvertTo-Json -Depth 5 | Set-Content version.json\n")
+            read = ["pwsh", "-NoProfile", "-Command",
+                    "(Get-Content -Raw version.json | ConvertFrom-Json).release.version"]
+            write = ["pwsh", "-NoProfile", "-File", "scripts/version.ps1", "{version}"]
+        declaration["version"] = {"read": read, "write": write, "files": [path.name]}
+    elif mode == "receipt-only":
+        declaration["version"] = {"mode": "receipt-only"}
+        assert flow.read_declared_version(root, declaration, reference=owner) is None
+        assert flow.write_declared_version(root, declaration, "2.0.0b1", reference=owner) == []
+        return
+    assert flow.read_declared_version(root, declaration, reference=owner) == "1.2.3b1"
+    assert flow.write_declared_version(root, declaration, "2.0.0b1", reference=owner) == [path.name]
+    first = path.read_bytes()
+    flow.write_declared_version(root, declaration, "2.0.0b1", reference=owner)
+    assert path.read_bytes() == first
+    assert flow.read_declared_version(root, declaration, reference=owner) == "2.0.0b1"
+    assert b"42" in first
+    for version in ("3.7.10-autopsy.17", "26.1103.3517.0"):
+        flow.write_declared_version(root, declaration, version, reference=owner)
+        assert flow.read_declared_version(root, declaration, reference=owner) == version
+    if mode == "toml":
+        assert b"# retained comment" in first
+    if mode != "toml" or owner != "deliverables.packages.claims":
+        return
+    ref = "deliverables.packages.claims"
+    original_head = run_git(root, "rev-parse", "HEAD").stdout.strip()
+    manifest = (root / "pyproject.toml").read_bytes()
+    argv = ["--repo-root", str(root), "--operation", ref + ".actions.build",
+            "--qualification-level", "beta", "--parameter", "target=native"]
+    assert runner.main(argv) == 2
+    decision = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert decision["status"] == "version_decision_required"
+    assert decision["version_decisions"][0]["current_version"] == "1.2.19"
+    assert decision["version_decisions"][0]["changed_files"]
+    assert "next_command" in decision
+    assert run_git(root, "rev-parse", "HEAD").stdout.strip() == original_head
+    assert (root / "pyproject.toml").read_bytes() == manifest
+    assert not (root / ".build-count").exists()
+    assert not list(storage._artifact_store_path(root, temporary=True).rglob("build_request.json"))
+    choice = json.dumps({ref: {"version": "2.0.0b1"}})
+    assert runner.main([*argv, "--version-source-commit", original_head, "--version-choices", choice]) == 0
+    completed = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert completed["status"] == "completed", completed
+    assert "2.0.0b1" in (root / "pyproject.toml").read_text()
+    assert (root / ".build-count").read_text() == "x"
+    assert run_git(root, "diff", "--cached", "--name-only").stdout.strip() == "unrelated.txt"
+    assert runner.main([*argv, "--version-choices", choice]) == 0
+    capsys.readouterr()
+    assert (root / ".build-count").read_text() == "x"
+    assert runner.main([*argv, "--version-choices", json.dumps({ref: {"version": "3.0.0b1"}})]) == 0
+    capsys.readouterr()
+    assert (root / ".build-count").read_text() == "xx"
+
+
+@pytest.mark.parametrize("mode", ["json", "command"])
+@pytest.mark.parametrize("timing", ["before", "after"])
+def test_version_write_repeats_after_interruption(tmp_path, monkeypatch, mode, timing):
+    flow = importlib.import_module("execute_worktree_build")
+    path = tmp_path / "package.json"
+    path.write_text('{"version":"1.0.0","kept":true}\n')
+    source = {"file": path.name, "field": "version"}
+    if mode == "command":
+        source = {"read": [sys.executable, "-c", "import json; print(json.load(open('package.json'))['version'])"],
+                  "write": [sys.executable, "-c", "import json,pathlib,sys; p=pathlib.Path('package.json'); "
+                            "d=json.loads(p.read_text()); d['version']=sys.argv[1]; p.write_text(json.dumps(d))",
+                            "{version}"], "files": [path.name]}
+    declaration = {"version": source}
+    with monkeypatch.context() as patch:
+        if timing == "after":
+            patch.setattr(flow, "read_declared_version", Mock(side_effect=KeyboardInterrupt))
+        elif mode == "json":
+            patch.setattr(flow.os, "replace", Mock(side_effect=KeyboardInterrupt))
+        else:
+            patch.setattr(flow.release_lock_module(), "run_protected_command", Mock(side_effect=KeyboardInterrupt))
+        with pytest.raises(KeyboardInterrupt):
+            flow.write_declared_version(tmp_path, declaration, "2.0.0", reference="repository.release-bundles.suite")
+    assert json.loads(path.read_text())["version"] == ("2.0.0" if timing == "after" else "1.0.0")
+    unfinished = path.with_name(".package.json.in_process")
+    if mode == "json":
+        unfinished.write_bytes(b"interrupted partial JSON")
+    flow.write_declared_version(tmp_path, declaration, "2.0.0", reference="repository.release-bundles.suite")
+    assert json.loads(path.read_text()) == {"version": "2.0.0", "kept": True}
+    assert not unfinished.exists()
+    repeated = path.read_bytes()
+    flow.write_declared_version(tmp_path, declaration, "2.0.0", reference="repository.release-bundles.suite")
+    assert path.read_bytes() == repeated
+
+
 from tests.repository_lifecycle.test_sdlc_handoffs import (
     _bound_test_build,
     _checkpoint_child,
@@ -107,6 +221,7 @@ def _worktree_build_case(tmp_path):
         "deliverables": {"packages": {"claims": {
             "root-dir": "src", "additional-source-files": ["pyproject.toml", "scripts/build.py"],
             "project": "pyproject.toml", "build-after": [],
+            "version": {"file": "pyproject.toml", "field": "project.version"},
             "artifact": {"type": "python-wheel", "distribution": "claims", "output-directory": "dist", "filename-pattern": "*.whl"},
             "actions": {"build": {"requires": {"tools": []}, "result-schema": "ceratops-builder-output",
                 "parameters": ["version", "artifact_directory", "target"],
@@ -174,7 +289,7 @@ def test_release_build_consumes_existing_tagged_receipt_without_starting_builder
     contract_path = repository / runner.DEFAULT_CONTRACT
     contract = json.loads(contract_path.read_text())
     reference = "deliverables.packages.claims"
-    contract["repository"]["release-bundles"] = {"claims": {"members": [reference]}}
+    contract["repository"]["release-bundles"] = {"claims": {"version": {"mode": "receipt-only"}, "members": [reference]}}
     action = contract["deliverables"]["packages"]["claims"]["actions"]["build"]
     action["steps"][0]["run"].append("{target}")
     contract_path.write_text(json.dumps(contract))
@@ -840,10 +955,12 @@ def test_build_recipe_and_independent_member_versions(tmp_path, capsys):
     engine = json.loads(json.dumps(tool))
     engine.update({"root-dir": "engine", "project": "engine/pyproject.toml",
                    "additional-source-files": ["scripts/engine.py"]})
+    engine["version"] = {"file": "engine/pyproject.toml", "field": "project.version"}
     engine["actions"]["build"]["steps"][0]["run"][1] = "scripts/engine.py"
     contract["deliverables"]["packages"]["engine"] = engine
-    contract["repository"]["release-bundles"] = {"suite": {"members": [
+    contract["repository"]["release-bundles"] = {"suite": {"version": {"file": "suite.json", "field": "version"}, "members": [
         "deliverables.packages.claims", "deliverables.packages.engine"]}}
+    _write_fixture_bytes(repository, "suite.json", b'{"version":"2.0.0","kept":true}\n')
     _write_fixture_bytes(repository, "engine/pyproject.toml", b'[project]\nname="engine"\nversion="3.2.0"\n')
     engine_code = (repository / "scripts/build.py").read_text().replace(
         "pyproject.toml", "engine/pyproject.toml").replace(".build-count", ".engine-count")
@@ -857,7 +974,11 @@ def test_build_recipe_and_independent_member_versions(tmp_path, capsys):
         runner.OperationRequest("deliverables.packages.claims.actions.build", {"version": "1.4.0", "target": "native"}),
         runner.OperationRequest("deliverables.packages.engine.actions.build", {"version": "3.2.0", "target": "native"}),
     ]
-    first = runner.execute_build(repository, requests, qualification_level="final", bundle_versions={"suite": "2.0.0"})
+    review = runner.execute_build(repository, requests, qualification_level="final", bundles=["suite"])
+    assert review["status"] == "version_decision_required", review
+    assert [item["reference"] for item in review["version_decisions"]] == ["repository.release-bundles.suite"]
+    assert not (repository / ".build-count").exists()
+    first = runner.execute_build(repository, requests, qualification_level="final", bundles=["suite"], version_choices={"repository.release-bundles.suite": {"version": "2.0.0"}})
     assert first["status"] == "completed", first
     bundle = results.read_artifact_receipt_chain(repository, tag="bundles/suite/2.0.0",
         expected=results.artifact_identity(repository.name, "bundles/suite", "2.0.0", "native"))
@@ -871,7 +992,7 @@ def test_build_recipe_and_independent_member_versions(tmp_path, capsys):
 
     (repository / "src/claims.py").write_text("VALUE = 'changed package'\n")
     requests[0] = runner.OperationRequest(requests[0].operation, {"version": "1.4.1", "target": "native"})
-    second = runner.execute_build(repository, requests, qualification_level="final", bundle_versions={"suite": "2.0.1"})
+    second = runner.execute_build(repository, requests, qualification_level="final", bundles=["suite"], version_choices={"repository.release-bundles.suite": {"version": "2.0.1"}})
     assert second["status"] == "completed", second
     newer = results.read_artifact_receipt_chain(repository, tag="bundles/suite/2.0.1",
         expected=results.artifact_identity(repository.name, "bundles/suite", "2.0.1", "native"))
@@ -879,7 +1000,14 @@ def test_build_recipe_and_independent_member_versions(tmp_path, capsys):
     assert newer.members[1].build_receipt.raw == original_engine
     assert (repository / ".engine-count").read_text() == "x"
     assert (repository / ".build-count").read_text() == "xx"
-    repeated = runner.execute_build(repository, requests, qualification_level="final", bundle_versions={"suite": "2.0.1"})
+    assert json.loads((repository / "suite.json").read_text()) == {"version": "2.0.1", "kept": True}
+    bumped = runner.execute_build(repository, requests, qualification_level="final", bundles=["suite"],
+                                 version_choices={"repository.release-bundles.suite": {"bump": "minor"}})
+    assert bumped["status"] == "completed", bumped
+    assert bumped["bundles"][0]["version"] == "2.1.0"
+    assert (repository / ".engine-count").read_text() == "x"
+    assert (repository / ".build-count").read_text() == "xx"
+    repeated = runner.execute_build(repository, requests, qualification_level="final", bundles=["suite"])
     assert repeated["status"] == "completed", repeated
     assert repeated["bundles"][0]["decision"] == "reused"
     assert (repository / ".engine-count").read_text() == "x"
@@ -931,7 +1059,7 @@ def test_grouped_completion_interruption(tmp_path, monkeypatch, effect):
     path = repository / runner.DEFAULT_CONTRACT
     contract = json.loads(path.read_text())
     contract["repository"]["release-bundles"] = {
-        "suite": {"members": ["deliverables.packages.claims"]}}
+        "suite": {"version": {"mode": "receipt-only"}, "members": ["deliverables.packages.claims"]}}
     path.write_text(json.dumps(contract))
     assert run_git(repository, "add", "sdlc/sdlc.yml").returncode == 0
     assert run_git(repository, "commit", "--only", "-m", "bundle", "--", "sdlc/sdlc.yml").returncode == 0
@@ -943,11 +1071,11 @@ def test_grouped_completion_interruption(tmp_path, monkeypatch, effect):
     with monkeypatch.context() as patch:
         patch.setattr(completion, name, Mock(wraps=getattr(completion, name), side_effect=sequence))
         with pytest.raises(KeyboardInterrupt, match="group interrupted"):
-            unexpected = runner.execute_build(repository, **options, bundle_versions={"suite": "2.0.0b1"})
+            unexpected = runner.execute_build(repository, **options, bundles=["suite"], version_choices={"repository.release-bundles.suite": {"version": "2.0.0b1"}})
             assert unexpected["status"] == "completed", json.dumps(unexpected, indent=2)
-    finished = runner.execute_build(repository, **options, bundle_versions={"suite": "2.0.0b1"})
+    finished = runner.execute_build(repository, **options, bundles=["suite"], version_choices={"repository.release-bundles.suite": {"version": "2.0.0b1"}})
     assert finished["status"] == "completed", finished
-    repeated = runner.execute_build(repository, **options, bundle_versions={"suite": "2.0.0b1"})
+    repeated = runner.execute_build(repository, **options, bundles=["suite"], version_choices={"repository.release-bundles.suite": {"version": "2.0.0b1"}})
     assert repeated["status"] == "completed", repeated
     selected = results.read_artifact_receipt_chain(repository, tag="bundles/suite/2.0.0b1",
         expected=results.artifact_identity(repository.name, "bundles/suite", "2.0.0b1", "python-3.14-windows"))

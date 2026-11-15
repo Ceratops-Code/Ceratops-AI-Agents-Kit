@@ -50,6 +50,44 @@ def _repository(repo: pathlib.Path) -> str:
     return run_git(repo, "rev-parse", "HEAD").stdout.strip()
 
 
+@pytest.mark.parametrize("owner", ["member", "bundle"])
+@pytest.mark.parametrize("source", [
+    {"file": "package.json", "field": "version"},
+    {"file": "pyproject.toml", "field": "project.version"},
+    {"read": ["pwsh", "read-version.ps1"], "write": ["pwsh", "write-version.ps1", "{version}"], "files": ["release.psd1"]},
+    {"mode": "receipt-only"},
+])
+def test_deliverable_version_declarations(tmp_path, owner, source):
+    document = _bundle_contract()
+    product = (document["deliverables"]["packages"]["claims"] if owner == "member"
+               else document["repository"]["release-bundles"]["claims"])
+    product["version"] = source
+    assert contracts.validation_errors(document) == []
+    original = deepcopy(source)
+    for invalid in ({}, {"file": "../outside.json", "field": "version"},
+                    {"file": "VERSION", "field": "version"},
+                    {"file": "package.json", "field": "project..version"},
+                    {"read": ["read"], "write": ["write"], "files": ["version.json"]},
+                    {"read": ["read"], "write": ["write", "{version}"], "files": []},
+                    {"mode": "receipt-only", "file": "package.json"}):
+        product["version"] = invalid
+        assert contracts.validation_errors(document), invalid
+    product["version"] = original
+    (tmp_path / "package.json").write_text('{"version":"1.0.0"}\n')
+    _repository(tmp_path)
+    # Use a minimal real repository for path ownership; unrelated bundle
+    # declarations in the schema cases above need no physical fixture tree.
+    minimal: dict[str, Any] = {"version": 5, "kind": "ceratops-sdlc", "repository": {"tools": {}, "actions": {
+        "pre-build-checks": {"check-groups": {"source": {"requires": {"tools": []}, "no-op": "No source checks in this declaration case."}}}}}, "deliverables": {"packages": {
+        "sample": {"root-dir": ".", "build-after": [], "artifact": {"type": "zip", "output-directory": "dist", "filename-pattern": "*.zip"},
+                   "version": {"file": "package.json", "field": "version"},
+                   "actions": {"build": {"requires": {"tools": []}, "steps": [{"run": ["builder"]}]}}}}}}
+    assert contracts.validation_errors(minimal, repo_root=tmp_path) == []
+    (tmp_path / "untracked.json").write_text('{"version":"1.0.0"}')
+    minimal["deliverables"]["packages"]["sample"]["version"]["file"] = "untracked.json"
+    assert any("Git-tracked" in error for error in contracts.validation_errors(minimal, repo_root=tmp_path))
+
+
 @pytest.mark.parametrize("entrypoint", ["ci", "callable"])
 def test_explicit_group_requests_and_whole_phase_run_the_named_commands(tmp_path, entrypoint):
     repo = tmp_path / "repo"
@@ -921,14 +959,15 @@ def _bundle_contract() -> dict[str, Any]:
     document = fixture_with_tools(_typed_contract())
     document["version"] = 5
     document["repository"]["release-bundles"] = {
-        "core": {"members": ["deliverables.packages.core"]},
+        "core": {"version": {"mode": "receipt-only"}, "members": ["deliverables.packages.core"]},
         "claims": {
+            "version": {"mode": "receipt-only"},
             "members": [
                 "deliverables.packages.claims",
                 "deliverables.mcp-servers.insurance-claims-mcp-server",
             ]
         },
-        "desktop": {"members": ["deliverables.apps.claims-mobile"]},
+        "desktop": {"version": {"mode": "receipt-only"}, "members": ["deliverables.apps.claims-mobile"]},
     }
     mcp_server = document["deliverables"]["mcp-servers"]["insurance-claims-mcp-server"]
     mcp_server["project"] = "mcp-servers/insurance-claims-mcp-server/pyproject.toml"
@@ -1093,7 +1132,7 @@ def test_bundle_release_members_support_non_python_artifacts(kind: str, name: st
     reference = f"deliverables.{kind}.{name}"
     units = document["repository"]["release-bundles"]
     if kind in {"skills", "hooks"}:
-        units["extension"] = {"members": [reference]}
+        units["extension"] = {"version": {"mode": "receipt-only"}, "members": [reference]}
     assert contracts.validation_errors(document) == []
     entries = contracts.release_bundle_entries(document)
     owner = next(unit for unit in entries.values() if reference in unit["members"])

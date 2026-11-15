@@ -79,7 +79,7 @@ print(json.dumps({'schema':'ceratops-builder-output','status':'passed',
     'installationArtifactPath':destination.name, 'check_summary':summary}))
 '''.replace('REFERENCES', repr(references)).replace('DEPENDENCIES', repr(dependencies))
     (root / "scripts/product.py").write_text(source)
-    (root / "pyproject.toml").write_text('[project]\nname="fixture"\nversion="1.0.0"\n'.replace("\n", chr(10)))
+    (root / "pyproject.toml").write_text('[project]\nname="fixture"\nversion="1.0.0b1"\n'.replace("\n", chr(10)))
     (root / ".gitignore").write_text(".order\n.outputs/\n.fault\n")
 
     def action(verb, name):
@@ -103,11 +103,12 @@ print(json.dumps({'schema':'ceratops-builder-output','status':'passed',
         record: dict[str, Any] = {"root-dir": name, "additional-source-files": ["scripts/product.py"], "build-after": [references["bridge"]] if name == "desktop" else [],
                   "artifact": {"type": "archive", "output-directory": ".outputs", "filename-pattern": "*.bin"},
                   "actions": {"pre-build-checks": {"check-groups": {'source': fixture_with_tools(_no_op()), 'tests': fixture_with_tools(_no_op())}}, "build": build}}
+        record["version"] = {"file": f"{name}/pyproject.toml", "field": "project.version"}
         (root / name).mkdir()
-        (root / name / "pyproject.toml").write_text(f'[project]\nname="{name}"\nversion="1.0.0"\n'.replace("\n", chr(10)))
+        (root / name / "pyproject.toml").write_text(f'[project]\nname="{name}"\nversion="1.0.0b1"\n'.replace("\n", chr(10)))
         if kind == "packages":
             record["project"] = f"{name}/pyproject.toml"
-            (root / record["project"]).write_text(f'[project]\nname="{name}"\nversion="1.0.0"\n')
+            (root / record["project"]).write_text(f'[project]\nname="{name}"\nversion="1.0.0b1"\n')
         else:
             record["actions"]["install"] = action("install", name) if name == "desktop" else fixture_with_tools(_no_op())
         if kind == "mcp-servers":
@@ -120,7 +121,7 @@ print(json.dumps({'schema':'ceratops-builder-output','status':'passed',
                     "lifecycle": "ceratops-skill-lifecycle", "action": name_of_action, "inputs": {"skill": name}}}]}
         if kind in {"apps", "mcp-servers"}:
             record["manifest"] = f"{name}/pyproject.toml"
-            (root / record["manifest"]).write_text(f'[project]\nname="{name}"\nversion="1.0.0"\n')
+            (root / record["manifest"]).write_text(f'[project]\nname="{name}"\nversion="1.0.0b1"\n')
         data["deliverables"].setdefault(kind, {})[name] = record
     (root / runner.DEFAULT_CONTRACT).write_text(json.dumps(data))
     assert run_git(root, "add", ".").returncode == 0
@@ -384,7 +385,8 @@ elif a.check_group == 'unit-tests':
         "checks": {"compiler-check": {"uses-artifacts": []}},
     }
     document["deliverables"]["packages"]["sample"]["project"] = "pyproject.toml"
-    (root / "pyproject.toml").write_text('[project]\nname="sample"\nversion="1.0.0"\n')
+    document["deliverables"]["packages"]["sample"]["version"] = {"file": "pyproject.toml", "field": "project.version"}
+    (root / "pyproject.toml").write_text('[project]\nname="sample"\nversion="1.0.0b1"\n')
     contract.write_text(json.dumps(document))
     assert run_git(root, "add", ".").returncode == 0
     assert run_git(root, "commit", "-m", "phases").returncode == 0
@@ -527,6 +529,8 @@ def test_build_action_accepts_current_build_reports(tmp_path, contract_version, 
     if contract_version == 5:
         document = fixture_with_tools(document)
     document["version"] = contract_version
+    if contract_version == 5 and schema == "ceratops-builder-output":
+        document["deliverables"]["packages"]["sample"]["version"] = {"mode": "receipt-only"}
     document["deliverables"]["packages"]["sample"]["actions"]["build"]["result-schema"] = schema
     path.write_text(json.dumps(fixture_with_tools(document) if document["version"] == 5 else document))
     prepared = runner.prepare_operations(tmp_path, [
@@ -1446,6 +1450,7 @@ def test_build_comparison_and_exact_artifact_groups(tmp_path, monkeypatch, chang
         (repository / "src/package.json").write_text('{"name":"other","version":"1.0.0b1"}')
         declaration["deliverables"]["packages"]["other"] = {
             "root-dir": "src", "project": "src/package.json", "build-after": [],
+            "version": {"file": "src/package.json", "field": "version"},
             "artifact": {"type": "python-wheel", "distribution": "other",
                          "output-directory": "dist", "filename-pattern": "*.whl"},
             "actions": {"build": {

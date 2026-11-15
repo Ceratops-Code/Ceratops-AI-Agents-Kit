@@ -1178,6 +1178,16 @@ def test_promotion_passes_accepted_package_to_install(tmp_path, monkeypatch):
     task = tmp_path / "task"
     assert run_git(repo, "worktree", "add", "-b", "approved", str(task)).returncode == 0
     command = [sys.executable, str(PROMOTE_REPOSITORY), "--repo-root", str(task), "--source-branch", "approved"]
+    before = run_git(repo, "rev-parse", "release/local").stdout.strip()
+    review = subprocess.run([*command, "--no-run-operation"], capture_output=True, text=True, check=False)
+    assert review.returncode == 2, (review.stdout, review.stderr)
+    decision = json.loads(review.stdout)
+    assert decision["status"] == "version_decision_required"
+    assert decision["version_decisions"][0]["current_version"] == "1.2.19"
+    assert run_git(repo, "rev-parse", "release/local").stdout.strip() == before
+    assert not (task / ".build-count").exists()
+    assert "next_command" in decision
+    command.extend(["--version-choices", json.dumps({"deliverables.packages.claims": {"version": "1.2.19b1"}})])
     plain = subprocess.run([*command, "--no-run-operation"], capture_output=True, text=True, check=False)
     assert plain.returncode == 0, plain.stderr
     assert json.loads(plain.stdout)["operations"] is None

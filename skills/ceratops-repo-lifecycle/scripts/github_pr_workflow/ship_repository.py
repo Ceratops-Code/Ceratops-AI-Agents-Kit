@@ -80,6 +80,8 @@ class ShipOptions:
     validation_operation: list[str] | None = None
     publish_operation: list[str] | None = None
     deploy_operation: list[str] | None = None
+    version_choices: dict[str, dict[str, str]] | None = None
+    version_source_commit: str | None = None
     ci_wait_seconds: int = 1800
     review_wait_seconds: int = 260
     review_replies_request: pathlib.Path | None = None
@@ -480,6 +482,8 @@ def _checkpointed_operation_batch(
     target_branch: str,
     target_commit: str,
     synchronized_commit: str,
+    version_choices: dict[str, dict[str, str]] | None = None,
+    version_source_commit: str | None = None,
     validation_operations: list[str] | None = None,
     diagnostic_output: pathlib.Path | None = None,
     diagnostic_owner: tuple[pathlib.Path, str] | None = None,
@@ -538,7 +542,11 @@ def _checkpointed_operation_batch(
                 validation_operations=validation_operations,
                 diagnostic_output=diagnostic_output, diagnostic_owner=diagnostic_owner,
                 successful_results=completed_results,
+                version_choices=version_choices, version_source_commit=version_source_commit,
             )
+            if batch["status"] == "version_decision_required":
+                return 2, {**batch, "completed_operations": operations[:first_pending + offset],
+                           "pending_operations": operations[first_pending + offset:]}, checkpoints
             if batch["status"] in FAILED_STATUSES:
                 return 1, {**batch, "completed_operations": operations[:first_pending + offset],
                            "pending_operations": operations[first_pending + offset:]}, checkpoints
@@ -1200,12 +1208,15 @@ def ship_repository(args: ShipOptions) -> dict[str, object]:
                         target_branch=args.head_branch,
                         target_commit=target_commit,
                         synchronized_commit=synchronized_head,
+                        version_choices=args.version_choices, version_source_commit=args.version_source_commit,
                         validation_operations=args.validation_operation,
                         diagnostic_output=getattr(args, "diagnostic_output", None),
                         diagnostic_owner=getattr(args, "diagnostic_owner", None) or (args.repo_root, "ship"),
                     )
                 )
                 operation_checkpoints.extend(release_checkpoints)
+                if release_code == 2:
+                    return {**release_publication, "phase": "release_publication", "remote_mutation": True}
                 if release_code:
                     raise RepositoryShipError(
                         str(
@@ -1240,12 +1251,15 @@ def ship_repository(args: ShipOptions) -> dict[str, object]:
                         target_branch=args.head_branch,
                         target_commit=target_commit,
                         synchronized_commit=synchronized_head,
+                        version_choices=args.version_choices, version_source_commit=args.version_source_commit,
                         validation_operations=args.validation_operation,
                         diagnostic_output=getattr(args, "diagnostic_output", None),
                         diagnostic_owner=getattr(args, "diagnostic_owner", None) or (args.repo_root, "ship"),
                     )
                 )
                 operation_checkpoints.extend(deployment_checkpoints)
+                if deploy_code == 2:
+                    return {**deployment, "phase": "deployment", "remote_mutation": True}
                 if deploy_code:
                     raise RepositoryShipError(
                         str(deployment.get("message", "Deployment failed.")),

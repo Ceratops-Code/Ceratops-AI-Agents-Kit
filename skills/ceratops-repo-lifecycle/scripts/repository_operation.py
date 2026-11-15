@@ -140,6 +140,8 @@ class PreparedOperation:
     build_source_files: tuple[str, ...] = ()
     build_target: str | None = None
     automatic_check: bool = False
+    current_version: str | None = None
+    version_explicit: bool = False
     install_from_build: bool = False
     installation: Mapping[str, Any] | None = None
     install_input_file: pathlib.Path | None = None
@@ -1112,6 +1114,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repo-root", type=pathlib.Path, default=pathlib.Path.cwd())
     parser.add_argument("--sdlc-contract", type=pathlib.Path, default=DEFAULT_CONTRACT)
     parser.add_argument("--artifacts", help="JSON mapping deliverable references to exact built file-path arrays.")
+    parser.add_argument("--bundle", action="append", default=[], help="Release bundle to build; repeat for additional bundles.")
+    parser.add_argument("--version-choices", type=json.loads, help="JSON mapping deliverable or bundle references to version choices.")
+    parser.add_argument("--version-source-commit", help="Source commit used for the model's version recommendation.")
     parser.add_argument(
         "--operation",
         action="append",
@@ -1205,7 +1210,7 @@ def main(argv: list[str] | None = None) -> int:
             if operation_category(name) not in {"pre-build-checks", "post-build-checks"}:
                 raise OperationError("Check requests must name pre-build-checks or post-build-checks groups.")
             requests.append(OperationRequest(name, parameters, conditional, args.if_declared))
-        scheduled = any(operation_category(request.operation) in MUTATION_CATEGORIES | {"post-build-checks"}
+        scheduled = bool(args.bundle) or any(operation_category(request.operation) in MUTATION_CATEGORIES | {"post-build-checks"}
                         for request in requests)
         prepared = [] if scheduled else prepare_operations(
             root, requests, args.sdlc_contract, context=context, artifacts=artifacts,
@@ -1218,7 +1223,13 @@ def main(argv: list[str] | None = None) -> int:
                 diagnostic_output=args.diagnostic_output,
                 diagnostic_owner=(args.diagnostic_repo_root or root, args.diagnostic_action),
                 confirm_stopped=args.confirm_previous_commands_stopped, prepare_only=args.prepare_only,
+                bundles=args.bundle, version_choices=args.version_choices,
+                version_source_commit=args.version_source_commit,
             )
+            if result.get("status") == "version_decision_required":
+                result["next_command"] = [sys.executable, str(pathlib.Path(__file__).resolve()),
+                    *(argv if argv is not None else sys.argv[1:]), "--version-source-commit",
+                    result["source_commit"], "--version-choices", json.dumps(result["answer_schema"]["version_choices"])]
             return finish_operation_request(args, result)
         # Explicit check requests do not pull in sibling groups. Build/delivery
         # requests above still expand their required checks and prerequisite builds.
@@ -1279,7 +1290,7 @@ def finish_operation_request(args, result) -> int:
         json.dumps(result, separators=(",", ":")),
         file=sys.stderr if failed else sys.stdout,
     )
-    return 1 if failed else 0
+    return 1 if failed else (2 if result.get("status") == "version_decision_required" else 0)
 
 
 if __name__ == "__main__":

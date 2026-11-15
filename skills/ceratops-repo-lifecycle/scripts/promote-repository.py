@@ -152,6 +152,8 @@ def _ship_after_promotion(
         title=getattr(args, "title", None),
         body=getattr(args, "body", None),
         validation_operation=args.validation_operation,
+        version_choices=getattr(args, "version_choices", None),
+        version_source_commit=getattr(args, "version_source_commit", None),
         publish_operation=_operation_ids(args.publish_operation, "publish"),
         deploy_operation=_operation_ids(args.deploy_operation, "deploy-local"),
         diagnostic_output=getattr(args, "diagnostic_output", None),
@@ -161,6 +163,8 @@ def _ship_after_promotion(
         shipped = repository_ship.ship_repository(request)
     except (repository_ship.RepositoryShipError, CommandError, OperationError, OSError, ValueError) as exc:
         raise PromotionError(str(exc), describe_command_failure(exc)) from exc
+    if shipped.get("status") == "version_decision_required":
+        return shipped
     if shipped.get("status") == "pending_work":
         if not isinstance(shipped.get("findings"), list):
             raise PromotionError("Shipping returned an incomplete pending-work blocker.")
@@ -349,9 +353,16 @@ def promote(args: argparse.Namespace, *, timings: dict[str, float] | None = None
                                   "commit": git_branches._branch_head(task_root, task_branch)},
                     validation_operations=args.validation_operation, run_delivery=False,
                     successful_results=previous_results,
+                    bundles=getattr(args, "bundle", ()) or (),
+                    version_choices=getattr(args, "version_choices", None),
+                    version_source_commit=getattr(args, "version_source_commit", None),
                     diagnostic_output=getattr(args, "diagnostic_output", None),
                     diagnostic_owner=(args.repo_root, "promote"),
                 )
+            if validation["status"] == "version_decision_required":
+                return {**validation, "release_branch": args.release_branch,
+                        "head": observed_release, "task_worktree": str(task_root),
+                        "remote_mutation": False}
             if validation["status"] != "completed" or validation.get("deferred_handoffs"):
                 failed_commit = git_branches._branch_head(task_root, task_branch)
                 matching_sources = [name for name, state in source_states.items() if state.head == failed_commit]
@@ -594,6 +605,8 @@ def _result_summary(
     result: dict[str, object], path: pathlib.Path, digest: str, *, failed: bool,
 ) -> dict[str, object]:
     """Point to a published outcome without duplicating checks or receipts."""
+    if result.get("status") == "version_decision_required":
+        return {**result, "result_file": str(path), "result_sha256": digest}
     summary: dict[str, object] = {
         key: result[key] for key in (
             "status", "phase", "operation", "release_branch", "head", "commit",
@@ -872,6 +885,9 @@ def finalize_result(args: argparse.Namespace) -> None:
         args.publish_operation,
         args.deploy_operation,
         args.parameter,
+        getattr(args, "bundle", None),
+        getattr(args, "version_choices", None),
+        getattr(args, "version_source_commit", None),
         args.title,
         args.body,
     )
@@ -979,6 +995,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--repo-root", type=pathlib.Path, default=pathlib.Path.cwd())
     parser.add_argument("--source-branch", action="append")
+    parser.add_argument("--bundle", action="append", default=[])
+    parser.add_argument("--version-choices", type=json.loads)
+    parser.add_argument("--version-source-commit")
     parser.add_argument("--diagnostic-output", type=pathlib.Path,
                         help="Stable task-owned file for complete failure details.")
     parser.add_argument(
@@ -1122,6 +1141,11 @@ def main(argv: list[str] | None = None) -> int:
             result_file = requested
             report_repo_root = operation_report_root(args.repo_root)
         result = promote(args, timings=timings)
+        if result.get("status") == "version_decision_required":
+            answer: Any = result["answer_schema"]
+            result["next_command"] = [sys.executable, str(pathlib.Path(__file__).resolve()),
+                *(argv if argv is not None else sys.argv[1:]), "--version-source-commit",
+                result["source_commit"], "--version-choices", json.dumps(answer["version_choices"])]
     except (
         CommandError,
         OperationError,
@@ -1161,7 +1185,7 @@ def main(argv: list[str] | None = None) -> int:
         json.dumps(public_result, separators=(",", ":")),
         file=sys.stderr if failed else sys.stdout,
     )
-    return 1 if failed else (2 if result.get("status") == "pending_work" else 0)
+    return 1 if failed else (2 if result.get("status") in {"pending_work", "version_decision_required"} else 0)
 
 
 if __name__ == "__main__":

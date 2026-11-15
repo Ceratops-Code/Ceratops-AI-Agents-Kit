@@ -451,6 +451,35 @@ Files without that completed receipt cannot supply a build dependency.
 `installationArtifactPath` identifies one entry in `artifacts`; that entry alone
 owns its size and hash.
 
+Versioned builders declare `version` on their deliverable; release bundles use
+the same declaration under `repository.release-bundles.NAME.version`. A native
+field uses `{file: packages/tool/pyproject.toml, field: project.version}`, or
+`{file: packages/tool/package.json, field: version}`. A repository command uses
+`read` and `write` argument arrays and a `files` array naming the tracked files
+the writer owns. `write` receives a separate `{version}` argument; `{python}`
+means the current Python environment. Explicit shell commands are supported.
+`version: {mode: receipt-only}` uses completed Git receipts when no native file
+owns the version.
+
+`read_declared_version()` reads that source for either a member or a bundle.
+`write_declared_version()` updates it and returns its owned paths. JSON/TOML
+writes replace the file after flushing one adjacent `.in_process` file; the
+writer removes that temporary file after success or at its next write.
+Repository write commands must finish all their declared files on repeated
+calls. `prepare_build_or_reuse()` first reuses applicable accepted output; only
+new output gets an allocated version and a commit of its relevant source files.
+
+The public Build command accepts repeated `--bundle NAME` arguments. A bundle
+versions its member list independently; an unchanged member keeps its original
+version and accepted output. `--version-choices` is a JSON object keyed by
+`deliverables.KIND.NAME` or `repository.release-bundles.NAME`, with either
+`{"version":"2.0.0b1"}` or `{"bump":"minor","base_version":"1.4.2"}` per entry.
+A missing choice returns `version_decision_required`, current versions and the
+changes since each previous final release, before allocation or file edits.
+The returned `next_command` accepts the model's answer together with
+`--version-source-commit`. Unchanged builds reuse accepted versions; a new
+candidate on an already chosen alpha/beta base increments its suffix.
+
 Member identities use `storageKey: members/<kind>/<name>`. Bundle identities use
 `storageKey: bundles/<name>` and have their own versions. A bundle records exact
 member versions, tags, receipt hashes, outputs and dependencies. It can retain

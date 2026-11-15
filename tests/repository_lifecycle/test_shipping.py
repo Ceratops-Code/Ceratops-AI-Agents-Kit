@@ -363,10 +363,12 @@ def test_repository_ship_late_pending_work_reports_remote_mutation(
 
 @pytest.mark.parametrize("category", ["publish", "deploy-local"])
 @pytest.mark.parametrize("capture_receipt", [False, True])
+@pytest.mark.parametrize("version_review", [False, True])
 def test_repository_ship_checkpoints_each_operation_before_the_next(
     tmp_path: pathlib.Path,
     category: str,
     capture_receipt: bool,
+    version_review: bool,
 ) -> None:
     repo, loaded, args, log, _state, _ = _setup(tmp_path)
     phase = "release_publication" if category == "publish" else "deployment"
@@ -390,6 +392,11 @@ def test_repository_ship_checkpoints_each_operation_before_the_next(
     def execute(root: pathlib.Path, requests: Any, contract: Any, **kwargs: Any) -> dict[str, Any]:
         nonlocal count
         if not kwargs.get("prepare_only") and requests[0].operation == (PUBLIC if category == "publish" else LOCAL):
+            if version_review:
+                assert kwargs["version_choices"] is None
+                return {"status": "version_decision_required", "source_commit": "a" * 40,
+                        "answer_schema": {"version_source_commit": "a" * 40,
+                                          "version_choices": {"deliverables.apps.fixture": {"version": "<version>"}}}}
             count += 1
             if count == 2:
                 records = [
@@ -408,6 +415,14 @@ def test_repository_ship_checkpoints_each_operation_before_the_next(
     loaded["_checkpointed_operation_batch"].__globals__[
         "execute_build"
     ] = execute
+    if version_review:
+        review = loaded["ship_repository"](args)
+        assert review["status"] == "version_decision_required", review
+        assert review["phase"] == phase
+        assert review["remote_mutation"] is True
+        assert label not in log.read_text().splitlines()
+        assert review["answer_schema"]["version_source_commit"] == "a" * 40
+        version_review = False
     with pytest.raises(RuntimeError, match="interrupted"):
         loaded["ship_repository"](args)
     assert log.read_text().splitlines().count(label) == 1
