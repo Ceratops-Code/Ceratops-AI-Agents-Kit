@@ -285,6 +285,13 @@ means the current Python environment. Explicit shell commands are supported.
 `version: {mode: receipt-only}` uses completed Git receipts when no native file
 owns the version.
 
+Every supported SDLC schema accepts these deliverable version declarations and
+requires one for a `ceratops-builder-output` build. Reading the contract rejects
+a missing declaration before preparing or running commands; Build does not guess
+a native manifest. Release bundles add each missing member for every requested
+target, using that member's own version. An omitted target means `native`, and
+an explicit `native` request belongs to the same batch.
+
 `read_declared_version()` reads that source for either a member or a bundle.
 `write_declared_version()` updates it and returns its owned paths. JSON/TOML
 writes replace the file after flushing one adjacent `.in_process` file; the

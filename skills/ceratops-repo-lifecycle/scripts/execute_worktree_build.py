@@ -262,13 +262,22 @@ def execute_build(
             entries = operations.operation_entries(declaration)
             bundle_declarations = declaration.get('repository', {}).get('release-bundles', {})
             requests = list(requests)
+            targets = dict.fromkeys(
+                {**(request.parameters_if_declared or {}), **(request.parameters or {})}.get('target', 'native')
+                for request in requests
+            ) or {'native': None}
             for name in dict.fromkeys(bundles):
                 if name not in bundle_declarations:
                     raise operations.OperationError(f'Unknown release bundle: {name}')
                 for member in bundle_declarations[name]['members']:
                     location = member + '.actions.build'
-                    if not any(request.operation == location for request in requests):
-                        requests.append(operations.OperationRequest(location))
+                    for target in targets:
+                        if not any(request.operation == location and
+                                   {**(request.parameters_if_declared or {}), **(request.parameters or {})}.get('target', 'native') == target
+                                   for request in requests):
+                            # Every target needs the whole bundle. Versions stay
+                            # member-owned; only the requested target is inherited.
+                            requests.append(operations.OperationRequest(location, parameters_if_declared={'target': target}))
             requested_operations = [item.operation for item in requests]
             if run_delivery and requests and all(
                     entries.get(request.operation, {}).get("install-inputs") == "accepted-build" for request in requests):
@@ -291,7 +300,7 @@ def execute_build(
             groups: dict[str | None, list[Any]] = {}
             for request in requests:
                 parameters = {**(request.parameters_if_declared or {}), **(request.parameters or {})}
-                groups.setdefault(parameters.get("target"), []).append(request)
+                groups.setdefault(parameters.get("target", "native"), []).append(request)
             # Prepare every target before the first effect. Artifact maps remain
             # target-local so a second target cannot borrow the first's files.
             batches = [(target, prepare_build_operations(

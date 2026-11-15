@@ -706,6 +706,9 @@
         },
         "actions": {
           "$ref": "#/$defs/packageActions"
+        },
+        "version": {
+          "$ref": "#/$defs/declaredVersion"
         }
       },
       "allOf": [
@@ -727,6 +730,37 @@
           "then": {
             "required": [
               "project"
+            ]
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "actions"
+            ],
+            "properties": {
+              "actions": {
+                "required": [
+                  "build"
+                ],
+                "properties": {
+                  "build": {
+                    "required": [
+                      "result-schema"
+                    ],
+                    "properties": {
+                      "result-schema": {
+                        "const": "ceratops-builder-output"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "version"
             ]
           }
         }
@@ -767,8 +801,44 @@
         },
         "actions": {
           "$ref": "#/$defs/installedActions"
+        },
+        "version": {
+          "$ref": "#/$defs/declaredVersion"
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "actions"
+            ],
+            "properties": {
+              "actions": {
+                "required": [
+                  "build"
+                ],
+                "properties": {
+                  "build": {
+                    "required": [
+                      "result-schema"
+                    ],
+                    "properties": {
+                      "result-schema": {
+                        "const": "ceratops-builder-output"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "version"
+            ]
+          }
+        }
+      ]
     },
     "app": {
       "description": "An application installed on a target device or operating system.",
@@ -799,8 +869,44 @@
         },
         "actions": {
           "$ref": "#/$defs/installedActions"
+        },
+        "version": {
+          "$ref": "#/$defs/declaredVersion"
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "actions"
+            ],
+            "properties": {
+              "actions": {
+                "required": [
+                  "build"
+                ],
+                "properties": {
+                  "build": {
+                    "required": [
+                      "result-schema"
+                    ],
+                    "properties": {
+                      "result-schema": {
+                        "const": "ceratops-builder-output"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "version"
+            ]
+          }
+        }
+      ]
     },
     "skill": {
       "type": "object",
@@ -826,8 +932,44 @@
         },
         "actions": {
           "$ref": "#/$defs/skillActions"
+        },
+        "version": {
+          "$ref": "#/$defs/declaredVersion"
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "actions"
+            ],
+            "properties": {
+              "actions": {
+                "required": [
+                  "build"
+                ],
+                "properties": {
+                  "build": {
+                    "required": [
+                      "result-schema"
+                    ],
+                    "properties": {
+                      "result-schema": {
+                        "const": "ceratops-builder-output"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "version"
+            ]
+          }
+        }
+      ]
     },
     "hook": {
       "type": "object",
@@ -853,8 +995,44 @@
         },
         "actions": {
           "$ref": "#/$defs/skillActions"
+        },
+        "version": {
+          "$ref": "#/$defs/declaredVersion"
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "actions"
+            ],
+            "properties": {
+              "actions": {
+                "required": [
+                  "build"
+                ],
+                "properties": {
+                  "build": {
+                    "required": [
+                      "result-schema"
+                    ],
+                    "properties": {
+                      "result-schema": {
+                        "const": "ceratops-builder-output"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "version"
+            ]
+          }
+        }
+      ]
     },
     "namedPackages": {
       "type": "object",
@@ -949,6 +1127,79 @@
           "$ref": "#/$defs/namedHooks"
         }
       }
+    },
+    "declaredVersion": {
+      "description": "The authoritative version source used by the shared Build operation.",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "file",
+            "field"
+          ],
+          "properties": {
+            "file": {
+              "$ref": "#/$defs/relativePath",
+              "pattern": "\\.(?:json|toml)$"
+            },
+            "field": {
+              "type": "string",
+              "pattern": "^[^.\\s]+(?:\\.[^.\\s]+)*$"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "read",
+            "write",
+            "files"
+          ],
+          "properties": {
+            "read": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "write": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "contains": {
+                "const": "{version}"
+              }
+            },
+            "files": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "$ref": "#/$defs/relativePath"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "mode"
+          ],
+          "properties": {
+            "mode": {
+              "const": "receipt-only"
+            }
+          }
+        }
+      ]
     }
   }
 }

@@ -240,8 +240,19 @@ def _worktree_build_case(tmp_path):
 
 @pytest.mark.parametrize("checkout", ["primary", "release-local", "task-worktree"])
 @pytest.mark.parametrize("deletion", ["unstaged", "staged"])
-def test_worktree_build_commits_selected_source_and_finishes_once(tmp_path, checkout, deletion):
+@pytest.mark.parametrize("schema_version", [4, 5])
+def test_worktree_build_commits_selected_source_and_finishes_once(tmp_path, checkout, deletion, schema_version):
     repository, options = _worktree_build_case(tmp_path)
+    if schema_version == 4:
+        contract_path = repository / runner.DEFAULT_CONTRACT
+        contract = json.loads(contract_path.read_text())
+        contract["version"] = schema_version
+        contract["repository"]["capabilities"] = contract["repository"].pop("tools")
+        for action in runner.operation_entries(contract).values():
+            action["requires"]["capabilities"] = action["requires"].pop("tools")
+        contract_path.write_text(json.dumps(contract))
+        assert run_git(repository, "add", "sdlc/sdlc.yml").returncode == 0
+        assert run_git(repository, "commit", "--only", "-m", "declared build version", "--", "sdlc/sdlc.yml").returncode == 0
     if checkout == "release-local":
         assert run_git(repository, "branch", "-m", "release/local").returncode == 0
     elif checkout == "task-worktree":
@@ -947,7 +958,10 @@ def test_receipt_identities_require_release_bundle_without_an_old_name_alias(
         read(wrong)
 
 
-def test_build_recipe_and_independent_member_versions(tmp_path, capsys):
+@pytest.mark.parametrize("target,implicit_engine,second_target", [
+    ("native", False, None), ("android-arm64", True, None), ("linux", True, "windows"),
+])
+def test_build_recipe_and_independent_member_versions(tmp_path, capsys, target, implicit_engine, second_target):
     repository, _ = _worktree_build_case(tmp_path)
     path = repository / runner.DEFAULT_CONTRACT
     contract = json.loads(path.read_text())
@@ -971,17 +985,24 @@ def test_build_recipe_and_independent_member_versions(tmp_path, capsys):
     assert run_git(repository, "add", ".").returncode == 0
     assert run_git(repository, "commit", "-m", "two independently versioned packages").returncode == 0
     requests = [
-        runner.OperationRequest("deliverables.packages.claims.actions.build", {"version": "1.4.0", "target": "native"}),
-        runner.OperationRequest("deliverables.packages.engine.actions.build", {"version": "3.2.0", "target": "native"}),
+        runner.OperationRequest("deliverables.packages.claims.actions.build", {"version": "1.4.0", "target": target}),
     ]
+    if not implicit_engine:
+        requests.append(runner.OperationRequest("deliverables.packages.engine.actions.build", {"version": "3.2.0", "target": target}))
+    if second_target:
+        requests.append(runner.OperationRequest(requests[0].operation, {"version": "1.4.0", "target": second_target}))
     review = runner.execute_build(repository, requests, qualification_level="final", bundles=["suite"])
     assert review["status"] == "version_decision_required", review
-    assert [item["reference"] for item in review["version_decisions"]] == ["repository.release-bundles.suite"]
+    assert [item["reference"] for item in review["version_decisions"]] == [
+        *(["deliverables.packages.engine"] if implicit_engine else []), "repository.release-bundles.suite"]
     assert not (repository / ".build-count").exists()
-    first = runner.execute_build(repository, requests, qualification_level="final", bundles=["suite"], version_choices={"repository.release-bundles.suite": {"version": "2.0.0"}})
+    choices = {"repository.release-bundles.suite": {"version": "2.0.0"}}
+    if implicit_engine:
+        choices["deliverables.packages.engine"] = {"version": "3.2.0"}
+    first = runner.execute_build(repository, requests, qualification_level="final", bundles=["suite"], version_choices=choices)
     assert first["status"] == "completed", first
     bundle = results.read_artifact_receipt_chain(repository, tag="bundles/suite/2.0.0",
-        expected=results.artifact_identity(repository.name, "bundles/suite", "2.0.0", "native"))
+        expected=results.artifact_identity(repository.name, "bundles/suite", "2.0.0", target))
     assert [member.identity["version"] for member in bundle.members] == ["1.4.0", "3.2.0"]
     original_engine = bundle.members[1].build_receipt.raw
     assert len({value.final_commit for value in bundle.members} | {bundle.final_commit}) == 1
@@ -989,13 +1010,23 @@ def test_build_recipe_and_independent_member_versions(tmp_path, capsys):
     assert recipe["commandsAndSettings"]["operation"] == requests[0].operation
     assert recipe["platformAndTools"]["runtimes"][0]["version"]
     assert recipe["installationArtifactPath"] == recipe["artifacts"][0]["path"]
+    if second_target:
+        other = results.read_artifact_receipt_chain(repository, tag="bundles/suite/2.0.0",
+            expected=results.artifact_identity(repository.name, "bundles/suite", "2.0.0", second_target))
+        assert [member.identity["version"] for member in other.members] == ["1.4.0", "3.2.0"]
+        assert {member.identity["target"] for member in other.members} == {second_target}
+        repeated = runner.execute_build(repository, requests, qualification_level="final", bundles=["suite"])
+        assert repeated["status"] == "completed", repeated
+        assert (repository / ".engine-count").read_text() == "xx"
+        assert (repository / ".build-count").read_text() == "xx"
+        return
 
     (repository / "src/claims.py").write_text("VALUE = 'changed package'\n")
-    requests[0] = runner.OperationRequest(requests[0].operation, {"version": "1.4.1", "target": "native"})
+    requests[0] = runner.OperationRequest(requests[0].operation, {"version": "1.4.1", "target": target})
     second = runner.execute_build(repository, requests, qualification_level="final", bundles=["suite"], version_choices={"repository.release-bundles.suite": {"version": "2.0.1"}})
     assert second["status"] == "completed", second
     newer = results.read_artifact_receipt_chain(repository, tag="bundles/suite/2.0.1",
-        expected=results.artifact_identity(repository.name, "bundles/suite", "2.0.1", "native"))
+        expected=results.artifact_identity(repository.name, "bundles/suite", "2.0.1", target))
     assert [member.identity["version"] for member in newer.members] == ["1.4.1", "3.2.0"]
     assert newer.members[1].build_receipt.raw == original_engine
     assert (repository / ".engine-count").read_text() == "x"
@@ -1021,7 +1052,7 @@ def test_build_recipe_and_independent_member_versions(tmp_path, capsys):
     assert run_git(repository, "add", "sdlc/sdlc.yml").returncode == 0
     assert run_git(repository, "commit", "--only", "-m", "consume engine", "--", "sdlc/sdlc.yml").returncode == 0
     files = {reference: first["artifacts"][reference]}
-    request = runner.OperationRequest(requests[0].operation, {"version": "1.4.2", "target": "native"})
+    request = runner.OperationRequest(requests[0].operation, {"version": "1.4.2", "target": target})
     supplied = runner.execute_build(repository, [request], artifacts=files, qualification_level="final")
     assert supplied["status"] == "completed", supplied
     assert reference + ".actions.build" not in supplied["completed_operations"]
@@ -1038,7 +1069,7 @@ def test_build_recipe_and_independent_member_versions(tmp_path, capsys):
     # the consumer and its explicitly supplied dependency.
     argv = ["--repo-root", str(repository), "--operation", request.operation,
             "--artifacts", json.dumps(files), "--parameter", "version=1.4.2",
-            "--parameter", "target=native", "--qualification-level", "final"]
+            "--parameter", "target=" + target, "--qualification-level", "final"]
     capsys.readouterr()
     for _ in range(2):
         assert runner.main(argv) == 0

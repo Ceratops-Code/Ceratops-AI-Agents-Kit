@@ -50,19 +50,24 @@ def _repository(repo: pathlib.Path) -> str:
     return run_git(repo, "rev-parse", "HEAD").stdout.strip()
 
 
-@pytest.mark.parametrize("owner", ["member", "bundle"])
+@pytest.mark.parametrize("schema_version,owner", [(4, "member"), (5, "member"), (5, "bundle")])
 @pytest.mark.parametrize("source", [
     {"file": "package.json", "field": "version"},
     {"file": "pyproject.toml", "field": "project.version"},
     {"read": ["pwsh", "read-version.ps1"], "write": ["pwsh", "write-version.ps1", "{version}"], "files": ["release.psd1"]},
     {"mode": "receipt-only"},
 ])
-def test_deliverable_version_declarations(tmp_path, owner, source):
-    document = _bundle_contract()
+def test_deliverable_version_declarations(tmp_path, owner, source, schema_version):
+    document = _typed_contract() if schema_version == 4 else _bundle_contract()
     product = (document["deliverables"]["packages"]["claims"] if owner == "member"
                else document["repository"]["release-bundles"]["claims"])
+    if owner == "member":
+        product["actions"]["build"]["result-schema"] = "ceratops-builder-output"
     product["version"] = source
     assert contracts.validation_errors(document) == []
+    del product["version"]
+    assert contracts.validation_errors(document)
+    product["version"] = source
     original = deepcopy(source)
     for invalid in ({}, {"file": "../outside.json", "field": "version"},
                     {"file": "VERSION", "field": "version"},
@@ -82,6 +87,11 @@ def test_deliverable_version_declarations(tmp_path, owner, source):
         "sample": {"root-dir": ".", "build-after": [], "artifact": {"type": "zip", "output-directory": "dist", "filename-pattern": "*.zip"},
                    "version": {"file": "package.json", "field": "version"},
                    "actions": {"build": {"requires": {"tools": []}, "steps": [{"run": ["builder"]}]}}}}}}
+    if schema_version == 4:
+        minimal["version"] = schema_version
+        minimal["repository"]["capabilities"] = minimal["repository"].pop("tools")
+        for action in contracts.operation_entries(minimal).values():
+            action["requires"]["capabilities"] = action["requires"].pop("tools")
     assert contracts.validation_errors(minimal, repo_root=tmp_path) == []
     (tmp_path / "untracked.json").write_text('{"version":"1.0.0"}')
     minimal["deliverables"]["packages"]["sample"]["version"]["file"] = "untracked.json"
