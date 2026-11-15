@@ -529,7 +529,7 @@ def test_build_action_accepts_current_build_reports(tmp_path, contract_version, 
     if contract_version == 5:
         document = fixture_with_tools(document)
     document["version"] = contract_version
-    if contract_version == 5 and schema == "ceratops-builder-output":
+    if schema == "ceratops-builder-output":
         document["deliverables"]["packages"]["sample"]["version"] = {"mode": "receipt-only"}
     document["deliverables"]["packages"]["sample"]["actions"]["build"]["result-schema"] = schema
     path.write_text(json.dumps(fixture_with_tools(document) if document["version"] == 5 else document))
