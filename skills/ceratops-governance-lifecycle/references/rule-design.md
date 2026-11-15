@@ -2,7 +2,8 @@
 
 ## Behavioral objective
 
-Design rules for reliable execution by GPT-5.5 Light. Each rule must state an
+Design each rule so the least capable supported Codex model can apply it
+correctly at its lowest supported reasoning effort. Each rule must state an
 observable trigger, specific action, and explicit scope without relying on vague
 categories or implicit reasoning.
 
