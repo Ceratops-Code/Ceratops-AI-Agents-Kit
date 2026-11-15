@@ -580,7 +580,7 @@ def test_compatibility_materializer_preserves_existing_bundle_contract(
         "checks": {"build-check": {"uses-artifacts": []}},
     }
     contract["repository"]["release-bundles"] = {
-        "skills": {"members": ["deliverables.skills.alpha-tool"]}
+        "skills": {"members": ["deliverables.skills.alpha-tool"], "version": {"mode": "receipt-only"}}
     }
     sdlc_path.write_text(
         yaml.safe_dump(contract, sort_keys=False), encoding="utf-8", newline="\n"

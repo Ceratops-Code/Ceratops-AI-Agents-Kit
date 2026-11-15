@@ -995,7 +995,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--repo-root", type=pathlib.Path, default=pathlib.Path.cwd())
     parser.add_argument("--source-branch", action="append")
-    parser.add_argument("--bundle", action="append", default=[])
+    parser.add_argument("--bundle", action="append")
     parser.add_argument("--version-choices", type=json.loads)
     parser.add_argument("--version-source-commit")
     parser.add_argument("--diagnostic-output", type=pathlib.Path,

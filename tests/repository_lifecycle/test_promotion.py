@@ -285,6 +285,9 @@ def test_promote_repository_runs_explicit_operation_ids_in_order(
         ["--run-operation", "deliverables.apps.sample.actions.install"],
         "execution options",
     )
+    rejected(["--bundle", "sample"], "execution options")
+    rejected(["--version-choices", "{}"], "execution options")
+    rejected(["--version-source-commit", result["head"]], "execution options")
     rejected(["--task-temp-root", str(tmp_path)], "one existing task directory")
 
     # Even an acknowledged file must describe a complete deployment. These
