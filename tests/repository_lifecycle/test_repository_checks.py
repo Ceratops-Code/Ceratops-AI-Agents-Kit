@@ -19,11 +19,10 @@ from tests.repository_lifecycle.support import (
 )
 from tests.repository_lifecycle.test_compatibility import _write_current_sdlc
 from tests.support.processes import (
-    CI_ACTION_REVISION,
     COMPATIBILITY_ENGINE,
     run_compatibility_engine,
 )
-from tests.support.repositories import run_ci_action
+from tests.support.repositories import run_repository_ci_checks
 
 
 @pytest.mark.parametrize("scenario,passes", [
@@ -149,6 +148,12 @@ def test_android_coverage_requires_declared_gradle_checks_in_any_group(
 
     sdlc_path = repo / "sdlc/sdlc.yml"
     sdlc = yaml.safe_load(sdlc_path.read_text(encoding="utf-8"))
+    workflow = repo / ".github/workflows/validate.yml"
+    workflow.write_text(workflow.read_text(encoding="utf-8").replace(
+        "      - name: Upload validation evidence",
+        "      - run: " + "python scripts/android-validation.py" + "\n" + "      - name: Upload validation evidence",
+        1,
+    ), encoding="utf-8")
     sdlc["repository"]["capabilities"].update(
         {
             "jdk": {"executable": "java"},
@@ -248,6 +253,12 @@ def test_ecosystem_coverage_requires_declared_repository_checks(
     entrypoint.write_text("# Repository-owned check entrypoint.\n", encoding="utf-8")
     sdlc_path = repo / "sdlc/sdlc.yml"
     sdlc = yaml.safe_load(sdlc_path.read_text(encoding="utf-8"))
+    workflow = repo / ".github/workflows/validate.yml"
+    workflow.write_text(workflow.read_text(encoding="utf-8").replace(
+        "      - name: Upload validation evidence",
+        "      - run: " + f"python scripts/{coverage_id}-check.py" + "\n" + "      - name: Upload validation evidence",
+        1,
+    ), encoding="utf-8")
     sdlc["repository"]["capabilities"].update(
         {
             prerequisite: {"executable": prerequisite}
@@ -769,8 +780,11 @@ def test_compatibility_materializer_supports_repositories_without_skills(
         assert operation["check-results"]["tools"] == ["node", manager]
         assert repository["tools"]["node"] == {"executable": "node"}
         assert materializer.repository_checks.default_markdown_files(nested) == {}
-        _, setup = materializer.repository_checks._validation_workflow(nested, [check], markdown_files={})
-        assert f"{manager} {flag} scripts " in setup
+        workflow = materializer.repository_checks.repository_workflow(
+            nested, [check], markdown_files={}, sdlc=generated,
+        )
+        assert workflow is not None
+        assert f"{manager} {flag} scripts " in workflow
         (nested / ".build").mkdir()
         (nested / ".build/test_diagnostic.py").write_text("raise AssertionError\n", encoding="utf-8")
         rules = materializer.load_compatibility_contract()["python_test_detection"]
@@ -903,11 +917,10 @@ def test_compatibility_materializer_supports_repositories_without_skills(
         for step in uv_steps
         if step.get("name") == "Install Python validation dependencies"
     ] == []
-    action_step = next(step for step in yaml.safe_load(uv_workflow)["jobs"]["validate-repository"]["steps"]
-                       if step.get("uses", "").startswith("Ceratops-Code/"))
-    assert action_step["uses"].endswith("@" + CI_ACTION_REVISION)
-    assert set(action_step["with"]) == {"repo-root", "evidence-file", "operations"}
-    assert action_step["with"]["operations"] == "repository.actions.pre-build-checks"
+    assert any(
+        'uv run --project scripts --locked python' in step.get('run', '')
+        for step in uv_steps
+    )
     assert (uv_repo / "application/uv.lock").read_text() == "version = 1\n"
 
     # Synthetic recipes exercise extension behavior without coupling the shipped
@@ -1267,37 +1280,13 @@ def test_generated_scripts_and_skill_owned_ci_keep_environments_and_tests_separa
     type_failure = subprocess.run([*prefix, "scripts/validate-repository.py"], cwd=repo, capture_output=True, text=True, check=False)
     assert json.loads(type_failure.stdout)["check"] == "mypy"
     check_probe.write_text("def value() -> int:\n    return 1\n")
-    evidence = tmp_path / "sdlc-failure.json"
-    bundle = tmp_path / "ci-action"
-    failed = run_ci_action(repo, evidence, bundle)
-    assert failed.returncode == 1, failed.stdout + failed.stderr
-    result = json.loads(evidence.read_text())
-    assert result["status"] == "validation_failed"
-    assert result["operation"] == "repository.actions.pre-build-checks.check-groups.tests"
-    assert any("test-gate-evidence" in line for line in result["diagnostic"]["stdout_tail"]), result["diagnostic"]
-    collector = importlib.import_module("github_contract_engine.collectors.local_repository")
-    facts = collector._repository_validation_facts(
-        {"available": True, "root": str(repo)}, [{"id": "content.repository_validation"}], str(evidence),
-    )
-    assert facts == {
-        "applicable": True,
-        "validator_present": True,
-        "workflow_present": True,
-        "valid": True,
-        "errors": [],
-    }
-    assert json.loads(evidence.read_text())["status"] == "validation_failed"
-    validation_only = run_ci_action(repo, evidence, bundle, operations="repository.actions.pre-build-checks.check-groups.source")
-    assert validation_only.returncode == 0, validation_only.stdout + validation_only.stderr
-    assert not evidence.exists()
-    assert json.loads(validation_only.stdout)["completed_operations"] == [
-        "repository.actions.pre-build-checks.check-groups.source"
-    ]
+    evidence = tmp_path / "repository-validation.log"
+    failed = run_repository_ci_checks(repo, evidence)
+    assert failed.returncode != 0, failed.stdout + failed.stderr
+    assert "test-gate-evidence" in evidence.read_text()
     probe.write_text("def test_probe():\n    assert True\n")
-    passed = run_ci_action(repo, evidence, bundle)
+    passed = run_repository_ci_checks(repo, evidence)
     assert passed.returncode == 0, passed.stdout + passed.stderr
-    assert not evidence.exists()
-    assert json.loads(passed.stdout)["completed_operations"] == ["repository.actions.pre-build-checks.check-groups.source", "repository.actions.pre-build-checks.check-groups.tests"]
     lock = (repo / "scripts/uv.lock").read_bytes()
     reapplied = run_compatibility_engine(REPOSITORY_LIFECYCLE_SCRIPTS, "apply", "--target-repo-root", str(repo))
     assert reapplied.returncode == 0, reapplied.stdout
@@ -1378,7 +1367,7 @@ def test_configuration_policy_reports_paths_and_blocks_setup_without_writes(
         # Fresh public-entry calls cover the same planner without starting a
         # new interpreter for every filename. Existing CLI cases cover dispatch.
         applied = materializer.main([
-            "--target-repo-root", str(repo), "--ci-action-revision", CI_ACTION_REVISION,
+            "--target-repo-root", str(repo),
         ])
         captured = capsys.readouterr()
         assert applied == 1, captured.out + captured.err

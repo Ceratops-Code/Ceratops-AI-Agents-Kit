@@ -236,7 +236,10 @@ def prepare_sdlc_configuration(
         template_validation = {"requires": {key: ["uv"]}, "steps": [{"run": [
             "uv", "run", "--locked", surface_path("validator").as_posix(),
         ]}]}
-        owned_validation = dict(template_validation)
+        project = load_compatibility_contract()["runtime"]["project"]
+        owned_validation = {**template_validation, "steps": [{"run": [
+            "uv", "run", "--project", project, "--locked", "python", surface_path("validator").as_posix(),
+        ]}]}
         if any(item["id"] == "shellcheck" for item in repository_checks.contract_checks(repo_root)):
             capabilities.setdefault("shellcheck", {"executable": "shellcheck"})
             owned_validation["requires"] = {key: ["uv", "shellcheck"]}
@@ -510,7 +513,6 @@ def plan_ceratops_compatibility(
     existing: Mapping[str, object],
     *,
     apply_sdlc_contract: bool,
-    ci_action_revision: str | None = None,
 ) -> CompatibilityPlan:
     """Validate target evidence and compose writes without changing files."""
 
@@ -660,10 +662,11 @@ def plan_ceratops_compatibility(
             raise RuntimeError("; ".join(action_errors))
     target_sdlc = repo_root / surface_path("sdlc")
     version = load_contract(target_sdlc, repo_root=repo_root)["version"] if target_sdlc.is_file() else latest_sdlc_version()
-    validator_text, workflow_text, validation_checks, markdown_files = (
-        repository_checks.validation_surfaces(repo_root, ci_action_revision, legacy_validator=version < 5)
+    validator_text, validation_checks, markdown_files = repository_checks.validation_surfaces(
+        repo_root, legacy_validator=version < 5,
     )
-    planned_paths = {surface_path("workflow").as_posix()} if workflow_text is not None else set()
+    workflow_path = surface_path("workflow")
+    planned_paths = {workflow_path.as_posix()} if not (repo_root / workflow_path).is_file() else set()
     source_checks = repository_checks.contract_checks(
         repo_root, package=json.loads(markdown_files["scripts/package.json"]) if markdown_files else None,
         planned_paths=planned_paths,
@@ -671,6 +674,9 @@ def plan_ceratops_compatibility(
     sdlc_contract = prepare_sdlc_configuration(
         repo_root, skill_names=sorted(skill_names), apply_contract=apply_sdlc_contract,
         generated_checks=source_checks, planned_markdown=bool(markdown_files),
+    )
+    workflow_text = repository_checks.repository_workflow(
+        repo_root, source_checks, markdown_files=markdown_files, sdlc=sdlc_contract,
     )
     compatibility_contract = load_compatibility_contract()
     python_tests = discover_python_tests(
@@ -799,10 +805,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--target-repo-root", required=True, type=pathlib.Path)
     parser.add_argument("--runtime-source-id")
-    parser.add_argument(
-        "--ci-action-revision",
-        help="Published lifecycle action commit; otherwise preserve or resolve its pin.",
-    )
     args = parser.parse_args(argv)
     repo_root = args.target_repo_root.resolve()
     phase = "preflight"
@@ -832,7 +834,6 @@ def main(argv: list[str] | None = None) -> int:
             template,
             existing,
             apply_sdlc_contract=True,
-            ci_action_revision=args.ci_action_revision,
         )
         skill_paths = sorted((repo_root / "skills").glob("*/SKILL.md"))
         mutable_paths = [

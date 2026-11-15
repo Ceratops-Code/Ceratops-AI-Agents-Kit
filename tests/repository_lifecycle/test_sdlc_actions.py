@@ -27,7 +27,7 @@ from tests.repository_lifecycle.support import (
     run_operation_cli,
 )
 from tests.support.processes import run_compatibility_engine
-from tests.support.repositories import ROOT, run_ci_action, run_git
+from tests.support.repositories import ROOT, run_git
 
 runner = importlib.import_module("repository_operation")
 skill_actions = importlib.import_module("execute_skill_actions")
@@ -50,7 +50,7 @@ def _repository(repo: pathlib.Path) -> str:
     return run_git(repo, "rev-parse", "HEAD").stdout.strip()
 
 
-@pytest.mark.parametrize("entrypoint", ["ci", "callable"])
+@pytest.mark.parametrize("entrypoint", ["cli", "callable"])
 def test_explicit_group_requests_and_whole_phase_run_the_named_commands(tmp_path, entrypoint):
     repo = tmp_path / "repo"
     (repo / "sdlc").mkdir(parents=True)
@@ -66,8 +66,8 @@ def test_explicit_group_requests_and_whole_phase_run_the_named_commands(tmp_path
         (phase + ".check-groups.source", 2, 0),
         (phase + "\n" + phase + ".check-groups.source", 3, 1),
     ):
-        if entrypoint == "ci":
-            completed = run_ci_action(repo, tmp_path / "evidence.json", tmp_path / "action", operations=locations)
+        if entrypoint == "cli":
+            completed = run_operation_cli(repo, tuple(locations.splitlines()), ci=True)
             assert completed.returncode == 0, completed.stdout + completed.stderr
         else:
             result = runner.execute_build(
@@ -254,7 +254,7 @@ def test_typed_tests_gate_mutations_and_ci_never_dispatches_handoffs(
 
 
 @pytest.mark.parametrize("failure", [None, "validation", "tests"])
-def test_ci_action_runs_skill_engine_without_repository_copies(
+def test_external_runner_reports_failures_and_handoffs_without_repository_copies(
     tmp_path: pathlib.Path,
     failure: str | None,
 ) -> None:
@@ -309,11 +309,11 @@ def test_ci_action_runs_skill_engine_without_repository_copies(
     }
     (repo / "skills/service").mkdir(parents=True)
     (repo / "sdlc/sdlc.yml").write_text(json.dumps(declaration))
-    result = run_ci_action(repo, evidence, tmp_path / "action checkout", operations="\n".join([
+    result = run_operation_cli(repo, (
         "repository.actions.pre-build-checks.check-groups.source",
         "deliverables.skills.service.actions.pre-build-checks.check-groups.source",
         "repository.actions.pre-build-checks.check-groups.tests",
-    ]))
+    ), ci=True, evidence_file=evidence)
     assert result.returncode == (1 if failure else 0), result.stderr
     payload = json.loads(result.stderr if failure else result.stdout)
     if failure:

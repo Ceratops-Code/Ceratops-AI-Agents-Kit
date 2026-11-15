@@ -49,10 +49,13 @@ def discover_python_tests(root: pathlib.Path, rules: Mapping[str, Any]) -> list[
 
 def test_operation(runner: str) -> dict[str, Any]:
     """Use the scripts project for generated tests; preserve explicit SDLC operations."""
+    from .compatibility_contract import load_compatibility_contract
+
+    project = load_compatibility_contract()["runtime"]["project"]
     return {
         "requires": {"capabilities": ["uv"]},
         "steps": [{"run": [
-            "uv", "run", "--locked", runner, "--temporary-root",
+            "uv", "run", "--project", project, "--locked", "python", runner, "--temporary-root",
             load_validation_contract()["test_temporary_root"],
         ]}],
     }
