@@ -262,7 +262,7 @@ def execute_build(
             entries = operations.operation_entries(declaration)
             bundle_declarations = declaration.get('repository', {}).get('release-bundles', {})
             requests = list(requests)
-            targets = dict.fromkeys(
+            bundle_targets = dict.fromkeys(
                 {**(request.parameters_if_declared or {}), **(request.parameters or {})}.get('target', 'native')
                 for request in requests
             ) or {'native': None}
@@ -271,7 +271,7 @@ def execute_build(
                     raise operations.OperationError(f'Unknown release bundle: {name}')
                 for member in bundle_declarations[name]['members']:
                     location = member + '.actions.build'
-                    for target in targets:
+                    for target in bundle_targets:
                         if not any(request.operation == location and
                                    {**(request.parameters_if_declared or {}), **(request.parameters or {})}.get('target', 'native') == target
                                    for request in requests):
