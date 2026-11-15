@@ -327,6 +327,9 @@ repository:
 deliverables:
   mcp-servers:
     ceratops-mcp-server-manager:
+      version:
+        file: "mcp-servers/ceratops_mcp_server_manager/pyproject.toml"
+        field: "project.version"
       root-dir: mcp-servers/ceratops_mcp_server_manager
       manifest: mcp-servers/ceratops_mcp_server_manager/mcp-server.json
       build-after: []
@@ -349,6 +352,9 @@ deliverables:
             - run: [uv, run, --project, scripts, --locked, python, scripts/deploy-mcp-server-manager.py]
 
     source_search_mcp:
+      version:
+        file: "tools/pyproject.toml"
+        field: "project.version"
       root-dir: tools
       manifest: tools/mcp-server.json
       build-after: []
