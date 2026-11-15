@@ -180,7 +180,11 @@ operational hooks that are not owned by one managed skill live under `hooks/`.
 Contract sources live inside their owning lifecycle skill.
 `skills/ceratops-repo-lifecycle/references/` owns GitHub org, GitHub repo,
 repo-code, PR readiness, artifact, release, code-comment, and CodeQL disposition
-contracts. `skills/ceratops-skill-lifecycle/references/` owns
+contracts. Publication and health checks require enabled CodeQL for active public
+repositories and skip private repositories. They accept configured default setup
+or an active repository workflow running CodeQL. The opt-in repair command enables
+default setup only after fresh reads establish that neither setup is enabled.
+`skills/ceratops-skill-lifecycle/references/` owns
 skill-design contracts and skill source-doc tracking. The
 `skills-contract-review` action refreshes those contracts against registered
 best-practice evidence; it does not audit skills or run the source validator.

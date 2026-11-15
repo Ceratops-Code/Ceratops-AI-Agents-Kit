@@ -260,7 +260,8 @@
     },
     "github-contracts": {
       "pytest": [
-        "tests/repository_lifecycle/test_contract_engine.py"
+        "tests/repository_lifecycle/test_contract_engine.py",
+        "tests/repository_lifecycle/test_code_scanning.py"
       ],
       "depends_on": [],
       "packages": [

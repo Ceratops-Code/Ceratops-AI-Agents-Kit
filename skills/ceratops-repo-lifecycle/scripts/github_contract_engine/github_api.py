@@ -16,7 +16,6 @@ import urllib.request
 from dataclasses import asdict, dataclass
 from typing import Any
 
-
 API_VERSION = "2026-03-10"
 RETRY_DELAY_SECONDS = 10
 TRANSIENT_HTTP_STATUSES = {502, 503, 504}
@@ -211,7 +210,7 @@ def run_gh_api(
             and all(isinstance(page, dict) for page in payload)
         ):
             merged = dict(payload[0])
-            for key in ("items", "alerts", "repositories", "workflow_runs"):
+            for key in ("items", "alerts", "repositories", "workflow_runs", "workflows"):
                 if all(isinstance(page.get(key), list) for page in payload):
                     merged[key] = [item for page in payload for item in page[key]]
             payload = merged

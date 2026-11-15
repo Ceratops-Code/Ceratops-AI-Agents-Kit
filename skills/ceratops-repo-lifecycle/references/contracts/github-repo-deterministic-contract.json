@@ -273,16 +273,17 @@
           "endpoint": "/repos/${owner}/${repo}/code-scanning/default-setup",
           "covers_checks": [
             "security.code_scanning_default_setup_or_custom"
-          ]
+          ],
+          "applies_when": "repo.visibility == public && repo.archived == false"
         },
         {
           "method": "GET",
           "endpoint": "/repos/${owner}/${repo}/code-scanning/alerts?state=open&per_page=100",
           "paginate": true,
           "covers_checks": [
-            "security.open_code_scanning_alert_queue",
-            "security.code_scanning_default_setup_or_custom"
-          ]
+            "security.open_code_scanning_alert_queue"
+          ],
+          "applies_when": "repo.visibility == public && repo.archived == false"
         },
         {
           "method": "GET",
@@ -913,11 +914,13 @@
       "applies_when": "repo.visibility == public && repo.archived == false",
       "assertions": [
         {
-          "path": "/repository/security/code_scanning",
-          "operator": "any_true",
+          "path": "/repository/security/code_scanning/enabled",
+          "operator": "equal",
+          "expected": true,
           "level": "WARN"
         }
-      ]
+      ],
+      "remediation_action": "repository.enable_code_scanning"
     },
     {
       "id": "security.open_code_scanning_alert_queue",

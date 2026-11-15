@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import base64
 import datetime as dt
 import json
 import re
 from fnmatch import fnmatchcase
 from typing import Any
+from urllib.parse import quote
+
+import yaml
 
 from ..github_api import ApiResult, run_gh_api, run_json_command, substitute
 from .local_repository import classify_repository, dependabot_coverage
@@ -579,6 +583,89 @@ def _uses_state_path(rules: list[dict[str, Any]], prefix: str) -> bool:
     )
 
 
+def collect_code_scanning(
+    parameters: dict[str, Any], default_setup: ApiResult | None = None
+) -> dict[str, Any]:
+    """Read current CodeQL enablement without inferring it from alert access.
+
+    Default setup is authoritative when configured. Otherwise inspect active
+    repository workflows at the default branch. Old analyses and dynamic
+    workflow registrations can survive disabled default setup.
+    """
+
+    slug = f"{parameters['owner']}/{parameters['repo']}"
+    setup = default_setup
+    if setup is None:
+        setup = run_gh_api("GET", f"/repos/{slug}/code-scanning/default-setup")
+    if not setup.ok:
+        return {"enabled": None, "error": setup.message or "CodeQL setup is unreadable"}
+    if not isinstance(setup.data, dict) or setup.data.get("state") not in {
+        "configured", "not-configured"
+    }:
+        return {"enabled": None, "error": "GitHub returned an unknown CodeQL setup state"}
+    if setup.data["state"] == "configured":
+        return {"enabled": True, "error": None}
+
+    response = run_gh_api(
+        "GET", f"/repos/{slug}/actions/workflows?per_page=100", paginate=True
+    )
+    workflows = response.data.get("workflows") if isinstance(response.data, dict) else None
+    if not response.ok or not isinstance(workflows, list):
+        return {"enabled": None, "error": response.message or "Actions workflows are unreadable"}
+
+    errors = []
+    branch = str(parameters.get("default_branch") or "")
+    if not branch:
+        return {"enabled": None, "error": "The repository default branch is unknown"}
+    for workflow in workflows:
+        if not isinstance(workflow, dict) or workflow.get("state") != "active":
+            continue
+        path = str(workflow.get("path") or "")
+        if not re.fullmatch(r"\.github/workflows/[^/]+\.ya?ml", path):
+            continue
+        contents = run_gh_api(
+            "GET",
+            f"/repos/{slug}/contents/{quote(path, safe='/')}?ref={quote(branch, safe='')}",
+        )
+        if not contents.ok:
+            errors.append(f"{path}: {contents.message or 'workflow contents are unreadable'}")
+            continue
+        try:
+            payload = contents.data
+            if not isinstance(payload, dict) or payload.get("encoding") != "base64":
+                raise ValueError("GitHub did not return base64 workflow contents")
+            encoded = "".join(str(payload.get("content") or "").split())
+            document = yaml.safe_load(base64.b64decode(encoded, validate=True).decode("utf-8"))
+        except (ValueError, yaml.YAMLError) as exc:
+            errors.append(f"{path}: {exc}")
+            continue
+        if not isinstance(document, dict):
+            continue
+        # PyYAML treats the YAML 1.1 key 'on' as True.
+        if not document.get("on", document.get(True)):
+            continue
+        jobs = document.get("jobs")
+        if not isinstance(jobs, dict):
+            continue
+        for job in jobs.values():
+            if not isinstance(job, dict) or str(job.get("if")).strip().lower() in {
+                "false", "${{ false }}"
+            }:
+                continue
+            steps = job.get("steps")
+            if not isinstance(steps, list):
+                continue
+            actions = {
+                str(step.get("uses") or "").partition("@")[0].lower()
+                for step in steps
+                if isinstance(step, dict)
+                and str(step.get("if")).strip().lower() not in {"false", "${{ false }}"}
+            }
+            if {"github/codeql-action/init", "github/codeql-action/analyze"} <= actions:
+                return {"enabled": True, "error": None}
+    return {"enabled": None if errors else False, "error": "\n".join(errors) or None}
+
+
 def collect_repository(
     fetched: dict[tuple[str, str], ApiResult],
     parameters: dict[str, Any],
@@ -811,6 +898,13 @@ def collect_repository(
     default_setup = _result(
         fetched, "/repos/${owner}/${repo}/code-scanning/default-setup", parameters
     )
+    code_scanning = {"enabled": None, "error": None}
+    if (
+        repo.get("visibility") == "public"
+        and not repo.get("archived")
+        and _uses_state_path(rules, "/repository/security/code_scanning/")
+    ):
+        code_scanning = collect_code_scanning(parameters, default_setup)
     private_reporting = _result(
         fetched, "/repos/${owner}/${repo}/private-vulnerability-reporting", parameters
     )
@@ -983,18 +1077,7 @@ def collect_repository(
                 "/repos/${owner}/${repo}/code-security-configuration",
                 parameters,
             ).ok,
-            "code_scanning": {
-                "default_setup_configured": bool(
-                    default_setup.ok
-                    and isinstance(default_setup.data, dict)
-                    and default_setup.data.get("state") == "configured"
-                ),
-                "custom_alerts_endpoint_available": _result(
-                    fetched,
-                    "/repos/${owner}/${repo}/code-scanning/alerts?state=open&per_page=100",
-                    parameters,
-                ).ok,
-            },
+            "code_scanning": code_scanning,
             "private_vulnerability_reporting": {
                 "api_enabled": bool(
                     private_reporting.ok

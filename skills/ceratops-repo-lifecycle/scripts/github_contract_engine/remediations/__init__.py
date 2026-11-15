@@ -6,17 +6,18 @@ from typing import Any, Callable
 
 from .organization import apply_organization_desired
 from .repository import (
+    enable_code_scanning,
     enable_repository_endpoint,
     ensure_dependencies_label,
     update_repository_settings,
 )
-
 
 Handler = Callable[[list[dict[str, Any]], dict[str, Any]], list[dict[str, Any]]]
 HANDLERS: dict[str, Handler] = {
     "organization.write_desired": apply_organization_desired,
     "repository.update_settings": update_repository_settings,
     "repository.enable_endpoint": enable_repository_endpoint,
+    "repository.enable_code_scanning": enable_code_scanning,
     "repository.ensure_dependencies_label": ensure_dependencies_label,
 }
 
