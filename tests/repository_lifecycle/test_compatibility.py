@@ -470,7 +470,7 @@ def test_compatibility_materializer_supplies_target_identity_and_assignments(
         (repo / ".github/workflows/validate.yml").read_text(encoding="utf-8")
     )["jobs"]["validate-repository"]["steps"]
     assert next(step["with"] for step in steps if step["name"] == "Set up Node.js") == {
-        "node-version": "24",
+        "node-version": package["engines"]["node"],
     }
     assert next(
         step["run"] for step in steps if step["name"] == "Install npm validation dependencies"
