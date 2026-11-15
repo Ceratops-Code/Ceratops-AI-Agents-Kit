@@ -1647,7 +1647,9 @@ File paths and byte hashes remain part of the saved reuse inputs.
 its caller writes the YAML. Before a check runs, `collect_check_inputs()` records
 its command, relevant files, runtime, target and artifacts; `decide_check_reuse()`
 compares those facts with saved results. Moving an unchanged command to a new
-phase/group address preserves an applicable result's original identity. Whole
+phase/group address preserves an applicable result's original identity. Saved
+build summaries are searched by command before checking their input records;
+an unrelated command's result cannot block the requested check. Whole
 command reuse and the test runner's individual-test reuse remain in place.
 
 SDLC build actions can require a v1, v2 or v3 result. Build receipts

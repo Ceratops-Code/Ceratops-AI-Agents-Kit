@@ -385,7 +385,13 @@ class CheckResultStore:
                         or check.get("status") != "passed" or check.get("reusable") is False
                         or not {"inputGroup", "result_id", "check_version", "completed_ns"} <= check.keys()):
                     continue
-                original = check_context(summary["inputGroups"][check["inputGroup"]])
+                saved = summary["inputGroups"].get(check["inputGroup"])
+                # Matching execution arguments are already required for reuse.
+                # Other commands can own different context/checksum formats in
+                # this shared summary and must not block the requested check.
+                if not isinstance(saved, dict) or saved.get("arguments") != request["arguments"]:
+                    continue
+                original = check_context(saved)
                 if (check.get("inputs_digest") != original["fingerprint"]
                         or check["check_version"] != original["checkVersion"]
                         or check.get("qualificationLevel") != original["qualificationLevel"]

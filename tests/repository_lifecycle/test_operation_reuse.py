@@ -821,7 +821,17 @@ def test_git_build_summary_supplies_public_cli_check_without_original_log(tmp_pa
     original = runner.execute_prepared_operation(_check(tmp_path))
     assert original["status"] == "completed" and original["check_decision"] == "executed"
     reference = original["check_result"]
-    tag, _ = _tag_summary(tmp_path, "1.0.0b1", original["check_summary"])
+    summary = json.loads(json.dumps(original["check_summary"]))
+    own = summary["checks"][0]
+    unrelated = {**summary["inputGroups"][own["inputGroup"]],
+                 "group": "python-runner", "arguments": ["python", "other-tests.py"],
+                 "fingerprint": "0" * 64}
+    unrelated_group = hashlib.sha256(json.dumps(unrelated, sort_keys=True,
+                                                separators=(",", ":")).encode()).hexdigest()
+    summary["inputGroups"][unrelated_group] = unrelated
+    summary["checks"].insert(0, {**own, "id": "python-runner",
+                                 "inputGroup": unrelated_group, "inputs_digest": "0" * 64})
+    tag, _ = _tag_summary(tmp_path, "1.0.0b1", summary)
     (tmp_path / ".git" / reference["path"]).unlink()
     argv = [sys.executable, str(ROOT / "skills/ceratops-repo-lifecycle/scripts/repository_operation.py"),
             "--repo-root", str(tmp_path), "--operation", "repository.actions.pre-build-checks.check-groups.tests", "--qualification-level", "beta"]
