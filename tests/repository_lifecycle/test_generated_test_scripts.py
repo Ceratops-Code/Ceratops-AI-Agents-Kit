@@ -69,6 +69,15 @@ def test_custom_runner_keeps_behavior_and_can_select_generated_support(tmp_path,
     assert support.exists() is managed
     assert generator.generated_support_errors(tmp_path, contract) == []
     if managed:
+        environment = runpy.run_path(str(scripts / "testing/read_check_environment.py"))
+        compare = environment["environment_inputs_for_reuse"]
+        before = {"tools": {"git": {"sha256": "a" * 64}, "uv": "uv 1.2.3"}, "runtime": {"python": "3.13.4"}}
+        after = {"tools": {"uv": {"version": "1.2.99"}}, "runtime": {"python": "3.13.99"}}
+        assert compare(before) == compare(after)
+        after["runtime"]["python"] = "3.14.0"
+        assert compare(before) != compare(after)
+        with pytest.raises(ValueError, match="major/minor"):
+            compare({"tools": {"uv": {"sha256": "a" * 64}}})
         support.unlink()
         assert any("reuse_test_results.py" in error for error in generator.generated_support_errors(tmp_path, contract))
 

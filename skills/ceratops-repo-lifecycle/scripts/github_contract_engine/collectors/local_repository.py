@@ -1334,6 +1334,38 @@ def collect_local_repository(
                 ):
                     matches.append({"path": name, "pattern": pattern})
         scans[rule["id"]] = {"matches": matches}
+    # Report declarations, not an imitation of Renovate's preset resolver.
+    # Unresolved inheritance is explicit; only Renovate can establish its final
+    # merged policy. Health never queries jobs or claims a bot ran successfully.
+    renovate_paths = [name for name in (
+        "renovate.json", "renovate.json5", ".github/renovate.json", ".github/renovate.json5",
+        ".renovaterc", ".renovaterc.json",
+    ) if name in local["files"]]
+    renovate: dict[str, Any] = {"config_paths": renovate_paths, "declarations": {}, "errors": [],
+                                "inherited_policy": "none", "presets": []}
+    for name in renovate_paths:
+        try:
+            configuration = json.loads(local["texts"].get(name, ""))
+            if not isinstance(configuration, dict):
+                raise ValueError("configuration must be an object")
+        except ValueError as exc:
+            renovate["errors"].append({"file": name, "message": str(exc),
+                                       "next_action": "Run Renovate's configuration checker; JSON5 requires its native parser."})
+            continue
+        renovate["declarations"][name] = {key: configuration[key] for key in (
+            "extends", "enabled", "enabledManagers", "includePaths", "ignorePaths", "packageRules",
+            "customManagers", "baseBranchPatterns", "baseBranches", "forkProcessing",
+            "vulnerabilityAlerts", "osvVulnerabilityAlerts", "dependencyDashboard",
+        ) if key in configuration}
+        presets = configuration.get("extends", [])
+        if isinstance(presets, list):
+            renovate["presets"].extend(item for item in presets if isinstance(item, str))
+        else:
+            renovate["errors"].append({"file": name, "message": "extends must be an array"})
+    if renovate["presets"]:
+        renovate["inherited_policy"] = "requires_renovate_resolution"
+    if len(renovate_paths) > 1:
+        renovate["errors"].append({"message": "Multiple repository configs exist; report their native precedence before claiming effective coverage."})
     permission_names = ("id-token", "attestations", "artifact-metadata", "packages")
     return {
         **local,
@@ -1377,6 +1409,7 @@ def collect_local_repository(
             "contents_read_present": "contents: read" in workflow_text,
             "npm_publishing": _npm_publishing_runtimes(workflows),
         },
+        "renovate": renovate,
         "dependabot": {
             "config_path": next(
                 (

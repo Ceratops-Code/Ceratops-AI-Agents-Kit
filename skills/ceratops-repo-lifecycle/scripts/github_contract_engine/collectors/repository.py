@@ -89,7 +89,7 @@ def _latest_stable_release_assets_count(releases: list[Any]) -> int:
         if published is None:
             return float("-inf")
         if published.tzinfo is None:
-            published = published.replace(tzinfo=dt.timezone.utc)
+            published = published.replace(tzinfo=dt.UTC)
         return published.timestamp()
 
     latest = max(stable, key=published_timestamp)
@@ -104,7 +104,7 @@ def _workflow_run_timestamp(run: dict[str, Any]) -> float:
     if created is None:
         return float("-inf")
     if created.tzinfo is None:
-        created = created.replace(tzinfo=dt.timezone.utc)
+        created = created.replace(tzinfo=dt.UTC)
     return created.timestamp()
 
 
@@ -158,8 +158,8 @@ def _older_than(value: Any, days: int, now: dt.datetime | None = None) -> bool:
     parsed = _parse_datetime(value)
     if not parsed:
         return False
-    current = now or dt.datetime.now(dt.timezone.utc)
-    return current - parsed.astimezone(dt.timezone.utc) > dt.timedelta(days=days)
+    current = now or dt.datetime.now(dt.UTC)
+    return current - parsed.astimezone(dt.UTC) > dt.timedelta(days=days)
 
 
 def _with_reason(item: dict[str, Any], reason: str) -> dict[str, Any]:
@@ -1047,7 +1047,7 @@ def collect_repository(
                     item
                     for item in dependabot_alerts
                     if str(
-                        ((item.get("security_advisory") or {}).get("severity"))
+                        (item.get("security_advisory") or {}).get("severity")
                     ).lower()
                     in high_severities
                 ],
@@ -1066,7 +1066,7 @@ def collect_repository(
                     item
                     for item in code_alerts
                     if str(
-                        ((item.get("rule") or {}).get("security_severity_level"))
+                        (item.get("rule") or {}).get("security_severity_level")
                     ).lower()
                     in high_severities
                 ],
@@ -1098,6 +1098,7 @@ def collect_repository(
             "dependabot_label_referenced": "dependencies" in dependabot_text,
             "dependabot_label_exists": dependency_label.ok,
             "dependabot": dependabot_coverage(local, default_branch),
+            "renovate": local.get("renovate", {}),
             "workflow_write_all": local.get("workflows", {}).get(
                 "permissions_write_all", []
             ),

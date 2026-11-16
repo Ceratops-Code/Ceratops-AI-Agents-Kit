@@ -6,6 +6,7 @@ import pathlib
 import subprocess
 from types import SimpleNamespace
 from typing import Any, Self
+from unittest.mock import Mock
 
 import pytest
 
@@ -88,12 +89,13 @@ def test_dependabot_retarget_preserves_existing_pr_controls(
     assert message in blockers[0]["message"]
 
 
+@pytest.mark.parametrize("bot_state", ["absent", "renovate", "configured", "unavailable"])
 @pytest.mark.parametrize("wait_status", ["ready", "timed_out", "failed"])
 @pytest.mark.parametrize("annotation_state", ["clear", "warning", "unavailable"])
 @pytest.mark.parametrize("interruption", ["none", "before_write", "after_write"])
-def test_dependency_preflight_collects_evidence_after_rebase_wait(
+def test_dependency_review_collects_evidence_after_rebase_wait(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, wait_status: str,
-    annotation_state: str, interruption: str,
+    annotation_state: str, interruption: str, bot_state: str,
 ) -> None:
     queue = load_pr_workflow_module(monkeypatch, "dependency_queue")
     common = load_pr_workflow_module(monkeypatch, "dependency_common")
@@ -117,17 +119,38 @@ def test_dependency_preflight_collects_evidence_after_rebase_wait(
         queue, "refresh_snapshot",
         lambda *_: (snapshot, subprocess.CompletedProcess([], 0, "", "")),
     )
-    monkeypatch.setattr(queue, "fetch_pr_batch", lambda *_: ({("owner/repo", 1): old}, []))
+    observed = []
+    if bot_state != "absent":
+        snapshot["repositories"] = [{"full_name": "owner/repo", "name": "repo", "archived": False}]
+    if bot_state == "renovate":
+        observed = [
+            {"number": 2, "title": old["title"], "pull_request": {}, "user": {"login": "renovate[bot]"},
+             "html_url": "https://github.com/owner/repo/pull/2"},
+            {"number": 3, "title": "Dependency Dashboard", "user": {"login": "renovate[bot]"},
+             "html_url": "https://github.com/owner/repo/issues/3", "updated_at": "2026-11-01T00:00:00Z",
+             "body": "## Configuration Errors\nInvalid registry setting\n## Open\nTwo PRs"},
+        ]
+    if bot_state == "configured":
+        (tmp_path / "renovate.json").write_text('{"extends":["config:recommended"]}')
+    api = Mock(return_value=SimpleNamespace(ok=bot_state != "unavailable", data=observed,
+        state=Mock(return_value={"error": "GitHub access denied", "exit_code": 1})))
+    monkeypatch.setattr(queue, "run_gh_api", api)
+    monkeypatch.setattr(queue, "fetch_pr_batch", lambda *_: ({("owner/repo", number): old
+        for number in ([1, 2] if bot_state == "renovate" else [1])}, []))
 
     def wait(details: dict[Any, Any]):
         assert details[("owner/repo", 1)]["head_oid"] == "a" * 40
         order.append("wait")
-        return {("owner/repo", 1): new}, (
+        return {key: {**new, "author": "renovate[bot]" if key[1] == 2 else "app/dependabot",
+                      "title": "Update dependency demo to v1.0.1" if key[1] == 2 else old["title"]}
+                for key in details}, (
             [{"repo": "owner/repo", "pr": 1, "check": "branch_freshness", "message": "unavailable"}]
             if wait_status == "failed" else []
         )
 
     monkeypatch.setattr(queue, "wait_for_dependabot_rebases", wait)
+    monkeypatch.setattr(queue, "fetch_pr_body", Mock(return_value={"status": "ok", "body":
+        "| Package | Update | Change |\n|---|---|---|\n| [demo](https://example.test/demo) | patch | `1.0.0` → `1.0.1` |"}))
     monkeypatch.setattr(queue, "queued_repositories", lambda _: [{"repo": "owner/repo", "name": "repo"}])
     monkeypatch.setattr(
         common, "run_command",
@@ -159,18 +182,18 @@ def test_dependency_preflight_collects_evidence_after_rebase_wait(
         assert files == new["files"]
         assert update["ecosystem"] == "npm"
         assert commit == new["head_oid"]
-        assert order == ["wait", "ci"]
+        assert order in (["wait", "ci"], ["wait", "ci", "tree"])
         order.append("tree")
         return {"status": "ok"}
 
     monkeypatch.setattr(queue, "dependency_tree_evidence", tree)
     monkeypatch.setattr(queue, "emit_result", lambda *_: None)
     monkeypatch.setattr(queue, "retarget_dependabot_prs", lambda *_: pytest.fail(
-        "Standalone preflight must not retarget without explicit authorization.",
+        "Standalone review must not retarget without explicit authorization.",
     ))
-    output = tmp_path / "preflight.json"
+    output = tmp_path / "review.json"
     args = queue.build_parser().parse_args([
-        "preflight", "--org", "owner",
+        "review", "--org", "owner",
         "--snapshot-helper", str(tmp_path / "snapshot.py"),
         "--snapshot", str(tmp_path / "snapshot.json"), "--output", str(output),
         "--workspace-root", str(tmp_path),
@@ -186,11 +209,11 @@ def test_dependency_preflight_collects_evidence_after_rebase_wait(
     if interruption != "none":
         monkeypatch.setattr(queue, "write_json", interrupted_write)
         with pytest.raises(RuntimeError, match="interrupted report write"):
-            queue.preflight(args)
+            queue.prepare_dependency_review(args)
         assert output.exists() == (interruption == "after_write")
         monkeypatch.setattr(queue, "write_json", write)
         order.clear()
-    assert queue.preflight(args) == 0
+    assert queue.prepare_dependency_review(args) == 0
     payload = json.loads(output.read_text(encoding="utf-8"))
     repository = payload["repositories"][0]
     assert repository["checkout"]["explicit"] is True
@@ -199,12 +222,27 @@ def test_dependency_preflight_collects_evidence_after_rebase_wait(
     assert result_pr["decision_gates"]["rebase_repair_required"] == (wait_status == "timed_out")
     assert result_pr["ci_annotations"] == annotations
     assert result_pr["decision_gates"]["ci_warning_review_required"] == (annotation_state == "warning")
-    assert payload["summary"]["ci_warning_annotations"] == int(annotation_state == "warning")
-    assert payload["summary"]["ci_annotation_reads_unavailable"] == int(annotation_state == "unavailable")
-    assert payload["outcome"]["blocked"] == (wait_status == "failed" or annotation_state == "unavailable")
-    assert order == ["wait", "ci", "tree"]
+    count = 2 if bot_state == "renovate" else 1
+    assert payload["summary"]["ci_warning_annotations"] == count * int(annotation_state == "warning")
+    assert payload["summary"]["ci_annotation_reads_unavailable"] == count * int(annotation_state == "unavailable")
+    assert payload["outcome"]["blocked"] == (wait_status == "failed" or annotation_state == "unavailable" or bot_state != "absent")
+    assert order == ["wait", "ci"] + ["tree"] * count
+    assert payload["summary"]["open_dependency_prs"] == count
+    assert payload["summary"]["open_renovate_prs"] == int(bot_state == "renovate")
+    if bot_state in {"renovate", "configured"}:
+        processing = payload["dependency_processing"]["owner/repo"]
+        assert processing["hosted_job_status"] == "unavailable"
+        assert bool(processing["problems"]) == (bot_state == "renovate")
+        assert repository["dependency_processing"] == processing
+        if bot_state == "renovate":
+            assert repository["pull_requests"][1]["provider"] == "renovate"
+            assert "Invalid registry setting" in processing["problems"][0]
+    elif bot_state == "unavailable":
+        assert any(item.get("evidence", {}).get("error") == "GitHub access denied" for item in payload["blockers"])
+    else:
+        api.assert_not_called()
     order.clear()
-    assert queue.preflight(args) == 0
+    assert queue.prepare_dependency_review(args) == 0
     repeated = json.loads(output.read_text(encoding="utf-8"))
     assert repeated["repositories"] == payload["repositories"]
     assert repeated["summary"] == payload["summary"]
@@ -312,7 +350,7 @@ def test_dependency_ci_annotations_keep_successful_job_warnings_and_read_failure
      ("not-a-version", "unparsed_patched_version_range"), ("2.0.2", None)],
 )
 @pytest.mark.parametrize("interruption", ["none", "before_write", "after_write"])
-def test_alert_preflight_distinguishes_missing_patch_and_repeats_after_interruption(
+def test_alert_review_distinguishes_missing_patch_and_repeats_after_interruption(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
     patched: str | None, reason: str | None, interruption: str,
 ) -> None:
@@ -359,8 +397,8 @@ def test_alert_preflight_distinguishes_missing_patch_and_repeats_after_interrupt
             raise OSError("interrupted after output")
 
     monkeypatch.setattr(queue, "write_json", write)
-    output = tmp_path / "preflight.json"
-    argv = ["preflight", "--org", "owner", "--snapshot-helper", str(tmp_path / "snapshot.py"),
+    output = tmp_path / "review.json"
+    argv = ["review", "--org", "owner", "--snapshot-helper", str(tmp_path / "snapshot.py"),
             "--snapshot", str(tmp_path / "snapshot.json"), "--output", str(output),
             "--workspace-root", str(tmp_path)]
     assert queue.main(argv) == (0 if interruption == "none" else 1)
@@ -379,7 +417,7 @@ def test_alert_preflight_distinguishes_missing_patch_and_repeats_after_interrupt
             assert blockers[0]["message"] == reason
             assert blockers[0]["check"] == (
                 "alert_patch_availability" if reason == "no_patched_version_listed"
-                else "alert_registry_preflight"
+                else "alert_registry_review"
             )
     assert registry_targets == (["2.0.2"] * 3 if reason is None else [])
 
@@ -889,7 +927,7 @@ def test_alert_default_branch_query_keeps_exact_commit_and_failures(monkeypatch,
 
 @pytest.mark.parametrize("source_available", [True, False])
 @pytest.mark.parametrize("interruption", ["none", "before_write", "after_write"])
-def test_alert_preflight_reads_live_default_tree_without_touching_release_checkout(
+def test_alert_review_reads_live_default_tree_without_touching_release_checkout(
     tmp_path, monkeypatch, source_available, interruption,
 ):
     queue = load_pr_workflow_module(monkeypatch, "dependency_queue")
@@ -935,8 +973,8 @@ def test_alert_preflight_reads_live_default_tree_without_touching_release_checko
         return original_tree(*arguments)
 
     monkeypatch.setattr(queue, "dependency_tree_evidence", tree)
-    output = tmp_path / "preflight.json"
-    argv = ["preflight", "--org", "owner", "--snapshot-helper", str(tmp_path / "snapshot.py"),
+    output = tmp_path / "review.json"
+    argv = ["review", "--org", "owner", "--snapshot-helper", str(tmp_path / "snapshot.py"),
             "--snapshot", str(tmp_path / "snapshot.json"), "--output", str(output), "--workspace-root", str(tmp_path)]
     original_write = queue.write_json
 
@@ -959,7 +997,7 @@ def test_alert_preflight_reads_live_default_tree_without_touching_release_checko
         payload = json.loads(output.read_text())
         assert payload["outcome"]["blocked"] != source_available
         for alert in payload["repositories"][0]["alerts"]:
-            alert_tree = alert["preflight"]["dependency_tree"]
+            alert_tree = alert["review"]["dependency_tree"]
             if source_available:
                 assert alert_tree["status"] == "ok" and alert_tree["commit"] == published
                 assert alert_tree["sources"][0]["matches"][0]["version"] == "1.0.0"

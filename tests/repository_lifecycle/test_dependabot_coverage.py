@@ -278,6 +278,26 @@ class DependabotCoverageTests(unittest.TestCase):
                             and finding["level"] == "WARN" for finding in result["findings"]))
 
     def test_version_updates_target_release_and_security_only_entries_use_main(self):
+        for declaration in [
+            {"extends": ["github>owner/policy"], "enabledManagers": ["nvm"],
+             "includePaths": ["scripts/**"], "baseBranchPatterns": ["release/local"],
+             "forkProcessing": "enabled", "vulnerabilityAlerts": {"enabled": False}},
+            [], "broken-json",
+        ]:
+            text = declaration if isinstance(declaration, str) else json.dumps(declaration)
+            for _ in range(2):
+                local = self.facts({"renovate.json": text, "requirements.txt": "pytest"}, [
+                    self.entry("pip", directory="/", **{"target-branch": "release/local"}),
+                ])
+                facts = local["renovate"]
+                self.assertEqual(facts["config_paths"], ["renovate.json"])
+                self.assertEqual(bool(facts["errors"]), not isinstance(declaration, dict))
+                if isinstance(declaration, dict):
+                    self.assertEqual(facts["declarations"]["renovate.json"], declaration)
+                    self.assertEqual(facts["inherited_policy"], "requires_renovate_resolution")
+                    observed = collect_repository({}, {"owner": "example", "repo": "demo", "default_branch": "main"}, local, [])
+                    self.assertEqual(observed["content"]["renovate"], facts)
+
         version_entry = self.entry("pip", directory="/")
         security_entry = {**version_entry, "open-pull-requests-limit": 0}
         files = {"requirements.txt": "pytest"}

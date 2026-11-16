@@ -21,12 +21,12 @@ import copy
 import datetime
 import fnmatch
 import hashlib
-import importlib.metadata
 import json
 import os
 import pathlib
 import platform
 import re
+import runpy
 import shutil
 import subprocess
 import sys
@@ -822,33 +822,6 @@ def _check_inventory(root: pathlib.Path, patterns: list[str], files: list[str]) 
     return {name: _check_file_digest(root, name) for name in sorted(names)}
 
 
-def _check_environment_value(value: str | None, root: pathlib.Path) -> str | None:
-    """Keep owned checkout relocation out of declared environment identities."""
-    if value is None:
-        return None
-    resolved = str(root.resolve())
-    prefixes = sorted({resolved, resolved.replace("\\", "/"), resolved.replace("/", "\\")},
-                      key=len, reverse=True)
-    pattern = "(?:" + "|".join(re.escape(prefix) for prefix in prefixes) + r")(?=[\\/;:]|$)"
-    flags = re.IGNORECASE if os.name == "nt" else 0
-    return re.sub(pattern, lambda _match: "${REPO_ROOT}", value, flags=flags)
-
-
-def _check_environment_file(value: str | None, root: pathlib.Path) -> str | None:
-    """Bind the explicitly declared event-file pointer to its current bytes."""
-    if not value:
-        return None
-    path = pathlib.Path(value)
-    path = path if path.is_absolute() else root / path
-    if not path.exists():
-        return None
-    path = path.resolve(strict=True)
-    if not path.is_file():
-        raise ValueError("declared environment file must be a regular file")
-    with path.open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
-
-
 def check_current_inputs(context: Mapping[str, Any], root: pathlib.Path) -> None:
     """Reject edits, new/deleted owned files and execution-scope drift.
 
@@ -880,50 +853,16 @@ def check_current_inputs(context: Mapping[str, Any], root: pathlib.Path) -> None
     dependencies = {name: _check_file_digest(root, name) for name in rules.get("dependencies", [])}
     if dependencies != context["dependencies"] or any(value is None for value in dependencies.values()):
         raise ValueError("repository check dependencies changed before completion")
+    helper_path = pathlib.Path(__file__).resolve().parent / "testing/read_check_environment.py"
+    if pathlib.Path(__file__).suffix == ".tmpl":
+        helper_path = pathlib.Path(__file__).resolve().parents[1] / "scripts/testing/read_check_environment.py"
+    helper = runpy.run_path(str(helper_path))
     recorded = context["environment"]
-    variables = {
-        name: hashlib.sha256(canonical(_check_environment_value(os.environ.get(name), root))).hexdigest()
-        for name in rules.get("environment", [])
-    }
-    if (recorded.get("variables") != variables or recorded.get("platform") != platform.system()
-            or recorded.get("architecture") != platform.machine()):
+    current = helper["read_environment"](root, rules, runtime=bool(recorded.get("runtime")))
+    if helper["environment_inputs_for_reuse"](recorded, ignore_path=True, allow_unknown=True) != helper[
+        "environment_inputs_for_reuse"
+    ](current, ignore_path=True, allow_unknown=True):
         raise ValueError("repository check environment changed before completion")
-    if "files" in recorded:
-        environment_files = {
-            name: _check_environment_file(os.environ.get(name), root)
-            for name in rules.get("environment", []) if name == "GITHUB_EVENT_PATH"
-        }
-        if environment_files != recorded["files"]:
-            raise ValueError("repository check environment file changed before completion")
-    tools: dict[str, dict[str, str | None]] = {}
-    for name in rules.get("tools", []):
-        expanded = re.sub(r"\$\{([^}]+)\}", lambda match: os.environ.get(match[1], ""), name)
-        path: pathlib.Path | None
-        if "/" in expanded or "\\" in expanded:
-            path = pathlib.Path(expanded)
-            path = path if path.is_absolute() else root / path
-        else:
-            found = shutil.which(expanded)
-            path = pathlib.Path(found) if found else None
-        if path is not None and not path.exists():
-            path = None
-        if path is not None:
-            path = path.resolve(strict=True)
-        if path is not None and (path.is_symlink() or path.is_junction() or not path.is_file()):
-            raise ValueError("repository check tool must be a regular file")
-        tools[name] = {"sha256": hashlib.sha256(path.read_bytes()).hexdigest() if path is not None else None}
-    if recorded.get("tools") != tools:
-        raise ValueError("repository check tools changed before completion")
-    if recorded.get("runtime"):
-        runtime = {
-            "python": platform.python_version(), "implementation": platform.python_implementation(),
-            "packages": sorted(
-                [dist.metadata["Name"].lower(), dist.version]
-                for dist in importlib.metadata.distributions()
-            ),
-        }
-        if runtime != recorded["runtime"]:
-            raise ValueError("repository check locked runtime differs from the selected runtime")
 
 
 

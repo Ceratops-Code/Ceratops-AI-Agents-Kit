@@ -16,6 +16,8 @@ from collections.abc import Iterable, Mapping
 from datetime import datetime
 from typing import Any
 
+from read_check_environment import environment_inputs_for_reuse
+
 RESULT_SCHEMA = "ceratops-repository-check-result.v1"
 CONTEXT_SCHEMA = "ceratops-repository-check-inputs.v1"
 CONTEXT_ENV = "CERATOPS_REPOSITORY_CHECK_CONTEXT"
@@ -55,9 +57,9 @@ def fingerprint(context: Mapping[str, Any]) -> str:
 
 
 def _recorded_tools_cover_path_lookup(context: Mapping[str, Any]) -> bool:
-    """Use binary identities only for a complete declared tool inventory.
+    """Ignore PATH only for a complete declared tool inventory.
 
-    The launched command must itself be listed. Missing binaries, omitted tool
+    The launched command must itself be listed. Missing versions, omitted tool
     entries and declarations without tool ownership keep PATH significant.
     This reads existing records without revising their fingerprints or bytes.
     """
@@ -81,32 +83,42 @@ def _recorded_tools_cover_path_lookup(context: Mapping[str, Any]) -> bool:
             or not isinstance(variables.get("PATH"), str)
             or not _SHA.fullmatch(variables["PATH"])
             or not isinstance(declared_variables, list) or "PATH" not in declared_variables
-            or not isinstance(tools, dict) or set(tools) != set(names)):
+            or not isinstance(tools, dict) or (set(tools) - {name for name in tools if pathlib.PureWindowsPath(name).stem.lower() == "git"}) != {name for name in names if pathlib.PureWindowsPath(name).stem.lower() != "git"}):
         return False
-    return all(isinstance(tool, dict)
-               and isinstance(tool.get("sha256"), str)
-               and _SHA.fullmatch(tool["sha256"]) for tool in tools.values())
+    try:
+        environment_inputs_for_reuse({"tools": tools})
+    except ValueError:
+        return False
+    return True
 
 
-def check_inputs_match_for_reuse(recorded: Mapping[str, Any], current: Mapping[str, Any]) -> bool:
-    """Compare applicability while preserving every original result identity.
 
-    PATH text can differ when all declared executables still have identical
-    bytes. Every other environment value, runtime, dependency, check and product
-    input must match. Incomplete tool evidence retains exact PATH matching.
-    The same comparison governs failures and retention, so a PATH-only change
-    cannot hide a newer applicable failure or discard the evidence blocking it.
+def check_inputs_match_for_reuse(recorded: Mapping[str, Any], current: Mapping[str, Any],
+                                 *, differences: list[str] | None = None) -> bool:
+    """Compare source and execution inputs using the shared tool-version policy.
+
+    The same comparison governs failures and retention, so Git or patch upgrades
+    cannot hide a newer applicable failure. Original result records stay intact.
     """
-    if recorded["fingerprint"] == current["fingerprint"]:
-        return True
     # An SDLC route is an address, not the work performed by its command.
     # Compare the owning deliverable and complete execution facts, so moving a
     # command between phase containers preserves its original result identity.
     # Never remove checkGroup/artifacts/target/cwd/worktree from that comparison.
     def work(context: Mapping[str, Any]) -> dict[str, Any]:
         value = {key: item for key, item in context.items()
-                 if key not in {"fingerprint", "workVersion", "qualificationLevel", "environment"}}
+                 if key not in {"fingerprint", "workVersion", "qualificationLevel", "environment", "checkVersion"}}
         scope = dict(value["scope"])
+        rules = dict(scope.get("inputRules", {}))
+        if "tools" in rules:
+            rules["tools"] = sorted(pathlib.PureWindowsPath(name).stem.lower() for name in rules["tools"]
+                                    if pathlib.PureWindowsPath(name).stem.lower() != "git")
+        scope["inputRules"] = rules
+        value["scope"] = scope
+        arguments = list(value.get("arguments", []))
+        declared = context.get("scope", {}).get("inputRules", {}).get("tools", [])
+        if arguments and arguments[0] in declared:
+            arguments[0] = pathlib.PureWindowsPath(arguments[0]).stem.lower()
+            value["arguments"] = arguments
         operation = scope.pop("operation", None)
         if not isinstance(operation, str) or ".actions." not in operation:
             return value  # Unrecognized ownership retains exact comparison.
@@ -118,18 +130,17 @@ def check_inputs_match_for_reuse(recorded: Mapping[str, Any], current: Mapping[s
 
     if work(recorded) != work(current):
         return False
-    if recorded["environment"] == current["environment"]:
-        return True
-    if not _recorded_tools_cover_path_lookup(recorded) or not _recorded_tools_cover_path_lookup(current):
+    try:
+        return environment_inputs_for_reuse(
+            recorded["environment"], ignore_path=_recorded_tools_cover_path_lookup(recorded),
+        ) == environment_inputs_for_reuse(
+            current["environment"], ignore_path=_recorded_tools_cover_path_lookup(current),
+        )
+    except ValueError as exc:
+        if differences is not None:
+            differences.append(str(exc))
         return False
 
-    def effective_environment(context: Mapping[str, Any]) -> dict[str, Any]:
-        environment = dict(context["environment"])
-        environment["variables"] = {name: value for name, value in environment["variables"].items()
-                                    if name != "PATH"}
-        return environment
-
-    return effective_environment(recorded) == effective_environment(current)
 
 
 def _relative_path(value: Any) -> bool:
@@ -413,7 +424,7 @@ class CheckResultStore:
             # request. Their owned context formats need not be parsed here.
             saved = record.get("inputs", {})
             if (isinstance(saved, dict) and isinstance(saved.get("arguments"), list)
-                    and saved["arguments"] != request["arguments"]):
+                    and saved["arguments"] != request["arguments"] and record.get("check_id") != request["group"]):
                 continue
             if (not isinstance(saved, dict) or not isinstance(saved.get("arguments"), list)) and record.get("check_id") != request["group"]:
                 continue
@@ -436,8 +447,11 @@ class CheckResultStore:
         if invalid:
             decision["reason"] = "The requested check needs execution: " + "; ".join(dict.fromkeys(invalid))
             return decision
+        differences: list[str] = []
         matching = [(path, record, raw) for path, record, raw in records
-                    if check_inputs_match_for_reuse(record["inputs"], request)]
+                    if check_inputs_match_for_reuse(record["inputs"], request, differences=differences)]
+        if differences:
+            decision["reason"] = " ".join(dict.fromkeys(differences))
         matching.sort(key=lambda item: _order(item[1]), reverse=True)
         if any(_nonreusable(record) for _, record, _ in matching):
             decision["reason"] = "Unrepresented child scope requires fresh execution."
@@ -458,7 +472,7 @@ class CheckResultStore:
                 # Other commands can own different context/checksum formats in
                 # this shared summary and must not block the requested check.
                 if (isinstance(saved, dict) and isinstance(saved.get("arguments"), list)
-                        and saved["arguments"] != request["arguments"]):
+                        and saved["arguments"] != request["arguments"] and check.get("id") != request["group"]):
                     continue
                 if (not isinstance(saved, dict) or not isinstance(saved.get("arguments"), list)) and check.get("id") != request["group"]:
                     continue

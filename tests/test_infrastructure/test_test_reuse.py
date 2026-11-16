@@ -107,7 +107,7 @@ def test_imported_baseline_does_not_hide_changed_inputs(tmp_path, change):
         path.write_text(path.read_text() + "# Changed input\n")
     fresh = _level_store(root, "final" if change == "level" else "beta")
     if change == "tool":
-        fresh.context["tools"]["git"] = "another-git"
+        fresh.context["tools"]["uv"] = "uv 999.0.0"
     elif change == "environment":
         fresh.context["environment"]["INPUT"] = "another-input"
     elif change == "package":
@@ -204,7 +204,7 @@ def test_path_reuse_uses_declared_tool_identities(tmp_path, bounded_tools):
     if selected:
         assert selected["result_id"] == record["result_id"]
     changed = _level_store(root, "beta")
-    changed.context["tools"]["git"] = "another-version"
+    changed.context["tools"]["uv"] = "uv 999.0.0"
     assert changed.matching(node, changed.inputs(node)) is None
 
 
@@ -318,7 +318,7 @@ def _mapped_repository(tmp_path):
         (root / f"{name}.py").write_text("VALUE = 1\n")
         manifest["suites"][name] = {
             "pytest": [f"tests/{name}"], "depends_on": dependencies,
-            "packages": ["example-library"], "tools": ["git"], "environment": ["INPUT"],
+            "packages": ["example-library"], "tools": ["uv"], "environment": ["INPUT"],
         }
         manifest["rules"].append({"id": name, "paths": [f"{name}.*"], "suites": [name]})
     (root / "tests/test-impact.json").write_text(json.dumps(manifest))
@@ -331,10 +331,10 @@ def _mapped_repository(tmp_path):
     ("new", "Source/dependency files not recorded previously: b.data."),
     ("test", "Test/fixture files changed: tests/b/test_value.py."),
     ("package", "Packages changed: example-library."),
-    ("tool", "Tools changed: git."),
+    ("tool", "Tool uv lacks a recorded readable major/minor version."),
     ("environment", "Environment variables changed: INPUT."),
     ("arguments", "Pytest behavior arguments changed (values omitted)."),
-    ("runtime", "Runtime fields changed: python."),
+    ("runtime", "Python lacks a recorded readable major/minor version."),
     ("level", "Recorded passes do not cover the requested qualification level: final."),
     ("missing", "No recorded result for this check."),
     ("failure", "A newer applicable failure requires execution."),
@@ -359,8 +359,8 @@ def test_rerun_reports_concrete_cause_without_values(tmp_path, change, expected)
         if change == "package":
             fresh.context["dependencies"].append(["example-library", "secret-value"])
         elif change in {"tool", "environment", "runtime"}:
-            field, name = {"tool": ("tools", "git"), "environment": ("environment", "INPUT"),
-                           "runtime": ("runtime", "python")}[change]
+            field, name = {"tool": ("tools", "uv"), "environment": ("environment", "INPUT"),
+                           "runtime": ("runtime", "version")}[change]
             fresh.context[field][name] = "secret-value"
         elif change == "arguments":
             fresh.context["arguments"] = ["--password=secret-value"]
@@ -531,7 +531,6 @@ def test_only_declared_dependency_tool_and_environment_affect_group(tmp_path, mo
         types.SimpleNamespace(metadata={"Name": "transitive-lib"}, version="1", requires=[]),
         types.SimpleNamespace(metadata={"Name": "unrelated"}, version="1", requires=[]),
     ])
-    monkeypatch.setattr(module, "_tool_versions", lambda root: {"git": "one", "uv": "one"})
     first = module.ResultStore(root, context()).inputs(node)
     assert not {"unrelated", "legacy-only"}.intersection(dict(first["dependencies"]))
     current = module.ResultStore(root, context())
@@ -539,7 +538,7 @@ def test_only_declared_dependency_tool_and_environment_affect_group(tmp_path, mo
         current.context["dependencies"] = [[name, "2" if name == ("transitive-lib" if relevant else "unrelated") else value]
                                             for name, value in current.context["dependencies"]]
     elif kind == "tool":
-        current.context["tools"]["git" if relevant else "uv"] = "two"
+        current.context["tools"]["uv" if relevant else "node"] = "999.0.0"
     else:
         current.context["environment"]["INPUT" if relevant else "OTHER"] = "two"
     assert (current.inputs(node) != first) is relevant
@@ -1329,7 +1328,7 @@ def test_fresh_worker_identity_reuses_current_input_passes(test_runner_module, t
     assert counter.read_text().splitlines() == ["example"]
 
 
-@pytest.mark.parametrize("change", ["arguments", "tools"])
+@pytest.mark.parametrize("change", ["arguments", "tools", "git", "patch", "python-patch", "python-minor", "old-hash", "missing", "tool-package-patch", "tool-package-minor", "newer-failure"])
 def test_argument_and_tool_changes_are_independent_inputs(test_runner_module, tmp_path, monkeypatch, change):
     import importlib
 
@@ -1338,15 +1337,42 @@ def test_argument_and_tool_changes_are_independent_inputs(test_runner_module, tm
     _acceptance_test(root, "example", tmp_path / "effects.log")
     nodeid = "tests/test_example.py::test_example"
     original = _result_store(root)
-    original.save(nodeid, original.inputs(nodeid))
+    original.context["tools"] = {"uv": "uv 1.2.3", "git": "git version 1.0"}
+    original.context["runtime"] = {"python": "a" * 64, "version": "3.13.4 (old build)", "platform": "test-platform"}
+    original.context["dependencies"] = [["pytest", "8.2.0"], ["product-library", "1.0.0"]]
+    if change == "old-hash":
+        original.context["tools"]["uv"] = "b" * 64
+    saved = original.save(nodeid, original.inputs(nodeid))
+    before = original.current.path.read_bytes()
     command = [sys.executable, "-m", "pytest", "-q", "tests"]
     if change == "arguments":
         command.insert(3, "--import-mode=importlib")
-    else:
-        monkeypatch.setattr(module, "_tool_versions", lambda root: {"git": "changed", "uv": "changed"})
     context = json.loads(module.result_environment(command, root, {})[module.RESULT_CONTEXT_ENV])
-    changed = module.ResultStore(root, context)
-    assert changed.matching(nodeid, changed.inputs(nodeid)) is None
+    for _ in range(2):
+        changed = module.ResultStore(root, context)
+        changed.context["tools"] = {"uv": {"version": "1.2.99"}, "git": "completely different Git"}
+        changed.context["runtime"] = {"version": "3.13.99", "platform": "test-platform"}
+        changed.context["dependencies"] = [["pytest", "8.2.99"], ["product-library", "1.0.0"]]
+        if change == "tools":
+            changed.context["tools"]["uv"] = {"version": "1.3.0"}
+        elif change == "python-minor":
+            changed.context["runtime"]["version"] = "3.14.0"
+        elif change == "missing":
+            changed.context["tools"]["uv"] = {"version": None}
+        elif change == "tool-package-minor":
+            changed.context["dependencies"][0][1] = "8.3.0"
+        elif change == "newer-failure":
+            changed.save(nodeid, changed.inputs(nodeid), outcome="failed", phases={"call": "failed"})
+            changed = module.ResultStore(root, context)
+            changed.context.update({key: value for key, value in original.context.items() if key != "producer"})
+        selected = changed.matching(nodeid, changed.inputs(nodeid))
+        assert (selected is not None) is (change in {"git", "patch", "python-patch", "tool-package-patch"})
+        if selected:
+            assert selected["result_id"] == saved["result_id"]
+        if change != "newer-failure":
+            assert original.current.path.read_bytes() == before
+        if change in {"old-hash", "missing"}:
+            assert "major/minor version" in changed.reuse_reasons[nodeid]["reason"]
 
 
 @pytest.mark.parametrize("target", ["production.py", "tests/test_example.py"])

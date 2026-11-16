@@ -2630,8 +2630,26 @@ interruption finishes the edit without touching test results or source branches.
 Local results use the worktree's current file; completed builds use their Git summary.
 
 `read_check_environment.py` observes the declared locked child interpreter,
-including uv's PATH activation, package identities and resolved tool bytes.
+including uv's PATH activation, package identities and actual tool versions.
+The runner generator copies this same source into repository
+`scripts/testing/read_check_environment.py`. Whole-command reuse, individual-test
+reuse and command completion use its collection and comparison functions. Git is
+excluded. Other declared tools and language runtimes compare major/minor versions;
+patch changes retain passes. Product-library versions and manifest contents remain
+exact inputs. A saved executable hash without a readable tool version cannot
+establish reuse and returns that reason. Full observed versions and original
+result identities stay in the saved records.
 Declared values are hashed with owned checkout prefixes represented by
 `${REPO_ROOT}`. A declared `GITHUB_EVENT_PATH` also binds the event file's bytes,
 so a different PR selection cannot borrow the prior event's pass. Repository
 writers compare the same inputs before and after their actual callback.
+
+`github_pr_workflow/dependency_queue.py::prepare_dependency_review()` serves
+the `dependency-review` command. It extends the caller's existing repository
+scope with Renovate PRs and dashboard problems, alongside Dependabot PRs and
+alerts. Both providers use the existing PR evidence and approval handling.
+GitHub activity does not establish a successful hosted Renovate job: unavailable
+Mend job results remain a reported blocker with the portal follow-up. Repository
+health's existing local collector reports Renovate configuration declarations,
+including preset references and ownership restrictions; unresolved presets and
+JSON5 parsing requirements remain explicit. Health does not read live job logs.

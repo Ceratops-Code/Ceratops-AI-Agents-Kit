@@ -25,7 +25,6 @@ import pathlib
 import platform
 import re
 import runpy
-import shutil
 import stat
 import subprocess
 import sys
@@ -419,22 +418,6 @@ def result_environment(
     return {RESULT_CONTEXT_ENV: _json(context).decode()}
 
 
-def _tool_versions(root: pathlib.Path) -> dict[str, str | None]:
-    """Bind the repository's Git/uv toolchain without saving caller identities."""
-    uv = shutil.which("uv")
-    result = subprocess.run(
-        [uv, "--version"], capture_output=True, text=True, encoding="utf-8", check=False,
-    ) if uv else None
-    versions = {
-        "git": _git(root, "--version").decode("utf-8").strip(),
-        "uv": result.stdout.strip() if result is not None and result.returncode == 0 else None,
-    }
-    for name in ("node", "npm", "powershell"):
-        found = shutil.which(name)
-        versions[name] = hashlib.sha256(pathlib.Path(found).read_bytes()).hexdigest() if found else None
-    return versions
-
-
 def _module_inputs(module: types.ModuleType, root: pathlib.Path) -> set[str]:
     """Include repository modules imported as helpers, including other tests.
 
@@ -502,6 +485,11 @@ class ResultStore:
         if self.qualification_level is not None and self.qualification_level not in LEVELS:
             raise ValueError("unsupported pytest qualification level")
         self.manifest = load_manifest(self.root / "tests/test-impact.json")
+        environment_reader = runpy.run_path(str(pathlib.Path(__file__).with_name("read_check_environment.py")))
+        self.environment_inputs_for_reuse = environment_reader["environment_inputs_for_reuse"]
+        declared_tools = sorted({name for suite in self.manifest.suites.values()
+                                 for name in (suite.tools if suite.tools is not None else ("uv",))})
+        observed_environment = environment_reader["read_environment"](root, {"tools": declared_tools}, runtime=False)
         ignored = [pattern for item in self.manifest.ignored_paths for pattern in item.paths]
         names = _git(root, "ls-files", "--cached", "--others", "--exclude-standard", "-z").decode("utf-8").split("\0")
         self.files: dict[str, str | None] = {}
@@ -527,9 +515,8 @@ class ResultStore:
         self.context = {
             "arguments": context["arguments"], "environment": context["environment"],
             "checkout": self.checkout,
-            "runtime": {"python": hashlib.sha256(pathlib.Path(sys.executable).read_bytes()).hexdigest(),
-                        "version": sys.version, "platform": platform.platform()},
-            "tools": _tool_versions(root),
+            "runtime": {"version": platform.python_version(), "platform": platform.platform()},
+            "tools": observed_environment["tools"],
             "dependencies": sorted(
                 [dist.metadata.get("Name", ""), dist.version]
                 for dist in distributions
@@ -670,7 +657,7 @@ class ResultStore:
             packages = [[name, installed.get(name)] for name in sorted(required)]
         tools = self.context["tools"]
         if suite.tools is not None:
-            tools = {name: tools.get(name) for name in suite.tools}
+            tools = {name: tools.get(name) for name in suite.tools if pathlib.PureWindowsPath(name).stem.lower() != "git"}
         return {
             **self.context, "group": suite.suite_id,
             "environment": environment, "dependencies": packages, "tools": tools,
@@ -783,8 +770,21 @@ class ResultStore:
                 # are not inputs when the tool set is explicitly bounded.
                 # Project both sides without rewriting either original record.
                 facts["environment"] = {key: value for key, value in facts["environment"].items() if key != "PATH"}
+            environment = self.environment_inputs_for_reuse({
+                "tools": facts.get("tools", {}), "variables": facts.get("environment", {}),
+                "runtime": {**facts.get("runtime", {}), "packages": facts.get("dependencies", [])},
+            }, ignore_path=suite.tools is not None)
+            facts["tools"] = environment["tools"]
+            facts["environment"] = environment["variables"]
+            facts["runtime"] = dict(environment["runtime"])
+            facts["dependencies"] = facts["runtime"].pop("packages")
             return facts
-        old_metadata, new_metadata = metadata(original), metadata(inputs)
+        try:
+            old_metadata, new_metadata = metadata(original), metadata(inputs)
+        except ValueError as exc:
+            if differences is not None:
+                differences.append(str(exc))
+            return False
         same_metadata = old_metadata == new_metadata
         if not same_metadata and differences is None:
             return False

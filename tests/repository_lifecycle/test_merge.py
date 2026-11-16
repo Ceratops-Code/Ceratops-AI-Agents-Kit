@@ -1075,7 +1075,7 @@ def dependency_automation(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatc
     return queue, root, report, call
 
 
-@pytest.mark.parametrize("phase", ["preflight", "finalize"])
+@pytest.mark.parametrize("phase", ["review", "finalize"])
 @pytest.mark.parametrize("custom", [False, True])
 def test_dependency_automation_public_entrypoint_keeps_scope_options_and_reports(dependency_automation: Any, monkeypatch: pytest.MonkeyPatch, phase: str, custom: bool) -> None:
     queue, root, report, call = dependency_automation
@@ -1099,17 +1099,17 @@ def test_dependency_automation_public_entrypoint_keeps_scope_options_and_reports
             assert args.retarget_dependabot_prs
         selected.write_text(json.dumps(report(phase)))
         return 0
-    monkeypatch.setattr(queue, phase, handler)
+    monkeypatch.setattr(queue, "prepare_dependency_review" if phase == "review" else phase, handler)
     for _ in range(2):
         selected.write_text("stale selected result")
         queue.failure_partial_path(selected).write_text("stale partial")
-        if phase == "preflight":
+        if phase == "review":
             final.write_text("stale final result")
         assert call(phase, *options) == 0
         assert json.loads(selected.read_text()) == report(phase)
 
 
-@pytest.mark.parametrize("phase", ["preflight", "finalize"])
+@pytest.mark.parametrize("phase", ["review", "finalize"])
 @pytest.mark.parametrize("failure", ["absent", "malformed", "error", "blocked", "before", "after", "scope", "arguments", "unwritable"])
 def test_dependency_automation_failure_boundaries_preserve_current_results(dependency_automation: Any, monkeypatch: pytest.MonkeyPatch, phase: str, failure: str, capsys: pytest.CaptureFixture[str]) -> None:
     queue, root, report, call = dependency_automation
@@ -1126,7 +1126,7 @@ def test_dependency_automation_failure_boundaries_preserve_current_results(depen
         if failure == "error":
             raise OSError("specific failure evidence")
         return 1 if failure == "blocked" else 0
-    monkeypatch.setattr(queue, phase, handler)
+    monkeypatch.setattr(queue, "prepare_dependency_review" if phase == "review" else phase, handler)
     if failure == "scope":
         (root / "github-repository-scopes.json").write_text("{}")
     if failure == "unwritable":
@@ -1146,7 +1146,7 @@ def test_dependency_automation_failure_boundaries_preserve_current_results(depen
         assert not queue.failure_partial_path(output).exists()
 
 
-@pytest.mark.parametrize("phase", ["preflight", "finalize"])
+@pytest.mark.parametrize("phase", ["review", "finalize"])
 @pytest.mark.parametrize("target_name", ["output", "partial", "final", "final_partial"])
 @pytest.mark.parametrize("after", [False, True])
 def test_dependency_automation_interrupted_retirement_converges(dependency_automation: Any, monkeypatch: pytest.MonkeyPatch, phase: str, target_name: str, after: bool) -> None:
@@ -1166,7 +1166,7 @@ def test_dependency_automation_interrupted_retirement_converges(dependency_autom
                 original(path, *args, **kwargs)
             raise KeyboardInterrupt
         original(path, *args, **kwargs)
-    monkeypatch.setattr(queue, phase, lambda args: 0)
+    monkeypatch.setattr(queue, "prepare_dependency_review" if phase == "review" else phase, lambda args: 0)
     with monkeypatch.context() as scoped:
         scoped.setattr(pathlib.Path, "unlink", unlink)
         assert call(phase) == 130

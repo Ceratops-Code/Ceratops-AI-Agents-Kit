@@ -314,7 +314,6 @@ repository:
               - UV_OFFLINE
             tools:
               - uv
-              - git
               - node
               - npm
               - powershell

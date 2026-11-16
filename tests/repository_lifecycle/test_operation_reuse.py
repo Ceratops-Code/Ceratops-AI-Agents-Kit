@@ -291,6 +291,8 @@ def _fixture(root: pathlib.Path):
     (root / ".gitignore").write_text("source-checks.txt\nartifact-checks.txt\nwheel.bin\n")
     template = ROOT / "skills/ceratops-repo-lifecycle/references/templates/run-tests.py.tmpl"
     (root / "scripts/check.py").write_text(template.read_text().replace("__TEST_TARGETS__", "[]"))
+    (root / "scripts/testing").mkdir()
+    shutil.copy2(ROOT / "scripts/testing/read_check_environment.py", root / "scripts/testing/read_check_environment.py")
     probe = "from pathlib import Path; p=Path('source-checks.txt'); p.write_text(p.read_text()+'x' if p.exists() else 'x')"
     check = {
         "requires": {"capabilities": []},
@@ -477,7 +479,7 @@ def test_check_phases_public_cli_reports_first_source_failure(tmp_path, source_f
 @pytest.mark.parametrize("damage", [None, "missing", "changed"])
 @pytest.mark.parametrize("public_cli", [False, True])
 def test_check_phases_pass_every_stored_artifact_and_block_partial_output(tmp_path, damage, public_cli):
-    requests = _phased_repository(tmp_path)
+    _phased_repository(tmp_path)
     contract_path = tmp_path / runner.DEFAULT_CONTRACT
     document = json.loads(contract_path.read_text())
     build = document["deliverables"]["packages"]["sample"]["actions"]["build"]
@@ -1185,19 +1187,44 @@ def _path_scoped_operation(root, *, tools=None):
     (root / ".git/dependency.lock").write_text("locked dependency")
     declaration = {
         **operation.check_results, "environment": ["PATH", "CHECK_MODE"],
-        "tools": tools if tools is not None else [sys.executable, "git", ".git/tool.bin"],
+        "tools": tools if tools is not None else [sys.executable, "git"],
         "dependencies": [".git/dependency.lock"],
     }
     return runner.replace(operation, check_results=declaration)
 
 
-def test_path_folder_change_reuses_original_pass_without_rewriting_it(tmp_path, monkeypatch):
+@pytest.mark.parametrize("upgrade", ["path", "git", "tool-patch", "tool-minor", "python-patch", "python-minor", "old-hash", "missing"])
+def test_path_folder_change_reuses_original_pass_without_rewriting_it(tmp_path, monkeypatch, upgrade):
     operation = _path_scoped_operation(tmp_path)
     first = runner.execute_prepared_operation(operation)
     assert first["status"] == "completed", first
     reference = first["check_result"]
     path = reuse.CheckResultStore(tmp_path).current.path
     original = path.read_bytes()
+    # Compare the same recorded check through the public reuse decision without
+    # replacing installed runtimes or rewriting the accepted record.
+    old_inputs = reuse.read_check_result(path, reference["result_id"])["inputs"]
+    import copy
+
+    from retain_check_results import check_inputs_match_for_reuse, fingerprint
+    changed_inputs = copy.deepcopy(old_inputs)
+    tool = sys.executable
+    old_inputs["environment"]["tools"][tool] = {"version": "3.13.4", "sha256": "a" * 64}
+    changed_inputs["environment"]["tools"][tool] = {"version": "3.13.99", "sha256": "b" * 64}
+    old_inputs["environment"]["tools"]["git"] = {"sha256": "a" * 64}
+    changed_inputs["environment"]["tools"]["git"] = {"version": "999.0.0"}
+    if upgrade == "tool-minor":
+        changed_inputs["environment"]["tools"][tool]["version"] = "3.14.0"
+    elif upgrade == "old-hash":
+        old_inputs["environment"]["tools"][tool] = {"sha256": "a" * 64}
+    elif upgrade == "missing":
+        changed_inputs["environment"]["tools"][tool] = {"version": None}
+    elif upgrade in {"python-patch", "python-minor"}:
+        old_inputs["environment"]["runtime"] = {"python": "3.13.4"}
+        changed_inputs["environment"]["runtime"] = {"python": "3.13.5" if upgrade == "python-patch" else "3.14.0"}
+    old_inputs["fingerprint"] = fingerprint(old_inputs)
+    changed_inputs["fingerprint"] = fingerprint(changed_inputs)
+    assert check_inputs_match_for_reuse(old_inputs, changed_inputs) is (upgrade not in {"tool-minor", "python-minor", "old-hash", "missing"})
     empty = tmp_path / ".git/empty-path-folder"
     empty.mkdir()
     monkeypatch.setenv("PATH", str(empty) + os.pathsep + os.environ["PATH"])
@@ -1236,7 +1263,7 @@ def test_path_equivalence_does_not_hide_other_changed_inputs(tmp_path, monkeypat
     elif change == "dependency":
         (tmp_path / ".git/dependency.lock").write_text("changed lock")
     elif change == "tool":
-        (tmp_path / ".git/tool.bin").write_bytes(b"changed tool")
+        operation = runner.replace(operation, check_results={**operation.check_results, "tools": [sys.executable, "unavailable-test-command"]})
     elif change == "variable":
         monkeypatch.setenv("CHECK_MODE", "changed")
     else:
@@ -1475,8 +1502,9 @@ def test_explicit_phase_and_group_cli_requests_do_not_guess_group_kind(tmp_path,
 @pytest.mark.parametrize("change", ["committed", "staged", "unstaged", "new", "deleted", "renamed",
                                    "covered-readme", "uncovered-readme", "checks-only", "argument", "environment", "preparation"])
 def test_build_comparison_and_exact_artifact_groups(tmp_path, monkeypatch, change):
-    from tests.repository_lifecycle.test_completed_builds import _worktree_build_case
     from run_build_operations import prepare_build_operations, recorded_build
+
+    from tests.repository_lifecycle.test_completed_builds import _worktree_build_case
     repository, options = _worktree_build_case(tmp_path)
     path = repository / runner.DEFAULT_CONTRACT
     declaration = json.loads(path.read_text())

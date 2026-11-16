@@ -10,7 +10,6 @@
         "pyyaml"
       ],
       "tools": [
-        "git",
         "uv"
       ],
       "environment": [
@@ -35,7 +34,6 @@
         "jsonschema"
       ],
       "tools": [
-        "git",
         "uv"
       ],
       "environment": [
@@ -55,7 +53,6 @@
       "depends_on": [],
       "packages": [],
       "tools": [
-        "git",
         "uv"
       ],
       "environment": [
@@ -79,7 +76,6 @@
         "markdown-it-py"
       ],
       "tools": [
-        "git",
         "uv"
       ],
       "environment": [
@@ -102,7 +98,6 @@
         "jsonschema"
       ],
       "tools": [
-        "git",
         "uv"
       ],
       "environment": [
@@ -129,7 +124,6 @@
         "tomlkit"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -154,7 +148,6 @@
         "pyyaml"
       ],
       "tools": [
-        "git",
         "uv"
       ],
       "environment": [
@@ -181,7 +174,6 @@
         "tomlkit"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -212,7 +204,6 @@
         "tomlkit"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -242,7 +233,6 @@
         "tomlkit"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -272,7 +262,6 @@
         "tomlkit"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -302,7 +291,6 @@
         "tomlkit"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -331,7 +319,6 @@
         "tomlkit"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -362,7 +349,6 @@
         "tomlkit"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -391,7 +377,6 @@
         "tomlkit"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -420,7 +405,6 @@
         "tomlkit"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -450,7 +434,6 @@
         "tomlkit"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -480,7 +463,6 @@
         "tomlkit"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -509,7 +491,6 @@
         "tomlkit"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -538,7 +519,6 @@
         "tomlkit"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -572,7 +552,6 @@
         "tzdata"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -605,7 +584,6 @@
         "tzdata"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -638,7 +616,6 @@
         "tzdata"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -672,7 +649,6 @@
         "tzdata"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -705,7 +681,6 @@
         "tzdata"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -735,7 +710,6 @@
         "tomlkit"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -764,7 +738,6 @@
         "tomlkit"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -787,7 +760,6 @@
       "depends_on": [],
       "packages": [],
       "tools": [
-        "git",
         "uv"
       ],
       "environment": [
@@ -824,7 +796,6 @@
         "tomlkit"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -868,7 +839,6 @@
         "tomlkit"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -897,7 +867,6 @@
         "tomlkit"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -926,7 +895,6 @@
         "tomlkit"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -955,7 +923,6 @@
         "tomlkit"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -988,7 +955,6 @@
         "tzdata"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -1021,7 +987,6 @@
         "tzdata"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -1050,7 +1015,6 @@
         "tomlkit"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -1079,7 +1043,6 @@
         "tomlkit"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -1110,7 +1073,6 @@
         "tomlkit"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",

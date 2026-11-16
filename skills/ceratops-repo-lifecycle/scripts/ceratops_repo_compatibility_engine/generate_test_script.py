@@ -106,7 +106,7 @@ def record_generated_runner(
     """Deliver local reuse modules with an owned runner or opted-in custom runner.
 
     Custom runners and their input maps remain repository-owned. A custom
-    runner can opt into these two generated modules without transferring its
+    runner can opt into these generated support modules without transferring its
     command implementation to the standard template.
     """
     from .compatibility_contract import template_path
@@ -131,6 +131,12 @@ def record_generated_runner(
         if destination.is_symlink() or destination.is_junction():
             raise RuntimeError(f"generated test support must not be a link: {destination}")
         planned[destination] = (templates / (name + ".tmpl")).read_text(encoding="utf-8")
+    destination = root / "scripts/testing/read_check_environment.py"
+    if destination.is_symlink() or destination.is_junction():
+        raise RuntimeError(f"generated test support must not be a link: {destination}")
+    planned[destination] = pathlib.Path(__file__).resolve().parents[1].joinpath(
+        "read_check_environment.py",
+    ).read_text(encoding="utf-8")
 
 
 def generated_support_errors(root: pathlib.Path, contract: Mapping[str, Any]) -> list[str]:
@@ -151,7 +157,7 @@ def generated_support_errors(root: pathlib.Path, contract: Mapping[str, Any]) ->
     if not enabled:
         return []  # Custom commands/storage retain their own executable contract.
     errors = []
-    for name in ("select_test_groups.py", "reuse_test_results.py"):
+    for name in ("select_test_groups.py", "reuse_test_results.py", "read_check_environment.py"):
         path = root / "scripts/testing" / name
         if not path.is_file() or path.is_symlink() or path.is_junction():
             errors.append(f"Generated test support requires its own regular file: scripts/testing/{name}")

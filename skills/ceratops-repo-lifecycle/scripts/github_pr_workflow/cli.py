@@ -41,7 +41,7 @@ def _parser() -> argparse.ArgumentParser:
             "merge",
             "sync",
             "ship",
-            "dependency-preflight",
+            "dependency-review",
             "dependency-finalize",
         ),
         help="workflow operation",
@@ -69,8 +69,8 @@ def main(argv: list[str] | None = None) -> int:
         "merge": merge.main,
         "sync": sync.main,
         "ship": ship_pull_request.main,
-        "dependency-preflight": lambda values: dependency_queue.main(
-            ["preflight", *(values or [])]
+        "dependency-review": lambda values: dependency_queue.main(
+            ["review", *(values or [])]
         ),
         "dependency-finalize": lambda values: dependency_queue.main(
             ["finalize", *(values or [])]
