@@ -16,6 +16,7 @@ import json
 import os
 import pathlib
 import runpy
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -26,7 +27,6 @@ from typing import Any, TypedDict
 
 import yaml
 
-from .ci_workflow import workflow_errors
 from .compatibility_contract import load_compatibility_contract, template_path
 from .generate_repository_checks import (
     contract_checks,
@@ -498,7 +498,50 @@ def validate_ceratops_compatibility(
         if (required or name in present) and (error := _regular_file_error(root, paths[name])):
             errors.append(error)
     if not _regular_file_error(root, paths["workflow"]):
-        errors.extend(workflow_errors(root / paths["workflow"], contract["ci_action"]))
+        try:
+            workflow = yaml.safe_load((root / paths["workflow"]).read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, yaml.YAMLError) as exc:
+            errors.append(f"Invalid CI workflow: {exc}")
+            workflow = None
+        jobs = workflow.get("jobs") if isinstance(workflow, Mapping) else None
+        if not isinstance(jobs, Mapping) or not jobs:
+            errors.append("CI workflow must declare jobs")
+        else:
+            ci_commands = set()
+            for job in jobs.values():
+                if not isinstance(job, Mapping) or job.get("continue-on-error"):
+                    continue
+                steps = job.get("steps", [])
+                if not isinstance(steps, list):
+                    continue
+                for step in steps:
+                    if not isinstance(step, Mapping) or step.get("continue-on-error"):
+                        continue
+                    if step.get("if") not in (None, "success()", "${{ success() }}"):
+                        continue
+                    if step.get("working-directory") not in (None, "."):
+                        continue
+                    script = step.get("run")
+                    if not isinstance(script, str):
+                        continue
+                    for line in script.splitlines():
+                        log = ' 2>&1 | tee -a "$RUNNER_TEMP/repository-validation.log"'
+                        if step.get("shell") == "bash":
+                            line = line.removesuffix(log)
+                        try:
+                            ci_commands.add(tuple(shlex.split(line)))
+                        except ValueError:
+                            continue
+            for location, check in entries.items():
+                if not location.startswith("repository.actions.pre-build-checks.check-groups."):
+                    continue
+                for step in check.get("steps", []):
+                    argv = step.get("run")
+                    if argv and tuple(
+                        "$RUNNER_TEMP" if argument == "{temporary_root}" else argument
+                        for argument in argv
+                    ) not in ci_commands:
+                        errors.append(f"CI workflow must run the declared command for {location} and fail on errors")
     python_skills: set[str] = set()
     if "skill_manifest" in present and not _regular_file_error(root, paths["skill_manifest"]):
         manifest_errors, python_skills = _manifest_errors(

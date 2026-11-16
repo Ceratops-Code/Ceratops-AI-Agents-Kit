@@ -179,9 +179,8 @@ Infer the source identity from stable repository evidence before asking.
 
 - Create a missing `scripts/validate-repository.py` and
   `.github/workflows/validate.yml` for every repository, including repositories
-  with no skills. CI invokes this skill's GitHub action to select validation and
-  tests separately. Preserve an existing action commit pin; otherwise resolve a
-  published revision or use `--ci-action-revision <commit>`.
+  with no skills. Generate CI from the declared repository check and test
+  commands. Preserve existing workflows and report missing check coverage.
 - When skills exist, the compatibility apply helper synchronizes the
   independent `scripts/deploy-skills.py`. Retain a same- or
   higher-version bootstrap and replace only a missing or lower version.

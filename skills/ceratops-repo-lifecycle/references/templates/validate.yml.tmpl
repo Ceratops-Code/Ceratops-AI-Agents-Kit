@@ -10,21 +10,29 @@ permissions:
 
 jobs:
   validate-repository:
+    timeout-minutes: 90
     name: validate-repository
     runs-on: __RUNNER__
     steps:
+      - name: Check pull request source for main
+        if: github.event_name == 'pull_request' && github.base_ref == 'main'
+        shell: bash
+        env:
+          PR_HEAD_BRANCH: ${{ github.head_ref }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_BASE_REPO: ${{ github.repository }}
+        run: |
+          if [[ "$PR_HEAD_BRANCH" != release/local || "$PR_HEAD_REPO" != "$PR_BASE_REPO" ]]; then
+            echo "::error::Pull requests to main must come from this repository's release/local."
+            exit 1
+          fi
+
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Begin generated repository steps
       # __SETUP_STEPS__
-      - name: Validate and test through SDLC
-        uses: __CI_ACTION__
-        env:
-          CERATOPS_PROJECTS_ROOT: ${{ github.workspace }}/..
-          CERATOPS_TASK_TEMP_ROOT: ${{ runner.temp }}
-        with:
-          repo-root: __CI_REPO_ROOT__
-          operations: __CI_OPERATIONS__
-          evidence-file: __CI_EVIDENCE__
+      # __CHECK_STEPS__
+      # End generated repository steps
 
       - name: Upload validation evidence
         if: failure()

@@ -263,8 +263,7 @@ without repository deduplication.
 | `skills/ceratops-repo-lifecycle/scripts/check_deployment_receipts.py` | Checks closed deployment receipts for promotion finalization, preserving MCP server underscores while keeping skill identities unchanged; rejects mismatched records, unfinished cleanup and duplicate identities without running installation or publication. |
 | `skills/ceratops-repo-lifecycle/scripts/manage-pending-work.py` | Records, checks, automatically resumes the retained target commit, and progressively finalizes the exact selected scope; preflight preserves and reports non-cleanup-eligible worktrees, while eligible residual-worktree and identity-matched task-temp cleanup delegates bounded removal to `pending-work-cleanup.py`. |
 | `skills/ceratops-repo-lifecycle/scripts/pending-work-cleanup.py` | Checks named directory boundaries, preserves active skill-update state, and removes selected residual and task-temp trees after clearing read-only Windows files and directories without traversing links. |
-| `skills/ceratops-repo-lifecycle/scripts/action.yml` | GitHub composite action that runs explicitly requested check phases or groups using the skill-owned SDLC engine; The required `operations` input names check phases or individual groups, one per line; name only the source group when tests require an interactive desktop. CI defers skill handoffs and retains failure evidence. |
-| `skills/ceratops-repo-lifecycle/scripts/repository_operation.py` | Runs named SDLC operations and keeps their structured results separate from command completion. Skill callers execute registered handoffs. CI defers handoffs and checks that PRs to `main` come from the same repository's `release/local`. |
+| `skills/ceratops-repo-lifecycle/scripts/repository_operation.py` | Runs named SDLC operations and keeps their structured results separate from command completion. Skill callers execute registered handoffs and use the repository's declared commands. |
 | `skills/ceratops-repo-lifecycle/scripts/execute_skill_actions.py` | Runs a skill action's declared commands for the repository runner. Selects ordinary, named-skill or package-backed MCP arguments before any command starts. MCP package selection uses the SDLC prerequisites, exact project pin, one existing wheel and its canonical package lock; it never builds or tests an artifact. Preserves installed/source agreement and pinned Python execution, and returns step results and complete failure-report paths. It calls the owning skill's implementation; it does not install skills itself. |
 | `skills/ceratops-repo-lifecycle/scripts/ship-repository.py` | Public Ship argument parser and JSON/exit-code adapter; calls `github_pr_workflow/ship_repository.py`. |
 | `skills/ceratops-repo-lifecycle/scripts/github_pr_workflow/ship_repository.py` | Callable Ship orchestration and shared inputs/errors, used by both the CLI and Promote: SDLC checks, direct GitHub workflow calls, publication, installation and cleanup. |
@@ -941,10 +940,8 @@ The approved changes below are **planned**, not new behavior of today's commands
 See [test reuse and affected checks](docs/design-draft.md#acceptance-reuse-and-affected-checks),
 [the complete Ship sequence](docs/design-draft.md#ship-ci-receipts-and-local-installation)
 and [completion cleanup](docs/design-draft.md#shipped-task-work-and-planned-abandoned-work-cleanup).
-The existing `skills/ceratops-repo-lifecycle/scripts/action.yml` remains a thin
-repository-check wrapper. Step 10 updates it, its workflow callers and the
-compatibility template together; PR management, publication and local installation
-do not belong inside that composite action.
+GitHub workflows call the repository commands directly. Ship executes the
+same declared commands from outside the repository.
 
 ### Generated-output lifecycle
 
@@ -1432,18 +1429,11 @@ Initial application resolves the lock and syncs the environment. Later runs
 use the lock; missing dependencies are installed by uv before Python starts,
 while stale locks fail instead of changing dependency decisions during checks.
 
-SDLC execution and schemas stay in the repository-lifecycle skill. Target
-repositories receive no engine copy or SDLC launcher. CI sets up uv and calls
-`Ceratops-Code/Ceratops-AI-Agents-Kit/skills/ceratops-repo-lifecycle/scripts@<commit>`
-with `repo-root` and `evidence-file` inputs. GitHub obtains the action; no Codex
-skills installation is needed on the runner. The action uses its own locked Python
-project, while target scripts use their repository's project.
-
-Compatibility preserves an existing action pin. For new CI it resolves a
-published revision before writing files; `--ci-action-revision <commit>` selects
-an explicit revision for offline planning or a chosen release. That revision
-must contain the published action before CI can run. Dependabot maintains
-GitHub Actions pins as well as the scripts project.
+SDLC execution and schemas stay in the repository-lifecycle skill. The
+compatibility template creates a workflow that runs the repository's own
+check and test commands in their declared environments. Existing workflows
+keep their job definitions. Compatibility checks that required commands are
+present and that command failures fail the job.
 
 Skill callers invoke their bundled engine directly:
 
@@ -1696,12 +1686,9 @@ are local working data and do not authorize deployment. Deployment retains its
 immediate destination checks and producer-specific completion result.
 
 This source repository uses `scripts/pyproject.toml` and `scripts/uv.lock` for
-its maintenance scripts, Python tests, and Ruff and mypy settings. Its SDLC v4
-contract runs validation and tests separately.
-CI uses the local composite action in this checkout, preserving PR test selection;
-local and push gates cover the required tests while reusing applicable passes.
-Other repositories use the same
-skill-owned action pinned to a published commit.
+its maintenance scripts, Python tests, and Ruff and mypy settings. CI calls
+the commands declared for repository pre-build checks in `sdlc/sdlc.yml`.
+The test launcher owns PR test selection.
 
 Repository-wide Markdown and YAML lint settings live in
 `scripts/.markdownlint.json` and `scripts/.yamllint.yml`. The npm Markdown

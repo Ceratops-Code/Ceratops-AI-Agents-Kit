@@ -81,6 +81,7 @@ def run_operation_cli(
     if_declared: bool = False,
     prepare_only: bool = False,
     ci: bool = False,
+    evidence_file: pathlib.Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run an isolated ordered capability selection."""
 
@@ -104,6 +105,8 @@ def run_operation_cli(
         command.append("--prepare-only")
     if ci:
         command.append("--ci")
+    if evidence_file is not None:
+        command.extend(("--evidence-file", str(evidence_file)))
     return subprocess.run(
         command,
         capture_output=True,
