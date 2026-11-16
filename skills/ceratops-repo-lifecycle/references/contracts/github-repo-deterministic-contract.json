@@ -483,6 +483,13 @@
           "when": "repo.archived == false && repo.fork == false && (repo.visibility != private || owner.plan.name != free)"
         },
         {
+          "path": "/repository/repo/delete_branch_on_merge",
+          "operator": "equal",
+          "expected": false,
+          "level": "WARN",
+          "when": "repo.archived == false"
+        },
+        {
           "path": "/repository/repo/allow_update_branch",
           "operator": "equal",
           "expected": true,
