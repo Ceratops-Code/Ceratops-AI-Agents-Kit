@@ -646,6 +646,9 @@ The repository-operation CLI takes explicit `--operation` phase or group
 locations. A direct group request does not run its siblings. Promote and Ship
 derive their required pre-build group locations from the SDLC declaration;
 build and delivery calls still bring in their prerequisite checks and builds.
+Saved build summaries can contain results from several producers. The result
+reader selects matching commands before checking their saved input records,
+so an unrelated result cannot block execution or reuse of a requested check.
 The CI composite action accepts the same locations through its `operations`
 input, one per line, including source-only requests for noninteractive jobs.
 Compatibility setup checks the resolved published action's input declarations
