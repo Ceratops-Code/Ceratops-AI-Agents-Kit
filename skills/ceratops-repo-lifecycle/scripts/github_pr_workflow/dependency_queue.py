@@ -329,10 +329,7 @@ def prepare_dependency_review(args: argparse.Namespace) -> int:
         for item in dashboards:
             if latest is None or str(item.get("updated_at", "")) > str(latest.get("updated_at", "")):
                 latest = item
-        details: dict[str, Any] = {"provider": "renovate", "hosted_job_status": "unavailable",
-                   "reason": "Hosted job results require the Mend portal; GitHub activity does not establish job success.",
-                   "next_action": "Open the repository job-log link in its Renovate PR and inspect the latest job.",
-                   "dashboard": None, "problems": []}
+        details: dict[str, Any] = {"provider": "renovate", "dashboard": None, "problems": []}
         if latest:
             body = str(latest.get("body") or "")
             sections = re.split(r"(?m)^## ", body)
@@ -346,19 +343,23 @@ def prepare_dependency_review(args: argparse.Namespace) -> int:
         updated = str((latest or {}).get("updated_at") or "")
         try:
             from datetime import UTC, datetime, timedelta
-            stale = not updated or datetime.fromisoformat(updated.replace("Z", "+00:00")) < datetime.now(UTC) - timedelta(days=7)
+            stale = not updated or datetime.fromisoformat(updated) < datetime.now(UTC) - timedelta(days=7)
         except ValueError:
             stale = True
         details["dashboard_stale"] = stale
         if configured and (details["problems"] or stale or configuration.get("status") != "ok"):
             details["local_lookup"] = read_renovate_configuration(pathlib.Path(str(checkout["path"])), lookup=True)
-        details["job_log_links"] = sorted(set(re.findall(
-            r"https://(?:developer\.mend\.io|app\.renovatebot\.com)/[^\s)<>]+",
-            "\n".join(str(item.get("body") or "") for item in bot_issues),
-        )))
         processing[full_name.lower()] = details
-        processing_blockers.append({"repo": full_name, "check": "renovate_processing", "message": details["reason"],
-                                    "problems": details["problems"], "next_action": details["next_action"]})
+        # Report observed failures; access to Mend's separate job service is not
+        # a prerequisite for reviewing dependency PRs and GitHub alerts.
+        failures = {name: details[name] for name in ("configuration", "local_lookup")
+                    if name in details and details[name].get("status") not in {"ok", "not_configured"}}
+        if details["problems"] or failures:
+            processing_blockers.append({
+                "repo": full_name, "check": "renovate_processing",
+                "message": "Renovate reported dependency-processing problems.",
+                "problems": details["problems"], "evidence": failures,
+            })
     snapshot["open_dependency_prs"] = dependency_prs
     snapshot["dependency_processing"] = processing
     requested: dict[str, set[int]] = defaultdict(set)

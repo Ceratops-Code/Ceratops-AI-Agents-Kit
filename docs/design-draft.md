@@ -2683,9 +2683,11 @@ report; successful configuration reads never imply a successful hosted job.
 
 The recurring dependency review reads only the newest dashboard and current bot
 PRs. It requests a native local lookup for a reported problem, a stale or missing
-dashboard, or failed configuration loading. This diagnostic remains distinct
-from the hosted outcome. A missing supported Mend job-status interface is
-reported with available job-log links, not replaced by a success inferred from
-PR activity. The same existing PR route handles both bots and leaves PRs outside
-the declared owned paths for review. Alerts keep their package, manifest,
+dashboard, or failed configuration loading. The report preserves actual
+dashboard problems and failed configuration or lookup results. It does not
+report a placeholder hosted-job status, collect portal links, or block review
+because access to Mend's separate job service is missing. Hosted-job monitoring
+is separate future work; successful local diagnostics do not establish that a
+hosted job succeeded. The same existing PR route handles both bots and leaves
+PRs outside the declared owned paths for review. Alerts keep their package, manifest,
 published fix information and next action, including alerts without a fix PR.
