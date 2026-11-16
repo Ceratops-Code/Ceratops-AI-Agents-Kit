@@ -485,7 +485,6 @@ def plan_ceratops_compatibility(
     existing: Mapping[str, object],
     *,
     apply_sdlc_contract: bool,
-    ci_action_revision: str | None = None,
 ) -> CompatibilityPlan:
     """Validate target evidence and compose writes without changing files."""
 
@@ -633,11 +632,14 @@ def plan_ceratops_compatibility(
         action_errors = action_assignment_errors(repo_root, manifest)
         if action_errors:
             raise RuntimeError("; ".join(action_errors))
-    workflow_text, source_checks, markdown_files = repository_checks.validation_surfaces(repo_root, ci_action_revision)
+    source_checks, markdown_files = repository_checks.validation_surfaces(repo_root)
     validation_checks = [str(check["id"]) for check in source_checks]
     sdlc_contract = prepare_sdlc_configuration(
         repo_root, skill_names=sorted(skill_names), apply_contract=apply_sdlc_contract,
         generated_checks=source_checks, planned_markdown=bool(markdown_files),
+    )
+    workflow_text = repository_checks.repository_workflow(
+        repo_root, source_checks, markdown_files=markdown_files, sdlc=sdlc_contract,
     )
     compatibility_contract = load_compatibility_contract()
     python_tests = discover_python_tests(
@@ -757,10 +759,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--target-repo-root", required=True, type=pathlib.Path)
     parser.add_argument("--runtime-source-id")
-    parser.add_argument(
-        "--ci-action-revision",
-        help="Published lifecycle action commit; otherwise preserve or resolve its pin.",
-    )
     args = parser.parse_args(argv)
     repo_root = args.target_repo_root.resolve()
     phase = "preflight"
@@ -790,7 +788,6 @@ def main(argv: list[str] | None = None) -> int:
             template,
             existing,
             apply_sdlc_contract=True,
-            ci_action_revision=args.ci_action_revision,
         )
         skill_paths = sorted((repo_root / "skills").glob("*/SKILL.md"))
         mutable_paths = [

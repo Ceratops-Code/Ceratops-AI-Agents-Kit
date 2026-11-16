@@ -26,7 +26,7 @@ from tests.repository_lifecycle.support import (
     run_operation_cli,
 )
 from tests.support.processes import run_compatibility_engine
-from tests.support.repositories import ROOT, run_ci_action, run_git
+from tests.support.repositories import ROOT, run_git
 
 runner = importlib.import_module("repository_operation")
 skill_actions = importlib.import_module("execute_skill_actions")

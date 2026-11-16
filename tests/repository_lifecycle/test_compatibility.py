@@ -30,7 +30,6 @@ from tests.repository_lifecycle.support import (
 )
 from tests.skill_lifecycle.support import add_action_sections
 from tests.support.processes import (
-    CI_ACTION_REVISION,
     run_compatibility_engine,
 )
 from tests.support.repositories import (
@@ -460,7 +459,7 @@ def test_compatibility_materializer_supplies_target_identity_and_assignments(
         (repo / ".github/workflows/validate.yml").read_text(encoding="utf-8")
     )["jobs"]["repository-checks"]["steps"]
     assert next(step["with"] for step in steps if step["name"] == "Set up Node.js") == {
-        "node-version": "24",
+        "node-version": package["engines"]["node"],
     }
     assert next(
         step["run"] for step in steps if step["name"] == "Install npm validation dependencies"
@@ -566,6 +565,9 @@ def test_compatibility_materializer_preserves_existing_bundle_contract(
         "v5/source",
     )
     assert prepared.returncode == 0, prepared.stdout + prepared.stderr
+    workflow = repo / ".github/workflows/validate.yml"
+    custom_comment = "# Repository-owned workflow comment"
+    workflow.write_text(custom_comment + "\n" + workflow.read_text(encoding="utf-8"), encoding="utf-8")
     sdlc_path = repo / "sdlc" / "sdlc.yml"
     contract = yaml.safe_load(sdlc_path.read_text(encoding="utf-8"))
     alpha = contract["deliverables"]["skills"]["alpha-tool"]
@@ -596,6 +598,14 @@ def test_compatibility_materializer_preserves_existing_bundle_contract(
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
+    assert workflow.read_text(encoding="utf-8").startswith(custom_comment + "\n")
+    package_node = json.loads((repo / "scripts/package.json").read_text(encoding="utf-8"))["engines"]["node"]
+    workflow_jobs = yaml.safe_load(workflow.read_text(encoding="utf-8"))["jobs"]
+    setup_node = next(
+        step for job in workflow_jobs.values() for step in job["steps"]
+        if step.get("uses", "").startswith("actions/setup-node@")
+    )
+    assert setup_node["with"]["node-version"] == package_node
     updated = yaml.safe_load(sdlc_path.read_text(encoding="utf-8"))
     assert updated["version"] == 5
     assert updated["repository"]["release-bundles"] == contract["repository"][
@@ -852,14 +862,12 @@ def test_compatibility_materializer_preserves_existing_check_and_ci(
     validator.chmod(0o744)
     workflow = repo / ".github" / "workflows" / "validate.yml"
     workflow.parent.mkdir(parents=True)
-    materializer = importlib.import_module(
-        "ceratops_repo_compatibility_engine.apply_ceratops_compatibility"
-    )
-    action = materializer.load_compatibility_contract()["ci_action"]
-    steps = [{"run": "python scripts/check-custom.py"}, {
-        "uses": action["uses"] + "@" + CI_ACTION_REVISION,
-        "with": dict(action["inputs"]),
-    }]
+    steps = [
+        {"run": "uv run --project scripts --locked python -m ruff check . --config scripts/pyproject.toml"},
+        {"run": "uv run --project scripts --locked python -m mypy --config-file scripts/pyproject.toml"},
+        {"run": "uv run --project scripts --locked python scripts/run-actionlint.py"},
+        {"run": "python scripts/check-custom.py"},
+    ]
     workflow.write_text(yaml.safe_dump({"jobs": {"checks": {"steps": steps}}}))
     before = {
         path: (path.read_bytes(), path.stat().st_mode)
@@ -889,6 +897,17 @@ def test_compatibility_materializer_preserves_existing_check_and_ci(
     assert report["workflow"] == "preserved"
     assert not (repo / "package.json").exists()
     assert not (repo / ".markdownlint.json").exists()
+
+    payload = yaml.safe_load(workflow.read_text(encoding="utf-8"))
+    payload["jobs"]["checks"]["steps"][0]["continue-on-error"] = True
+    workflow.write_text(yaml.safe_dump(payload), encoding="utf-8")
+    checker = importlib.import_module(
+        "ceratops_repo_compatibility_engine.validate_ceratops_compatibility"
+    )
+    checked = checker.validate_ceratops_compatibility(repo)
+    assert not checked["valid"]
+    assert any("CI workflow must run the declared command" in error
+               and "fail on errors" in error for error in checked["errors"])
 
 
 @pytest.mark.parametrize("configuration", [
@@ -991,8 +1010,8 @@ def test_compatibility_materializer_rolls_back_every_target_write_on_blocker(
     )
     workflow_template.write_text(
         workflow_template.read_text(encoding="utf-8").replace(
-            "repo-root: __CI_REPO_ROOT__",
-            "wrong-input: __CI_REPO_ROOT__",
+            "      # __CHECK_STEPS__\n",
+            "      # __CHECK_STEPS__\n        continue-on-error: true\n",
         ),
         encoding="utf-8",
         newline="\n",
@@ -1172,138 +1191,16 @@ def test_compatibility_materializes_action_assignments(tmp_path: pathlib.Path, i
 
 
 
-@pytest.mark.parametrize("failure", [None, "git", "ambiguous", "missing-action", "wrong-action", "missing-inputs"])
-def test_ci_action_resolution_requires_published_unambiguous_action(
-    monkeypatch: pytest.MonkeyPatch, failure: str | None,
-) -> None:
-    ci = importlib.import_module("ceratops_repo_compatibility_engine.ci_workflow")
-    contract = importlib.import_module("ceratops_repo_compatibility_engine.compatibility_contract").load_compatibility_contract()
-    action = contract["ci_action"]
-    calls = []
-
-    def git(argv, **kwargs):
-        calls.append(argv)
-        assert kwargs["timeout"] == 30
-        output = CI_ACTION_REVISION + "\t" + action["ref"] + "\n"
-        return subprocess.CompletedProcess(argv, 1 if failure == "git" else 0,
-                                           stdout=output * (2 if failure == "ambiguous" else 1), stderr="")
-
-    def published(url, **kwargs):
-        assert CI_ACTION_REVISION in url and url.endswith("/action.yml")
-        assert kwargs["timeout"] == 30
-        if failure == "missing-action":
-            raise OSError("not published")
-        inputs = {name: {"required": True} for name in action["inputs"]}
-        declaration = {
-            "runs": {"using": "node24" if failure == "wrong-action" else "composite"},
-            "inputs": inputs,
-        }
-        if failure == "missing-inputs":
-            inputs.pop("operations")
-        return io.BytesIO(yaml.safe_dump(declaration).encode())
-
-    monkeypatch.setattr(ci.subprocess, "run", git)
-    monkeypatch.setattr(ci.urllib.request, "urlopen", published)
-    if failure:
-        with pytest.raises(RuntimeError, match="publication is unavailable"):
-            ci.resolve_action(action)
-    else:
-        assert ci.resolve_action(action) == action["uses"] + "@" + CI_ACTION_REVISION
-    assert len(calls) == 1
-    # Explicit revisions support offline planning but never accept a floating ref.
-    assert ci.resolve_action(action, CI_ACTION_REVISION).endswith("@" + CI_ACTION_REVISION)
-    with pytest.raises(RuntimeError, match="full lowercase Git commit"):
-        ci.resolve_action(action, "main")
-    assert len(calls) == 1
-
-
-def test_ci_action_reconciliation_preserves_pins_and_rejects_unsafe_bindings(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    ci = importlib.import_module("ceratops_repo_compatibility_engine.ci_workflow")
-    generator = importlib.import_module("ceratops_repo_compatibility_engine.generate_repository_checks")
-    action = generator.load_compatibility_contract()["ci_action"]
-    workflow = tmp_path / ".github/workflows/validate.yml"
-    workflow.parent.mkdir(parents=True)
-    step = {"name": "Custom checks", "uses": action["uses"] + "@" + CI_ACTION_REVISION,
-            "with": dict(action["inputs"]), "if": "success()"}
-    payload = {"jobs": {"checks": {"runs-on": "ubuntu-latest", "steps": [step]}}}
-    workflow.write_text(yaml.safe_dump(payload))
-
-    def unexpected_resolution(*args, **kwargs):
-        raise AssertionError("existing pin must not resolve remote state")
-
-    monkeypatch.setattr(generator, "resolve_action", unexpected_resolution)
-    assert generator.validation_surfaces(tmp_path)[0] is None
-    assert not ci.workflow_errors(workflow, action)
-    step["continue-on-error"] = True
-    workflow.write_text(yaml.safe_dump(payload))
-    assert any("continue on error" in error for error in ci.workflow_errors(workflow, action))
-    del step["continue-on-error"], step["with"]["evidence-file"]
-    workflow.write_text(yaml.safe_dump(payload))
-    assert any("inputs" in error for error in ci.workflow_errors(workflow, action))
-    step["uses"] = action["uses"] + "@main"
-    workflow.write_text(yaml.safe_dump(payload))
-    with pytest.raises(RuntimeError, match="full commit pin"):
-        generator.validation_surfaces(tmp_path)
-
-
-def test_source_repository_can_validate_its_checked_out_local_action(
-    tmp_path: pathlib.Path,
-) -> None:
-    ci = importlib.import_module("ceratops_repo_compatibility_engine.ci_workflow")
-    generator = importlib.import_module("ceratops_repo_compatibility_engine.generate_repository_checks")
-    action = generator.load_compatibility_contract()["ci_action"]
-    identity = action["uses"].split("/", 2)
-    local_action = tmp_path.joinpath(*pathlib.PurePosixPath(identity[2]).parts, "action.yml")
-    local_action.parent.mkdir(parents=True)
-    local_action.write_text("runs:\n  using: composite\n  steps: []\n", encoding="utf-8")
-    manifest = tmp_path / "skills/skill-sections.json"
-    manifest.parent.mkdir(parents=True, exist_ok=True)
-    manifest.write_text(
-        json.dumps({"runtime_source_id": "/".join(identity[:2])}),
-        encoding="utf-8",
-    )
-    workflow = tmp_path / ".github/workflows/validate.yml"
-    workflow.parent.mkdir(parents=True)
-    workflow.write_text(
-        yaml.safe_dump(
-            {
-                "jobs": {
-                    "checks": {
-                        "steps": [
-                            {
-                                "uses": "./" + identity[2],
-                                "with": dict(action["inputs"]),
-                            }
-                        ]
-                    }
-                }
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    assert ci.workflow_errors(workflow, action) == []
-    manifest.write_text(
-        json.dumps({"runtime_source_id": "different/repository"}),
-        encoding="utf-8",
-    )
-    assert ci.workflow_errors(workflow, action) == [
-        "CI validation workflow must call " + action["uses"] + " at a full commit pin"
-    ]
-
-
-def test_unpublished_ci_action_blocks_compatibility_before_target_writes(
+def test_workflow_planning_failure_blocks_compatibility_before_target_writes(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
 ) -> None:
     generator = importlib.import_module("ceratops_repo_compatibility_engine.apply_ceratops_compatibility")
     (tmp_path / ".git").write_text("gitdir: fixture\n")
 
     def unavailable(*args, **kwargs):
-        raise RuntimeError("CI action publication is unavailable")
+        raise RuntimeError("CI command cannot be rendered")
 
-    monkeypatch.setattr(generator.repository_checks, "resolve_action", unavailable)
+    monkeypatch.setattr(generator.repository_checks, "repository_workflow", unavailable)
     assert generator.main(["--target-repo-root", str(tmp_path)]) == 1
     result = json.loads(capsys.readouterr().out)
     assert result["phase"] == "compatibility_planning"

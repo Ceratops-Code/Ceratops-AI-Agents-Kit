@@ -12,13 +12,14 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import shlex
 import subprocess
 import tomllib
 from collections.abc import Mapping
+from typing import Any
 
 import yaml
 
-from .ci_workflow import pinned_action, resolve_action, workflow_errors
 from .compatibility_contract import (
     load_compatibility_contract,
     surface_path,
@@ -26,6 +27,7 @@ from .compatibility_contract import (
 )
 from .python_tool_configuration import project_text, repository_configured
 from .repository_validation_contract import load_validation_contract
+from .sdlc_contract_validation import operation_entries
 
 BUNDLE_ROOT = pathlib.Path(__file__).resolve().parents[2]
 SETUP_NODE = "actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0"
@@ -431,13 +433,20 @@ def default_markdown_files(repo_root: pathlib.Path) -> dict[str, str]:
     return files
 
 
-def _validation_workflow(
+def repository_workflow(
     repo_root: pathlib.Path,
     checks: list[dict[str, object]],
     *,
     markdown_files: Mapping[str, str],
-) -> tuple[str, str]:
-    """Render CI using target-owned dependency setup and Python requirements."""
+    sdlc: Mapping[str, Any],
+) -> str | None:
+    """Maintain the generated steps while preserving repository-owned workflow sections."""
+    workflow = repo_root / surface_path("workflow")
+    previous = workflow.read_bytes().decode("utf-8") if workflow.is_file() else None
+    begin = "      # Begin generated repository steps"
+    end = "      # End generated repository steps"
+    if previous is not None and begin not in previous and end not in previous:
+        return None
 
     commands: list[str] = []
     for check in checks:
@@ -452,6 +461,29 @@ def _validation_workflow(
                     "repository-validation contract check command values must be text"
                 )
             commands.append(value)
+    steps: list[str] = []
+    for location, group in operation_entries(sdlc).items():
+        prefix = "repository.actions.pre-build-checks.check-groups."
+        if not location.startswith(prefix):
+            continue
+        for step in group.get("steps", []):
+            argv = step.get("run")
+            if not argv:
+                raise RuntimeError(
+                    f"{location} needs a repository command or an explicitly configured external gate for CI"
+                )
+            if argv[0] in {"npm", "pnpm", "pwsh"}:
+                commands.append("{" + argv[0] + "}")
+            command = " ".join(
+                '"$RUNNER_TEMP"' if argument == "{temporary_root}" else shlex.quote(argument)
+                for argument in argv
+            )
+            steps.extend([
+                f"      - name: {location.removeprefix(prefix)}",
+                "        shell: bash",
+                "        run: |",
+                f'          {command} 2>&1 | tee -a "$RUNNER_TEMP/repository-validation.log"',
+            ])
     setup: list[str] = ["      - name: Set up uv", f"        uses: {SETUP_UV}"]
     package = (
         json.loads(markdown_files["scripts/package.json"])
@@ -464,6 +496,10 @@ def _validation_workflow(
     if "{npm}" in commands and "{pnpm}" in commands:
         raise RuntimeError("one validation workflow cannot mix npm and pnpm checks")
     if "{npm}" in commands:
+        engines = package.get("engines")
+        node_version = engines.get("node") if isinstance(engines, Mapping) else None
+        if not isinstance(node_version, str) or not node_version:
+            node_version = "20"
         if manager != "npm":
             raise RuntimeError("npm validation checks require npm repository ownership")
         if (
@@ -479,7 +515,7 @@ def _validation_workflow(
                 "      - name: Set up Node.js",
                 f"        uses: {SETUP_NODE}",
                 "        with:",
-                f'          node-version: "{"24" if markdown_files else "20"}"',
+                f"          node-version: {json.dumps(node_version)}",
                 "      - name: Install npm validation dependencies",
                 "        run: npm "
                 + ("--prefix scripts " if _package_root(repo_root) != repo_root else "")
@@ -524,7 +560,27 @@ def _validation_workflow(
             "        run: shellcheck --version",
         ])
     runner = "windows-latest" if "{pwsh}" in commands else "ubuntu-latest"
-    return runner, "\n".join(setup)
+    template = template_path("workflow").read_text(encoding="utf-8")
+    markers = ("__RUNNER__", "      # __SETUP_STEPS__", "      # __CHECK_STEPS__")
+    if any(template.count(marker) != 1 for marker in markers):
+        raise RuntimeError("CI workflow template markers are invalid")
+    rendered = (
+        template.replace(markers[0], runner)
+        .replace(markers[1], "\n".join(setup))
+        .replace(markers[2], "\n".join(steps))
+    )
+    if previous is None:
+        return rendered
+    newline = "\r\n" if "\r\n" in previous else "\n"
+    if previous.count(begin + newline) != 1 or previous.count(end + newline) != 1:
+        raise RuntimeError("Generated repository steps must have one opening and one closing marker")
+    start = previous.index(begin + newline) + len(begin + newline)
+    stop = previous.index(end + newline)
+    if stop < start:
+        raise RuntimeError("Generated repository step markers are out of order")
+    generated_steps = rendered.split(begin + "\n", 1)[1].split(end + "\n", 1)[0]
+    updated = previous[:start] + generated_steps.replace("\n", newline) + previous[stop:]
+    return updated if updated != previous else None
 
 
 def node_package_bootstrap(
@@ -577,9 +633,8 @@ def source_check_results(check: dict[str, object], tool: str) -> dict[str, objec
 
 def validation_surfaces(
     repo_root: pathlib.Path,
-    ci_action_revision: str | None = None,
-) -> tuple[str | None, list[dict[str, object]], dict[str, str]]:
-    """Plan direct source checks and their CI entry point."""
+) -> tuple[list[dict[str, object]], dict[str, str]]:
+    """Plan direct source checks and their supporting repository files."""
 
     workflow = repo_root / surface_path("workflow")
     if workflow.is_symlink() or (workflow.exists() and not workflow.is_file()):
@@ -596,72 +651,4 @@ def validation_surfaces(
             package=json.loads(markdown_files["scripts/package.json"]),
             planned_paths=planned_paths,
         )
-    workflow_text = None
-    action = load_compatibility_contract()["ci_action"]
-    if not workflow.is_file():
-        template = template_path("workflow").read_text(encoding="utf-8")
-        markers = (
-            "__RUNNER__",
-            "      # __SETUP_STEPS__",
-            "__CI_ACTION__",
-            "__CI_REPO_ROOT__",
-            "__CI_EVIDENCE__",
-            "__CI_OPERATIONS__",
-        )
-        if any(template.count(marker) != 1 for marker in markers):
-            raise RuntimeError("CI validation template markers are invalid")
-        runner, setup = _validation_workflow(
-            repo_root, checks, markdown_files=markdown_files
-        )
-        workflow_text = (
-            template.replace("__RUNNER__", runner)
-            .replace("      # __SETUP_STEPS__", setup)
-            .replace("__CI_ACTION__", resolve_action(action, ci_action_revision))
-            .replace("__CI_REPO_ROOT__", action["inputs"]["repo-root"])
-            .replace("__CI_EVIDENCE__", action["inputs"]["evidence-file"])
-            .replace("__CI_OPERATIONS__", json.dumps(action["inputs"]["operations"]))
-        )
-    if workflow.is_file():
-        payload = yaml.safe_load(workflow.read_text(encoding="utf-8"))
-        if not isinstance(payload, dict) or not isinstance(payload.get("jobs"), dict):
-            raise RuntimeError(
-                "existing CI workflow has no jobs; reconcile its SDLC invocation explicitly"
-            )
-        if True in payload:
-            payload["on"] = payload.pop(True)
-        changed = False
-        found = False
-        for job in payload["jobs"].values():
-            if not isinstance(job, dict):
-                continue
-            steps = job.get("steps", [])
-            if not isinstance(steps, list):
-                raise RuntimeError("existing CI job steps must be a list")
-            for step in list(steps):
-                command = step.get("run", "") if isinstance(step, dict) else ""
-                if not isinstance(command, str):
-                    raise RuntimeError("existing CI run command must be text")
-                if isinstance(step, dict) and str(step.get("uses", "")).startswith(
-                    action["uses"] + "@"
-                ):
-                    if not pinned_action(step["uses"], action):
-                        raise RuntimeError(
-                            "existing lifecycle action must use a full commit pin"
-                        )
-                    if errors := workflow_errors(workflow, action):
-                        raise RuntimeError("; ".join(errors))
-                    found = True
-                    if ci_action_revision is not None:
-                        chosen = resolve_action(action, ci_action_revision)
-                        if step["uses"] != chosen:
-                            step["uses"] = chosen
-                            changed = True
-        if not found:
-            raise RuntimeError(
-                "existing CI workflow must expose a repository validation invocation before integration"
-            )
-        if changed:
-            workflow_text = yaml.dump(
-                payload, Dumper=IndentedSafeDumper, sort_keys=False
-            )
-    return workflow_text, checks, markdown_files
+    return checks, markdown_files

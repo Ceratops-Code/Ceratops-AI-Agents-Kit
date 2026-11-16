@@ -69,63 +69,29 @@ def prepare_skill_python_project(repo: pathlib.Path) -> None:
     assert result.returncode == 0, result.stderr
 
 
-def run_ci_action(
-    repo: pathlib.Path,
-    evidence: pathlib.Path,
-    bundle: pathlib.Path,
-    *,
-    operations: str = "repository.actions.pre-build-checks",
+def run_repository_ci_checks(
+    repo: pathlib.Path, evidence: pathlib.Path,
 ) -> subprocess.CompletedProcess[str]:
-    """Execute the real composite action in a caller-owned isolated action checkout."""
-    action_root = bundle / "skills/ceratops-repo-lifecycle"
-    if not action_root.exists():
-        shutil.copytree(
-            ROOT / "skills/ceratops-repo-lifecycle",
-            action_root,
-            ignore=shutil.ignore_patterns(".venv", "__pycache__"),
-        )
-        # The action checkout carries its own project; target repositories own theirs separately.
-        project = bundle / "scripts"
-        project.mkdir(parents=True)
-        for name in ("pyproject.toml", "uv.lock"):
-            shutil.copy2(ROOT / "scripts" / name, project / name)
-        # uv needs each workspace member's metadata to read the shared lock.
-        for member in ("tools", "mcp-servers/ceratops_mcp_server_manager"):
-            destination = bundle / member
-            destination.mkdir(parents=True)
-            shutil.copy2(ROOT / member / "pyproject.toml", destination / "pyproject.toml")
-        # Source actions import the same shared command helper as a real checkout.
-        shutil.copytree(
-            ROOT / "skills/sections/scripts", bundle / "skills/sections/scripts",
-            ignore=shutil.ignore_patterns("__pycache__"),
-        )
-    action_root = action_root / "scripts"
-    action = yaml.safe_load((action_root / "action.yml").read_text(encoding="utf-8"))
-    assert action["runs"]["using"] == "composite"
-    (step,) = action["runs"]["steps"]
-    assert step["shell"] == "bash"
-    values = {
-        "${{ github.action_path }}": str(action_root),
-        "${{ inputs.repo-root }}": str(repo),
-        "${{ inputs.evidence-file }}": str(evidence),
-        "${{ inputs.operations }}": operations,
-    }
+    """Run native check steps with the shell flags GitHub uses for Bash."""
+    workflow = yaml.safe_load((repo / ".github/workflows/validate.yml").read_text(encoding="utf-8"))
+    commands = [
+        step["run"]
+        for job in workflow["jobs"].values()
+        for step in job["steps"]
+        if step.get("shell") == "bash" and "run" in step and "if" not in step
+    ]
+    assert commands, "workflow declares no native checks"
     environment = dict(os.environ)
     environment.pop("UV_PROJECT_ENVIRONMENT", None)
-    environment.update({key: values[value] for key, value in step["env"].items()})
-    # Git Bash is also the Windows runner's Bash; avoid an unrelated WSL launcher.
+    environment["RUNNER_TEMP"] = str(evidence.parent)
     bash = (
         pathlib.Path(shutil.which("git") or "git").resolve().parents[1] / "bin/bash.exe"
         if os.name == "nt"
         else pathlib.Path(shutil.which("bash") or "bash")
     )
     return subprocess.run(
-        [str(bash), "--noprofile", "--norc", "-c", step["run"]],
-        cwd=repo,
-        env=environment,
-        capture_output=True,
-        text=True,
-        check=False,
+        [str(bash), "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", "\n".join(commands)],
+        cwd=repo, env=environment, capture_output=True, text=True, check=False,
     )
 
 

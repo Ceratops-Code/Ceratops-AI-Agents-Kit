@@ -24,7 +24,7 @@ Infer the source identity from stable repository evidence before asking.
 
 - Keep compatibility and SDLC execution code and schemas in this skill.
   Target repositories receive declarations and repository-specific entrypoints.
-  CI invokes this skill's pinned GitHub action and never dispatches handoffs.
+  CI runs repository-owned commands and never dispatches lifecycle handoffs.
 - (D) `ceratops_repo_compatibility_engine.validate_ceratops_compatibility`
   exposes `validate_ceratops_compatibility(repo_root)` returning
   `{applicable, valid, errors}`. It performs read-only manifest, deployment,
@@ -180,10 +180,9 @@ Infer the source identity from stable repository evidence before asking.
 
 - Generate one SDLC group per applicable source check from the repository
   check contract. Create a missing `.github/workflows/validate.yml` for every
-  repository, including repositories with no skills. CI invokes this skill's
-  GitHub action to run source checks and tests separately. Preserve an existing
-  action commit pin; otherwise resolve a
-  published revision or use `--ci-action-revision <commit>`.
+  repository, including repositories with no skills. Generate CI from the
+  declared repository check and test commands. Preserve repository-owned
+  workflows and report missing command coverage.
 - When skills exist, the compatibility apply helper synchronizes the
   independent `scripts/deploy-skills.py`. Retain a same- or
   higher-version bootstrap and replace only a missing or lower version.

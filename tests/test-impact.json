@@ -1787,16 +1787,6 @@
       ]
     },
     {
-      "id": "repository-ci-action",
-      "paths": [
-        "skills/ceratops-repo-lifecycle/scripts/action.yml"
-      ],
-      "suites": [
-        "repository-lint",
-        "repository-checks"
-      ]
-    },
-    {
       "id": "shared-skill-sections",
       "paths": [
         "skills/skill-sections.json",
@@ -2084,7 +2074,6 @@
         "skills/ceratops-repo-lifecycle/scripts/ceratops_repo_compatibility_engine/__main__.py",
         "skills/ceratops-repo-lifecycle/scripts/ceratops_repo_compatibility_engine/apply_ceratops_compatibility.py",
         "skills/ceratops-repo-lifecycle/scripts/ceratops_repo_compatibility_engine/bootstrap_installer_synchronization.py",
-        "skills/ceratops-repo-lifecycle/scripts/ceratops_repo_compatibility_engine/ci_workflow.py",
         "skills/ceratops-repo-lifecycle/scripts/ceratops_repo_compatibility_engine/validate_ceratops_compatibility.py",
         "skills/ceratops-repo-lifecycle/scripts/ceratops_repo_compatibility_engine/validation_environment.py"
       ],

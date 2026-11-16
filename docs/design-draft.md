@@ -352,10 +352,8 @@ operation engine, and `scripts/runtime`. Those proposed extra layers were
 rejected. Installed skill bindings remain in the skills; target repositories
 receive configuration and their own entrypoints.
 
-CI runs declared executable checks and tests and reports skill handoffs as
-deferred. It does not dispatch skills. A skill-driven workflow can execute
-those handoffs. Ceratops-AI-Agents-Kit uses its local composite action; other
-repositories can use a pinned published action.
+CI runs the repository's declared check and test commands. Ship executes
+registered skill handoffs separately.
 
 This repository currently declares SDLC v4 and a repository-wide test action;
 the shared loader no longer supports v1–3. Its runner supports individual
@@ -649,10 +647,8 @@ build and delivery calls still bring in their prerequisite checks and builds.
 Saved build summaries can contain results from several producers. The result
 reader selects matching commands before checking their saved input records,
 so an unrelated result cannot block execution or reuse of a requested check.
-The CI composite action accepts the same locations through its `operations`
-input, one per line, including source-only requests for noninteractive jobs.
-Compatibility setup checks the resolved published action's input declarations
-before writing a new workflow that calls it.
+Generated workflows run commands from repository pre-build check groups.
+Checks requiring a lifecycle handoff belong to the external lifecycle gate.
 
 `operation_prerequisites()` returns ordering references in `build-after` and
 the builder's file references in `build-uses-artifacts`. The

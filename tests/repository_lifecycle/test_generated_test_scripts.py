@@ -26,7 +26,6 @@ from tests.repository_lifecycle.support import (
 )
 from tests.skill_lifecycle.support import add_action_sections
 from tests.support.processes import (
-    CI_ACTION_REVISION,
     run_compatibility_engine,
 )
 from tests.support.repositories import (
@@ -701,7 +700,7 @@ def test_missing_uv_rolls_back_generated_files_before_compatibility_claim(tmp_pa
     runtime = importlib.import_module("ceratops_repo_compatibility_engine.validation_environment")
     (tmp_path / ".git").write_text("gitdir: test\n")
     monkeypatch.setattr(runtime.shutil, "which", lambda name: None)
-    assert generator.main(["--target-repo-root", str(tmp_path), "--ci-action-revision", CI_ACTION_REVISION]) == 1
+    assert generator.main(["--target-repo-root", str(tmp_path)]) == 1
     outcome = json.loads(capsys.readouterr().out)
     assert outcome["phase"] == "validator_environment_setup"
     assert outcome["rollback"] == "completed"
@@ -722,7 +721,7 @@ def test_compatibility_qualifies_scratch_before_writing_a_new_runner(
         raise ValueError("controlled failure before runner publication")
 
     monkeypatch.setattr(application, "qualify_generated_runner_scratch", interrupt_after_probe)
-    assert application.main(["--target-repo-root", str(tmp_path), "--ci-action-revision", CI_ACTION_REVISION]) == 1
+    assert application.main(["--target-repo-root", str(tmp_path)]) == 1
     outcome = json.loads(capsys.readouterr().out)
     assert outcome["phase"] == "test_runner_scratch_qualification"
     assert "controlled failure before runner publication" in str(outcome)
