@@ -604,8 +604,8 @@ if __name__ == '__main__':
     skill = fixture["deliverables"]["skills"]["claims-catalog-invoice"]
     for action in [*skill["actions"]["pre-build-checks"]["check-groups"].values(), skill["actions"]["install"]]:
         action["steps"][-1]["handoff"]["inputs"]["prerequisite-packages"] = ["claims"]
-    (repo / "sdlc").mkdir()
-    (repo / "sdlc/sdlc.yml").write_text(json.dumps(fixture))
+    (repo / ".ceratops/sdlc").mkdir(parents=True)
+    (repo / ".ceratops/sdlc/sdlc.yml").write_text(json.dumps(fixture))
     (repo / ".gitignore").write_text("calls.jsonl\nran.txt\n")
     _repository(repo)
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))

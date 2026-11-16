@@ -94,12 +94,12 @@ def test_deliverable_version_declarations(tmp_path, owner, source, schema_versio
 @pytest.mark.parametrize("entrypoint", ["cli", "callable"])
 def test_explicit_group_requests_and_whole_phase_run_the_named_commands(tmp_path, entrypoint):
     repo = tmp_path / "repo"
-    (repo / "sdlc").mkdir(parents=True)
+    (repo / ".ceratops/sdlc").mkdir(parents=True)
     groups = {name: {"requires": {"tools": []}, "steps": [{"run": [
         sys.executable, "-c", ("from pathlib import Path; "
         f"p=Path('{name}'); p.write_text(p.read_text()+'x' if p.exists() else 'x')"),
     ]}]} for name in ("source", "interactive")}
-    (repo / "sdlc/sdlc.yml").write_text(json.dumps({"version": 5, "kind": "ceratops-sdlc",
+    (repo / ".ceratops/sdlc/sdlc.yml").write_text(json.dumps({"version": 5, "kind": "ceratops-sdlc",
         "repository": {"tools": {}, "actions": {"pre-build-checks": {"check-groups": groups}}}}))
     phase = "repository.actions.pre-build-checks"
     for locations, source_count, interactive_count in (
@@ -123,7 +123,7 @@ def test_direct_after_group_receives_own_and_extra_files_without_running_sibling
     from tests.repository_lifecycle.test_operation_reuse import _phased_repository
 
     _phased_repository(tmp_path)
-    path = tmp_path / "sdlc/sdlc.yml"
+    path = tmp_path / ".ceratops/sdlc/sdlc.yml"
     document = json.loads(path.read_text())
     document["repository"]["actions"].pop("post-build-checks")
     packages = document["deliverables"]["packages"]
@@ -193,7 +193,7 @@ def test_compatibility_preserves_custom_unittest_runner_without_pytest(
     assert runner.read_text(encoding="utf-8") == runner_text
     project = tomllib.loads((scripts / "pyproject.toml").read_text(encoding="utf-8"))
     assert "pytest" not in project["project"]["dependencies"]
-    assert "scripts/run-tests.py" in (repo / "sdlc/sdlc.yml").read_text(
+    assert "scripts/run-tests.py" in (repo / ".ceratops/sdlc/sdlc.yml").read_text(
         encoding="utf-8"
     )
 
@@ -248,8 +248,8 @@ def test_typed_tests_gate_mutations_and_ci_never_dispatches_handoffs(
         },
     }
     (tmp_path / "apps/service").mkdir(parents=True)
-    (tmp_path / "sdlc").mkdir()
-    (tmp_path / "sdlc/sdlc.yml").write_text(json.dumps(declaration))
+    (tmp_path / ".ceratops/sdlc").mkdir(parents=True)
+    (tmp_path / ".ceratops/sdlc/sdlc.yml").write_text(json.dumps(declaration))
     location = "deliverables.apps.service.actions.install"
     selected = runner.validation_operations(
         tmp_path, [location], ["repository.actions.pre-build-checks.check-groups.source",
@@ -300,7 +300,7 @@ def test_external_runner_reports_failures_and_handoffs_without_repository_copies
     failure: str | None,
 ) -> None:
     repo = tmp_path / "repository with spaces"
-    (repo / "sdlc").mkdir(parents=True)
+    (repo / ".ceratops/sdlc").mkdir(parents=True)
     evidence = tmp_path / "failure evidence.json"
     evidence.write_text("previous failure")
 
@@ -349,7 +349,7 @@ def test_external_runner_reports_failures_and_handoffs_without_repository_copies
         },
     }
     (repo / "skills/service").mkdir(parents=True)
-    (repo / "sdlc/sdlc.yml").write_text(json.dumps(declaration))
+    (repo / ".ceratops/sdlc/sdlc.yml").write_text(json.dumps(declaration))
     result = run_operation_cli(repo, (
         "repository.actions.pre-build-checks.check-groups.source",
         "deliverables.skills.service.actions.pre-build-checks.check-groups.source",
@@ -541,8 +541,8 @@ def test_typed_prerequisites_are_exposed_without_build_or_install(
     tmp_path: pathlib.Path,
 ) -> None:
     fixture = _typed_contract(tmp_path)
-    (tmp_path / "sdlc").mkdir()
-    (tmp_path / "sdlc/sdlc.yml").write_text(json.dumps(fixture))
+    (tmp_path / ".ceratops/sdlc").mkdir(parents=True)
+    (tmp_path / ".ceratops/sdlc/sdlc.yml").write_text(json.dumps(fixture))
     _repository(tmp_path)
     (tmp_path / "uncommitted.txt").write_text("inspection must remain read-only")
     location = "deliverables.skills.claims-catalog-invoice.actions.install"
@@ -596,8 +596,8 @@ def test_typed_source_installed_mcp_server_needs_no_package_artifact(
     mcp_server["build-after"] = []
     assert contracts.validation_errors(fixture) == []
 
-    (tmp_path / "sdlc").mkdir()
-    (tmp_path / "sdlc/sdlc.yml").write_text(json.dumps(fixture))
+    (tmp_path / ".ceratops/sdlc").mkdir(parents=True)
+    (tmp_path / ".ceratops/sdlc/sdlc.yml").write_text(json.dumps(fixture))
     _repository(tmp_path)
     location = "deliverables.mcp-servers.insurance-claims-mcp-server.actions.install"
     prepared = runner.prepare_operations(tmp_path, [runner.OperationRequest(location)])[
@@ -621,8 +621,8 @@ def test_typed_mcp_server_install_can_run_standalone_script(tmp_path: pathlib.Pa
         }
     )
     assert contracts.validation_errors(fixture) == []
-    (tmp_path / "sdlc").mkdir()
-    (tmp_path / "sdlc/sdlc.yml").write_text(json.dumps(fixture))
+    (tmp_path / ".ceratops/sdlc").mkdir(parents=True)
+    (tmp_path / ".ceratops/sdlc/sdlc.yml").write_text(json.dumps(fixture))
     prepared = runner.prepare_operations(
         tmp_path,
         [
@@ -640,8 +640,8 @@ def test_typed_mcp_server_install_can_run_standalone_script(tmp_path: pathlib.Pa
 def test_typed_app_install_can_run_standalone_script(tmp_path: pathlib.Path) -> None:
     fixture = _typed_contract(tmp_path)
     assert contracts.validation_errors(fixture) == []
-    (tmp_path / "sdlc").mkdir()
-    (tmp_path / "sdlc/sdlc.yml").write_text(json.dumps(fixture))
+    (tmp_path / ".ceratops/sdlc").mkdir(parents=True)
+    (tmp_path / ".ceratops/sdlc/sdlc.yml").write_text(json.dumps(fixture))
     prepared = runner.prepare_operations(
         tmp_path,
         [
@@ -681,8 +681,8 @@ def test_typed_declared_operation_result_is_validated(tmp_path: pathlib.Path) ->
         }
     ]
     assert contracts.validation_errors(fixture) == []
-    (tmp_path / "sdlc").mkdir()
-    (tmp_path / "sdlc/sdlc.yml").write_text(json.dumps(fixture))
+    (tmp_path / ".ceratops/sdlc").mkdir(parents=True)
+    (tmp_path / ".ceratops/sdlc/sdlc.yml").write_text(json.dumps(fixture))
     prepared = runner.prepare_operations(
         tmp_path,
         [
@@ -713,8 +713,8 @@ def test_typed_invalid_required_result_retains_completed_side_effect(
         }
     ]
     assert contracts.validation_errors(fixture) == []
-    (tmp_path / "sdlc").mkdir()
-    (tmp_path / "sdlc/sdlc.yml").write_text(json.dumps(fixture))
+    (tmp_path / ".ceratops/sdlc").mkdir(parents=True)
+    (tmp_path / ".ceratops/sdlc/sdlc.yml").write_text(json.dumps(fixture))
     prepared = runner.prepare_operations(
         tmp_path,
         [
@@ -751,8 +751,8 @@ def test_typed_runs_commands_then_returns_structured_handoff(
             ]
         },
     )
-    (tmp_path / "sdlc").mkdir()
-    (tmp_path / "sdlc/sdlc.yml").write_text(json.dumps(fixture))
+    (tmp_path / ".ceratops/sdlc").mkdir(parents=True)
+    (tmp_path / ".ceratops/sdlc/sdlc.yml").write_text(json.dumps(fixture))
     location = "deliverables.skills.claims-catalog-invoice.actions.install"
     prepared = runner.prepare_operations(
         tmp_path,
@@ -788,8 +788,8 @@ def test_typed_package_build_waits_for_declared_test_gate(tmp_path: pathlib.Path
             ],
         }
     )
-    (tmp_path / "sdlc").mkdir()
-    (tmp_path / "sdlc/sdlc.yml").write_text(json.dumps(fixture))
+    (tmp_path / ".ceratops/sdlc").mkdir(parents=True)
+    (tmp_path / ".ceratops/sdlc/sdlc.yml").write_text(json.dumps(fixture))
     result = run_operation_cli(tmp_path, "deliverables.packages.claims.actions.build")
     assert result.returncode == 1
     assert json.loads(result.stderr)["status"] == "validation_failed"
@@ -1318,8 +1318,8 @@ def test_bundle_prepare_and_gates_keep_typed_deliverable_selection(
     for group in document["deliverables"].values():
         for record in group.values():
             (tmp_path / record["root-dir"]).mkdir(parents=True, exist_ok=True)
-    (tmp_path / "sdlc").mkdir()
-    (tmp_path / "sdlc/sdlc.yml").write_text(json.dumps(document), encoding="utf-8")
+    (tmp_path / ".ceratops/sdlc").mkdir(parents=True)
+    (tmp_path / ".ceratops/sdlc/sdlc.yml").write_text(json.dumps(document), encoding="utf-8")
     _repository(tmp_path)
     location = "deliverables.mcp-servers.insurance-claims-mcp-server.actions.build"
     prepared = runner.prepare_operations(tmp_path, [runner.OperationRequest(location)])[

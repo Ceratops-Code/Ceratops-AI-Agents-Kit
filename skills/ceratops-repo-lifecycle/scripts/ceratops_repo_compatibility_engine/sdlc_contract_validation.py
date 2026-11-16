@@ -299,7 +299,8 @@ def deliverable_source_files(repo_root: pathlib.Path, record: Mapping[str, Any],
         names.update(result.stdout.decode("utf-8").split("\0"))
     resolved_root = repo_root.resolve()
     return sorted({
-        name for name in names if name and (
+        name for name in names if name and not name.startswith(
+            (".ceratops/build/", ".ceratops/results/")) and (
             pathlib.PurePosixPath(name).is_relative_to(root)
             or any(fnmatch.fnmatchcase(name, pattern) or
                    (pattern.startswith("**/") and fnmatch.fnmatchcase(name, pattern[3:]))

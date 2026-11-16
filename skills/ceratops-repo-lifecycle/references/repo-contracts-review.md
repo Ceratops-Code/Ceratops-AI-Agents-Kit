@@ -116,7 +116,8 @@ are applied.
   `references/contracts/artifact-deterministic-contract.json` or this lifecycle
   action set claims to cover them.
 - Keep artifact identity in `deliverables.<name>.artifacts`, beside optional
-  `publish` operations in `sdlc/sdlc.yml`; keep reusable artifact standards in
+  `publish` operations in `.ceratops/sdlc/sdlc.yml`; keep reusable artifact
+  standards in
   skill-local contracts. Omit undeclared publication and identity sections.
 - Do not recreate a separate standards checklist file.
 - If a recommendation would widen contract scope beyond supported GH lifecycle

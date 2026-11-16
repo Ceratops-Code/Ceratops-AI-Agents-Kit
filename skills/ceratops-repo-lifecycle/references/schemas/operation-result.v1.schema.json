@@ -27,6 +27,9 @@
     },
     {
       "$ref": "#/$defs/builderOutput"
+    },
+    {
+      "$ref": "#/$defs/checkDecision"
     }
   ],
   "$defs": {
@@ -1065,8 +1068,7 @@
       "required": [
         "startedAt",
         "finishedAt",
-        "durationSeconds",
-        "workerPid"
+        "durationSeconds"
       ],
       "properties": {
         "startedAt": {
@@ -1165,9 +1167,59 @@
         "execution": {
           "$ref": "#/$defs/repositoryCheckExecution"
         },
-        "checks": {
+        "check_summary": {
+          "$ref": "#/$defs/checkSummary"
+        },
+        "children": {
           "type": "array",
           "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "storeKind",
+              "result_id"
+            ],
+            "properties": {
+              "storeKind": {
+                "enum": [
+                  "pytest",
+                  "reported-check"
+                ]
+              },
+              "result_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "required": {
+                "type": "boolean"
+              },
+              "reused": {
+                "type": "boolean"
+              },
+              "applicableInputGroup": {
+                "type": "string",
+                "minLength": 1
+              },
+              "comparisonInputGroup": {
+                "type": "string",
+                "minLength": 1
+              },
+              "comparisonCheckGroup": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        },
+        "childInputs": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object"
+          }
+        },
+        "childChecks": {
+          "type": "object",
+          "additionalProperties": {
             "type": "object"
           }
         }
@@ -1194,7 +1246,10 @@
                   "durationSeconds": {
                     "type": "null"
                   }
-                }
+                },
+                "required": [
+                  "workerPid"
+                ]
               }
             }
           }
@@ -1261,6 +1316,11 @@
                     "type": "number",
                     "minimum": 0
                   }
+                },
+                "not": {
+                  "required": [
+                    "workerPid"
+                  ]
                 }
               }
             }
@@ -1690,7 +1750,7 @@
           "$ref": "#/$defs/relativePath"
         },
         "check_summary": {
-          "type": "object"
+          "$ref": "#/$defs/checkSummary"
         }
       }
     },
@@ -1710,6 +1770,123 @@
             "pattern": "//|/$"
           }
         ]
+      }
+    },
+    "checkSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "inputGroups",
+        "checkGroups",
+        "checks"
+      ],
+      "properties": {
+        "schema": {
+          "const": "ceratops-check-summary.v1"
+        },
+        "inputGroups": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object"
+          }
+        },
+        "checkGroups": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object"
+          }
+        },
+        "checks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "id",
+              "status"
+            ],
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "status": {
+                "type": "string",
+                "minLength": 1
+              },
+              "kind": {
+                "type": "string",
+                "minLength": 1
+              },
+              "result_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "check_version": {
+                "type": "string",
+                "minLength": 1
+              },
+              "required": {
+                "type": "boolean"
+              },
+              "reusable": {
+                "type": "boolean"
+              },
+              "reused": {
+                "type": "boolean"
+              },
+              "inputGroup": {
+                "type": "string",
+                "minLength": 1
+              },
+              "checkGroup": {
+                "type": "string",
+                "minLength": 1
+              },
+              "applicableInputGroup": {
+                "type": "string",
+                "minLength": 1
+              },
+              "comparisonInputGroup": {
+                "type": "string",
+                "minLength": 1
+              },
+              "comparisonCheckGroup": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        }
+      }
+    },
+    "checkDecision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "status",
+        "question",
+        "answer_schema"
+      ],
+      "properties": {
+        "schema": {
+          "const": "ceratops-check-decision"
+        },
+        "status": {
+          "const": "decision_required"
+        },
+        "question": {
+          "type": "string",
+          "minLength": 1
+        },
+        "answer_schema": {
+          "type": [
+            "object",
+            "boolean"
+          ]
+        },
+        "payload": {}
       }
     }
   }

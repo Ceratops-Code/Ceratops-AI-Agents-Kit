@@ -249,8 +249,8 @@ def _write_current_sdlc(
     document = yaml.safe_load(SDLC_CONTRACT_TEMPLATE.read_text(encoding="utf-8"))
     if deliverables is not None:
         document["deliverables"] = deliverables
-    target = repo / "sdlc" / "sdlc.yml"
-    target.parent.mkdir(exist_ok=True)
+    target = repo / ".ceratops/sdlc" / "sdlc.yml"
+    target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
 
 
@@ -344,7 +344,7 @@ def test_compatibility_materializer_supplies_target_identity_and_assignments(
     ).read_bytes()
     assert "SECTION SOURCE: skills/sections/" not in beta.read_text(encoding="utf-8")
     contract = yaml.safe_load(
-        (repo / "sdlc" / "sdlc.yml").read_text(encoding="utf-8")
+        (repo / ".ceratops/sdlc" / "sdlc.yml").read_text(encoding="utf-8")
     )
     assert contract["version"] == 5
     assert contract["kind"] == "ceratops-sdlc"
@@ -389,7 +389,7 @@ def test_compatibility_materializer_supplies_target_identity_and_assignments(
         "no-op": "Target-owned skill tests remain separate.",
     }
     custom = contract["deliverables"]["skills"]["alpha-tool"]
-    sdlc = repo / "sdlc" / "sdlc.yml"
+    sdlc = repo / ".ceratops/sdlc" / "sdlc.yml"
     sdlc.write_text(yaml.safe_dump(contract, sort_keys=False), encoding="utf-8")
     assert materializer.prepare_sdlc_configuration(
         repo, skill_names=["alpha-tool", "beta-tool"], apply_contract=True,
@@ -535,13 +535,13 @@ def test_compatibility_materializer_supplies_target_identity_and_assignments(
     (alternate / ".git").write_text("gitdir: test\n", encoding="utf-8")
     (alternate / "scripts/deploy-skills.py").unlink()
     # Keep target-owned operation preservation separate from generated defaults.
-    (alternate / "sdlc/sdlc.yml").unlink()
+    (alternate / ".ceratops/sdlc/sdlc.yml").unlink()
     _write_current_sdlc(alternate)
     changed = run_compatibility_engine(bundle / "scripts", "apply", "--target-repo-root", str(alternate))
     assert changed.returncode == 0, changed.stdout + changed.stderr
     assert (alternate / "scripts/bootstrap-skills.py").is_file()
     assert not (alternate / "scripts/deploy-skills.py").exists()
-    actual = yaml.safe_load((alternate / "sdlc/sdlc.yml").read_text(encoding="utf-8"))
+    actual = yaml.safe_load((alternate / ".ceratops/sdlc/sdlc.yml").read_text(encoding="utf-8"))
     assert actual["deliverables"]["skills"]["alpha-tool"]["actions"]["pre-build-checks"]["check-groups"]["source"]["steps"][0]["handoff"] == {
         "lifecycle": "ceratops-skill-lifecycle",
         "action": "source-validate",
@@ -568,7 +568,7 @@ def test_compatibility_materializer_preserves_existing_bundle_contract(
     workflow = repo / ".github/workflows/validate.yml"
     custom_comment = "# Repository-owned workflow comment"
     workflow.write_text(custom_comment + "\n" + workflow.read_text(encoding="utf-8"), encoding="utf-8")
-    sdlc_path = repo / "sdlc" / "sdlc.yml"
+    sdlc_path = repo / ".ceratops/sdlc" / "sdlc.yml"
     contract = yaml.safe_load(sdlc_path.read_text(encoding="utf-8"))
     alpha = contract["deliverables"]["skills"]["alpha-tool"]
     alpha["artifact"] = {
@@ -744,7 +744,7 @@ def test_explicit_app_test_ownership_does_not_generate_python_test_runner(
     (repo / "runtime" / "app.json").write_text(
         "{}\n", encoding="utf-8", newline="\n"
     )
-    (repo / "sdlc").mkdir()
+    (repo / ".ceratops/sdlc").mkdir(parents=True)
     _write_current_sdlc(
         repo,
         deliverables={
@@ -767,7 +767,7 @@ def test_explicit_app_test_ownership_does_not_generate_python_test_runner(
             }
         },
     )
-    contract_path = repo / "sdlc" / "sdlc.yml"
+    contract_path = repo / ".ceratops/sdlc" / "sdlc.yml"
     contract = yaml.safe_load(contract_path.read_text(encoding="utf-8"))
     contract["repository"]["tools"]["python"] = {"executable": "python"}
     contract["repository"]["actions"]["pre-build-checks"]["check-groups"]["tests"] = {
@@ -1039,7 +1039,7 @@ def test_compatibility_materializer_rolls_back_every_target_write_on_blocker(
         repo / "skills" / "sections" / "core.md",
         repo / "skills" / "skill-sections.json",
         repo / "scripts" / "deploy-skills.py",
-        repo / "sdlc" / "sdlc.yml",
+        repo / ".ceratops/sdlc" / "sdlc.yml",
     )
     original = {path: path.read_bytes() for path in changed_paths}
 
@@ -1089,7 +1089,7 @@ def test_compatibility_materializer_blocks_invalid_assignments_before_writes(
         repo / "skills" / "sections" / "core.md",
         manifest_path,
         repo / "scripts" / "deploy-skills.py",
-        repo / "sdlc" / "sdlc.yml",
+        repo / ".ceratops/sdlc" / "sdlc.yml",
     )
     original = {
         path: (path.read_bytes(), path.stat().st_mtime_ns)
@@ -1317,8 +1317,8 @@ def test_sdlc_capabilities_preserve_native_references_and_unversioned_tools(
         native_paths.append(node_version_file)
         capabilities["node"]["version-from"] = {"file": "tooling/.nvmrc"}
     contract = _capability_contract(schema_version, capabilities)
-    sdlc = tmp_path / "sdlc/sdlc.yml"
-    sdlc.parent.mkdir()
+    sdlc = tmp_path / ".ceratops/sdlc/sdlc.yml"
+    sdlc.parent.mkdir(parents=True)
     sdlc.write_text(yaml.safe_dump(contract), encoding="utf-8")
     original = {path: path.read_bytes() for path in (sdlc, *native_paths)}
     for _ in range(2):
@@ -1347,8 +1347,8 @@ def test_sdlc_invalid_capability_stops_public_runner_before_effects(tmp_path, sc
     contract["repository"]["actions"]["pre-build-checks"]["check-groups"]["tests"]["steps"] = [{"run": [
         sys.executable, "-c", "from pathlib import Path; Path('ran').touch()",
     ]}]
-    sdlc = tmp_path / "sdlc/sdlc.yml"
-    sdlc.parent.mkdir()
+    sdlc = tmp_path / ".ceratops/sdlc/sdlc.yml"
+    sdlc.parent.mkdir(parents=True)
     sdlc.write_text(yaml.safe_dump(contract), encoding="utf-8")
     for _ in range(2):
         blocked = run_operation_cli(tmp_path, "repository.actions.pre-build-checks.check-groups.tests")
@@ -1379,7 +1379,7 @@ def test_repository_tool_requirements_point_to_native_metadata():
     reader = importlib.import_module(
         "ceratops_repo_compatibility_engine.sdlc_contract_validation"
     )
-    tools = reader.load_contract(ROOT / "sdlc/sdlc.yml")["repository"]["tools"]
+    tools = reader.load_contract(ROOT / ".ceratops/sdlc/sdlc.yml")["repository"]["tools"]
     python_reference = tools["python"]["version-from"]
     python_metadata = tomllib.loads((ROOT / python_reference["file"]).read_text(encoding="utf-8"))
     assert python_reference["key"] == "project.requires-python"
@@ -1455,10 +1455,10 @@ def test_new_configuration_uses_latest_installed_schema_without_rewriting_old_fi
         )
         assert document["version"] == newest
         assert reader.validation_errors(document) == []
-        assert not (repo / "sdlc/sdlc.yml").exists()
+        assert not (repo / ".ceratops/sdlc/sdlc.yml").exists()
     document = _capability_contract(min(versions), {})
-    path = repo / "sdlc/sdlc.yml"
-    path.parent.mkdir()
+    path = repo / ".ceratops/sdlc/sdlc.yml"
+    path.parent.mkdir(parents=True)
     path.write_text(yaml.safe_dump(document), encoding="utf-8")
     original = path.read_bytes()
     for _ in range(2):
@@ -1495,8 +1495,8 @@ def test_public_sdlc_runner_reports_newer_repository_before_running(tmp_path):
     document["repository"]["actions"]["pre-build-checks"]["check-groups"]["tests"]["steps"] = [{"run": [
         sys.executable, "-c", "from pathlib import Path; Path('ran').touch()",
     ]}]
-    path = tmp_path / "sdlc/sdlc.yml"
-    path.parent.mkdir()
+    path = tmp_path / ".ceratops/sdlc/sdlc.yml"
+    path.parent.mkdir(parents=True)
     path.write_text(yaml.safe_dump(document), encoding="utf-8")
     for _ in range(2):
         result = run_operation_cli(tmp_path, "repository.actions.pre-build-checks.check-groups.tests")
@@ -1518,8 +1518,8 @@ def test_release_bundle_declarations_have_one_public_name(tmp_path):
         for record in group.values():
             (tmp_path / record["root-dir"]).mkdir(parents=True, exist_ok=True)
     assert reader.validation_errors(document) == []
-    path = tmp_path / "sdlc/sdlc.yml"
-    path.parent.mkdir()
+    path = tmp_path / ".ceratops/sdlc/sdlc.yml"
+    path.parent.mkdir(parents=True)
     path.write_text(yaml.safe_dump(document), encoding="utf-8")
     prepared = run_operation_cli(tmp_path, "deliverables.packages.claims.actions.build", prepare_only=True)
     assert prepared.returncode == 0, prepared.stdout + prepared.stderr

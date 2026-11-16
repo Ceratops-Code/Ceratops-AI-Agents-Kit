@@ -21,7 +21,7 @@
       "required": "always"
     },
     "sdlc": {
-      "path": "sdlc/sdlc.yml",
+      "path": ".ceratops/sdlc/sdlc.yml",
       "template": "sdlc.yml.tmpl",
       "required": "always"
     },

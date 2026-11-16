@@ -22,8 +22,15 @@ from typing import Any
 import reuse_operation_checks
 import sdlc_results
 import store_artifacts
-from ceratops_repo_compatibility_engine.sdlc_contract_validation import deliverable_source_files, operation_entries
-from github_pr_workflow.command import CommandError, release_write_context, report_failure
+from ceratops_repo_compatibility_engine.sdlc_contract_validation import (
+    deliverable_source_files,
+    operation_entries,
+)
+from github_pr_workflow.command import (
+    release_write_context,
+    report_failure,
+)
+
 
 @contextmanager
 def build_operation_context(root: pathlib.Path, *, confirm_stopped=False, wait_seconds=60):
@@ -66,7 +73,8 @@ def build_dependencies(item: Any) -> set[str]:
 
 
 def prepare_build_operations(root, requests, contract_path=None, *, context="skill", artifacts=None,
-                             qualification_level="alpha", validation_operations=None, include_checks=True):
+                             qualification_level="alpha", validation_operations=None, include_checks=True,
+                             optional_builds=(), source_base=None, build_decisions=None):
     """Expand requested actions only through declared builds and required tests.
 
     Repository checks retain their existing scope. An artifact test that needs a
@@ -78,6 +86,7 @@ def prepare_build_operations(root, requests, contract_path=None, *, context="ski
     contract = operations.read_repository_contract(root, contract_path)
     entries = operation_entries(contract)
     requested = {request.operation: request for request in requests}
+    optional = set(optional_builds)
     if any(request != requested[request.operation] for request in requests):
         raise operations.OperationError("Repeated actions in one target must use the same parameters.")
     direct_checks = all(operations.operation_category(name) in {"pre-build-checks", "post-build-checks"}
@@ -113,9 +122,22 @@ def prepare_build_operations(root, requests, contract_path=None, *, context="ski
             parameters.setdefault("artifact_directory", str(root / ".pending-build-output"))
             request = replace(request, parameters_if_declared={key: value for key, value in parameters.items()
                               if key not in (request.parameters or {})})
-        items = operations.prepare_operations(root, [request], contract_path, context=context, artifacts=artifacts, defer_install_inputs=True)
-        prepared[request.operation] = [replace(item, qualification_level=qualification_level,
-            current_version=current_version, version_explicit=version_explicit) for item in items]
+        items = operations.prepare_operations(root, [request], contract_path, context=context, artifacts=artifacts,
+                                               defer_install_inputs=True, defer_build_parameters=True)
+        items = [replace(item, qualification_level=qualification_level,
+                         build_target=dict(item.parameters).get("target", "native"),
+                         current_version=current_version, version_explicit=version_explicit) for item in items]
+        if request.operation in optional:
+            comparison = recorded_build(items[0], artifacts or {}, require_artifacts=False, source_base=source_base)
+            if build_decisions is not None:
+                build_decisions[request.operation] = {
+                    "needed": comparison.get("build_needed", True),
+                    "reasons": comparison["rebuild_reasons"] or ["Declared build inputs are unchanged; no output is requested."],
+                }
+            if not comparison.get("build_needed", True):
+                requested.pop(request.operation)
+                items = []
+        prepared[request.operation] = items
         references: set[str] = set()
         for item in items:
             references.update(build_dependencies(item))
@@ -129,10 +151,14 @@ def prepare_build_operations(root, requests, contract_path=None, *, context="ski
                 request_parameters = {key: value for key, value in {
                     **(request.parameters_if_declared or {}), **(request.parameters or {})}.items()
                     if key not in {"version", "artifact_directory"}}
-                if action.get("install-inputs") == "accepted-build" and reference == request.operation.rsplit(".actions.", 1)[0]:
-                    if "version" in (request.parameters or {}):
-                        request_parameters["version"] = request.parameters["version"]
+                if (action.get("install-inputs") == "accepted-build"
+                        and reference == request.operation.rsplit(".actions.", 1)[0]
+                        and "version" in (request.parameters or {})):
+                    request_parameters["version"] = request.parameters["version"]
                 dependency = operations.OperationRequest(location, parameters_if_declared=request_parameters)
+                optional.discard(location)
+                if build_decisions is not None:
+                    build_decisions[location] = {"needed": True, "reasons": ["Required by " + request.operation]}
                 requested[location] = dependency
                 pending.append(dependency)
         if include_checks and not pending:
@@ -163,6 +189,9 @@ def prepare_build_operations(root, requests, contract_path=None, *, context="ski
                         if reference not in (artifacts or {}) and location in entries and location not in requested:
                             dependency = operations.OperationRequest(location, parameters_if_declared={
                                 key: value for key, value in parameters.items() if key not in {"version", "artifact_directory"}})
+                            optional.discard(location)
+                            if build_decisions is not None:
+                                build_decisions[location] = {"needed": True, "reasons": ["Required by " + item.operation]}
                             requested[location] = dependency
                             pending.append(dependency)
     # Dependency builds run once; explicitly repeated delivery commands retain
@@ -300,7 +329,7 @@ def collect_build_details(item):
         },
     }
 
-def recorded_build(item, inputs, *, supplier_results=()):
+def recorded_build(item, inputs, *, supplier_results=(), require_artifacts=True, source_base=None):
     """Compare this worktree's last completed package with the requested build.
 
     Git compares tracked sources against the recorded source commit. Generated
@@ -319,12 +348,86 @@ def recorded_build(item, inputs, *, supplier_results=()):
     if target is None:
         reasons.append("No target was supplied for the recorded build.")
         return decision
+    if not item.commit:
+        reasons.append("No Git source commit is available for recorded build reuse.")
+        return decision
+    current_results = reuse_operation_checks.CheckResultStore(item.repo_root).current
+    waiting = next((record for record in current_results.records("pending-build", target={"target": target})
+                    if record["operation"] == item.operation), None)
+    requests = current_results.records("check-decision") if waiting else []
+    if waiting and any(reference in record["inputs"]["scope"].get("artifacts", {}) for record in requests):
+        # This is an unfinished package awaiting a check answer, not accepted
+        # work. Reopen its current files and compare their recorded bytes once
+        # before making them available to checks in this fresh call.
+        owner = reference.split(".")
+        product = contract["deliverables"][owner[1]][owner[2]]
+        paths = tuple(deliverable_source_files(item.repo_root, product, include_deleted=True))
+        try:
+            matches = (paths == tuple(waiting["source_paths"])
+                and store_artifacts._inputs_match_commit(item.repo_root, waiting["source_commit"], paths)
+                and collect_build_details(item) == waiting["inputs"]
+                and reuse_operation_checks.artifact_inputs(item.repo_root, inputs) == waiting["dependencies"]
+                and reuse_operation_checks.artifact_inputs(item.repo_root, waiting["result"]["artifacts"]) == waiting["files"]
+                and (not item.version_explicit or parameters["version"] == waiting["version"]))
+        except (OSError, ValueError, store_artifacts.OperationError):
+            matches = False
+        if matches:
+            decision["result"] = {**waiting["result"], "pending_acceptance": True,
+                                  "build_decision": "awaiting_check", "commit": item.commit}
+            return decision
+        decision["abandoned_decisions"] = [record["decision_id"] for record in requests
+                                          if reference in record["inputs"]["scope"].get("artifacts", {})]
     candidates = [
         build for build in sdlc_results.select_build_check_summaries(
             item.repo_root, qualification_level=item.qualification_level, target=target)
         if build["receipt"].get("commandsAndSettings", {}).get("operation") == item.operation
     ]
     if not candidates:
+        if not require_artifacts and source_base is not None:
+            owner = reference.split(".")
+            product = contract["deliverables"][owner[1]][owner[2]]
+            sources = set(deliverable_source_files(item.repo_root, product, include_deleted=True))
+            needed = list(item.artifact_references)
+            covered: set[str] = set()
+            while needed:
+                dependency = needed.pop()
+                if dependency in covered:
+                    continue
+                covered.add(dependency)
+                parts = dependency.split(".")
+                declaration = contract["deliverables"][parts[1]][parts[2]]
+                sources.update(deliverable_source_files(item.repo_root, declaration, include_deleted=True))
+                needed.extend(declaration.get("actions", {}).get("build", {}).get("uses-artifacts", []))
+            required = item.prerequisites.get("tools", {})
+            for name in required:
+                version_source = contract.get("repository", {}).get("tools", {}).get(name, {}).get("version-from")
+                if version_source:
+                    sources.add(version_source["file"])
+            changes = set(reuse_operation_checks._git(
+                item.repo_root, "diff", "--name-only", "--no-renames", "-z", source_base, "--").split("\0"))
+            changes.update(reuse_operation_checks._git(
+                item.repo_root, "ls-files", "--others", "--exclude-standard", "-z").split("\0"))
+            reasons.extend("Changed build source: " + name for name in sorted(sources & changes))
+            # Compare the build declaration at the release commit, independently
+            # of checks and repository metadata. This is a Git history read, not
+            # a fallback for the current configuration location.
+            import yaml
+            relative = (item.repo_root / (item.contract_path or operations.DEFAULT_CONTRACT)).resolve().relative_to(item.repo_root).as_posix()
+            historical = sdlc_results._build_git(
+                item.repo_root, "ls-tree", "-r", "--name-only", source_base, "--",
+                relative, "sdlc/sdlc.yml").decode().splitlines()
+            old_path = relative if relative in historical else next(iter(historical), None)
+            previous = (yaml.safe_load(sdlc_results._build_blob(item.repo_root, source_base, old_path, 1024 * 1024)) or {}) if old_path else {}
+            old_product = previous.get("deliverables", {}).get(owner[1], {}).get(owner[2], {})
+            if (old_product.get("actions", {}).get("build") != product["actions"]["build"]
+                    or old_product.get("build-after", []) != product.get("build-after", [])):
+                reasons.append("Changed declared build command or settings.")
+            old_tools = previous.get("repository", {}).get("tools", {})
+            new_tools = contract.get("repository", {}).get("tools", {})
+            if any(old_tools.get(name) != new_tools.get(name) for name in required):
+                reasons.append("Changed declared build tools.")
+            decision["build_needed"] = bool(reasons)
+            return decision
         reasons.append("No completed build with the required format, target and level in this worktree.")
         return decision
     # Each producer has one current history key. During adoption an earlier
@@ -340,8 +443,7 @@ def recorded_build(item, inputs, *, supplier_results=()):
         reasons.append('Requested a different base version: ' + parameters['version'])
     owner = reference.split(".")
     declaration = contract["deliverables"][owner[1]][owner[2]]
-    current = {name for name in deliverable_source_files(item.repo_root, declaration)
-               if not name.startswith(".build/")}
+    current = set(deliverable_source_files(item.repo_root, declaration))
     previous = {record["path"] for record in receipt["artifactInputs"] if record["root"] == "git"}
     for name in sorted(current - previous):
         reasons.append("Added build source: " + name)
@@ -357,6 +459,11 @@ def recorded_build(item, inputs, *, supplier_results=()):
     for name in sorted((set(changed) | set(untracked)) & (current | previous)):
         reasons.append("Changed build source: " + name)
     details = collect_build_details(item)
+    # An omitted builder-only argument retains its previously accepted value
+    # for comparison. It must be supplied before any new builder is invoked.
+    old_parameters = receipt["commandsAndSettings"].get("parameters", {})
+    details["commandsAndSettings"]["parameters"].update({
+        name: old_parameters[name] for name in item.deferred_parameters if name in old_parameters})
     for key in ("commandsAndSettings", "platformAndTools"):
         old, new = receipt[key], details[key]
         for field in sorted(old.keys() | new.keys()):
@@ -392,6 +499,9 @@ def recorded_build(item, inputs, *, supplier_results=()):
         if recorded.get(ref) != sorted(record["sha256"] for record in files.get(ref, [])):
             reasons.append("Changed consumed artifacts: " + ref)
     if reasons:
+        return decision
+    if not require_artifacts:
+        decision["build_needed"] = False
         return decision
     try:
         accepted = sdlc_results.read_artifact_receipt_chain(
@@ -446,6 +556,39 @@ def execute_sdlc_operations(
         "pre-build-checks", "post-build-checks", "build", "bootstrap", "test-selection"}]
     by_reference = {item.operation.rsplit(".actions.", 1)[0]: item for item in builds}
     try:
+        # Repair only an unfinished final append before read-only reuse planning.
+        # The checkout's current command owns this file; complete bad records
+        # still stop preparation with their original diagnostic.
+        for root in {item.repo_root for item in prepared if item.check_results is not None}:
+            current = reuse_operation_checks.CheckResultStore(root).current
+            current.rewrite_current_results()
+            requested = [item for item in prepared if item.repo_root == root and item.check_phase]
+            names = {item.operation for item in requested}
+            declarations = operation_entries(operations.read_repository_contract(root, requested[0].contract_path)) if requested else {}
+            checks = {name: declaration for name, declaration in declarations.items()
+                      if operations.operation_category(name) in {"pre-build-checks", "post-build-checks"}}
+            commands_now = [step["run"] for declaration in checks.values()
+                            for step in declaration.get("steps", []) if "run" in step]
+            for owner in {name.split(".actions.", 1)[0] for name in names}:
+                prefix = owner + ".actions."
+                inventory = {name for name in checks if name.startswith(prefix)}
+                if not inventory <= names:
+                    continue  # A partial request cannot retire its other checks.
+                for entry in list(current.value["entries"].values()):
+                    name = entry["check_id"]
+                    if entry["kind"] not in {"repository-check", "check-decision"} or not name.startswith(prefix) or name in checks:
+                        continue
+                    if entry["kind"] == "check-decision":
+                        current.remove_deleted("check-decision", {name}, entry["target"])
+                        continue
+                    record = current._expand(entry["record"], current.value["inputGroups"])
+                    arguments = record.get("inputs", {}).get("arguments", [])
+                    if any(len(argv) == len(arguments) and all(
+                        token == old or operations.PLACEHOLDER_RE.fullmatch(token)
+                        for token, old in zip(argv, arguments, strict=True)
+                    ) for argv in commands_now):
+                        continue  # A moved command retains its original pass.
+                    current.remove_deleted("repository-check", {name}, entry["target"])
         before = [
             replace(item, check_plan=reuse_operation_checks.decide_check_reuse(item))
             if item.check_results is not None and not item.artifact_references else item
@@ -495,7 +638,7 @@ def execute_sdlc_operations(
         return result
 
     def produced_files(item, result):
-        if (result.get("build_tag") or result.get("prepared_receipt")) and result.get("artifacts"):
+        if (result.get("build_tag") or result.get("prepared_receipt") or result.get("pending_acceptance")) and result.get("artifacts"):
             return result["artifacts"]
         reference = item.operation.rsplit(".actions.", 1)[0]
         produced: dict[str, list[str]] = {}
@@ -560,6 +703,21 @@ def execute_sdlc_operations(
                 ref: available[ref] for ref in item.artifact_references if ref in available},
                 supplier_results=[*results, *(build_context or {}).get("supplied_results", [])])
             comparisons[item.operation] = comparison
+            if comparison.get("abandoned_decisions"):
+                current = reuse_operation_checks.CheckResultStore(item.repo_root).current
+                obsolete = set(comparison["abandoned_decisions"])
+                for entry in list(current.value["entries"].values()):
+                    if entry["kind"] == "check-decision" and entry["record"].get("decision_id") in obsolete:
+                        current.remove_deleted("check-decision", {entry["check_id"]}, entry["target"])
+                current.remove_deleted("pending-build", {item.operation}, {"target": item.build_target})
+                if build_context is not None:
+                    build_context.setdefault("abandoned_decisions", set()).update(obsolete)
+            if comparison["result"] is None and item.deferred_parameters:
+                # Ask for real builder arguments before allocation, version
+                # writes or command execution. Reusable work never needs them.
+                operations.prepare_operations(item.repo_root, [
+                    operations.OperationRequest(item.operation, parameters_if_declared=dict(item.parameters))
+                ], item.contract_path, context=item.handoff_mode, artifacts=available)
             if (comparison["result"] is None and item.result_schema == "ceratops-builder-output"
                     and build_context is not None):
                 from execute_worktree_build import _commit_source
@@ -624,6 +782,27 @@ def execute_sdlc_operations(
                         }
                         build_context["receipts"][key] = saved
             comparison["compared_commit"] = operations.repository_commit(item.repo_root)
+        comparison = comparisons[item.operation]
+        pending_result = comparison["result"]
+        if pending_result is not None and pending_result.get("pending_acceptance") and build_context is not None:
+            import complete_artifact_builds
+            identity = pending_result["artifact_identity"]
+            target = identity["target"]
+            key = (reference, target)
+            if key not in build_context["transactions"]:
+                transaction = complete_artifact_builds.read_artifact_build(item.repo_root,
+                    repository=identity["repository"], release_bundle=sdlc_results.receipt_storage_key(identity),
+                    version=identity["version"], required_targets=build_context["targets"][reference])
+                refreshed = operations.prepare_operations(item.repo_root, [operations.OperationRequest(
+                    item.operation, parameters_if_declared=pending_result["parameters"])
+                ], item.contract_path, context=item.handoff_mode, artifacts=available)[0]
+                refreshed = replace(refreshed, qualification_level=item.qualification_level, build_target=target,
+                    source_input_paths=transaction.declared_input_paths, current_version=transaction.version,
+                    check_answers=item.check_answers, test_context=item.test_context)
+                commands[item.operation] = refreshed
+                by_reference[reference] = refreshed
+                build_context["transactions"][key] = transaction
+                build_context["prepared"][key] = refreshed
         return comparisons[item.operation]
 
     def run_check(item):
@@ -632,7 +811,8 @@ def execute_sdlc_operations(
         if (item.automatic_check and producer is not None
                 and not (set(item.artifact_references) - {owner})
                 and not (set(producer.artifact_references) - available.keys())
-                and prepare_build_or_reuse(producer)["result"] is not None):
+                and (previous := prepare_build_or_reuse(producer)["result"]) is not None
+                and not previous.get("pending_acceptance")):
             # The original artifact acceptance remains attached to its original
             # check versions. This records a skipped automatic gate, not a new pass.
             automatic_result: dict[str, Any] = {"operation": item.operation, "status": "no_op",
@@ -653,9 +833,9 @@ def execute_sdlc_operations(
         return run(item.with_artifacts(available))
 
     for item in setup:
-        if run(item)["status"] in operations.FAILED_STATUSES:
+        if run(item)["status"] in operations.FAILED_STATUSES | {"decision_required"}:
             break
-    if not any(item["status"] in operations.FAILED_STATUSES for item in results):
+    if not any(item["status"] in operations.FAILED_STATUSES | {"decision_required"} for item in results):
         accepted = {item["operation"]: item for item in _successful_builds(successful_results)}
         completed_work: set[str] = set()
         for operation in order:
@@ -668,7 +848,10 @@ def execute_sdlc_operations(
                     for producer in list(by_reference.values()):
                         if not (build_dependencies(producer) - available.keys()):
                             prepare_build_or_reuse(producer)
-                if run_check(item)["status"] not in operations.FAILED_STATUSES:
+                checked = run_check(item)
+                if checked["status"] == "decision_required":
+                    break
+                if checked["status"] not in operations.FAILED_STATUSES:
                     completed_work.add(operation)
                 elif operation.startswith("repository.") and not item.artifact_references:
                     # A repository-wide source gate protects the entire batch.
@@ -702,9 +885,14 @@ def execute_sdlc_operations(
                     latest = next((value for value in reversed(results) if value.get("operation") == gate.operation), None)
                     if latest is not None and latest.get("commit") not in {None, item.commit}:
                         results[:] = [value for value in results if value.get("operation") != gate.operation]
-                        if run_check(replace(gate, commit=item.commit, check_plan=None))["status"] in operations.FAILED_STATUSES:
+                        gate_result = run_check(replace(gate, commit=item.commit, check_plan=None))
+                        if gate_result["status"] == "decision_required":
+                            break
+                        if gate_result["status"] in operations.FAILED_STATUSES:
                             gates_failed = True
                             break
+                if any(value["status"] == "decision_required" for value in results):
+                    break
                 if gates_failed:
                     blocked(item, ["repository checks failed after source preparation"])
                     break
@@ -741,6 +929,18 @@ def execute_sdlc_operations(
                     result["artifacts"] = produced
                     available.update(produced)
                     completed_work.add(operation)
+                    if (build_context and key in build_context["transactions"]
+                            and not result.get("build_tag") and not result.get("prepared_receipt")):
+                        transaction = build_context["transactions"][key]
+                        reuse_operation_checks.CheckResultStore(item.repo_root).current.put(
+                            "pending-build", item.operation, {"target": key[1]}, {
+                                "operation": item.operation, "version": transaction.version,
+                                "source_commit": transaction.pre_test_commit,
+                                "source_paths": list(transaction.declared_input_paths),
+                                "inputs": collect_build_details(item), "dependencies": inputs,
+                                "files": reuse_operation_checks.artifact_inputs(item.repo_root, produced),
+                                "result": result,
+                            })
             except (OSError, ValueError, KeyError, TypeError, store_artifacts.OperationError) as exc:
                 if results and results[-1].get("operation") == operation:
                     results[-1].update(status="result_invalid", message=str(exc))
@@ -752,16 +952,18 @@ def execute_sdlc_operations(
             and not commands[result["operation"]].artifact_references
             for result in results
         )
-        for item in (() if source_gate_failed else after):
+        awaiting_answer = any(value["status"] == "decision_required" for value in results)
+        for item in (() if source_gate_failed or awaiting_answer else after):
             owner = item.operation.rsplit(".actions.", 1)[0]
             required = {by_reference[ref].operation for ref in item.artifact_references if ref in by_reference}
             required.update(check.operation for check in before if check.operation.startswith(owner + ".actions."))
             if reasons := (required - completed_work) | missing_artifacts(item):
                 blocked(item, reasons)
             else:
-                run_check(item)
+                if run_check(item)["status"] == "decision_required":
+                    break
 
-    if not any(item["status"] in operations.FAILED_STATUSES for item in results):
+    if not any(item["status"] in operations.FAILED_STATUSES | {"decision_required"} for item in results):
         for item in (delivery if run_delivery else []):
             reference = item.operation.rsplit(".actions.", 1)[0]
             # None means an explicit installation request. A mapping means the
@@ -783,12 +985,13 @@ def execute_sdlc_operations(
             if run(replace(item, selected_artifacts=files or item.selected_artifacts))["status"] in operations.FAILED_STATUSES:
                 break
     failed = [item for item in results if item["status"] in operations.FAILED_STATUSES]
+    decisions = [item for item in results if item["status"] == "decision_required"]
     failed_names = {item["operation"] for item in failed}
     completed = [item["operation"] for item in results
                  if item["status"] in {"completed", "no_op"}
                  and item["operation"] not in failed_names]
-    final_result = {**preparation_cleanup, **(failed[0] if failed else {}),
-                    "status": failed[0]["status"] if failed else "completed", "results": results,
+    final_result = {**preparation_cleanup, **(failed[0] if failed else decisions[0] if decisions else {}),
+                    "status": failed[0]["status"] if failed else "decision_required" if decisions else "completed", "results": results,
                     "artifacts": available,
                     "deferred_handoffs": [handoff for result in results for handoff in result.get("deferred_handoffs", [])],
                     "completed_operations": completed,
@@ -816,6 +1019,8 @@ def execute_sdlc_operations(
     ]
     if failed:
         final_result["message"] = failed[0].get("message", "Required build/check did not complete.")
+    if (build_context or {}).get("abandoned_decisions"):
+        final_result["answer_not_applied"] = "The pending package changed; the check must report a fresh result before accepting an answer."
     if prepared:
         operations.remove_operation_failures(final_result, diagnostic_output=diagnostic_output,
                                              diagnostic_owner=diagnostic_owner or (prepared[0].repo_root, "operation"))

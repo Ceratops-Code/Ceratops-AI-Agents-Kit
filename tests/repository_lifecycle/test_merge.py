@@ -1220,7 +1220,7 @@ def test_contract_requires_merge_only_and_remediates_exact_flags(
     for name, value in expected.items():
         assertion = next(a for a in rule["assertions"] if a["path"].endswith("/" + name))
         assert assertion["expected"] is value and "when" not in assertion
-    repo = {"fork": True, "archived": False, **expected}
+    repo = {"fork": True, "archived": False, "delete_branch_on_merge": False, **expected}
     observed = {"repo": repo, "repository": {"repo": repo}}
     assert compare_states(observed, desired)["findings"][0]["level"] == "PASS"
     repo[setting] = not expected[setting]

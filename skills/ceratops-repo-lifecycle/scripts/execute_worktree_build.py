@@ -8,11 +8,10 @@ retention make repeated calls finish only missing effects.
 
 from __future__ import annotations
 
-import pathlib
 import json
 import os
+import pathlib
 import sys
-import tomlkit
 from collections.abc import Mapping, MutableMapping, Sequence
 from dataclasses import replace
 from typing import Any
@@ -21,8 +20,8 @@ import complete_artifact_builds
 import retain_artifact_versions
 import sdlc_results
 import store_artifacts
+import tomlkit
 from github_pr_workflow.command import release_lock_module
-
 
 
 def _git(root: pathlib.Path, *arguments: str, input: str | None = None):
@@ -238,6 +237,8 @@ def execute_build(
     wait_seconds=60, test_context=None, delivery_baseline=None, run_delivery=True,
     bundles: Sequence[str] = (), version_choices: Mapping[str, Mapping[str, str]] | None = None,
     version_source_commit: str | None = None,
+    compare_builds_from: str | None = None,
+    check_answers: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run one fresh build/delivery request against source read under its lock.
 
@@ -247,10 +248,15 @@ def execute_build(
     """
     import repository_operation as operations
     import reuse_operation_checks
-    from run_build_operations import (build_dependencies, build_operation_context, prepare_build_operations,
-                                     execute_sdlc_operations, recorded_build)
-    from packaging.version import Version
     from github_pr_workflow.command import CommandError, report_failure
+    from packaging.version import Version
+    from run_build_operations import (
+        build_dependencies,
+        build_operation_context,
+        execute_sdlc_operations,
+        prepare_build_operations,
+        recorded_build,
+    )
 
     root = pathlib.Path(repo_root).resolve()
     requested_operations = [item.operation for item in requests]
@@ -262,6 +268,11 @@ def execute_build(
             entries = operations.operation_entries(declaration)
             bundle_declarations = declaration.get('repository', {}).get('release-bundles', {})
             requests = list(requests)
+            optional_builds: set[str] = set()
+            build_decisions: dict[str, Any] = {}
+            if compare_builds_from is not None and not requests and not bundles:
+                optional_builds = {name for name in entries if name.endswith(".actions.build")}
+                requests = [operations.OperationRequest(name) for name in sorted(optional_builds)]
             bundle_targets = dict.fromkeys(
                 {**(request.parameters_if_declared or {}), **(request.parameters or {})}.get('target', 'native')
                 for request in requests
@@ -307,6 +318,7 @@ def execute_build(
                 root, group, contract_path, context=context, artifacts=artifacts,
                 qualification_level=qualification_level, validation_operations=validation_operations,
                 include_checks=include_checks,
+                optional_builds=optional_builds, source_base=compare_builds_from, build_decisions=build_decisions,
             )) for target, group in groups.items()]
             # Explicit supplier files suppress their build operation. Read their
             # existing acceptance before effects and retain it for the consumer's
@@ -402,7 +414,8 @@ def execute_build(
                 # Own version preparation and receipt commits are direct target
                 # state, so retrying the same answer can finish interrupted work.
                 stale_choice = bool(ancestor.returncode or any(path and path not in version_paths
-                    and not path.startswith('.build/') for path in changes.stdout.split('\0')))
+                    and not path.startswith(('.ceratops/build/', '.ceratops/results/'))
+                    for path in changes.stdout.split('\0')))
             comparisons = {}
             accepted_members = {}
             needs_decision = set()
@@ -416,7 +429,7 @@ def execute_build(
                         if reference in version_choices and not stale_choice:
                             parameters = {**dict(item.parameters), 'version': selected_versions[reference]}
                             prepared_choice = operations.prepare_operations(root, [operations.OperationRequest(item.operation, parameters)],
-                                contract_path, context=context, artifacts=artifacts)[0]
+                                contract_path, context=context, artifacts=artifacts, defer_build_parameters=True)[0]
                             item = replace(prepared_choice, qualification_level=item.qualification_level,
                                 current_version=item.current_version, version_explicit=True)
                         item = replace(item, build_target=target or dict(item.parameters).get('target', 'native'))
@@ -470,7 +483,9 @@ def execute_build(
                     release = max(previous_builds, key=lambda record: Version(record['receipt']['identity']['version']), default=None)
                     # With no release, show all tracked source as the initial
                     # product, not just the most recent commit's changes.
-                    from ceratops_repo_compatibility_engine.sdlc_contract_validation import deliverable_source_files
+                    from ceratops_repo_compatibility_engine.sdlc_contract_validation import (
+                        deliverable_source_files,
+                    )
 
                     related = (bundle_declarations[reference.removeprefix('repository.release-bundles.')]['members']
                                if reference.startswith('repository.release-bundles.') else [reference])
@@ -548,6 +563,7 @@ def execute_build(
                             target or dict(item.parameters).get("target", "native"))
             for target, prepared in batches:
                 prepared = [replace(item, build_target=target or dict(item.parameters).get("target", "native"),
+                                    check_answers=check_answers,
                                     test_context=test_context if item.check_phase or item.category == "build" else item.test_context)
                             for item in prepared]
                 result = execute_sdlc_operations(
@@ -586,6 +602,8 @@ def execute_build(
                     result = report_failure(result, diagnostic_output=diagnostic_output,
                                             repo_root=owner, action=action,
                                             successful_results=(successful_results, finished))
+                    break
+                if result["status"] == "decision_required":
                     break
             if result["status"] == "completed" and not result.get("deferred_handoffs"):
                 pending: dict[str, tuple[store_artifacts.ArtifactVersionTransaction, list[complete_artifact_builds.PreparedBuildReceipt]]] = {}
@@ -711,6 +729,10 @@ def execute_build(
                     result.update(final_commit=completed.final_commit, tag=completed.tag, version=transaction.version,
                                   build_receipts=[str(path) for path in completed.build_receipts])
                     for transaction, _ in pending_builds:
+                        current = reuse_operation_checks.CheckResultStore(root).current
+                        for (reference, target), owner in build_context["transactions"].items():
+                            if owner == transaction:
+                                current.remove_deleted("pending-build", {reference + ".actions.build"}, {"target": target})
                         # Delivery receives retained files. The tested temporary
                         # copies have been removed after completion.
                         for batch in finished:
@@ -769,6 +791,8 @@ def execute_build(
                           "pending_targets": [target for target, _ in batches[len(finished):]]}
             if result["status"] == "completed":
                 result["accepted_commit"] = operations.repository_commit(root)
+            if build_decisions:
+                result["build_decisions"] = build_decisions
             return result
     except (CommandError, operations.OperationError, OSError, ValueError) as exc:
         owner, action = diagnostic_owner or (root, "build")

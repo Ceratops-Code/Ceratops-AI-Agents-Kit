@@ -66,10 +66,10 @@ CURRENT_RESULTS_SCHEMA = "ceratops-current-check-results.v1"
 class CurrentCheckResults:
     """Keep one latest outcome per check/target in this worktree's single file.
 
-    The calling thread serializes commands in its worktree; there is no worktree
-    lock. A fixed in-process file protects previously saved outcomes while the
-    next complete JSON document is flushed and replaced. Inputs are deduplicated
-    inside this document, never in additional manifest or history files.
+    The owning command serializes writes within its worktree. Each durable JSON
+    line changes only named entries; a null entry explicitly deletes that key.
+    Command boundaries compact current entries through an atomic replacement.
+    Read-only instances never clean temporary files or repair incomplete writes.
     """
 
     def __init__(self, root: pathlib.Path) -> None:
@@ -90,10 +90,9 @@ class CurrentCheckResults:
         self.path = result_path(self.common / "ceratops/results/repository-checks" / identity / "check_results.json")
         self.worktree = {"id": identity, "path": str(self.root)}
         self.pending = result_path(self.path.with_name(".check_results.in_process.json"))
-        # A partial replacement is never acceptance. The last complete file
-        # remains authoritative until os.replace succeeds.
-        self.pending.unlink(missing_ok=True)
         self._stamp: tuple[int, int, int] | None = None
+        self._offset = 0
+        self._incomplete_tail = False
         self.value: dict[str, Any] = {}
         self._refresh()
 
@@ -102,6 +101,8 @@ class CurrentCheckResults:
             info = self.path.stat()
         except FileNotFoundError:
             self._stamp = None
+            self._offset = 0
+            self._incomplete_tail = False
             self.value = {"schema": CURRENT_RESULTS_SCHEMA, "worktree": self.worktree,
                           "inputGroups": {}, "entries": {}}
             return
@@ -110,21 +111,43 @@ class CurrentCheckResults:
             return
         if info.st_size > 64 * 1024 * 1024:
             raise ValueError(f"Current check results exceed 64 MiB: {self.path}")
-        value = read_result(self.path)[1]
-        if (not isinstance(value, dict) or set(value) != {"schema", "worktree", "inputGroups", "entries"}
-                or value["schema"] != CURRENT_RESULTS_SCHEMA or value["worktree"] != self.worktree
-                or not isinstance(value["inputGroups"], dict) or not isinstance(value["entries"], dict)):
-            raise ValueError(f"Current check results are incomplete or belong to another worktree: {self.path}")
-        for key, inputs in value["inputGroups"].items():
-            if not isinstance(inputs, dict) or key != hashlib.sha256(canonical(inputs)).hexdigest():
-                raise ValueError(f"Saved check inputs changed: {self.path}")
-        for key, entry in value["entries"].items():
-            if (not isinstance(entry, dict) or set(entry) != {"kind", "check_id", "target", "record"}
-                    or key != self._key(entry["kind"], entry["check_id"], entry["target"])
-                    or not isinstance(entry["record"], dict)):
-                raise ValueError(f"Saved check entry is incomplete: {self.path}")
-            self._expand(entry["record"], value["inputGroups"])
-        self.value, self._stamp = value, stamp
+        if (self._stamp is None or stamp[2] != self._stamp[2]
+                or stamp[1] <= self._stamp[1]):
+            self._offset = 0
+            self.value = {"schema": CURRENT_RESULTS_SCHEMA, "worktree": self.worktree,
+                          "inputGroups": {}, "entries": {}}
+        self._incomplete_tail = False
+        with self.path.open("rb") as stream:
+            stream.seek(self._offset)
+            for raw in stream:
+                if not raw.endswith(b"\n"):
+                    # Only the command owner may discard a torn trailing append.
+                    self._incomplete_tail = True
+                    break
+                try:
+                    value = json.loads(raw, object_pairs_hook=_object, parse_constant=_nonfinite)
+                except (ValueError, UnicodeError, RecursionError) as exc:
+                    raise ValueError(f"Malformed complete check-results record at byte {self._offset}: {self.path}") from exc
+                if (not isinstance(value, dict) or set(value) != {"schema", "worktree", "inputGroups", "entries"}
+                        or value["schema"] != CURRENT_RESULTS_SCHEMA or value["worktree"] != self.worktree
+                        or not isinstance(value["inputGroups"], dict) or not isinstance(value["entries"], dict)):
+                    raise ValueError(f"Current check results are incomplete or belong to another worktree: {self.path}")
+                for key, inputs in value["inputGroups"].items():
+                    if not isinstance(inputs, dict) or key != hashlib.sha256(canonical(inputs)).hexdigest():
+                        raise ValueError(f"Saved check inputs changed: {self.path}")
+                self.value["inputGroups"].update(value["inputGroups"])
+                for key, entry in value["entries"].items():
+                    if entry is None:
+                        self.value["entries"].pop(key, None)
+                        continue
+                    if (not isinstance(entry, dict) or set(entry) != {"kind", "check_id", "target", "record"}
+                            or key != self._key(entry["kind"], entry["check_id"], entry["target"])
+                            or not isinstance(entry["record"], dict)):
+                        raise ValueError(f"Saved check entry is incomplete: {self.path}")
+                    self._expand(entry["record"], self.value["inputGroups"])
+                    self.value["entries"][key] = entry
+                self._offset += len(raw)
+        self._stamp = stamp
 
     @staticmethod
     def _key(kind: str, check_id: str, target: Mapping[str, Any]) -> str:
@@ -135,21 +158,29 @@ class CurrentCheckResults:
     @staticmethod
     def _expand(record: Mapping[str, Any], groups: Mapping[str, Any]) -> dict[str, Any]:
         expanded = copy.deepcopy(dict(record))
-        for field, name in (("inputGroup", "inputs"), ("checkGroup", "check_inputs")):
+        for field, name in (("inputGroup", "inputs"), ("comparisonGroup", "comparison_inputs"),
+                            ("invocationGroup", "invocation"), ("checkGroup", "check_inputs")):
             if field not in expanded:
                 continue
             key = expanded.pop(field)
             if key not in groups:
                 raise ValueError("Current result names missing saved inputs.")
-            if name == "inputs":
-                expanded[name] = copy.deepcopy(groups[key])
-            else:
+            if name == "check_inputs":
                 expanded["inputs"][name] = copy.deepcopy(groups[key])
+            else:
+                expanded[name] = copy.deepcopy(groups[key])
+        for field, name in (("inputParts", "inputs"), ("comparisonParts", "comparison_inputs")):
+            for part, key in expanded.pop(field, {}).items():
+                if key not in groups:
+                    raise ValueError("Current result names missing saved inputs.")
+                expanded[name][part] = copy.deepcopy(groups[key])
         return expanded
 
     def records(self, kind: str, *, target: Mapping[str, Any] | None = None) -> list[dict[str, Any]]:
         """Read only current outcomes, preserving each original result identity."""
         self._refresh()
+        if self._incomplete_tail:
+            raise ValueError(f"Unfinished trailing check-results record; the next owning command must repair it: {self.path}")
         return [self._expand(entry["record"], self.value["inputGroups"])
                 for entry in self.value["entries"].values()
                 if entry["kind"] == kind and (target is None or entry["target"] == target)]
@@ -159,38 +190,110 @@ class CurrentCheckResults:
         self.put_many([(kind, check_id, target, record)])
 
     def put_many(self, outcomes: list[tuple[str, str, dict[str, Any], Mapping[str, Any]]]) -> None:
-        """Save an explicit import together; ordinary tests still save individually."""
+        """Append one atomic record for these outcomes and their new shared facts."""
         self._refresh()
-        groups = dict(self.value["inputGroups"])
-        entries = dict(self.value["entries"])
+        groups: dict[str, Any] = {}
+        entries: dict[str, Any] = {}
         for kind, check_id, target, record in outcomes:
             encoded = copy.deepcopy(dict(record))
-            inputs = encoded.pop("inputs", None)
-            if inputs is not None:
+            for name, field, parts_field in (("inputs", "inputGroup", "inputParts"),
+                                             ("comparison_inputs", "comparisonGroup", "comparisonParts"),
+                                             ("invocation", "invocationGroup", None)):
+                inputs = encoded.pop(name, None)
+                if inputs is None:
+                    continue
                 inputs = dict(inputs)
-                checks = inputs.pop("check_inputs", None)
-                for field, facts in (("inputGroup", inputs), ("checkGroup", checks)):
-                    if facts is not None:
-                        key = hashlib.sha256(canonical(facts)).hexdigest()
-                        groups[key] = facts
-                        encoded[field] = key
+                parts = {}
+                if parts_field is not None:
+                    for part, facts in list(inputs.items()):
+                        if isinstance(facts, dict):
+                            key = hashlib.sha256(canonical(facts)).hexdigest()
+                            if key not in self.value["inputGroups"]:
+                                groups[key] = facts
+                            parts[part] = key
+                            del inputs[part]
+                    if parts:
+                        encoded[parts_field] = parts
+                key = hashlib.sha256(canonical(inputs)).hexdigest()
+                if key not in self.value["inputGroups"]:
+                    groups[key] = inputs
+                encoded[field] = key
             entries[self._key(kind, check_id, target)] = {
                 "kind": kind, "check_id": check_id, "target": dict(target), "record": encoded,
             }
-        self._save(entries, groups)
+        if entries:
+            self._append_results(entries, groups)
 
     def remove_deleted(self, kind: str, deleted_ids: set[str], target: dict[str, Any]) -> None:
         """Remove explicitly deleted checks, never merely unselected checks."""
         self._refresh()
-        entries = {key: entry for key, entry in self.value["entries"].items()
-                   if not (entry["kind"] == kind and entry["target"] == target
-                           and entry["check_id"] in deleted_ids)}
-        if entries != self.value["entries"]:
-            self._save(entries, self.value["inputGroups"])
+        entries = {key: None for key, entry in self.value["entries"].items()
+                   if entry["kind"] == kind and entry["target"] == target
+                   and entry["check_id"] in deleted_ids}
+        if entries:
+            self._append_results(entries, {})
 
-    def _save(self, entries: dict[str, Any], groups: Mapping[str, Any]) -> None:
+    def _append_results(self, entries: dict[str, Any], groups: Mapping[str, Any]) -> None:
+        """Flush a finished outcome before acknowledging it; never rewrite peers."""
+        if self._incomplete_tail:
+            raise ValueError(f"Unfinished trailing check-results record: {self.path}")
+        value: dict[str, Any] = {"schema": CURRENT_RESULTS_SCHEMA, "worktree": self.worktree,
+                 "entries": entries, "inputGroups": dict(groups)}
+        raw = canonical(value)
+        if self._offset + len(raw) > 64 * 1024 * 1024:
+            previous_groups = self.value["inputGroups"]
+            self.rewrite_current_results()
+            # Compaction may remove a previously unused group needed by this
+            # new entry. Keep that group's original contents in this append.
+            for entry in entries.values():
+                if entry is None:
+                    continue
+                record = entry["record"]
+                used = {record[name] for name in ("inputGroup", "checkGroup", "comparisonGroup", "invocationGroup")
+                        if name in record}
+                used.update(key for name in ("inputParts", "comparisonParts") for key in record.get(name, {}).values())
+                for key in used - self.value["inputGroups"].keys() - value["inputGroups"].keys():
+                    value["inputGroups"][key] = previous_groups[key]
+            raw = canonical(value)
+        if self._offset + len(raw) > 64 * 1024 * 1024:
+            raise ValueError(f"Current check results exceed 64 MiB: {self.path}")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.pending.unlink(missing_ok=True)
+        try:
+            with self.path.open("ab") as stream:
+                stream.write(raw)
+                stream.flush()
+                os.fsync(stream.fileno())
+        except BaseException:
+            self._stamp = None
+            raise
+        self.value["inputGroups"].update(value["inputGroups"])
+        for key, entry in entries.items():
+            if entry is None:
+                self.value["entries"].pop(key, None)
+            else:
+                self.value["entries"][key] = entry
+        self._offset += len(raw)
+        info = self.path.stat()
+        self._stamp = (info.st_mtime_ns, info.st_size, info.st_ino)
+
+    def rewrite_current_results(self) -> None:
+        """At an owning command boundary, retain current outcomes and recover a torn tail.
+
+        Only incomplete bytes after the last newline may be discarded. Complete
+        malformed records always block this operation. The old file remains
+        authoritative until the compacted contents have been flushed and replaced.
+        """
+        self._refresh()
+        self.pending.unlink(missing_ok=True)
+        if not self.path.exists():
+            return
+        entries, groups = self.value["entries"], self.value["inputGroups"]
         used = {entry["record"][name] for entry in entries.values()
-                for name in ("inputGroup", "checkGroup") if name in entry["record"]}
+                for name in ("inputGroup", "checkGroup", "comparisonGroup", "invocationGroup")
+                if name in entry["record"]}
+        used.update(key for entry in entries.values() for name in ("inputParts", "comparisonParts")
+                    for key in entry["record"].get(name, {}).values())
         value = {"schema": CURRENT_RESULTS_SCHEMA, "worktree": self.worktree,
                  "entries": entries, "inputGroups": {key: groups[key] for key in sorted(used)}}
         raw = canonical(value)
@@ -207,4 +310,6 @@ class CurrentCheckResults:
             self.pending.unlink(missing_ok=True)
         info = self.path.stat()
         self.value = value
+        self._offset = len(raw)
+        self._incomplete_tail = False
         self._stamp = (info.st_mtime_ns, info.st_size, info.st_ino)

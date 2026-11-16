@@ -24,6 +24,7 @@ from typing import Any, NamedTuple
 
 import git_branch_operations as git_branches
 from check_deployment_receipts import check_deployment_receipt
+from execute_worktree_build import execute_build
 from git_branch_operations import PromotionError, SourceState
 from github_contract_engine.format_report import sanitize_for_output
 from github_pr_workflow import ship_repository as repository_ship
@@ -45,27 +46,23 @@ from github_pr_workflow.command import (
     write_operation_report,
 )
 from github_pr_workflow.dependency_common import normalize_github_repo
-from execute_worktree_build import execute_build
-from ceratops_repo_compatibility_engine.sdlc_contract_validation import operation_entries
 from repository_operation import (
     OperationError,
     OperationRequest,
     PreparedOperation,
     execute_prepared_operations,
-    read_repository_contract,
     operation_category,
     parse_parameters,
     prepare_operations,
     remove_operation_failures,
     require_clean_commit,
-    validation_operations,
 )
 from sdlc_results import _unique_result_object
 
 SCRIPT_ROOT = pathlib.Path(__file__).resolve().parent
 PENDING_MANAGER = SCRIPT_ROOT / "manage-pending-work.py"
 RELEASE_BRANCH = "release/local"
-DEFAULT_SDLC_CONTRACT = pathlib.Path("sdlc/sdlc.yml")
+DEFAULT_SDLC_CONTRACT = pathlib.Path(".ceratops/sdlc/sdlc.yml")
 
 
 class CompletedPromotion(NamedTuple):
@@ -154,6 +151,7 @@ def _ship_after_promotion(
         validation_operation=args.validation_operation,
         version_choices=getattr(args, "version_choices", None),
         version_source_commit=getattr(args, "version_source_commit", None),
+        check_answers=getattr(args, "check_answers", None),
         publish_operation=_operation_ids(args.publish_operation, "publish"),
         deploy_operation=_operation_ids(args.deploy_operation, "deploy-local"),
         diagnostic_output=getattr(args, "diagnostic_output", None),
@@ -163,7 +161,7 @@ def _ship_after_promotion(
         shipped = repository_ship.ship_repository(request)
     except (repository_ship.RepositoryShipError, CommandError, OperationError, OSError, ValueError) as exc:
         raise PromotionError(str(exc), describe_command_failure(exc)) from exc
-    if shipped.get("status") == "version_decision_required":
+    if shipped.get("status") in {"version_decision_required", "decision_required"}:
         return shipped
     if shipped.get("status") == "pending_work":
         if not isinstance(shipped.get("findings"), list):
@@ -343,10 +341,6 @@ def promote(args: argparse.Namespace, *, timings: dict[str, float] | None = None
             git_branches.merge_release_into_task(task_root, observed_release)
             with _timed_phase(timings, "checks-and-builds", diagnostic_output=getattr(args, "diagnostic_output", None)):
                 build_requests = [OperationRequest(name, parameters=parameters) for name in (args.run_operation or [])]
-                if not build_requests:
-                    declaration = read_repository_contract(task_root, contract)
-                    build_requests = [OperationRequest(name) for name in operation_entries(declaration)
-                                      if name.endswith(".actions.build")]
                 validation = execute_build(
                     task_root, build_requests, contract, qualification_level="beta",
                     test_context={"trigger": "promotion", "branch": task_branch,
@@ -356,10 +350,12 @@ def promote(args: argparse.Namespace, *, timings: dict[str, float] | None = None
                     bundles=getattr(args, "bundle", ()) or (),
                     version_choices=getattr(args, "version_choices", None),
                     version_source_commit=getattr(args, "version_source_commit", None),
+                    check_answers=getattr(args, "check_answers", None),
+                    compare_builds_from=observed_release if not build_requests else None,
                     diagnostic_output=getattr(args, "diagnostic_output", None),
                     diagnostic_owner=(args.repo_root, "promote"),
                 )
-            if validation["status"] == "version_decision_required":
+            if validation["status"] in {"version_decision_required", "decision_required"}:
                 return {**validation, "release_branch": args.release_branch,
                         "head": observed_release, "task_worktree": str(task_root),
                         "remote_mutation": False}
@@ -605,7 +601,7 @@ def _result_summary(
     result: dict[str, object], path: pathlib.Path, digest: str, *, failed: bool,
 ) -> dict[str, object]:
     """Point to a published outcome without duplicating checks or receipts."""
-    if result.get("status") == "version_decision_required":
+    if result.get("status") in {"version_decision_required", "decision_required"}:
         return {**result, "result_file": str(path), "result_sha256": digest}
     summary: dict[str, object] = {
         key: result[key] for key in (
@@ -888,6 +884,7 @@ def finalize_result(args: argparse.Namespace) -> None:
         getattr(args, "bundle", None),
         getattr(args, "version_choices", None),
         getattr(args, "version_source_commit", None),
+        getattr(args, "check_answers", None),
         args.title,
         args.body,
     )
@@ -997,6 +994,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--source-branch", action="append")
     parser.add_argument("--bundle", action="append")
     parser.add_argument("--version-choices", type=json.loads)
+    parser.add_argument("--check-answers", type=json.loads)
     parser.add_argument("--version-source-commit")
     parser.add_argument("--diagnostic-output", type=pathlib.Path,
                         help="Stable task-owned file for complete failure details.")
@@ -1146,6 +1144,10 @@ def main(argv: list[str] | None = None) -> int:
             result["next_command"] = [sys.executable, str(pathlib.Path(__file__).resolve()),
                 *(argv if argv is not None else sys.argv[1:]), "--version-source-commit",
                 result["source_commit"], "--version-choices", json.dumps(answer["version_choices"])]
+        if result.get("status") == "decision_required":
+            result["next_command"] = [sys.executable, str(pathlib.Path(__file__).resolve()),
+                *(argv if argv is not None else sys.argv[1:]), "--check-answers",
+                json.dumps({result["decision_id"]: "<answer matching answer_schema>"})]
     except (
         CommandError,
         OperationError,
@@ -1185,7 +1187,7 @@ def main(argv: list[str] | None = None) -> int:
         json.dumps(public_result, separators=(",", ":")),
         file=sys.stderr if failed else sys.stdout,
     )
-    return 1 if failed else (2 if result.get("status") in {"pending_work", "version_decision_required"} else 0)
+    return 1 if failed else (2 if result.get("status") in {"pending_work", "version_decision_required", "decision_required"} else 0)
 
 
 if __name__ == "__main__":

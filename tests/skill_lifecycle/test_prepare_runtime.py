@@ -126,7 +126,7 @@ def test_bootstrap_full_install_materializes_lifecycle_bundle_with_source_runtim
         assert checked.returncode == 0, checked.stderr
     target_repo = tmp_path / "installed-bundle-target"
     create_compatible_repo(target_repo, "stale/source", ["alpha-tool"])
-    contract_path = target_repo / "sdlc/sdlc.yml"
+    contract_path = target_repo / ".ceratops/sdlc/sdlc.yml"
     contract = fixture_with_tools(yaml.safe_load(contract_path.read_text(encoding="utf-8")))
     template = REPOSITORY_LIFECYCLE_SOURCE / "references/templates/sdlc.yml.tmpl"
     contract["version"] = yaml.safe_load(template.read_text(encoding="utf-8"))["version"]
@@ -229,7 +229,7 @@ def test_lifecycle_only_installed_bundle_materializes_compatible_repo(
     )
     assert installed.returncode == 0, installed.stderr
     create_compatible_repo(target_repo, "stale/source", ["alpha-tool"])
-    contract_path = target_repo / "sdlc/sdlc.yml"
+    contract_path = target_repo / ".ceratops/sdlc/sdlc.yml"
     contract = fixture_with_tools(yaml.safe_load(contract_path.read_text(encoding="utf-8")))
     template = REPOSITORY_LIFECYCLE_SOURCE / "references/templates/sdlc.yml.tmpl"
     contract["version"] = yaml.safe_load(template.read_text(encoding="utf-8"))["version"]
@@ -404,8 +404,8 @@ def test_shared_skill_python_environment_reuses_lock_and_repairs_missing_package
         "import json, pathlib, sys\n"
         "pathlib.Path('target-python.json').write_text(json.dumps(sys.prefix))\n"
     )
-    (repository / "sdlc").mkdir()
-    (repository / "sdlc/sdlc.yml").write_text(json.dumps({
+    (repository / ".ceratops/sdlc").mkdir(parents=True)
+    (repository / ".ceratops/sdlc/sdlc.yml").write_text(json.dumps({
         "version": 4, "kind": "ceratops-sdlc", "repository": {
             "capabilities": {},
             "actions": {"pre-build-checks": {"check-groups": {'source': {

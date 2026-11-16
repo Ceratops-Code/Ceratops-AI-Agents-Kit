@@ -93,7 +93,7 @@ def _new_receipt_fixtures(
 ):
     required_targets = required_targets or [target, "python-3.14-linux"]
     target_suffix = f"/{target}" if len(required_targets) > 1 else ""
-    receipt_path = f".build/claims/{version}{target_suffix}/{receipt_name}"
+    receipt_path = f".ceratops/build/claims/{version}{target_suffix}/{receipt_name}"
 
     def digest(content: bytes) -> str:
         return hashlib.sha256(content).hexdigest()
@@ -216,7 +216,7 @@ def _new_receipt_fixtures(
                 "evidence": [
                     {
                         "root": "git",
-                        "path": f".build/claims/{version}{target_suffix}/evidence/validation.json",
+                        "path": f".ceratops/build/claims/{version}{target_suffix}/evidence/validation.json",
                         "size": len(validation),
                         "sha256": digest(validation),
                     }
@@ -255,7 +255,7 @@ def _new_receipt_fixtures(
             {
                 "type": "source-check-evidence",
                 "root": "git",
-                "path": f".build/claims/{version}{target_suffix}/evidence/validation.json",
+                "path": f".ceratops/build/claims/{version}{target_suffix}/evidence/validation.json",
                 "size": len(validation),
                 "sha256": digest(validation),
             },
@@ -276,7 +276,7 @@ def _new_receipt_fixtures(
         ],
         "committedResultPaths": [
             receipt_path,
-            f".build/claims/{version}{target_suffix}/evidence/validation.json",
+            f".ceratops/build/claims/{version}{target_suffix}/evidence/validation.json",
         ],
     }
     build_bytes = results.encode_new_receipt(build_receipt)
@@ -583,13 +583,13 @@ def test_versioned_requests_clear_only_same_checkout_and_item(tmp_path, stage_re
     assert foreign.version == "1.2.3a2"
     foreign_file = foreign.target_output(targets[0]) / "keep.bin"
     foreign_file.write_bytes(b"another checkout")
-    unfinished_path = ".build/claims/1.2.3a1/build_receipt.json"
+    unfinished_path = ".ceratops/build/claims/1.2.3a1/build_receipt.json"
     unfinished = repository / unfinished_path
     unfinished.parent.mkdir(parents=True)
     unfinished.write_text("{}", encoding="utf-8")
     if stage_results:
         assert run_git(repository, "add", "--", unfinished_path).returncode == 0
-    unrelated_result_path = ".build/other/1.0.0a1/build_receipt.json"
+    unrelated_result_path = ".ceratops/build/other/1.0.0a1/build_receipt.json"
     unrelated_result = repository / unrelated_result_path
     unrelated_result.parent.mkdir(parents=True)
     unrelated_result.write_text("{}", encoding="utf-8")
@@ -896,7 +896,7 @@ def test_artifact_receipt_reader_rejects_malformed_records(tmp_path, problem) ->
     if problem == "wrong-root":
         receipt["buildReceipt"]["root"] = "store"
     elif problem == "wrong-build-path":
-        receipt["buildReceipt"]["path"] = ".build/other/1.2.3b1/build_receipt.json"
+        receipt["buildReceipt"]["path"] = ".ceratops/build/other/1.2.3b1/build_receipt.json"
     elif problem == "unsafe-artifact":
         receipt["artifactPaths"][0] = "../claims.whl"
     elif problem == "self-artifact":

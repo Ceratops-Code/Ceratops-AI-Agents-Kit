@@ -267,8 +267,8 @@ class GHContractStateEngineTests(unittest.TestCase):
     def test_local_health_validates_present_deploy_contract_schema(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = pathlib.Path(temporary_directory)
-            contract = root / "sdlc" / "sdlc.yml"
-            contract.parent.mkdir()
+            contract = root / ".ceratops/sdlc" / "sdlc.yml"
+            contract.parent.mkdir(parents=True)
             contract.write_text(
                 json.dumps(
                     {
@@ -420,8 +420,8 @@ class GHContractStateEngineTests(unittest.TestCase):
                 "--evidence-file evidence.log\n",
                 encoding="utf-8",
             )
-            contract = root / "sdlc" / "sdlc.yml"
-            contract.parent.mkdir()
+            contract = root / ".ceratops/sdlc" / "sdlc.yml"
+            contract.parent.mkdir(parents=True)
             contract.write_text(
                 json.dumps(
                     {
@@ -553,8 +553,8 @@ class GHContractStateEngineTests(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as temporary_directory:
             repo_root = pathlib.Path(temporary_directory)
-            sdlc_root = repo_root / "sdlc"
-            sdlc_root.mkdir()
+            sdlc_root = repo_root / ".ceratops/sdlc"
+            sdlc_root.mkdir(parents=True)
             (sdlc_root / "sdlc.yml").write_text(
                 json.dumps(
                     {

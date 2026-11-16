@@ -114,7 +114,7 @@ def write_sdlc_contract(
 ) -> pathlib.Path:
     """Write or extend one native v4 capability contract."""
 
-    contract = repo / "sdlc" / "sdlc.yml"
+    contract = repo / ".ceratops/sdlc" / "sdlc.yml"
     contract.parent.mkdir(parents=True, exist_ok=True)
     document: dict[str, object] = {
         "version": 4,

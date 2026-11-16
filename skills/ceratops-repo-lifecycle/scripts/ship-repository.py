@@ -42,6 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--remote-name", default=defaults.remote_name)
     parser.add_argument("--commit")
     parser.add_argument("--version-choices", type=json.loads)
+    parser.add_argument("--check-answers", type=json.loads)
     parser.add_argument("--version-source-commit")
     parser.add_argument("--title")
     parser.add_argument("--body")
@@ -122,8 +123,12 @@ def main(argv: list[str] | None = None) -> int:
         result["next_command"] = [sys.executable, str(pathlib.Path(__file__).resolve()),
             *(argv if argv is not None else sys.argv[1:]), "--version-source-commit",
             result["source_commit"], "--version-choices", json.dumps(answer["version_choices"])]
+    if result.get("status") == "decision_required":
+        result["next_command"] = [sys.executable, str(pathlib.Path(__file__).resolve()),
+            *(argv if argv is not None else sys.argv[1:]), "--check-answers",
+            json.dumps({result["decision_id"]: "<answer matching answer_schema>"})]
     print(json.dumps(result, separators=(",", ":")))
-    return 2 if result.get("status") in {"pending_work", "version_decision_required"} else 0
+    return 2 if result.get("status") in {"pending_work", "version_decision_required", "decision_required"} else 0
 
 
 if __name__ == "__main__":

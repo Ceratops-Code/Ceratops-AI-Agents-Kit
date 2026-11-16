@@ -10,6 +10,7 @@ import pathlib
 import sys
 from contextlib import redirect_stdout
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -37,7 +38,7 @@ jobs:
 
 @pytest.fixture
 def github(monkeypatch):
-    state = {
+    state: dict[str, Any] = {
         "visibility": "public", "archived": False, "setup": "not-configured",
         "workflows": [], "workflow_text": CODEQL_WORKFLOW,
         "setup_error": None, "workflow_error": None, "interrupt": None,
@@ -45,6 +46,7 @@ def github(monkeypatch):
     }
 
     def request(method, endpoint, body=None, **_kwargs):
+        data: Any
         state["requests"].append((method, endpoint, body))
         if endpoint == "/repos/example/project":
             data = {

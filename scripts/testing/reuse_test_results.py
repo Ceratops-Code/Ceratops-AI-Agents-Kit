@@ -271,6 +271,12 @@ def compact_results(references: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             groups[identity] = facts
             record["applicableInputGroup"] = identity
         if (comparison := record.pop("comparison_inputs", None)) is not None:
+            comparison = dict(comparison)
+            if "check_inputs" in comparison:
+                test_files = comparison.pop("check_inputs")
+                check_identity = _digest(test_files)
+                checks[check_identity] = test_files
+                record["comparisonCheckGroup"] = check_identity
             identity = _digest(comparison)
             groups[identity] = comparison
             record["comparisonInputGroup"] = identity
@@ -346,6 +352,8 @@ def write_test_baseline(root: pathlib.Path, summary: Mapping[str, Any]) -> pathl
     reader = runpy.run_path(str(pathlib.Path(__file__).resolve().parents[1] / "result_records.py"))
     reader["parse_check_summary"](_json(summary))
     current = reader["CurrentCheckResults"](root)
+    if current._incomplete_tail:
+        current.rewrite_current_results()
     target = {"platform": platform.system(), "architecture": platform.machine()}
     existing = {item["nodeid"]: item for item in current.records("pytest", target=target)}
     imported: dict[str, list[dict[str, Any]]] = {}
@@ -578,13 +586,16 @@ class ResultStore:
                         "producer": inputs.get("producer"), "check_inputs": inputs["check_inputs"],
                     })):
                 raise ValueError("Summary pytest outcome conflicts with its recorded execution facts.")
-            comparison = ({"comparison_inputs": summary["inputGroups"][check["comparisonInputGroup"]]}
+            comparison = ({"comparison_inputs": dict(summary["inputGroups"][check["comparisonInputGroup"]])}
                           if "comparisonInputGroup" in check else {})
+            if "comparisonCheckGroup" in check:
+                comparison["comparison_inputs"]["check_inputs"] = summary["checkGroups"][check["comparisonCheckGroup"]]
             target.setdefault(check["id"], []).append({
                 "nodeid": check["id"], "outcome": "passed", "inputs": inputs, **origin, **comparison,
                 **{key: check.get(key) for key in ("result_id", "completed_ns", "inputs_digest", "phases", "qualificationLevel")},
                 "summary_reference": {key: value for key, value in check.items()
-                                      if key not in {"inputGroup", "checkGroup", "applicableInputGroup", "comparisonInputGroup"}},
+                                      if key not in {"inputGroup", "checkGroup", "applicableInputGroup", "comparisonInputGroup",
+                                                     "comparisonCheckGroup"}},
             })
 
     def _load_check(self, nodeid: str) -> None:
@@ -1231,6 +1242,7 @@ class ReusePasses:
             nodeid = self.current_node
             if nodeid in self.references:
                 return
+            self.store.current.rewrite_current_results()
             saved = next((record for record in self.store.current.records("pytest", target=self.store.target)
                           if record["nodeid"] == nodeid and record["completed_ns"] >= self.started_ns
                           and record["inputs_digest"] == _digest(self.inputs_by_node[nodeid])), None)

@@ -33,6 +33,8 @@ def parse_request(argv: Sequence[str] | None) -> tuple[argparse.Namespace, str |
     parser.add_argument("--base")
     parser.add_argument("--head")
     parser.add_argument("--diagnostic-output", type=pathlib.Path)
+    parser.add_argument("--temporary-root", type=pathlib.Path,
+                        help="Parent of disposable pytest folders; defaults to PYTEST_DEBUG_TEMPROOT or system temp.")
     parser.add_argument("--select-only", action="store_true",
                         help="Validate diff/worktree selection without collecting or running tests.")
     parser.add_argument("--node-map", type=pathlib.Path)
@@ -164,7 +166,7 @@ def run_recorded_request(
     checks: Callable[[], object] | None = None,
     summary: Callable[[], object] | None = None,
 ) -> int:
-    """Keep custom selection/output while the declared runner writes outcomes."""
+    """Delegate execution and startup/final compaction to the declared writer."""
     if args.describe_test_results:
         _result_writer["describe_result_contract"]()
         return 0

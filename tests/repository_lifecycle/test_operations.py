@@ -71,7 +71,7 @@ RECEIPT = {
                     {
                         "id": "unit",
                         "status": "passed",
-                        "path": ".test-results/groups/unit.json",
+                        "path": ".ceratops/results/groups/unit.json",
                         "sha256": "2" * 64,
                     }
                 ],
@@ -131,7 +131,7 @@ def test_canonical_operation_result_rejects_incomplete_artifact() -> None:
 
 
 def test_live_sdlc_selects_validation_and_tests_for_every_install() -> None:
-    document = contracts.load_contract(ROOT / "sdlc/sdlc.yml")
+    document = contracts.load_contract(ROOT / ".ceratops/sdlc/sdlc.yml")
     assert document["version"] in contracts.sdlc_schema_paths()
     installs = (
         "deliverables.skills.ceratops-repo-lifecycle.actions.install",
@@ -153,13 +153,15 @@ def test_live_sdlc_selects_validation_and_tests_for_every_install() -> None:
         assert operation.check_results is not None
         assert operation.check_results["result-owner"] == "operation"
         assert len(operation.steps) == 1
-    assert operations[-1].steps[0].argv == (
+    assert operations[-1].steps[0].argv[:-2] == (
         "uv",
         "run", "--project", "scripts",
         "--locked", "python",
         "scripts/testing/run-tests.py",
         "--auto",
     )
+    assert operations[-1].steps[0].argv[-2] == "--temporary-root"
+    assert pathlib.Path(operations[-1].steps[0].argv[-1]).is_absolute()
 
 
 def _step(script: str, *arguments: str) -> dict[str, object]:
@@ -179,7 +181,7 @@ def _app(actions: dict[str, object]) -> dict[str, object]:
     complete = {"pre-build-checks": {"check-groups": {"source": _no_op()}}, "install": _no_op(), **actions}
     return {
         "root-dir": ".",
-        "manifest": "sdlc/sdlc.yml",
+        "manifest": ".ceratops/sdlc/sdlc.yml",
         "build-after": [],
         "actions": complete,
     }
@@ -206,7 +208,7 @@ def test_sdlc_template_is_a_schema_valid_empty_skeleton(tmp_path: pathlib.Path) 
     assert list(groups) == ["tests"]
     assert "no-op" in groups["tests"]
     assert "deliverables" not in document
-    live = contracts.load_contract(ROOT / "sdlc" / "sdlc.yml")
+    live = contracts.load_contract(ROOT / ".ceratops/sdlc" / "sdlc.yml")
     assert live["version"] == 5
     entries = contracts.operation_entries(live)
     expected = {
@@ -249,6 +251,7 @@ def test_sdlc_template_is_a_schema_valid_empty_skeleton(tmp_path: pathlib.Path) 
                 "--locked", "python",
                 "scripts/testing/run-tests.py",
                 "--auto",
+                "--temporary-root", "{temporary_root}",
             ]
         },
     ]
@@ -1039,7 +1042,7 @@ def test_repository_bootstrap_resolves_platform_launcher_and_preserves_exit_stat
     executable.chmod(0o755)
     prepare_script_environment(tmp_path)
     if source == "live":
-        contract = contracts.load_contract(ROOT / "sdlc" / "sdlc.yml")
+        contract = contracts.load_contract(ROOT / ".ceratops/sdlc" / "sdlc.yml")
     else:
         materializer = importlib.import_module(
             "ceratops_repo_compatibility_engine.apply_ceratops_compatibility"
@@ -1718,7 +1721,7 @@ def test_accepted_package_install_inputs(tmp_path, monkeypatch, input_mode, entr
                     "root-dir": "src", "project": "pyproject.toml", "build-after": [],
                     "artifact": {"type": "python-wheel", "distribution": "claims", "output-directory": "dist", "filename-pattern": "*.whl"},
                     "actions": {"build": forbidden, "post-build-checks": {"check-groups": {"contents": forbidden}}, "install": install}}}}}
-    _write_fixture_bytes(repo, "sdlc/sdlc.yml", json.dumps(contract).encode())
+    _write_fixture_bytes(repo, ".ceratops/sdlc/sdlc.yml", json.dumps(contract).encode())
     assert not contracts.validation_errors(contract)
     for field, value in [("install-inputs", True), ("parameters", ["target"]), ("result-schema", "ceratops-builder-output")]:
         changed = json.loads(json.dumps(contract))
@@ -1735,7 +1738,7 @@ def test_accepted_package_install_inputs(tmp_path, monkeypatch, input_mode, entr
             identity.pop("releaseBundle")
             identity["storageKey"] = key
         old_path = build["receiptPath"]
-        build["receiptPath"] = old_path.replace(".build/claims/", f".build/{key}/")
+        build["receiptPath"] = old_path.replace(".ceratops/build/claims/", f".ceratops/build/{key}/")
         build["committedResultPaths"] = [build["receiptPath"] if name == old_path else name for name in build["committedResultPaths"]]
         build["preTestCommit"] = run_git(repo, "rev-parse", "HEAD").stdout.strip()
         encoded = results.encode_new_receipt(build)

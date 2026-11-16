@@ -31,7 +31,7 @@ procedures. Repository-specific tests and dependencies remain with the repo.
 | Ceratops compatibility deterministic contract and schema | Define mechanically checkable compatibility requirements and the reusable files needed to satisfy them. Executable fields require a runtime or validator consumer. |
 | Ceratops compatibility nondeterministic contract | Guide review of whether the repository's choices satisfy the internal Ceratops intent. External evidence is not invented for this internal concept. |
 | Repository dependency declarations and lockfiles | Own the packages and versions needed to execute repository commands successfully. |
-| Repository `sdlc/sdlc.yml` | Declare operations, tests, and skill/action handoffs for this repository and its deliverables. |
+| Repository `.ceratops/sdlc/sdlc.yml` | Declare operations, tests, and skill/action handoffs for this repository and its deliverables. |
 | Installed lifecycle skills | Own reusable execution, validation gates, deployment routing, and their domain helpers. |
 | Repository test runner and tests | Own repository-specific test execution and implementation. |
 
@@ -168,7 +168,7 @@ places tests and other repository scripts under the same scripts project.
 
 ## Operations, tests, and CI
 
-SDLC here means the repository's lifecycle configuration in `sdlc/sdlc.yml`.
+SDLC here means the repository's lifecycle configuration in `.ceratops/sdlc/sdlc.yml`.
 An operation is an entry such as a deliverable's validation or local deployment
 command. A handoff names an installed skill and action that owns the next step.
 `execute_skill_actions.py` reads that installed skill's action declaration and
@@ -311,6 +311,27 @@ The returned `next_command` accepts the model's answer together with
 `--version-source-commit`. Unchanged builds reuse accepted versions; a new
 candidate on an already chosen alpha/beta base increments its suffix.
 
+A declared check can pause for an answer by printing a JSON result with
+`schema: "ceratops-check-decision"`, `status: "decision_required"`, `question`
+and an `answer_schema` (JSON Schema), then exiting successfully. Its optional
+`payload` is returned unchanged. It declares `check-results` so the question
+is bound to its source, package and check inputs, and must not save a passing
+result while awaiting an answer. Build, Promote and Ship return the question,
+`decision_id` and `next_command`, with exit code 2 and no release update or
+installation. This is a pending decision, not a failed assertion.
+
+Run that same command with `--check-answers '{"DECISION_ID":{"approve":true}}'`,
+using the answer shape the check requested. The check receives
+`CERATOPS_CHECK_ANSWER` containing `decision_id` and `answer`. An unchanged
+question is returned without running the check again until its answer arrives.
+The package stays in this checkout's `_in-test` directory; its current record
+and question use `pending-build` and `check-decision` entries in this checkout's
+existing results file. Matching packages are reused on continuation. Changed
+package bytes or relevant inputs cause a fresh question before an old answer
+can be applied. Required checks must pass before the package is accepted.
+Completion removes the pending entries and temporary package; abandonment
+lets the next build replace only that item's unfinished output.
+
 An Install action opts into package consumption with `install-inputs:
 accepted-build`. It declares `target` and `destination` in `parameters` and
 returns the existing `ceratops-deployment-result.v1` result with `version` and
@@ -424,7 +445,8 @@ here-strings are outside that contract. Direct searches and the existing
 The MCP lifecycle skill and manager own release packaging, installation,
 version selection, and bounded retention. Codex registration selects the stable
 launcher and startup boundary. Hook deployment is independently declared in
-`sdlc/sdlc.yml` as `deliverables.hooks.codex-hooks.actions.install`; it copies
+`.ceratops/sdlc/sdlc.yml` as `deliverables.hooks.codex-hooks.actions.install`;
+it copies
 definitions without granting trust or restarting Codex. Register and connect
 the MCP server before relying on the guard, then review changed hook trust as
 required by the client. An installed or registered server is not evidence that
@@ -588,16 +610,30 @@ Partial runs keep unselected entries. Complete collection of a selected group
 can remove its deleted tests; filtered collection cannot do so.
 
 One thread owns a worktree, and its commands save serially without a worktree
-lock. The writer flushes/fsyncs the fixed sibling
-`.check_results.in_process.json`, then replaces `check_results.json`.
-An interrupted write leaves earlier saved outcomes intact; the next call removes
-the unfinished sibling. There are no timestamped generations or per-test files.
+lock. Each finished outcome appends one complete JSON record and newline, then
+flushes it to disk. The existing envelope surrounds each record; explicit
+deletions have null entries. Readers apply records in order and read only newly
+appended bytes. A command's startup and `finally` cleanup rewrite current entries
+and referenced input tables through `.check_results.in_process.json`, flush it,
+and atomically replace `check_results.json`. Read-only callers never tidy it.
+The next owning command discards only an unfinished trailing append after a
+crash. A malformed complete record remains an error. Cleanup also runs before
+the file reaches 64 MiB; current outcomes exceeding that limit report an error
+without discarding saved results. Cleanup failure retains the command's original
+failure. There are no timestamped generations or per-test files.
+Completed commands save their own outcome and original child result IDs, not
+copies of every child's summary. Reported non-Python checks use the same store.
+A replaced child makes its old parent inapplicable; individual unchanged passes
+remain reusable. Exported build summaries contain each result and input table
+once, without links requiring the mutable worktree store. Completed records do
+not retain a process ID.
 Git build summaries remain immutable and independent of this working file.
 Completing a build never clears it. Normal calls touch only their worktree;
 dedicated worktree retirement removes it in step 20C. Old-file conversion is an
 explicit `run-tests.py --consolidate-results` call, not startup discovery.
 
-Previous-build selection still reads this worktree's `.build` records and the
+Previous-build selection still reads this worktree's `.ceratops/build` records
+and the
 eligible tag's `check_summary.json`, never another worktree or artifact storage.
 An applicable current failure blocks an older tagged pass. Local calls record
 alpha unless a declared level applies; `release/local` requests at least beta.
@@ -773,7 +809,8 @@ bind the summary to the intended `<unit>/<version>` tag. Receipt and summary ent
 the same result-only commit; artifact binding follows, and tag creation is last.
 
 `sdlc_results.select_build_check_summaries()` discovers only the current worktree's
-`.build/<unit>/<version>/[<target>/]build_receipt.json` records. It chooses the
+`.ceratops/build/<unit>/<version>/[<target>/]build_receipt.json` records. It
+chooses the
 highest completed eligible version for each requested unit/target and reads exact
 receipt and summary blobs at that tag. It neither walks commit ancestry nor reads
 other worktrees, deployments, packages or full logs. The portable reader is part
@@ -858,9 +895,10 @@ test-runner acceptance follows the 1e.3 protocol below, not this reference's
 mutable latest-test-result layout.
 
 The template keeps current validation and test JSON under tracked
-`.test-results/`, raw screenshots and logs under ignored
+`.ceratops/results/`, raw screenshots and logs under ignored
 `.test-results/evidence/`, tracked build metadata and approvals under
-`.build/builds/`, and package bytes under ignored `.build/artifacts/`. Records
+`.ceratops/build/builds/`, and package bytes under ignored `.build/artifacts/`.
+Records
 bind to source bytes, the latest commit that changed non-result files, execution
 context, and exact artifact bytes. An immutable source tag is the build version;
 its resolved commit is traceability metadata. Evidence retention is bounded to
@@ -1383,7 +1421,7 @@ only optional command supervision remains deferred.
 
 | Record | Authoritative content | Storage and creation |
 | --- | --- | --- |
-| Build receipt | Attempt ID, pre-test B, unit/version/target and required targets, declared build inputs, artifacts and dependencies by digest, original required checks and completed outcomes, and evidence digests | Written after checks and committed at `.build/<unit>/<version>/build_receipt.json`; add `<target>` below the version for separately qualified targets; it contains neither its own hash nor C |
+| Build receipt | Attempt ID, pre-test B, unit/version/target and required targets, declared build inputs, artifacts and dependencies by digest, original required checks and completed outcomes, and evidence digests | Written after checks and committed at `.ceratops/build/<unit>/<version>/build_receipt.json`; add `<target>` below the version for separately qualified targets; it contains neither its own hash nor C |
 | Artifact receipt | Final C, repository-relative build-receipt path, hash of its exact committed bytes, store-relative artifact locations and completed acceptance reference | Stored alongside immutable artifacts in the Git common directory after closure passes |
 | Promotion/deployment completion record | Selected artifact receipts, integrated release commit, version/target, expected old and resulting refs, successful completed effects | Existing owning lifecycle result; it does not duplicate test acceptance or record aggregate failure; essential unfinished-request data stays in checkpoints |
 
@@ -1867,7 +1905,8 @@ not reassigned to a new attempt. If its passing receipt is already committed and
 its source inputs still match, finish missing copies or tags from those files
 instead of allocating another build.
 
-Prepared receipts remain at `.build/<unit>/<version>/build_receipt.json`, with
+Prepared receipts remain at
+`.ceratops/build/<unit>/<version>/build_receipt.json`, with
 a target subdirectory for separately qualified targets. Artifacts are produced
 inside that checkout's temporary directory. After their required checks pass,
 completion copies them to `worktrees/<checkout>/<unit>/<version>/<target>/`
@@ -2148,7 +2187,7 @@ they do not rename old files, alter tags or rerun accepted builds/tests.
 | Committed build receipt/evidence | Producer; current record plus at most two predecessors per unit/check group in the checkout; Git commit history supplies historical retrieval without an extra record database |
 | `ceratops/artifacts/<unit>/<version>/` with optional target subdirectory | Artifact store; immutable artifacts, supporting files and artifact receipt. The 4F retention functions keep each unpromoted worktree's latest approved build and the separate shared/destination selections described above. Unconnected callers retain the existing current-plus-two policy per repository/unit/target and version class until their planned adoption. |
 | `ceratops/artifacts/<unit>/<version>/build_request.json` | Artifact allocation and input binding; immediately records the registered worktree and whole target set, then exact B/inputs before artifacts. No allocation lock. Remove after receipt/tag completion; preserve unfinished and uncertain requests. |
-| `.build/<unit>/<version>/build_receipt.json` with optional target directory | Operation runner; directly written final result, validated and reused by exact bytes, committed at C with other declared Git evidence and retained historically by Git |
+| `.ceratops/build/<unit>/<version>/build_receipt.json` with optional target directory | Operation runner; directly written final result, validated and reused by exact bytes, committed at C with other declared Git evidence and retained historically by Git |
 | `artifacts/<unit>/<version>/` with optional target directory | Direct final output; protected while a build request exists or the immutable tag is absent. Complete target receipts and the tag bind it to C. Directory creation, not a reservation file, allocates the version. |
 | `artifacts/<unit>/<version>/.diagnostics/<target>.json` | Completion owner; one bounded directly replaced report per version/target, removed after that build completes. Separate from accepted evidence. |
 
@@ -2484,7 +2523,7 @@ means the thread's decision is recorded, not that the whole system was audited.
   "owners": ["Unassigned in the thread; confirm for a full design"],
   "source_of_truth": [
     {"path": "README.md", "role": "Repository usage documentation"},
-    {"path": "sdlc/sdlc.yml", "role": "This repository's operation declarations"},
+    {"path": ".ceratops/sdlc/sdlc.yml", "role": "This repository's operation declarations"},
     {"path": "skills/ceratops-repo-lifecycle/references/contracts/repository-validation-contract.json", "role": "Reusable validation behavior"},
     {"path": "skills/ceratops-repo-lifecycle/references/contracts/ceratops-compatibility-deterministic-contract.json", "role": "Mechanically checked compatibility requirements"},
     {"path": "skills/ceratops-repo-lifecycle/references/contracts/ceratops-compatibility-nondeterministic-contract.json", "role": "Internal compatibility review"},

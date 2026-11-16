@@ -625,7 +625,7 @@ def source_check_results(check: dict[str, object], tool: str) -> dict[str, objec
     return {
         "result-owner": "operation",
         "product-inputs": check["result-inputs"],
-        "check-inputs": ["sdlc/sdlc.yml", ".gitattributes"],
+        "check-inputs": [".ceratops/sdlc/sdlc.yml", ".gitattributes"],
         "dependencies": ["scripts/pyproject.toml", "scripts/uv.lock"] if tool == "uv" else [],
         "tools": ["node", tool] if tool in {"npm", "pnpm"} else [tool],
     }

@@ -138,11 +138,9 @@ def collect_check_inputs(prepared: Any, declaration: dict[str, Any]) -> dict[str
         "productInputs": products, "checkInputs": checks, "arguments": list(argv),
         "dependencies": dependencies, "environment": environment,
     }
-    if group := getattr(prepared, "check_group", None):
-        # A descriptive SDLC group does not change a native command's work.
-        # Runners that accept group arguments include those values in argv.
-        if "--check-group" in argv:
-            context["scope"]["checkGroup"] = group
+    # A descriptive SDLC group changes work only when passed to the runner.
+    if (group := getattr(prepared, "check_group", None)) and "--check-group" in argv:
+        context["scope"]["checkGroup"] = group
     if artifacts := getattr(prepared, "selected_artifacts", None):
         context["scope"]["artifacts"] = artifact_inputs(root, artifacts)
     context["fingerprint"] = fingerprint(context)
@@ -157,7 +155,7 @@ def artifact_inputs(root: pathlib.Path, artifacts: Any) -> dict[str, list[dict[s
     dependent check before it can run against a different installation.
     """
     if not isinstance(artifacts, dict):
-        raise ValueError("artifacts must map deliverable references to file-path arrays")
+        raise ValueError("artifacts must map deliverable references to file-path arrays")  # noqa: TRY004 -- public command error
     output = {}
     for reference, paths in artifacts.items():
         if (not isinstance(reference, str) or not reference.startswith("deliverables.")
@@ -191,7 +189,7 @@ class CheckPlan:
         return collect_check_inputs(prepared, prepared.check_results) != self.context
 
     def record_tool_result(self, prepared: Any, argv: list[str], started: datetime.datetime, code: int) -> None:
-        """Save a native command's exit observation and its reporting copy."""
+        """Save the native command once; reporting is assembled by the reader."""
         self.result_id, self.path = self.store.new_result_path()
         finished = max(started, datetime.datetime.now(datetime.UTC))
         duration = (finished - started).total_seconds()
@@ -199,21 +197,14 @@ class CheckPlan:
         check = self.context["group"]
         version = self.context["checkVersion"]
         work = self.context["workVersion"]
-        input_group = hashlib.sha256(canonical(self.context).rstrip(b"\n")).hexdigest()
         record = {
             "schema": RESULT_SCHEMA, "result_id": self.result_id, "candidate_id": work,
             "check_id": check, "check_version": version, "status": status, "exit_code": code,
             "invocation": {"argv": argv, "cwd": prepared.steps[0].cwd.relative_to(prepared.repo_root).as_posix()},
             "inputs": self.context,
             "execution": {"startedAt": started.isoformat(), "finishedAt": finished.isoformat(),
-                          "durationSeconds": duration, "workerPid": os.getpid()},
-            "check_summary": {"schema": "ceratops-check-summary.v1", "inputGroups": {input_group: self.context},
-                              "checkGroups": {}, "checks": [{"kind": "repository-check", "id": check,
-                              "status": status, "required": True, "result_id": self.result_id,
-                              "check_version": version, "inputGroup": input_group,
-                              "candidate_id": work, "qualificationLevel": self.context["qualificationLevel"],
-                              "inputs_digest": self.context["fingerprint"],
-                              "completed_ns": int(finished.timestamp() * 1_000_000_000)}]},
+                          "durationSeconds": duration},
+            "children": [], "childInputs": {},
         }
         target = {key: value for key, value in self.context["scope"].items()
                   if key not in {"worktree", "inputRules", "artifacts"}}
@@ -275,7 +266,8 @@ class CheckPlan:
                 "inputGroups": {check[field] for check in checks
                                 for field in ("inputGroup", "applicableInputGroup", "comparisonInputGroup")
                                 if field in check},
-                "checkGroups": {check["checkGroup"] for check in checks if "checkGroup" in check},
+                "checkGroups": {check[field] for check in checks
+                                for field in ("checkGroup", "comparisonCheckGroup") if field in check},
             }
             selected_summary = {**summary, "checks": checks,
                                 **{name: {key: summary[name][key] for key in sorted(keys)}
@@ -320,7 +312,14 @@ def decide_check_reuse(prepared: Any) -> CheckPlan | None:
         return None
     context = collect_check_inputs(prepared, declaration)
     store = CheckResultStore(prepared.repo_root)
-    builds = select_build_check_summaries(prepared.repo_root, qualification_level=prepared.qualification_level)
+    try:
+        builds = select_build_check_summaries(prepared.repo_root, qualification_level=prepared.qualification_level,
+                                            requested_check=context)
+    except ValueError as exc:
+        # Unusable historical results do not block executing the requested check.
+        # They also cannot justify falling back to another saved passing result.
+        return CheckPlan(context, {"decision": "execute", "record": None, "reference": None,
+                                   "reason": "Saved build results cannot cover this check: " + str(exc)}, store)
     decision = store.select(context, check_id=context["group"], builds=builds)
     if decision["decision"] == "blocked":
         raise ValueError("Recorded check evidence blocks reuse: " + decision["reason"])

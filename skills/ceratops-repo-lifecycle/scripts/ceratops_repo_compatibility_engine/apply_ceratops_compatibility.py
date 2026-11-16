@@ -814,7 +814,7 @@ def main(argv: list[str] | None = None) -> int:
                 repo_root / "skills",
                 repo_root / "skills" / "sections",
                 repo_root / "scripts",
-                repo_root / "sdlc",
+                repo_root / ".ceratops/sdlc",
                 repo_root / ".github",
                 repo_root / ".github" / "workflows",
             )

@@ -23,12 +23,12 @@ import re
 import shutil
 import subprocess
 import sys
+import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
 import execute_skill_actions
-from execute_worktree_build import execute_build
 import reuse_operation_checks
 import sdlc_results
 import store_artifacts
@@ -42,6 +42,7 @@ from ceratops_repo_compatibility_engine.sdlc_contract_validation import (
 from ceratops_repo_compatibility_engine.sdlc_contract_validation import (
     operation_category as contract_operation_category,
 )
+from execute_worktree_build import execute_build
 from github_pr_workflow.command import (
     CommandError,
     completed_operation_report_ids,
@@ -57,10 +58,9 @@ from github_pr_workflow.command import (
     update_ci_failure_evidence,
     write_operation_report,
 )
-from run_build_operations import (
-    build_operation_context,
-    execute_sdlc_operations,
-)
+from retain_check_results import check_inputs_match_for_reuse
+from run_build_operations import build_operation_context as build_operation_context  # noqa: PLC0414 -- public import
+from run_build_operations import execute_sdlc_operations
 from sdlc_results import StepResultError, capture_step_result
 from store_artifacts import (
     OperationError,
@@ -69,7 +69,7 @@ from store_artifacts import (
 # Public storage types and reader; storage remains their implementation owner.
 RecoveryRequired = store_artifacts.RecoveryRequired
 
-DEFAULT_CONTRACT = pathlib.Path("sdlc/sdlc.yml")
+DEFAULT_CONTRACT = pathlib.Path(".ceratops/sdlc/sdlc.yml")
 PARAMETER_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 PLACEHOLDER_RE = re.compile(r"^\{(?P<name>[a-z][a-z0-9_]*)\}$")
 FAILURE_TAIL_LINES = 8
@@ -145,6 +145,8 @@ class PreparedOperation:
     install_from_build: bool = False
     installation: Mapping[str, Any] | None = None
     install_input_file: pathlib.Path | None = None
+    deferred_parameters: tuple[str, ...] = ()
+    check_answers: Mapping[str, Any] | None = None
 
     @property
     def artifact_references(self) -> tuple[str, ...]:
@@ -245,6 +247,7 @@ def parse_parameters(values: Sequence[str]) -> dict[str, str]:
 def _collect_operation_parameters(
     selected: Mapping[str, Any],
     request: OperationRequest,
+    *, require_all: bool = True,
 ) -> dict[str, str]:
     """Collect caller values; accepted-package selectors are optional until Build finishes."""
     declared = set(selected.get("parameters", []))
@@ -262,9 +265,9 @@ def _collect_operation_parameters(
     )
     missing = sorted(declared - set(supplied))
     extra = sorted(set(request.parameters or {}) - allowed)
-    if missing or extra:
+    if (missing and require_all) or extra:
         detail = []
-        if missing:
+        if missing and require_all:
             detail.append("missing " + ", ".join(missing))
         if extra:
             detail.append("unexpected " + ", ".join(extra))
@@ -356,6 +359,7 @@ def prepare_operations(
     artifacts: Mapping[str, list[str]] | None = None,
     accepted_builds: Sequence[Mapping[str, Any]] = (),
     defer_install_inputs: bool = False,
+    defer_build_parameters: bool = False,
 ) -> list[PreparedOperation]:
     """Prepare declared commands, arguments and working directories.
 
@@ -389,7 +393,9 @@ def prepare_operations(
                 continue
             included[location] = request
             selected = entries[location]
-            parameters = _collect_operation_parameters(selected, request)
+            defer_builder = defer_build_parameters and category == "build"
+            parameters = _collect_operation_parameters(selected, request, require_all=not defer_builder)
+            deferred_parameters = tuple(sorted(set(selected.get("parameters", [])) - parameters.keys()))
             install_from_build = selected.get("install-inputs") == "accepted-build"
             installation: dict[str, Any] | None = None
             input_file = None
@@ -426,11 +432,14 @@ def prepare_operations(
                     # The tag fixes the receipt, including its repository identity.
                     # No latest-version search or installed-version fallback occurs.
                     commit_at_tag = sdlc_results._resolve_git_tag(root, tag)
-                    directory = f".build/{key}/{version}"
+                    # Read this exact tag's paths, including records moved in
+                    # later checkouts. Never search an old checkout directory.
                     paths = sdlc_results._build_git(root, "ls-tree", "-r", "--name-only", commit_at_tag,
-                                                   "--", directory).decode().splitlines()
-                    paths = [path for path in paths if path in {
-                        directory + "/build_receipt.json", directory + f"/{target}/build_receipt.json"}]
+                                                   "--").decode().splitlines()
+                    suffixes = (f"/{key}/{version}/build_receipt.json",
+                                f"/{key}/{version}/{target}/build_receipt.json")
+                    paths = [path for path in paths if path.endswith(suffixes)
+                             and path.startswith((".ceratops/build/", ".build/"))]
                     if len(paths) != 1:
                         raise OperationError(f"Install receipt is missing or ambiguous for {tag} on {target}.")
                     saved = sdlc_results.read_build_check_summary(root, tag, paths[0])
@@ -471,6 +480,8 @@ def prepare_operations(
             # Artifact paths become known after prerequisite builds. Only explicit
             # whole-argument placeholders are supplied; native scans get no extra flags.
             command_parameters = {**parameters, **derived_parameters, "artifacts": "{artifacts}"}
+            if defer_builder:
+                command_parameters.update({name: "{" + name + "}" for name in deferred_parameters})
             if any("{temporary_root}" in step.get("run", []) for step in selected.get("steps", [])):
                 if temporary_root is None:
                     # Linked worktrees share the primary repository's temp base;
@@ -499,6 +510,7 @@ def prepare_operations(
                 mcp_source=deliverable.get("root-dir") if owner[:2] == ["deliverables", "mcp-servers"] else None,
                 check_group=group,
                 install_from_build=install_from_build, installation=installation, install_input_file=input_file,
+                deferred_parameters=deferred_parameters,
                 check_phase=category.removesuffix("-checks") if category in {"pre-build-checks", "post-build-checks"} else None,
                 build_source_files=tuple(deliverable_source_files(root, deliverable))
                 if category == "build" and commit else (),
@@ -600,6 +612,8 @@ def execute_prepared_operation(
     runs in another checkout. No tests are selected or repeated for reporting.
     """
 
+    results_owner = None
+    result_value = None
     try:
         base: dict[str, object] = {
             "operation": prepared.operation,
@@ -640,6 +654,11 @@ def execute_prepared_operation(
                 "message": "HEAD changed after preparation.",
             }, **report_options)
         try:
+            if prepared.check_answers is not None and not isinstance(prepared.check_answers, Mapping):
+                raise ValueError("Check answers must be a JSON object keyed by the decision ID.")
+            if prepared.check_results is not None:
+                results_owner = reuse_operation_checks.CheckResultStore(prepared.repo_root).current
+                results_owner.rewrite_current_results()
             if prepared.check_group is not None or prepared.category == "build":
                 missing = set(prepared.artifact_references) - set(prepared.selected_artifacts or {})
                 for group, references in prepared.build_check_references.items():
@@ -670,6 +689,10 @@ def execute_prepared_operation(
                     if check_plan.decision["decision"] == "blocked":
                         raise ValueError("Recorded check evidence blocks reuse: " + check_plan.decision["reason"])
                 if check_plan.decision["decision"] == "reuse":
+                    check_plan.store.current.remove_deleted("check-decision", {prepared.operation}, {
+                        "target": prepared.build_target or dict(prepared.parameters).get("target"),
+                        "qualificationLevel": prepared.qualification_level,
+                    })
                     result = check_plan.reused_result(prepared)
                     if prepared.check_group:
                         result["check_group"] = prepared.check_group
@@ -679,7 +702,28 @@ def execute_prepared_operation(
                     )
                     return result
                 base.update(check_decision="executed", check_reason=check_plan.decision["reason"])
-        except (OSError, ValueError) as exc:
+            pending_decision = None
+            answer = None
+            decision_target = {"target": prepared.build_target or dict(prepared.parameters).get("target"),
+                               "qualificationLevel": prepared.qualification_level}
+            if check_plan is not None:
+                pending_decision = next((record for record in check_plan.store.current.records("check-decision", target=decision_target)
+                                         if record["operation"] == prepared.operation), None)
+                if pending_decision is not None:
+                    if not check_inputs_match_for_reuse(
+                        pending_decision["inputs"], check_plan.context,
+                    ):
+                        check_plan.store.current.remove_deleted("check-decision", {prepared.operation}, decision_target)
+                        base["answer_not_applied"] = "The check's package or inputs changed; a fresh check result is required."
+                        pending_decision = None
+                    elif pending_decision["decision_id"] not in (prepared.check_answers or {}):
+                        return {**base, **{key: value for key, value in pending_decision.items() if key != "inputs"},
+                                "status": "decision_required"}
+                    else:
+                        answer = {"decision_id": pending_decision["decision_id"],
+                                  "answer": (prepared.check_answers or {})[pending_decision["decision_id"]]}
+                        sdlc_results.jsonschema.Draft202012Validator(pending_decision["answer_schema"]).validate(answer["answer"])
+        except (OSError, ValueError, sdlc_results.jsonschema.exceptions.ValidationError) as exc:
             return report_failure({**base, "status": "result_invalid", "message": str(exc)}, **report_options)
         completed: list[int | str] = []
         step_results: list[dict[str, Any]] = []
@@ -813,6 +857,7 @@ def execute_prepared_operation(
                 if (repository_uv or prepared.test_context is not None or check_plan is not None
                         or prepared.selected_artifacts or prepared.check_phase or prepared.category == "build"):
                     environment = dict(os.environ)
+                    environment.pop("CERATOPS_CHECK_ANSWER", None)
                     if repository_uv:
                         # Repository-selected environments must not inherit the
                         # installed lifecycle helper's unrelated active venv.
@@ -823,6 +868,8 @@ def execute_prepared_operation(
                         )
                     if check_plan is not None:
                         environment[reuse_operation_checks.CONTEXT_ENV] = json.dumps(check_plan.context)
+                    if answer is not None:
+                        environment["CERATOPS_CHECK_ANSWER"] = json.dumps(answer, allow_nan=False)
                     if prepared.build_check_groups:
                         environment["CERATOPS_BUILD_CHECK_GROUPS"] = json.dumps(prepared.build_check_groups)
                         environment["CERATOPS_BUILD_CHECK_ARTIFACTS"] = json.dumps(prepared.build_check_artifacts or {})
@@ -840,6 +887,26 @@ def execute_prepared_operation(
                 code, stdout, stderr = None, "", str(exc)
             except ValueError as exc:
                 return report_failure({**base, "status": "result_invalid", "message": str(exc)}, **report_options)
+            if code == 0 and prepared.check_phase:
+                request = capture_step_result(stdout).get("result", {})
+                if request.get("status") == "decision_required":
+                    try:
+                        sdlc_results._operation_result_validator("checkDecision").validate(request)
+                        sdlc_results.jsonschema.Draft202012Validator.check_schema(request["answer_schema"])
+                        if check_plan is None:
+                            raise ValueError("A check requesting a decision must declare check-results and its relevant input files.")
+                        if check_plan.inputs_changed(prepared):
+                            raise ValueError("Check inputs changed while the decision request was being produced.")
+                        record = {"operation": prepared.operation, "question": request["question"],
+                                  "answer_schema": request["answer_schema"], "inputs": check_plan.context,
+                                  **({"payload": request["payload"]} if "payload" in request else {})}
+                        record["decision_id"] = str(uuid.uuid4())
+                        check_plan.store.current.put("check-decision", prepared.operation, decision_target, record)
+                        return {**base, **{key: value for key, value in record.items() if key != "inputs"},
+                                "status": "decision_required", "steps": completed}
+                    except (ValueError, sdlc_results.jsonschema.exceptions.SchemaError,
+                            sdlc_results.jsonschema.exceptions.ValidationError) as exc:
+                        return report_failure({**base, "status": "result_invalid", "message": str(exc)}, **report_options)
             if check_plan is not None and (code is not None or operation_records_check):
                 try:
                     if operation_records_check:
@@ -853,6 +920,7 @@ def execute_prepared_operation(
                     base["check_result"] = check_plan.completed(prepared, passed=code == 0)
                     if check_plan.summary is not None:
                         base["check_summary"] = check_plan.summary
+                    check_plan.store.current.remove_deleted("check-decision", {prepared.operation}, decision_target)
                 except (OSError, ValueError) as exc:
                     failure = {
                         **base, "status": "result_invalid", "steps": completed,
@@ -977,6 +1045,14 @@ def execute_prepared_operation(
     finally:
         if prepared.install_input_file is not None:
             prepared.install_input_file.unlink(missing_ok=True)
+        active_error = sys.exception()
+        if results_owner is not None:
+            try:
+                results_owner.rewrite_current_results()
+            except (OSError, ValueError) as exc:
+                print(f"Check-results cleanup failed: {exc}", file=sys.stderr)
+                if active_error is None and result_value is not None:
+                    result_value.update(status="result_invalid", message=str(exc))
 
 
 def remove_operation_failures(
@@ -1077,7 +1153,7 @@ def execute_prepared_operations(
             successful_results=(successful_results, results),
         )
         results.append(result)
-        if result["status"] in FAILED_STATUSES:
+        if result["status"] in FAILED_STATUSES or result["status"] == "decision_required":
             return {
                 **batch,
                 **result,
@@ -1116,6 +1192,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--artifacts", help="JSON mapping deliverable references to exact built file-path arrays.")
     parser.add_argument("--bundle", action="append", default=[], help="Release bundle to build; repeat for additional bundles.")
     parser.add_argument("--version-choices", type=json.loads, help="JSON mapping deliverable or bundle references to version choices.")
+    parser.add_argument("--check-answers", type=json.loads, help="JSON mapping returned check decision IDs to their answers.")
     parser.add_argument("--version-source-commit", help="Source commit used for the model's version recommendation.")
     parser.add_argument(
         "--operation",
@@ -1182,6 +1259,7 @@ def require_release_source_for_ci() -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    args.command_arguments = list(argv if argv is not None else sys.argv[1:])
     if args.retire_handoff_reports is not None:
         return retire_handoff_reports_cli(args)
     try:
@@ -1225,6 +1303,7 @@ def main(argv: list[str] | None = None) -> int:
                 confirm_stopped=args.confirm_previous_commands_stopped, prepare_only=args.prepare_only,
                 bundles=args.bundle, version_choices=args.version_choices,
                 version_source_commit=args.version_source_commit,
+                check_answers=args.check_answers,
             )
             if result.get("status") == "version_decision_required":
                 result["next_command"] = [sys.executable, str(pathlib.Path(__file__).resolve()),
@@ -1240,7 +1319,8 @@ def main(argv: list[str] | None = None) -> int:
         # commit evidence can replace that declared exemption.
         if test_context and root.name in PROMOTION_RECHECK_EXEMPT_UNTIL_COMMIT_EVIDENCE_REDESIGN:
             prepared = [item for item in prepared if not item.check_phase]
-        prepared = [replace(item, qualification_level=level, test_context=test_context) for item in prepared]
+        prepared = [replace(item, qualification_level=level, test_context=test_context,
+                            check_answers=args.check_answers) for item in prepared]
         if args.prepare_only:
             result = {"status": "prepared", "operations": [item.operation for item in prepared]}
             requirements = _combined_prerequisites(prepared)
@@ -1270,6 +1350,10 @@ def main(argv: list[str] | None = None) -> int:
 def finish_operation_request(args, result) -> int:
     """Keep the public command response and report cleanup identical for every route."""
     failed = result.get("status") in FAILED_STATUSES
+    if result.get("status") == "decision_required":
+        result["next_command"] = [sys.executable, str(pathlib.Path(__file__).resolve()),
+            *args.command_arguments,
+            "--check-answers", json.dumps({result["decision_id"]: "<answer matching answer_schema>"})]
     if args.evidence_file:
         try:
             if args.ci:
@@ -1290,7 +1374,7 @@ def finish_operation_request(args, result) -> int:
         json.dumps(result, separators=(",", ":")),
         file=sys.stderr if failed else sys.stdout,
     )
-    return 1 if failed else (2 if result.get("status") == "version_decision_required" else 0)
+    return 1 if failed else (2 if result.get("status") in {"version_decision_required", "decision_required"} else 0)
 
 
 if __name__ == "__main__":

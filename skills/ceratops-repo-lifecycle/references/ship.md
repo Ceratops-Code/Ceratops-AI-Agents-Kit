@@ -177,7 +177,7 @@ Owner diagnostics do not replace interrupted-operation recovery requirements.
 3. Before the first remote push, the scope manager atomically normalizes an
    exact version-1 record, then the helper checks the canonical version-2 scope.
    Prevalidate all selected entries, parameters, exact argv and
-   repository-bounded working directories from `sdlc/sdlc.yml`, then run
+   repository-bounded working directories from `.ceratops/sdlc/sdlc.yml`, then run
    applicable validation and tests. Reject SDLC v1-v3 before executing any
    operation; v4/v5 preserve declared commands, handoffs, and reasoned no-ops.
    Only `validate` and `test` entries may be selected as checks; missing

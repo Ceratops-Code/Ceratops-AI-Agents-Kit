@@ -90,14 +90,14 @@ BytesRunner = Callable[
 
 
 def run_text(
-    command: Sequence[str], cwd: pathlib.Path
+    command: Sequence[str], cwd: pathlib.Path, *, temporary_root: pathlib.Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run argv without a shell, isolating every pytest collection or execution."""
     is_pytest = tuple(command[:3]) == (sys.executable, "-m", "pytest")
     result: subprocess.CompletedProcess[str] | None = None
     try:
         context = (
-            pytest_environment.isolated_environment(cwd) if is_pytest else nullcontext(None)
+            pytest_environment.isolated_environment(cwd, temporary_root=temporary_root) if is_pytest else nullcontext(None)
         )
         with context as environ, (
             environ.scratch.child_options() if environ is not None else nullcontext({})
@@ -114,8 +114,13 @@ def run_text(
                 environ.update(result_environment(command, cwd, os.environ))
                 if request := CHECK_REQUEST_INPUTS.get():
                     environ["CERATOPS_TEST_ARTIFACTS"] = json.dumps(request.get("artifacts", {}))
-                result = pytest_progress.run_pytest(command, cwd, environ, **process_options)
+                child_command = [*command, "--basetemp", str(environ.scratch.path / "pytest"),
+                                 "-o", "cache_dir=" + str(environ.scratch.path / "pytest-cache")]
+                result = pytest_progress.run_pytest(child_command, cwd, environ, **process_options)
             else:
+                if environ is not None:
+                    command = [*command, "--basetemp", str(environ.scratch.path / "pytest"),
+                               "-o", "cache_dir=" + str(environ.scratch.path / "pytest-cache")]
                 result = subprocess.run(
                     list(command), cwd=cwd, env=environ, capture_output=True,
                     text=True, encoding="utf-8", errors="replace", check=False,
@@ -801,7 +806,8 @@ def execute(
         return CONFIGURATION_EXIT_CODE
 
     def observe(command: Sequence[str], cwd: pathlib.Path) -> subprocess.CompletedProcess[str]:
-        result = text_runner(command, cwd)
+        result = (run_text(command, cwd, temporary_root=args.temporary_root)
+                  if text_runner is run_text else text_runner(command, cwd))
         if result.returncode == 0 and "--collect-only" not in command:
             completed_commands.append(list(command))
         observed.extend(getattr(result, "accepted_result_references", None) or [])
@@ -835,7 +841,9 @@ def execute(
             code = CONFIGURATION_EXIT_CODE
             if outputs:
                 outputs[-1]["status"] = "diagnostic-cleanup-failed"
-                outputs[-1].setdefault("pytest", {})["diagnostic_error"] = f"{type(exc).__name__}: {exc}"
+                pytest_output = outputs[-1].setdefault("pytest", {})
+                assert isinstance(pytest_output, dict)
+                pytest_output["diagnostic_error"] = f"{type(exc).__name__}: {exc}"
             else:
                 print(f"Checks passed; diagnostic cleanup failed: {exc}", file=sys.stderr)
     for output in outputs:
@@ -858,7 +866,8 @@ def execute_selected(
 
     def preflight_text(command: Sequence[str], cwd: pathlib.Path) -> subprocess.CompletedProcess[str]:
         """Retain complete collection/error streams before summaries shorten them."""
-        result = text_runner(command, cwd)
+        result = (run_text(command, cwd, temporary_root=args.temporary_root)
+                  if text_runner is run_text else text_runner(command, cwd))
         if result.returncode or "--collect-only" in command:
             preflight_commands.append({
                 "command": list(command), "cwd": str(cwd), "exit_code": result.returncode,
@@ -1059,7 +1068,8 @@ def execute_selected(
                                             "diagnosticPath": str(diagnostic_path)})
     try:
         measure_selected_artifacts(root, args.artifacts)
-        result = text_runner(pytest_command, root)
+        result = (run_text(pytest_command, root, temporary_root=args.temporary_root)
+                  if text_runner is run_text else text_runner(pytest_command, root))
     except (ValueError, OSError) as exc:
         payload["manifest_errors"] = [str(exc)]
         payload["status"] = "configuration-error"

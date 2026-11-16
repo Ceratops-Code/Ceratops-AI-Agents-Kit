@@ -161,7 +161,8 @@ Infer the source identity from stable repository evidence before asking.
   source skills exist, write `skills/skill-sections.json`, copy canonical shared
   sections to `skills/sections/`, and remove generated section blocks from
   source skills.
-- Create or update the current `sdlc/sdlc.yml` from the owned template, preserving
+- Create or update the current `.ceratops/sdlc/sdlc.yml` from the owned
+  template, preserving
   target tools and separate source/test commands in `pre-build-checks`
   groups. For each source skill, add `deliverables.skills.<name>` with
   `actions.pre-build-checks.check-groups.source` handing off to

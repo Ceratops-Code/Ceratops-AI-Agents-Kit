@@ -849,7 +849,8 @@ def test_reused_check_retires_report_without_executing_command(report_repo, monk
               "check_decision": "reused", "check_result": {"path": str(accepted)}}
     plan = SimpleNamespace(
         context={"fingerprint": "same", "group": "tests.unit"},
-        store=SimpleNamespace(select=lambda *_args, **_kwargs: {"decision": "reuse"}),
+        store=SimpleNamespace(select=lambda *_args, **_kwargs: {"decision": "reuse"},
+                              current=runner.reuse_operation_checks.CheckResultStore(repo).current),
         reused_result=lambda _prepared: result,
     )
     monkeypatch.setattr(runner.reuse_operation_checks, "collect_check_inputs", lambda *_args: {"fingerprint": "same", "group": "tests.unit"})
@@ -997,8 +998,6 @@ def test_terminal_workflow_cleans_only_its_matching_failure(report_repo, monkeyp
         args = promote.build_parser().parse_args([
             "--repo-root", str(repo), "--source-branch", "report-task", "--no-run-operation",
             "--diagnostic-output", str(path)])
-        monkeypatch.setattr(promote, "read_repository_contract", Mock(return_value={
-            "repository": {"actions": {}}, "deliverables": {}}))
         monkeypatch.setattr(promote, "execute_build", Mock(return_value={
             "status": "completed", "accepted_commit": head, "results": []}))
     elif workflow == "ship":

@@ -1664,7 +1664,7 @@
     {
       "id": "repository-sdlc",
       "paths": [
-        "sdlc/**"
+        ".ceratops/sdlc/**"
       ],
       "suites": [
         "repository-lint",

@@ -1339,7 +1339,7 @@ def test_failed_checks_prevent_remote_work_and_succeed_after_committed_repair(
     if gate == "tests":
         import yaml
 
-        path = repo / "sdlc/sdlc.yml"
+        path = repo / ".ceratops/sdlc/sdlc.yml"
         document = yaml.safe_load(path.read_text())
         groups = document["repository"]["actions"]["pre-build-checks"]["check-groups"]
         groups["tests"] = groups["source"]

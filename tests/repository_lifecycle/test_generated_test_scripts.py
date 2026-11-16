@@ -3,16 +3,14 @@ from __future__ import annotations
 import hashlib
 import importlib
 import importlib.util
-import io
 import json
 import pathlib
 import runpy
 import shutil
 import subprocess
 import sys
-import tomllib
-import zipfile
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 import yaml
@@ -20,23 +18,16 @@ import yaml
 from tests.repository_lifecycle.support import (
     REPOSITORY_LIFECYCLE_SCRIPTS,
     REPOSITORY_LIFECYCLE_SOURCE,
-    SDLC_CONTRACT_TEMPLATE,
-    SECTION_MANIFEST_TEMPLATE,
     run_operation_cli,
 )
-from tests.skill_lifecycle.support import add_action_sections
 from tests.support.processes import (
     run_compatibility_engine,
 )
 from tests.support.repositories import (
     ROOT,
-    create_compatible_repo,
     run_git,
     write_sdlc_contract,
 )
-
-
-from tests.repository_lifecycle.test_compatibility import _write_current_sdlc
 
 
 def _write_generated_runner(root, targets):
@@ -100,12 +91,25 @@ def test_generated_python_runner_cleans_owned_temp_even_with_overrides(
     link = f"    (tmp_path / 'linked-object').hardlink_to(pathlib.Path({str(external)!r}))\n" if readonly else ""
     (repo / "test_probe.py").write_text(
         "import json, pathlib, tempfile\n"
-        "def test_probe(tmp_path):\n"
-        f"    pathlib.Path({str(marker)!r}).write_text(json.dumps([str(tmp_path), tempfile.gettempdir()]))\n"
+        "def test_probe(tmp_path, pytestconfig):\n"
+        f"    pathlib.Path({str(marker)!r}).write_text(json.dumps([str(tmp_path), tempfile.gettempdir(), str(pytestconfig.cache._cachedir)]))\n"
         f"{link}"
         "    assert False\n"
     )
     runner = _write_generated_runner(repo, ["test_probe.py"])
+    support_loader = runpy.run_path(str(runner))["test_support"]
+    for previous in (False, True):
+        with monkeypatch.context() as patch:
+            patch.setattr(sys, "dont_write_bytecode", previous)
+            imported = Mock(return_value=object())
+            patch.setattr(importlib, "import_module", imported)
+            for _ in range(2):
+                assert support_loader() is imported.return_value
+                assert sys.dont_write_bytecode is previous
+            imported.side_effect = ImportError("support unavailable")
+            with pytest.raises(ImportError, match="support unavailable"):
+                support_loader()
+            assert sys.dont_write_bytecode is previous
     templates = REPOSITORY_LIFECYCLE_SOURCE / "references/templates"
     (repo / "scripts/pyproject.toml").write_text(
         (templates / "validation-pyproject.toml.tmpl").read_text().replace("__DEPENDENCIES__", '["pytest"]')
@@ -123,13 +127,16 @@ def test_generated_python_runner_cleans_owned_temp_even_with_overrides(
             "--pytest-arg=--junitxml=" + str(junit),
         ], cwd=repo, capture_output=True, text=True, check=False)
         assert result.returncode == 1, result.stderr
-        observed, process_temp = map(pathlib.Path, json.loads(marker.read_text()))
+        observed, process_temp, cache = map(pathlib.Path, json.loads(marker.read_text()))
         assert observed.is_relative_to(process_temp)
+        assert cache.is_relative_to(process_temp)
         assert process_temp.is_relative_to(task_temp)
         assert junit.is_file()
         assert not process_temp.exists()
         assert not observed.exists()
         assert not outside.exists()
+        assert not list((repo / "scripts/testing").rglob("__pycache__"))
+        assert not (repo / ".pytest_cache").exists()
         assert external.read_bytes() == b"git object"
         assert external.stat().st_mode == original_mode and external.stat().st_nlink == 1
     finally:
@@ -216,7 +223,7 @@ def test_generated_runner_requires_explicit_temporary_root(tmp_path, monkeypatch
     for attempt in range(2):
         if attempt:
             # A distinct request must execute; an identical request reuses its pass.
-            contract_path = root / "sdlc/sdlc.yml"
+            contract_path = root / ".ceratops/sdlc/sdlc.yml"
             declaration = yaml.safe_load(contract_path.read_text())
             command = declaration["repository"]["actions"]["pre-build-checks"]["check-groups"]["tests"]["steps"][0]["run"]
             result_file = output / "second-result.json"
@@ -803,8 +810,8 @@ def test_result_records_template_binds_source_artifact_and_bounds_evidence(
             "-C",
             str(tmp_path),
             "add",
-            ".build/builds",
-            ".test-results/validation.json",
+            ".ceratops/build",
+            ".ceratops/results/validation.json",
         ],
         check=True,
     )

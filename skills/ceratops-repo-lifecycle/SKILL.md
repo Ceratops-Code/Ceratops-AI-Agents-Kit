@@ -9,7 +9,7 @@ description: Route Ceratops repository lifecycle work to action references for r
 
 Route repository compatibility, local Git, GitHub, release publication, and
 deployment lifecycle work to the narrowest action reference. Keep repository
-state transitions in the skill while `sdlc/sdlc.yml` describes repository
+state transitions in the skill while `.ceratops/sdlc/sdlc.yml` describes repository
 setup, validation and tests, plus deliverable validation, tests, deployment
 and publication.
 

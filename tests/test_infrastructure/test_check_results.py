@@ -129,13 +129,15 @@ def test_current_results_replace_one_check_and_keep_other_targets(
     assert fresh.records("pytest", target=windows)[0]["result_id"] == "windows-a"
     assert fresh.path.name == "check_results.json"
     assert list(fresh.path.parent.iterdir()) == [fresh.path]
+    assert len(fresh.path.read_bytes().splitlines()) == 4
+    fresh.rewrite_current_results()
     assert len(json.loads(fresh.path.read_text())["entries"]) == 3
     fresh.remove_deleted("pytest", {"test_b"}, linux)
     assert fresh.records("pytest", target=linux) == [corrected]
     assert fresh.records("pytest", target=windows)[0]["result_id"] == "windows-a"
 
 
-@pytest.mark.parametrize("boundary", ["before-replace", "after-replace"])
+@pytest.mark.parametrize("boundary", ["before-append", "before-flush", "after-flush", "before-replace", "after-replace"])
 def test_current_results_preserve_saved_outcomes_after_interrupted_write(
     check_writer, tmp_path, monkeypatch, boundary,
 ):
@@ -144,20 +146,33 @@ def test_current_results_preserve_saved_outcomes_after_interrupted_write(
     target = {"os": "linux"}
     store.put("pytest", "test_a", target, _current_outcome("a"))
     replace = os.replace
+    fsync = os.fsync
 
-    def interrupted(source, destination):
+    def interrupted(*arguments):
         if boundary == "after-replace":
-            replace(source, destination)
-        raise OSError("interrupted replacement")
+            replace(*arguments)
+        elif boundary == "after-flush":
+            fsync(*arguments)
+        raise OSError("interrupted result write")
 
     with monkeypatch.context() as scoped:
-        scoped.setattr(os, "replace", interrupted)
-        with pytest.raises(OSError, match="interrupted replacement"):
+        if boundary.endswith("replace"):
             store.put("pytest", "test_b", target, _current_outcome("b", "failed"))
+            scoped.setattr(os, "replace", interrupted)
+            with pytest.raises(OSError, match="interrupted result write"):
+                store.rewrite_current_results()
+        else:
+            if boundary == "before-append":
+                scoped.setattr(store, "_append_results", interrupted)
+            else:
+                scoped.setattr(os, "fsync", interrupted)
+            with pytest.raises(OSError, match="interrupted result write"):
+                store.put("pytest", "test_b", target, _current_outcome("b", "failed"))
     for _ in range(2):
         fresh = check_writer["CurrentCheckResults"](tmp_path)
         identities = {item["result_id"] for item in fresh.records("pytest")}
-        assert identities == ({"a", "b"} if boundary == "after-replace" else {"a"})
+        assert identities == ({"a"} if boundary == "before-append" else {"a", "b"})
+        fresh.rewrite_current_results()
         assert not fresh.pending.exists()
     fresh.put("pytest", "test_b", target, _current_outcome("b", "failed"))
     assert {item["result_id"] for item in fresh.records("pytest")} == {"a", "b"}
@@ -172,7 +187,24 @@ def test_current_results_discard_incomplete_replacement_without_losing_results(
     store.pending.write_bytes(b'{"entries":')
     fresh = check_writer["CurrentCheckResults"](tmp_path)
     assert fresh.records("pytest")[0]["result_id"] == "saved"
+    assert fresh.pending.exists()
+    fresh.rewrite_current_results()
     assert not fresh.pending.exists()
+    original = fresh.path.read_bytes()
+    with fresh.path.open("ab") as stream:
+        stream.write(b'{"unfinished":')
+    reader = check_writer["CurrentCheckResults"](tmp_path)
+    with pytest.raises(ValueError, match="Unfinished trailing"):
+        reader.records("pytest")
+    assert fresh.path.read_bytes() != original
+    for _ in range(2):
+        reader.rewrite_current_results()
+        assert reader.records("pytest")[0]["result_id"] == "saved"
+        assert reader.path.read_bytes() == original
+    with fresh.path.open("ab") as stream:
+        stream.write(b'{"broken":}\n')
+    with pytest.raises(ValueError, match="Malformed complete"):
+        check_writer["CurrentCheckResults"](tmp_path)
 
 
 def test_current_results_refresh_after_child_and_keep_worktrees_separate(
@@ -185,6 +217,8 @@ def test_current_results_refresh_after_child_and_keep_worktrees_separate(
     child.put("repository-check", "lint", {}, _current_outcome("lint"))
     first.put("pytest", "test_b", {}, _current_outcome("b"))
     assert first.records("repository-check")[0]["result_id"] == "lint"
+    child.rewrite_current_results()
+    assert {item["result_id"] for item in first.records("pytest")} == {"a", "b"}
     other = tmp_path / "other"
     other.mkdir()
     _context(other)
@@ -240,10 +274,12 @@ def test_repository_checks_share_current_file_with_individual_tests(check_writer
     assert calls == ["failed-run", "corrected-run"]
     saved = reader["read_check_result"](current.path, "corrected-run")
     assert saved["status"] == "passed"
-    assert reader["result_reference"](current.path, "corrected-run")["sha256"] == hashlib.sha256(reader["canonical"](saved)).hexdigest()
+    stored = current.records("repository-check")[0]
+    assert "checks" not in stored and "check_summary" not in stored
+    assert reader["result_reference"](current.path, "corrected-run")["sha256"] == hashlib.sha256(reader["canonical"](stored)).hexdigest()
     shared = runpy.run_path(str(ROOT / "skills/sections/scripts/store_check_results.py"))["CurrentCheckResults"](tmp_path)
     assert shared.records("pytest")[0]["result_id"] == "original-pass"
-    assert shared.records("repository-check") == [saved]
+    assert shared.records("repository-check") == [stored]
     assert list(current.path.parent.iterdir()) == [current.path]
 
 
@@ -305,9 +341,13 @@ def test_path_equivalent_outcomes_survive_interrupted_replacement(
     failure_path, current_inputs = save_attempt(7)
     assert original_inputs["fingerprint"] != current_inputs["fingerprint"]
     replace = os.replace
+    replacements = []
 
     def interrupt(source, destination):
         if pathlib.Path(destination) != original_path:
+            return replace(source, destination)
+        replacements.append(destination)
+        if len(replacements) == 1:
             return replace(source, destination)
         if boundary == "after":
             replace(source, destination)
@@ -320,7 +360,8 @@ def test_path_equivalent_outcomes_survive_interrupted_replacement(
         ) == 2
     fresh = reader["CheckResultStore"](tmp_path)
     result = fresh.select(current_inputs, check_id="repository.actions.pre-build-checks.check-groups.tests")
-    assert result["decision"] == ("reuse" if boundary == "after" else "execute")
+    # The finished result was flushed before either final-compaction boundary.
+    assert result["decision"] == "reuse"
     assert failure_path == original_path
     assert len(fresh.current.records("repository-check")) == 1
 
@@ -359,7 +400,8 @@ def test_declared_writer_preserves_actual_attempt_and_original_timing(
     assert record["result_id"] == "attempt-1" and record["check_version"] == "2" * 64
     assert record["execution"]["finishedAt"] >= record["execution"]["startedAt"]
     assert record["execution"]["durationSeconds"] >= 0
-    assert record["checks"] == [{"id": "actual-check", "status": outcome}]
+    assert "checks" not in record and "workerPid" not in record["execution"]
+    assert {"id": "actual-check", "status": outcome} in record["check_summary"]["checks"]
     assert run(actual_check, request, {"targets": ["checks.py"]}) == (0 if outcome == "passed" else 2)
     assert calls == ["executed"] and path.read_bytes() == saved
 
@@ -396,13 +438,14 @@ def test_complete_suite_summary_omits_duplicate_local_links(check_writer, tmp_pa
     ) == 0
     saved = path.read_bytes()
     record = reader["read_check_result"](path)
-    assert record["checks"] == observed and children == original
+    assert "checks" not in record and children == original
     exported = [item for item in record["check_summary"]["checks"] if item.get("kind") == "pytest"]
     assert exported == [{key: value for key, value in item.items() if key not in {"path", "sha256"}}
                         for item in children["checks"]]
     duplicate = copy.deepcopy(record)
     duplicate["check_summary"]["checks"][:len(children["checks"])] = children["checks"]
-    assert len(saved) < reader["MAX_RECORD_BYTES"] < len(reader["canonical"](duplicate))
+    assert len(saved) < reader["MAX_RECORD_BYTES"]
+    assert len(saved) * 2 < len(reader["canonical"](duplicate))
     assert check_writer["run_recorded_check"](
         lambda: pytest.fail("repeated accepted work"), request, {},
     ) == 0
@@ -595,11 +638,11 @@ def test_custom_pytest_child_does_not_inherit_the_owning_check_context(
     monkeypatch.setenv("CERATOPS_SDLC_TEST_CONTEXT", "outer promotion inputs")
     monkeypatch.setenv("UNRELATED_CALLER_INPUT", "keep")
     class FixtureEnvironment(dict):
-        scratch = type("FixtureScratch", (), {"child_options": lambda _self: nullcontext({})})()
+        scratch = type("FixtureScratch", (), {"path": tmp_path / "scratch", "child_options": lambda _self: nullcontext({})})()
 
     monkeypatch.setattr(
         test_runner_module.pytest_environment, "isolated_environment",
-        lambda _root: nullcontext(FixtureEnvironment(os.environ)),
+        lambda _root, **_options: nullcontext(FixtureEnvironment(os.environ)),
     )
     observed = []
 
@@ -789,7 +832,7 @@ def test_qualified_group_retains_the_original_inherited_child_level(
                      "--candidate-id", "1" * 40, "--check-id", "repository.actions.pre-build-checks.check-groups.tests",
                      "--check-version", "2" * 64]
         if saved and fault is not None:
-            original_path = root / ".git" / saved[0]["checks"][0]["path"]
+            original_path = runpy.run_path(str(ROOT / "scripts/result_records.py"))["CurrentCheckResults"](root).path
             original_bytes = original_path.read_bytes()
             original = json.loads(original_bytes)
             if fault == "partial_write":
@@ -802,7 +845,8 @@ def test_qualified_group_retains_the_original_inherited_child_level(
                 elif fault == "conflicting":
                     attempt["phases"] = {"call": "failed"}
                 broken_path = original_path
-                broken = b"{" if fault == "malformed" else json.dumps(original).encode()
+                broken = (b"{\n" if fault == "malformed" else
+                          runpy.run_path(str(ROOT / "scripts/result_records.py"))["canonical"](original))
                 broken_path.write_bytes(broken)
         code = test_runner_module.execute(arguments, repo_root=root)
         assert (code == 0) == (fault in {None, "partial_write"} or not saved)
@@ -810,7 +854,7 @@ def test_qualified_group_retains_the_original_inherited_child_level(
             assert not path.exists()  # The unreadable shared file blocks the command before it starts.
             assert broken_path.read_bytes() == broken
             assert counter.read_text().splitlines() == ["example"]
-            assert "Current" in capsys.readouterr().err
+            assert "Malformed complete check-results record" in capsys.readouterr().err
             return
         saved.append(json.loads(path.read_text()))
     assert counter.read_text().splitlines() == ["example"]
@@ -819,12 +863,13 @@ def test_qualified_group_retains_the_original_inherited_child_level(
         assert not broken_path.exists()
     elif fault is not None:
         assert saved[1]["status"] == "failed"
-        assert not saved[1]["checks"]
+        assert not [item for item in saved[1]["check_summary"]["checks"] if item.get("kind") != "repository-check"]
         assert broken_path.read_bytes() == broken
         captured = capsys.readouterr()
         assert "Current" in captured.out + captured.err
         return
-    first, inherited = saved[0]["checks"][0], saved[1]["checks"][0]
+    first, inherited = (next(item for item in record["check_summary"]["checks"] if item.get("kind") == "pytest")
+                        for record in saved)
     assert saved[1]["inputs"]["qualificationLevel"] == "alpha"
     assert inherited["qualificationLevel"] == "beta"
     assert inherited["result_id"] == first["result_id"] and inherited["reused"] is True
@@ -875,14 +920,15 @@ def test_aggregate_reuse_preserves_external_input_markers_and_original_child_pas
         ], repo_root=root) == 0
         record = reader["read_check_result"](path)
         assert record["status"] == "passed"
-        constraints = [item for item in record["checks"] if item.get("reusable") is False]
+        constraints = [item for item in record["check_summary"]["checks"]
+                       if item.get("kind") != "repository-check" and item.get("reusable") is False]
         assert [item["id"] for item in constraints] == ["tests/test_marked.py::test_marked"]
         saved.append(record)
         original_bytes[path] = path.read_bytes()
         if len(saved) == 1:
             # Historical aggregate producers did not export child scope facts.
             # Such an older pass must never bypass the explicit current constraint.
-            historical = {**record, "result_id": str(uuid.uuid4()), "checks": []}
+            historical = {**record, "result_id": str(uuid.uuid4()), "children": [], "childInputs": {}, "childChecks": {}}
             historical.pop("check_summary", None)
             historical["execution"] = {**record["execution"], "startedAt": "2000-01-01T00:00:00+00:00",
                                        "finishedAt": "2000-01-01T00:00:00+00:00", "durationSeconds": 0}
@@ -893,7 +939,7 @@ def test_aggregate_reuse_preserves_external_input_markers_and_original_child_pas
     if mixed:
         assert counter.read_text().splitlines().count("ordinary") == 1
         original, inherited = (
-            next(item for item in record["checks"] if item.get("status") == "passed")
+            next(item for item in record["check_summary"]["checks"] if item.get("kind") == "pytest")
             for record in saved
         )
         assert inherited["result_id"] == original["result_id"]
@@ -920,8 +966,8 @@ def test_check_reader_rejects_nonboolean_child_reuse_constraint(
     ) == 0
     with pytest.raises(ValueError, match="Reported checks conflict"):
         reader["read_check_result"](path)
-    with pytest.raises(ValueError, match="Reported checks conflict"):
-        reader["CheckResultStore"](tmp_path).select(context, check_id="repository.actions.pre-build-checks.check-groups.tests")
+    decision = reader["CheckResultStore"](tmp_path).select(context, check_id="repository.actions.pre-build-checks.check-groups.tests")
+    assert decision["decision"] == "execute" and "Reported checks conflict" in decision["reason"]
 
 
 @pytest.mark.parametrize("boundary", ["complete", "interrupted_teardown", "missing_teardown_report", "marked_skip", "xpass"])
@@ -977,7 +1023,10 @@ def test_aggregate_expected_skips_keep_actual_outcomes_and_complete_scope(
     original = path.read_bytes()
     record = reader["read_check_result"](path)
     decision = store.select(context, check_id="repository.actions.pre-build-checks.check-groups.tests")
-    skips = {item["id"]: item for item in record["checks"] if item.get("status") == "skipped"}
+    children = [item for item in record["check_summary"]["checks"] if item.get("kind") != "repository-check"]
+    skips = {item["id"]: {key: value for key, value in item.items()
+                          if key not in {"result_id", "required", "reused"}}
+             for item in children if item.get("status") == "skipped"}
     nodeid = "tests/test_skips.py::test_call_skip"
     if boundary == "xpass":
         nodeid = "tests/test_skips.py::test_xfail"
@@ -999,14 +1048,15 @@ def test_aggregate_expected_skips_keep_actual_outcomes_and_complete_scope(
         }
         assert test_runner_module.execute(arguments, repo_root=root) == 0
         assert counter.read_text().splitlines() == ["passed"]
-        assert len([item for item in record["checks"] if "result_id" in item]) == 1
+        assert len([item for item in children if item.get("kind") == "pytest"]) == 1
+        assert all(item.get("result_id") for item in children)
     else:
         assert decision["decision"] == "execute" and nodeid not in skips
         if boundary == "interrupted_teardown":
             assert record["status"] == "failed"
-            assert any(item.get("status") == "interrupted" for item in record["checks"])
+            assert any(item.get("status") == "interrupted" for item in children)
         else:
-            assert any(item["id"] == nodeid and item.get("reusable") is False for item in record["checks"])
+            assert any(item["id"] == nodeid and item.get("reusable") is False for item in children)
     assert path.read_bytes() == original
 
 
@@ -1080,13 +1130,14 @@ def test_aggregate_excludes_changed_or_incomplete_child_inputs(
     assert not list(store.directory.glob("pytest-attempt-*.json"))
     decision = store.select(context, check_id="repository.actions.pre-build-checks.check-groups.tests")
     assert decision["decision"] == "execute"
-    assert not any(item.get("status") == "passed" for item in record["checks"])
-    constraint, = record["checks"]
+    children = [item for item in record["check_summary"]["checks"] if item.get("kind") != "repository-check"]
+    assert not any(item.get("status") == "passed" for item in children)
+    constraint, = children
     if boundary in {"inputs_changed", "skip_inputs_changed", "xfail_inputs_changed"}:
         assert constraint["reusable"] is False
         assert constraint["reason"] == "Check inputs changed after collection."
         assert (root / "production.py").read_text() == "VALUE = 1\n"
-        assert not any(item.get("status") == "skipped" for item in record["checks"])
+        assert not any(item.get("status") == "skipped" for item in children)
     else:
         assert record["status"] == "failed"
         assert constraint["status"] == "interrupted"

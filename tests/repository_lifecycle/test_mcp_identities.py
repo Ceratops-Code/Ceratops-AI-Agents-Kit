@@ -90,8 +90,8 @@ def _package_mcp_case(tmp_path, monkeypatch, problem=None):
             pytest.skip(f"This host cannot create the linked-path fixture: {exc}")
     elif problem == "source-only":
         server["build-after"] = []
-    (repo / "sdlc").mkdir()
-    (repo / "sdlc/sdlc.yml").write_text(json.dumps(fixture), encoding="utf-8")
+    (repo / ".ceratops/sdlc").mkdir(parents=True)
+    (repo / ".ceratops/sdlc/sdlc.yml").write_text(json.dumps(fixture), encoding="utf-8")
     binding_path = pathlib.Path("skills/ceratops-mcp-server-lifecycle/references/action-executors.json")
     for base in (repo, tmp_path / "codex"):
         binding = base / binding_path
@@ -200,8 +200,8 @@ def test_mcp_identity_survives_contract_preparation(tmp_path, version, name):
     server["build-after"] = []
     server["actions"]["install"]["steps"][0]["handoff"]["inputs"]["mcp-server"] = name
     assert contracts.validation_errors(fixture) == []
-    (tmp_path / "sdlc").mkdir()
-    (tmp_path / "sdlc/sdlc.yml").write_text(json.dumps(fixture), encoding="utf-8")
+    (tmp_path / ".ceratops/sdlc").mkdir(parents=True)
+    (tmp_path / ".ceratops/sdlc/sdlc.yml").write_text(json.dumps(fixture), encoding="utf-8")
     _repository(tmp_path)
     location = f"deliverables.mcp-servers.{name}.actions.install"
     for _ in range(2):

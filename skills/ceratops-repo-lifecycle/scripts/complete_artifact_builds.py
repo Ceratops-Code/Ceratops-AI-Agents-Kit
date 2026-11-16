@@ -22,12 +22,12 @@ from typing import Any
 import sdlc_results
 from sdlc_results import StepResultError
 from store_artifacts import (
-    _inputs_match_commit,
     ArtifactVersionTransaction,
     OperationError,
     RecoveryRequired,
     _build_directory,
     _git_text,
+    _inputs_match_commit,
     _read_transaction_record,
     _require_build_request,
     _require_transaction_target,
@@ -274,7 +274,10 @@ def prepare_versioned_build_receipt(
             if ".pre-build-checks." not in operation and ".post-build-checks." not in operation:
                 continue
             check_id = "check-" + hashlib.sha256(operation.encode()).hexdigest()[:24]
-            version = result.get("check_result", {}).get("check_version") or result.get("commit") or transaction.pre_test_commit
+            observed: dict[str, Any] = next((check for check in result.get("check_summary", {}).get("checks", [])
+                             if check.get("kind") == "repository-check" and check["id"] == operation), {})
+            version = (observed.get("check_version") or result.get("check_result", {}).get("check_version")
+                       or result.get("commit") or transaction.pre_test_commit)
             common: dict[str, Any] = {"id": check_id, "version": version, "status": "passed", "evidence": []}
             if ".pre-build-checks." in operation:
                 source_checks.append({**common, "inputs": [record["id"] for record in product_inputs]})
@@ -422,8 +425,11 @@ def compose_build_check_summary(
                 check["checkGroup"] for check in parsed["checks"]
                 if "checkGroup" in check and "comparisonInputGroup" not in check
             }]
-            inventories.extend(parsed["inputGroups"][check["comparisonInputGroup"]]["check_inputs"]
-                               for check in parsed["checks"] if "comparisonInputGroup" in check)
+            inventories.extend(
+                parsed["checkGroups"][check["comparisonCheckGroup"]] if "comparisonCheckGroup" in check
+                else parsed["inputGroups"][check["comparisonInputGroup"]]["check_inputs"]
+                for check in parsed["checks"] if "comparisonInputGroup" in check
+            )
             groups = {check.get("applicableInputGroup", check.get("inputGroup"))
                       for check in parsed["checks"]}
             for identity in groups - {None}:
@@ -452,16 +458,25 @@ def compose_build_check_summary(
             if key in outcomes and outcomes[key] != check:
                 raise OperationError(f'Conflicting outcomes for check: {check["id"]}')
             outcomes[key] = dict(check)
+    represented = {(check["id"], check.get("check_version")) for check in outcomes.values()}
+    represented.update(("check-" + hashlib.sha256(check["id"].encode()).hexdigest()[:24], check.get("check_version"))
+                       for check in outcomes.values() if check.get("kind") == "repository-check")
     for kind, field in (("source-check", "sourceChecks"), ("artifact-test", "artifactTests")):
         for check in receipt[field]:
             if check["status"] != "passed":
                 raise OperationError(f'Required build check has not passed: {check["id"]}')
+            if (check["id"], check["version"]) in represented:
+                continue  # The original executed result already records this check.
             outcomes[(kind, check["id"])] = {
                 "kind": kind, "id": check["id"], "status": check["status"],
                 "check_version": check["version"], "required": True,
                 "acceptance": dict(receipt["acceptance"]),
             }
     result["checks"] = [outcomes[key] for key in sorted(outcomes, key=lambda item: (item[0] or "", item[1]))]
+    for table, fields in (("inputGroups", ("inputGroup", "applicableInputGroup", "comparisonInputGroup")),
+                          ("checkGroups", ("checkGroup", "comparisonCheckGroup"))):
+        referenced = {check[field] for check in result["checks"] for field in fields if field in check}
+        result[table] = {key: value for key, value in result[table].items() if key in referenced}
     return result
 
 
@@ -499,10 +514,10 @@ def load_prepared_versioned_receipts(
     """Reconstruct prepared identities from direct final worktree paths."""
 
     prepared: list[PreparedBuildReceipt] = []
-    for target in ((target,) if target is not None else transaction.required_targets):
-        _require_transaction_target(transaction, target)
+    for receipt_target in ((target,) if target is not None else transaction.required_targets):
+        _require_transaction_target(transaction, receipt_target)
         relative = sdlc_results._bundle_relative_path(
-            transaction.receipt_path(target), label="Prepared build receipt"
+            transaction.receipt_path(receipt_target), label="Prepared build receipt"
         )
         path, info = sdlc_results._plain_path(
             transaction.repo_root.joinpath(*relative.parts),
@@ -510,7 +525,7 @@ def load_prepared_versioned_receipts(
         )
         if info.st_size > sdlc_results.NEW_RECEIPT_BYTES:
             raise RecoveryRequired("Prepared build receipt is oversized.")
-        prepared.append(_prepared_result(transaction, target, path.read_bytes()))
+        prepared.append(_prepared_result(transaction, receipt_target, path.read_bytes()))
     return tuple(prepared)
 
 
@@ -977,8 +992,8 @@ def _remove_completed_build_temp(transaction: ArtifactVersionTransaction) -> Non
     """Remove this completed version's temporary output, never a sibling's files."""
     from store_artifacts import _artifact_store_path, _remove_versioned_tree
     parent = _artifact_store_path(transaction.repo_root, temporary=True) / transaction.release_bundle
-    from store_artifacts import FULL_VERSION_RE
     from packaging.version import Version
+    from store_artifacts import FULL_VERSION_RE
     directory = transaction.request_path.parent
     if directory != parent / transaction.version:
         raise OperationError("Completed-build cleanup escapes this checkout's temporary directory.")

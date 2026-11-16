@@ -648,7 +648,7 @@ raise SystemExit(int(pathlib.Path('source.txt').read_text()))
     data["repository"]["actions"]["pre-build-checks"]["check-groups"] = {
         "scan": {"requires": {"tools": []}, "steps": [{"run": [sys.executable, "-c", source]}],
                  "check-results": {"result-owner": "operation", "product-inputs": ["source.txt"],
-                                   "check-inputs": ["sdlc/sdlc.yml"]}},
+                                   "check-inputs": [".ceratops/sdlc/sdlc.yml"]}},
     }
     path.write_text(json.dumps(fixture_with_tools(data) if data["version"] == 5 else data))
     request = runner.OperationRequest("repository.actions.pre-build-checks.check-groups.scan")
@@ -708,6 +708,32 @@ def test_moving_a_check_keeps_its_original_success_and_result_id(tmp_path):
         assert result["check_decision"] == "reused", result
         assert result["check_result"] == original["check_result"]
         assert path.read_bytes() == saved
+    assert (tmp_path / "source-checks.txt").read_text() == "x"
+
+    store = reuse.CheckResultStore(tmp_path).current
+    original_entry = next(iter(store.value["entries"].values()))
+    record = store.records("repository-check")[0]
+    for retired in ("repository.actions.retired-check", "deliverables.packages.other.actions.retired-check"):
+        stored = {**record, "check_id": retired, "result_id": retired,
+                  "inputs": {**record["inputs"], "arguments": ["retired-command"]}}
+        store.put("repository-check", retired, original_entry["target"], stored)
+    # The command owner recovers a torn last append without losing completed
+    # results. A single-group request cannot retire another group's record.
+    with path.open("ab") as output:
+        output.write(b'{"schema":')
+    partial = runner.execute_build(tmp_path, [runner.OperationRequest(current.operation)],
+                                   qualification_level="beta", include_checks=False)
+    assert partial["status"] == "completed", partial
+    assert "repository.actions.retired-check" in {
+        value["check_id"] for value in store.records("repository-check")}
+    for _ in range(2):
+        complete = runner.execute_build(tmp_path, [runner.OperationRequest("repository.actions.pre-build-checks")],
+                                        qualification_level="beta", include_checks=False)
+        assert complete["status"] == "completed", complete
+        names = {value["check_id"] for value in store.records("repository-check")}
+        assert "repository.actions.retired-check" not in names
+        assert "deliverables.packages.other.actions.retired-check" in names
+        assert previous.operation in names
     assert (tmp_path / "source-checks.txt").read_text() == "x"
 
 
@@ -1093,7 +1119,7 @@ def test_pass_survives_interruption_before_build_and_a_fresh_request_reuses_it(t
 ])
 def test_sdlc_refuses_unsafe_or_unconsumed_check_declarations(tmp_path, declaration):
     _fixture(tmp_path)
-    path = tmp_path / "sdlc/sdlc.yml"
+    path = tmp_path / ".ceratops/sdlc/sdlc.yml"
     data = json.loads(path.read_text())
     data["repository"]["actions"]["pre-build-checks"]["check-groups"]["tests"]["check-results"] = declaration
     path.write_text(json.dumps(fixture_with_tools(data) if data["version"] == 5 else data))
@@ -1254,7 +1280,7 @@ if mode == 'failed':
 print('{' if mode == 'partial' else json.dumps(payload))
 '''
     (root / "scripts/build.py").write_text(producer, encoding="utf-8")
-    contract = root / "sdlc/sdlc.yml"
+    contract = root / ".ceratops/sdlc/sdlc.yml"
     data = json.loads(contract.read_text())
     build = data["deliverables"]["packages"]["sample"]["actions"]["build"]
     build["steps"] = [{"run": [sys.executable, "scripts/build.py"]}]
@@ -1291,7 +1317,7 @@ def test_declared_build_reports_final_commit_and_repeats_without_new_effects(tmp
 
 def test_sdlc_v5_build_reports_its_clean_final_commit(tmp_path, capsys):
     _committing_build(tmp_path)
-    contract = tmp_path / "sdlc/sdlc.yml"
+    contract = tmp_path / ".ceratops/sdlc/sdlc.yml"
     data = json.loads(contract.read_text())
     data = fixture_with_tools(data)
     data["version"] = 5
@@ -1317,7 +1343,7 @@ def test_commit_reporting_requires_starting_git_before_any_build_effect(tmp_path
         "version": 4, "kind": "ceratops-sdlc",
         "repository": {"capabilities": {}, "actions": {"pre-build-checks": {"check-groups": {'source': _no_op(), 'tests': _no_op()}}, }},
         "deliverables": {"packages": {"sample": {
-            "root-dir": ".", "project": "sdlc/sdlc.yml", "build-after": [],
+            "root-dir": ".", "project": ".ceratops/sdlc/sdlc.yml", "build-after": [],
             "artifact": {"type": "python-wheel", "distribution": "sample",
                          "output-directory": "dist", "filename-pattern": "*.whl"},
             "actions": {"pre-build-checks": {"check-groups": {'source': _no_op(), 'tests': _no_op()}}, "build": build},
@@ -1392,7 +1418,7 @@ def test_returned_commit_must_descend_from_prepared_commit(tmp_path, monkeypatch
 @pytest.mark.parametrize("change", ["non-build", "handoff", "bad-field", "later-operation"])
 def test_commit_declaration_blocks_unsafe_flow_before_effects(tmp_path, version, change):
     _committing_build(tmp_path)
-    path = tmp_path / "sdlc/sdlc.yml"
+    path = tmp_path / ".ceratops/sdlc/sdlc.yml"
     data = json.loads(path.read_text())
     if version == 5:
         data = fixture_with_tools(data)
@@ -1476,8 +1502,8 @@ def test_build_comparison_and_exact_artifact_groups(tmp_path, monkeypatch, chang
         assert run_git(repository, "add", "src/package.json").returncode == 0
         assert run_git(repository, "commit", "--only", "-m", "shared package metadata", "--", "src/package.json").returncode == 0
     path.write_text(json.dumps(declaration))
-    assert run_git(repository, "add", "sdlc/sdlc.yml").returncode == 0
-    assert run_git(repository, "commit", "--only", "-m", "builder environment", "--", "sdlc/sdlc.yml").returncode == 0
+    assert run_git(repository, "add", ".ceratops/sdlc/sdlc.yml").returncode == 0
+    assert run_git(repository, "commit", "--only", "-m", "builder environment", "--", ".ceratops/sdlc/sdlc.yml").returncode == 0
     first = runner.execute_build(repository, **options)
     assert first["status"] == "completed", first
     previous_tag = first["tag"]

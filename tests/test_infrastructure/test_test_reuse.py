@@ -160,7 +160,7 @@ def test_import_repeats_safely_across_write_interruption(tmp_path, monkeypatch, 
     with monkeypatch.context() as patch:
         original_open = pathlib.Path.open
         def interrupted_open(path, mode="r", *args, **kwargs):
-            if path == store.current.pending and mode == "wb":
+            if path == destination and mode == "ab":
                 if interruption == "partial":
                     with original_open(path, mode) as stream:
                         stream.write(b'{"schema":')
@@ -172,7 +172,7 @@ def test_import_repeats_safely_across_write_interruption(tmp_path, monkeypatch, 
             patch.setattr(pathlib.Path, "open", interrupted_open)
         with pytest.raises(OSError, match="interrupted"):
             reuse.write_test_baseline(root, summary)
-    assert not destination.exists()
+    assert destination.exists() is (interruption != "before")
     assert not store.current.pending.exists()
     assert reuse.write_test_baseline(root, summary) == destination
     before = destination.stat().st_mtime_ns
@@ -873,13 +873,13 @@ def test_current_write_interruption_preserves_other_tests(tmp_path, monkeypatch,
     store = _level_store(root, "beta")
     a, b = "tests/a/test_value.py::test_value", "tests/b/test_value.py::test_value"
     first = store.save(a, store.inputs(a))
-    original = os.replace
-    def interrupted(source, destination):
+    original = type(store.current)._append_results
+    def interrupted(current, entries, groups):
         if after_effect:
-            original(source, destination)
+            original(current, entries, groups)
         raise KeyboardInterrupt("power lost")
     with monkeypatch.context() as patch:
-        patch.setattr(os, "replace", interrupted)
+        patch.setattr(type(store.current), "_append_results", interrupted)
         with pytest.raises(KeyboardInterrupt, match="power lost"):
             store.save(b, store.inputs(b), outcome="failed", phases={"call": "failed"})
     fresh = _level_store(root, "beta")
@@ -1019,14 +1019,15 @@ def test_deleted_case_cleanup_resumes_between_effects(tmp_path, monkeypatch, eff
     accepted = store.save(replacement, store.inputs(replacement))
     if effect == "delete":
         other = store.save(b, store.inputs(b))
-    original_replace, original_unlink = support.os.replace, pathlib.Path.unlink
+    original_write = type(store.current)._append_results if effect == "results" else support.os.replace
+    original_unlink = pathlib.Path.unlink
 
-    def replace(source, destination):
-        target = pathlib.Path(destination)
+    def interrupted_write(source, destination, *groups):
+        target = store.current.path if effect == "results" else pathlib.Path(destination)
         fault = target == (store.current.path if effect == "results" else report) and effect != "delete"
         if fault and when == "before":
             raise OSError("cleanup interrupted")
-        original_replace(source, destination)
+        original_write(source, destination, *groups)
         if fault and when == "after":
             raise OSError("cleanup interrupted")
 
@@ -1039,7 +1040,10 @@ def test_deleted_case_cleanup_resumes_between_effects(tmp_path, monkeypatch, eff
             raise OSError("cleanup interrupted")
 
     with monkeypatch.context() as patch:
-        patch.setattr(support.os, "replace", replace)
+        if effect == "results":
+            patch.setattr(type(store.current), "_append_results", interrupted_write)
+        else:
+            patch.setattr(support.os, "replace", interrupted_write)
         patch.setattr(pathlib.Path, "unlink", unlink)
         with pytest.raises(OSError, match="cleanup interrupted"):
             store.discard_deleted_checks({replacement}, ["tests/a"], complete_files={"tests/a/test_value.py"})
@@ -1171,12 +1175,12 @@ def test_explicit_old_file_conversion_keeps_latest_facts_and_repeats(tmp_path, m
         path.write_text(json.dumps(value), encoding="utf-8")
     unknown = directory / "pytest-pass-unknown.json"
     unknown.write_text(json.dumps({**latest, "inputs": {"checkout": "unknown"}}))
-    replace, unlink = os.replace, pathlib.Path.unlink
+    flush, unlink = os.fsync, pathlib.Path.unlink
 
-    def interrupted_replace(source, destination):
+    def interrupted_flush(fd):
         if boundary == "before-save":
             raise KeyboardInterrupt()
-        replace(source, destination)
+        flush(fd)
         if boundary == "after-save":
             raise KeyboardInterrupt()
 
@@ -1189,7 +1193,7 @@ def test_explicit_old_file_conversion_keeps_latest_facts_and_repeats(tmp_path, m
 
     if boundary != "none":
         with monkeypatch.context() as patch:
-            patch.setattr(os, "replace", interrupted_replace)
+            patch.setattr(os, "fsync", interrupted_flush)
             patch.setattr(pathlib.Path, "unlink", interrupted_delete)
             with pytest.raises(KeyboardInterrupt):
                 module.consolidate_result_files(root)
@@ -1492,15 +1496,15 @@ def test_pytest_interrupt_hook_preserves_completed_pass_and_incomplete_failure(
         test.write_text(test.read_text() + "    raise KeyboardInterrupt('incomplete call')\n")
     else:
         (root / "tests/conftest.py").write_text(
-            "import os\noriginal = os.replace\nINTERRUPTED = False\n"
-            "def interrupted(source, destination):\n"
+            "import os\noriginal = os.fsync\nINTERRUPTED = False\n"
+            "def interrupted(fd):\n"
             "    global INTERRUPTED\n"
-            "    if not str(destination).endswith('check_results.json'): return original(source, destination)\n"
-            "    if INTERRUPTED: return original(source, destination)\n"
+            "    if INTERRUPTED: return original(fd)\n"
             "    INTERRUPTED = True\n"
-            + ("    original(source, destination)\n" if boundary == "after_durable_pass" else "")
+            + ("    original(fd)\n" if boundary == "after_durable_pass" else
+               "    os.ftruncate(fd, max(0, os.fstat(fd).st_size - 20))\n    original(fd)\n")
             + "    raise KeyboardInterrupt('interrupted pass write')\n"
-            "os.replace = interrupted\n"
+            "os.fsync = interrupted\n"
         )
     first = _qualified_acceptance_run(test_runner_module, root, monkeypatch, "beta")
     assert first.returncode != 0, first.stdout + first.stderr

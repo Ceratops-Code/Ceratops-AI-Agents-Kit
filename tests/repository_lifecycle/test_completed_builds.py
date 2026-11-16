@@ -9,6 +9,7 @@ import os
 import pathlib
 import runpy
 import shutil
+import subprocess
 import sys
 from dataclasses import replace
 from unittest.mock import DEFAULT, Mock
@@ -146,7 +147,8 @@ from tests.repository_lifecycle.test_sdlc_handoffs import (
 )
 
 
-def _tag_summary(repository, version, summary, *, target="python-3.14-windows", tagged=True, key="claims"):
+def _tag_summary(repository, version, summary, *, target="python-3.14-windows", tagged=True,
+                 key="claims", receipt_root=".ceratops/build"):
     """Create committed receipt bytes without packages, receipts in a store or logs."""
     fixture = repository / ".git/receipt-fixture"
     fixture.mkdir(parents=True, exist_ok=True)
@@ -156,7 +158,7 @@ def _tag_summary(repository, version, summary, *, target="python-3.14-windows", 
         receipt["identity"].pop("releaseBundle")
         receipt["identity"]["storageKey"] = key
         old_path = receipt["receiptPath"]
-        receipt["receiptPath"] = old_path.replace(".build/claims/", f".build/{key}/")
+        receipt["receiptPath"] = old_path.replace(".ceratops/build/claims/", f".ceratops/build/{key}/")
         receipt["committedResultPaths"] = [receipt["receiptPath"] if name == old_path else name
                                            for name in receipt["committedResultPaths"]]
     if key.startswith("bundles/"):
@@ -165,7 +167,7 @@ def _tag_summary(repository, version, summary, *, target="python-3.14-windows", 
             "deliverable": "deliverables.packages.claims",
             "identity": {**receipt["identity"], "storageKey": member_key},
             "tag": member_key + "/" + version,
-            "buildReceipt": {"root": "git", "path": f".build/{member_key}/{version}/build_receipt.json",
+            "buildReceipt": {"root": "git", "path": f".ceratops/build/{member_key}/{version}/build_receipt.json",
                              "size": 1, "sha256": "0" * 64},
             "artifacts": receipt["artifacts"], "dependencies": receipt["dependencies"],
         }]
@@ -175,6 +177,7 @@ def _tag_summary(repository, version, summary, *, target="python-3.14-windows", 
                      "sourceChecks", "artifactTests", "supportingFiles"):
             receipt[name] = []
         receipt["committedResultPaths"] = [receipt["receiptPath"]]
+    receipt = json.loads(json.dumps(receipt).replace(".ceratops/build/", receipt_root + "/"))
     path = repository / receipt["receiptPath"]
     path.parent.mkdir(parents=True, exist_ok=True)
     if summary is not None:
@@ -185,7 +188,7 @@ def _tag_summary(repository, version, summary, *, target="python-3.14-windows", 
                                              "size": len(raw), "sha256": hashlib.sha256(raw).hexdigest()})
         receipt["committedResultPaths"].append(receipt["checkSummary"]["path"])
     path.write_bytes(results.encode_new_receipt(receipt))
-    assert run_git(repository, "add", ".build").returncode == 0
+    assert run_git(repository, "add", receipt_root).returncode == 0
     committed = run_git(repository, "-c", "user.name=Build Tests", "-c", "user.email=builds@example.invalid",
                         "commit", "--no-gpg-sign", "-m", "completed " + version)
     assert committed.returncode == 0, committed.stderr
@@ -251,8 +254,8 @@ def test_worktree_build_commits_selected_source_and_finishes_once(tmp_path, chec
         for action in runner.operation_entries(contract).values():
             action["requires"]["capabilities"] = action["requires"].pop("tools")
         contract_path.write_text(json.dumps(contract))
-        assert run_git(repository, "add", "sdlc/sdlc.yml").returncode == 0
-        assert run_git(repository, "commit", "--only", "-m", "declared build version", "--", "sdlc/sdlc.yml").returncode == 0
+        assert run_git(repository, "add", ".ceratops/sdlc/sdlc.yml").returncode == 0
+        assert run_git(repository, "commit", "--only", "-m", "declared build version", "--", ".ceratops/sdlc/sdlc.yml").returncode == 0
     if checkout == "release-local":
         assert run_git(repository, "branch", "-m", "release/local").returncode == 0
     elif checkout == "task-worktree":
@@ -326,14 +329,102 @@ def test_release_build_consumes_existing_tagged_receipt_without_starting_builder
     assert builds.recorded_build(replace(prepared, parameters=(*prepared.parameters, ("mode", "debug"))), {})["result"] is None
 
 
-def test_worktree_build_failure_preserves_cause_without_receipt_or_tag(tmp_path):
+@pytest.mark.parametrize("failure", ["compiler", "decision", "changed-package", "changed-check",
+                                      "malformed-answer", "rejected-answer", "repeated-decision", "decision-cli"])
+def test_worktree_build_failure_preserves_cause_without_receipt_or_tag(tmp_path, failure):
     repository, options = _worktree_build_case(tmp_path)
+    if failure != "compiler":
+        check_path = repository / "scripts/review.py"
+        check_path.write_text(
+            "import json,os,pathlib,sys\n"
+            "count=pathlib.Path('.git/review-count'); count.write_text(count.read_text()+'x' if count.exists() else 'x')\n"
+            "answer=json.loads(os.environ.get('CERATOPS_CHECK_ANSWER','null'))\n"
+            "if answer is not None and not pathlib.Path('.git/ask-again').exists(): sys.exit(0 if answer['answer']['approve'] else 6)\n"
+            "print(json.dumps({'schema':'ceratops-check-decision','status':'decision_required',"
+            "'question':'Accept these observed changes?', 'answer_schema':{'type':'object','required':['approve'],"
+            "'properties':{'approve':{'type':'boolean'}},'additionalProperties':False},"
+            "'payload':{'details':{'tests':['one','two']},'report':'review.txt'}}))\n"
+        )
+        contract_path = repository / runner.DEFAULT_CONTRACT
+        contract = json.loads(contract_path.read_text())
+        check = contract["deliverables"]["packages"]["claims"]["actions"]["post-build-checks"]["check-groups"]["contents"]
+        check.update(steps=[{"run": [sys.executable, "scripts/review.py"]}],
+            **{"check-results": {"result-owner": "operation", "product-inputs": ["src/**", "pyproject.toml"],
+                                 "check-inputs": ["scripts/review.py"]}})
+        contract_path.write_text(json.dumps(contract))
+        assert run_git(repository, "add", "scripts/review.py", runner.DEFAULT_CONTRACT.as_posix()).returncode == 0
+        assert run_git(repository, "commit", "--only", "-m", "declare package review", "--",
+                       "scripts/review.py", runner.DEFAULT_CONTRACT.as_posix()).returncode == 0
+        if failure == "decision-cli":
+            request = options["requests"][0]
+            command = [sys.executable, runner.__file__, "--repo-root", str(repository),
+                       "--operation", request.operation, "--qualification-level", "beta"]
+            for name, value in request.parameters.items():
+                command.extend(["--parameter", name + "=" + value])
+            waiting_process = subprocess.run(command, capture_output=True, text=True, check=False)
+            assert waiting_process.returncode == 2, (waiting_process.stdout, waiting_process.stderr)
+            waiting = json.loads(waiting_process.stdout.splitlines()[-1])
+        else:
+            waiting = runner.execute_build(repository, **options)
+        assert waiting["status"] == "decision_required", waiting
+        assert waiting["payload"] == {"details": {"tests": ["one", "two"]}, "report": "review.txt"}
+        assert run_git(repository, "tag", "--list").stdout == ""
+        assert (repository / ".build-count").read_text() == "x"
+        again = runner.execute_build(repository, **options)
+        assert again["status"] == "decision_required" and again["decision_id"] == waiting["decision_id"], again
+        assert (repository / ".build-count").read_text() == "x"
+        assert (repository / ".git/review-count").read_text() == "x"
+        if failure == "changed-package":
+            package = next(storage._artifact_store_path(repository, temporary=True).rglob("*.whl"))
+            package.write_bytes(b"changed after the question")
+        elif failure == "changed-check":
+            check_path.write_text(check_path.read_text() + "# new check input\n")
+        answers = {waiting["decision_id"]: {"approve": True}}
+        if failure == "malformed-answer":
+            malformed = runner.execute_build(repository, **options, check_answers={waiting["decision_id"]: {"approve": "yes"}})
+            assert malformed["status"] in runner.FAILED_STATUSES, malformed
+            assert (repository / ".git/review-count").read_text() == "x"
+            assert (repository / ".build-count").read_text() == "x"
+            assert run_git(repository, "tag", "--list").stdout == ""
+        elif failure == "rejected-answer":
+            rejected = runner.execute_build(repository, **options, check_answers={waiting["decision_id"]: {"approve": False}})
+            assert rejected["status"] in runner.FAILED_STATUSES, rejected
+            assert run_git(repository, "tag", "--list").stdout == ""
+            current = runner.reuse_operation_checks.CheckResultStore(repository).current
+            assert not current.records("check-decision")
+            return
+        elif failure == "repeated-decision":
+            (repository / ".git/ask-again").touch()
+        if failure == "decision-cli":
+            command = waiting["next_command"]
+            command[-1] = json.dumps(answers)
+            answered_process = subprocess.run(command, capture_output=True, text=True, check=False)
+            assert answered_process.returncode == 0, (answered_process.stdout, answered_process.stderr)
+            answered = json.loads(answered_process.stdout.splitlines()[-1])
+        else:
+            answered = runner.execute_build(repository, **options, check_answers=answers)
+        if failure in {"changed-package", "changed-check", "repeated-decision"}:
+            assert answered["status"] == "decision_required", answered
+            if failure != "repeated-decision":
+                assert "answer_not_applied" in json.dumps(answered)
+            else:
+                (repository / ".git/ask-again").unlink()
+            assert answered["decision_id"] != waiting["decision_id"], answered
+            answers = {answered["decision_id"]: {"approve": True}}
+            answered = runner.execute_build(repository, **options, check_answers=answers)
+        assert answered["status"] == "completed", answered
+        expected_builds = "xx" if failure == "changed-package" else "x"
+        assert (repository / ".build-count").read_text() == expected_builds
+        assert not list(storage._artifact_store_path(repository, temporary=True).rglob("*.whl"))
+        current = runner.reuse_operation_checks.CheckResultStore(repository).current
+        assert not current.records("check-decision") and not current.records("pending-build")
+        return
     (repository / ".fail-build").touch()
     result = runner.execute_build(repository, **options)
     assert result["status"] in runner.FAILED_STATUSES, result
     assert "compiler rejected source" in json.dumps(result)
     assert run_git(repository, "tag", "--list").stdout == ""
-    assert not list((repository / ".build").glob("**/build_receipt.json"))
+    assert not list((repository / ".ceratops/build").glob("**/build_receipt.json"))
     assert list(storage._artifact_store_path(repository, temporary=True).rglob("build_request.json"))
     assert not list(storage._artifact_store_path(repository, worktree=True).glob("members/*/*/*/*/artifact-receipt.json"))
     temporary = storage._artifact_store_path(repository, temporary=True) / "members/packages/claims"
@@ -429,14 +520,24 @@ def test_build_selection_uses_checkout_records_and_levels_not_other_tags(tmp_pat
     assert build_reader["select_build_check_summaries"](repository, target="absent") == []
 
 
-def test_git_summary_survives_missing_logs_and_ignores_checkout_summary_edits(tmp_path, build_reader):
+@pytest.mark.parametrize("moved", [False, True])
+def test_git_summary_survives_missing_logs_and_ignores_checkout_summary_edits(tmp_path, build_reader, moved):
     repository, _ = _versioned_repository(tmp_path)
     summary = _empty_summary()
     summary["checks"] = [{"kind": "source-check", "id": "original", "status": "passed", "result_id": "stable-original"}]
-    tag, path = _tag_summary(repository, "1.2.9b1", summary)
+    tag, path = _tag_summary(repository, "1.2.9b1", summary,
+                             receipt_root=".build" if moved else ".ceratops/build")
+    if moved:
+        original = path.read_bytes()
+        relative = path.relative_to(repository / ".build")
+        (repository / ".ceratops").mkdir(exist_ok=True)
+        (repository / ".build").rename(repository / ".ceratops/build")
+        path = repository / ".ceratops/build" / relative
+        assert path.read_bytes() == original
     path.with_name("check_summary.json").write_text("broken local bytes")
     selected = build_reader["select_build_check_summaries"](repository)[0]
     assert selected["summary"] == summary and selected["tag"] == tag
+    assert selected["receiptPath"].startswith(".build/" if moved else ".ceratops/build/")
     assert not (repository / ".git/ceratops/artifacts").exists()
     _tag_summary(repository, "1.2.9b2", None)
     selected = build_reader["select_build_check_summaries"](repository)[0]
@@ -447,7 +548,7 @@ def test_tagged_summary_hash_mismatch_blocks_reuse(tmp_path, build_reader):
     repository, _ = _versioned_repository(tmp_path)
     tag, path = _tag_summary(repository, "1.2.9b1", _empty_summary(), tagged=False)
     path.with_name("check_summary.json").write_text(json.dumps({**_empty_summary(), "checks": []}) + "\n\n")
-    assert run_git(repository, "add", ".build").returncode == 0
+    assert run_git(repository, "add", ".ceratops/build").returncode == 0
     assert run_git(repository, "commit", "-m", "broken summary link").returncode == 0
     assert run_git(repository, "tag", tag).returncode == 0
     with pytest.raises(ValueError, match="differs from its receipt"):
@@ -622,7 +723,7 @@ def test_versioned_receipt_rejects_changed_tested_artifact(tmp_path) -> None:
         required_targets=[target],
         attempt_id="attempt-beta-002",
     )
-    assert receipt["receiptPath"] == ".build/claims/1.2.4b1/build_receipt.json"
+    assert receipt["receiptPath"] == ".ceratops/build/claims/1.2.4b1/build_receipt.json"
     _write_versioned_outputs(repository, transaction, receipt)
     measured = storage.measure_versioned_artifact(
         transaction,
@@ -1049,8 +1150,8 @@ def test_build_recipe_and_independent_member_versions(tmp_path, capsys, target, 
     reference = "deliverables.packages.engine"
     tool["actions"]["build"]["uses-artifacts"] = [reference]
     path.write_text(json.dumps(contract))
-    assert run_git(repository, "add", "sdlc/sdlc.yml").returncode == 0
-    assert run_git(repository, "commit", "--only", "-m", "consume engine", "--", "sdlc/sdlc.yml").returncode == 0
+    assert run_git(repository, "add", ".ceratops/sdlc/sdlc.yml").returncode == 0
+    assert run_git(repository, "commit", "--only", "-m", "consume engine", "--", ".ceratops/sdlc/sdlc.yml").returncode == 0
     files = {reference: first["artifacts"][reference]}
     request = runner.OperationRequest(requests[0].operation, {"version": "1.4.2", "target": target})
     supplied = runner.execute_build(repository, [request], artifacts=files, qualification_level="final")
@@ -1092,8 +1193,8 @@ def test_grouped_completion_interruption(tmp_path, monkeypatch, effect):
     contract["repository"]["release-bundles"] = {
         "suite": {"version": {"mode": "receipt-only"}, "members": ["deliverables.packages.claims"]}}
     path.write_text(json.dumps(contract))
-    assert run_git(repository, "add", "sdlc/sdlc.yml").returncode == 0
-    assert run_git(repository, "commit", "--only", "-m", "bundle", "--", "sdlc/sdlc.yml").returncode == 0
+    assert run_git(repository, "add", ".ceratops/sdlc/sdlc.yml").returncode == 0
+    assert run_git(repository, "commit", "--only", "-m", "bundle", "--", ".ceratops/sdlc/sdlc.yml").returncode == 0
     name = {"result-commit": "_create_result_commit", "artifact-receipt": "_write_version_artifact_receipts",
             "first-tag": "_create_artifact_tag", "second-tag": "_create_artifact_tag",
             "cleanup": "_remove_completed_build_temp"}[effect]

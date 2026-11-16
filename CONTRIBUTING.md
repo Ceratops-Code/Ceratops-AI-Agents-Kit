@@ -21,7 +21,7 @@ Contributions should keep skills practical, current, and safe.
   `skills/ceratops-skill-lifecycle/references/skills-consistency-review.md`, and
   keep skill-design standards refresh in
   `skills/ceratops-skill-lifecycle/references/skills-contract-review.md`.
-- Keep live deployment and release operations in `sdlc/sdlc.yml` as structured
+- Keep live deployment and release operations in `.ceratops/sdlc/sdlc.yml` as structured
   argv steps. Keep reusable section and SDLC templates under
   `skills/ceratops-repo-lifecycle/references/templates/`; neither is live
   repository configuration.
@@ -49,7 +49,7 @@ uv run --project scripts --locked python -m mypy --config-file scripts/pyproject
 uv run --project scripts --locked python scripts/testing/run-tests.py --all
 ```
 
-CI runs these source checks and the separate test group from `sdlc/sdlc.yml`.
+CI runs these source checks and the separate test group from `.ceratops/sdlc/sdlc.yml`.
 The test suite needs `rg` (ripgrep) on `PATH`.
 
 Run full skill-source validation separately when skill source, metadata, shared

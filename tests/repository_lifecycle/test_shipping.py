@@ -287,11 +287,28 @@ def test_repository_ship_rejects_noncanonical_legacy_promotion_branch(
         loaded["ship_repository"](args)
 
 
-def test_repository_ship_missing_custom_contract_blocks_before_remote_mutation(
+@pytest.mark.parametrize("reason", ["missing-contract", "decision-required"])
+def test_repository_ship_unfinished_checks_block_remote_mutation(
     tmp_path: pathlib.Path,
+    reason: str,
 ) -> None:
-    _, loaded, args, log, state, _ = _setup(tmp_path)
-    args.sdlc_contract = pathlib.Path("sdlc/missing.yml")
+    repo, loaded, args, log, state, _ = _setup(tmp_path)
+    if reason == "decision-required":
+        request = {"schema": "ceratops-check-decision", "status": "decision_required",
+                   "question": "Accept the check observations?", "answer_schema": {"type": "boolean"}}
+        (repo / "quality-check.py").write_text("print(" + repr(json.dumps(request)) + ")\n")
+        path = repo / ".ceratops/sdlc/sdlc.yml"
+        contract = json.loads(path.read_text())
+        contract["repository"]["actions"]["pre-build-checks"]["check-groups"]["source"]["check-results"] = {
+            "product-inputs": ["code.txt"], "check-inputs": ["quality-check.py"]}
+        path.write_text(json.dumps(contract))
+        _commit(repo)
+        outcome = loaded["ship_repository"](args)
+        assert outcome["status"] == "decision_required", outcome
+        assert outcome["question"] == request["question"]
+        assert state["calls"] == 0 and not log.exists()
+        return
+    args.sdlc_contract = pathlib.Path(".ceratops/sdlc/missing.yml")
     with pytest.raises(loaded["RepositoryShipError"], match="repository file"):
         loaded["ship_repository"](args)
     assert state["calls"] == 0 and not log.exists()
@@ -589,7 +606,7 @@ def test_repository_ship_blocks_selected_worktree_caller_before_remote_process(
                 merge_method="merge",
                 delete_branch=False,
                 reusable_head=True,
-                sdlc_contract=pathlib.Path("sdlc/sdlc.yml"),
+                sdlc_contract=pathlib.Path(".ceratops/sdlc/sdlc.yml"),
                 validation_operation=None,
                 publish_operation=None,
                 deploy_operation=None,
@@ -1338,7 +1355,7 @@ def _saved_stage_fixture(
 ) -> tuple[pathlib.Path, str]:
     """Use real subprocesses and Git identities without any remote or app effects."""
     repo = root / repository_name
-    (repo / "sdlc").mkdir(parents=True)
+    (repo / ".ceratops/sdlc").mkdir(parents=True)
     (repo / ".gitignore").write_text(".build/\n", encoding="utf-8")
     (repo / "probe.py").write_text(
         "import pathlib,sys\n"
@@ -1384,7 +1401,7 @@ def _saved_stage_fixture(
         },
     }
     (repo / "apps/fixture").mkdir(parents=True)
-    (repo / "sdlc/sdlc.yml").write_text(json.dumps(contract), encoding="utf-8")
+    (repo / ".ceratops/sdlc/sdlc.yml").write_text(json.dumps(contract), encoding="utf-8")
     assert run_git(repo, "init", "--quiet").returncode == 0
     assert run_git(repo, "add", ".").returncode == 0
     assert (

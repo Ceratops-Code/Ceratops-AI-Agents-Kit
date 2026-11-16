@@ -1241,7 +1241,7 @@ def _sdlc_contract_facts(local: dict[str, Any]) -> dict[str, Any]:
 
     if not local["available"] or not local["root"]:
         return {"present": False, "valid": None, "errors": []}
-    path = pathlib.Path(local["root"]) / "sdlc" / "sdlc.yml"
+    path = pathlib.Path(local["root"]) / ".ceratops/sdlc" / "sdlc.yml"
     present = path.exists() or path.is_symlink()
     if not present:
         return {"present": False, "valid": None, "errors": []}
@@ -1249,7 +1249,7 @@ def _sdlc_contract_facts(local: dict[str, Any]) -> dict[str, Any]:
         return {
             "present": True,
             "valid": False,
-            "errors": ["sdlc/sdlc.yml must be a regular file"],
+            "errors": [".ceratops/sdlc/sdlc.yml must be a regular file"],
         }
     contract, errors = read_contract(path, repo_root=pathlib.Path(local["root"]))
     facts: dict[str, Any] = {
@@ -1281,7 +1281,7 @@ def _repository_validation_facts(
 
     root = pathlib.Path(local["root"]).resolve()
     workflow = root / ".github" / "workflows" / "validate.yml"
-    contract_path = root / "sdlc/sdlc.yml"
+    contract_path = root / ".ceratops/sdlc/sdlc.yml"
     sdlc_present = contract_path.is_file() and not contract_path.is_symlink()
     workflow_present = workflow.is_file() and not workflow.is_symlink()
     errors: list[str] = []

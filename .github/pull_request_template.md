@@ -11,7 +11,7 @@
   --config-file scripts/.yamllint.yml .`
 - [ ] `uv run --project scripts --locked python -m mypy
   --config-file scripts/pyproject.toml`
-- [ ] Repository source checks in `sdlc/sdlc.yml` passed.
+- [ ] Repository source checks in `.ceratops/sdlc/sdlc.yml` passed.
 - [ ] `uv run --project scripts --locked python scripts/testing/run-tests.py --all`
 
 ## Release impact

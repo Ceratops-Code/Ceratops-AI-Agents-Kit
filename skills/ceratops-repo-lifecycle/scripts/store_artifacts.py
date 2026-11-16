@@ -83,7 +83,7 @@ class ArtifactVersionAllocation:
 
     def receipt_path(self, target: str) -> str:
         _require_transaction_target(self, target)
-        base = f".build/{self.release_bundle}/{self.version}"
+        base = f".ceratops/build/{self.release_bundle}/{self.version}"
         return (
             f"{base}/build_receipt.json"
             if len(self.required_targets) == 1
@@ -476,7 +476,7 @@ def _input_paths(repo_root: pathlib.Path, declared: Sequence[str]) -> tuple[str,
         raise OperationError(f"Git could not list build inputs: {result.stderr.strip()}")
     # Result receipts are not source inputs for the next build.
     return tuple(sorted(path for path in result.stdout.split("\0")
-                        if path and not path.startswith(".build/")))
+                        if path and not path.startswith((".ceratops/build/", ".ceratops/results/"))))
 
 
 def _inputs_match_commit(root: pathlib.Path, commit: str, paths: Sequence[str]) -> bool:
@@ -540,7 +540,7 @@ def allocate_artifact_version(
         # A committed passing receipt means testing finished. Its remaining tags
         # or retained copy can still need completion after interruption; that is
         # completion of finished work, not another build of unfinished output.
-        result_directory = f".build/{unit}/{version}"
+        result_directory = f".ceratops/build/{unit}/{version}"
         committed = set(_git_text(
             root, ["ls-tree", "-r", "--name-only", "HEAD", "--", result_directory],
             label="committed build results", single_line=False,
@@ -561,7 +561,7 @@ def allocate_artifact_version(
             # them would make a new build read results for bytes just removed.
             # Committed history stays in Git and occupies its original version.
             if FULL_VERSION_RE.fullmatch(obsolete.name):
-                records = root / ".build" / unit / obsolete.name
+                records = root / ".ceratops/build" / unit / obsolete.name
                 if records.exists() and not _artifact_tag_exists(root, unit, obsolete.name):
                     result_path = records.relative_to(root).as_posix()
                     committed_results = _git_text(
@@ -575,7 +575,7 @@ def allocate_artifact_version(
                             root, ["reset", "--quiet", "HEAD", "--", result_path],
                             label="discarded staged build results", single_line=False,
                         )
-                        _remove_versioned_tree(records, root / ".build" / unit,
+                        _remove_versioned_tree(records, root / ".ceratops/build" / unit,
                                                label="Uncommitted unfinished build results")
             _remove_versioned_tree(obsolete, temporary / unit, label="Unfinished build output")
         while True:
@@ -589,7 +589,7 @@ def allocate_artifact_version(
                 lock_path=lock_path,
             )
             if (_artifact_tag_exists(root, unit, version)
-                    or (root / ".build" / unit / version).exists()):
+                    or (root / ".ceratops/build" / unit / version).exists()):
                 version = _next_prerelease(version)
                 continue
             # Tags name versions repository-wide. Reserve by directory under the

@@ -147,7 +147,7 @@ def test_android_coverage_requires_declared_gradle_checks_in_any_group(
     assert missing["valid"] is False
     assert any("coverage android-gradle requires" in error for error in missing["errors"])
 
-    sdlc_path = repo / "sdlc/sdlc.yml"
+    sdlc_path = repo / ".ceratops/sdlc/sdlc.yml"
     sdlc = yaml.safe_load(sdlc_path.read_text(encoding="utf-8"))
     workflow = repo / ".github/workflows/validate.yml"
     workflow.write_text(workflow.read_text(encoding="utf-8").replace(
@@ -248,7 +248,7 @@ def test_ecosystem_coverage_requires_declared_repository_checks(
 
     entrypoint = repo / "scripts" / f"{coverage_id}-check.py"
     entrypoint.write_text("# Repository-owned check entrypoint.\n", encoding="utf-8")
-    sdlc_path = repo / "sdlc/sdlc.yml"
+    sdlc_path = repo / ".ceratops/sdlc/sdlc.yml"
     sdlc = yaml.safe_load(sdlc_path.read_text(encoding="utf-8"))
     workflow = repo / ".github/workflows/validate.yml"
     workflow.write_text(workflow.read_text(encoding="utf-8").replace(
@@ -276,7 +276,7 @@ def test_ecosystem_coverage_requires_declared_repository_checks(
         ), encoding="utf-8")
         check_operation["check-results"] = {
             "result-owner": "operation", "product-inputs": ["**/*.sh"],
-            "check-inputs": ["sdlc/sdlc.yml"],
+            "check-inputs": [".ceratops/sdlc/sdlc.yml"],
         }
     groups["ecosystem-source"] = check_operation
     sdlc_path.write_text(
@@ -356,7 +356,7 @@ def test_shell_compatibility_declares_its_generated_check_and_repeats(tmp_path: 
             REPOSITORY_LIFECYCLE_SCRIPTS, "apply", "--target-repo-root", str(repo)
         )
         assert result.returncode == 0, result.stdout + result.stderr
-        sdlc = yaml.safe_load((repo / "sdlc/sdlc.yml").read_text(encoding="utf-8"))
+        sdlc = yaml.safe_load((repo / ".ceratops/sdlc/sdlc.yml").read_text(encoding="utf-8"))
         check = sdlc["repository"]["actions"]["pre-build-checks"]["check-groups"]["source-shellcheck"]
         assert check["validation-tools"] == ["shellcheck"]
         assert "shellcheck" in check["requires"]["tools"]
@@ -735,7 +735,7 @@ def test_compatibility_materializer_supports_repositories_without_skills(
     assert output["runtime_source_id"] is None
     assert output["skill_manifest"] == "not_configured"
     assert not (repo / "skills").exists()
-    contract = yaml.safe_load((repo / "sdlc" / "sdlc.yml").read_text())
+    contract = yaml.safe_load((repo / ".ceratops/sdlc" / "sdlc.yml").read_text())
     groups = contract["repository"]["actions"]["pre-build-checks"]["check-groups"]
     expected = ["npm-lint", "ruff", "mypy", "actionlint"]
     assert list(groups) == [*(f"source-{name}" for name in expected), "tests"]
@@ -753,7 +753,7 @@ def test_compatibility_materializer_supports_repositories_without_skills(
         engine_scripts, "apply", "--target-repo-root", str(repo), "--no-sdlc-contract",
     )
     assert omitted.returncode != 0
-    assert (repo / "sdlc/sdlc.yml").is_file()
+    assert (repo / ".ceratops/sdlc/sdlc.yml").is_file()
 
     def empty_repository(name: str) -> pathlib.Path:
         target = tmp_path / name
@@ -1048,14 +1048,14 @@ def test_compatibility_materializer_supports_repositories_without_skills(
         encoding="utf-8",
         newline="\n",
     )
-    authoritative_sdlc = authoritative_repo / "sdlc/sdlc.yml"
+    authoritative_sdlc = authoritative_repo / ".ceratops/sdlc/sdlc.yml"
     document = yaml.safe_load(authoritative_sdlc.read_text())
     groups = document["repository"]["actions"]["pre-build-checks"]["check-groups"]
     groups["custom"] = {
         "requires": {"tools": ["uv"]}, "validation-tools": ["project-check"],
         "steps": [{"run": ["uv", "run", "--project", "scripts", "--locked", "python", "scripts/check_project.py"]}],
         "check-results": {"result-owner": "operation", "product-inputs": ["scripts/check_project.py"],
-                          "check-inputs": ["sdlc/sdlc.yml"]},
+                          "check-inputs": [".ceratops/sdlc/sdlc.yml"]},
     }
     authoritative_sdlc.write_text(yaml.safe_dump(document, sort_keys=False))
     _write_tooling_settings(authoritative_repo, '[tool.mypy]\npython_version = "3.12"\n')
@@ -1105,7 +1105,7 @@ def test_compatibility_materializer_supports_repositories_without_skills(
             "npm-markdown-lint", "ruff", "mypy", "actionlint"
         ]
         assert (config_repo / "scripts/run-tests.py").is_file()
-        assert yaml.safe_load((config_repo / "sdlc/sdlc.yml").read_text())["repository"]["actions"]["pre-build-checks"]["check-groups"]["tests"]["steps"]
+        assert yaml.safe_load((config_repo / ".ceratops/sdlc/sdlc.yml").read_text())["repository"]["actions"]["pre-build-checks"]["check-groups"]["tests"]["steps"]
 
     # Contract validation covers entries which do not match the target and
     # rejects broken metadata or evidence links before target mutation.
@@ -1139,7 +1139,7 @@ def test_compatibility_materializer_supports_repositories_without_skills(
         assert invalid.returncode == 1, invalid.stdout
         assert json.loads(invalid.stdout)["rollback"] == "not_started"
         assert not (invalid_repo / "scripts").exists()
-        assert not (invalid_repo / "sdlc").exists()
+        assert not (invalid_repo / ".ceratops/sdlc").exists()
     contract_path.write_text(json.dumps(valid_contract) + "\n", encoding="utf-8")
 
     # The contract-review checker also rejects new schema fields which lack

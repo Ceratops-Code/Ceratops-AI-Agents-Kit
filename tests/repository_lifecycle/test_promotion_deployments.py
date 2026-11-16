@@ -968,11 +968,11 @@ def _prepare_standalone_handoff_reports(
         assert run_git(repo, "worktree", "add", "-b", "installer-source", str(source)).returncode == 0
         _typed_contract(source)
         if source_checkout == "worktree-primary-changed":
-            contract_path = repo / "sdlc/sdlc.yml"
+            contract_path = repo / ".ceratops/sdlc/sdlc.yml"
             contract = json.loads(contract_path.read_text())
             del contract["deliverables"]["skills"]["claims-catalog-invoice"]["actions"]["install"]
             contract_path.write_text(json.dumps(contract))
-            assert run_git(repo, "add", "sdlc/sdlc.yml").returncode == 0
+            assert run_git(repo, "add", ".ceratops/sdlc/sdlc.yml").returncode == 0
             assert run_git(repo, "commit", "-m", "Change only the primary installation contract").returncode == 0
     operation = "deliverables.skills.claims-catalog-invoice.actions.install"
     prepared = runner.prepare_operations(source, [runner.OperationRequest(operation)], context="return")[0]
@@ -1163,7 +1163,7 @@ def test_promotion_passes_accepted_package_to_install(tmp_path, monkeypatch):
     repo, _options = _worktree_build_case(tmp_path)
     assert run_git(repo, "restore", "--staged", "--worktree", "unrelated.txt").returncode == 0
     (repo / "scripts/install.py").write_text(INSTALLER_PROBE, encoding="utf-8")
-    contract_path = repo / "sdlc/sdlc.yml"
+    contract_path = repo / ".ceratops/sdlc/sdlc.yml"
     contract = json.loads(contract_path.read_text())
     operation = "deliverables.packages.claims.actions.install"
     contract["deliverables"]["packages"]["claims"]["actions"]["install"] = {
@@ -1179,7 +1179,9 @@ def test_promotion_passes_accepted_package_to_install(tmp_path, monkeypatch):
     assert run_git(repo, "worktree", "add", "-b", "approved", str(task)).returncode == 0
     command = [sys.executable, str(PROMOTE_REPOSITORY), "--repo-root", str(task), "--source-branch", "approved"]
     before = run_git(repo, "rev-parse", "release/local").stdout.strip()
-    review = subprocess.run([*command, "--no-run-operation"], capture_output=True, text=True, check=False)
+    destination = tmp_path / "installed package"
+    parameters = ["--parameter", "target=native", "--parameter", "destination=" + str(destination)]
+    review = subprocess.run([*command, "--run-operation", operation, *parameters], capture_output=True, text=True, check=False)
     assert review.returncode == 2, (review.stdout, review.stderr)
     decision = json.loads(review.stdout)
     assert decision["status"] == "version_decision_required"
@@ -1191,9 +1193,7 @@ def test_promotion_passes_accepted_package_to_install(tmp_path, monkeypatch):
     plain = subprocess.run([*command, "--no-run-operation"], capture_output=True, text=True, check=False)
     assert plain.returncode == 0, plain.stderr
     assert json.loads(plain.stdout)["operations"] is None
-    assert (task / ".build-count").read_text() == "x"
-    destination = tmp_path / "installed package"
-    parameters = ["--parameter", "target=native", "--parameter", "destination=" + str(destination)]
+    assert not (task / ".build-count").exists()
     promoted = subprocess.run([*command, "--run-operation", operation, *parameters], capture_output=True, text=True, check=False)
     assert promoted.returncode == 0, promoted.stderr
     payload = json.loads(promoted.stdout)

@@ -84,6 +84,14 @@ def test_pytest_environment_isolates_peers_and_nested_runs_and_cleans_up(
     assert set(tmp_path.iterdir()) == {sentinel, root.parent}
     assert [path.name for path in root.parent.iterdir()] == [".registry"]
     assert caller == before and dict(os.environ) == process_before
+    explicit = tmp_path / "selected-parent"
+    for _ in range(2):
+        with environment.isolated_environment(tmp_path, environ=caller, windows=False,
+                                              temporary_root=explicit) as selected:
+            selected_root = pathlib.Path(selected["TMP"])
+            assert selected_root.is_relative_to(explicit)
+        assert not selected_root.exists()
+    assert caller == before and dict(os.environ) == process_before
 
 
 def test_test_runner_reclaims_abandoned_scratch_after_its_worker_exits(
@@ -500,7 +508,7 @@ def test_pytest_cleanup_error_preserves_output_and_test_exit_code(
     roots = []
 
     @contextmanager
-    def cleanup_error(cwd: pathlib.Path) -> Iterator[dict[str, str]]:
+    def cleanup_error(cwd: pathlib.Path, *, temporary_root=None) -> Iterator[dict[str, str]]:
         with original(
             cwd, environ={**os.environ, "PYTEST_DEBUG_TEMPROOT": str(tmp_path)}
         ) as child:
@@ -541,7 +549,7 @@ def test_pytest_setup_failure_returns_diagnostic_before_launch(
     runner = test_runner_module
 
     @contextmanager
-    def rejected(cwd: pathlib.Path) -> Iterator[dict[str, str]]:
+    def rejected(cwd: pathlib.Path, *, temporary_root=None) -> Iterator[dict[str, str]]:
         raise runner.pytest_environment.PytestEnvironmentError("unavailable template")
         yield {}  # pragma: no cover
 

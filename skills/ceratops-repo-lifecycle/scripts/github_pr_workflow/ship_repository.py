@@ -53,7 +53,7 @@ SCRIPT_ROOT = pathlib.Path(__file__).resolve().parents[1]
 OPERATION_RUNNER = SCRIPT_ROOT / "repository_operation.py"
 PENDING_MANAGER = SCRIPT_ROOT / "manage-pending-work.py"
 SHIPPED_CLEANUP = SCRIPT_ROOT / "retire_shipped_work.py"
-DEFAULT_SDLC_CONTRACT = pathlib.Path("sdlc/sdlc.yml")
+DEFAULT_SDLC_CONTRACT = pathlib.Path(".ceratops/sdlc/sdlc.yml")
 RELEASE_BRANCH = "release/local"
 
 
@@ -82,6 +82,7 @@ class ShipOptions:
     deploy_operation: list[str] | None = None
     version_choices: dict[str, dict[str, str]] | None = None
     version_source_commit: str | None = None
+    check_answers: dict[str, Any] | None = None
     ci_wait_seconds: int = 1800
     review_wait_seconds: int = 260
     review_replies_request: pathlib.Path | None = None
@@ -484,6 +485,7 @@ def _checkpointed_operation_batch(
     synchronized_commit: str,
     version_choices: dict[str, dict[str, str]] | None = None,
     version_source_commit: str | None = None,
+    check_answers: dict[str, Any] | None = None,
     validation_operations: list[str] | None = None,
     diagnostic_output: pathlib.Path | None = None,
     diagnostic_owner: tuple[pathlib.Path, str] | None = None,
@@ -543,8 +545,9 @@ def _checkpointed_operation_batch(
                 diagnostic_output=diagnostic_output, diagnostic_owner=diagnostic_owner,
                 successful_results=completed_results,
                 version_choices=version_choices, version_source_commit=version_source_commit,
+                check_answers=check_answers,
             )
-            if batch["status"] == "version_decision_required":
+            if batch["status"] in {"version_decision_required", "decision_required"}:
                 return 2, {**batch, "completed_operations": operations[:first_pending + offset],
                            "pending_operations": operations[first_pending + offset:]}, checkpoints
             if batch["status"] in FAILED_STATUSES:
@@ -917,7 +920,11 @@ def _validate_phase(
     commit = repository_commit(repo_root)
     if commit:
         command.extend(("--commit", commit))
+    if args.check_answers:
+        command.extend(("--check-answers", json.dumps(args.check_answers)))
     code, result = run_command_for_json(command, cwd=repo_root)
+    if code == 2 and result.get("status") == "decision_required":
+        return {**result, "phase": phase, "remote_mutation": remote_mutation}
     if code:
         raise RepositoryShipError(
             str(result.get("message", "Repository validation failed.")),
@@ -1136,6 +1143,8 @@ def ship_repository(args: ShipOptions) -> dict[str, object]:
                 args, repo_root, [*release_operations, *deploy_operations],
                 phase="before_remote", remote_mutation=False,
             )
+            if validation.get("status") == "decision_required":
+                return validation
             test_selection = (
                 None if _synchronized_post_merge_resume(args, repo_root, prepared_target_commit)
                 else _test_selection_phase(args, repo_root, prepared_target_commit)
@@ -1209,6 +1218,7 @@ def ship_repository(args: ShipOptions) -> dict[str, object]:
                         target_commit=target_commit,
                         synchronized_commit=synchronized_head,
                         version_choices=args.version_choices, version_source_commit=args.version_source_commit,
+                        check_answers=args.check_answers,
                         validation_operations=args.validation_operation,
                         diagnostic_output=getattr(args, "diagnostic_output", None),
                         diagnostic_owner=getattr(args, "diagnostic_owner", None) or (args.repo_root, "ship"),
@@ -1252,6 +1262,7 @@ def ship_repository(args: ShipOptions) -> dict[str, object]:
                         target_commit=target_commit,
                         synchronized_commit=synchronized_head,
                         version_choices=args.version_choices, version_source_commit=args.version_source_commit,
+                        check_answers=args.check_answers,
                         validation_operations=args.validation_operation,
                         diagnostic_output=getattr(args, "diagnostic_output", None),
                         diagnostic_owner=getattr(args, "diagnostic_owner", None) or (args.repo_root, "ship"),

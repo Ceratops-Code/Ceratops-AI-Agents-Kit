@@ -439,6 +439,8 @@ def group_inputs(manifest: Manifest, nodeid: str, paths: Iterable[str]) -> tuple
                for target in manifest.suites[group].pytest]
     selected = []
     for path in sorted(set(paths)):
+        if path.startswith((".ceratops/build/", ".ceratops/results/")):
+            continue
         # The manifest describes ownership, not product bytes. Only the rules
         # affecting this group are recorded below; unrelated rule edits do not
         # invalidate it. Imported check helpers are recorded by the collector.
@@ -502,6 +504,9 @@ def selection_from_changes(
     full_suite = False
     for changed in sorted(changes, key=lambda item: (item.paths, item.status)):
         for path_index, path in enumerate(changed.paths):
+            if path.startswith((".ceratops/build/", ".ceratops/results/")):
+                ignored_paths.append({"path": path, "reason": "generated Ceratops result"})
+                continue
             renamed_source = (
                 changed.status.startswith("R")
                 and path_index == 0
