@@ -47,6 +47,54 @@ jobs:
           operations: repository.actions.pre-build-checks
           evidence-file: ${{ runner.temp }}/sdlc-validation.json
 
+      - name: Set up Node.js for Renovate configuration checks
+        id: renovate_node
+        if: >-
+          hashFiles('renovate.json', 'renovate.jsonc', 'renovate.json5',
+          '.github/renovate.json', '.github/renovate.jsonc', '.github/renovate.json5',
+          '.renovaterc', '.renovaterc.json', '.renovaterc.jsonc', '.renovaterc.json5',
+          'org-inherited-config.json') != '' ||
+          (github.event.repository.name == 'renovate-config' &&
+          hashFiles('**/*.json', '**/*.jsonc', '**/*.json5') != '')
+        uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: '26.13.0'
+
+      - name: Check Renovate configuration
+        if: steps.renovate_node.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          config_files=()
+          repository="${GITHUB_REPOSITORY:-}"
+          # Preset repositories own their tracked JSON-family files.
+          if [[ "${repository##*/}" == renovate-config || -f org-inherited-config.json ]]; then
+            while IFS= read -r -d '' config_file; do
+              config_files+=("$config_file")
+            done < <(git ls-files -z -- '*.json' '*.jsonc' '*.json5')
+            wait "$!"
+          else
+            for config_file in renovate.json renovate.jsonc renovate.json5 \
+              .github/renovate.json .github/renovate.jsonc .github/renovate.json5 \
+              .renovaterc .renovaterc.json .renovaterc.jsonc .renovaterc.json5; do
+              if [[ -f "$config_file" ]]; then
+                config_files+=("$config_file")
+              fi
+            done
+          fi
+          if [[ "${#config_files[@]}" -eq 0 ]]; then
+            echo "No repository-owned Renovate configuration files."
+            exit 0
+          fi
+          for config_file in "${config_files[@]}"; do
+            if [[ "$config_file" == *.json ]]; then
+              node -e 'JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8").replace(/^\uFEFF/, ""))' "$config_file"
+            fi
+          done
+          # This offline check does not inspect Mend jobs or fetch private presets.
+          npm exec --yes --package=renovate@44.240.0 -- \
+            renovate-config-validator --no-global --strict "${config_files[@]}"
+
       - name: Upload validation evidence
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
