@@ -25,6 +25,7 @@ from tests.support.processes import (
 )
 from tests.support.repositories import (
     ROOT,
+    prepare_linked_worktree,
     run_git,
     write_sdlc_contract,
 )
@@ -714,7 +715,7 @@ def test_runner_ownership_is_explicit_and_custom_sources_are_preserved(tmp_path:
 def test_missing_uv_rolls_back_generated_files_before_compatibility_claim(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     generator = importlib.import_module("ceratops_repo_compatibility_engine.apply_ceratops_compatibility")
     runtime = importlib.import_module("ceratops_repo_compatibility_engine.validation_environment")
-    (tmp_path / ".git").write_text("gitdir: test\n")
+    prepare_linked_worktree(tmp_path)
     monkeypatch.setattr(runtime.shutil, "which", lambda name: None)
     assert generator.main(["--target-repo-root", str(tmp_path)]) == 1
     outcome = json.loads(capsys.readouterr().out)
@@ -728,7 +729,7 @@ def test_compatibility_qualifies_scratch_before_writing_a_new_runner(
 ) -> None:
     application = importlib.import_module("ceratops_repo_compatibility_engine.apply_ceratops_compatibility")
     original = application.qualify_generated_runner_scratch
-    (tmp_path / ".git").write_text("gitdir: test\n", encoding="utf-8")
+    prepare_linked_worktree(tmp_path)
     (tmp_path / "test_probe.py").write_text("def test_example(): pass\n", encoding="utf-8")
 
     def interrupt_after_probe(content, probe, contract):

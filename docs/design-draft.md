@@ -2650,6 +2650,42 @@ scope with Renovate PRs and dashboard problems, alongside Dependabot PRs and
 alerts. Both providers use the existing PR evidence and approval handling.
 GitHub activity does not establish a successful hosted Renovate job: unavailable
 Mend job results remain a reported blocker with the portal follow-up. Repository
-health's existing local collector reports Renovate configuration declarations,
-including preset references and ownership restrictions; unresolved presets and
-JSON5 parsing requirements remain explicit. Health does not read live job logs.
+health's existing local collector invokes the pinned Renovate CLI to read JSON,
+JSONC or JSON5 and apply shared presets. It returns the resulting settings,
+detected dependency files, and native errors. It does not implement another
+preset or package-version resolver, and it does not read hosted job logs.
+
+`collect_dependency_coverage()` extends the previous Dependabot collection. Setup,
+health and dependency review use the same root `renovate.json` ownership scope.
+Forks need explicit owned paths; upstream alerts remain visible as upstream
+maintenance. A Dependabot entry cannot narrow updates to one file inside a
+directory or exclude members of a workspace. Setup stops before changing such
+an entry when it would also update upstream-owned files. New entries cover the
+actual manifest/workspace directories and group minor/patch updates while
+preserving existing schedules and custom groups. Shared defaults and the native
+Renovate version live in the compatibility contract. New root Renovate configs
+reference the owner's preset; they do not copy that policy into every repository.
+The workflow generator also refreshes its two named native Renovate CI steps
+from the template, including the pinned tool version. Other workflow steps and
+comments remain repository-owned.
+
+Renovate's local read uses this checkout's Git-directory cache under
+`ceratops/renovate-cache`. npm manages its downloaded CLI cache; Renovate manages
+its temporary extraction cache with repository caching disabled and a one-hour
+hard cache lifetime. The reader keeps one empty global config and its native
+lock in that folder. Atomic replacement removes its one temporary file on
+success and at the next locked initialization after interruption. No result
+history is saved there. This prevents ambient JavaScript configuration from
+running. npm retrieves the pinned Renovate CLI; dependency installation, other
+tool downloads and repository scripts are disabled. Failures
+retain the invocation, exit status and redacted output streams in the caller's
+report; successful configuration reads never imply a successful hosted job.
+
+The recurring dependency review reads only the newest dashboard and current bot
+PRs. It requests a native local lookup for a reported problem, a stale or missing
+dashboard, or failed configuration loading. This diagnostic remains distinct
+from the hosted outcome. A missing supported Mend job-status interface is
+reported with available job-log links, not replaced by a success inferred from
+PR activity. The same existing PR route handles both bots and leaves PRs outside
+the declared owned paths for review. Alerts keep their package, manifest,
+published fix information and next action, including alerts without a fix PR.

@@ -1,19 +1,23 @@
 """Behavior checks for Dependabot manifest classification and coverage."""
 import json
+import os
 import pathlib
 import re
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / "skills" / "ceratops-repo-lifecycle" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
+sys.path.insert(0, str(ROOT / "skills/sections/scripts"))
 
 from github_contract_engine.collectors.local_repository import (  # noqa: E402
+    collect_dependency_coverage,
     collect_local_repository,
-    dependabot_coverage,
+    read_renovate_configuration,
 )
 from github_contract_engine.collectors.repository import (  # noqa: E402
     collect_repository,
@@ -144,7 +148,7 @@ class DependabotCoverageTests(unittest.TestCase):
         return {"package-ecosystem": ecosystem, "schedule": {"interval": "weekly"}, **locations}
 
     def coverage(self, files, updates):
-        return dependabot_coverage(self.facts(files, updates), "main")
+        return collect_dependency_coverage(self.facts(files, updates), "main")
 
     def test_wrong_pip_root_leaves_nested_manifest_uncovered(self):
         facts = self.coverage({"tools/demo/pyproject.toml": "[project]\nname='demo'"}, [
@@ -166,7 +170,8 @@ class DependabotCoverageTests(unittest.TestCase):
             with self.subTest(directories=directories):
                 # Windows merges case-only directory names and strips trailing dots.
                 # Supply the repository's POSIX inventory directly for these cases.
-                facts = dependabot_coverage({
+                facts = collect_dependency_coverage({
+                    "files": list(files),
                     "dependabot": {"config_path": ".github/dependabot.yml", "ecosystems": {"pip": list(files)}},
                     "texts": {".github/dependabot.yml": json.dumps({"version": 2, "updates": [
                         self.entry("pip", directories=directories),
@@ -235,7 +240,7 @@ class DependabotCoverageTests(unittest.TestCase):
         ])
         self.assertIn("packages/member/pyproject.toml", local["dependabot"]["ecosystems"]["uv"])
         self.assertEqual(local["dependabot"]["ecosystems"]["pip"], ["packages/standalone/pyproject.toml"])
-        self.assertEqual(dependabot_coverage(local)["missing_manifest_directories"], [])
+        self.assertEqual(collect_dependency_coverage(local)["missing_manifest_directories"], [])
 
     def test_npm_and_pnpm_workspaces_do_not_cover_unrelated_nested_packages(self):
         for extra in [{"package.json": '{"workspaces":["packages/*"]}'},
@@ -271,32 +276,123 @@ class DependabotCoverageTests(unittest.TestCase):
         local = self.facts({"tools/demo/requirements.txt": "pytest"}, [self.entry("pip", directory="/")])
         contract = json.loads((SCRIPTS.parent / "references/contracts/code-repo-deterministic-contract.json").read_text())
         rule = next(rule for rule in contract["checks"] if rule["id"] == "security.dependabot_config_file")
-        rule = {**rule, "applies_when": "always"}
         repository = collect_repository({}, {"owner": "example", "repo": "demo", "default_branch": "main"}, local, [])
-        result = compare_states({"repository": repository}, {"rules": [rule], "contracts": []})
+        result = compare_states({"repo": {"archived": False}, "repository": repository}, {"rules": [rule], "contracts": []})
         self.assertTrue(any(finding["path"].endswith("/missing_manifest_directories")
                             and finding["level"] == "WARN" for finding in result["findings"]))
 
     def test_version_updates_target_release_and_security_only_entries_use_main(self):
-        for declaration in [
-            {"extends": ["github>owner/policy"], "enabledManagers": ["nvm"],
-             "includePaths": ["scripts/**"], "baseBranchPatterns": ["release/local"],
-             "forkProcessing": "enabled", "vulnerabilityAlerts": {"enabled": False}},
-            [], "broken-json",
-        ]:
-            text = declaration if isinstance(declaration, str) else json.dumps(declaration)
-            for _ in range(2):
-                local = self.facts({"renovate.json": text, "requirements.txt": "pytest"}, [
-                    self.entry("pip", directory="/", **{"target-branch": "release/local"}),
-                ])
-                facts = local["renovate"]
-                self.assertEqual(facts["config_paths"], ["renovate.json"])
-                self.assertEqual(bool(facts["errors"]), not isinstance(declaration, dict))
-                if isinstance(declaration, dict):
-                    self.assertEqual(facts["declarations"]["renovate.json"], declaration)
-                    self.assertEqual(facts["inherited_policy"], "requires_renovate_resolution")
-                    observed = collect_repository({}, {"owner": "example", "repo": "demo", "default_branch": "main"}, local, [])
-                    self.assertEqual(observed["content"]["renovate"], facts)
+        module = "github_contract_engine.collectors.local_repository"
+        declaration = {"extends": ["github>owner/policy"], "includePaths": ["scripts/**"]}
+        effective = {**declaration, "baseBranchPatterns": ["release/local"],
+                     "enabledManagers": ["npm"], "vulnerabilityAlerts": {"enabled": False},
+                     "osvVulnerabilityAlerts": False, "dependencyDashboard": True}
+        events = [
+            {"msg": "Repository config", "fileName": "renovate.json5", "config": declaration},
+            {"msg": "Resolved shallow config, without merging internal presets", "visitedPresets": declaration["extends"]},
+            {"msg": "Full resolved config and hostRules including presets", "config": effective, "hostRules": [{"password": "not-returned"}]},
+            {"msg": "Extracted dependencies", "packageFiles": {"npm": [{"packageFile": "scripts/package.json", "deps": [
+                {"depType": "engines", "depName": "node", "currentValue": ">=24 <25", "datasource": "node-version"},
+            ]}]}},
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config = root / "renovate.json5"
+            config.write_text('// JSON5 belongs to Renovate\n{extends: ["github>owner/policy"],}', encoding="utf-8")
+            successful = subprocess.CompletedProcess(["renovate"], 0, "\n".join(json.dumps(event) for event in events), "")
+            cache = subprocess.CompletedProcess(["git"], 0, str(root / ".git/ceratops/renovate-cache"), "")
+            with patch(module + ".shutil.which", return_value="npm"), patch(module + ".subprocess.run", side_effect=[cache, successful] * 2) as command:
+                first = read_renovate_configuration(root)
+                second = read_renovate_configuration(root)
+            self.assertEqual(first, second)
+            self.assertEqual(first["status"], "ok")
+            self.assertEqual(first["declarations"]["renovate.json5"], declaration)
+            self.assertEqual(first["effective_settings"]["baseBranchPatterns"], ["release/local"])
+            self.assertEqual(first["dependency_files"], ["scripts/package.json"])
+            self.assertEqual(first["dependencies"][0]["depName"], "node")
+            self.assertNotIn("not-returned", json.dumps(first))
+            self.assertIn("--platform=local", command.call_args.args[0])
+            self.assertIn("--dry-run=extract", command.call_args.args[0])
+            self.assertIn("--allow-scripts=false", command.call_args.args[0])
+            self.assertEqual(command.call_args.kwargs["env"]["RENOVATE_BINARY_SOURCE"], "global")
+            self.assertEqual(config.read_text(), '// JSON5 belongs to Renovate\n{extends: ["github>owner/policy"],}')
+            global_config = root / ".git/ceratops/renovate-cache/global-config.json"
+            for boundary in ("before_replace", "after_replace"):
+                global_config.unlink(missing_ok=True)
+                target = module + ".os.replace" if boundary == "before_replace" else "filelock.FileLock.__exit__"
+                with patch(module + ".shutil.which", return_value="npm"), patch(module + ".subprocess.run", side_effect=[cache]), patch(target, side_effect=OSError("interrupted config publication")):
+                    interrupted = read_renovate_configuration(root)
+                self.assertEqual(interrupted["status"], "blocked")
+                self.assertIn("interrupted config publication", str(interrupted["errors"]))
+                self.assertEqual(global_config.exists(), boundary == "after_replace")
+                self.assertFalse(global_config.with_name(".global-config.tmp").exists())
+                with patch(module + ".shutil.which", return_value="npm"), patch(module + ".subprocess.run", side_effect=[cache, successful]):
+                    self.assertEqual(read_renovate_configuration(root)["status"], "ok")
+            for problem in (OSError("git could not start"), subprocess.TimeoutExpired(["git"], 30, stderr="timed out")):
+                with patch(module + ".shutil.which", return_value="npm"), patch(module + ".subprocess.run", side_effect=problem):
+                    failed_cache = read_renovate_configuration(root)
+                self.assertEqual(failed_cache["status"], "blocked")
+                self.assertTrue(failed_cache["command_failure"]["command"])
+            failures = [
+                subprocess.CompletedProcess(["renovate"], 1, "preset cannot load", "native failure"),
+                subprocess.CompletedProcess(["renovate"], 0, "{}", ""),
+                subprocess.CompletedProcess(["renovate"], 0, successful.stdout + '\n' + json.dumps({"level": 50, "msg": "extraction failed"}), ""),
+                subprocess.TimeoutExpired(["renovate"], 180, output="partial output", stderr="lookup failed"),
+            ]
+            for failure in failures:
+                with self.subTest(failure=type(failure).__name__), patch(module + ".shutil.which", return_value="npm"), patch(module + ".subprocess.run", side_effect=[cache, failure, cache, successful]):
+                    failed = read_renovate_configuration(root, lookup=True)
+                    self.assertEqual(failed["status"], "blocked")
+                    self.assertTrue(failed["errors"])
+                    self.assertIn("--dry-run=lookup", failed["command_failure"]["command"])
+                    self.assertIn("stderr", failed["command_failure"])
+                    self.assertEqual(read_renovate_configuration(root)["status"], "ok")
+            with patch(module + ".read_renovate_configuration", return_value=first):
+                local = self.facts({"renovate.json5": config.read_text(), "requirements.txt": "pytest"}, [])
+            self.assertEqual(local["renovate"], first)
+            observed = collect_repository({}, {"owner": "example", "repo": "demo", "default_branch": "main"}, local, [])
+            self.assertEqual(observed["content"]["dependency_updates"]["renovate"], first)
+
+        owned = {**first, "config_paths": ["renovate.json"], "declarations": {"renovate.json": {
+            "includePaths": ["scripts/**"], "forkProcessing": "enabled",
+        }}}
+        local_scope = {"files": ["scripts/package.json", "upstream/package.json", "native/conanfile.py"],
+                       "renovate": owned, "dependabot": {"ecosystems": {"npm": ["scripts/package.json", "upstream/package.json"]}}}
+        scoped = collect_dependency_coverage(local_scope, is_fork=True)
+        self.assertEqual(scoped["owned_files"], ["scripts/package.json"])
+        self.assertTrue(scoped["ownership_known"])
+        self.assertEqual(scoped["uncovered_dependency_sources"], [])
+        self.assertEqual(scoped["policy_errors"], [])
+        for scope in [[], "scripts/**", ["!upstream/**"], ["../outside"]]:
+            broken = {**owned, "declarations": {"renovate.json": {"forkProcessing": "enabled", "includePaths": scope}}}
+            scoped = collect_dependency_coverage({**local_scope, "renovate": broken}, is_fork=True)
+            self.assertFalse(scoped["ownership_known"])
+            self.assertTrue(scoped["policy_errors"])
+        manual = collect_dependency_coverage({"files": ["native/conanfile.py"], "renovate": {"status": "not_configured"}})
+        self.assertEqual(manual["uncovered_dependency_sources"], ["native/conanfile.py"])
+        config_only = collect_dependency_coverage({"files": ["default.json"], "renovate": {"status": "not_configured"}})
+        self.assertEqual(config_only["config_errors"], [])
+        self.assertEqual(config_only["policy_errors"], [])
+
+        # Explicit integration run exercises Renovate's real JSON5 and built-in
+        # preset support. Routine runs retain deterministic fault cases above.
+        if os.environ.get("CERATOPS_RUN_NATIVE_RENOVATE") == "1":
+            with tempfile.TemporaryDirectory() as temporary:
+                native = pathlib.Path(temporary)
+                subprocess.run(["git", "init", "--quiet", str(native)], check=True)
+                config = native / "renovate.json5"
+                config.write_text('{extends: ["config:recommended"], enabledManagers: ["npm"],}', encoding="utf-8")
+                (native / "package.json").write_text(json.dumps({"name": "native-reader-test", "private": True, "engines": {"node": ">=24 <25"}, "dependencies": {"is-number": "7.0.0"}}), encoding="utf-8")
+                subprocess.run(["git", "add", "package.json", "renovate.json5"], cwd=native, check=True)
+                for _ in range(2):
+                    actual = read_renovate_configuration(native)
+                    self.assertEqual(actual["status"], "ok", actual["errors"])
+                    self.assertEqual(actual["dependency_files"], ["package.json"], actual)
+                    self.assertTrue(any(dep["depName"] == "node" for dep in actual["dependencies"]))
+                config.write_text('{extends: ["not-a-real-preset-for-this-test"],}', encoding="utf-8")
+                failed = read_renovate_configuration(native)
+                self.assertEqual(failed["status"], "blocked")
+                self.assertTrue(failed["errors"])
 
         version_entry = self.entry("pip", directory="/")
         security_entry = {**version_entry, "open-pull-requests-limit": 0}

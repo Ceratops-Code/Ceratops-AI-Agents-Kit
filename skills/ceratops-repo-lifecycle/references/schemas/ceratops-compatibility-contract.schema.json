@@ -19,7 +19,8 @@
     "configuration_layout",
     "python_test_detection",
     "dependency_updates",
-    "ci_dependency_updates"
+    "ci_dependency_updates",
+    "dependency_maintenance"
   ],
   "properties": {
     "contract_format_version": {
@@ -288,6 +289,54 @@
         }
       },
       "description": "Executable: generator and checker require GitHub Actions dependency maintenance, preserving target schedules."
+    },
+    "dependency_maintenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "renovate_version",
+        "renovate_expected_settings",
+        "compatible_update_groups",
+        "require_explicit_fork_scope",
+        "renovate_preset_repository"
+      ],
+      "description": "Executable: native configuration reader, dependency setup and repository health share these defaults. Live job outcomes belong to dependency maintenance.",
+      "properties": {
+        "renovate_version": {
+          "type": "string",
+          "pattern": "^\\d+\\.\\d+\\.\\d+$"
+        },
+        "renovate_expected_settings": {
+          "const": {
+            "baseBranchPatterns": [
+              "release/local"
+            ],
+            "vulnerabilityAlerts": {
+              "enabled": false
+            },
+            "osvVulnerabilityAlerts": false,
+            "dependencyDashboard": true
+          }
+        },
+        "compatible_update_groups": {
+          "const": {
+            "compatible-updates": {
+              "update-types": [
+                "minor",
+                "patch"
+              ]
+            }
+          }
+        },
+        "require_explicit_fork_scope": {
+          "const": true
+        },
+        "renovate_preset_repository": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.-]+$"
+        }
+      }
     }
   },
   "$defs": {

@@ -152,7 +152,7 @@ def test_dependency_rebase_wait_batches_and_reuses_commit_comparisons(
     monkeypatch.setattr(queue.time, "sleep", lambda seconds: now.__setitem__(0, now[0] + seconds))
     monkeypatch.setattr(queue, "branch_freshness", compare)
     monkeypatch.setattr(queue, "fetch_pr_batch", refresh)
-    result, blockers = queue.wait_for_dependabot_rebases(
+    result, blockers = queue.wait_for_dependency_rebases(
         details, wait_seconds=30, interval_seconds=15
     )
     assert now[0] <= 30
@@ -182,7 +182,7 @@ def test_dependency_rebase_wait_skips_sleep_for_current_or_failed_evidence(
             queue, "branch_freshness",
             lambda *_, status=status, **kwargs: {"status": status, "message": "comparison unavailable"},
         )
-        _, blockers = queue.wait_for_dependabot_rebases({
+        _, blockers = queue.wait_for_dependency_rebases({
             ("owner/repo", 1): {"state": "OPEN", "author": "dependabot[bot]"},
         })
         assert bool(blockers) == (status == "failed")
@@ -1085,7 +1085,7 @@ def test_dependency_automation_public_entrypoint_keeps_scope_options_and_reports
     if phase == "finalize":
         options += ["--approved-pr", "https://github.com/scope-owner/repo/pull/1", "--admin", "--wait-seconds", "7"]
     elif custom:
-        options.append("--retarget-dependabot-prs")
+        options.append("--retarget-dependency-prs")
     def handler(args: argparse.Namespace) -> int:
         assert args.org == "scope-owner" and args.output == selected
         assert args.snapshot_helper == root / "dependabot-repository-queue-snapshot.py"
@@ -1096,7 +1096,7 @@ def test_dependency_automation_public_entrypoint_keeps_scope_options_and_reports
             assert args.sync_helper == root / "sync-local-repo-checkouts.py"
         else:
             assert not final.exists()
-            assert args.retarget_dependabot_prs
+            assert args.retarget_dependency_prs
         selected.write_text(json.dumps(report(phase)))
         return 0
     monkeypatch.setattr(queue, "prepare_dependency_review" if phase == "review" else phase, handler)

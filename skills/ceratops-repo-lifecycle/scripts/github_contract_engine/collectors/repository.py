@@ -13,7 +13,7 @@ from urllib.parse import quote
 import yaml
 
 from ..github_api import ApiResult, run_gh_api, run_json_command, substitute
-from .local_repository import classify_repository, dependabot_coverage
+from .local_repository import classify_repository, collect_dependency_coverage
 
 COLLECTION_KEYS = {
     "report_open_prs_older_than_days",
@@ -1097,8 +1097,8 @@ def collect_repository(
             "codeowners_errors": codeowners_errors,
             "dependabot_label_referenced": "dependencies" in dependabot_text,
             "dependabot_label_exists": dependency_label.ok,
-            "dependabot": dependabot_coverage(local, default_branch),
-            "renovate": local.get("renovate", {}),
+            "dependency_updates": {key: value for key, value in collect_dependency_coverage(local, default_branch, is_fork=repo.get("fork") is True).items()
+                                   if key not in {"owned_files", "outside_owned_scope"}},
             "workflow_write_all": local.get("workflows", {}).get(
                 "permissions_write_all", []
             ),

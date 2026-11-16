@@ -129,6 +129,7 @@ CONDITION_STATE_PATTERNS = (
     "repo.visibility",
     "repository.codeowners_present",
     "repository.content.dependabot_label_referenced",
+    "repository.content.dependency_updates.requires_dependabot",
     "repository.private_fork_enabled",
     "repository.pages.build_type",
     "repository.release_branch.deletion_restricted",

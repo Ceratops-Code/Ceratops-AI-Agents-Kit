@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tomllib
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 import yaml
@@ -23,7 +24,7 @@ from tests.support.processes import (
     COMPATIBILITY_ENGINE,
     run_compatibility_engine,
 )
-from tests.support.repositories import run_repository_ci_checks
+from tests.support.repositories import prepare_linked_worktree, run_repository_ci_checks
 
 
 @pytest.mark.parametrize("scenario,passes", [
@@ -122,7 +123,7 @@ def test_android_coverage_requires_declared_gradle_checks_in_any_group(
 ) -> None:
     repo = tmp_path / "android-compatible"
     repo.mkdir()
-    (repo / ".git").write_text("gitdir: test\n", encoding="utf-8", newline="\n")
+    prepare_linked_worktree(repo)
     (repo / "README.md").write_text(
         "# Android compatible\n", encoding="utf-8", newline="\n"
     )
@@ -221,7 +222,7 @@ def test_ecosystem_coverage_requires_declared_repository_checks(
 ) -> None:
     repo = tmp_path / f"{coverage_id}-compatible"
     repo.mkdir()
-    (repo / ".git").write_text("gitdir: test\n", encoding="utf-8", newline="\n")
+    prepare_linked_worktree(repo)
     (repo / "README.md").write_text(
         f"# {coverage_id} compatible\n", encoding="utf-8", newline="\n"
     )
@@ -348,7 +349,7 @@ def test_shell_compatibility_declares_its_generated_check_and_repeats(tmp_path: 
     """A fresh shell repository gets a runnable command and matching SDLC setup."""
     repo = tmp_path / "shell-repo"
     repo.mkdir()
-    (repo / ".git").write_text("gitdir: test\n", encoding="utf-8")
+    prepare_linked_worktree(repo)
     (repo / "README.md").write_text("# Shell repository\n", encoding="utf-8")
     (repo / "build.sh").write_text("#!/bin/sh\necho OK\n", encoding="utf-8")
     for _ in range(2):
@@ -366,6 +367,21 @@ def test_shell_compatibility_declares_its_generated_check_and_repeats(tmp_path: 
         shell = next(item for item in generator.contract_checks(repo) if item["id"] == "shellcheck")
         assert check["steps"][0]["run"] == shell["command"] == ["shellcheck", "--severity=error", "--", "build.sh"]
         assert check["check-results"]["result-owner"] == "operation"
+    workflow = repo / ".github/workflows/validate.yml"
+    current = workflow.read_text()
+    version = generator.load_compatibility_contract()["dependency_maintenance"]["renovate_version"]
+    # Setup refreshes native CI checks even when the repository changes other
+    # steps outside the generated command block.
+    custom = "      - name: Repository custom check\n        run: echo custom\n"
+    workflow.write_text(current.replace("renovate@" + version, "renovate@1.0.0") + custom)
+    for _ in range(2):
+        result = run_compatibility_engine(REPOSITORY_LIFECYCLE_SCRIPTS, "apply", "--target-repo-root", str(repo))
+        assert result.returncode == 0, result.stdout + result.stderr
+        updated = workflow.read_text()
+        steps = yaml.safe_load(updated)["jobs"]["repository-checks"]["steps"]
+        native = [step for step in steps if step.get("name") == "Check Renovate configuration"]
+        assert len(native) == 1 and "renovate@" + version in native[0]["run"]
+        assert updated.endswith(custom)
 
 
 def test_language_checks_respect_git_vendor_and_generated_attributes(tmp_path: pathlib.Path) -> None:
@@ -579,7 +595,7 @@ def test_ruff_template_appends_missing_tool_without_changing_crlf_bytes(tmp_path
 
 @pytest.mark.parametrize("newline", ["\n", "\r\n"])
 def test_tooling_plan_preserves_existing_project_bytes(
-    tmp_path: pathlib.Path, newline: str,
+    tmp_path: pathlib.Path, newline: str, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repo = tmp_path / "repo"
     (repo / "scripts").mkdir(parents=True)
@@ -600,6 +616,41 @@ def test_tooling_plan_preserves_existing_project_bytes(
         planned = environment.runtime_files(repo, REPOSITORY_LIFECYCLE_SOURCE, contract, [custom_check])
         assert project not in planned
         assert project.read_bytes() == original
+    (repo / "packages/app").mkdir(parents=True)
+    (repo / "packages/app/Cargo.toml").write_text('[package]\nname="app"\nversion="1.0.0"', encoding="utf-8")
+    (repo / "scripts/.nvmrc").write_text("lts/*", encoding="utf-8")
+    generated = environment.runtime_files(repo, REPOSITORY_LIFECYCLE_SOURCE, contract, [custom_check], source_id="owner/repo")
+    updates = yaml.safe_load(generated[repo / ".github/dependabot.yml"])["updates"]
+    cargo = next(item for item in updates if item["package-ecosystem"] == "cargo")
+    assert cargo["directory"] == "/packages/app"
+    assert cargo["target-branch"] == "release/local"
+    assert cargo["groups"] == contract["dependency_maintenance"]["compatible_update_groups"]
+    assert json.loads(generated[repo / "renovate.json"])["extends"] == ["github>owner/renovate-config"]
+    assert not (repo / "renovate.json").exists()
+    assert project.read_bytes() == original
+    collector = importlib.import_module("github_contract_engine.collectors.local_repository")
+    native = Mock(return_value={"status": "ok", "config_paths": ["renovate.json"],
+        "errors": [], "declarations": {"renovate.json": {
+            "forkProcessing": "enabled", "includePaths": ["scripts/**"],
+        }}})
+    monkeypatch.setattr(collector, "read_renovate_configuration", native)
+    scoped = environment.runtime_files(repo, REPOSITORY_LIFECYCLE_SOURCE, contract, [custom_check])
+    updates = yaml.safe_load(scoped[repo / ".github/dependabot.yml"])["updates"]
+    assert updates and all(item["directory"] == "/scripts" for item in updates)
+    (repo / ".github/workflows").mkdir(parents=True)
+    (repo / ".github/workflows/owned.yml").write_text("jobs: {}")
+    (repo / ".github/workflows/upstream.yml").write_text("jobs: {}")
+    for scope, message in [
+        ([".github/workflows/owned.yml"], "individual owned workflows"),
+        (["../outside"], "unknown ownership"),
+        ([], "unknown ownership"),
+    ]:
+        native.return_value["declarations"]["renovate.json"]["includePaths"] = scope
+        for _ in range(2):
+            with pytest.raises(RuntimeError, match=message):
+                environment.runtime_files(repo, REPOSITORY_LIFECYCLE_SOURCE, contract, [custom_check])
+        assert project.read_bytes() == original
+        assert not (repo / ".github/dependabot.yml").exists()
 
 
 def _write_tooling_settings(repo: pathlib.Path, settings: str) -> None:
@@ -613,7 +664,7 @@ def _write_tooling_settings(repo: pathlib.Path, settings: str) -> None:
 def test_compatibility_repeatedly_rejects_weak_ruff_and_restores_original_files(tmp_path: pathlib.Path) -> None:
     repo = tmp_path / "weak-policy"
     repo.mkdir()
-    (repo / ".git").write_text("gitdir: test\n", encoding="utf-8")
+    prepare_linked_worktree(repo)
     (repo / "README.md").write_text("# Policy fixture\n", encoding="utf-8")
     _write_tooling_settings(repo, '[tool.ruff]\ntarget-version = "py314"\n[tool.ruff.lint]\nselect = ["F"]\n')
     before = {path.relative_to(repo): path.read_bytes() for path in repo.rglob("*") if path.is_file()}
@@ -645,9 +696,7 @@ def test_compatibility_materializer_supports_repositories_without_skills(
     engine_scripts = lifecycle_bundle / "scripts"
     repo = tmp_path / "empty-compatible"
     repo.mkdir()
-    (repo / ".git").write_text(
-        "gitdir: test\n", encoding="utf-8", newline="\n"
-    )
+    prepare_linked_worktree(repo)
     (repo / "README.md").write_text(
         "# Empty Compatible Repository\n\n"
         "## Skills\n\n"
@@ -758,7 +807,7 @@ def test_compatibility_materializer_supports_repositories_without_skills(
     def empty_repository(name: str) -> pathlib.Path:
         target = tmp_path / name
         target.mkdir()
-        (target / ".git").write_text("gitdir: test\n", encoding="utf-8", newline="\n")
+        prepare_linked_worktree(target)
         (target / "README.md").write_text(
             f"# {name}\n\n## Skills\n\n| Skill | Purpose |\n| --- | --- |\n",
             encoding="utf-8",
@@ -1300,7 +1349,7 @@ def test_generated_scripts_and_skill_owned_ci_keep_environments_and_tests_separa
     # Root settings must block setup instead of being silently shadowed.
     root_configured = tmp_path / "root-configured"
     root_configured.mkdir()
-    (root_configured / ".git").write_text("gitdir: test\n")
+    prepare_linked_worktree(root_configured)
     (root_configured / "pyproject.toml").write_text(
         _ruff_root_configuration()
         + '[tool.mypy]\nfiles=["scripts/check_probe.py"]\ndisable_error_code=["return-value"]\n'
@@ -1335,7 +1384,7 @@ def test_configuration_policy_reports_paths_and_blocks_setup_without_writes(
 ) -> None:
     repo = tmp_path / "layout-policy"
     repo.mkdir()
-    (repo / ".git").write_text("gitdir: test\n")
+    prepare_linked_worktree(repo)
     path = repo / relative
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(contents, encoding="utf-8")

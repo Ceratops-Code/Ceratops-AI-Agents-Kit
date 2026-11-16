@@ -663,6 +663,7 @@ def plan_ceratops_compatibility(
         planned_files=markdown_files,
         has_python_skills=bool(python_skills),
         generate_python_test_runner=test_script is not None,
+        source_id=source_id,
     )
     markdown_files.pop(".gitignore", None)
     require_skill_runtime_project(

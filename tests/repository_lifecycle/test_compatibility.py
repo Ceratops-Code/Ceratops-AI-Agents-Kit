@@ -35,6 +35,7 @@ from tests.support.processes import (
 from tests.support.repositories import (
     ROOT,
     create_compatible_repo,
+    prepare_linked_worktree,
     run_git,
 )
 
@@ -269,7 +270,7 @@ def test_compatibility_materializer_supplies_target_identity_and_assignments(
             "actions": {"pre-build-checks": {"check-groups": {'source': {"requires": {"tools": []}, "no-op": "Covered by repository source checks."}}}, "install": {"requires": {"tools": []}, "steps": [{"run": [sys.executable, "-V"]}]}, "publish": {"requires": {"tools": []}, "steps": [{"run": [sys.executable, "-V"]}]}},
         }}},
     )
-    (repo / ".git").write_text("gitdir: test\n", encoding="utf-8", newline="\n")
+    prepare_linked_worktree(repo)
     (repo / "skills" / "sections" / "core.md").unlink()
     (repo / "skills" / "skill-sections.json").unlink()
     alpha_scripts = repo / "skills" / "alpha-tool" / "scripts"
@@ -532,7 +533,7 @@ def test_compatibility_materializer_supplies_target_identity_and_assignments(
     contract_path.write_text(json.dumps(defaults), encoding="utf-8")
     alternate = tmp_path / "alternate-target"
     create_compatible_repo(alternate, "target/alternate", ["alpha-tool"])
-    (alternate / ".git").write_text("gitdir: test\n", encoding="utf-8")
+    prepare_linked_worktree(alternate)
     (alternate / "scripts/deploy-skills.py").unlink()
     # Keep target-owned operation preservation separate from generated defaults.
     (alternate / ".ceratops/sdlc/sdlc.yml").unlink()
@@ -555,7 +556,7 @@ def test_compatibility_materializer_preserves_existing_bundle_contract(
     repo = tmp_path / "compatible-v5"
     create_compatible_repo(repo, "v5/source", ["alpha-tool"])
     _write_current_sdlc(repo)
-    (repo / ".git").write_text("gitdir: test\n", encoding="utf-8", newline="\n")
+    prepare_linked_worktree(repo)
     prepared = run_compatibility_engine(
         REPOSITORY_LIFECYCLE_SCRIPTS,
         "apply",
@@ -636,7 +637,7 @@ def test_compatibility_routes_existing_dependabot_version_updates(
     repo = tmp_path / "dependabot-migration"
     create_compatible_repo(repo, "example/dependabot-migration", ["alpha-tool"])
     _write_current_sdlc(repo)
-    (repo / ".git").write_text("gitdir: test\n", encoding="utf-8")
+    prepare_linked_worktree(repo)
     path = repo / ".github" / "dependabot.yml"
     path.parent.mkdir(exist_ok=True)
     legacy_version = {
@@ -689,7 +690,7 @@ def test_non_python_skill_needs_no_shared_skill_runtime(
     repo = tmp_path / "non-python"
     create_compatible_repo(repo, "example/non-python", ["alpha-tool"])
     _write_current_sdlc(repo)
-    (repo / ".git").write_text("gitdir: test\n", encoding="utf-8")
+    prepare_linked_worktree(repo)
 
     result = run_compatibility_engine(
         REPOSITORY_LIFECYCLE_SCRIPTS,
@@ -731,7 +732,7 @@ def test_explicit_app_test_ownership_does_not_generate_python_test_runner(
 ) -> None:
     repo = tmp_path / "app-repository"
     repo.mkdir()
-    (repo / ".git").write_text("gitdir: test\n", encoding="utf-8", newline="\n")
+    prepare_linked_worktree(repo)
     (repo / "README.md").write_text(
         "# App Repository\n", encoding="utf-8", newline="\n"
     )
@@ -852,7 +853,7 @@ def test_compatibility_materializer_preserves_existing_check_and_ci(
     repo = tmp_path / "compatible"
     create_compatible_repo(repo, "preserved/source", ["alpha-tool"])
     _write_current_sdlc(repo)
-    (repo / ".git").write_text("gitdir: test\n", encoding="utf-8", newline="\n")
+    prepare_linked_worktree(repo)
     validator = repo / "scripts" / "check-custom.py"
     validator.write_text(
         "#!/usr/bin/env python3\nprint('target-owned')\n",
@@ -921,7 +922,7 @@ def test_compatibility_materializer_preserves_existing_identity_and_custom_secti
     repo = tmp_path / "compatible"
     create_compatible_repo(repo, "preserved/source", ["alpha-tool"])
     _write_current_sdlc(repo)
-    (repo / ".git").write_text("gitdir: test\n", encoding="utf-8", newline="\n")
+    prepare_linked_worktree(repo)
     markdown_config = repo / configuration
     configuration_bytes = {
         "scripts/.markdownlint.jsonc": b'{"MD013": false}\r\n',
@@ -1020,7 +1021,7 @@ def test_compatibility_materializer_rolls_back_every_target_write_on_blocker(
     repo = tmp_path / "compatible"
     create_compatible_repo(repo, "preserved/source", ["alpha-tool"])
     _write_current_sdlc(repo)
-    (repo / ".git").write_text("gitdir: test\n", encoding="utf-8", newline="\n")
+    prepare_linked_worktree(repo)
     ignore = repo / ".gitignore"
     if existing_ignore:
         ignore.write_bytes(b"build/\r\n")
@@ -1075,7 +1076,7 @@ def test_compatibility_materializer_blocks_invalid_assignments_before_writes(
     repo = tmp_path / "compatible"
     create_compatible_repo(repo, "preserved/source", ["alpha-tool"])
     _write_current_sdlc(repo)
-    (repo / ".git").write_text("gitdir: test\n", encoding="utf-8", newline="\n")
+    prepare_linked_worktree(repo)
     manifest_path = repo / "skills" / "skill-sections.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["skills"]["alpha-tool"].append("missing-section")
@@ -1170,7 +1171,7 @@ def test_compatibility_materializes_action_assignments(tmp_path: pathlib.Path, i
     repo = tmp_path / "compatible"
     create_compatible_repo(repo, "example/actions", ["alpha-tool"])
     _write_current_sdlc(repo)
-    (repo / ".git").write_text("gitdir: test\n", encoding="utf-8")
+    prepare_linked_worktree(repo)
     manifest = add_action_sections(repo)
     if invalid:
         manifest["actions"]["alpha-tool"]["references/notes.md"] = ["review-policy"]

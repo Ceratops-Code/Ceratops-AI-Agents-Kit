@@ -86,6 +86,7 @@
             "type.path_signals",
             "content.required_files_presence",
             "security.dependabot_config_file",
+            "security.dependency_maintenance_policy",
             "stale_state.local_path_references"
           ]
         },
@@ -114,6 +115,7 @@
         "type.path_signals",
         "actions.workflow_sha_pinning",
         "security.dependabot_config_file",
+        "security.dependency_maintenance_policy",
         "content.required_files_presence",
         "content.sdlc_contract_schema",
         "content.ceratops_compatibility",
@@ -167,50 +169,61 @@
     {
       "id": "security.dependabot_config_file",
       "kind": "tree_scan",
-      "applies_when": "repo.archived == false && repo.fork == false && package_manifests_present == true",
+      "applies_when": "repo.archived == false && repository.content.dependency_updates.requires_dependabot == true",
       "assertions": [
         {
-          "path": "/repository/content/dependabot/config_present",
+          "path": "/repository/content/dependency_updates/config_present",
           "operator": "equal",
           "expected": true
         },
         {
-          "path": "/repository/content/dependabot/text_available",
+          "path": "/repository/content/dependency_updates/text_available",
           "operator": "equal",
           "expected": true
         },
         {
-          "path": "/repository/content/dependabot/missing_ecosystems",
+          "path": "/repository/content/dependency_updates/missing_ecosystems",
           "operator": "empty",
           "level": "WARN"
         },
         {
-          "path": "/repository/content/dependabot/missing_manifest_directories",
+          "path": "/repository/content/dependency_updates/missing_manifest_directories",
           "operator": "empty",
           "level": "WARN"
         },
         {
-          "path": "/repository/content/dependabot/unmatched_configured_directories",
+          "path": "/repository/content/dependency_updates/unmatched_configured_directories",
           "operator": "empty",
           "level": "WARN"
         },
         {
-          "path": "/repository/content/dependabot/config_errors",
+          "path": "/repository/content/dependency_updates/config_errors",
           "operator": "empty"
         },
         {
-          "path": "/repository/content/dependabot/version_update_target_errors",
+          "path": "/repository/content/dependency_updates/version_update_target_errors",
           "operator": "empty"
         },
         {
-          "path": "/repository/content/dependabot/updates_present",
+          "path": "/repository/content/dependency_updates/updates_present",
           "operator": "equal",
           "expected": true
         },
         {
-          "path": "/repository/content/dependabot/schedule_present",
+          "path": "/repository/content/dependency_updates/schedule_present",
           "operator": "equal",
           "expected": true
+        }
+      ]
+    },
+    {
+      "id": "security.dependency_maintenance_policy",
+      "kind": "local_contract",
+      "applies_when": "repo.archived == false && local_repo_path is provided",
+      "assertions": [
+        {
+          "path": "/repository/content/dependency_updates/policy_errors",
+          "operator": "empty"
         }
       ]
     },

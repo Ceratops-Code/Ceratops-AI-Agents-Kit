@@ -205,5 +205,28 @@
     "schedule": {
       "interval": "weekly"
     }
+  },
+  "dependency_maintenance": {
+    "renovate_version": "44.240.0",
+    "renovate_expected_settings": {
+      "baseBranchPatterns": [
+        "release/local"
+      ],
+      "vulnerabilityAlerts": {
+        "enabled": false
+      },
+      "osvVulnerabilityAlerts": false,
+      "dependencyDashboard": true
+    },
+    "compatible_update_groups": {
+      "compatible-updates": {
+        "update-types": [
+          "minor",
+          "patch"
+        ]
+      }
+    },
+    "require_explicit_fork_scope": true,
+    "renovate_preset_repository": "renovate-config"
   }
 }

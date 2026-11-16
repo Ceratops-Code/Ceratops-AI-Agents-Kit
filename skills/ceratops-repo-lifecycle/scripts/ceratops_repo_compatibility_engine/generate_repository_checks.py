@@ -6,7 +6,6 @@ vendored/generated files are identified by Git attributes, never directory names
 """
 
 # Malformed target contracts are reported as RuntimeError to the transaction.
-# ruff: noqa: TRY004
 from __future__ import annotations
 
 import json
@@ -561,6 +560,7 @@ def repository_workflow(
         ])
     runner = "windows-latest" if "{pwsh}" in commands else "ubuntu-latest"
     template = template_path("workflow").read_text(encoding="utf-8")
+    template = template.replace("__RENOVATE_VERSION__", load_compatibility_contract()["dependency_maintenance"]["renovate_version"])
     markers = ("__RUNNER__", "      # __SETUP_STEPS__", "      # __CHECK_STEPS__")
     if any(template.count(marker) != 1 for marker in markers):
         raise RuntimeError("CI workflow template markers are invalid")
@@ -580,6 +580,30 @@ def repository_workflow(
         raise RuntimeError("Generated repository step markers are out of order")
     generated_steps = rendered.split(begin + "\n", 1)[1].split(end + "\n", 1)[0]
     updated = previous[:start] + generated_steps.replace("\n", newline) + previous[stop:]
+    # These two named steps are owned by setup as well as the marked command
+    # block. Refresh them in place, keeping unrelated workflow text and comments.
+    # Missing steps are inserted immediately after the managed command block.
+    rendered_lines = rendered.splitlines(keepends=True)
+    for name in reversed(("Set up Node.js for Renovate configuration checks", "Check Renovate configuration")):
+        header = "      - name: " + name
+        source_start = next(index for index, line in enumerate(rendered_lines) if line.rstrip() == header)
+        source_end = next((index for index in range(source_start + 1, len(rendered_lines))
+                           if rendered_lines[index].startswith("      - ")
+                           or (rendered_lines[index].strip() and len(rendered_lines[index]) - len(rendered_lines[index].lstrip()) < 6)), len(rendered_lines))
+        block = "".join(rendered_lines[source_start:source_end]).replace("\n", newline)
+        lines = updated.splitlines(keepends=True)
+        locations = [index for index, line in enumerate(lines) if line.rstrip() == header]
+        if len(locations) > 1:
+            raise RuntimeError(f"Generated CI step is duplicated: {name}")
+        if locations:
+            target_start = locations[0]
+            target_end = next((index for index in range(target_start + 1, len(lines))
+                               if lines[index].startswith("      - ")
+                               or (lines[index].strip() and len(lines[index]) - len(lines[index].lstrip()) < 6)), len(lines))
+            updated = "".join(lines[:target_start]) + block + "".join(lines[target_end:])
+        else:
+            position = updated.index(end + newline) + len(end + newline)
+            updated = updated[:position] + newline + block + updated[position:]
     return updated if updated != previous else None
 
 

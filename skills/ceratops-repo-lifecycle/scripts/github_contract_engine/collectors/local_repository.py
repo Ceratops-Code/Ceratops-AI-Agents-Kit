@@ -9,12 +9,16 @@ import pathlib
 import posixpath
 import re
 import shlex
+import shutil
 import subprocess
 import tomllib
 import xml.etree.ElementTree as ET
 from typing import Any
 
 import yaml
+from ceratops_repo_compatibility_engine.compatibility_contract import (
+    load_compatibility_contract,
+)
 from ceratops_repo_compatibility_engine.sdlc_contract_validation import (
     read_contract,
 )
@@ -353,19 +357,67 @@ def _dependabot_project_links(
     return links
 
 
-def dependabot_coverage(
-    local: dict[str, Any], default_branch: str = ""
+def collect_dependency_coverage(
+    local: dict[str, Any], default_branch: str = "", *, is_fork: bool = False,
 ) -> dict[str, Any]:
-    """Validate parsed update entries against detected manifest directories.
+    """Report each bot's settings and the dependency files covered by its role.
 
     GitHub's singular directory is literal; directories may contain globs.
     Matching uses POSIX case-sensitive paths even when this collector runs on
     Windows. No network, package installation, or project execution occurs.
     """
+    policy = load_compatibility_contract()["dependency_maintenance"]
+    renovate = local.get("renovate", {})
+    effective = renovate.get("effective_settings", {})
+    policy_errors = list(renovate.get("errors", []))
+    declaration = renovate.get("declarations", {}).get("renovate.json", {})
+    scope = declaration.get("includePaths", [])
+    scope_valid = True
+    if scope and (not isinstance(scope, list) or any(
+        not isinstance(item, str) or not item or item.startswith(("!", "/"))
+        or ".." in item.split("/") or any(char in item for char in "{}\\") for item in scope
+    )):
+        policy_errors.append("Root renovate.json includePaths must use positive repository-relative paths or glob patterns")
+        scope = []
+        scope_valid = False
+    if is_fork and policy["require_explicit_fork_scope"]:
+        if declaration.get("forkProcessing") != "enabled" or not scope:
+            policy_errors.append("Maintained forks require root renovate.json with forkProcessing enabled and explicit owned includePaths")
+    files = local.get("files", [])
+    owned_files = [name for name in files if not scope and not is_fork or any(
+        pathlib.PurePosixPath(name).full_match(pattern, case_sensitive=True) for pattern in scope
+    )]
     metadata = local.get("dependabot", {})
-    ecosystems = metadata.get("ecosystems", {})
+    ecosystems = {name: [path for path in paths if path in owned_files]
+                  for name, paths in metadata.get("ecosystems", {}).items()}
+    ecosystems = {name: paths for name, paths in ecosystems.items() if paths}
+    if renovate.get("config_paths") and renovate.get("status") == "ok":
+        for key, expected in policy["renovate_expected_settings"].items():
+            actual = effective.get(key)
+            matches = (isinstance(actual, dict) and all(actual.get(k) == v for k, v in expected.items())
+                       if isinstance(expected, dict) else actual == expected)
+            if not matches:
+                policy_errors.append(f"Renovate {key} must be {json.dumps(expected)} after presets are applied")
+    # Files outside Dependabot's manifest vocabulary must be explicitly covered
+    # by Renovate extraction or remain visible as manual maintenance. This is
+    # source inventory, not a second dependency-version resolver.
+    other_sources = [name for name in owned_files if pathlib.PurePosixPath(name).name in {
+        ".nvmrc", ".node-version", ".python-version", ".tool-versions", "mise.toml", ".mise.toml",
+        "global.json", "rust-toolchain.toml", "rust-toolchain", "gradle-wrapper.properties",
+        "conanfile.py", "conanfile.txt", "vcpkg.json", "CMakePresets.json",
+    }]
+    missing_other_sources = sorted(set(other_sources) - set(renovate.get("dependency_files", [])))
+    if missing_other_sources:
+        policy_errors.append("Dependency sources without automated coverage: " + ", ".join(missing_other_sources))
     text = local.get("texts", {}).get(metadata.get("config_path"), "")
     result: dict[str, Any] = {
+        "renovate": renovate,
+        "policy_errors": policy_errors,
+        "owned_files": owned_files,
+        "ownership_known": scope_valid and renovate.get("status") not in {"blocked", "unavailable"} and (not is_fork or bool(scope) and declaration.get("forkProcessing") == "enabled"),
+        "outside_owned_scope": sorted(set(files) - set(owned_files)),
+        "uncovered_dependency_sources": missing_other_sources,
+        "requires_dependabot": bool(ecosystems),
         "config_present": bool(metadata.get("config_path")),
         "text_available": bool(text),
         "ecosystems": sorted(ecosystems),
@@ -378,6 +430,8 @@ def dependabot_coverage(
         "schedule_present": False,
     }
     errors = result["config_errors"]
+    if not ecosystems and not metadata.get("config_path"):
+        return result
     try:
         document = yaml.safe_load(text)
     except yaml.YAMLError:
@@ -417,8 +471,9 @@ def dependabot_coverage(
         limit = update.get("open-pull-requests-limit")
         security_only = type(limit) is int and limit == 0
         if not security_only and target != "release/local":
+            target_branch = load_compatibility_contract()["dependency_updates"]["target-branch"]
             result["version_update_target_errors"].append(
-                f"{label}.target-branch must be release/local for version updates"
+                f"{label}.target-branch must be {target_branch} for version updates"
             )
         if target not in (None, default_branch, "release/local"):
             continue
@@ -1301,6 +1356,169 @@ def _repository_validation_facts(
     }
 
 
+def read_renovate_configuration(
+    root: pathlib.Path, *, lookup: bool = False,
+) -> dict[str, Any]:
+    """Ask the pinned Renovate CLI for settings and dependency extraction.
+
+    This is a read-only local-platform run, never a hosted-job success signal.
+    Renovate owns JSON5 and preset merging. Repository/global JavaScript config
+    and dependency install scripts are disabled; npm retrieves pinned Renovate.
+    Renovate cannot install other tools. npm owns its package cache;
+    Renovate owns one disposable cache in this checkout's Git directory. No
+    result or job history is written there. Caller reports own returned evidence.
+    Only dependency maintenance requests lookup diagnostics; health uses extract.
+    """
+    root = root.resolve()
+    names = ("renovate.json", "renovate.jsonc", "renovate.json5", ".github/renovate.json", ".github/renovate.jsonc", ".github/renovate.json5",
+             ".renovaterc", ".renovaterc.json", ".renovaterc.jsonc", ".renovaterc.json5")
+    paths = [name for name in names if (root / name).is_file()]
+    result: dict[str, Any] = {
+        "config_paths": paths, "declarations": {}, "effective_settings": {},
+        "presets": [], "dependency_files": [], "dependencies": [], "errors": [],
+        "warnings": [], "status": "not_configured", "mode": "lookup" if lookup else "extract",
+    }
+    if not paths:
+        return result
+    from hold_write_lock import command_failure_details
+
+    result["status"] = "blocked"
+    if any((root / name).is_symlink() or not (root / name).resolve().is_relative_to(root) for name in paths):
+        result["errors"].append("Renovate configuration must be a regular file inside the checkout")
+        return result
+    policy = load_compatibility_contract()["dependency_maintenance"]
+    version = policy["renovate_version"]
+    result["tool_version"] = version
+    npm = shutil.which("npm.cmd" if os.name == "nt" else "npm")
+    if not npm:
+        result["errors"].append("npm is unavailable; Renovate settings and dependency coverage could not be read")
+        return result
+    # A fixed empty JSON global config avoids executing ambient config.js.
+    # All task-specific options are supplied through a clean environment. Paths
+    # use forward slashes because npm's Windows command wrapper handles argv.
+    cache_command = ["git", "rev-parse", "--path-format=absolute", "--git-path", "ceratops/renovate-cache"]
+    try:
+        cache_probe = subprocess.run(cache_command, cwd=root, capture_output=True, text=True,
+                                     encoding="utf-8", errors="replace", timeout=30, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        result["errors"].append("Cannot locate this checkout's Renovate cache")
+        result["command_failure"] = command_failure_details(exc, command=cache_command, target=root)
+        return result
+    if cache_probe.returncode:
+        result["errors"].append("Cannot locate this checkout's Renovate cache")
+        result["command_failure"] = command_failure_details(cache_probe, target=root)
+        return result
+    cache = pathlib.Path(cache_probe.stdout.strip())
+    global_config = cache / "global-config.json"
+    from filelock import FileLock
+    try:
+        cache.mkdir(parents=True, exist_ok=True)
+        # One immutable-content config and one native lock per checkout. A
+        # stopped initializer may leave only this exact temporary file; remove
+        # it under the same lock before the next atomic replacement.
+        with FileLock(str(cache / "configuration.lock"), timeout=30):
+            temporary = cache / ".global-config.tmp"
+            temporary.unlink(missing_ok=True)
+            if global_config.is_symlink():
+                raise OSError("Global Renovate configuration must not be a filesystem link")
+            if not global_config.is_file() or global_config.read_bytes() != b"{}\n":
+                try:
+                    temporary.write_bytes(b"{}\n")
+                    os.replace(temporary, global_config)
+                finally:
+                    temporary.unlink(missing_ok=True)
+    except OSError as exc:
+        result["errors"].append(f"Cannot prepare the empty Renovate global configuration: {exc}")
+        return result
+    environment = {key: value for key, value in os.environ.items()
+                   if not key.upper().startswith(("RENOVATE_", "LOG_"))}
+    # Credential variables are read by Renovate itself and never returned.
+    for name in ("RENOVATE_TOKEN", "RENOVATE_GITHUB_COM_TOKEN", "RENOVATE_HOST_RULES"):
+        if name in os.environ:
+            environment[name] = os.environ[name]
+    environment.update({
+        "LOG_FORMAT": "json", "LOG_LEVEL": "debug", "RENOVATE_PRINT_CONFIG": "true",
+        "RENOVATE_CONFIG_FILE": global_config.as_posix(),
+        "RENOVATE_BASE_DIR": cache.as_posix(), "RENOVATE_CACHE_DIR": (cache / "cache").as_posix(),
+        "RENOVATE_REPOSITORY_CACHE": "disabled", "RENOVATE_CACHE_HARD_TTL_MINUTES": "60",
+        "RENOVATE_USE_CLOUD_METADATA_SERVICES": "false", "RENOVATE_BINARY_SOURCE": "global",
+        "RENOVATE_PERSIST_REPO_DATA": "false", "RENOVATE_ALLOW_SCRIPTS": "false",
+        "RENOVATE_SKIP_INSTALLS": "true",
+    })
+    command = [npm, "exec", "--yes", f"--package=renovate@{version}", "--", "renovate",
+               "--platform=local", f"--dry-run={result['mode']}", "--allow-scripts=false",
+               "--skip-installs=true", "--onboarding=false", "--require-config=required"]
+    try:
+        completed = subprocess.run(command, cwd=root, env=environment, capture_output=True,
+                                   text=True, encoding="utf-8", errors="replace", timeout=180, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        result["errors"].append("Renovate could not finish reading this checkout")
+        result["command_failure"] = command_failure_details(exc, command=command, target=root)
+        return result
+    fields = {
+        "extends", "enabled", "enabledManagers", "includePaths", "ignorePaths", "packageRules",
+        "customManagers", "baseBranchPatterns", "baseBranches", "forkProcessing",
+        "vulnerabilityAlerts", "osvVulnerabilityAlerts", "dependencyDashboard",
+    }
+    settings_seen = extraction_seen = False
+    for line in completed.stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        message = str(event.get("msg", ""))
+        config = event.get("config")
+        if message == "Repository config" and isinstance(config, dict):
+            result["declarations"][str(event.get("fileName", paths[0]))] = {
+                name: config[name] for name in fields if name in config
+            }
+        if message == "Resolved shallow config, without merging internal presets":
+            result["presets"] = event.get("visitedPresets", [])
+        if message == "Full resolved config and hostRules including presets" and isinstance(config, dict):
+            settings_seen = True
+            result["effective_settings"] = {name: config[name] for name in fields if name in config}
+        package_files = event.get("packageFiles")
+        if isinstance(package_files, dict):
+            extraction_seen = True
+            for manager, files in package_files.items():
+                if not isinstance(files, list):
+                    continue
+                for package in files:
+                    if not isinstance(package, dict) or not isinstance(package.get("packageFile"), str):
+                        continue
+                    name = package["packageFile"]
+                    if name not in result["dependency_files"]:
+                        result["dependency_files"].append(name)
+                    for dep in package.get("deps", []):
+                        if not isinstance(dep, dict):
+                            continue
+                        record = {"manager": manager, "file": name,
+                                  **{key: dep[key] for key in (
+                                      "depName", "packageName", "depType", "currentValue", "datasource",
+                                      "skipReason", "warnings", "updates",
+                                  ) if key in dep}}
+                        if record not in result["dependencies"]:
+                            result["dependencies"].append(record)
+        if isinstance(event.get("level"), int) and event["level"] >= 40:
+            problem = {key: event[key] for key in ("msg", "err", "configFile", "validationError",
+                                                  "validationMessage", "packageFile", "depName") if key in event}
+            destination = "errors" if event["level"] >= 50 else "warnings"
+            result[destination].append(problem)
+    # A zero exit is insufficient when Renovate intentionally stops for an
+    # invalid/missing preset or cannot complete dependency extraction.
+    if completed.returncode or not settings_seen or not extraction_seen:
+        result["errors"].append("Renovate did not return complete settings and dependency extraction")
+    if result["errors"]:
+        result["command_failure"] = command_failure_details(completed, command=command, target=root)
+    else:
+        result["status"] = "ok"
+    # Reuse the shared redactor for nested errors and config values as well as
+    # child streams. Do not expose hostRules or a separate unsanitized log.
+    return command_failure_details(completed, command=command, target=root, context=result)["context"]
+
+
 def collect_local_repository(
     path: str | None,
     rules: list[dict[str, Any]],
@@ -1334,38 +1552,14 @@ def collect_local_repository(
                 ):
                     matches.append({"path": name, "pattern": pattern})
         scans[rule["id"]] = {"matches": matches}
-    # Report declarations, not an imitation of Renovate's preset resolver.
-    # Unresolved inheritance is explicit; only Renovate can establish its final
-    # merged policy. Health never queries jobs or claims a bot ran successfully.
-    renovate_paths = [name for name in (
-        "renovate.json", "renovate.json5", ".github/renovate.json", ".github/renovate.json5",
-        ".renovaterc", ".renovaterc.json",
-    ) if name in local["files"]]
-    renovate: dict[str, Any] = {"config_paths": renovate_paths, "declarations": {}, "errors": [],
-                                "inherited_policy": "none", "presets": []}
-    for name in renovate_paths:
-        try:
-            configuration = json.loads(local["texts"].get(name, ""))
-            if not isinstance(configuration, dict):
-                raise ValueError("configuration must be an object")
-        except ValueError as exc:
-            renovate["errors"].append({"file": name, "message": str(exc),
-                                       "next_action": "Run Renovate's configuration checker; JSON5 requires its native parser."})
-            continue
-        renovate["declarations"][name] = {key: configuration[key] for key in (
-            "extends", "enabled", "enabledManagers", "includePaths", "ignorePaths", "packageRules",
-            "customManagers", "baseBranchPatterns", "baseBranches", "forkProcessing",
-            "vulnerabilityAlerts", "osvVulnerabilityAlerts", "dependencyDashboard",
-        ) if key in configuration}
-        presets = configuration.get("extends", [])
-        if isinstance(presets, list):
-            renovate["presets"].extend(item for item in presets if isinstance(item, str))
-        else:
-            renovate["errors"].append({"file": name, "message": "extends must be an array"})
-    if renovate["presets"]:
-        renovate["inherited_policy"] = "requires_renovate_resolution"
-    if len(renovate_paths) > 1:
-        renovate["errors"].append({"message": "Multiple repository configs exist; report their native precedence before claiming effective coverage."})
+    read_dependencies = not rules or any(
+        "/dependency_updates/" in str(assertion.get("path", ""))
+        or "/renovate/" in str(assertion.get("path", ""))
+        for rule in rules for assertion in rule.get("assertions", [])
+    )
+    renovate = (read_renovate_configuration(pathlib.Path(path)) if path else {
+        "config_paths": [], "status": "unavailable", "errors": ["Local checkout is unavailable"],
+    }) if read_dependencies else {"status": "not_requested", "config_paths": [], "errors": []}
     permission_names = ("id-token", "attestations", "artifact-metadata", "packages")
     return {
         **local,

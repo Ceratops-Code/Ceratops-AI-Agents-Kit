@@ -15,12 +15,13 @@ from tests.support.repositories import run_git
 
 
 @pytest.mark.parametrize("interruption", [None, "before", "after"])
-def test_dependabot_retarget_reads_current_base_after_interruption(monkeypatch, interruption):
+@pytest.mark.parametrize("bot", ["dependabot", "renovate"])
+def test_dependency_retarget_reads_current_base_after_interruption(monkeypatch, interruption, bot):
     queue = load_pr_workflow_module(monkeypatch, "dependency_queue")
     repo = "owner/repo"
     key = (repo, 12)
     snapshot = {"queue": [{"repo": repo, "default_branch": "main"}]}
-    live = {"state": "OPEN", "base_ref": "main", "author": "app/dependabot", "is_cross_repository": False}
+    live = {"state": "OPEN", "base_ref": "main", "author": "app/" + bot, "is_cross_repository": False}
     patches = []
 
     def api(method, endpoint, body=None):
@@ -30,7 +31,7 @@ def test_dependabot_retarget_reads_current_base_after_interruption(monkeypatch, 
         if method == "GET":
             assert endpoint == f"repos/{repo}/pulls/12"
             return SimpleNamespace(ok=True, data={
-                "state": "open", "user": {"login": "dependabot[bot]"},
+                "state": "open", "user": {"login": bot + "[bot]"},
                 "head": {"repo": {"full_name": repo}},
                 "base": {"repo": {"full_name": repo}, "ref": live["base_ref"]},
             })
@@ -48,12 +49,12 @@ def test_dependabot_retarget_reads_current_base_after_interruption(monkeypatch, 
     monkeypatch.setattr(queue, "run_gh_api", api)
     monkeypatch.setattr(queue, "fetch_pr_batch", lambda requested: ({key: dict(live)}, []))
     initial_fault = interruption
-    details, blockers = queue.retarget_dependabot_prs(snapshot, {key: dict(live)})
+    details, blockers = queue.retarget_dependency_prs(snapshot, {key: dict(live)})
     assert bool(blockers) == bool(initial_fault)
     if not initial_fault:
         assert details[key]["base_ref"] == "release/local"
     for _ in range(2):
-        details, blockers = queue.retarget_dependabot_prs(snapshot, {key: dict(live)})
+        details, blockers = queue.retarget_dependency_prs(snapshot, {key: dict(live)})
         assert blockers == []
         assert details[key]["base_ref"] == "release/local"
     assert len(patches) == 1
@@ -84,7 +85,7 @@ def test_dependabot_retarget_preserves_existing_pr_controls(
         })
 
     monkeypatch.setattr(queue, "run_gh_api", api)
-    _, blockers = queue.retarget_dependabot_prs(snapshot, {key: live})
+    _, blockers = queue.retarget_dependency_prs(snapshot, {key: live})
     assert len(blockers) == 1
     assert message in blockers[0]["message"]
 
@@ -135,6 +136,8 @@ def test_dependency_review_collects_evidence_after_rebase_wait(
     api = Mock(return_value=SimpleNamespace(ok=bot_state != "unavailable", data=observed,
         state=Mock(return_value={"error": "GitHub access denied", "exit_code": 1})))
     monkeypatch.setattr(queue, "run_gh_api", api)
+    native_read = Mock(return_value={"status": "ok", "errors": [], "declarations": {}, "dependency_files": []})
+    monkeypatch.setattr(queue, "read_renovate_configuration", native_read)
     monkeypatch.setattr(queue, "fetch_pr_batch", lambda *_: ({("owner/repo", number): old
         for number in ([1, 2] if bot_state == "renovate" else [1])}, []))
 
@@ -148,7 +151,7 @@ def test_dependency_review_collects_evidence_after_rebase_wait(
             if wait_status == "failed" else []
         )
 
-    monkeypatch.setattr(queue, "wait_for_dependabot_rebases", wait)
+    monkeypatch.setattr(queue, "wait_for_dependency_rebases", wait)
     monkeypatch.setattr(queue, "fetch_pr_body", Mock(return_value={"status": "ok", "body":
         "| Package | Update | Change |\n|---|---|---|\n| [demo](https://example.test/demo) | patch | `1.0.0` → `1.0.1` |"}))
     monkeypatch.setattr(queue, "queued_repositories", lambda _: [{"repo": "owner/repo", "name": "repo"}])
@@ -188,7 +191,7 @@ def test_dependency_review_collects_evidence_after_rebase_wait(
 
     monkeypatch.setattr(queue, "dependency_tree_evidence", tree)
     monkeypatch.setattr(queue, "emit_result", lambda *_: None)
-    monkeypatch.setattr(queue, "retarget_dependabot_prs", lambda *_: pytest.fail(
+    monkeypatch.setattr(queue, "retarget_dependency_prs", lambda *_: pytest.fail(
         "Standalone review must not retarget without explicit authorization.",
     ))
     output = tmp_path / "review.json"
@@ -232,6 +235,10 @@ def test_dependency_review_collects_evidence_after_rebase_wait(
     if bot_state in {"renovate", "configured"}:
         processing = payload["dependency_processing"]["owner/repo"]
         assert processing["hosted_job_status"] == "unavailable"
+        assert processing["configuration"]["status"] == "ok"
+        if bot_state == "configured":
+            assert processing["local_lookup"]["status"] == "ok"
+            assert any(call.kwargs.get("lookup") for call in native_read.call_args_list)
         assert bool(processing["problems"]) == (bot_state == "renovate")
         assert repository["dependency_processing"] == processing
         if bot_state == "renovate":
@@ -246,6 +253,23 @@ def test_dependency_review_collects_evidence_after_rebase_wait(
     repeated = json.loads(output.read_text(encoding="utf-8"))
     assert repeated["repositories"] == payload["repositories"]
     assert repeated["summary"] == payload["summary"]
+    if (bot_state, wait_status, annotation_state, interruption) == ("absent", "ready", "clear", "none"):
+        snapshot["repositories"] = [{"full_name": "owner/repo", "name": "repo", "fork": True}]
+        args.retarget_dependency_prs = True
+        retarget = Mock(return_value=({("owner/repo", 1): old}, []))
+        monkeypatch.setattr(queue, "retarget_dependency_prs", retarget)
+        for scope in (["old.txt"], ["owned/**"], []):
+            native_read.return_value = {"status": "ok", "errors": [], "declarations": {
+                "renovate.json": {"forkProcessing": "enabled", "includePaths": scope}}}
+            retarget.reset_mock()
+            order.clear()
+            assert queue.prepare_dependency_review(args) == 0
+            scoped = json.loads(output.read_text())
+            if scope == ["old.txt"]:
+                assert set(retarget.call_args.args[1]) == {("owner/repo", 1)}
+            else:
+                retarget.assert_not_called()
+                assert any(item["check"] == "dependency_ownership" for item in scoped["blockers"])
 
 
 @pytest.mark.parametrize("head_ref,expected", [
@@ -366,7 +390,7 @@ def test_alert_review_distinguishes_missing_patch_and_repeats_after_interruption
         snapshot, subprocess.CompletedProcess([], 0, "", ""),
     ))
     monkeypatch.setattr(queue, "fetch_pr_batch", lambda *_: ({}, []))
-    monkeypatch.setattr(queue, "wait_for_dependabot_rebases", lambda *_: ({}, []))
+    monkeypatch.setattr(queue, "wait_for_dependency_rebases", lambda *_: ({}, []))
     monkeypatch.setattr(queue, "queued_repositories", lambda _: [{"repo": "owner/repo"}])
     monkeypatch.setattr(queue, "resolve_checkout", lambda *_, **__: {
         "status": "found", "path": str(tmp_path), "explicit": True,
@@ -952,7 +976,7 @@ def test_alert_review_reads_live_default_tree_without_touching_release_checkout(
                 "open_dependabot_prs": [], "open_dependabot_alerts": alerts}
     monkeypatch.setattr(queue, "refresh_snapshot", lambda *_: (snapshot, subprocess.CompletedProcess([], 0, "", "")))
     monkeypatch.setattr(queue, "fetch_pr_batch", lambda *_: ({}, []))
-    monkeypatch.setattr(queue, "wait_for_dependabot_rebases", lambda *_: ({}, []))
+    monkeypatch.setattr(queue, "wait_for_dependency_rebases", lambda *_: ({}, []))
     monkeypatch.setattr(queue, "queued_repositories", lambda _: [{"repo": "owner/repo", "default_branch": "main"}])
     monkeypatch.setattr(queue, "resolve_checkout", lambda *_, **__: {"status": "found", "path": str(checkout)})
     monkeypatch.setattr(queue, "exact_ci_evidence", lambda _: {"status": "ok"})
@@ -1004,3 +1028,20 @@ def test_alert_review_reads_live_default_tree_without_touching_release_checkout(
             else:
                 assert alert_tree["status"] == "unavailable" and alert_tree["sources"] == []
         assert _checkout_state(checkout) == before and not lock.exists()
+
+    if source_available and interruption == "none":
+        snapshot["repositories"] = [{"full_name": "owner/repo", "name": "repo", "fork": True}]
+        monkeypatch.setattr(queue, "queued_repositories", Mock(return_value=[{
+            "repo": "owner/repo", "default_branch": "main", "fork": True}]))
+        monkeypatch.setattr(queue, "run_gh_api", Mock(return_value=SimpleNamespace(ok=True, data=[])))
+        native = Mock(return_value={"status": "ok", "declarations": {"renovate.json": {
+            "forkProcessing": "enabled", "includePaths": ["scripts/**"]}}})
+        monkeypatch.setattr(queue, "read_renovate_configuration", native)
+        for scope, disposition in [(["scripts/**"], "upstream_maintenance"), ([], "ownership_unknown")]:
+            native.return_value["declarations"]["renovate.json"]["includePaths"] = scope
+            previous, previous_trees = len(heads), len(tree_reads)
+            assert queue.main(argv) == 0
+            scoped = json.loads(output.read_text())
+            assert len(heads) == previous and len(tree_reads) == previous_trees
+            assert all(alert["review"]["disposition"] == disposition for alert in scoped["repositories"][0]["alerts"])
+            assert _checkout_state(checkout) == before

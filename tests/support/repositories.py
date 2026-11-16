@@ -106,6 +106,44 @@ def run_git(repo: pathlib.Path, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def prepare_linked_worktree(repo: pathlib.Path) -> None:
+    """Create real linked Git metadata while preserving every fixture byte.
+
+    The caller supplies a disposable pytest directory. Its primary Git directory
+    and temporary holding directory stay beside it under the same test-run root;
+    pytest's run-directory cleanup removes them with the fixture. Original files
+    are moved back even when Git fails, and never pass through Git's checkout
+    filters. No user checkout or global Git configuration is changed.
+    """
+    repo = repo.resolve()
+    if (repo / ".git").exists():
+        result = run_git(repo, "rev-parse", "--is-inside-work-tree")
+        assert (repo / ".git").is_file() and result.returncode == 0, result.stderr
+        return
+    primary = repo.with_name("_" + repo.name + "-primary")
+    holding = repo.with_name("_" + repo.name + "-files")
+    assert primary.resolve().parent == holding.resolve().parent == repo.parent
+    assert not primary.exists() and not holding.exists()
+    primary.mkdir()
+    for args in (
+        ("init", "--quiet", "--initial-branch=main"),
+        ("config", "core.autocrlf", "false"),
+        ("-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
+         "-c", "commit.gpgsign=false", "commit", "--quiet", "--allow-empty", "-m", "Fixture"),
+    ):
+        result = run_git(primary, *args)
+        assert result.returncode == 0, result.stderr
+    repo.rename(holding)
+    try:
+        result = run_git(primary, "worktree", "add", "--quiet", "-b", "codex/test", str(repo))
+        assert result.returncode == 0, result.stderr
+    finally:
+        repo.mkdir(exist_ok=True)
+        for original in holding.iterdir():
+            original.rename(repo / original.name)
+        holding.rmdir()
+
+
 def write_sdlc_contract(
     repo: pathlib.Path,
     *,
