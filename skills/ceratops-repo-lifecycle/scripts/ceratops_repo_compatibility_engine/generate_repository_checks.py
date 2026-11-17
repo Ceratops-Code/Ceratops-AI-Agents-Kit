@@ -439,7 +439,12 @@ def repository_workflow(
     markdown_files: Mapping[str, str],
     sdlc: Mapping[str, Any],
 ) -> str | None:
-    """Maintain the generated steps while preserving repository-owned workflow sections."""
+    """Render commands and their working directories as native GitHub steps.
+
+    The generated workflow needs no SDLC runner. Repository-owned sections stay
+    intact, and an omitted command directory means the repository root even if
+    the workflow has a different job-wide default.
+    """
     workflow = repo_root / surface_path("workflow")
     previous = workflow.read_bytes().decode("utf-8") if workflow.is_file() else None
     begin = "      # Begin generated repository steps"
@@ -480,6 +485,7 @@ def repository_workflow(
             steps.extend([
                 f"      - name: {location.removeprefix(prefix)}",
                 "        shell: bash",
+                f"        working-directory: {json.dumps(step.get('cwd', '.'))}",
                 "        run: |",
                 f'          {command} 2>&1 | tee -a "$RUNNER_TEMP/repository-validation.log"',
             ])

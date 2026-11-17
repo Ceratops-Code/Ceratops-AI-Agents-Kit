@@ -72,15 +72,15 @@ def prepare_skill_python_project(repo: pathlib.Path) -> None:
 def run_repository_ci_checks(
     repo: pathlib.Path, evidence: pathlib.Path,
 ) -> subprocess.CompletedProcess[str]:
-    """Run native check steps with the shell flags GitHub uses for Bash."""
+    """Run native checks in separate shells with GitHub's flags and directories."""
     workflow = yaml.safe_load((repo / ".github/workflows/validate.yml").read_text(encoding="utf-8"))
-    commands = [
-        step["run"]
+    steps = [
+        step
         for job in workflow["jobs"].values()
         for step in job["steps"]
         if step.get("shell") == "bash" and "run" in step and "if" not in step
     ]
-    assert commands, "workflow declares no native checks"
+    assert steps, "workflow declares no native checks"
     environment = dict(os.environ)
     environment.pop("UV_PROJECT_ENVIRONMENT", None)
     environment["RUNNER_TEMP"] = str(evidence.parent)
@@ -89,10 +89,18 @@ def run_repository_ci_checks(
         if os.name == "nt"
         else pathlib.Path(shutil.which("bash") or "bash")
     )
-    return subprocess.run(
-        [str(bash), "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", "\n".join(commands)],
-        cwd=repo, env=environment, capture_output=True, text=True, check=False,
-    )
+    stdout, stderr = "", ""
+    for step in steps:
+        result = subprocess.run(
+            [str(bash), "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", step["run"]],
+            cwd=repo / step.get("working-directory", "."), env=environment,
+            capture_output=True, text=True, check=False,
+        )
+        stdout += result.stdout
+        stderr += result.stderr
+        if result.returncode:
+            break
+    return subprocess.CompletedProcess(result.args, result.returncode, stdout, stderr)
 
 
 def run_git(repo: pathlib.Path, *args: str) -> subprocess.CompletedProcess[str]:

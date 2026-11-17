@@ -383,6 +383,42 @@ def test_shell_compatibility_declares_its_generated_check_and_repeats(tmp_path: 
         assert len(native) == 1 and "renovate@" + version in native[0]["run"]
         assert updated.endswith(custom)
 
+    # Each native CI step reads a relative file in its declared directory. The
+    # final command omits cwd and must return to the repository root.
+    directories = ("nested tools", "package # two", ".")
+    command_steps = []
+    for index, directory in enumerate(directories):
+        target = repo / directory
+        target.mkdir(exist_ok=True)
+        expected = f"directory-{index}"
+        (target / "input.txt").write_text(expected, encoding="utf-8")
+        command: dict[str, object] = {"run": [
+            pathlib.Path(sys.executable).as_posix(), "-c",
+            "from pathlib import Path; "
+            f"assert Path('input.txt').read_text() == {expected!r}; print({expected!r})",
+        ]}
+        if directory != ".":
+            command["cwd"] = directory
+        command_steps.append(command)
+    sdlc["repository"]["actions"]["pre-build-checks"]["check-groups"] = {
+        "working-directories": {"steps": command_steps},
+    }
+    rendered = generator.repository_workflow(repo, [], markdown_files={}, sdlc=sdlc)
+    assert rendered is not None
+    workflow.write_text(rendered, encoding="utf-8", newline="")
+    steps = yaml.safe_load(rendered)["jobs"]["repository-checks"]["steps"]
+    generated = [step for step in steps if step.get("name") == "working-directories"]
+    assert [step["working-directory"] for step in generated] == list(directories)
+    for _ in range(2):
+        assert generator.repository_workflow(repo, [], markdown_files={}, sdlc=sdlc) is None
+        result = run_repository_ci_checks(repo, tmp_path / "check-result.json")
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout.splitlines() == ["directory-0", "directory-1", "directory-2"]
+    (repo / directories[1] / "input.txt").write_text("wrong directory contents", encoding="utf-8")
+    failed = run_repository_ci_checks(repo, tmp_path / "check-result.json")
+    assert failed.returncode != 0 and "AssertionError" in failed.stdout + failed.stderr
+    assert "directory-0" in failed.stdout and "directory-2" not in failed.stdout
+
 
 def test_language_checks_respect_git_vendor_and_generated_attributes(tmp_path: pathlib.Path) -> None:
     repo = tmp_path / "repo"
