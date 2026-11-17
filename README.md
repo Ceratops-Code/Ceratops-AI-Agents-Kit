@@ -1634,7 +1634,12 @@ templates. Ceratops uses those same support files. A repository's existing
 `tests/test-impact.json` supplies test dependencies; without that map the generated
 runner executes tests but cannot reuse individual passes. A custom runner stays
 custom; `[tool.ceratops.test-support] managed = true` opts its support files into
-generation. Compatibility checks require the declared support to be present.
+generation, including `scripts/result_records.py` from the standard runner's
+result interface and `scripts/testing/read_check_environment.py`. Its command
+implementation stays unchanged. Compatibility checks require the declared
+support to be present. Dependency setup expands an existing release-branch
+Dependabot entry instead of adding another updater for the same directory;
+default-branch security-only entries remain separate.
 
 SDLC actions run in this order: `pre-build-checks`, `build`, then
 `post-build-checks`, even when YAML keys appear in another order. This replaces

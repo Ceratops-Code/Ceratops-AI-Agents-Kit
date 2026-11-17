@@ -287,7 +287,14 @@ def runtime_files(
     for item in data["updates"]:
         limit = item.get("open-pull-requests-limit")
         if type(limit) is int and limit == 0:
-            continue
+            if item.get("target-branch") != target_branch:
+                continue
+            # Security-only entries on the default branch remain separate.
+            # On the release branch, expand the existing entry instead of
+            # creating an overlapping updater for the same manifest directory.
+            del item["open-pull-requests-limit"]
+            item.setdefault("groups", {}).update(dependency_policy["compatible_update_groups"])
+            changed = True
         if declarations.get("includePaths"):
             ecosystem = item.get("package-ecosystem")
             patterns = item.get("directories", [item.get("directory")])

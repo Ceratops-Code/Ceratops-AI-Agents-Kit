@@ -70,6 +70,10 @@ def test_custom_runner_keeps_behavior_and_can_select_generated_support(tmp_path,
     assert support.exists() is managed
     assert generator.generated_support_errors(tmp_path, contract) == []
     if managed:
+        records = runpy.run_path(str(scripts / "result_records.py"))
+        result = scripts / "result.json"
+        records["write_result"](result, {"status": "passed"}, exclusive=True)
+        assert records["read_result"](result) == (True, {"status": "passed"})
         environment = runpy.run_path(str(scripts / "testing/read_check_environment.py"))
         compare = environment["environment_inputs_for_reuse"]
         before = {"tools": {"git": {"sha256": "a" * 64}, "uv": "uv 1.2.3"}, "runtime": {"python": "3.13.4"}}

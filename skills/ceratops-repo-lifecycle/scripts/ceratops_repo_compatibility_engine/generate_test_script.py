@@ -126,6 +126,27 @@ def record_generated_runner(
     if content is not None:
         planned[root / contract["surfaces"]["python_test_runner"]["path"]] = content
     templates = template_path("python_test_runner").parent
+    if content is None:
+        # Custom commands import the same result interface that the standard
+        # runner embeds. Generate it from that template, never a second copy
+        # maintained in a checkout or loaded from an installed skill at runtime.
+        destination = root / "scripts/result_records.py"
+        if destination.is_symlink() or destination.is_junction():
+            raise RuntimeError(f"generated result module must not be a link: {destination}")
+        runner = template_path("python_test_runner").read_text(encoding="utf-8")
+        interface = runner.split("# Repository check runner interface\n", 1)[1].split(
+            "# A lease is registered before its directory exists.", 1,
+        )[0]
+        planned[destination] = (
+            '"""Record check and test outcomes for repository-owned commands.\n\n'
+            'Generated from the shared runner template; refresh through repository update.\n'
+            '"""\n\nfrom __future__ import annotations\n\n'
+            'import argparse\nimport copy\nimport datetime\nimport fnmatch\nimport hashlib\n'
+            'import json\nimport os\nimport pathlib\nimport platform\nimport re\nimport runpy\n'
+            'import shutil\nimport subprocess\nimport sys\nimport time\n'
+            'from collections.abc import Callable, Mapping\nfrom typing import Any\n\n'
+            '# Repository check runner interface\n' + interface
+        )
     for name in ("select_test_groups.py", "reuse_test_results.py"):
         destination = root / "scripts/testing" / name
         if destination.is_symlink() or destination.is_junction():

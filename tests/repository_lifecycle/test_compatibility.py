@@ -646,8 +646,9 @@ def test_compatibility_materializer_preserves_existing_bundle_contract(
     assert "SDLC v5 requires a recorded source check for ruff" in result["errors"]
 
 
+@pytest.mark.parametrize("security_branch", [None, "release/local"])
 def test_compatibility_routes_existing_dependabot_version_updates(
-    tmp_path: pathlib.Path,
+    tmp_path: pathlib.Path, security_branch: str | None,
 ) -> None:
     repo = tmp_path / "dependabot-migration"
     create_compatible_repo(repo, "example/dependabot-migration", ["alpha-tool"])
@@ -674,6 +675,8 @@ def test_compatibility_routes_existing_dependabot_version_updates(
         "schedule": {"interval": "weekly"},
         "groups": {"security": {"applies-to": "security-updates", "patterns": ["*"]}},
     }
+    if security_branch is not None:
+        security["target-branch"] = security_branch
     path.write_text(
         yaml.safe_dump({"version": 2, "updates": [legacy_version, custom_version, security]}),
         encoding="utf-8",
@@ -687,16 +690,22 @@ def test_compatibility_routes_existing_dependabot_version_updates(
         raw = path.read_bytes()
         assert b"\r\n" in raw and b"\n" not in raw.replace(b"\r\n", b"")
         updates = yaml.safe_load(raw)["updates"]
+        expected_security = dict(security)
+        if security_branch is not None:
+            expected_security.pop("open-pull-requests-limit")
+            security_groups = security["groups"]
+            assert isinstance(security_groups, dict)
+            expected_security["groups"] = {**security_groups, "compatible-updates": {"update-types": ["minor", "patch"]}}
         assert updates[:3] == [
             {**legacy_version, "target-branch": "release/local"},
             {**custom_version, "target-branch": "release/local"},
-            security,
+            expected_security,
         ]
         assert [item for item in updates if item["package-ecosystem"] == "uv"] == [updates[0]]
         actions = [item for item in updates if item["package-ecosystem"] == "github-actions"]
-        assert len(actions) == 2
-        assert actions[1]["directory"] == "/"
-        assert actions[1]["target-branch"] == "release/local"
+        assert len(actions) == (1 if security_branch else 2)
+        assert actions[-1]["directory"] == "/"
+        assert actions[-1]["target-branch"] == "release/local"
 
 
 def test_non_python_skill_needs_no_shared_skill_runtime(
