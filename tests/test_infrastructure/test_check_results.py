@@ -9,6 +9,7 @@ import os
 import pathlib
 import platform
 import runpy
+import shutil
 import subprocess
 import sys
 import uuid
@@ -16,6 +17,8 @@ from contextlib import nullcontext
 from typing import Any
 
 import pytest
+
+from scripts.testing.read_check_environment import read_environment, scoped_variable
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 
@@ -230,15 +233,24 @@ def test_current_results_refresh_after_child_and_keep_worktrees_separate(
 
 
 @pytest.fixture(params=["portable", "standard"])
-def check_writer(request: pytest.FixtureRequest, tmp_path: pathlib.Path) -> dict[str, Any]:
+def check_writer(request: pytest.FixtureRequest, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     path = ROOT / (
         "scripts/result_records.py" if request.param == "portable"
         else "skills/ceratops-repo-lifecycle/references/templates/run-tests.py.tmpl"
     )
     if request.param == "standard":
+        monkeypatch.syspath_prepend(str(ROOT / "skills/ceratops-repo-lifecycle/scripts"))
+        from ceratops_repo_compatibility_engine.compatibility_contract import load_compatibility_contract
+        from ceratops_repo_compatibility_engine.generate_test_script import record_generated_runner
+
+        contract = load_compatibility_contract()
         source = path.read_text().replace("__TEST_TARGETS__", "['test_probe.py']")
-        generated = tmp_path / "run-tests.py"
-        generated.write_text(source, encoding="utf-8")
+        generated = tmp_path / contract["surfaces"]["python_test_runner"]["path"]
+        planned = {tmp_path / contract["surfaces"]["validation_project"]["path"]: ""}
+        record_generated_runner(tmp_path, contract, source, planned)
+        for output, content in planned.items():
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(content, encoding="utf-8")
         return runpy.run_path(str(generated))
     return runpy.run_path(str(path))
 
@@ -314,10 +326,8 @@ def test_path_equivalent_outcomes_survive_interrupted_replacement(
     monkeypatch.syspath_prepend(str(ROOT / "skills/ceratops-repo-lifecycle/scripts"))
     monkeypatch.chdir(tmp_path)
     context = _context(tmp_path)
-    tool = tmp_path / ".git/tool.bin"
-    tool.write_bytes(b"original tool")
     rules = context["scope"]["inputRules"]
-    rules.update({"environment": ["PATH"], "tools": ["uv", ".git/tool.bin"]})
+    rules.update({"environment": ["PATH"], "tools": ["uv", sys.executable]})
     read_environment = runpy.run_path(str(
         ROOT / "skills/ceratops-repo-lifecycle/scripts/read_check_environment.py"
     ))["read_environment"]
@@ -497,9 +507,9 @@ def test_declared_writer_rejects_input_drift_at_each_execution_boundary(
             "CHECK_INPUT": hashlib.sha256(check_writer["canonical"]("before")).hexdigest(),
         }
     if mutation == "tool":
-        (tmp_path / ".git/tool.bin").write_bytes(b"tool")
-        context["scope"]["inputRules"]["tools"] = [".git/tool.bin"]
-        context["environment"]["tools"] = {".git/tool.bin": {"sha256": hashlib.sha256(b"tool").hexdigest()}}
+        (tmp_path / ".git/tool.exe").symlink_to(sys.executable)
+        context["scope"]["inputRules"]["tools"] = [".git/tool.exe"]
+        context["environment"] = read_environment(tmp_path, context["scope"]["inputRules"], runtime=False)
     if mutation == "runtime":
         context["environment"]["runtime"] = {
             "python": platform.python_version(), "implementation": platform.python_implementation(),
@@ -518,7 +528,10 @@ def test_declared_writer_rejects_input_drift_at_each_execution_boundary(
         elif mutation == "environment":
             monkeypatch.setenv("CHECK_INPUT", "after")
         elif mutation == "tool":
-            (tmp_path / ".git/tool.bin").write_bytes(b"changed tool")
+            (tmp_path / ".git/tool.exe").unlink()
+            uv = shutil.which("uv")
+            assert uv is not None
+            (tmp_path / ".git/tool.exe").symlink_to(uv)
         else:
             monkeypatch.setattr(platform, "python_version", lambda: "0.0.0")
 
@@ -696,29 +709,32 @@ def test_pytest_input_identity_excludes_the_owning_operation_context(test_runner
     assert first != test_runner_module.result_environment(command, ROOT, {"STATIC_INPUT": "changed"})
 
 
-def test_tool_alias_identity_uses_resolved_executable_bytes(
+def test_tool_alias_uses_resolved_executable_version(
     check_writer: dict[str, Any], tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.chdir(tmp_path)
     context = _context(tmp_path)
-    target = tmp_path / ".git/tool.bin"
-    target.write_bytes(b"executable bytes")
-    alias = tmp_path / ".git/tool-alias"
+    uv = shutil.which("uv")
+    assert uv is not None
+    target = pathlib.Path(uv)
+    alias = tmp_path / ".git/tool-alias.exe"
     try:
         alias.symlink_to(target)
     except OSError as exc:
         pytest.skip(f"tool alias creation unavailable: {exc}")
-    context["scope"]["inputRules"]["tools"] = [".git/tool-alias"]
-    context["environment"]["tools"] = {
-        ".git/tool-alias": {"sha256": hashlib.sha256(target.read_bytes()).hexdigest()},
-    }
+    context["scope"]["inputRules"]["tools"] = [".git/tool-alias.exe"]
+    context["environment"] = read_environment(tmp_path, context["scope"]["inputRules"], runtime=False)
+    version = context["environment"]["tools"][".git/tool-alias.exe"]["version"]
+    assert version is not None
+    assert version == read_environment(tmp_path, {"tools": [uv]}, runtime=False)["tools"][uv]["version"]
     monkeypatch.setenv("CERATOPS_REPOSITORY_CHECK_CONTEXT", json.dumps(context))
     path = tmp_path / ".git/result.json"
     run = check_writer["run_recorded_check"]
     assert run(lambda: 0, _request(path), {}) == 0
     saved = path.read_bytes()
-    target.write_bytes(b"changed executable")
-    assert run(lambda: pytest.fail("ran with changed tool bytes"), _request(path), {}) == 2
+    alias.unlink()
+    alias.symlink_to(sys.executable)
+    assert run(lambda: pytest.fail("ran with changed tool version"), _request(path), {}) == 2
     assert path.read_bytes() == saved
 
 
@@ -733,7 +749,7 @@ def test_declared_event_file_bytes_bind_both_execution_boundaries(
     event.write_bytes(b'{"pull_request":{"head":"first"}}')
     monkeypatch.setenv("GITHUB_EVENT_PATH", str(event))
     context["scope"]["inputRules"]["environment"] = ["GITHUB_EVENT_PATH"]
-    portable = check_writer["_check_environment_value"](str(event), tmp_path)
+    portable = scoped_variable(str(event), tmp_path)
     context["environment"]["variables"] = {
         "GITHUB_EVENT_PATH": hashlib.sha256(check_writer["canonical"](portable)).hexdigest(),
     }
@@ -763,7 +779,7 @@ def test_declared_environment_values_preserve_owned_relocation_and_other_path_dr
     check_writer: dict[str, Any], tmp_path: pathlib.Path,
 ) -> None:
     first, second = tmp_path / "checkout-one", tmp_path / "checkout-two"
-    value = check_writer["_check_environment_value"]
+    value = scoped_variable
     original = str(first / ".venv/Scripts") + os.pathsep + "external-tools"
     relocated = str(second / ".venv/Scripts") + os.pathsep + "external-tools"
     assert value(original, first) == value(relocated, second)
@@ -778,7 +794,7 @@ def test_declared_environment_values_preserve_owned_relocation_and_other_path_dr
     assert value(None, first) is None
 
 
-def test_existing_context_without_environment_file_field_remains_supported(
+def test_declared_event_file_requires_recorded_contents(
     check_writer: dict[str, Any], tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.chdir(tmp_path)
@@ -787,14 +803,18 @@ def test_existing_context_without_environment_file_field_remains_supported(
     event.write_bytes(b"event")
     monkeypatch.setenv("GITHUB_EVENT_PATH", str(event))
     context["scope"]["inputRules"]["environment"] = ["GITHUB_EVENT_PATH"]
-    portable = check_writer["_check_environment_value"](str(event), tmp_path)
+    portable = scoped_variable(str(event), tmp_path)
     context["environment"]["variables"] = {
         "GITHUB_EVENT_PATH": hashlib.sha256(check_writer["canonical"](portable)).hexdigest(),
     }
     monkeypatch.setenv("CERATOPS_REPOSITORY_CHECK_CONTEXT", json.dumps(context))
     path = tmp_path / ".git/result.json"
+    assert check_writer["run_recorded_check"](int, _request(path), {}) == 2
+    assert not path.exists()
+    context["environment"]["files"] = {"GITHUB_EVENT_PATH": hashlib.sha256(event.read_bytes()).hexdigest()}
+    monkeypatch.setenv("CERATOPS_REPOSITORY_CHECK_CONTEXT", json.dumps(context))
     assert check_writer["run_recorded_check"](lambda: 0, _request(path), {}) == 0
-    assert "files" not in json.loads(path.read_text())["inputs"]["environment"]
+    assert json.loads(path.read_text())["inputs"]["environment"]["files"] == context["environment"]["files"]
 
 
 @pytest.mark.parametrize("fault", [None, "malformed", "incomplete", "conflicting", "partial_write"])

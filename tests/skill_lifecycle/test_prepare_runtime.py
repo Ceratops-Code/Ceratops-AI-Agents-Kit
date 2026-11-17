@@ -29,6 +29,7 @@ from tests.support.processes import COMPATIBILITY_ENGINE, run_compatibility_engi
 from tests.support.repositories import (
     ROOT,
     create_compatible_repo,
+    prepare_linked_worktree,
     prepare_script_environment,
     prepare_skill_python_project,
 )
@@ -132,9 +133,7 @@ def test_bootstrap_full_install_materializes_lifecycle_bundle_with_source_runtim
     contract["version"] = yaml.safe_load(template.read_text(encoding="utf-8"))["version"]
     contract_path.write_text(yaml.safe_dump(contract, sort_keys=False), encoding="utf-8")
     prepare_script_environment(target_repo)
-    (target_repo / ".git").write_text(
-        "gitdir: test\n", encoding="utf-8", newline="\n"
-    )
+    prepare_linked_worktree(target_repo)
     shutil.rmtree(target_repo / "skills" / "sections")
     prepare_skill_python_project(target_repo)
     (target_repo / "skills" / "skill-sections.json").unlink()
@@ -235,9 +234,7 @@ def test_lifecycle_only_installed_bundle_materializes_compatible_repo(
     contract["version"] = yaml.safe_load(template.read_text(encoding="utf-8"))["version"]
     contract_path.write_text(yaml.safe_dump(contract, sort_keys=False), encoding="utf-8")
     prepare_script_environment(target_repo)
-    (target_repo / ".git").write_text(
-        "gitdir: test\n", encoding="utf-8", newline="\n"
-    )
+    prepare_linked_worktree(target_repo)
     shutil.rmtree(target_repo / "skills" / "sections")
     (target_repo / "skills" / "skill-sections.json").unlink()
     alpha_scripts = target_repo / "skills" / "alpha-tool" / "scripts"

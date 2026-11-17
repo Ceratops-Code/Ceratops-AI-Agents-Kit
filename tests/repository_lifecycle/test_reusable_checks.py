@@ -92,10 +92,14 @@ def test_qualification_matrix_keeps_original_identity(check_store, earlier, cand
     ("environment", {"platform": "other", "python": "3.14"}),
     ("scope", {"stage": "other"}), ("group", "other"),
 ])
-def test_relevant_inputs_block_reuse(check_store, field, changed):
+def test_reuse_compares_facts_and_preserves_recorded_check_version(check_store, field, changed):
     attempt(check_store, context())
-    assert check_store.select(context(**{field: changed}),
-                              check_id="repository.actions.pre-build-checks.check-groups.tests")["decision"] == "execute"
+    result = check_store.select(context(**{field: changed}),
+                                check_id="repository.actions.pre-build-checks.check-groups.tests")
+    # The derived version identifies the original run; files and argv decide reuse.
+    assert result["decision"] == ("reuse" if field == "checkVersion" else "execute")
+    if field == "checkVersion":
+        assert result["reference"]["check_version"] == context()["checkVersion"]
 
 
 def test_newer_failure_only_resolves_with_matching_later_pass(check_store):

@@ -119,6 +119,8 @@ def environment_inputs_for_reuse(environment: Mapping[str, Any], *, ignore_path:
     while still recording the actual outcome of a command that ran.
     """
     projected = dict(environment)
+    # No declared file inputs and an omitted empty inventory describe the same work.
+    projected.setdefault("files", {})
     if ignore_path and isinstance(projected.get("variables"), dict):
         projected["variables"] = {key: value for key, value in projected["variables"].items() if key != "PATH"}
     tools: dict[str, Any] = {}

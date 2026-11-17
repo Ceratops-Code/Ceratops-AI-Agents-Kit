@@ -1137,6 +1137,7 @@ def test_old_baseline_conversion_preserves_facts_and_reports_missing_scope(tmp_p
 
     root = _mapped_repository(tmp_path)
     store = _level_store(root, "beta")
+    store.context["runtime"]["version"] = sys.version  # Historical records included the architecture here.
     node = "tests/a/test_value.py::test_value"
     original = store.save(node, store.inputs(node))
     summary = compact_results([store.reference(original, reused=False)])
@@ -1164,6 +1165,7 @@ def test_explicit_old_file_conversion_keeps_latest_facts_and_repeats(tmp_path, m
     module = importlib.import_module("reuse_test_results")
     root = _mapped_repository(tmp_path)
     store = _level_store(root, "beta")
+    store.context["runtime"]["version"] = sys.version
     node = "tests/a/test_value.py::test_value"
     first = store.save(node, store.inputs(node), outcome="failed", phases={"call": "failed"})
     latest = store.save(node, store.inputs(node))
@@ -1230,6 +1232,7 @@ def test_conversion_cli_selects_worktree_without_running_tests(tmp_path):
 
     root = _mapped_repository(tmp_path)
     store = _level_store(root, "beta")
+    store.context["runtime"]["version"] = sys.version
     node = "tests/a/test_value.py::test_value"
     saved = store.save(node, store.inputs(node))
     old = store.common / "ceratops/results/repository-checks" / f"pytest-attempt-{saved['result_id']}.json"

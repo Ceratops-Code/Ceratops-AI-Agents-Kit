@@ -1174,11 +1174,11 @@ def test_batch_preparation_cleanup_error_reaches_caller(report_repo, monkeypatch
     script = "import sys; sys.exit(1)" if fail_later else "print('passed')"
     operation = replace(prepared(repo, "tests.unit", script), category="pre-build-checks", check_phase="pre-build")
 
-    def cannot_prepare(_operation):
+    def cannot_prepare(*_args):
         raise ValueError("missing check input")
 
     with monkeypatch.context() as patch:
-        patch.setattr(runner.reuse_operation_checks, "decide_check_reuse", cannot_prepare)
+        patch.setattr(runner, "read_repository_contract", cannot_prepare)
         assert runner.execute_prepared_operations(
             [runner.replace(operation, check_results={})], diagnostic_output=path, diagnostic_owner=(repo, "promote"),
         )["status"] == "result_invalid"

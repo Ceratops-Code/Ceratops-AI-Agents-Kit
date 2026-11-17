@@ -20,7 +20,7 @@ from tests.repository_lifecycle.support import (
     run_operation_cli,
 )
 from tests.support.processes import run_compatibility_engine
-from tests.support.repositories import ROOT, run_git
+from tests.support.repositories import ROOT, prepare_linked_worktree, run_git
 
 runner = importlib.import_module("repository_operation")
 skill_actions = importlib.import_module("execute_skill_actions")
@@ -166,7 +166,7 @@ def test_compatibility_preserves_custom_unittest_runner_without_pytest(
     repo = tmp_path / "repository"
     scripts = repo / "scripts"
     scripts.mkdir(parents=True)
-    (repo / ".git").write_text("gitdir: fixture\n", encoding="utf-8")
+    prepare_linked_worktree(repo)
     (scripts / "pyproject.toml").write_text(
         "[project]\n"
         'name = "repository-tools"\n'
