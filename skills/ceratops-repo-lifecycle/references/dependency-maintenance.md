@@ -37,7 +37,8 @@ first.
   reads its repository-scope configuration and binds its independent adapters;
   explicit options override defaults. It owns current-report retirement and
   dated unavailable-state reports, preserving genuine blocked queue results.
-- Review with `--retarget-dependency-prs` moves eligible open Dependabot and Renovate PRs
+- Review with `--retarget-dependency-prs` moves eligible open Dependabot
+  and Renovate PRs
   from the default branch to the repository's published `release/local`.
   It refreshes the moved PRs before collecting readiness evidence. Use this
   option when the caller authorizes the target changes.
