@@ -78,10 +78,10 @@ class DependencyFinalizationTests(unittest.TestCase):
                     "repo": repo, "checkout": {"status": "found", "path": str(root)},
                     "pull_requests": prs,
                 })
-            review = root / "review.json"
+            review_path = root / "review.json"
             snapshot = root / "snapshot.json"
             output = root / "finalize.json"
-            review.write_text(json.dumps({
+            review_path.write_text(json.dumps({
                 "outcome": {"blocked": bool(review_blockers)},
                 "summary": {"org": "owner"}, "repositories": repositories,
                 "blockers": review_blockers or [],
@@ -96,7 +96,7 @@ class DependencyFinalizationTests(unittest.TestCase):
                 org=None, admin=False, merge_method="auto", wait_seconds=0, interval_seconds=1,
                 task_name="review", include_unpublished_release=[], workspace_root=root,
                 snapshot_helper=root / "snapshot.py", sync_helper=root / "sync.py",
-                review=review, snapshot=snapshot, sync_output=root / "sync.json", output=output,
+                review=review_path, snapshot=snapshot, sync_output=root / "sync.json", output=output,
             )
             calls = []
 

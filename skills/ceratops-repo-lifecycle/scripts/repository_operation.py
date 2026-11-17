@@ -860,8 +860,8 @@ def execute_prepared_operation(
                         environment["CERATOPS_TEST_ARTIFACTS"] = json.dumps(prepared.selected_artifacts or {})
                     process_options["env"] = environment
                 with release_lock_module().track_command_completion():
-                    result = run_progress_command(argv, cwd=step.cwd, **process_options)
-                code, stdout, stderr = result.returncode, result.stdout, result.stderr
+                    command_result = run_progress_command(argv, cwd=step.cwd, **process_options)
+                code, stdout, stderr = command_result.returncode, command_result.stdout, command_result.stderr
             except KeyboardInterrupt:
                 if check_plan is None or not operation_records_check:
                     raise
