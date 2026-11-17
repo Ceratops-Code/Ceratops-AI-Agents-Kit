@@ -628,7 +628,7 @@ def finalize_worktree_cleanup(
             raise WorkflowError("selected worktree is not ready for cleanup; see recorded findings")
         if recorded.get("source_branches") != [plan["branch"]]:
             raise WorkflowError("pending-work selection changed during recording; cleanup preserved")
-        finalized = manager["finalize_scope"](
+        finalized = manager["remove_completed_task_work"](
             primary, scope, target_branch=base, target_commit=target,
             current_branch=base, current_commit=target,
         )

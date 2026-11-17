@@ -661,7 +661,7 @@ def test_tooling_plan_preserves_existing_project_bytes(
     assert cargo["directory"] == "/packages/app"
     assert cargo["target-branch"] == "release/local"
     assert cargo["groups"] == contract["dependency_maintenance"]["compatible_update_groups"]
-    assert json.loads(generated[repo / "renovate.json"])["extends"] == ["github>owner/renovate-config"]
+    assert json.loads(generated[repo / "renovate.json"])["extends"] == ["github>owner/renovate-config:org-inherited-config"]
     assert not (repo / "renovate.json").exists()
     assert project.read_bytes() == original
     collector = importlib.import_module("github_contract_engine.collectors.local_repository")

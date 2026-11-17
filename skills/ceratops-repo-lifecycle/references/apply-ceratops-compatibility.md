@@ -31,13 +31,15 @@ Infer the source identity from stable repository evidence before asking.
   and validation-wiring checks. It never runs skill-source validation.
 - (D) Apply Ceratops compatibility: `python -m
   ceratops_repo_compatibility_engine apply --target-repo-root
-  <task-worktree> [--runtime-source-id <stable-id>]`; it performs the
+  <target-repo> [--runtime-source-id <stable-id>]
+  [--allow-primary-checkout]`; it performs the
   compatibility transaction and emits one compact result.
   Every compatible repository receives the current SDLC format with separate
   validation and tests. Existing supported formats remain executable outside
   this compatibility application.
 - (D) Bootstrap-only repair: `python -m ceratops_repo_compatibility_engine
-  synchronize-bootstrap --target-repo-root <task-worktree>`; it only compares
+  synchronize-bootstrap --target-repo-root <target-repo>
+  [--allow-primary-checkout]`; it only compares
   parsed installer versions and copies a missing or lower version.
 - (D) `ceratops_repo_compatibility_engine.sdlc_contract_validation` reads and
   validates SDLC contracts for compatibility application, execution, and
@@ -59,7 +61,9 @@ Infer the source identity from stable repository evidence before asking.
 
 - Use this action only when an existing repository does not yet satisfy the
   `ceratops-compatible` profile.
-- Work only in the target repository's task-specific linked worktree.
+- Use a linked task worktree by default. For an explicitly authorized direct
+  edit, pass `--allow-primary-checkout`; the target must be the primary
+  checkout on `main` or `release/local`. The command never switches branches.
 - Do not add Ceratops naming, branding, icons, or Ceratops-only contracts to a
   compatible repository unless that repository independently requires them.
 - Do not create the requested new skill in this action; return to `create` after
@@ -203,7 +207,7 @@ Infer the source identity from stable repository evidence before asking.
   every applicable result to be valid with no errors.
 - Resolve every applicable compatibility review check before claiming full
   compatibility; keep its result distinct from the read-only structural result.
-- Commit the validated compatibility change in the task worktree.
+- Commit the checked compatibility change in the selected checkout.
 - If only local release staging was requested, return to the parent skill and
   select `promote`; if deployment was requested, select `promote-and-deploy`;
   otherwise stop at committed source compatibility.

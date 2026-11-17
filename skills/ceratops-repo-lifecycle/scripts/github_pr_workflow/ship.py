@@ -32,6 +32,7 @@ from . import (
     wait_pr_checks,
 )
 from .command import (
+    CommandError,
     capture_failure_report,
     project_task_temp_root,
     release_write_context,
@@ -402,62 +403,13 @@ def _pending_work_findings(
             cwd=repo_root,
         )
         if exists.returncode == 1:
-            if source_state == "deleting":
-                recorded = run_command(
-                    _git(repo_root, "cat-file", "-e", f"{source_commit}^{{commit}}"),
-                    cwd=repo_root,
-                )
-                if recorded.returncode:
-                    findings.append(
-                        {
-                            "kind": "missing_source_commit",
-                            "subject": branch,
-                            "detail": "recorded source commit is unavailable",
-                        }
-                    )
-                    continue
-                contained = run_command(
-                    _git(
-                        repo_root,
-                        "merge-base",
-                        "--is-ancestor",
-                        source_commit,
-                        target_commit,
-                    ),
-                    cwd=repo_root,
-                )
-                if contained.returncode == 1:
-                    findings.append(
-                        {
-                            "kind": "recorded_source_not_in_target",
-                            "subject": branch,
-                            "detail": "recorded source commit is not in target commit",
-                        }
-                    )
-                    continue
-                if contained.returncode:
-                    raise ShipError(
-                        f"Could not compare recorded source commit for {branch!r}."
-                    )
-                findings.append(
-                    {
-                        "kind": "interrupted_cleanup",
-                        "subject": branch,
-                        "detail": "scope manager must retire proven helper cleanup",
-                    }
-                )
-                continue
-            findings.append(
-                {
-                    "kind": "missing_branch",
-                    "subject": branch,
-                    "detail": "selected source branch is missing",
-                }
-            )
+            # The record owner removes obsolete branch entries. Their absence
+            # cannot make unrelated live branches unready or authorize cleanup.
             continue
         if exists.returncode:
-            raise ShipError(
-                f"Could not verify pending-work branch {branch!r}."
+            raise CommandError(
+                f"Could not read pending-work branch {branch!r}.",
+                completed=exists,
             )
 
         worktree = require_output(

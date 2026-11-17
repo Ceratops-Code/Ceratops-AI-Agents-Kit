@@ -124,6 +124,12 @@ def prepare_build_operations(root, requests, contract_path=None, *, context="ski
                               if key not in (request.parameters or {})})
         items = operations.prepare_operations(root, [request], contract_path, context=context, artifacts=artifacts,
                                                defer_install_inputs=True, defer_build_parameters=True)
+        required_checks = {name for name in entries
+                           if operations.operation_category(name) in {"pre-build-checks", "post-build-checks"}
+                           and (name == request.operation or name.startswith(request.operation + ".check-groups."))}
+        missing_checks = required_checks - {item.operation for item in items}
+        if missing_checks:
+            raise operations.OperationError("Required checks were not prepared: " + ", ".join(sorted(missing_checks)))
         items = [replace(item, qualification_level=qualification_level,
                          build_target=dict(item.parameters).get("target", "native"),
                          current_version=current_version, version_explicit=version_explicit) for item in items]
@@ -177,6 +183,8 @@ def prepare_build_operations(root, requests, contract_path=None, *, context="ski
                 parameters = {**(request.parameters_if_declared or {}), **(request.parameters or {})}
                 check_request = operations.OperationRequest(name, parameters_if_declared=parameters)
                 checks = operations.prepare_operations(root, [check_request], contract_path, context=context, artifacts=artifacts)
+                if not checks:
+                    raise operations.OperationError(f"Required check was not prepared: {name}")
                 members = {name.rsplit(".actions.", 1)[0] for name in requested}
                 checks = [item for item in checks if (name, item.check_group) not in checked
                           and (item.category == "pre-build-checks" or not item.artifact_references
@@ -987,6 +995,20 @@ def execute_sdlc_operations(
             }
             if run(replace(item, selected_artifacts=files or item.selected_artifacts))["status"] in operations.FAILED_STATUSES:
                 break
+    # An operation can finish only by returning its outcome. Missing outcomes
+    # must not turn an incomplete batch into an accepted source commit.
+    required_operations = [*setup, *before, *builds, *after, *(delivery if run_delivery else [])]
+    outcomes = {value["operation"]: value for value in results}
+    stopped = any(value["status"] in operations.FAILED_STATUSES | {"decision_required"} for value in results)
+    for item in required_operations:
+        value = outcomes.get(item.operation)
+        if value is None and not stopped:
+            results.append({"operation": item.operation, "status": "result_invalid", "steps": [],
+                            "message": "Required operation did not return an outcome: " + item.operation})
+        elif (value is not None and item.check_results is not None and value.get("status") == "completed"
+              and not value.get("check_result") and not value.get("check_summary")):
+            value.update(status="result_invalid",
+                         message="Required check did not return its recorded result: " + item.operation)
     failed = [item for item in results if item["status"] in operations.FAILED_STATUSES]
     decisions = [item for item in results if item["status"] == "decision_required"]
     failed_names = {item["operation"] for item in failed}
@@ -998,7 +1020,7 @@ def execute_sdlc_operations(
                     "artifacts": available,
                     "deferred_handoffs": [handoff for result in results for handoff in result.get("deferred_handoffs", [])],
                     "completed_operations": completed,
-                    "pending_operations": list(dict.fromkeys(item.operation for item in prepared
+                    "pending_operations": list(dict.fromkeys(item.operation for item in required_operations
                                                              if item.operation not in completed))}
     final_result["builds"] = [
         {"deliverable": value["operation"].split(".actions.", 1)[0],
@@ -1011,7 +1033,12 @@ def execute_sdlc_operations(
     final_result["checks"] = [
         {"operation": value["operation"], "phase": next(
             item.check_phase for item in prepared if item.operation == value["operation"]),
-         "status": value["status"]}
+         "status": value["status"],
+         **{key: value[key] for key in ("check_decision", "check_result", "check_outcome", "check_baseline", "no_op") if key in value},
+         **({"outcomes": [{key: check[key] for key in
+                          ("id", "kind", "status", "result_id", "check_version", "execution") if key in check}
+                         for check in value["check_summary"]["checks"]]}
+            if value.get("check_summary") else {})}
         for value in results if any(item.operation == value.get("operation") and item.check_phase for item in prepared)
     ]
     final_result["delivery"] = [

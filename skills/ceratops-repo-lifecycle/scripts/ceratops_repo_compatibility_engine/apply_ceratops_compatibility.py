@@ -122,13 +122,31 @@ class CompatibilityPlan:
     python_tests: list[str]
 
 
-def require_linked_worktree(repo_root: pathlib.Path) -> None:
-    """Reject primary checkouts so compatibility writes stay task-isolated."""
+def require_authorized_checkout(
+    repo_root: pathlib.Path, *, allow_primary_checkout: bool = False,
+) -> None:
+    """Keep task isolation unless the caller explicitly permits a primary checkout."""
 
-    if not (repo_root / ".git").is_file():
-        raise RuntimeError(
-            f"target repository must be a linked task worktree: {repo_root}"
-        )
+    marker = repo_root / ".git"
+    if marker.is_file():
+        return
+    if not allow_primary_checkout or not marker.is_dir():
+        raise RuntimeError(f"target repository must be a linked task worktree: {repo_root}")
+    # The exception permits an actual primary checkout, not a nested folder,
+    # detached revision or arbitrary branch. It never changes the branch.
+    for arguments, expected in (
+        (["rev-parse", "--show-toplevel"], {repo_root.resolve().as_posix().casefold()}),
+        (["symbolic-ref", "--short", "HEAD"], {"main", "release/local"}),
+    ):
+        command = ["git", "-C", str(repo_root), *arguments]
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        actual = result.stdout.strip().replace("\\", "/").casefold()
+        if result.returncode or actual not in expected:
+            raise RuntimeError(
+                f"primary-checkout request rejected: {command!r}; "
+                f"exit={result.returncode}; stdout={result.stdout or '<empty>'}; "
+                f"stderr={result.stderr or '<empty>'}"
+            )
 
 
 def runtime_source_id(
@@ -760,6 +778,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--target-repo-root", required=True, type=pathlib.Path)
     parser.add_argument("--runtime-source-id")
+    parser.add_argument("--allow-primary-checkout", action="store_true",
+                        help="Permit an explicitly authorized primary main or release/local checkout.")
     args = parser.parse_args(argv)
     repo_root = args.target_repo_root.resolve()
     phase = "preflight"
@@ -771,7 +791,7 @@ def main(argv: list[str] | None = None) -> int:
     runtime = {}
     try:
         runtime = load_compatibility_contract()["runtime"]
-        require_linked_worktree(repo_root)
+        require_authorized_checkout(repo_root, allow_primary_checkout=args.allow_primary_checkout)
         template = repository_checks.load_mapping(template_path("skill_manifest"))
         validate_template(template)
         existing_path = repo_root / surface_path("skill_manifest")
@@ -864,7 +884,9 @@ def main(argv: list[str] | None = None) -> int:
                 synchronize_bootstrap_installer,
             )
 
-            bootstrap = synchronize_bootstrap_installer(repo_root)
+            bootstrap = synchronize_bootstrap_installer(
+                repo_root, allow_primary_checkout=args.allow_primary_checkout,
+            )
             bootstrap_status_value = (
                 bootstrap.get("status") if isinstance(bootstrap, Mapping) else None
             )

@@ -184,6 +184,7 @@ class CheckPlan:
     result_id: str | None = None
     path: pathlib.Path | None = None
     summary: dict[str, Any] | None = None
+    outcome: dict[str, Any] | None = None
 
     def inputs_changed(self, prepared: Any) -> bool:
         return collect_check_inputs(prepared, prepared.check_results) != self.context
@@ -285,7 +286,9 @@ class CheckPlan:
                 "check_reason": self.decision["reason"],
                 **({"check_summary": self.decision["record"]["check_summary"]}
                    if self.decision["record"].get("check_summary") else {}),
-                "check_result": self.decision["reference"]}
+                "check_result": self.decision["reference"],
+                "check_outcome": {key: self.decision["record"][key] for key in
+                                  ("result_id", "check_id", "check_version", "status", "execution")}}
 
     def completed(self, prepared: Any, *, passed: bool) -> dict[str, Any]:
         """Require the declared producer's actual terminal result, including failure."""
@@ -302,6 +305,8 @@ class CheckPlan:
             raise ValueError("Declared runner outcome conflicts with its requested inputs or exit status.")
         reference = result_reference(self.path, self.result_id)
         self.summary = record.get("check_summary")
+        self.outcome = {key: record[key] for key in
+                        ("result_id", "check_id", "check_version", "status", "execution")}
         return reference
 
 

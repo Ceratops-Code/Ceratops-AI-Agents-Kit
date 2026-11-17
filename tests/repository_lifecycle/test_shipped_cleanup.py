@@ -1104,7 +1104,7 @@ def test_ship_finalization_uses_live_head_after_selected_source_moves(
     with monkeypatch.context() as fault:
         fault.setattr(cleanup, "_scope_manager", lambda: manager)
         fault.setitem(
-            manager["finalize_scope"].__globals__, "_remove_source_record", interrupt_scope_retirement,
+            manager["remove_completed_task_work"].__globals__, "_remove_source_record", interrupt_scope_retirement,
         )
         with pytest.raises(KeyboardInterrupt):
             finalize()
@@ -1258,7 +1258,7 @@ def test_callable_interfaces_reject_removed_worktree_retention_parameter(
 
 
 @pytest.mark.parametrize("scope_present", [False, True])
-def test_repository_ship_absent_default_contract_is_no_op_and_finalizes(
+def test_repository_ship_missing_contract_blocks_remote_work(
     tmp_path: pathlib.Path,
     scope_present: bool,
     monkeypatch: pytest.MonkeyPatch,
@@ -1267,19 +1267,12 @@ def test_repository_ship_absent_default_contract_is_no_op_and_finalizes(
         tmp_path, contract=False
     )
     state["scope"] = scope_present
-    result = loaded["ship_repository"](args)
-    assert result["status"] == "shipped"
-    for phase in ("release_publication", "deployment"):
-        assert result[phase] == {
-            "status": "completed",
-            "completed_operations": [],
-            "pending_operations": [],
-            "results": [],
-        }
-    assert result["finalization"] == {"status": "finalized"}
-    assert log.read_text().splitlines() == ["remote", "finalize"]
-    _, pending_scope, _ = state["github_request"]
-    assert (pending_scope is not None) is scope_present
+    for _ in range(2):
+        with pytest.raises(loaded["RepositoryShipError"], match="contract"):
+            loaded["ship_repository"](args)
+        assert state["calls"] == 0
+        assert not log.exists() or not log.read_text()
+    pending_scope = tmp_path / "scope.json" if scope_present else None
     received = []
 
     def receive(request):

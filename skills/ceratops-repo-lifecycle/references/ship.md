@@ -36,10 +36,12 @@ owns timing.
   commit; a caller-supplied `--commit` must match it. An absent scope skips checks
   of selected sources; repository-wide cleanup still runs. Each version-2 source
   persists its branch, exact recorded tip,
-  and helper-owned `retained`, `preserved`, or `deleting` state. A missing
-  `retained` source remains blocking. Only a missing `deleting` source whose
-  recorded commit exists and is an ancestor of the recorded target may be
-  atomically retired as completed interrupted helper cleanup. Before normal
+  and helper-owned `retained`, `preserved`, or `deleting` state. The
+  pending-work manager removes saved entries for absent branches
+  automatically, regardless of saved state or old commit availability. This
+  removes bookkeeping only; it never authorizes filesystem cleanup.
+  A Git lookup failure leaves the record unchanged
+  and remains an error. Before normal
   validation, the scope manager atomically converts an exact version-1 record
   to version 2. A missing legacy source is retired; a clean source still
   contained in the legacy target becomes `retained`; a dirty, unavailable, or

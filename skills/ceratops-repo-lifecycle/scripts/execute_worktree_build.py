@@ -789,6 +789,7 @@ def execute_build(
             if len(batches) > 1:
                 result = {**result, "target_results": finished,
                           "pending_targets": [target for target, _ in batches[len(finished):]]}
+            result["checks"] = [check for batch in finished for check in batch.get("checks", [])]
             if result["status"] == "completed":
                 result["accepted_commit"] = operations.repository_commit(root)
             if build_decisions:

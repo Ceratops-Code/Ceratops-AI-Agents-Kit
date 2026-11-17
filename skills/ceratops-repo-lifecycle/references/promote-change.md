@@ -228,10 +228,12 @@ abandonment/replacement and worktree removal rather than matching-work success.
    and helper-owned state. When a recorded target diverges from the new target,
    preserve every prior unselected source without cleanup authority and begin
    the new scope; a same-name source explicitly selected at the new target may
-   replace its old record after the normal containment checks. Recover a
-   missing source automatically only when its `deleting` state and recorded
-   commit ancestry prove an interrupted helper deletion; a missing `retained`
-   source blocks.
+   replace its old record after the normal containment checks. The
+   pending-work manager removes saved entries for absent branches
+   automatically, without warnings or filesystem cleanup. Existing changed or
+   dirty branches retain their current checks.
+   A Git lookup failure leaves the record unchanged
+   and remains an error.
 7. On a shipping blocker, retain the scope, branches, worktrees, and checkpoints
    for resume. Terminal shipping owns finalization and selected-work cleanup;
    it leaves a worktree and branch untouched when the worktree's parent chain
@@ -324,6 +326,11 @@ artifacts, and pending-work state. Success prints `OK`; failure reports
   reasons.
 
 ### Output Contract
+
+The promotion result carries checks from the existing runner: each check
+names its operation, status and original saved result reference. Reused local
+results retain their original result identity and execution date. A ready
+promotion-only result confirms the release update; it does not claim installation.
 
 Report only:
 

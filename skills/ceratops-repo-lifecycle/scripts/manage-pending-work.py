@@ -261,7 +261,9 @@ def _branch_exists(repo_root: pathlib.Path, branch: str) -> bool:
         cwd=repo_root,
     )
     if result.returncode not in {0, 1}:
-        raise PendingWorkError(f"Could not verify pending-work branch {branch!r}.")
+        raise CommandError(
+            f"Could not read pending-work branch {branch!r}.", completed=result
+        )
     return result.returncode == 0
 
 
@@ -317,51 +319,27 @@ def _scope_with_sources(
     }
 
 
-def _recover_completed_deletions(
+def _remove_missing_source_records(
     repo_root: pathlib.Path,
     path: pathlib.Path,
     scope: dict[str, Any],
 ) -> dict[str, Any] | None:
-    """Retire only evidence-proven interruptions after helper-owned deletion.
+    """Remove absent branch names without authorizing any filesystem cleanup.
 
-    ``deleting`` is written before cleanup begins. A missing branch alone is
-    never sufficient: its recorded source commit must still exist and be
-    contained in this scope's recorded target. Any residual-worktree record is
-    completed before the source identity is discarded.
+    Complete every Git lookup before writing so a lookup failure preserves the
+    original record. A branch's absence says nothing about residual worktrees.
     """
 
-    retained: list[dict[str, str]] = []
-    changed = False
-    target_commit = str(scope["target_commit"])
-    for source in scope["sources"]:
-        normalized = {
-            "branch": str(source["branch"]),
-            "commit": str(source["commit"]),
-            "state": str(source["state"]),
-        }
-        branch = normalized["branch"]
-        if (
-            normalized["state"] != "deleting"
-            or _branch_exists(repo_root, branch)
-            or not _commit_exists(repo_root, normalized["commit"])
-            or not _is_ancestor(repo_root, normalized["commit"], target_commit)
-        ):
-            retained.append(normalized)
-            continue
-        residual_record = _residual_cleanup_record_path(path, branch)
-        if residual_record.exists():
-            residual_preserved = _finish_recorded_residual_cleanup(
-                repo_root, residual_record
-            )
-            if residual_preserved is not None:
-                _remove_completed_state_file(residual_record)
-        changed = True
-    if not changed:
+    retained = [
+        dict(source) for source in scope["sources"]
+        if _branch_exists(repo_root, str(source["branch"]))
+    ]
+    if len(retained) == len(scope["sources"]):
         return scope
     if retained:
-        recovered = _scope_with_sources(scope, retained)
-        preserve_check_references.write_scope(path, recovered)
-        return recovered
+        updated = _scope_with_sources(scope, retained)
+        preserve_check_references.write_scope(path, updated)
+        return updated
     _remove_completed_state_file(path)
     return None
 
@@ -574,6 +552,7 @@ def record_scope(
             target_branch=target_branch,
             target_commit=recorded_target.lower(),
         )
+        existing = _remove_missing_source_records(repo_root, path, existing) or requested_scope
         old_target = str(existing["target_commit"])
         target_history_diverged = False
         if old_target != target_commit:
@@ -613,9 +592,7 @@ def record_scope(
                 target_branch=target_branch,
             )
         else:
-            recovered_existing = _recover_completed_deletions(
-                repo_root, path, existing
-            )
+            recovered_existing = existing
         if not target_history_diverged and recovered_existing is not None:
             existing = recovered_existing
             candidate_existing = {**existing, "target_commit": target_commit}
@@ -761,7 +738,7 @@ def check_scope(
         target_branch=target_branch,
         target_commit=target_commit,
     )
-    recovered_scope = _recover_completed_deletions(repo_root, path, scope)
+    recovered_scope = _remove_missing_source_records(repo_root, path, scope)
     if recovered_scope is None:
         return _ready_without_scope()
     scope = recovered_scope
@@ -789,13 +766,13 @@ def check_scope(
     return result
 
 
-def prepare_scope(
+def check_pending_work_before_ship(
     repo_root: pathlib.Path,
     *,
     target_branch: str,
     target_commit: str | None = None,
 ) -> dict[str, object]:
-    """Resume the recorded target identity and recheck its selected scope."""
+    """Read promoted branch records before Ship and report unfinished work."""
 
     _validate_branch(repo_root, target_branch)
     path = _scope_path(repo_root, target_branch)
@@ -814,6 +791,11 @@ def prepare_scope(
         or ship.FULL_SHA_RE.fullmatch(recorded_commit) is None
     ):
         raise PendingWorkError("Pending-work scope has an invalid target commit.")
+    checked = check_scope(
+        repo_root, path, target_branch=target_branch, target_commit=recorded_commit
+    )
+    if not checked.get("pending_work_scope"):
+        return checked
     if target_commit is not None:
         target_commit = target_commit.lower()
         if ship.FULL_SHA_RE.fullmatch(target_commit) is None:
@@ -826,15 +808,10 @@ def prepare_scope(
         _git(repo_root, "cat-file", "-e", f"{recorded_commit}^{{commit}}"),
         cwd=repo_root,
     )
-    return check_scope(
-        repo_root,
-        path,
-        target_branch=target_branch,
-        target_commit=recorded_commit,
-    )
+    return checked
 
 
-def finalize_scope(
+def remove_completed_task_work(
     repo_root: pathlib.Path,
     path: pathlib.Path,
     *,
@@ -845,7 +822,7 @@ def finalize_scope(
     retention_reason: Callable[[str, pathlib.Path | None], str | None] | None = None,
     remove_branch: Callable[[pathlib.Path, str, str], None] | None = None,
 ) -> dict[str, object]:
-    """Late-recheck selected work and prune only eligible cleanup parents.
+    """Remove eligible finished task branches and worktrees after shipping.
 
     Ship supplies its thread/path retention guard and expected-head ref remover;
     standalone scope callers retain the native Git merged-branch deletion gate.
@@ -1031,7 +1008,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "discard-check-references":
             result = preserve_check_references.discard_check_references(repo_root, args.target_branch)
         elif args.command == "prepare":
-            result = prepare_scope(
+            result = check_pending_work_before_ship(
                 repo_root,
                 target_branch=args.target_branch,
                 target_commit=(
@@ -1054,7 +1031,7 @@ def main(argv: list[str] | None = None) -> int:
                 target_commit=args.target_commit.lower(),
             )
         else:
-            result = finalize_scope(
+            result = remove_completed_task_work(
                 repo_root,
                 args.scope,
                 target_branch=args.target_branch,

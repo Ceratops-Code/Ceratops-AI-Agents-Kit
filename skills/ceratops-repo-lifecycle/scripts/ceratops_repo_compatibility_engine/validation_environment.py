@@ -253,7 +253,7 @@ def runtime_files(
         # Shared behavior belongs to the owner's preset. A target root only
         # names that preset and keeps any explicit ownership restrictions.
         files[root / "renovate.json"] = json.dumps({
-            "extends": [f"github>{owner}/{dependency_policy['renovate_preset_repository']}"]
+            "extends": [f"github>{owner}/{dependency_policy['renovate_preset_repository']}:org-inherited-config"]
         }, indent=2) + "\n"
     for ecosystem, manifests in ecosystems.items():
         projects = ({"/": set()} if ecosystem == "github-actions" else

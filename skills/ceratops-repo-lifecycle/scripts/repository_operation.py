@@ -208,25 +208,19 @@ def read_repository_contract(
     repo_root: pathlib.Path,
     contract_path: pathlib.Path | None = None,
 ) -> Mapping[str, Any]:
-    """Read only a repository-bounded contract; an absent default is empty."""
+    """Read the required repository SDLC file; never invent an empty declaration."""
 
     selected = contract_path or DEFAULT_CONTRACT
     lexical = repo_root / selected
     resolved = lexical.resolve()
     if not resolved.is_relative_to(repo_root) or lexical.is_symlink():
         raise OperationError("SDLC contract must be a file inside the repository.")
-    if not resolved.exists() and selected == DEFAULT_CONTRACT:
-        return {
-            "version": 4,
-            "kind": "ceratops-sdlc",
-            "repository": {"capabilities": {}, "actions": {}},
-        }
     if not resolved.is_file():
-        raise OperationError("Selected SDLC contract must be a repository file.")
+        raise OperationError(f"Required SDLC contract is missing or is not a file: {selected}")
     try:
         return load_contract(resolved, repo_root=repo_root)
-    except SdlcContractError as exc:
-        raise OperationError(f"Invalid SDLC contract: {exc}") from exc
+    except (SdlcContractError, OSError) as exc:
+        raise OperationError(f"Could not read SDLC contract {selected}: {exc}") from exc
 
 
 def parse_parameters(values: Sequence[str]) -> dict[str, str]:
@@ -901,6 +895,7 @@ def execute_prepared_operation(
                         if inputs_changed:
                             raise ValueError("Source check inputs changed during execution.")
                     base["check_result"] = check_plan.completed(prepared, passed=code == 0)
+                    base["check_outcome"] = check_plan.outcome
                     if check_plan.summary is not None:
                         base["check_summary"] = check_plan.summary
                     check_plan.store.current.remove_deleted("check-decision", {prepared.operation}, decision_target)

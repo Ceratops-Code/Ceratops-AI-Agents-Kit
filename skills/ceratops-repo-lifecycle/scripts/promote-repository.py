@@ -421,6 +421,7 @@ def promote(args: argparse.Namespace, *, timings: dict[str, float] | None = None
             "merged_branches": merged,
             "pending_work_scope": record["pending_work_scope"],
             "operations": None,
+            "checks": validation.get("checks", []),
         }
         try:
             prepared_operations = prepare_operations(

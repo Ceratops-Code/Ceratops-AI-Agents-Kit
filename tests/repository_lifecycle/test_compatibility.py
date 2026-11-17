@@ -255,8 +255,9 @@ def _write_current_sdlc(
     target.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
 
 
+@pytest.mark.parametrize("primary", [False, True])
 def test_compatibility_materializer_supplies_target_identity_and_assignments(
-    tmp_path: pathlib.Path,
+    tmp_path: pathlib.Path, primary: bool,
 ) -> None:
     repo = tmp_path / "compatible"
     create_compatible_repo(repo, "stale/source", ["alpha-tool", "beta-tool"], skill_runtime=True)
@@ -270,7 +271,16 @@ def test_compatibility_materializer_supplies_target_identity_and_assignments(
             "actions": {"pre-build-checks": {"check-groups": {'source': {"requires": {"tools": []}, "no-op": "Covered by repository source checks."}}}, "install": {"requires": {"tools": []}, "steps": [{"run": [sys.executable, "-V"]}]}, "publish": {"requires": {"tools": []}, "steps": [{"run": [sys.executable, "-V"]}]}},
         }}},
     )
-    prepare_linked_worktree(repo)
+    if primary:
+        run_git(repo, "init", "-b", "main")
+        before = (repo / "skills/skill-sections.json").read_bytes()
+        for _ in range(2):
+            blocked = run_compatibility_engine(REPOSITORY_LIFECYCLE_SCRIPTS, "apply", "--target-repo-root", str(repo))
+            assert blocked.returncode == 1
+            assert json.loads(blocked.stdout)["rollback"] == "not_started"
+            assert (repo / "skills/skill-sections.json").read_bytes() == before
+    else:
+        prepare_linked_worktree(repo)
     (repo / "skills" / "sections" / "core.md").unlink()
     (repo / "skills" / "skill-sections.json").unlink()
     alpha_scripts = repo / "skills" / "alpha-tool" / "scripts"
@@ -321,6 +331,7 @@ def test_compatibility_materializer_supplies_target_identity_and_assignments(
         str(repo),
         "--runtime-source-id",
         "target/skills",
+        *(["--allow-primary-checkout"] if primary else []),
     )
 
     assert result.returncode == 0, result.stdout
@@ -329,6 +340,10 @@ def test_compatibility_materializer_supplies_target_identity_and_assignments(
         (repo / "skills" / "skill-sections.json").read_text(encoding="utf-8")
     )
     assert output["status"] == "ok"
+    if primary:
+        assert run_git(repo, "branch", "--show-current").stdout.strip() == "main"
+        repeated = run_compatibility_engine(REPOSITORY_LIFECYCLE_SCRIPTS, "apply", "--target-repo-root", str(repo), "--allow-primary-checkout")
+        assert repeated.returncode == 0, repeated.stdout + repeated.stderr
     assert output["markers_removed"] == ["beta-tool"]
     assert manifest["runtime_source_id"] == "target/skills"
     assert manifest["validation_profile"] == "ceratops-compatible"
@@ -995,10 +1010,11 @@ def test_compatibility_materializer_preserves_existing_identity_and_custom_secti
     assert {name: (repo / name).read_bytes() for name in preserved} == preserved
 
 
+@pytest.mark.parametrize("primary", [False, True])
 @pytest.mark.parametrize("existing_ignore", [False, True])
 def test_compatibility_materializer_rolls_back_every_target_write_on_blocker(
     tmp_path: pathlib.Path,
-    existing_ignore: bool,
+    existing_ignore: bool, primary: bool,
 ) -> None:
     lifecycle_bundle = tmp_path / "lifecycle-bundle"
     shutil.copytree(REPOSITORY_LIFECYCLE_SOURCE, lifecycle_bundle)
@@ -1021,7 +1037,10 @@ def test_compatibility_materializer_rolls_back_every_target_write_on_blocker(
     repo = tmp_path / "compatible"
     create_compatible_repo(repo, "preserved/source", ["alpha-tool"])
     _write_current_sdlc(repo)
-    prepare_linked_worktree(repo)
+    if primary:
+        run_git(repo, "init", "-b", "main")
+    else:
+        prepare_linked_worktree(repo)
     ignore = repo / ".gitignore"
     if existing_ignore:
         ignore.write_bytes(b"build/\r\n")
@@ -1049,6 +1068,7 @@ def test_compatibility_materializer_rolls_back_every_target_write_on_blocker(
         "apply",
         "--target-repo-root",
         str(repo),
+        *(["--allow-primary-checkout"] if primary else []),
     )
 
     assert result.returncode == 1

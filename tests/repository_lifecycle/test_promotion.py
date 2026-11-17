@@ -1158,8 +1158,10 @@ def test_task_merge_preserves_main_merges_and_reports_conflicts(
 
 
 @pytest.mark.parametrize("case", ["success", "failure", "outside-writer", "interrupted-checkout",
-                                 "metadata-only", "product-change", "install-required"])
-def test_checks_finish_before_release_moves(tmp_path, case):
+                                 "metadata-only", "product-change", "install-required",
+                                 "missing-contract", "invalid-contract", "unreadable-contract",
+                                 "missing-result", "lost-check", "empty-scope"])
+def test_checks_finish_before_release_moves(tmp_path, case, monkeypatch):
     fails = case == "failure"
     repo, task, submitted, release_head, _ = prepare_divergent_promotion_repo(tmp_path / "checked")
     optional_builder = None
@@ -1224,7 +1226,17 @@ def test_checks_finish_before_release_moves(tmp_path, case):
     }
     if optional_builder is not None:
         contract["deliverables"] = {"apps": {"sample": optional_builder}}
+    assert isinstance(contract["repository"], dict)
+    if case == "empty-scope":
+        contract["repository"]["actions"]["pre-build-checks"]["check-groups"] = {
+            "not-needed": {"requires": {"tools": []}, "no-op": "This fixture requires no checks."}}
+    if case == "missing-result":
+        contract["repository"]["actions"]["pre-build-checks"]["check-groups"]["release-still-unchanged"]["check-results"].pop("result-owner")
     path.write_text(json.dumps(contract))
+    if case == "missing-contract":
+        path.unlink()
+    elif case == "invalid-contract":
+        path.write_text("not: [valid yaml")
     assert run_git(task, "add", ".").returncode == 0
     assert run_git(task, "commit", "-m", "checks must precede release movement").returncode == 0
     selected = run_git(task, "rev-parse", "HEAD").stdout.strip()
@@ -1233,6 +1245,24 @@ def test_checks_finish_before_release_moves(tmp_path, case):
         "--repo-root", str(task), "--source-branch", "approved", *(
             ["--run-operation", "deliverables.apps.sample.actions.install"]
             if case == "install-required" else ["--no-run-operation"])])
+    if case == "unreadable-contract":
+        from unittest.mock import Mock
+        import repository_operation
+        monkeypatch.setattr(repository_operation, "load_contract", Mock(side_effect=PermissionError("contract cannot be read")))
+    if case == "lost-check":
+        from unittest.mock import Mock
+        import repository_operation
+        monkeypatch.setattr(repository_operation, "prepare_operations", Mock(return_value=[]))
+    if case in {"missing-contract", "invalid-contract", "unreadable-contract", "missing-result", "lost-check"}:
+        for _ in range(2):
+            with pytest.raises(module["PromotionError"]) as error:
+                module["promote"](args)
+            assert ("contract" in str(error.value).lower() or "check" in str(error.value).lower()
+                    or "yaml" in str(error.value).lower())
+            assert run_git(repo, "rev-parse", "release/local").stdout.strip() == release_head
+        if case != "missing-result":
+            assert not log.exists()
+        return
     if case in {"product-change", "install-required"}:
         for _ in range(2):
             with pytest.raises(module["PromotionError"], match="build_dir"):
@@ -1253,6 +1283,13 @@ def test_checks_finish_before_release_moves(tmp_path, case):
     assert head == run_git(task, "rev-parse", "HEAD").stdout.strip()
     assert result["submitted_commits"] == {"approved": selected}
     assert result["tested_commit"] == result["accepted_commit"] == head
+    if case != "empty-scope":
+        check = next(value for value in result["checks"] if value["operation"].startswith("repository."))
+        assert check["check_outcome"]["status"] == "passed"
+        assert check["check_outcome"]["result_id"] == check["check_result"]["result_id"]
+        assert check["check_outcome"]["execution"]["finishedAt"]
+    else:
+        assert all(value["status"] == "no_op" for value in result["checks"])
     for ancestor in (submitted, selected, release_head):
         assert run_git(task, "merge-base", "--is-ancestor", ancestor, head).returncode == 0
     if case == "interrupted-checkout":
@@ -1266,7 +1303,12 @@ def test_checks_finish_before_release_moves(tmp_path, case):
         head = next_head
     again = module["promote"](args)
     assert again["status"] == "ready" and again["head"] == head
-    assert log.read_text() == ("xx" if case == "outside-writer" else "x")
+    if case == "empty-scope":
+        assert not log.exists()
+    else:
+        assert log.read_text() == ("xx" if case == "outside-writer" else "x")
+        reused = next(value for value in again["checks"] if value["operation"].startswith("repository."))
+        assert reused["check_outcome"] == check["check_outcome"]
     assert run_git(repo, "status", "--porcelain").stdout == ""
     if case == "interrupted-checkout":
         assert (repo / "extra.txt").read_text() == "next source file"
