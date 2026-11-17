@@ -775,7 +775,8 @@ def prepare_dependency_review(args: argparse.Namespace) -> int:
             for repo in repositories for pr in repo["pull_requests"]
         ),
     }
-    queue_present = bool(snapshot.get("outcome", {}).get("queue_present")) or bool(dependency_prs) or bool(processing)
+    # Observing a healthy dashboard/configuration does not create dependency work.
+    queue_present = bool(snapshot.get("outcome", {}).get("queue_present")) or bool(dependency_prs)
     blocked = snapshot_blocked or bool(blockers)
     payload = {
         "schema": "ceratops-repo-lifecycle/dependency-review.v1",

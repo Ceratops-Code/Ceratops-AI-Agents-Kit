@@ -330,9 +330,42 @@ def test_release_build_consumes_existing_tagged_receipt_without_starting_builder
 
 
 @pytest.mark.parametrize("failure", ["compiler", "decision", "changed-package", "changed-check",
-                                      "malformed-answer", "rejected-answer", "repeated-decision", "decision-cli"])
+                                      "malformed-answer", "rejected-answer", "repeated-decision", "decision-cli",
+                                      "missing-tool", "tool-version-failed"])
 def test_worktree_build_failure_preserves_cause_without_receipt_or_tag(tmp_path, failure):
     repository, options = _worktree_build_case(tmp_path)
+    if failure in {"missing-tool", "tool-version-failed"}:
+        contract_path = repository / runner.DEFAULT_CONTRACT
+        contract = json.loads(contract_path.read_text())
+        executable = repository / "scripts" / ("version-tool.cmd" if os.name == "nt" else "version-tool")
+        if failure == "tool-version-failed":
+            executable.write_text("@echo off\necho probe output\necho probe failure 1>&2\nexit /b 7\n"
+                                  if os.name == "nt" else
+                                  "#!/bin/sh\necho probe output\necho probe failure >&2\nexit 7\n")
+            executable.chmod(0o755)
+        contract["repository"]["tools"] = {"builder": {"executable": str(executable)}}
+        contract["deliverables"]["packages"]["claims"]["actions"]["build"]["requires"]["tools"] = ["builder"]
+        contract_path.write_text(json.dumps(contract))
+        for _ in range(2):
+            failed = runner.execute_build(repository, **options)
+            assert failed["status"] in runner.FAILED_STATUSES, failed
+            assert "Cannot read required build tool builder" in failed["message"]
+            assert run_git(repository, "tag", "--list").stdout == ""
+            assert not list((repository / ".ceratops/build").glob("**/build_receipt.json"))
+            details = failed["tool_failure"]
+            assert details["version"] is None and details["tool"] == "builder"
+            if failure == "tool-version-failed":
+                assert details["exit_code"] == 7
+                assert details["command"] == [str(executable), "--version"]
+                assert "probe output" in details["stdout"] and "probe failure" in details["stderr"]
+            else:
+                assert "not installed" in details["error"]
+        contract["repository"]["tools"]["builder"]["executable"] = sys.executable
+        contract_path.write_text(json.dumps(contract))
+        repaired = runner.execute_build(repository, **options)
+        assert repaired["status"] == "completed", repaired
+        assert list((repository / ".ceratops/build").glob("**/build_receipt.json"))
+        return
     if failure != "compiler":
         check_path = repository / "scripts/review.py"
         check_path.write_text(
@@ -1067,6 +1100,10 @@ def test_build_recipe_and_independent_member_versions(tmp_path, capsys, target, 
     path = repository / runner.DEFAULT_CONTRACT
     contract = json.loads(path.read_text())
     tool = contract["deliverables"]["packages"]["claims"]
+    contract["repository"]["tools"] = {
+        "python": {"executable": sys.executable}, "git": {"executable": "git"},
+    }
+    tool["actions"]["build"]["requires"]["tools"] = ["python", "git"]
     engine = json.loads(json.dumps(tool))
     engine.update({"root-dir": "engine", "project": "engine/pyproject.toml",
                    "additional-source-files": ["scripts/engine.py"]})
@@ -1110,6 +1147,9 @@ def test_build_recipe_and_independent_member_versions(tmp_path, capsys, target, 
     recipe = bundle.members[0].build_receipt.value
     assert recipe["commandsAndSettings"]["operation"] == requests[0].operation
     assert recipe["platformAndTools"]["runtimes"][0]["version"]
+    assert recipe["platformAndTools"]["tools"] == [
+        {"id": "step-1-tool-python", "version": recipe["platformAndTools"]["runtimes"][0]["version"]},
+    ]
     assert recipe["installationArtifactPath"] == recipe["artifacts"][0]["path"]
     if second_target:
         other = results.read_artifact_receipt_chain(repository, tag="bundles/suite/2.0.0",

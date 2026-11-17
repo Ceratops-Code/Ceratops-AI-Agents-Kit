@@ -90,15 +90,21 @@ def test_dependabot_retarget_preserves_existing_pr_controls(
     assert message in blockers[0]["message"]
 
 
-@pytest.mark.parametrize("bot_state", [
-    "absent", "renovate", "renovate_clean", "configured", "configuration_failed", "lookup_failed", "unavailable",
+@pytest.mark.parametrize("annotation_state,wait_status,bot_state,has_prs", [
+    *((annotation, wait, bot, True)
+      for annotation in ("clear", "warning", "unavailable")
+      for wait in ("ready", "timed_out", "failed")
+      for bot in ("absent", "renovate", "renovate_clean", "configured",
+                  "configuration_failed", "lookup_failed", "unavailable")),
+    # With no PRs, rebase/CI-message states do not apply. Exercise each observed
+    # bot state and interruption once without multiplying equivalent cases.
+    *(("clear", "ready", bot, False) for bot in ("renovate_clean", "configured", "renovate",
+                                                "configuration_failed", "lookup_failed", "unavailable")),
 ])
-@pytest.mark.parametrize("wait_status", ["ready", "timed_out", "failed"])
-@pytest.mark.parametrize("annotation_state", ["clear", "warning", "unavailable"])
 @pytest.mark.parametrize("interruption", ["none", "before_write", "after_write"])
 def test_dependency_review_collects_evidence_after_rebase_wait(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, wait_status: str,
-    annotation_state: str, interruption: str, bot_state: str,
+    annotation_state: str, interruption: str, bot_state: str, has_prs: bool,
 ) -> None:
     queue = load_pr_workflow_module(monkeypatch, "dependency_queue")
     common = load_pr_workflow_module(monkeypatch, "dependency_common")
@@ -116,7 +122,7 @@ def test_dependency_review_collects_evidence_after_rebase_wait(
     pr = {"repo": "owner/repo", "number": 1, "title": old["title"]}
     snapshot = {
         "outcome": {"blocked": False}, "summary": {"org": "owner"},
-        "open_dependabot_prs": [pr], "open_dependabot_alerts": [],
+        "open_dependabot_prs": [pr] if has_prs else [], "open_dependabot_alerts": [],
     }
     monkeypatch.setattr(
         queue, "refresh_snapshot",
@@ -135,6 +141,8 @@ def test_dependency_review_collects_evidence_after_rebase_wait(
              "body": ("## Configuration Errors\nInvalid registry setting\n" if bot_state == "renovate" else "")
                       + "## Open\nTwo PRs"},
         ]
+        if not has_prs:
+            observed = [issue for issue in observed if "pull_request" not in issue]
     if bot_state in {"configured", "configuration_failed", "lookup_failed"}:
         (tmp_path / "renovate.json").write_text('{"extends":["config:recommended"]}')
     api = Mock(return_value=SimpleNamespace(ok=bot_state != "unavailable", data=observed,
@@ -148,16 +156,17 @@ def test_dependency_review_collects_evidence_after_rebase_wait(
             {"status": "blocked", "errors": ["Registry lookup failed"]}] * 3
     monkeypatch.setattr(queue, "read_renovate_configuration", native_read)
     monkeypatch.setattr(queue, "fetch_pr_batch", lambda *_: ({("owner/repo", number): old
-        for number in ([1, 2] if bot_state in {"renovate", "renovate_clean"} else [1])}, []))
+        for number in (([1, 2] if bot_state in {"renovate", "renovate_clean"} else [1]) if has_prs else [])}, []))
 
     def wait(details: dict[Any, Any]):
-        assert details[("owner/repo", 1)]["head_oid"] == "a" * 40
+        if has_prs:
+            assert details[("owner/repo", 1)]["head_oid"] == "a" * 40
         order.append("wait")
         return {key: {**new, "author": "renovate[bot]" if key[1] == 2 else "app/dependabot",
                       "title": "Update dependency demo to v1.0.1" if key[1] == 2 else old["title"]}
                 for key in details}, (
             [{"repo": "owner/repo", "pr": 1, "check": "branch_freshness", "message": "unavailable"}]
-            if wait_status == "failed" else []
+            if has_prs and wait_status == "failed" else []
         )
 
     monkeypatch.setattr(queue, "wait_for_dependency_rebases", wait)
@@ -229,21 +238,25 @@ def test_dependency_review_collects_evidence_after_rebase_wait(
     payload = json.loads(output.read_text(encoding="utf-8"))
     repository = payload["repositories"][0]
     assert repository["checkout"]["explicit"] is True
-    result_pr = repository["pull_requests"][0]
-    assert result_pr["live"]["head_oid"] == "b" * 40
-    assert result_pr["decision_gates"]["rebase_repair_required"] == (wait_status == "timed_out")
-    assert result_pr["ci_annotations"] == annotations
-    assert result_pr["decision_gates"]["ci_warning_review_required"] == (annotation_state == "warning")
-    count = 2 if bot_state in {"renovate", "renovate_clean"} else 1
+    if has_prs:
+        result_pr = repository["pull_requests"][0]
+        assert result_pr["live"]["head_oid"] == "b" * 40
+        assert result_pr["decision_gates"]["rebase_repair_required"] == (wait_status == "timed_out")
+        assert result_pr["ci_annotations"] == annotations
+        assert result_pr["decision_gates"]["ci_warning_review_required"] == (annotation_state == "warning")
+    count = (2 if bot_state in {"renovate", "renovate_clean"} else 1) if has_prs else 0
     assert payload["summary"]["ci_warning_annotations"] == count * int(annotation_state == "warning")
     assert payload["summary"]["ci_annotation_reads_unavailable"] == count * int(annotation_state == "unavailable")
     assert payload["outcome"]["blocked"] == (
-        wait_status == "failed" or annotation_state == "unavailable"
+        has_prs and (wait_status == "failed" or annotation_state == "unavailable")
         or bot_state in {"renovate", "configuration_failed", "lookup_failed", "unavailable"}
     )
+    assert payload["outcome"]["queue_present"] == has_prs
+    assert payload["outcome"]["attention_required"] == (has_prs or payload["outcome"]["blocked"])
+    assert payload["outcome"]["routine"] == (not has_prs and not payload["outcome"]["blocked"])
     assert order == ["wait", "ci"] + ["tree"] * count
     assert payload["summary"]["open_dependency_prs"] == count
-    assert payload["summary"]["open_renovate_prs"] == int(bot_state in {"renovate", "renovate_clean"})
+    assert payload["summary"]["open_renovate_prs"] == int(has_prs and bot_state in {"renovate", "renovate_clean"})
     if bot_state not in {"absent", "unavailable"}:
         processing = payload["dependency_processing"]["owner/repo"]
         assert {"hosted_job_status", "job_log_links", "reason", "next_action"}.isdisjoint(processing)
@@ -253,7 +266,7 @@ def test_dependency_review_collects_evidence_after_rebase_wait(
             assert any(call.kwargs.get("lookup") for call in native_read.call_args_list)
         assert bool(processing["problems"]) == (bot_state == "renovate")
         assert repository["dependency_processing"] == processing
-        if bot_state in {"renovate", "renovate_clean"}:
+        if has_prs and bot_state in {"renovate", "renovate_clean"}:
             assert repository["pull_requests"][1]["provider"] == "renovate"
         if bot_state == "renovate":
             assert "Invalid registry setting" in processing["problems"][0]
@@ -272,6 +285,7 @@ def test_dependency_review_collects_evidence_after_rebase_wait(
     repeated = json.loads(output.read_text(encoding="utf-8"))
     assert repeated["repositories"] == payload["repositories"]
     assert repeated["summary"] == payload["summary"]
+    assert repeated["outcome"] == payload["outcome"]
     if (bot_state, wait_status, annotation_state, interruption) == ("absent", "ready", "clear", "none"):
         snapshot["repositories"] = [{"full_name": "owner/repo", "name": "repo", "fork": True}]
         args.retarget_dependency_prs = True

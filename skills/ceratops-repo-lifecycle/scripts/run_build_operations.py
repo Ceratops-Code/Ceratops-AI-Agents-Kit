@@ -295,21 +295,27 @@ def collect_build_details(item):
             )
             if result.returncode:
                 error = operations.OperationError("Cannot read the builder's Python environment.")
-                error.__dict__["command_failure"] = command_failure_details(result, target=item.operation)
+                error.__dict__["payload"] = {"command_failure": command_failure_details(result, target=item.operation)}
                 raise error
             try:
                 observation = json.loads(result.stdout)
             except (ValueError, TypeError) as exc:
                 error = operations.OperationError("Builder environment reader returned malformed output.")
-                error.__dict__["command_failure"] = command_failure_details(result, target=item.operation)
+                error.__dict__["payload"] = {"command_failure": command_failure_details(result, target=item.operation)}
                 raise error from exc
         platform = observation
         settings["environment"] = observation["variables"]
         for name, executable in required.items():
-            identity = observation["tools"][executable["executable"]]["sha256"]
-            if identity is None:
-                raise operations.OperationError(f"Required build tool is unavailable: {name}")
-            tools.append({"id": f"step-{index + 1}-{name}", "version": "sha256:" + identity})
+            tool = observation["tools"].get(executable["executable"])
+            if tool is None:
+                # The shared reader deliberately omits Git from execution inputs.
+                continue
+            if tool["version"] is None:
+                error = operations.OperationError(
+                    f"Cannot read required build tool {name} for {item.operation}: {tool['error']}")
+                error.__dict__["payload"] = {"tool_failure": {"tool": name, **tool}}
+                raise error
+            tools.append({"id": f"step-{index + 1}-tool-{name}", "version": tool["version"]})
         runtime = observation.get("runtime", {})
         if runtime:
             runtimes.extend([
@@ -942,10 +948,12 @@ def execute_sdlc_operations(
                                 "result": result,
                             })
             except (OSError, ValueError, KeyError, TypeError, store_artifacts.OperationError) as exc:
+                failure = {**getattr(exc, "payload", {}), "operation": operation,
+                           "status": "result_invalid", "message": str(exc)}
                 if results and results[-1].get("operation") == operation:
-                    results[-1].update(status="result_invalid", message=str(exc))
+                    results[-1].update(failure)
                 else:
-                    results.append({"operation": operation, "status": "result_invalid", "message": str(exc)})
+                    results.append(failure)
         source_gate_failed = any(
             result["status"] in operations.FAILED_STATUSES
             and result["operation"].startswith("repository.actions.pre-build-checks.")
