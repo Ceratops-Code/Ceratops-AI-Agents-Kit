@@ -562,7 +562,7 @@ def execute_sdlc_operations(
         "pre-build-checks", "post-build-checks", "build", "bootstrap", "test-selection"}]
     by_reference = {item.operation.rsplit(".actions.", 1)[0]: item for item in builds}
     try:
-        # Repair only an unfinished final append before read-only reuse planning.
+        # Repair only an unfinished final append before retiring removed checks.
         # The checkout's current command owns this file; complete bad records
         # still stop preparation with their original diagnostic.
         for root in {item.repo_root for item in prepared if item.check_results is not None}:
@@ -595,11 +595,6 @@ def execute_sdlc_operations(
                     ) for argv in commands_now):
                         continue  # A moved command retains its original pass.
                     current.remove_deleted("repository-check", {name}, entry["target"])
-        before = [
-            replace(item, check_plan=reuse_operation_checks.decide_check_reuse(item))
-            if item.check_results is not None and not item.artifact_references else item
-            for item in before
-        ]
     except (OSError, ValueError) as exc:
         return preparation_failed(str(exc))
     commands = {item.operation: item for item in [*before, *builds]}
@@ -835,7 +830,7 @@ def execute_sdlc_operations(
             prepare_build_or_reuse(producer)
         current_commit = operations.repository_commit(item.repo_root)
         if item.commit != current_commit:
-            item = replace(item, commit=current_commit, check_plan=None)
+            item = replace(item, commit=current_commit)
         return run(item.with_artifacts(available))
 
     for item in setup:
@@ -891,7 +886,7 @@ def execute_sdlc_operations(
                     latest = next((value for value in reversed(results) if value.get("operation") == gate.operation), None)
                     if latest is not None and latest.get("commit") not in {None, item.commit}:
                         results[:] = [value for value in results if value.get("operation") != gate.operation]
-                        gate_result = run_check(replace(gate, commit=item.commit, check_plan=None))
+                        gate_result = run_check(replace(gate, commit=item.commit))
                         if gate_result["status"] == "decision_required":
                             break
                         if gate_result["status"] in operations.FAILED_STATUSES:

@@ -894,13 +894,37 @@ def test_versioned_fresh_instance_discovers_attempt_and_reuses_prepared_results(
     assert storage._build_request_record(reused)["preTestCommit"] is None
 
 
-def test_versioned_completion_needs_no_checkpoint_directory(tmp_path) -> None:
-    _repository, _checkpoint, transaction, prepared, _receipts = _prepared_versioned_completion(tmp_path)
+def test_versioned_completion_needs_no_checkpoint_directory(tmp_path, monkeypatch) -> None:
+    repository, _checkpoint, transaction, prepared, receipts = _prepared_versioned_completion(tmp_path)
     first = completion.complete_versioned_artifacts(transaction, prepared)
     second = completion.complete_versioned_artifacts(transaction, prepared)
     assert first == second
     assert not (transaction.store.parent / "operations/artifact-versions").exists()
     assert not (transaction.store.parent / "locks/artifact-versions").exists()
+    for _ in range(2):
+        reads = Mock(wraps=results.read_artifact_receipt_chain)
+        with monkeypatch.context() as patch:
+            patch.setattr(results, "read_artifact_receipt_chain", reads)
+            fresh = completion.read_artifact_build(
+                repository, repository=transaction.repository, release_bundle=transaction.release_bundle,
+                version=transaction.version, required_targets=transaction.required_targets,
+            )
+        assert [call.kwargs["expected"]["target"] for call in reads.call_args_list] == list(transaction.required_targets)
+        assert completion.complete_versioned_artifacts(fresh) == first
+    # No loaded record survives a later call. Damage to either target's retained
+    # bytes must still stop reopening, including the target read first.
+    for target in transaction.required_targets:
+        artifact = transaction.artifact_receipt(target).parent / receipts[target]["artifacts"][0]["path"]
+        original = artifact.read_bytes()
+        artifact.write_bytes(b"changed retained output")
+        try:
+            with pytest.raises(results.StepResultError, match="(size|SHA-256) mismatch"):
+                completion.read_artifact_build(
+                    repository, repository=transaction.repository, release_bundle=transaction.release_bundle,
+                    version=transaction.version, required_targets=transaction.required_targets,
+                )
+        finally:
+            artifact.write_bytes(original)
 
 
 def test_versioned_request_may_own_multiple_units_without_premature_cleanup(tmp_path) -> None:

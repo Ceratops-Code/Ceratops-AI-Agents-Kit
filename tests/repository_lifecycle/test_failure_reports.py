@@ -849,12 +849,12 @@ def test_reused_check_retires_report_without_executing_command(report_repo, monk
               "check_decision": "reused", "check_result": {"path": str(accepted)}}
     plan = SimpleNamespace(
         context={"fingerprint": "same", "group": "tests.unit"},
-        store=SimpleNamespace(select=lambda *_args, **_kwargs: {"decision": "reuse"},
-                              current=runner.reuse_operation_checks.CheckResultStore(repo).current),
+        decision={"decision": "reuse"},
+        store=SimpleNamespace(current=runner.reuse_operation_checks.CheckResultStore(repo).current),
         reused_result=lambda _prepared: result,
     )
-    monkeypatch.setattr(runner.reuse_operation_checks, "collect_check_inputs", lambda *_args: {"fingerprint": "same", "group": "tests.unit"})
-    operation = replace(operation, check_results={}, check_plan=plan)
+    monkeypatch.setattr(runner.reuse_operation_checks, "decide_check_reuse", Mock(return_value=plan))
+    operation = replace(operation, check_results={})
     original_unlink = pathlib.Path.unlink
 
     def interrupted(selected, *args, **kwargs):

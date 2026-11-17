@@ -15,6 +15,7 @@ import sys
 import time
 import xml.etree.ElementTree as ET
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 
@@ -1001,19 +1002,20 @@ def test_unrelated_changes_keep_original_provenance_and_changed_inputs_execute(t
 
 
 @pytest.mark.parametrize("report_selected", [False, True])
-def test_incomplete_ownership_blocks_the_batch_before_any_callback(
+def test_incomplete_ownership_blocks_its_check_and_keeps_earlier_results(
     tmp_path, monkeypatch, report_selected,
 ):
     repo = tmp_path / "repo"
     repo.mkdir()
     _fixture(repo)
     valid = _check(repo)
-    invalid = runner.replace(valid, check_results={"product-inputs": ["unknown/*.py"], "check-inputs": ["scripts/check.py"]})
+    invalid = runner.replace(valid, operation=valid.operation + "-invalid",
+                             check_results={"product-inputs": ["unknown/*.py"], "check-inputs": ["scripts/check.py"]})
     report_path = tmp_path / "tmp/repo/repo/_promote_failure.json"
     accepted = tmp_path / "accepted.json"
     accepted.write_text("original accepted bytes")
-    callbacks = []
-    monkeypatch.setattr(runner, "run_progress_command", lambda *args, **kw: callbacks.append(args))
+    callbacks = Mock(wraps=runner.run_progress_command)
+    monkeypatch.setattr(runner, "run_progress_command", callbacks)
     result = runner.execute_prepared_operations(
         [valid, invalid],
         diagnostic_output=report_path if report_selected else None,
@@ -1021,18 +1023,18 @@ def test_incomplete_ownership_blocks_the_batch_before_any_callback(
         successful_results=[{"status": "passed", "path": str(accepted)}],
     )
     assert result["status"] == "result_invalid"
-    assert "ownership" in result["message"]
-    assert callbacks == []
-    assert result["completed_operations"] == []
-    assert result["pending_operations"] == [valid.operation, invalid.operation]
-    assert result["successful_result_paths"] == [str(accepted)]
+    assert "ownership" in result["results"][-1]["message"]
+    assert callbacks.call_count == 1
+    assert result["completed_operations"] == [valid.operation]
+    assert result["pending_operations"] == [invalid.operation]
+    assert str(accepted) in result["successful_result_paths"]
+    assert (repo / "source-checks.txt").read_text() == "x"
     if report_selected:
         report = json.loads(report_path.read_text())
         assert result["diagnostic_output"] == str(report_path)
         assert report["owner"]["action"] == "promote"
-        assert report["successful_result_paths"] == [str(accepted)]
-        preparation_id = f"operation_preparation:{valid.operation},{invalid.operation}"
-        assert "ownership" in report["failures"][preparation_id]["message"]
+        assert str(accepted) in report["successful_result_paths"]
+        assert any("ownership" in value["message"] for value in report["failures"].values())
     else:
         assert not report_path.exists()
     assert accepted.read_text() == "original accepted bytes"
@@ -1143,16 +1145,31 @@ def test_saved_corruption_blocks_a_fresh_call_without_repeating_the_check(tmp_pa
     assert path.read_bytes() == before
 
 
-def test_an_earlier_callback_cannot_make_a_preflight_reuse_decision_stale(tmp_path):
+@pytest.mark.parametrize("entry", ["operation-batch", "build-batch"])
+def test_check_reuse_is_decided_once_after_earlier_operations(tmp_path, monkeypatch, entry):
     commit = _fixture(tmp_path)
     assert runner.execute_prepared_operation(_check(tmp_path))["status"] == "completed"
     setup = runner.PreparedOperation(
         tmp_path, "repository.actions.bootstrap", "bootstrap", commit,
         (runner.PreparedStep(1, (sys.executable, "-c", "from pathlib import Path; Path('source.py').write_text('value = 3\\n')"), tmp_path),), {},
     )
-    result = runner.execute_prepared_operations([setup, _check(tmp_path)])
-    assert result["status"] == "completed", result
-    assert result["results"][-1]["check_decision"] == "executed"
+    check = _check(tmp_path)
+    if entry == "operation-batch":
+        check = runner.replace(check, check_phase=None, check_group=None)
+    collected = Mock(wraps=reuse.collect_check_inputs)
+    decisions = Mock(wraps=reuse.decide_check_reuse)
+    summaries = Mock(wraps=reuse.select_build_check_summaries)
+    monkeypatch.setattr(reuse, "collect_check_inputs", collected)
+    monkeypatch.setattr(reuse, "decide_check_reuse", decisions)
+    monkeypatch.setattr(reuse, "select_build_check_summaries", summaries)
+    monkeypatch.setattr(runner.sdlc_results, "select_build_check_summaries", summaries)
+    for attempt, outcome in enumerate(("executed", "reused"), 1):
+        result = runner.execute_prepared_operations([setup, check])
+        assert result["status"] == "completed", result
+        assert result["results"][-1]["check_decision"] == outcome
+        assert collected.call_count == summaries.call_count == attempt
+        assert sum(call.args[0].check_results is not None for call in decisions.call_args_list) == attempt
+        assert summaries.call_args.kwargs["requested_check"]["group"] == check.operation
     assert (tmp_path / "source-checks.txt").read_text() == "xx"
 
 

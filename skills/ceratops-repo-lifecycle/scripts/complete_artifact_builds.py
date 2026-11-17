@@ -1086,6 +1086,7 @@ def read_artifact_build(
     request = directory / "build_request.json"
     branch = _git_text(root, ["symbolic-ref", "--quiet", "--short", "HEAD"], label="branch")
     registration = _git_text(root, ["rev-parse", "--absolute-git-dir"], label="Git registration")
+    first_target_receipt = None
     if request.exists() or request.is_symlink():
         record = _read_transaction_record(request, "Artifact build request")
         commit = _validated_commit(root, record.get("preTestCommit"))
@@ -1093,14 +1094,14 @@ def read_artifact_build(
         attempt = _require_identifier(record.get("attemptId"), label="attempt ID", pattern=LOGICAL_ID_RE)
         paths = _validated_relative_paths(record.get("declaredInputPaths"), label="declared input path")
     else:
-        selected = sdlc_results.read_artifact_receipt_chain(
+        first_target_receipt = sdlc_results.read_artifact_receipt_chain(
             root, tag=f"{unit}/{version}", expected=sdlc_results.artifact_identity(repository, unit, version, targets[0]),
         )
         # A completed original may have been retired after an identical copy
         # reached the shared pool. Report that actual location to consumers.
-        output = selected.receipt_path.parent
+        output = first_target_receipt.receipt_path.parent
         directory = output if len(targets) == 1 else output.parent
-        receipt = selected.build_receipt.value
+        receipt = first_target_receipt.build_receipt.value
         commit = receipt["preTestCommit"]
         allocation_commit = commit
         attempt = receipt["identity"]["attemptId"]
@@ -1115,26 +1116,34 @@ def read_artifact_build(
     )
     if request.exists():
         _require_build_request(transaction)
-    elif _completed_versioned_result(transaction) is None:
+    elif _completed_versioned_result(transaction, first_target_receipt=first_target_receipt) is None:
         raise RecoveryRequired("Artifact build has neither an owned request nor a completed tag.")
     return transaction
 
 
 def _completed_versioned_result(
     transaction: ArtifactVersionTransaction,
+    *, first_target_receipt: sdlc_results.CompletedArtifactSelection | None = None,
 ) -> CompletedArtifactVersion | None:
-    """Recognize durable success by the existing tag/receipt chain, not a journal."""
+    """Read completed targets, reusing the first receipt loaded by this call.
+
+    Reopening a build needs that receipt to construct its transaction. No build
+    or file mutation intervenes before it reaches here. Later completion calls
+    omit it and read retained files again because those files could have changed.
+    """
     final_commit = _artifact_tag_commit(transaction)
     if final_commit is None:
         return None
     artifact_receipts: list[pathlib.Path] = []
     for target in transaction.required_targets:
-        selected = sdlc_results.read_artifact_receipt_chain(
-            transaction.repo_root,
-            tag=f"{transaction.release_bundle}/{transaction.version}",
-            expected=sdlc_results.artifact_identity(
-                transaction.repository, transaction.release_bundle, transaction.version, target, transaction.attempt_id),
-        )
+        selected = first_target_receipt if target == transaction.required_targets[0] else None
+        if selected is None:
+            selected = sdlc_results.read_artifact_receipt_chain(
+                transaction.repo_root,
+                tag=f"{transaction.release_bundle}/{transaction.version}",
+                expected=sdlc_results.artifact_identity(
+                    transaction.repository, transaction.release_bundle, transaction.version, target, transaction.attempt_id),
+            )
         _validate_prepared_receipt(transaction, target, selected.build_receipt.raw)
         if selected.final_commit != final_commit:
             raise RecoveryRequired("Completed artifact targets disagree on their final commit.")

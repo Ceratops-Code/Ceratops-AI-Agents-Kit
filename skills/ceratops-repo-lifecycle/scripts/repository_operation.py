@@ -130,7 +130,6 @@ class PreparedOperation:
     check_results: dict[str, Any] | None = None
     qualification_level: str = "alpha"
     source_input_paths: tuple[str, ...] | None = None
-    check_plan: Any = None
     result_commit_field: str | None = None
     mcp_source: str | None = None
     check_group: str | None = None
@@ -668,26 +667,10 @@ def execute_prepared_operation(
                 reuse_operation_checks.artifact_inputs(prepared.repo_root, dict(prepared.selected_artifacts or {}))
                 for files in (prepared.build_check_artifacts or {}).values():
                     reuse_operation_checks.artifact_inputs(prepared.repo_root, files)
-            check_plan = prepared.check_plan
-            if prepared.check_results is not None and check_plan is None:
-                check_plan = reuse_operation_checks.decide_check_reuse(prepared)
+            # Decide from current inputs and results only when this check is
+            # about to run; earlier operations may have changed either one.
+            check_plan = reuse_operation_checks.decide_check_reuse(prepared)
             if check_plan is not None:
-                if prepared.check_results is None:
-                    raise ValueError("Check plan has no current owned input declaration.")
-                # An earlier callback may have changed declared inputs after the batch
-                # preflight. Read current inputs before consuming that original pass.
-                current = reuse_operation_checks.collect_check_inputs(prepared, prepared.check_results)
-                if current["fingerprint"] != check_plan.context["fingerprint"]:
-                    check_plan = reuse_operation_checks.decide_check_reuse(prepared)
-                else:
-                    check_plan.decision = check_plan.store.select(
-                        current, check_id=current["group"],
-                        builds=sdlc_results.select_build_check_summaries(
-                            prepared.repo_root, qualification_level=prepared.qualification_level,
-                        ),
-                    )
-                    if check_plan.decision["decision"] == "blocked":
-                        raise ValueError("Recorded check evidence blocks reuse: " + check_plan.decision["reason"])
                 if check_plan.decision["decision"] == "reuse":
                     check_plan.store.current.remove_deleted("check-decision", {prepared.operation}, {
                         "target": prepared.build_target or dict(prepared.parameters).get("target"),
@@ -1117,15 +1100,10 @@ def execute_prepared_operations(
             diagnostic_owner=diagnostic_owner, successful_results=successful_results,
         )
 
-    # Resolve every marked check before the first check/build callback. Later
-    # phases consume these original plans; no result payload crosses the model.
     preparation_id = "operation_preparation:" + ",".join(item.operation for item in prepared)
     try:
         if any(item.result_commit_field for item in prepared[:-1]):
             raise ValueError("A build returning its final commit must be the last selected operation.")
-        prepared = [replace(item, check_plan=reuse_operation_checks.decide_check_reuse(item))
-                    if item.check_results is not None and item.check_plan is None else item
-                    for item in prepared]
     except (OSError, ValueError) as exc:
         failure = {"status": "result_invalid", "message": str(exc)}
         owner_root, action = diagnostic_owner or (prepared[0].repo_root, "operation")
