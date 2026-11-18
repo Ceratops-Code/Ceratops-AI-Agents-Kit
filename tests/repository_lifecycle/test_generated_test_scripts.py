@@ -98,6 +98,9 @@ def test_custom_runner_keeps_behavior_and_can_select_generated_support(tmp_path,
     manifest = tmp_path / "skills/skill-sections.json"
     manifest.parent.mkdir(exist_ok=True)
     manifest.write_text('{"custom": true}\n')
+    sdlc = tmp_path / ".ceratops/sdlc/sdlc.yml"
+    sdlc.parent.mkdir(parents=True)
+    sdlc.write_text('version: 5\nrepository:\n  actions: {}\n')
     baseline = {path: path.read_bytes() for path in tmp_path.rglob('*') if path.is_file()}
     arguments = ["--target-repo-root", str(tmp_path), "--test-support-only"]
     monkeypatch.setattr(application, "setup_runtime", Mock(side_effect=AssertionError("unrelated environment setup")))

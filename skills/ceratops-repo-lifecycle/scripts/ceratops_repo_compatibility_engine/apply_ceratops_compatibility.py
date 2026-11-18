@@ -515,7 +515,9 @@ def plan_ceratops_compatibility(
         if not project.is_file():
             raise RuntimeError(f"test support refresh requires the existing tooling project: {project}")
         sdlc_path = repo_root / surface_path("sdlc")
-        sdlc = repository_checks.load_mapping(sdlc_path) if sdlc_path.is_file() else {}
+        sdlc = yaml.safe_load(sdlc_path.read_text(encoding="utf-8")) if sdlc_path.is_file() else {}
+        if not isinstance(sdlc, dict):
+            raise RuntimeError("test support refresh requires an SDLC mapping")
         targets = discover_python_tests(repo_root, contract["python_test_detection"])
         content = generated_test_runner(repo_root, contract, sdlc, targets)
         outputs: dict[pathlib.Path, str] = {}
@@ -959,7 +961,7 @@ def main(argv: list[str] | None = None) -> int:
         ):
             detail = "; ".join(compatibility["errors"]) or "not applicable"
             raise RuntimeError(f"repository compatibility failed: {detail}")
-    except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
+    except (OSError, RuntimeError, ValueError, json.JSONDecodeError, yaml.YAMLError) as exc:
         reason = str(exc)
         if mutation_started:
             try:
