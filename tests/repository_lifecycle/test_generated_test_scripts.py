@@ -763,6 +763,24 @@ def test_runner_ownership_is_explicit_and_custom_sources_are_preserved(tmp_path:
     assert declared.returncode == 0
     assert json.loads(declared.stdout)["result_schema"] == "ceratops-repository-check-result.v1"
 
+    (root / "test_probe.py").write_text("assert True\n", encoding="utf-8")
+    application = importlib.import_module("ceratops_repo_compatibility_engine.apply_ceratops_compatibility")
+    sdlc_path = root / ".ceratops/sdlc/sdlc.yml"
+    sdlc_path.parent.mkdir(parents=True, exist_ok=True)
+    sdlc_path.write_text(json.dumps(sdlc), encoding="utf-8")
+    workflow = root / ".github/workflows/tests.yml"
+    workflow.parent.mkdir(parents=True)
+    workflow.write_text("jobs:\n  tests:\n    steps:\n      - run: uv run --locked scripts/run-tests.py\n      - run: echo application-owned\n", encoding="utf-8")
+    for _ in range(2):
+        plan = application.plan_ceratops_compatibility(root, None, {}, {}, apply_sdlc_contract=False, test_support_only=True)
+        application.apply_compatibility_plan(root, plan)
+        observed = application.yaml.safe_load(sdlc_path.read_text(encoding="utf-8"))
+        argv = observed["repository"]["actions"]["pre-build-checks"]["check-groups"]["tests"]["steps"][0]["run"]
+        assert argv.count("--temporary-root") == 1 and argv[-1] == "{temporary_root}"
+        jobs = application.yaml.safe_load(workflow.read_text(encoding="utf-8"))
+        assert jobs["jobs"]["tests"]["steps"][0]["run"].count("--temporary-root") == 1
+        assert jobs["jobs"]["tests"]["steps"][1]["run"] == "echo application-owned"
+
 
 
 def test_missing_uv_rolls_back_generated_files_before_compatibility_claim(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:

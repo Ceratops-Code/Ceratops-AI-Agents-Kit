@@ -522,6 +522,43 @@ def plan_ceratops_compatibility(
         content = generated_test_runner(repo_root, contract, sdlc, targets)
         outputs: dict[pathlib.Path, str] = {}
         record_generated_runner(repo_root, contract, content, outputs, support_only=True)
+        if content is not None:
+            # A refreshed managed runner requires an explicit scratch parent.
+            # Update only its existing invocations in the same transaction.
+            pending = [sdlc]
+            changed = False
+            while pending:
+                node = pending.pop()
+                if isinstance(node, dict):
+                    argv = node.get("run")
+                    if (isinstance(argv, list) and "scripts/run-tests.py" in argv
+                            and "--temporary-root" not in argv):
+                        argv.extend(["--temporary-root", "{temporary_root}"])
+                        changed = True
+                    pending.extend(node.values())
+                elif isinstance(node, list):
+                    pending.extend(node)
+            if changed:
+                outputs[sdlc_path] = yaml.safe_dump(sdlc, sort_keys=False, allow_unicode=True)
+            for workflow in sorted((repo_root / ".github/workflows").glob("*.y*ml")):
+                workflow_source = workflow.read_text(encoding="utf-8")
+                updated_workflow = workflow_source
+                pending = [yaml.safe_load(workflow_source)]
+                while pending:
+                    node = pending.pop()
+                    if isinstance(node, dict):
+                        command = node.get("run")
+                        if (isinstance(command, str) and "scripts/run-tests.py" in command
+                                and "--temporary-root" not in command):
+                            replacement = command.replace("scripts/run-tests.py", 'scripts/run-tests.py --temporary-root "${{ runner.temp }}/ceratops-tests"')
+                            if command not in updated_workflow:
+                                raise RuntimeError(f"Cannot update managed test command without rewriting its workflow: {workflow}")
+                            updated_workflow = updated_workflow.replace(command, replacement)
+                        pending.extend(node.values())
+                    elif isinstance(node, list):
+                        pending.extend(node)
+                if updated_workflow != workflow_source:
+                    outputs[workflow] = updated_workflow
         return CompatibilityPlan(
             manifest=None, skill_updates={}, canonical_sources={}, sdlc_contract=None,
             workflow_text=None, markdown_files={}, validation_checks=[], skills=[],

@@ -665,7 +665,9 @@ dependency declaration. Missing maps allow execution but no individual-test reus
 Custom runners are preserved; their support files are managed only when the
 scripts project declares `tool.ceratops.test-support.managed = true`.
 The compatibility command's `--test-support-only` mode can make that opt-in
-without applying unrelated repository layout, CI or skill changes. It records
+without applying unrelated repository layout, CI or skill changes. When refreshing
+a managed runner, it updates existing SDLC and CI calls with the required temporary
+directory argument inside the same rollback boundary. It records
 `result-module = "scripts/write_check_results.py"` for a custom runner's new
 shared writer, preserving application-specific result modules. Existing declared
 writer paths remain authoritative. The same snapshot and rollback code owns all

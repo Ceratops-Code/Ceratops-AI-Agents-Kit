@@ -1527,8 +1527,10 @@ test implementations and non-Python test commands remain repository-owned.
 For a repository that needs only newer test support, the installed compatibility
 command accepts `apply --target-repo-root REPO --test-support-only`, with
 `--allow-primary-checkout` for an authorized direct edit. It refreshes owned
-runners and reuse modules without changing SDLC, CI, skill manifests, dependencies
-or environments. Custom runners remain intact. On first opt-in, their generated
+runners and reuse modules while preserving custom runners, skill manifests,
+dependencies and environments. For managed runners, it adds their required
+temporary-directory argument to existing SDLC and CI calls in the same transaction.
+Other SDLC and CI commands remain intact. On first opt-in, their generated
 writer is `scripts/write_check_results.py`, recorded as
 `tool.ceratops.test-support.result-module` in the existing scripts project;
 repository-specific `scripts/result_records.py` APIs remain intact. Custom callers
