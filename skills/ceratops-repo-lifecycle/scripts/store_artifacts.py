@@ -491,7 +491,7 @@ def _inputs_match_commit(root: pathlib.Path, commit: str, paths: Sequence[str]) 
     if not paths:
         return True
     owned = set(paths)
-    dirty = False
+    changed_paths: set[str] = set()
     for flags in ([], ["--cached"]):
         changed = subprocess.run(
             ["git", "-C", str(root), "diff", *flags, "--name-only", "--no-renames", "-z", commit, "--"],
@@ -499,14 +499,22 @@ def _inputs_match_commit(root: pathlib.Path, commit: str, paths: Sequence[str]) 
         )
         if changed.returncode:
             raise OperationError(f"Git could not compare build inputs: {changed.stderr.strip()}")
-        dirty = dirty or bool(owned.intersection(changed.stdout.split("\0")))
+        changed_paths.update(changed.stdout.split("\0"))
     untracked = subprocess.run(
         ["git", "-C", str(root), "ls-files", "--others", "--exclude-standard", "-z"],
         capture_output=True, text=True, encoding="utf-8", check=False,
     )
     if untracked.returncode:
         raise OperationError(f"Git could not inspect build inputs: {untracked.stderr.strip()}")
-    return not dirty and not owned.intersection(untracked.stdout.split("\0"))
+    changed_paths.update(untracked.stdout.split("\0"))
+    # Literal Git pathspecs include directory descendants. Preserve that scope
+    # while keeping the command bounded, including deleted and new children.
+    return not any(
+        str(ancestor) in owned
+        for value in changed_paths if value
+        for path in (pathlib.PurePosixPath(value),)
+        for ancestor in (path, *path.parents)
+    )
 
 
 def _next_prerelease(version: str) -> str:

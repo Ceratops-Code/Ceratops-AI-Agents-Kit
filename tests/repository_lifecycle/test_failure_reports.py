@@ -20,7 +20,7 @@ from unittest.mock import Mock
 import pytest
 
 from tests.repository_lifecycle.support import OPERATION_RUNNER
-from tests.support.repositories import ROOT, run_git
+from tests.support.repositories import ROOT, run_git, write_sdlc_contract
 
 command = importlib.import_module("github_pr_workflow.command")
 runner = importlib.import_module("repository_operation")
@@ -736,6 +736,7 @@ def test_promote_forwards_path_and_preserves_result_file(report_repo, monkeypatc
 
 def test_ship_check_phase_forwards_selected_path_and_owner(report_repo, monkeypatch):
     repo, path = report_repo
+    write_sdlc_contract(repo)
     args = ship_repository.ShipOptions(repo_root=repo, head_branch="release/local", diagnostic_output=path)
     commands = []
 
@@ -923,6 +924,7 @@ def test_ship_retires_saved_delivery_failure_without_repeating_effect(report_rep
 
 def test_ship_check_result_clears_report_before_delivery(report_repo, monkeypatch):
     repo, path = report_repo
+    write_sdlc_contract(repo)
     save(repo, path, {"tests.unit:1": "failed"})
     calls = []
 

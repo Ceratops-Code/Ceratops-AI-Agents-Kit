@@ -309,7 +309,7 @@ def test_repository_ship_unfinished_checks_block_remote_mutation(
         assert state["calls"] == 0 and not log.exists()
         return
     args.sdlc_contract = pathlib.Path(".ceratops/sdlc/missing.yml")
-    with pytest.raises(loaded["RepositoryShipError"], match="repository file"):
+    with pytest.raises(loaded["RepositoryShipError"], match="Required SDLC contract is missing"):
         loaded["ship_repository"](args)
     assert state["calls"] == 0 and not log.exists()
 

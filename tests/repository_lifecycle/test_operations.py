@@ -263,7 +263,7 @@ def test_sdlc_template_is_a_schema_valid_empty_skeleton(tmp_path: pathlib.Path) 
     assert "repository.actions.pre-build-checks.check-groups.tests" in validation
 
 
-def test_absent_sdlc_section_is_a_successful_no_op(tmp_path: pathlib.Path) -> None:
+def test_optional_operation_requires_an_existing_sdlc_contract(tmp_path: pathlib.Path) -> None:
     result = subprocess.run(
         [
             sys.executable,
@@ -276,8 +276,8 @@ def test_absent_sdlc_section_is_a_successful_no_op(tmp_path: pathlib.Path) -> No
         text=True,
         check=False,
     )
-    assert result.returncode == 0, result.stderr
-    assert all(item["status"] == "no_op" for item in json.loads(result.stdout)["results"])
+    assert result.returncode == 1
+    assert "Required SDLC contract is missing" in json.loads(result.stderr)["message"]
     write_sdlc_contract(tmp_path)
     missing_operation = "deliverables.apps.missing.actions.install"
     missing = run_operation_cli(tmp_path, missing_operation)
