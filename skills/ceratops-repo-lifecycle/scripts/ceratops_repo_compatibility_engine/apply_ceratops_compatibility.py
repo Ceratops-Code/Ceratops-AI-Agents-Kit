@@ -34,6 +34,7 @@ from .compatibility_contract import (
 from .generate_test_script import (
     discover_python_tests,
     generated_test_runner,
+    generated_support_errors,
     record_generated_runner,
     test_operation,
 )
@@ -120,6 +121,7 @@ class CompatibilityPlan:
     updated_markers: list[str]
     runtime_files: dict[pathlib.Path, str]
     python_tests: list[str]
+    test_support_only: bool = False
 
 
 def require_authorized_checkout(
@@ -503,8 +505,27 @@ def plan_ceratops_compatibility(
     existing: Mapping[str, object],
     *,
     apply_sdlc_contract: bool,
+    test_support_only: bool = False,
 ) -> CompatibilityPlan:
     """Validate target evidence and compose writes without changing files."""
+
+    if test_support_only:
+        contract = load_compatibility_contract()
+        project = repo_root / surface_path("validation_project")
+        if not project.is_file():
+            raise RuntimeError(f"test support refresh requires the existing tooling project: {project}")
+        sdlc_path = repo_root / surface_path("sdlc")
+        sdlc = repository_checks.load_mapping(sdlc_path) if sdlc_path.is_file() else {}
+        targets = discover_python_tests(repo_root, contract["python_test_detection"])
+        content = generated_test_runner(repo_root, contract, sdlc, targets)
+        outputs: dict[pathlib.Path, str] = {}
+        record_generated_runner(repo_root, contract, content, outputs, support_only=True)
+        return CompatibilityPlan(
+            manifest=None, skill_updates={}, canonical_sources={}, sdlc_contract=None,
+            workflow_text=None, markdown_files={}, validation_checks=[], skills=[],
+            updated_markers=[], runtime_files=outputs, python_tests=targets,
+            test_support_only=True,
+        )
 
     skill_paths = sorted((repo_root / "skills").glob("*/SKILL.md"))
     skill_names = {path.parent.name for path in skill_paths}
@@ -721,6 +742,8 @@ def apply_compatibility_plan(
         destination.write_text(
             content.replace("\r\n", "\n"), encoding="utf-8", newline=newline
         )
+    if plan.test_support_only:
+        return
     for relative, text in plan.markdown_files.items():
         (repo_root / relative).write_text(text, encoding="utf-8", newline="")
     if plan.canonical_sources:
@@ -780,6 +803,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--runtime-source-id")
     parser.add_argument("--allow-primary-checkout", action="store_true",
                         help="Permit an explicitly authorized primary main or release/local checkout.")
+    parser.add_argument("--test-support-only", action="store_true",
+                        help="Refresh owned test support without changing application, skill or CI configuration.")
     args = parser.parse_args(argv)
     repo_root = args.target_repo_root.resolve()
     phase = "preflight"
@@ -792,16 +817,16 @@ def main(argv: list[str] | None = None) -> int:
     try:
         runtime = load_compatibility_contract()["runtime"]
         require_authorized_checkout(repo_root, allow_primary_checkout=args.allow_primary_checkout)
-        template = repository_checks.load_mapping(template_path("skill_manifest"))
-        validate_template(template)
         existing_path = repo_root / surface_path("skill_manifest")
-        existing = repository_checks.load_mapping(existing_path) if existing_path.is_file() else {}
-        has_source_skills = any((repo_root / "skills").glob("*/SKILL.md"))
-        source_id = (
-            runtime_source_id(repo_root, args.runtime_source_id, existing)
-            if has_source_skills
-            else None
-        )
+        template = {}
+        existing = {}
+        source_id = None
+        if not args.test_support_only:
+            template = repository_checks.load_mapping(template_path("skill_manifest"))
+            validate_template(template)
+            existing = repository_checks.load_mapping(existing_path) if existing_path.is_file() else {}
+            if any((repo_root / "skills").glob("*/SKILL.md")):
+                source_id = runtime_source_id(repo_root, args.runtime_source_id, existing)
         phase = "compatibility_planning"
         plan = plan_ceratops_compatibility(
             repo_root,
@@ -809,6 +834,7 @@ def main(argv: list[str] | None = None) -> int:
             template,
             existing,
             apply_sdlc_contract=True,
+            test_support_only=args.test_support_only,
         )
         skill_paths = sorted((repo_root / "skills").glob("*/SKILL.md"))
         mutable_paths = [
@@ -817,6 +843,8 @@ def main(argv: list[str] | None = None) -> int:
             *plan.runtime_files,
             repo_root / runtime["lockfile"],
         ]
+        if plan.test_support_only:
+            mutable_paths = list(plan.runtime_files)
         mutable_paths.extend(repo_root / name for name in plan.markdown_files)
         mutable_paths.extend(
             repo_root / "skills" / "sections" / f"{section_name}.md"
@@ -851,6 +879,8 @@ def main(argv: list[str] | None = None) -> int:
                 or plan.workflow_text is not None
             )
         ]
+        if plan.test_support_only:
+            created_dirs = []
         # Include every new ancestor before writing payloads. Rollback removes
         # only empty directories after restoring files and the owned environment.
         new_directories = set(created_dirs)
@@ -878,6 +908,17 @@ def main(argv: list[str] | None = None) -> int:
         mutation_started = True
         apply_compatibility_plan(repo_root, plan)
         bootstrap_status = "skipped"
+        if plan.test_support_only:
+            phase = "test_support_files"
+            support_errors = generated_support_errors(repo_root, load_compatibility_contract())
+            if support_errors:
+                raise RuntimeError("; ".join(support_errors))
+            print(json.dumps({
+                "status": "ok", "scope": "test-support", "rollback": "not_needed",
+                "files": [path.relative_to(repo_root).as_posix() for path in plan.runtime_files],
+                "runner": "refreshed" if test_runner in plan.runtime_files else "preserved",
+            }, sort_keys=True))
+            return 0
         if plan.skills:
             phase = "bootstrap_synchronization"
             from .bootstrap_installer_synchronization import (
@@ -926,7 +967,8 @@ def main(argv: list[str] | None = None) -> int:
                     remove_created_environment(repo_root, runtime["environment"])
                 restore_snapshots(snapshots, created_dirs)
                 if (
-                    not environment_created
+                    not args.test_support_only
+                    and not environment_created
                     and (repo_root / runtime["lockfile"]).is_file()
                 ):
                     setup_runtime(repo_root, runtime)

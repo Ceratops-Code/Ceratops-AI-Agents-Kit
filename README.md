@@ -1524,6 +1524,18 @@ give `--project` the repository's absolute `scripts` path. uv prepares
 environment. Repository check scripts contain no package-installation logic. Existing
 test implementations and non-Python test commands remain repository-owned.
 
+For a repository that needs only newer test support, the installed compatibility
+command accepts `apply --target-repo-root REPO --test-support-only`, with
+`--allow-primary-checkout` for an authorized direct edit. It refreshes owned
+runners and reuse modules without changing SDLC, CI, skill manifests, dependencies
+or environments. Custom runners remain intact. On first opt-in, their generated
+writer is `scripts/write_check_results.py`, recorded as
+`tool.ceratops.test-support.result-module` in the existing scripts project;
+repository-specific `scripts/result_records.py` APIs remain intact. Custom callers
+must use the generated writer for shared check records. This command reports a
+test-support refresh, not full repository compatibility. Caught failures restore
+the previous files, and repeating the command converges on the same contents.
+
 The lifecycle runner invokes the declared repository validation and test
 scripts before deployment and continues only when they succeed. It does not
 store another results cache or interpret repository reports. A script's zero

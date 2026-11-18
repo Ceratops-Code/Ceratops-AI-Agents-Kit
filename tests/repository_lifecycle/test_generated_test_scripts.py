@@ -51,7 +51,7 @@ def _write_generated_runner(root, targets):
     return root / "scripts/run-tests.py"
 
 @pytest.mark.parametrize("managed", [False, True])
-def test_custom_runner_keeps_behavior_and_can_select_generated_support(tmp_path, managed):
+def test_custom_runner_keeps_behavior_and_can_select_generated_support(tmp_path, managed, monkeypatch, capsys):
     generator = importlib.import_module("ceratops_repo_compatibility_engine.generate_test_script")
     contract = importlib.import_module("ceratops_repo_compatibility_engine.compatibility_contract").load_compatibility_contract()
     scripts = tmp_path / "scripts"
@@ -86,6 +86,49 @@ def test_custom_runner_keeps_behavior_and_can_select_generated_support(tmp_path,
             compare({"tools": {"uv": {"sha256": "a" * 64}}})
         support.unlink()
         assert any("reuse_test_results.py" in error for error in generator.generated_support_errors(tmp_path, contract))
+
+    # Narrow refresh owns only declared support, even in a custom application
+    # whose unrelated layout, manifest and CI do not satisfy full compatibility.
+    application = importlib.import_module("ceratops_repo_compatibility_engine.apply_ceratops_compatibility")
+    prepare_linked_worktree(tmp_path)
+    project = scripts / "pyproject.toml"
+    project.write_text('[project]\nname="custom"\nversion="1.0"\n')
+    custom = scripts / "result_records.py"
+    custom.write_text("PACKAGE_FORMAT = 'native-app'\n")
+    manifest = tmp_path / "skills/skill-sections.json"
+    manifest.parent.mkdir(exist_ok=True)
+    manifest.write_text('{"custom": true}\n')
+    baseline = {path: path.read_bytes() for path in tmp_path.rglob('*') if path.is_file()}
+    arguments = ["--target-repo-root", str(tmp_path), "--test-support-only"]
+    monkeypatch.setattr(application, "setup_runtime", Mock(side_effect=AssertionError("unrelated environment setup")))
+    monkeypatch.setattr(application.repository_checks, "validation_surfaces", Mock(side_effect=AssertionError("unrelated checks")))
+    for boundary in ("apply_compatibility_plan", "generated_support_errors"):
+        with monkeypatch.context() as patch:
+            patch.setattr(application, boundary, Mock(side_effect=RuntimeError("interrupted refresh")))
+            assert application.main(arguments) == 1
+            outcome = json.loads(capsys.readouterr().out)
+            assert outcome["rollback"] == "completed"
+            assert {path: path.read_bytes() for path in tmp_path.rglob('*') if path.is_file()} == baseline
+    previous = None
+    for _ in range(2):
+        assert application.main(arguments) == 0
+        outcome = json.loads(capsys.readouterr().out)
+        assert outcome["scope"] == "test-support" and outcome["runner"] == "preserved"
+        assert script.read_bytes() == baseline[script]
+        assert custom.read_bytes() == baseline[custom]
+        assert manifest.read_bytes() == baseline[manifest]
+        current = {path: path.read_bytes() for path in tmp_path.rglob('*') if path.is_file()}
+        if previous is not None:
+            assert current == previous
+        previous = current
+    records = runpy.run_path(str(scripts / "write_check_results.py"))
+    result = scripts / "narrow-result.json"
+    records["write_result"](result, {"status": "passed"}, exclusive=True)
+    assert records["read_result"](result) == (True, {"status": "passed"})
+    assert generator.generated_support_errors(tmp_path, contract) == []
+    project.write_text('[tool.ceratops.test-support]\nmanaged = false\n')
+    with pytest.raises(RuntimeError, match="explicitly unmanaged"):
+        generator.record_generated_runner(tmp_path, contract, None, {}, support_only=True)
 
 
 @pytest.mark.parametrize("inherited_form", ["joined", "separate"])

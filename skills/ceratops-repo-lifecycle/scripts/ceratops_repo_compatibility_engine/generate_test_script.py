@@ -101,7 +101,7 @@ def generated_test_runner(
 
 def record_generated_runner(
     root: pathlib.Path, contract: Mapping[str, Any], content: str | None,
-    planned: dict[pathlib.Path, str],
+    planned: dict[pathlib.Path, str], *, support_only: bool = False,
 ) -> None:
     """Deliver local reuse modules with an owned runner or opted-in custom runner.
 
@@ -118,6 +118,14 @@ def record_generated_runner(
     support = metadata.get("tool", {}).get("ceratops", {}).get("test-support", {})
     if not isinstance(support, dict) or ("managed" in support and type(support["managed"]) is not bool):
         raise RuntimeError("tool.ceratops.test-support.managed must be a boolean")
+    if support_only and content is None and support.get("managed") is not True:
+        if "test-support" in metadata.get("tool", {}).get("ceratops", {}):
+            raise RuntimeError("test support is explicitly unmanaged; declare its ownership before refreshing it")
+        # A custom result module may contain package-specific APIs. Give the
+        # shared writer a separate declared path instead of overwriting it.
+        support = {"managed": True, "result-module": "scripts/write_check_results.py"}
+        text = text.rstrip() + '\n\n[tool.ceratops.test-support]\nmanaged = true\nresult-module = "scripts/write_check_results.py"\n'
+        planned[project] = text
     if content is None and support.get("managed") is not True:
         return
     if content is not None and "test-runner" not in metadata.get("tool", {}).get("ceratops", {}):
@@ -130,7 +138,10 @@ def record_generated_runner(
         # Custom commands import the same result interface that the standard
         # runner embeds. Generate it from that template, never a second copy
         # maintained in a checkout or loaded from an installed skill at runtime.
-        destination = root / "scripts/result_records.py"
+        relative = support.get("result-module", "scripts/result_records.py")
+        if not isinstance(relative, str) or relative not in {"scripts/result_records.py", "scripts/write_check_results.py"}:
+            raise RuntimeError("test-support.result-module must name a supported repository writer path")
+        destination = root / relative
         if destination.is_symlink() or destination.is_junction():
             raise RuntimeError(f"generated result module must not be a link: {destination}")
         runner = template_path("python_test_runner").read_text(encoding="utf-8")
@@ -178,6 +189,14 @@ def generated_support_errors(root: pathlib.Path, contract: Mapping[str, Any]) ->
     if not enabled:
         return []  # Custom commands/storage retain their own executable contract.
     errors = []
+    support = options.get("test-support", {})
+    if support.get("managed") is True and options.get("test-runner", {}).get("managed") is not True:
+        relative = support.get("result-module", "scripts/result_records.py")
+        if not isinstance(relative, str) or relative not in {"scripts/result_records.py", "scripts/write_check_results.py"}:
+            return ["test-support.result-module must name a supported repository writer path"]
+        path = root / relative
+        if not path.is_file() or path.is_symlink() or path.is_junction():
+            errors.append(f"Generated test support requires its own regular file: {relative}")
     for name in ("select_test_groups.py", "reuse_test_results.py", "read_check_environment.py"):
         path = root / "scripts/testing" / name
         if not path.is_file() or path.is_symlink() or path.is_junction():

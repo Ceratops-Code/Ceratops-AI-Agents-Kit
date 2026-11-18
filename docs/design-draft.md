@@ -664,6 +664,12 @@ own support modules. The repository's existing test-impact map remains the one
 dependency declaration. Missing maps allow execution but no individual-test reuse.
 Custom runners are preserved; their support files are managed only when the
 scripts project declares `tool.ceratops.test-support.managed = true`.
+The compatibility command's `--test-support-only` mode can make that opt-in
+without applying unrelated repository layout, CI or skill changes. It records
+`result-module = "scripts/write_check_results.py"` for a custom runner's new
+shared writer, preserving application-specific result modules. Existing declared
+writer paths remain authoritative. The same snapshot and rollback code owns all
+generated files; the mode neither creates another environment nor changes locks.
 
 `repository_operation.prepare_operations()` expands phase actions into their
 individual `check-groups`. Each group owns its `steps`, `requires`, optional
