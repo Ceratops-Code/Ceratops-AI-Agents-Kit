@@ -122,6 +122,7 @@ class CompatibilityPlan:
     runtime_files: dict[pathlib.Path, str]
     python_tests: list[str]
     test_support_only: bool = False
+    dependency_policy_only: bool = False
 
 
 def require_authorized_checkout(
@@ -506,8 +507,23 @@ def plan_ceratops_compatibility(
     *,
     apply_sdlc_contract: bool,
     test_support_only: bool = False,
+    dependency_policy_only: bool = False,
 ) -> CompatibilityPlan:
     """Validate target evidence and compose writes without changing files."""
+
+    if dependency_policy_only:
+        contract = load_compatibility_contract()
+        policy_files = runtime_files(repo_root, BUNDLE_ROOT, contract, [],
+                                source_id=source_id, dependency_policy_only=True)
+        policy_workflow = repository_checks.repository_workflow(
+            repo_root, [], markdown_files={}, sdlc={}, dependency_policy_only=True)
+        if policy_workflow is not None:
+            policy_files[repo_root / surface_path("workflow")] = policy_workflow
+        return CompatibilityPlan(
+            manifest=None, skill_updates={}, canonical_sources={}, sdlc_contract=None,
+            workflow_text=None, markdown_files={}, validation_checks=[], skills=[],
+            updated_markers=[], runtime_files=policy_files, python_tests=[], dependency_policy_only=True,
+        )
 
     if test_support_only:
         contract = load_compatibility_contract()
@@ -781,7 +797,7 @@ def apply_compatibility_plan(
         destination.write_text(
             content.replace("\r\n", "\n"), encoding="utf-8", newline=newline
         )
-    if plan.test_support_only:
+    if plan.test_support_only or plan.dependency_policy_only:
         return
     for relative, text in plan.markdown_files.items():
         (repo_root / relative).write_text(text, encoding="utf-8", newline="")
@@ -844,7 +860,11 @@ def main(argv: list[str] | None = None) -> int:
                         help="Permit an explicitly authorized primary main or release/local checkout.")
     parser.add_argument("--test-support-only", action="store_true",
                         help="Refresh owned test support without changing application, skill or CI configuration.")
+    parser.add_argument("--dependency-policy-only", action="store_true",
+                        help="Update dependency declarations and their CI checks without changing application layout.")
     args = parser.parse_args(argv)
+    if args.test_support_only and args.dependency_policy_only:
+        parser.error("choose one narrow refresh mode")
     repo_root = args.target_repo_root.resolve()
     phase = "preflight"
     rollback = "not_started"
@@ -860,7 +880,9 @@ def main(argv: list[str] | None = None) -> int:
         template = {}
         existing = {}
         source_id = None
-        if not args.test_support_only:
+        if args.dependency_policy_only:
+            source_id = runtime_source_id(repo_root, args.runtime_source_id, {})
+        elif not args.test_support_only:
             template = repository_checks.load_mapping(template_path("skill_manifest"))
             validate_template(template)
             existing = repository_checks.load_mapping(existing_path) if existing_path.is_file() else {}
@@ -874,6 +896,7 @@ def main(argv: list[str] | None = None) -> int:
             existing,
             apply_sdlc_contract=True,
             test_support_only=args.test_support_only,
+            dependency_policy_only=args.dependency_policy_only,
         )
         skill_paths = sorted((repo_root / "skills").glob("*/SKILL.md"))
         mutable_paths = [
@@ -882,7 +905,7 @@ def main(argv: list[str] | None = None) -> int:
             *plan.runtime_files,
             repo_root / runtime["lockfile"],
         ]
-        if plan.test_support_only:
+        if plan.test_support_only or plan.dependency_policy_only:
             mutable_paths = list(plan.runtime_files)
         mutable_paths.extend(repo_root / name for name in plan.markdown_files)
         mutable_paths.extend(
@@ -918,7 +941,7 @@ def main(argv: list[str] | None = None) -> int:
                 or plan.workflow_text is not None
             )
         ]
-        if plan.test_support_only:
+        if plan.test_support_only or plan.dependency_policy_only:
             created_dirs = []
         # Include every new ancestor before writing payloads. Rollback removes
         # only empty directories after restoring files and the owned environment.
@@ -947,6 +970,12 @@ def main(argv: list[str] | None = None) -> int:
         mutation_started = True
         apply_compatibility_plan(repo_root, plan)
         bootstrap_status = "skipped"
+        if plan.dependency_policy_only:
+            print(json.dumps({
+                "status": "ok", "scope": "dependency-policy", "rollback": "not_needed",
+                "files": [path.relative_to(repo_root).as_posix() for path in plan.runtime_files],
+            }, sort_keys=True))
+            return 0
         if plan.test_support_only:
             phase = "test_support_files"
             support_errors = generated_support_errors(repo_root, load_compatibility_contract())
@@ -1006,7 +1035,7 @@ def main(argv: list[str] | None = None) -> int:
                     remove_created_environment(repo_root, runtime["environment"])
                 restore_snapshots(snapshots, created_dirs)
                 if (
-                    not args.test_support_only
+                    not (args.test_support_only or args.dependency_policy_only)
                     and not environment_created
                     and (repo_root / runtime["lockfile"]).is_file()
                 ):

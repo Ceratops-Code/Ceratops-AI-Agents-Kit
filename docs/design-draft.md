@@ -2656,8 +2656,7 @@ writers compare the same inputs before and after their actual callback.
 the `dependency-review` command. It extends the caller's existing repository
 scope with Renovate PRs and dashboard problems, alongside Dependabot PRs and
 alerts. Both providers use the existing PR evidence and approval handling.
-GitHub activity does not establish a successful hosted Renovate job: unavailable
-Mend job results remain a reported blocker with the portal follow-up. Repository
+GitHub activity does not establish a successful hosted Renovate job. Repository
 health's existing local collector invokes the pinned Renovate CLI to read JSON,
 JSONC or JSON5 and apply shared presets. It returns the resulting settings,
 detected dependency files, and native errors. It does not implement another
@@ -2676,6 +2675,13 @@ reference the owner's preset; they do not copy that policy into every repository
 The workflow generator also refreshes its two named native Renovate CI steps
 from the template, including the pinned tool version. Other workflow steps and
 comments remain repository-owned.
+
+The compatibility command's `--dependency-policy-only` mode calls that same
+dependency collection and policy writer without preparing skills, SDLC,
+environments or test support. Its workflow update appends the configuration job
+from the maintained template, preserving existing application jobs. The command
+uses the existing file snapshots and rollback on a caught write failure. Repeating
+the request preserves the current configuration and avoids duplicate CI jobs.
 
 Renovate's local read uses this checkout's Git-directory cache under
 `ceratops/renovate-cache`. npm manages its downloaded CLI cache; Renovate manages

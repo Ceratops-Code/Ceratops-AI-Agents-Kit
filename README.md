@@ -1538,6 +1538,14 @@ must use the generated writer for shared check records. This command reports a
 test-support refresh, not full repository compatibility. Caught failures restore
 the previous files, and repeating the command converges on the same contents.
 
+For dependency maintenance alone, use the same command with
+`--dependency-policy-only` instead. It updates the existing Dependabot entries
+and adds coverage for discovered package directories. Where Renovate is needed,
+it references the owner's shared preset. It adds configuration checks to the
+existing CI workflow while preserving application commands, package locations,
+SDLC and test runners. A failed write restores the previous files; a repeated
+call leaves current contents unchanged.
+
 The lifecycle runner invokes the declared repository validation and test
 scripts before deployment and continues only when they succeed. It does not
 store another results cache or interpret repository reports. A script's zero

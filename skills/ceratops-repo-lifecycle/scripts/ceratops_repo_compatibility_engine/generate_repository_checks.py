@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import re
 import shlex
 import subprocess
 import tomllib
@@ -438,6 +439,7 @@ def repository_workflow(
     *,
     markdown_files: Mapping[str, str],
     sdlc: Mapping[str, Any],
+    dependency_policy_only: bool = False,
 ) -> str | None:
     """Render commands and their working directories as native GitHub steps.
 
@@ -447,6 +449,43 @@ def repository_workflow(
     """
     workflow = repo_root / surface_path("workflow")
     previous = workflow.read_bytes().decode("utf-8") if workflow.is_file() else None
+    if dependency_policy_only:
+        # This job owns only the policy files. Preserve the application's steps
+        # and YAML bytes; an ambiguous jobs layout stops before any write.
+        if previous is None:
+            raise RuntimeError("Dependency refresh requires an existing repository workflow")
+        document = yaml.safe_load(previous)
+        jobs = document.get("jobs") if isinstance(document, dict) else None
+        if not isinstance(jobs, dict) or not jobs:
+            raise RuntimeError("Dependency refresh requires a nonempty workflow jobs mapping")
+        if any(isinstance(job, dict) and any(isinstance(step, dict) and step.get("id") == "renovate_node"
+               for step in job.get("steps", [])) for job in jobs.values()):
+            return None
+        if "dependency-configuration" in jobs:
+            raise RuntimeError("The workflow already owns a dependency-configuration job")
+        template = template_path("workflow").read_text(encoding="utf-8")
+        template = template.replace("__RENOVATE_VERSION__", load_compatibility_contract()["dependency_maintenance"]["renovate_version"])
+        policy_start = template.index("      - name: Set up Node.js for Renovate configuration checks")
+        policy_end = template.index("      - name: Upload validation evidence", policy_start)
+        checkout = next(line.strip() for line in template.splitlines()
+                        if line.strip().startswith("uses: actions/checkout@"))
+        job = ("  dependency-configuration:\n"
+               "    name: Dependency configuration\n"
+               "    runs-on: ubuntu-latest\n"
+               "    timeout-minutes: 90\n"
+               "    permissions:\n      contents: read\n"
+               "    steps:\n"
+               + "      - " + checkout + "\n"
+               + template[policy_start:policy_end].rstrip() + "\n")
+        source = previous.replace("\r\n", "\n")
+        match = re.search(r"(?m)^jobs:[ \t]*(?:#.*)?$", source)
+        if match is None:
+            raise RuntimeError("Dependency refresh requires block-style workflow jobs")
+        following = re.search(r"(?m)^[^ \t\r\n#][^\n]*:", source[match.end():])
+        jobs_end = match.end() + following.start() if following else len(source)
+        rendered = source[:jobs_end].rstrip() + "\n\n" + job + source[jobs_end:]
+        yaml.safe_load(rendered)
+        return rendered
     begin = "      # Begin generated repository steps"
     end = "      # End generated repository steps"
     if previous is not None and begin not in previous and end not in previous:

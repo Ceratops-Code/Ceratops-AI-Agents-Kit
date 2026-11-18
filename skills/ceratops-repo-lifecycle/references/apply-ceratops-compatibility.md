@@ -32,13 +32,18 @@ Infer the source identity from stable repository evidence before asking.
 - (D) Apply Ceratops compatibility: `python -m
   ceratops_repo_compatibility_engine apply --target-repo-root
   <target-repo> [--runtime-source-id <stable-id>]
-  [--allow-primary-checkout] [--test-support-only]`; it performs the
+  [--allow-primary-checkout]
+  [--test-support-only | --dependency-policy-only]`; it performs the
   compatibility transaction and emits one compact result.
   Full application updates the repository's compatibility declarations.
   `--test-support-only` refreshes generated result and reuse support while
   preserving custom runners and application configuration. For managed runners,
   it also updates their existing SDLC and CI commands when a required runner
   argument changes. Its result describes only this narrower scope.
+  `--dependency-policy-only` updates dependency-bot configuration and adds
+  its configuration checks to the existing workflow. It preserves application
+  checks, SDLC, runners and package layout. Both narrow modes use the same
+  transaction rollback as full application; choose one mode per call.
 - (D) Bootstrap-only repair: `python -m ceratops_repo_compatibility_engine
   synchronize-bootstrap --target-repo-root <target-repo>
   [--allow-primary-checkout]`; it only compares

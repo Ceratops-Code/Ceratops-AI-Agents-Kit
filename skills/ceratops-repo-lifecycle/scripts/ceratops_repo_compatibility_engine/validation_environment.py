@@ -81,81 +81,83 @@ def runtime_files(
     has_python_skills: bool = False,
     generate_python_test_runner: bool = False,
     source_id: str | None = None,
+    dependency_policy_only: bool = False,
 ) -> dict[pathlib.Path, str]:
     """Render repository tooling declarations without copying the SDLC engine."""
 
-    if errors := repository_configuration_errors(root, contract):
-        raise RuntimeError("; ".join(errors))
-    runtime = contract["runtime"]
     planned_files = planned_files or {}
     files: dict[pathlib.Path, str] = {}
-    # Compatibility inspects native Ruff settings even when a custom runner
-    # owns the repository checks; its locked environment must provide Ruff.
-    dependencies: set[str] = {"ruff"}
-    # Skill repositories need the standalone bootstrap's TOML editor. Other
-    # repository runtimes retain their existing dependency requirements.
-    skills = root / "skills"
-    if skills.is_dir() and any((path / "SKILL.md").is_file() for path in skills.iterdir()):
-        dependencies.add("tomlkit")
-    # Preserved runners own their framework dependencies. Only the runner this
-    # transaction generates has a known pytest dependency.
-    if generate_python_test_runner:
-        dependencies.update({"pytest", "packaging"})
-    for check in checks:
-        command = check["command"]
-        if len(command) >= 3 and command[:2] == ["{python}", "-m"]:
-            module = command[2]
-            if module in {"ruff", "mypy", "yamllint"}:
-                dependencies.add(module)
-    project = root / contract["surfaces"]["validation_project"]["path"]
-    template = bundle / "references/templates" / contract["surfaces"]["validation_project"]["template"]
-    rendered = project_text(root, template, dependencies)
-    if project.is_file():
-        document = tomllib.loads(project.read_text(encoding="utf-8"))
-        declared = [*document.get("project", {}).get("dependencies", []),
-                    *document.get("dependency-groups", {}).get("dev", [])]
-        names = {re.split(r"[<>=!~;\[ ]", value, maxsplit=1)[0].lower().replace("_", "-") for value in declared if isinstance(value, str)}
-        missing = {name for name in dependencies if name.lower().replace("_", "-") not in names}
-        if missing:
-            raise RuntimeError("existing validator project must declare: " + ", ".join(sorted(missing)))
-    if not project.is_file() or project.read_bytes().decode("utf-8") != rendered:
-        files[project] = rendered
-    surface = contract["surfaces"]["actionlint_runner"]
-    runner = root / surface["path"]
-    if runner.is_symlink() or (runner.exists() and not runner.is_file()):
-        raise RuntimeError("existing actionlint runner must be a regular file")
-    if not runner.is_file():
-        template = bundle / "references/templates" / surface["template"]
-        files[runner] = template.read_text(encoding="utf-8")
-    for surface_name, label in (
-        ("issue_template", "issue template"),
-        ("pull_request_template", "pull request template"),
-    ):
-        surface = contract["surfaces"][surface_name]
-        destination = root / surface["path"]
-        if destination.is_symlink() or (
-            destination.exists() and not destination.is_file()
-        ):
-            raise RuntimeError(f"existing {label} must be a regular file")
-        if not destination.is_file():
+    if not dependency_policy_only:
+        if errors := repository_configuration_errors(root, contract):
+            raise RuntimeError("; ".join(errors))
+        runtime = contract["runtime"]
+        # Compatibility inspects native Ruff settings even when a custom runner
+        # owns the repository checks; its locked environment must provide Ruff.
+        dependencies: set[str] = {"ruff"}
+        # Skill repositories need the standalone bootstrap's TOML editor. Other
+        # repository runtimes retain their existing dependency requirements.
+        skills = root / "skills"
+        if skills.is_dir() and any((path / "SKILL.md").is_file() for path in skills.iterdir()):
+            dependencies.add("tomlkit")
+        # Preserved runners own their framework dependencies. Only the runner this
+        # transaction generates has a known pytest dependency.
+        if generate_python_test_runner:
+            dependencies.update({"pytest", "packaging"})
+        for check in checks:
+            command = check["command"]
+            if len(command) >= 3 and command[:2] == ["{python}", "-m"]:
+                module = command[2]
+                if module in {"ruff", "mypy", "yamllint"}:
+                    dependencies.add(module)
+        project = root / contract["surfaces"]["validation_project"]["path"]
+        template = bundle / "references/templates" / contract["surfaces"]["validation_project"]["template"]
+        rendered = project_text(root, template, dependencies)
+        if project.is_file():
+            document = tomllib.loads(project.read_text(encoding="utf-8"))
+            declared = [*document.get("project", {}).get("dependencies", []),
+                        *document.get("dependency-groups", {}).get("dev", [])]
+            names = {re.split(r"[<>=!~;\[ ]", value, maxsplit=1)[0].lower().replace("_", "-") for value in declared if isinstance(value, str)}
+            missing = {name for name in dependencies if name.lower().replace("_", "-") not in names}
+            if missing:
+                raise RuntimeError("existing validator project must declare: " + ", ".join(sorted(missing)))
+        if not project.is_file() or project.read_bytes().decode("utf-8") != rendered:
+            files[project] = rendered
+        surface = contract["surfaces"]["actionlint_runner"]
+        runner = root / surface["path"]
+        if runner.is_symlink() or (runner.exists() and not runner.is_file()):
+            raise RuntimeError("existing actionlint runner must be a regular file")
+        if not runner.is_file():
             template = bundle / "references/templates" / surface["template"]
-            files[destination] = template.read_text(encoding="utf-8")
-    ignore = root / runtime["project"] / ".gitignore"
-    existing_ignore = ignore.read_text(encoding="utf-8") if ignore.is_file() else ""
-    missing_ignore = [value for value in runtime["ignored_paths"] if value not in existing_ignore.splitlines()]
-    if missing_ignore:
-        files[ignore] = existing_ignore.rstrip("\n") + ("\n" if existing_ignore else "") + "\n".join(missing_ignore) + "\n"
-    # Merge the same transaction's npm ignore plan before adding diagnostics;
-    # neither writer may overwrite the other's ignored paths or existing bytes.
-    root_ignore = root / ".gitignore"
-    existing_root_ignore = planned_files.get(".gitignore")
-    if existing_root_ignore is None:
-        existing_root_ignore = root_ignore.read_bytes().decode("utf-8") if root_ignore.is_file() else ""
-    if "/.build/" not in existing_root_ignore.splitlines():
-        newline = "\r\n" if "\r\n" in existing_root_ignore else "\n"
-        existing_root_ignore += (newline if existing_root_ignore and not existing_root_ignore.endswith("\n") else "") + "/.build/" + newline
-    if ".gitignore" in planned_files or not root_ignore.is_file() or root_ignore.read_bytes().decode("utf-8") != existing_root_ignore:
-        files[root_ignore] = existing_root_ignore
+            files[runner] = template.read_text(encoding="utf-8")
+        for surface_name, label in (
+            ("issue_template", "issue template"),
+            ("pull_request_template", "pull request template"),
+        ):
+            surface = contract["surfaces"][surface_name]
+            destination = root / surface["path"]
+            if destination.is_symlink() or (
+                destination.exists() and not destination.is_file()
+            ):
+                raise RuntimeError(f"existing {label} must be a regular file")
+            if not destination.is_file():
+                template = bundle / "references/templates" / surface["template"]
+                files[destination] = template.read_text(encoding="utf-8")
+        ignore = root / runtime["project"] / ".gitignore"
+        existing_ignore = ignore.read_text(encoding="utf-8") if ignore.is_file() else ""
+        missing_ignore = [value for value in runtime["ignored_paths"] if value not in existing_ignore.splitlines()]
+        if missing_ignore:
+            files[ignore] = existing_ignore.rstrip("\n") + ("\n" if existing_ignore else "") + "\n".join(missing_ignore) + "\n"
+        # Merge the same transaction's npm ignore plan before adding diagnostics;
+        # neither writer may overwrite the other's ignored paths or existing bytes.
+        root_ignore = root / ".gitignore"
+        existing_root_ignore = planned_files.get(".gitignore")
+        if existing_root_ignore is None:
+            existing_root_ignore = root_ignore.read_bytes().decode("utf-8") if root_ignore.is_file() else ""
+        if "/.build/" not in existing_root_ignore.splitlines():
+            newline = "\r\n" if "\r\n" in existing_root_ignore else "\n"
+            existing_root_ignore += (newline if existing_root_ignore and not existing_root_ignore.endswith("\n") else "") + "/.build/" + newline
+        if ".gitignore" in planned_files or not root_ignore.is_file() or root_ignore.read_bytes().decode("utf-8") != existing_root_ignore:
+            files[root_ignore] = existing_root_ignore
     dependabot = root / ".github/dependabot.yml"
     existing_dependabot = dependabot.read_bytes().decode("utf-8") if dependabot.is_file() else None
     data = yaml.safe_load(existing_dependabot) if existing_dependabot is not None else {"version": 2, "updates": []}
@@ -269,13 +271,13 @@ def runtime_files(
     registrations = [registration for registration in registrations if (
         registration["package-ecosystem"] in ecosystems and (
             registration["package-ecosystem"] == "github-actions" or any(
-                pathlib.PurePosixPath(name).parent.as_posix().strip("/") == registration["directory"].strip("/")
+                pathlib.PurePosixPath(name).parent == pathlib.PurePosixPath(registration["directory"].lstrip("/"))
                 for name in ecosystems[registration["package-ecosystem"]]
             )
         )
     )]
     # Planned tooling files participate even before their transaction writes.
-    if not declarations.get("includePaths"):
+    if not dependency_policy_only and not declarations.get("includePaths"):
         for registration in (dict(contract["dependency_updates"]),
                              {**contract["ci_dependency_updates"], "target-branch": target_branch}):
             if registration not in registrations:

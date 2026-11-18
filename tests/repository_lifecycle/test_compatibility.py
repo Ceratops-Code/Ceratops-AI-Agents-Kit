@@ -15,6 +15,7 @@ import urllib.error
 import urllib.request
 import zipfile
 from email.message import Message
+from functools import partialmethod
 from types import SimpleNamespace
 
 import jsonschema
@@ -646,9 +647,19 @@ def test_compatibility_materializer_preserves_existing_bundle_contract(
     assert "SDLC v5 requires a recorded source check for ruff" in result["errors"]
 
 
+def _interrupt_policy_write(path, content, *args, selected, after, original, **kwargs):
+    """Interrupt one exact policy-file effect while retaining its real write."""
+    if path == selected and not after:
+        raise RuntimeError("interrupted policy write")
+    result = original(path, content, *args, **kwargs)
+    if path == selected and after:
+        raise RuntimeError("interrupted policy write")
+    return result
+
+
 @pytest.mark.parametrize("security_branch", [None, "release/local"])
 def test_compatibility_routes_existing_dependabot_version_updates(
-    tmp_path: pathlib.Path, security_branch: str | None,
+    tmp_path: pathlib.Path, security_branch: str | None, monkeypatch, capsys,
 ) -> None:
     repo = tmp_path / "dependabot-migration"
     create_compatible_repo(repo, "example/dependabot-migration", ["alpha-tool"])
@@ -706,6 +717,56 @@ def test_compatibility_routes_existing_dependabot_version_updates(
         assert len(actions) == (1 if security_branch else 2)
         assert actions[-1]["directory"] == "/"
         assert actions[-1]["target-branch"] == "release/local"
+
+    # A policy-only refresh must also work for a native non-Python application,
+    # without creating tooling projects, changing SDLC, or replacing its CI.
+    native = tmp_path / "native-application"
+    native.mkdir()
+    (native / "package.json").write_text(
+        '{"name":"native","private":true,"dependencies":{"example":"^1.0.0"}}\n')
+    workflow = native / ".github/workflows/validate.yml"
+    workflow.parent.mkdir(parents=True)
+    workflow.write_text(
+        "name: Native checks\non: push\njobs:\n  application:\n"
+        "    runs-on: ubuntu-latest\n    steps:\n      - run: echo native-check\n",
+        newline="\r\n",
+    )
+    prepare_linked_worktree(native)
+    arguments = ["apply", "--target-repo-root", str(native),
+                 "--runtime-source-id", "example/native", "--dependency-policy-only"]
+    original = {name: (native / name).read_bytes() for name in ("package.json", ".git")}
+    application = importlib.import_module("ceratops_repo_compatibility_engine.apply_ceratops_compatibility")
+    baseline = {path: path.read_bytes() for path in native.rglob('*') if path.is_file()}
+    write = pathlib.Path.write_text
+    for target in (native / ".github/dependabot.yml", workflow):
+        for after in (False, True):
+            with monkeypatch.context() as context:
+                context.setattr(pathlib.Path, "write_text", partialmethod(
+                    _interrupt_policy_write, selected=target, after=after, original=write))
+                assert application.main(arguments[1:]) == 1
+            failed = json.loads(capsys.readouterr().out)
+            assert "interrupted policy write" in failed["reason"]
+            assert failed["rollback"] == "completed"
+            assert {path: path.read_bytes() for path in native.rglob('*') if path.is_file()} == baseline
+    observed = None
+    for _ in range(2):
+        result = run_compatibility_engine(REPOSITORY_LIFECYCLE_SCRIPTS, *arguments)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert json.loads(result.stdout)["scope"] == "dependency-policy"
+        assert {name: (native / name).read_bytes() for name in original} == original
+        assert not (native / "scripts").exists()
+        assert not (native / "skills").exists()
+        assert not (native / ".ceratops").exists()
+        policies = yaml.safe_load((native / ".github/dependabot.yml").read_bytes())
+        assert {(item["package-ecosystem"], item["directory"])
+                for item in policies["updates"]} == {("npm", "/"), ("github-actions", "/")}
+        jobs = yaml.safe_load(workflow.read_bytes())["jobs"]
+        assert jobs["application"]["steps"] == [{"run": "echo native-check"}]
+        assert list(jobs).count("dependency-configuration") == 1
+        current = {path: path.read_bytes() for path in native.rglob('*') if path.is_file()}
+        if observed is not None:
+            assert current == observed
+        observed = current
 
 
 def test_non_python_skill_needs_no_shared_skill_runtime(
