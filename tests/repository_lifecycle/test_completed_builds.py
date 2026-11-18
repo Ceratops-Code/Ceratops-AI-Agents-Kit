@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import replace
+from typing import Any
 from unittest.mock import DEFAULT, Mock
 
 import pytest
@@ -64,8 +65,47 @@ def test_declared_version_source_and_decision(tmp_path, capsys, mode, owner):
         assert flow.read_declared_version(root, declaration, reference=owner) == version
     if mode == "toml":
         assert b"# retained comment" in first
+    if mode == 'json' and owner == 'deliverables.packages.claims':
+        (root / 'pyproject.toml').write_text('[project]\nname="claims"\nversion="1.2.20a7"\n')
+        assert run_git(root, 'add', 'pyproject.toml').returncode == 0
+        assert run_git(root, 'commit', '--only', '-m', 'alpha source', '--', 'pyproject.toml').returncode == 0
+        task = tmp_path / 'beta-task'
+        assert run_git(root, 'worktree', 'add', '-b', 'beta-task', str(task)).returncode == 0
+        request = runner.OperationRequest(owner + '.actions.build', {'target': 'native'})
+        alpha = runner.execute_build(task, [request], qualification_level='alpha')
+        assert alpha['status'] == 'completed', alpha
+        assert alpha['version'] == '1.2.20a7'
+        original_alpha = pathlib.Path(alpha['build_receipts'][0]).read_bytes()
+        head = run_git(task, 'rev-parse', 'HEAD').stdout.strip()
+        rejected = runner.execute_build(task, [runner.OperationRequest(request.operation,
+            {'version': '1.2.20a8', 'target': 'native'})], qualification_level='beta')
+        assert rejected['status'] == 'version_decision_required', rejected
+        assert rejected['version_decisions'][0]['requested_version'] == '1.2.20a8'
+        assert run_git(task, 'rev-parse', 'HEAD').stdout.strip() == head
+        assert (task / '.build-count').read_text() == 'x'
+        assert run_git(task, 'tag', 'members/packages/claims/1.2.20b1').returncode == 0
+        beta = runner.execute_build(task, [request], qualification_level='beta')
+        assert beta['status'] == 'completed', beta
+        assert beta['version'] == '1.2.20b2'
+        assert pathlib.Path(alpha['build_receipts'][0]).read_bytes() == original_alpha
+        assert (task / '.build-count').read_text() == 'xx'
+        for version in ('1.2.21rc1', '1.2.21'):
+            accepted = runner.execute_build(task, [runner.OperationRequest(request.operation,
+                {'version': version, 'target': 'native'})], qualification_level='beta')
+            assert accepted['status'] == 'completed', accepted
+            assert accepted['version'] == version
+            count = (task / '.build-count').read_text()
+            repeated = runner.execute_build(task, [request], qualification_level='beta')
+            assert repeated['status'] == 'completed', repeated
+            assert repeated['final_commit'] == accepted['final_commit']
+            assert (task / '.build-count').read_text() == count
     if mode != "toml" or owner != "deliverables.packages.claims":
         return
+    # The initial version question must handle a complete source inventory
+    # larger than Windows can carry in one process command line.
+    for index in range(400):
+        (root / "src" / (f"source-{index:04d}-" + "x" * 78 + ".py")).write_text("value = 1\n")
+    assert sum(len(path.relative_to(root).as_posix()) + 3 for path in (root / "src").iterdir()) > 32767
     ref = "deliverables.packages.claims"
     original_head = run_git(root, "rev-parse", "HEAD").stdout.strip()
     manifest = (root / "pyproject.toml").read_bytes()
@@ -76,6 +116,8 @@ def test_declared_version_source_and_decision(tmp_path, capsys, mode, owner):
     assert decision["status"] == "version_decision_required"
     assert decision["version_decisions"][0]["current_version"] == "1.2.19"
     assert decision["version_decisions"][0]["changed_files"]
+    assert len(decision["version_decisions"][0]["new_files"]) == 400
+    assert "unrelated.txt" not in decision["version_decisions"][0]["diff"]
     assert "next_command" in decision
     assert run_git(root, "rev-parse", "HEAD").stdout.strip() == original_head
     assert (root / "pyproject.toml").read_bytes() == manifest
@@ -201,7 +243,7 @@ def _empty_summary():
     return {"schema": "ceratops-check-summary.v1", "inputGroups": {}, "checkGroups": {}, "checks": []}
 
 
-def _worktree_build_case(tmp_path):
+def _worktree_build_case(tmp_path, *, linked=False):
     repository, commit = _versioned_repository(tmp_path)
     version, target = "1.2.20b1", "python-3.14-windows"
     code = (
@@ -216,10 +258,13 @@ def _worktree_build_case(tmp_path):
     )
     _write_fixture_bytes(repository, "scripts/build.py", code.encode())
     _write_fixture_bytes(repository, "pyproject.toml", b'[project]\nname="claims"\nversion="1.2.19"\n')
+    # The receipt fixture's placeholder is not a native uv lockfile. Build
+    # cases either have no lock or create a real one for their local workspace.
+    (repository / 'uv.lock').unlink()
     _write_fixture_bytes(repository, "unrelated.txt", b"original")
     _write_fixture_bytes(repository, ".gitignore", b".build-count\n.fail-build\n")
     check = {"requires": {"tools": []}, "steps": [{"run": [sys.executable, "-c", "print('OK')"]}]}
-    contract = {"version": 5, "kind": "ceratops-sdlc", "repository": {"tools": {}, "actions": {
+    contract: dict[str, Any] = {"version": 5, "kind": "ceratops-sdlc", "repository": {"tools": {}, "actions": {
         "pre-build-checks": {"check-groups": {"source": check}}}},
         "deliverables": {"packages": {"claims": {
             "root-dir": "src", "additional-source-files": ["pyproject.toml", "scripts/build.py"],
@@ -231,6 +276,21 @@ def _worktree_build_case(tmp_path):
                 "steps": [{"run": [sys.executable, "scripts/build.py", "{artifact_directory}", "{version}"]}]},
                 "post-build-checks": {"check-groups": {"contents": check}}}
         }}}}
+    if linked:
+        with (repository / 'pyproject.toml').open('a') as stream:
+            stream.write('requires-python=">=3.11"\n[project.optional-dependencies]\nreports=[]\n'
+                         '[tool.uv.workspace]\nmembers=["runtime", "mcp"]\n')
+        for name, requirement in [('runtime', 'claims==1.2.19'), ('mcp', "claims[reports]==1.2.19; python_version >= '3.11'")]:
+            _write_fixture_bytes(repository, name + '/pyproject.toml', (
+                '[project]\nname="' + name + '"\nversion="9.0.0"\nrequires-python=">=3.11"\n'
+                'dependencies=[' + json.dumps(requirement) + ']\n'
+                '[project.optional-dependencies]\nrange=["claims>=1.2,<2"]\n'
+                '[tool.uv.sources]\nclaims={workspace=true}\n').encode())
+        locked = subprocess.run(['uv', 'lock', '--offline', '--project', str(repository)],
+                                capture_output=True, text=True, check=False)
+        assert locked.returncode == 0, locked.stderr
+        contract['deliverables']['packages']['claims']['additional-source-files'].append('uv.lock')
+        check['steps'] = [{'run': ['uv', 'lock', '--offline', '--check']}]
     _write_fixture_bytes(repository, runner.DEFAULT_CONTRACT.as_posix(), json.dumps(contract).encode())
     assert run_git(repository, "add", ".").returncode == 0
     assert run_git(repository, "commit", "-m", "build fixture").returncode == 0
@@ -264,6 +324,20 @@ def test_worktree_build_commits_selected_source_and_finishes_once(tmp_path, chec
         assert run_git(source, "worktree", "add", "-b", "task", str(repository)).returncode == 0
         (repository / "unrelated.txt").write_bytes(b"keep staged change")
         assert run_git(repository, "add", "unrelated.txt").returncode == 0
+    unusual_paths = []
+    if checkout == "task-worktree" and schema_version == 5 and deletion == "staged":
+        for index in range(400):
+            path = repository / "src" / (f"source-{index:04d}-" + "x" * 78 + ".py")
+            path.write_text("value = 1\n")
+            unusual_paths.append(path.relative_to(repository).as_posix())
+        assert sum(len(path) + 3 for path in unusual_paths) > 32767
+        assert run_git(repository, "add", "src").returncode == 0
+        assert run_git(repository, "commit", "--only", "-m", "large source inventory", "--", "src").returncode == 0
+        old = unusual_paths.pop(0)
+        renamed = "src/-[moved] caf\u00e9.py"
+        (repository / old).rename(repository / renamed)
+        unusual_paths.extend([renamed, "src/new [literal] \u03bb.py"])
+        (repository / unusual_paths[-1]).write_text("new_value = 2\n")
     (repository / "src/claims.py").unlink()
     if deletion == "staged":
         assert run_git(repository, "add", "src/claims.py").returncode == 0
@@ -293,6 +367,10 @@ def test_worktree_build_commits_selected_source_and_finishes_once(tmp_path, chec
     assert "src/claims.py" not in {record["path"] for record in selected["receipt"]["artifactInputs"]}
     assert not run_git(repository, "diff", "--name-only", "HEAD", "--", "src/claims.py").stdout
     assert "releaseUnit" not in selected["receipt"]["identity"]
+    if unusual_paths:
+        assert set(unusual_paths) <= {record["path"] for record in selected["receipt"]["artifactInputs"]}
+        assert not run_git(repository, "ls-tree", selected["receipt"]["preTestCommit"], "--", old).stdout
+        assert run_git(repository, "show", selected["receipt"]["preTestCommit"] + ":" + unusual_paths[-1]).stdout == "new_value = 2\n"
     again = runner.execute_build(repository, **options)
     assert again["status"] == "completed" and again["final_commit"] == result["final_commit"], again
     assert (repository / ".build-count").read_text() == "x"
@@ -479,17 +557,42 @@ def test_worktree_build_failure_preserves_cause_without_receipt_or_tag(tmp_path,
     assert (repository / ".build-count").read_text() == "x"
 
 
-@pytest.mark.parametrize("effect", ["source-commit", "completion", "temporary-cleanup"])
+@pytest.mark.parametrize("effect", ["source-stage", "source-commit", "git-failure", "completion", "temporary-cleanup",
+                                  "version-write", "pin-write", "lock-write", "lock-failure", "pin-conflict"])
 @pytest.mark.parametrize("timing", ["before", "after"])
 @pytest.mark.parametrize("release", [False, True])
 def test_worktree_build_repeats_commit_and_completion_handoffs(tmp_path, monkeypatch, effect, timing, release):
-    repository, options = _worktree_build_case(tmp_path)
+    linked = effect in {'source-commit', 'version-write', 'pin-write', 'lock-write', 'lock-failure', 'pin-conflict'}
+    repository, options = _worktree_build_case(tmp_path, linked=linked)
+    if linked:
+        options['version_source_commit'] = run_git(repository, 'rev-parse', 'HEAD').stdout.strip()
     if release:
         assert run_git(repository, "branch", "-m", "release/local").returncode == 0
     flow = importlib.import_module("execute_worktree_build")
-    owner = flow if effect == "source-commit" else storage if effect == "temporary-cleanup" else completion
-    name = ("_git" if effect == "source-commit" else "_remove_versioned_tree"
+    if effect == 'pin-conflict':
+        source = repository / 'runtime/pyproject.toml'
+        before = source.read_bytes()
+        source.write_bytes(before + b'[tool.uv]\nconstraint-dependencies=["claims<1.2.20"]\n')
+        head = run_git(repository, 'rev-parse', 'HEAD').stdout.strip()
+        failed = runner.execute_build(repository, **options)
+        assert failed['status'] == 'version_decision_required', failed
+        assert failed['version_decisions'][0]['requirement'] == 'claims<1.2.20'
+        assert run_git(repository, 'rev-parse', 'HEAD').stdout.strip() == head
+        assert not (repository / '.build-count').exists()
+        source.write_bytes(before)
+        result = runner.execute_build(repository, **options)
+        assert result['status'] == 'completed', result
+        return
+    source_effect = effect in {"source-stage", "source-commit", "git-failure"}
+    owner = flow if source_effect else storage if effect == "temporary-cleanup" else completion
+    name = ("_git" if source_effect else "_remove_versioned_tree"
             if effect == "temporary-cleanup" else "complete_versioned_artifacts")
+    if effect == 'version-write':
+        owner, name = flow, 'write_declared_version'
+    elif effect == 'pin-write':
+        owner, name = flow.os, 'replace'
+    elif effect in {'lock-write', 'lock-failure'}:
+        owner, name = flow.release_lock_module(), 'run_protected_command'
     if effect == "temporary-cleanup":
         stale = storage._artifact_store_path(repository, temporary=True) / "members/packages/claims/1.1.0b1"
         stale.mkdir(parents=True)
@@ -499,9 +602,18 @@ def test_worktree_build_repeats_commit_and_completion_handoffs(tmp_path, monkeyp
 
     def interrupted(*args, **kwargs):
         nonlocal fired
-        match = not fired and (effect != "source-commit" or "commit" in args[1:])
+        match = not fired and (not source_effect or ("add" if effect == "source-stage" else "commit") in args[1:])
+        if effect == 'pin-write':
+            match = not fired and pathlib.Path(args[1]) == repository / 'mcp/pyproject.toml'
+        elif effect in {'lock-write', 'lock-failure'}:
+            match = not fired and args[0][:2] == ['uv', 'lock'] and '--check' not in args[0]
         if match:
             fired = True
+        if match and effect in {"git-failure", 'lock-failure'}:
+            if timing == "after":
+                original(*args, **kwargs)
+            return subprocess.CompletedProcess(args[0] if linked else ["git", *args[1:]], 7,
+                                               "preparation output", "preparation failed")
         if match and timing == "before":
             raise KeyboardInterrupt("test interruption")
         result = original(*args, **kwargs)
@@ -511,8 +623,14 @@ def test_worktree_build_repeats_commit_and_completion_handoffs(tmp_path, monkeyp
 
     with monkeypatch.context() as scoped:
         scoped.setattr(owner, name, interrupted)
-        with pytest.raises(KeyboardInterrupt, match="test interruption"):
-            runner.execute_build(repository, **options)
+        if effect in {"git-failure", 'lock-failure'}:
+            failed = runner.execute_build(repository, **options)
+            assert failed["status"] in runner.FAILED_STATUSES, failed
+            assert "preparation failed" in json.dumps(failed) and "preparation output" in json.dumps(failed)
+            assert not (repository / ".build-count").exists()
+        else:
+            with pytest.raises(KeyboardInterrupt, match="test interruption"):
+                runner.execute_build(repository, **options)
     assert fired
     result = runner.execute_build(repository, **options)
     assert result["status"] == "completed", result
@@ -520,6 +638,22 @@ def test_worktree_build_repeats_commit_and_completion_handoffs(tmp_path, monkeyp
     expected_count = "xx" if effect == "completion" and timing == "before" else "x"
     assert (repository / ".build-count").read_text() == expected_count
     assert not list(storage._artifact_store_path(repository, temporary=True).rglob("partial.bin"))
+    if linked:
+        import tomllib
+        for name in ('runtime', 'mcp'):
+            manifest = tomllib.loads((repository / name / 'pyproject.toml').read_text())
+            assert manifest['project']['version'] == '9.0.0'
+            assert '==1.2.20b1' in manifest['project']['dependencies'][0]
+            assert manifest['project']['optional-dependencies']['range'] == ['claims>=1.2,<2']
+        assert '[reports]' in (repository / 'mcp/pyproject.toml').read_text()
+        assert "python_version >= '3.11'" in (repository / 'mcp/pyproject.toml').read_text()
+        locked = subprocess.run(['uv', 'lock', '--offline', '--check', '--project', str(repository)],
+                                capture_output=True, text=True, check=False)
+        assert locked.returncode == 0, locked.stderr
+        repeated = runner.execute_build(repository, **options)
+        assert repeated['status'] == 'completed', repeated
+        assert (repository / '.build-count').read_text() == 'x'
+        assert run_git(repository, 'diff', '--cached', '--name-only').stdout.strip() == 'unrelated.txt'
 
 
 @pytest.fixture(params=["installed", "portable", "generated", "reference"])
@@ -1120,7 +1254,7 @@ def test_receipt_identities_require_release_bundle_without_an_old_name_alias(
     ("native", False, None), ("android-arm64", True, None), ("linux", True, "windows"),
 ])
 def test_build_recipe_and_independent_member_versions(tmp_path, capsys, target, implicit_engine, second_target):
-    repository, _ = _worktree_build_case(tmp_path)
+    repository, _ = _worktree_build_case(tmp_path, linked=target == 'native')
     path = repository / runner.DEFAULT_CONTRACT
     contract = json.loads(path.read_text())
     tool = contract["deliverables"]["packages"]["claims"]
@@ -1141,6 +1275,22 @@ def test_build_recipe_and_independent_member_versions(tmp_path, capsys, target, 
     engine_code = (repository / "scripts/build.py").read_text().replace(
         "pyproject.toml", "engine/pyproject.toml").replace(".build-count", ".engine-count")
     _write_fixture_bytes(repository, "scripts/engine.py", engine_code.encode())
+    if target == 'native':
+        _write_fixture_bytes(repository, 'engine/pyproject.toml',
+            b'[project]\nname="engine"\nversion="3.1.0"\nrequires-python=">=3.11"\n'
+            b'dependencies=["claims>=1.2,<2"]\n[tool.uv.sources]\nclaims={workspace=true}\n')
+        manifest = (repository / 'pyproject.toml').read_text().replace(
+            'version="1.2.19"', 'version="1.2.19"\ndependencies=["engine==3.1.0"]')
+        manifest = manifest.replace('members=["runtime", "mcp"]',
+                                    'members=["runtime", "mcp", "engine"]\n[tool.uv.sources]\nengine={workspace=true}')
+        (repository / 'pyproject.toml').write_text(manifest)
+        _write_fixture_bytes(repository, 'older/pyproject.toml',
+            b'[project]\nname="older"\nversion="1.0.0"\nrequires-python=">=3.11"\ndependencies=["claims==1.0.0"]\n')
+        contract['repository']['tools']['older-python'] = {'executable': sys.executable,
+            'version-from': {'file': 'older/pyproject.toml', 'key': 'project.requires-python'}}
+        locked = subprocess.run(['uv', 'lock', '--offline', '--project', str(repository)],
+                                capture_output=True, text=True, check=False)
+        assert locked.returncode == 0, locked.stderr
     with (repository / ".gitignore").open("a") as output:
         output.write(".engine-count\n")
     path.write_text(json.dumps(contract))
@@ -1163,6 +1313,13 @@ def test_build_recipe_and_independent_member_versions(tmp_path, capsys, target, 
         choices["deliverables.packages.engine"] = {"version": "3.2.0"}
     first = runner.execute_build(repository, requests, qualification_level="final", bundles=["suite"], version_choices=choices)
     assert first["status"] == "completed", first
+    if target == 'native':
+        assert 'engine==3.2.0' in (repository / 'pyproject.toml').read_text()
+        assert 'claims==1.4.0' in (repository / 'runtime/pyproject.toml').read_text()
+        assert 'claims==1.0.0' in (repository / 'older/pyproject.toml').read_text()
+        source_commit = json.loads(pathlib.Path(first['build_receipts'][0]).read_text())['preTestCommit']
+        for name in ('pyproject.toml', 'engine/pyproject.toml', 'runtime/pyproject.toml', 'mcp/pyproject.toml', 'uv.lock'):
+            assert run_git(repository, 'show', source_commit + ':' + name).returncode == 0
     bundle = results.read_artifact_receipt_chain(repository, tag="bundles/suite/2.0.0",
         expected=results.artifact_identity(repository.name, "bundles/suite", "2.0.0", target))
     assert [member.identity["version"] for member in bundle.members] == ["1.4.0", "3.2.0"]

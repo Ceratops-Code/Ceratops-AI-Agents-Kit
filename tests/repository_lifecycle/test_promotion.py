@@ -1160,7 +1160,7 @@ def test_task_merge_preserves_main_merges_and_reports_conflicts(
 @pytest.mark.parametrize("case", ["success", "failure", "outside-writer", "interrupted-checkout",
                                  "metadata-only", "product-change", "install-required",
                                  "missing-contract", "invalid-contract", "unreadable-contract",
-                                 "missing-result", "lost-check", "empty-scope"])
+                                 "missing-result", "lost-check", "empty-scope", "alpha-package"])
 def test_checks_finish_before_release_moves(tmp_path, case, monkeypatch):
     fails = case == "failure"
     repo, task, submitted, release_head, _ = prepare_divergent_promotion_repo(tmp_path / "checked")
@@ -1196,6 +1196,9 @@ def test_checks_finish_before_release_moves(tmp_path, case, monkeypatch):
         "assert context['trigger']=='promotion'\n"
         "assert context['branch']==subprocess.check_output(['git','branch','--show-current'],text=True).strip()\n"
         "assert context['commit']==subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()\n"
+        "if sys.argv[5]=='alpha-package':\n"
+        "    import tomllib\n"
+        "    assert tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version']=='1.2.20b1'\n"
         "root=pathlib.Path(sys.argv[1]); p=pathlib.Path(sys.argv[3])\n"
         "head=subprocess.check_output(['git','-C',str(root),'rev-parse','release/local'],text=True).strip()\n"
         "if sys.argv[5]=='outside-writer' and p.exists():\n"
@@ -1226,6 +1229,18 @@ def test_checks_finish_before_release_moves(tmp_path, case, monkeypatch):
     }
     if optional_builder is not None:
         contract["deliverables"] = {"apps": {"sample": optional_builder}}
+    if case == 'alpha-package':
+        from tests.repository_lifecycle.test_completed_builds import _worktree_build_case
+        (tmp_path / 'package-fixture').mkdir()
+        fixture, _ = _worktree_build_case(tmp_path / 'package-fixture')
+        contract['deliverables'] = json.loads((fixture / '.ceratops/sdlc/sdlc.yml').read_text())['deliverables']
+        for relative in ('src/claims.py', 'scripts/build.py', 'pyproject.toml'):
+            target = task / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes((fixture / relative).read_bytes())
+        (task / 'pyproject.toml').write_text('[project]\nname="claims"\nversion="1.2.20a3"\n')
+        with (task / '.gitignore').open('a') as stream:
+            stream.write('\n.build-count\n')
     assert isinstance(contract["repository"], dict)
     if case == "empty-scope":
         contract["repository"]["actions"]["pre-build-checks"]["check-groups"] = {
@@ -1283,6 +1298,9 @@ def test_checks_finish_before_release_moves(tmp_path, case, monkeypatch):
     assert head == run_git(task, "rev-parse", "HEAD").stdout.strip()
     assert result["submitted_commits"] == {"approved": selected}
     assert result["tested_commit"] == result["accepted_commit"] == head
+    if case == 'alpha-package':
+        assert (task / '.build-count').read_text() == 'x'
+        assert '1.2.20b1' in (repo / 'pyproject.toml').read_text()
     if case != "empty-scope":
         check = next(value for value in result["checks"] if value["operation"].startswith("repository."))
         assert check["check_outcome"]["status"] == "passed"

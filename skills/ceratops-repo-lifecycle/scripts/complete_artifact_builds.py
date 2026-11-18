@@ -655,21 +655,8 @@ def _require_unchanged_inputs(
             )
     except StepResultError as exc:
         raise RecoveryRequired("Declared inputs changed after checkpoint B.") from exc
-    if input_paths:
-        status = _git_bytes(
-            transaction.repo_root,
-            [
-                "status",
-                "--porcelain=v1",
-                "-z",
-                "--untracked-files=all",
-                "--",
-                *_literal_pathspecs(sorted(input_paths)),
-            ],
-            label="inspect declared inputs",
-        )
-        if status:
-            raise RecoveryRequired("Declared inputs changed after checkpoint B.")
+    if not _inputs_match_commit(transaction.repo_root, transaction.pre_test_commit, tuple(input_paths)):
+        raise RecoveryRequired("Declared inputs changed after checkpoint B.")
 
 
 def _verify_result_worktree(

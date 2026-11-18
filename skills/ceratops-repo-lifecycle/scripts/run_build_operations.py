@@ -113,10 +113,8 @@ def prepare_build_operations(root, requests, contract_path=None, *, context="ski
                 # permits read-only command preparation and never reaches a
                 # builder until execute_build has obtained that decision.
                 version = current_version or "0.0.0"
-                if (qualification_level in {"alpha", "beta"}
-                        and (match := store_artifacts.FULL_VERSION_RE.fullmatch(version))
-                        and match.group("class") is None):
-                    version += "a1" if qualification_level == "alpha" else "b1"
+                if store_artifacts.FULL_VERSION_RE.fullmatch(version):
+                    version, _ = store_artifacts._version_classification(version, qualification_level=qualification_level)
                 parameters["version"] = version
             parameters.setdefault("target", "native")
             parameters.setdefault("artifact_directory", str(root / ".pending-build-output"))
@@ -378,6 +376,8 @@ def recorded_build(item, inputs, *, supplier_results=(), require_artifacts=True,
         paths = tuple(deliverable_source_files(item.repo_root, product, include_deleted=True))
         try:
             matches = (paths == tuple(waiting["source_paths"])
+                and ('alpha', 'beta', 'rc', 'final').index(sdlc_results.build_qualification(waiting['version']))
+                    >= ('alpha', 'beta', 'rc', 'final').index(item.qualification_level)
                 and store_artifacts._inputs_match_commit(item.repo_root, waiting["source_commit"], paths)
                 and collect_build_details(item) == waiting["inputs"]
                 and reuse_operation_checks.artifact_inputs(item.repo_root, inputs) == waiting["dependencies"]
@@ -450,11 +450,15 @@ def recorded_build(item, inputs, *, supplier_results=(), require_artifacts=True,
     build = max(candidates, key=lambda value: Version(value["receipt"]["identity"]["version"]))
     receipt = build["receipt"]
     decision["previous_receipt"] = receipt
-    if item.version_explicit and Version(parameters['version']).release != Version(receipt['identity']['version']).release:
-        # The allocator advances alpha/beta counters for changed source. A
+    requested_version = Version(parameters['version']) if item.version_explicit else None
+    accepted_version = Version(receipt['identity']['version'])
+    if requested_version is not None and (requested_version.release != accepted_version.release
+            or requested_version > accepted_version
+            or (requested_version.pre or ('final',))[0] != (accepted_version.pre or ('final',))[0]):
+        # The allocator advances prerelease counters for changed source. A
         # repeat of the original request can reuse its completed later counter;
         # a different requested base requires a newly versioned artifact.
-        reasons.append('Requested a different base version: ' + parameters['version'])
+        reasons.append('Requested a different version or release stage: ' + parameters['version'])
     owner = reference.split(".")
     declaration = contract["deliverables"][owner[1]][owner[2]]
     current = set(deliverable_source_files(item.repo_root, declaration))
@@ -729,31 +733,11 @@ def execute_sdlc_operations(
                 ], item.contract_path, context=item.handoff_mode, artifacts=available)
             if (comparison["result"] is None and item.result_schema == "ceratops-builder-output"
                     and build_context is not None):
-                from execute_worktree_build import _commit_source
                 target = item.build_target or dict(item.parameters).get("target", "native")
                 key = (reference, target)
-                allocation = build_context.setdefault("allocations", {}).get(reference)
-                if (isinstance(allocation, store_artifacts.ArtifactVersionTransaction)
-                        and not store_artifacts._inputs_match_commit(
-                            item.repo_root, allocation.pre_test_commit, allocation.declared_input_paths)):
-                    del build_context["allocations"][reference]
-                    allocation = None
+                allocation = build_context['allocations'].get(reference)
                 if allocation is None:
-                    parameters = dict(item.parameters)
-                    contract = operations.read_repository_contract(item.repo_root, item.contract_path)
-                    owner = reference.split(".")
-                    product = contract["deliverables"][owner[1]][owner[2]]
-                    paths = tuple(deliverable_source_files(item.repo_root, product, include_deleted=True))
-                    allocation = store_artifacts.allocate_artifact_version(
-                        item.repo_root, repository=pathlib.Path(reuse_operation_checks._git(
-                            item.repo_root, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()).parent.name,
-                        release_bundle=sdlc_results.artifact_storage_key(deliverable=reference),
-                        version=parameters["version"], required_targets=build_context["targets"][reference],
-                        declared_input_paths=paths)
-                    if not isinstance(allocation, store_artifacts.ArtifactVersionTransaction):
-                        commit = _commit_source(allocation, paths, declaration=product, reference=reference)
-                        allocation = store_artifacts.bind_artifact_inputs(allocation, pre_test_commit=commit)
-                    build_context["allocations"][reference] = allocation
+                    raise operations.OperationError(f'{reference}: source changed after package versions were prepared.')
                 parameters = {**dict(item.parameters), "version": allocation.version,
                               "artifact_directory": str(allocation.target_output(target)), "target": target}
                 refreshed = operations.prepare_operations(item.repo_root, [

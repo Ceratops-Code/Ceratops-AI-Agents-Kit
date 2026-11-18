@@ -776,8 +776,25 @@ SDLC results; no caller-supplied second receipt exists. One result commit contai
 all required targets and bundle/member receipts, followed by member and bundle
 tags. A fresh call finishes missing effects from current files and Git state.
 Unrelated staged files remain outside the source/result commits.
-Source preparation includes staged and unstaged deletions under the declared
-source paths; the receipt's blob list contains only files present in that commit.
+`prepare_package_versions()` writes the requested package versions, their linked
+local Python requirements and native lockfiles before any check or builder runs.
+Promotion requests beta even in a task worktree: alpha source moves to the next
+available beta version. Suitable beta, release-candidate and final packages retain
+their existing versions and acceptance when their build sources still match.
+An explicitly incompatible stage returns a version question before source writes.
+Native TOML and requirement readers preserve compatible ranges, extras, markers
+and independent older consumers. `uv lock` resolves each affected lock once;
+only then does one source commit include the complete prepared change. A failed
+write or lock operation restores this call's metadata before any source commit.
+After a completed commit, a repeat uses its current files and allocated version.
+Each metadata writer owns its adjacent `.in_process` file and removes it after
+success or an exception; it never stores execution progress there.
+Source preparation includes staged/unstaged edits, new files, deletions and both
+rename paths. Git reports paths as NUL-separated output; owned changed paths go
+to `git add` and `git commit` through standard input, keeping large inventories
+off Windows command lines. Unrelated index and working files stay untouched.
+The receipt keeps the complete declared source inventory, with only files present
+in its source commit recorded as Git blobs.
 Explicit dependency files suppress their producer's build. Before running the
 consumer, Build reads the artifact receipt beside those exact files and passes
 the supplier's recorded version, file records and acceptance to completion.

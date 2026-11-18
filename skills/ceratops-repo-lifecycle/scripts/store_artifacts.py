@@ -32,7 +32,7 @@ REPOSITORY_ID_RE = re.compile(
 )
 FULL_VERSION_RE = re.compile(
     r"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
-    r"(?:(?P<class>a|b)(?:0|[1-9][0-9]*))?"
+    r"(?:(?P<class>a|b|rc)(?:0|[1-9][0-9]*))?"
     r"(?:\+[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)*)?$"
 )
 ARTIFACT_REQUEST_SCHEMA = "ceratops-artifact-build-request.v1"
@@ -268,7 +268,7 @@ def _validated_repository(value: object) -> str:
     return repository
 
 
-def _version_classification(version: object) -> tuple[str, str]:
+def _version_classification(version: object, *, qualification_level: str | None = None) -> tuple[str, str]:
     value = _require_identifier(
         version,
         label="full version",
@@ -276,6 +276,14 @@ def _version_classification(version: object) -> tuple[str, str]:
     )
     match = FULL_VERSION_RE.fullmatch(value)
     assert match is not None
+    if qualification_level is not None:
+        levels = ("alpha", "beta", "rc", "final")
+        current = {"a": "alpha", "b": "beta", "rc": "rc"}.get(match.group("class"), "final")
+        if levels.index(current) < levels.index(qualification_level):
+            suffix = {"alpha": "a1", "beta": "b1", "rc": "rc1", "final": ""}[qualification_level]
+            value = re.sub(r"(?:a|b|rc)\d+(?=\+|$)", suffix, value)
+            match = FULL_VERSION_RE.fullmatch(value)
+            assert match is not None
     return value, {"a": "alpha", "b": "beta"}.get(
         match.group("class"), "stable"
     )
@@ -482,27 +490,27 @@ def _input_paths(repo_root: pathlib.Path, declared: Sequence[str]) -> tuple[str,
 def _inputs_match_commit(root: pathlib.Path, commit: str, paths: Sequence[str]) -> bool:
     if not paths:
         return True
-    specifications = [f":(literal){path}" for path in paths]
+    owned = set(paths)
     dirty = False
     for flags in ([], ["--cached"]):
         changed = subprocess.run(
-            ["git", "-C", str(root), "diff", *flags, "--quiet", commit, "--", *specifications],
-            capture_output=True, text=True, check=False,
+            ["git", "-C", str(root), "diff", *flags, "--name-only", "--no-renames", "-z", commit, "--"],
+            capture_output=True, text=True, encoding="utf-8", check=False,
         )
-        if changed.returncode not in {0, 1}:
+        if changed.returncode:
             raise OperationError(f"Git could not compare build inputs: {changed.stderr.strip()}")
-        dirty = dirty or changed.returncode == 1
+        dirty = dirty or bool(owned.intersection(changed.stdout.split("\0")))
     untracked = subprocess.run(
-        ["git", "-C", str(root), "ls-files", "--others", "--exclude-standard", "-z",
-         "--", *specifications], capture_output=True, text=True, check=False,
+        ["git", "-C", str(root), "ls-files", "--others", "--exclude-standard", "-z"],
+        capture_output=True, text=True, encoding="utf-8", check=False,
     )
     if untracked.returncode:
         raise OperationError(f"Git could not inspect build inputs: {untracked.stderr.strip()}")
-    return not dirty and not untracked.stdout
+    return not dirty and not owned.intersection(untracked.stdout.split("\0"))
 
 
 def _next_prerelease(version: str) -> str:
-    match = re.fullmatch(r"(.+[ab])(\d+)(\+.*)?", version)
+    match = re.fullmatch(r"(.+(?:a|b|rc))(\d+)(\+.*)?", version)
     if match is None:
         raise OperationError(
             f"Final artifact version {version} is occupied; choose another final version."
@@ -513,19 +521,19 @@ def _next_prerelease(version: str) -> str:
 def allocate_artifact_version(
     repo_root: pathlib.Path, *, repository: str, release_bundle: str, version: str,
     required_targets: Sequence[str], attempt_id: str | None = None,
-    declared_input_paths: Sequence[str] = (),
+    declared_input_paths: Sequence[str] = (), qualification_level: str | None = None,
 ) -> ArtifactVersionAllocation:
     """Allocate temporary output inside this checkout before preparing source versions.
 
     Exclusive mkdir is the allocation primitive. Only a collision increments an
-    alpha/beta number. Permission/I/O errors propagate. Before allocating, remove
+    prerelease number. Permission/I/O errors propagate. Before allocating, remove
     every unfinished build of this item in this checkout. A short allocation lock
     covers cleanup and allocation; other checkouts' directories are never removed.
     """
     root = _validated_worktree(pathlib.Path(repo_root))
     repository = _validated_repository(repository)
     unit = sdlc_results.receipt_storage_key({"storageKey": release_bundle})
-    version, classification = _version_classification(version)
+    version, classification = _version_classification(version, qualification_level=qualification_level)
     targets = _validated_targets(required_targets)
     paths = _input_paths(root, declared_input_paths)
     if attempt_id is not None:
