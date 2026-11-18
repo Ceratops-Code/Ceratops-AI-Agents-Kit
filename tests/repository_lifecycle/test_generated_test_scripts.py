@@ -348,10 +348,19 @@ def _current_test_records(root, script):
 
 def test_generated_script_reuses_each_test_and_reruns_only_changed_inputs(tmp_path):
     root, script = _mapped_generated_runner(tmp_path)
+    manifest_path = root / "tests/test-impact.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["reuse_inputs"] = {
+        "tests/test_a.py::test_value": {"paths": ["a.data"], "packages": [], "tools": ["uv"]},
+        "tests/test_b.py::test_value": {"paths": ["b.data"], "packages": []},
+    }
+    manifest_path.write_text(json.dumps(manifest))
     for _ in range(2):
         result = _run_result_runner(root, script, ["tests"])
         assert result.returncode == 0, result.stdout + result.stderr
     first = _current_test_records(root, script)
+    assert first["tests/test_a.py::test_value"]["inputs"]["tools"]["uv"]["version"]
+    assert first["tests/test_b.py::test_value"]["inputs"]["tools"] == {}
     assert (tmp_path / "a-calls").read_text() == (tmp_path / "b-calls").read_text() == "x"
     (root / "a.data").write_text("bad")
     failed = _run_result_runner(root, script, ["tests"])

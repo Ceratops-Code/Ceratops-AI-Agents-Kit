@@ -1646,8 +1646,11 @@ Generated Python runners receive `scripts/testing/select_test_groups.py` and
 `scripts/testing/reuse_test_results.py` from the corresponding repo-lifecycle
 templates. Ceratops uses those same support files. A repository's existing
 `tests/test-impact.json` supplies test dependencies; without that map the generated
-runner executes tests but cannot reuse individual passes. A custom runner stays
-custom; `[tool.ceratops.test-support] managed = true` opts its support files into
+runner executes tests but cannot reuse individual passes.
+Tool versions come from both suite declarations and individual `reuse_inputs`;
+each saved test result includes only the tools declared for that test.
+A custom runner stays custom; `[tool.ceratops.test-support] managed = true`
+opts its support files into
 generation, including `scripts/result_records.py` from the standard runner's
 result interface and `scripts/testing/read_check_environment.py`. Its command
 implementation stays unchanged. Compatibility checks require the declared

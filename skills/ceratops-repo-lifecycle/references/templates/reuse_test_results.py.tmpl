@@ -489,9 +489,12 @@ class ResultStore:
         self.manifest = load_manifest(self.root / "tests/test-impact.json")
         environment_reader = runpy.run_path(str(pathlib.Path(__file__).with_name("read_check_environment.py")))
         self.environment_inputs_for_reuse = environment_reader["environment_inputs_for_reuse"]
-        declared_tools = sorted({name for suite in self.manifest.suites.values()
-                                 for name in (suite.tools if suite.tools is not None else ("uv",))})
-        observed_environment = environment_reader["read_environment"](root, {"tools": declared_tools}, runtime=False)
+        declared_tools = {name for suite in self.manifest.suites.values()
+                          for name in (suite.tools if suite.tools is not None else ("uv",))}
+        # A test may require a tool absent from every suite-level declaration.
+        declared_tools.update(name for inputs in self.manifest.reuse_inputs.values()
+                              for name in (inputs.get("tools") or ()))
+        observed_environment = environment_reader["read_environment"](root, {"tools": sorted(declared_tools)}, runtime=False)
         ignored = [pattern for item in self.manifest.ignored_paths for pattern in item.paths]
         names = _git(root, "ls-files", "--cached", "--others", "--exclude-standard", "-z").decode("utf-8").split("\0")
         self.files: dict[str, str | None] = {}
