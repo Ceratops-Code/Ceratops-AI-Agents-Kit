@@ -1641,6 +1641,11 @@ support to be present. Dependency setup expands an existing release-branch
 Dependabot entry instead of adding another updater for the same directory;
 default-branch security-only entries remain separate.
 
+Generated support preserves exact-test `reuse_inputs` declarations, failure
+cleanup within the requested scope, and failed unittest subtests. A later passing
+subtest cannot turn its failed parent into a reusable pass. `CODEX_TOOL_CALL_ID`
+identifies a caller and does not affect test reuse.
+
 SDLC actions run in this order: `pre-build-checks`, `build`, then
 `post-build-checks`, even when YAML keys appear in another order. This replaces
 the former per-group `phase` layout. Each before/after `check-groups` entry owns

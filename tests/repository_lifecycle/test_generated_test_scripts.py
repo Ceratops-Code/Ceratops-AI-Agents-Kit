@@ -4,6 +4,7 @@ import hashlib
 import importlib
 import importlib.util
 import json
+import os
 import pathlib
 import runpy
 import shutil
@@ -178,6 +179,8 @@ def _run_result_runner(root: pathlib.Path, runner: pathlib.Path, args: list[str]
     return subprocess.run(
         [sys.executable, str(runner), "--temporary-root", ".build/test-tmp", *args],
         cwd=root, capture_output=True, text=True, check=False,
+        # A parent test-name filter does not describe this fixture's tests.
+        env={name: value for name, value in os.environ.items() if name != "PYTEST_ADDOPTS"},
     )
 
 

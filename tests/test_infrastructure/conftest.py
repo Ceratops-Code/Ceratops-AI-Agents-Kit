@@ -21,4 +21,8 @@ def test_runner_module() -> Any:
     with pytest.MonkeyPatch.context() as context:
         context.syspath_prepend(str(path.parent))
         spec.loader.exec_module(module)
-    return module
+    with pytest.MonkeyPatch.context() as context:
+        # The outer suite's selection must not filter the sample repositories
+        # created by these tests. Cases can still set their own pytest options.
+        context.delenv("PYTEST_ADDOPTS", raising=False)
+        yield module

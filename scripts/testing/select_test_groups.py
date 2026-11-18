@@ -13,7 +13,7 @@ import json
 import pathlib
 import re
 from collections.abc import Iterable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 MANIFEST_VERSION = 1
@@ -63,6 +63,7 @@ class Manifest:
     full_suite_paths: tuple[str, ...]
     ignored_paths: tuple[Ignore, ...]
     unmapped_production: str
+    reuse_inputs: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -295,13 +296,34 @@ def parse_manifest(data: Any) -> Manifest:
     unmapped = data.get("unmapped_production")
     if unmapped != "error":
         raise ImpactError("unmapped_production must be 'error'")
-    return Manifest(
+    raw_reuse = data.get("reuse_inputs", {})
+    if not isinstance(raw_reuse, dict):
+        raise ImpactError("impact manifest reuse_inputs must be an object")
+    reuse_inputs = {}
+    for nodeid, raw in raw_reuse.items():
+        test_path, separator, test_name = nodeid.partition("::")
+        if not separator or not test_name or not test_path.endswith(".py") or not isinstance(raw, dict):
+            raise ImpactError(f"reuse_inputs requires an exact pytest node ID and an object: {nodeid!r}")
+        paths = tuple(normalize_pattern(item) for item in _string_tuple(raw.get("paths"), f"{nodeid}.paths"))
+        if not paths:
+            raise ImpactError(f"{nodeid}.paths must not be empty")
+        reuse_inputs[nodeid] = {
+            "paths": paths, "packages": _string_tuple(raw.get("packages"), f"{nodeid}.packages"),
+            **{name: _string_tuple(raw[name], f"{nodeid}.{name}") if name in raw else None
+               for name in ("tools", "environment")},
+        }
+    manifest = Manifest(
         suites=suites,
         rules=tuple(rules),
         full_suite_paths=full_suite_paths,
         ignored_paths=tuple(ignored),
         unmapped_production=unmapped,
+        reuse_inputs=reuse_inputs,
     )
+    for nodeid in reuse_inputs:
+        if len(owning_suites(manifest, nodeid.split("::", 1)[0])) != 1:
+            raise ImpactError(f"reuse_inputs requires one owning suite: {nodeid}")
+    return manifest
 
 
 def is_executable_production_path(path: str) -> bool:
@@ -431,6 +453,16 @@ def group_inputs(manifest: Manifest, nodeid: str, paths: Iterable[str]) -> tuple
         }))
     suite = replace(suite, packages=inherited("packages"), tools=inherited("tools"),
                     environment=inherited("environment"))
+    if (reuse := manifest.reuse_inputs.get(nodeid)) is not None:
+        # Choosing affected checks still uses the full suite graph. These
+        # narrower declarations describe this test's saved result only.
+        return replace(
+            suite, packages=reuse["packages"],
+            tools=suite.tools if reuse["tools"] is None else reuse["tools"],
+            environment=suite.environment if reuse["environment"] is None else reuse["environment"],
+        ), tuple(path for path in sorted(set(paths))
+                 if not path.startswith((".ceratops/build/", ".ceratops/results/"))
+                 and any(path_matches(pattern, path) for pattern in reuse["paths"]))
     patterns = [*(
         pattern for rule in manifest.rules if dependencies.intersection(rule.suites)
         for pattern in rule.paths
@@ -505,7 +537,7 @@ def selection_from_changes(
     for changed in sorted(changes, key=lambda item: (item.paths, item.status)):
         for path_index, path in enumerate(changed.paths):
             if path.startswith((".ceratops/build/", ".ceratops/results/")):
-                ignored_paths.append({"path": path, "reason": "generated Ceratops result"})
+                ignored_paths.append({"path": path, "id": "ceratops-results", "reason": "generated Ceratops result"})
                 continue
             renamed_source = (
                 changed.status.startswith("R")

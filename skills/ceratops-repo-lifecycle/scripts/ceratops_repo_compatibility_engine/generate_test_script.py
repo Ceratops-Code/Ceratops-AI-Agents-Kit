@@ -145,7 +145,7 @@ def record_generated_runner(
             'import json\nimport os\nimport pathlib\nimport platform\nimport re\nimport runpy\n'
             'import shutil\nimport subprocess\nimport sys\nimport time\n'
             'from collections.abc import Callable, Mapping\nfrom typing import Any\n\n'
-            '# Repository check runner interface\n' + interface
+            '# Repository check runner interface\n' + interface.rstrip() + '\n'
         )
     for name in ("select_test_groups.py", "reuse_test_results.py"):
         destination = root / "scripts/testing" / name

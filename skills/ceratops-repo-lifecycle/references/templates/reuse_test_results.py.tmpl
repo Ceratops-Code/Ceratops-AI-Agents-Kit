@@ -160,7 +160,8 @@ def save_test_diagnostic(path: pathlib.Path, payload: Mapping[str, Any], *,
 
 def remove_test_diagnostic(path: pathlib.Path, *, root: pathlib.Path, current: Any = None,
                            successful_request: Mapping[str, Any] | None = None,
-                           retired_checks: set[str] | None = None) -> None:
+                           retired_checks: set[str] | None = None,
+                           retired_scope: Mapping[str, Any] | None = None) -> None:
     """Remove a managed report after its own failures have newer saved passes.
 
     Caller-selected reports outside .build/test-diagnostics are user-retained.
@@ -182,7 +183,7 @@ def remove_test_diagnostic(path: pathlib.Path, *, root: pathlib.Path, current: A
         return
     unknown = report.get("unrepresented_failure", not report.get("saved_failures"))
     remaining = {nodeid: failure for nodeid, failure in _unresolved_test_failures(report, current).items()
-                 if nodeid not in (retired_checks or set())}
+                 if nodeid not in (retired_checks or set()) or failure.get("scope") != retired_scope}
     changed = remaining != report.get("saved_failures", {})
     if changed:
         report["saved_failures"] = remaining
@@ -390,6 +391,7 @@ def result_environment(
         RESULT_CONTEXT_ENV, RESULT_SUMMARY_ENV, "CERATOPS_SDLC_TEST_CONTEXT",
         "CERATOPS_REPOSITORY_CHECK_CONTEXT", "PYTEST_CURRENT_TEST",
         "CODEX_SESSION_ID", "CODEX_THREAD_ID", "CODEX_TASK_WORKSPACE_VERIFYING_IDENTITY",
+        "CODEX_TOOL_CALL_ID",
         "CERATOPS_TEST_ARTIFACTS",
     }
     context: dict[str, Any] = {
@@ -614,7 +616,8 @@ class ResultStore:
         for nodeid in deleted:
             self.records_by_check.pop((self.checkout, nodeid), None)
         if deleted:
-            remove_test_diagnostic(self.diagnostic_path, root=self.root, current=self.current, retired_checks=deleted)
+            remove_test_diagnostic(self.diagnostic_path, root=self.root, current=self.current,
+                                   retired_checks=deleted, retired_scope=scope)
 
     @staticmethod
     def _stat(path: pathlib.Path) -> tuple[int, int] | None:
@@ -626,16 +629,21 @@ class ResultStore:
 
     def inputs(self, nodeid: str, helpers: set[str] | None = None) -> dict[str, Any]:
         names = {nodeid.split("::", 1)[0], *(helpers or set())}
+        if nodeid in self.manifest.reuse_inputs:
+            # Declared production inputs replace broad imports for this test;
+            # its own source and test helpers still identify the check.
+            names = {name for name in names if not name.startswith(("packages/", "mcp-servers/"))}
         if any(name not in self.files or self.files[name] is None for name in names):
             raise ValueError("Check uses inputs outside the recorded inventory")
         owners = owning_suites(self.manifest, nodeid.split("::", 1)[0])
         if len(owners) != 1:
             raise ValueError(f"Check must have one input group: {nodeid}: {owners}")
-        if owners[0] not in self.inputs_by_group:
-            self.inputs_by_group[owners[0]] = self._group_context(nodeid)
+        group = nodeid if nodeid in self.manifest.reuse_inputs else owners[0]
+        if group not in self.inputs_by_group:
+            self.inputs_by_group[group] = self._group_context(nodeid)
         self._load_check(nodeid)
         return {
-            **self.inputs_by_group[owners[0]],
+            **self.inputs_by_group[group],
             "check_inputs": {name: self.files.get(name) for name in sorted(names)},
         }
 
@@ -745,13 +753,19 @@ class ResultStore:
         # Use the current owner, including when comparing a retained failure's
         # old inputs after that owner was renamed or split.
         owners = owning_suites(self.manifest, nodeid.split("::", 1)[0])
-        key = (owners[0] if len(owners) == 1 else nodeid,
+        key = (nodeid if nodeid in self.manifest.reuse_inputs else owners[0] if len(owners) == 1 else nodeid,
                tuple(sorted(set(previous) | set(current))))
         if key not in self.comparison_groups:
             self.comparison_groups[key] = group_inputs(self.manifest, nodeid, key[1])
         suite, required = self.comparison_groups[key]
         def metadata(source: Mapping[str, Any]) -> dict[str, Any]:
             facts = {key: value for key, value in source.items() if key not in excluded}
+            if nodeid in self.manifest.reuse_inputs and isinstance(facts.get("check_inputs"), dict):
+                facts["check_inputs"] = {name: value for name, value in facts["check_inputs"].items()
+                                        if not name.startswith(("packages/", "mcp-servers/"))}
+            if isinstance(facts.get("environment"), dict):
+                facts["environment"] = {name: value for name, value in facts["environment"].items()
+                                        if name != "CODEX_TOOL_CALL_ID"}
             # Narrowing declared inputs keeps the original pass and its check
             # version. Newly required or missing facts still differ below.
             for field, names in (("environment", suite.environment), ("tools", suite.tools)):
@@ -1121,7 +1135,6 @@ class ReusePasses:
             not self.collection_filtered and not self.collection_failed
             and not config.getoption("keyword") and not config.getoption("markexpr")
             and not config.pluginmanager.hasplugin("xdist")
-            and not any("::" in value for value in config.args)
             and self.collected == {item.nodeid for item in items} | self.reused.keys()
         )
 
@@ -1208,7 +1221,10 @@ class ReusePasses:
         if report.nodeid not in self.inputs_by_node:
             return
         phases = self.phases.setdefault(report.nodeid, {})
-        phases[report.when] = "xfail" if hasattr(report, "wasxfail") else report.outcome
+        observed = "xfail" if hasattr(report, "wasxfail") else report.outcome
+        # A later successful unittest subtest or parent report must not erase
+        # a failure already observed in that same test's call phase.
+        phases[report.when] = "failed" if phases.get(report.when) == "failed" else observed
         if report.skipped:
             self.skipped_phases.setdefault(report.nodeid, set()).add(report.when)
         if hasattr(report, "wasxfail"):
@@ -1297,8 +1313,11 @@ class ReusePasses:
         if exitstatus == pytest.ExitCode.NO_TESTS_COLLECTED and self.original_count == len(self.reused) > 0:
             session.exitstatus = pytest.ExitCode.OK
         if session.exitstatus == pytest.ExitCode.OK and self.complete_collection:
+            partial_files = {(self.store.root / value.split("::", 1)[0]).resolve()
+                             for value in session.config.args if "::" in value}
             unchanged = {name for name, stamp in self.collected_files.items()
-                         if stamp == self.store._stat(self.store.root / name)}
+                         if (self.store.root / name).resolve() not in partial_files
+                         and stamp == self.store._stat(self.store.root / name)}
             self.store.discard_deleted_checks(self.collected, session.config.args, complete_files=unchanged)
         if destination := os.environ.get(RESULT_SUMMARY_ENV):
             # This caller-selected output belongs to pytest's isolated temp
