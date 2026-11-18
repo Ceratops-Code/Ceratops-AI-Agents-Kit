@@ -1544,7 +1544,9 @@ and adds coverage for discovered package directories. Where Renovate is needed,
 it references the owner's shared preset. It adds configuration checks to the
 existing CI workflow while preserving application commands, package locations,
 SDLC and test runners. A failed write restores the previous files; a repeated
-call leaves current contents unchanged.
+call leaves current contents unchanged. Native Renovate reads tracked or staged
+configuration files. Private presets use the existing GitHub login only in the
+Renovate process environment; credentials are not saved in its reports or cache.
 
 The lifecycle runner invokes the declared repository validation and test
 scripts before deployment and continues only when they succeed. It does not

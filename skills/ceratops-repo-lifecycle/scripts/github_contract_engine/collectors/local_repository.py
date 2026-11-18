@@ -1436,6 +1436,25 @@ def read_renovate_configuration(
     for name in ("RENOVATE_TOKEN", "RENOVATE_GITHUB_COM_TOKEN", "RENOVATE_HOST_RULES"):
         if name in os.environ:
             environment[name] = os.environ[name]
+    if not environment.get("RENOVATE_GITHUB_COM_TOKEN"):
+        credential = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+        github_cli = shutil.which("gh") if not credential else None
+        if github_cli:
+            # Reuse the caller's existing GitHub login for private presets.
+            # The token is passed only in the child environment, never saved
+            # in the cache, command arguments or returned diagnostics.
+            try:
+                login = subprocess.run([github_cli, "auth", "token", "--hostname", "github.com"],
+                                       capture_output=True, text=True, encoding="utf-8",
+                                       errors="replace", timeout=30, check=False)
+                if login.returncode == 0:
+                    credential = login.stdout.strip()
+            except (OSError, subprocess.TimeoutExpired):
+                # Public presets remain readable without a GitHub login;
+                # Renovate reports the actual preset failure if access is needed.
+                credential = None
+        if credential:
+            environment["RENOVATE_GITHUB_COM_TOKEN"] = credential
     environment.update({
         "LOG_FORMAT": "json", "LOG_LEVEL": "debug", "RENOVATE_PRINT_CONFIG": "true",
         "RENOVATE_CONFIG_FILE": global_config.as_posix(),
@@ -1504,7 +1523,7 @@ def read_renovate_configuration(
         if isinstance(event.get("level"), int) and event["level"] >= 40:
             problem = {key: event[key] for key in ("msg", "err", "configFile", "validationError",
                                                   "validationMessage", "packageFile", "depName") if key in event}
-            destination = "errors" if event["level"] >= 50 else "warnings"
+            destination = "errors" if event["level"] >= 50 or message == "Repository has invalid config" else "warnings"
             result[destination].append(problem)
     # A zero exit is insufficient when Renovate intentionally stops for an
     # invalid/missing preset or cannot complete dependency extraction.

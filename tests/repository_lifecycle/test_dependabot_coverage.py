@@ -295,7 +295,7 @@ class DependabotCoverageTests(unittest.TestCase):
                 {"depType": "engines", "depName": "node", "currentValue": ">=24 <25", "datasource": "node-version"},
             ]}]}},
         ]
-        with tempfile.TemporaryDirectory() as temporary:
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {"RENOVATE_GITHUB_COM_TOKEN": "fixture-preset-token"}):
             root = pathlib.Path(temporary)
             config = root / "renovate.json5"
             config.write_text('// JSON5 belongs to Renovate\n{extends: ["github>owner/policy"],}', encoding="utf-8")
@@ -315,6 +315,18 @@ class DependabotCoverageTests(unittest.TestCase):
             self.assertIn("--dry-run=extract", command.call_args.args[0])
             self.assertIn("--allow-scripts=false", command.call_args.args[0])
             self.assertEqual(command.call_args.kwargs["env"]["RENOVATE_BINARY_SOURCE"], "global")
+            self.assertEqual(command.call_args.kwargs["env"]["RENOVATE_GITHUB_COM_TOKEN"], "fixture-preset-token")
+            self.assertNotIn("fixture-preset-token", json.dumps(first))
+            with patch.dict(os.environ, {"RENOVATE_GITHUB_COM_TOKEN": "", "GH_TOKEN": "", "GITHUB_TOKEN": ""}), \
+                    patch(module + ".shutil.which", return_value="tool"), \
+                    patch(module + ".subprocess.run", side_effect=[cache,
+                        subprocess.CompletedProcess(["gh"], 0, "private-preset-token\n", ""), successful] * 2) as authenticated:
+                for _ in range(2):
+                    authenticated_result = read_renovate_configuration(root)
+                    self.assertEqual(authenticated_result["status"], "ok")
+                    self.assertNotIn("private-preset-token", json.dumps(authenticated_result))
+                self.assertEqual(authenticated.call_args.kwargs["env"]["RENOVATE_GITHUB_COM_TOKEN"], "private-preset-token")
+                self.assertEqual(authenticated.call_args_list[1].args[0][1:], ["auth", "token", "--hostname", "github.com"])
             self.assertEqual(config.read_text(), '// JSON5 belongs to Renovate\n{extends: ["github>owner/policy"],}')
             global_config = root / ".git/ceratops/renovate-cache/global-config.json"
             for boundary in ("before_replace", "after_replace"):
@@ -338,6 +350,8 @@ class DependabotCoverageTests(unittest.TestCase):
                 subprocess.CompletedProcess(["renovate"], 0, "{}", ""),
                 subprocess.CompletedProcess(["renovate"], 0, "\n".join(json.dumps(event) for event in events[1:]), ""),
                 subprocess.CompletedProcess(["renovate"], 0, successful.stdout + '\n' + json.dumps({"level": 50, "msg": "extraction failed"}), ""),
+                subprocess.CompletedProcess(["renovate"], 0, successful.stdout + '\n' + json.dumps({
+                    "level": 40, "msg": "Repository has invalid config", "err": {"validationError": "Private preset access denied"}}), ""),
                 subprocess.TimeoutExpired(["renovate"], 180, output="partial output", stderr="lookup failed"),
             ]
             for failure in failures:
