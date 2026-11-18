@@ -1510,6 +1510,10 @@ def read_renovate_configuration(
     # invalid/missing preset or cannot complete dependency extraction.
     if completed.returncode or not settings_seen or not extraction_seen:
         result["errors"].append("Renovate did not return complete settings and dependency extraction")
+    if not result["declarations"]:
+        result["errors"].append(
+            "Renovate did not read the repository configuration; add the configuration file to Git's index before checking it"
+        )
     if result["errors"]:
         result["command_failure"] = command_failure_details(completed, command=command, target=root)
     else:

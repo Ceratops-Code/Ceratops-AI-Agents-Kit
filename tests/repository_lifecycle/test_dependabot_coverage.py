@@ -286,7 +286,7 @@ class DependabotCoverageTests(unittest.TestCase):
         declaration = {"extends": ["github>owner/policy"], "includePaths": ["scripts/**"]}
         effective = {**declaration, "baseBranchPatterns": ["release/local"],
                      "enabledManagers": ["npm"], "vulnerabilityAlerts": {"enabled": False},
-                     "osvVulnerabilityAlerts": False, "dependencyDashboard": True}
+                     "osvVulnerabilityAlerts": False, "dependencyDashboard": {"enabled": True}}
         events = [
             {"msg": "Repository config", "fileName": "renovate.json5", "config": declaration},
             {"msg": "Resolved shallow config, without merging internal presets", "visitedPresets": declaration["extends"]},
@@ -336,6 +336,7 @@ class DependabotCoverageTests(unittest.TestCase):
             failures = [
                 subprocess.CompletedProcess(["renovate"], 1, "preset cannot load", "native failure"),
                 subprocess.CompletedProcess(["renovate"], 0, "{}", ""),
+                subprocess.CompletedProcess(["renovate"], 0, "\n".join(json.dumps(event) for event in events[1:]), ""),
                 subprocess.CompletedProcess(["renovate"], 0, successful.stdout + '\n' + json.dumps({"level": 50, "msg": "extraction failed"}), ""),
                 subprocess.TimeoutExpired(["renovate"], 180, output="partial output", stderr="lookup failed"),
             ]

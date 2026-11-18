@@ -216,7 +216,7 @@
         "enabled": false
       },
       "osvVulnerabilityAlerts": false,
-      "dependencyDashboard": true
+      "dependencyDashboard": {"enabled": true}
     },
     "compatible_update_groups": {
       "compatible-updates": {
