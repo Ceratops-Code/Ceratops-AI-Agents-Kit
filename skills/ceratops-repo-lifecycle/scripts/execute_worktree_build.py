@@ -152,8 +152,8 @@ def _commit_source(allocation: store_artifacts.ArtifactVersionAllocation, paths:
     """Commit only the caller's paths; unrelated staged/unstaged files stay intact."""
     root = allocation.repo_root
     if paths:
-        # Read Git's changed paths once per index/worktree view. The complete
-        # source inventory belongs to the receipt, never to a command line.
+        # Read Git's changed paths once per index/worktree view. Source names
+        # stay in memory; Git receives the changed names through standard input.
         owned = set(paths)
         changed_paths = set()
         for flags in ((), ('--cached',)):
@@ -285,8 +285,9 @@ def prepare_package_versions(root, contract, declarations, versions, *, targets,
         bundle = reference.removeprefix('repository.release-bundles.') if reference.startswith('repository.') else None
         if bundle is None:
             paths = deliverable_source_files(root, product, include_deleted=True)
-        else:
-            paths.append((root / (contract_path or operations.DEFAULT_CONTRACT)).relative_to(root).as_posix())
+        # The receipt reads its source declaration from this committed file.
+        # Include current tool/command edits in the same source commit as code.
+        paths.append((root / (contract_path or operations.DEFAULT_CONTRACT)).relative_to(root).as_posix())
         paths_by_reference[reference] = tuple(sorted(set(paths)))
     packages = {}
     for reference in versions:

@@ -234,9 +234,9 @@ def test_release_build_failure_ignores_stale_output_and_can_repeat(tmp_path, mon
     result = runner.execute_build(tmp_path, [request])
     assert result["status"] == "completed", result
     order = (tmp_path / ".order").read_text().splitlines()
-    # No result commit/tag accepted the failed batch. Its temporary files are
-    # discarded before the next build, including its unfinished dependencies.
-    assert order.count("build:engine:one") == order.count("build:core:one") == 2
+    # Finished dependencies retain their passing receipts even when a later
+    # producer fails; that failure does not discard their completed work.
+    assert order.count("build:engine:one") == order.count("build:core:one") == 1
     assert order.count("build:bridge:one") == 2
     assert order[-1] == "install:desktop:one"
 
