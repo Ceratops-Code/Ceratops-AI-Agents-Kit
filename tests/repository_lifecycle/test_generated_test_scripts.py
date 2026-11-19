@@ -693,9 +693,22 @@ def test_managed_runner_qualification_rejects_scratch_cleanup_while_worker_is_li
     root, runner, output = _result_runner(tmp_path)
     original = runner.with_name("original_runner.py")
     runner.rename(original)
+    # Windows keeps a launcher's working directory busy until that launcher
+    # exits, even when the worker it started has already exited.
+    windows_launcher = (
+        "import os, pathlib, subprocess, sys, time\n"
+        "os.chdir(pathlib.Path(os.environ['PYTHONPYCACHEPREFIX']).parent)\n"
+        "result = subprocess.run(sys.argv[1:], check=False)\n"
+        "time.sleep(.5)\n"
+        "raise SystemExit(result.returncode)\n"
+    )
     runner.write_text(
         "from contextlib import nullcontext\n"
-        "import runpy\n"
+        "import json, runpy, sys\n"
+        "if sys.platform == 'win32' and 'scratch-interrupted' in sys.argv:\n"
+        "    index = sys.argv.index('--probe-command') + 1\n"
+        "    worker = json.loads(sys.argv[index])\n"
+        f"    sys.argv[index] = json.dumps([sys.executable, '-c', {windows_launcher!r}, *worker])\n"
         f"main = runpy.run_path({str(original)!r})['main']\n"
         "main.__globals__['_TestScratch'].child_options = lambda self: nullcontext({})\n"
         "raise SystemExit(main())\n",

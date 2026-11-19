@@ -25,6 +25,7 @@ import tomllib
 from collections.abc import Mapping
 from typing import Any, TypedDict
 
+import psutil
 import yaml
 
 from .compatibility_contract import load_compatibility_contract, template_path
@@ -606,33 +607,15 @@ def _probe_command_evidence(root: pathlib.Path, result: subprocess.CompletedProc
     return detail
 
 
-def _wait_for_scratch_probe_worker(pid: int) -> None:
-    """Wait for the probe's own worker to release every inherited handle."""
+def _wait_for_scratch_probe_processes(pid: int | None, windows_children: list[psutil.Process]) -> None:
+    """Wait for the probe's worker and its Windows launchers to close their handles."""
     if sys.platform == "win32":
-        import ctypes
-        from ctypes import wintypes
-
-        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-        open_process = kernel.OpenProcess
-        open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-        open_process.restype = wintypes.HANDLE
-        wait = kernel.WaitForSingleObject
-        wait.argtypes = [wintypes.HANDLE, wintypes.DWORD]
-        wait.restype = wintypes.DWORD
-        close = kernel.CloseHandle
-        close.argtypes = [wintypes.HANDLE]
-        close.restype = wintypes.BOOL
-        handle = open_process(0x00100000, False, pid)  # SYNCHRONIZE only.
-        if not handle:
-            error = ctypes.get_last_error()
-            if error == 87:  # The known worker already exited.
-                return
-            raise ctypes.WinError(error)
-        try:
-            if wait(handle, 10_000) != 0:
-                raise TimeoutError(f"Scratch probe worker {pid} did not exit")
-        finally:
-            close(handle)
+        _, alive = psutil.wait_procs(windows_children, timeout=10)
+        if alive:
+            owners = ", ".join(str(process.pid) for process in alive)
+            raise TimeoutError(f"Scratch probe processes did not exit: {owners}")
+        return
+    if pid is None:
         return
 
     deadline = time.monotonic() + 10
@@ -724,6 +707,7 @@ def _probe_test_scratch(root: pathlib.Path, probe: pathlib.Path, runner_relative
 
     child = [sys.executable, "-c", worker, str(ready), str(release)]
     interrupted = invocation("scratch-interrupted", child)
+    windows_children: list[psutil.Process] = []
     with subprocess.Popen(
         interrupted, cwd=root, env=environment,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -732,6 +716,14 @@ def _probe_test_scratch(root: pathlib.Path, probe: pathlib.Path, runner_relative
             deadline = time.monotonic() + 10
             while not ready.is_file() and launcher.poll() is None and time.monotonic() < deadline:
                 time.sleep(0.02)
+            if sys.platform == "win32" and launcher.poll() is None:
+                # A venv redirector can still hold scratch handles after its
+                # Python worker exits. Capture this probe's tree before killing
+                # the launcher, when Windows still reports their relationship.
+                try:
+                    windows_children = psutil.Process(launcher.pid).children(recursive=True)
+                except psutil.NoSuchProcess:
+                    pass
             if not ready.is_file():
                 launcher.kill()
                 stdout, stderr = launcher.communicate(timeout=5)
@@ -749,9 +741,8 @@ def _probe_test_scratch(root: pathlib.Path, probe: pathlib.Path, runner_relative
             if launcher.poll() is None:
                 launcher.kill()
             launcher.wait(timeout=5)
-            if ready.is_file():
-                _, pid = json.loads(ready.read_text(encoding="utf-8"))
-                _wait_for_scratch_probe_worker(pid)
+            worker_pid = json.loads(ready.read_text(encoding="utf-8"))[1] if ready.is_file() else None
+            _wait_for_scratch_probe_processes(worker_pid, windows_children)
     start_fresh("scratch-worker-exited")
     if scratch.exists() or sentinel.read_text(encoding="utf-8") != "keep":
         raise ValueError(f"Managed runner did not reclaim only abandoned scratch: {scratch}")
