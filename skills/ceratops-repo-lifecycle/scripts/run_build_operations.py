@@ -24,6 +24,7 @@ import sdlc_results
 import store_artifacts
 from ceratops_repo_compatibility_engine.sdlc_contract_validation import (
     deliverable_source_files,
+    load_contract,
     operation_entries,
 )
 from github_pr_workflow.command import (
@@ -36,8 +37,8 @@ from github_pr_workflow.command import (
 def build_operation_context(root: pathlib.Path, *, confirm_stopped=False, wait_seconds=60):
     """Protect primary/release source before preparation, including nested builds.
 
-    Independent task worktrees remain unlocked. The existing context owns writer
-    shutdown, exception cleanup, owner reporting and unfinished-run recovery.
+    Task worktrees assume one build at a time and remain unlocked. The existing
+    release context owns writer shutdown and interrupted-run recovery.
     """
     root = root.resolve()
     # A task's branch is fixed for its lifetime. Primary checkout protection does
@@ -367,15 +368,24 @@ def recorded_build(item, inputs, *, supplier_results=(), require_artifacts=True,
     waiting = next((record for record in current_results.records("pending-build", target={"target": target})
                     if record["operation"] == item.operation), None)
     requests = current_results.records("check-decision") if waiting else []
-    if waiting and any(reference in record["inputs"]["scope"].get("artifacts", {}) for record in requests):
-        # This is an unfinished package awaiting a check answer, not accepted
-        # work. Reopen its current files and compare their recorded bytes once
-        # before making them available to checks in this fresh call.
+    if (waiting and "source_definition" in waiting and ("completed_checks" in waiting or any(
+            reference in record["inputs"]["scope"].get("artifacts", {}) for record in requests))
+            and not store_artifacts._artifact_tag_exists(item.repo_root,
+                sdlc_results.artifact_storage_key(deliverable=reference), waiting["version"])):
+        # Reopen output awaiting a check answer or final receipt/tag completion.
+        # Compare its recorded bytes before using it in this fresh call. Once
+        # tagged, the immutable receipt below supplies its original acceptance.
         owner = reference.split(".")
         product = contract["deliverables"][owner[1]][owner[2]]
         paths = tuple(deliverable_source_files(item.repo_root, product, include_deleted=True))
         try:
-            matches = (paths == tuple(waiting["source_paths"])
+            old_contract = load_contract(item.repo_root / waiting["source_definition"]["sdlcPath"],
+                                         repo_root=item.repo_root, commit=waiting["source_commit"])
+            old_product = old_contract["deliverables"][owner[1]][owner[2]]
+            old_paths = tuple(deliverable_source_files(item.repo_root, old_product, commit=waiting["source_commit"]))
+            matches = (paths == old_paths
+                and all(product.get(key) == old_product.get(key)
+                        for key in ("root-dir", "additional-source-files", "version"))
                 and ('alpha', 'beta', 'rc', 'final').index(sdlc_results.build_qualification(waiting['version']))
                     >= ('alpha', 'beta', 'rc', 'final').index(item.qualification_level)
                 and store_artifacts._inputs_match_commit(item.repo_root, waiting["source_commit"], paths)
@@ -383,10 +393,14 @@ def recorded_build(item, inputs, *, supplier_results=(), require_artifacts=True,
                 and reuse_operation_checks.artifact_inputs(item.repo_root, inputs) == waiting["dependencies"]
                 and reuse_operation_checks.artifact_inputs(item.repo_root, waiting["result"]["artifacts"]) == waiting["files"]
                 and (not item.version_explicit or parameters["version"] == waiting["version"]))
-        except (OSError, ValueError, store_artifacts.OperationError):
+        except (OSError, ValueError, KeyError, store_artifacts.OperationError):
             matches = False
         if matches:
             decision["result"] = {**waiting["result"], "pending_acceptance": True,
+                                  "source_commit": waiting["source_commit"],
+                                  "source_definition": waiting["source_definition"],
+                                  **({"completed_checks": waiting["completed_checks"]}
+                                     if "completed_checks" in waiting else {}),
                                   "build_decision": "awaiting_check", "commit": item.commit}
             return decision
         decision["abandoned_decisions"] = [record["decision_id"] for record in requests
@@ -425,14 +439,18 @@ def recorded_build(item, inputs, *, supplier_results=(), require_artifacts=True,
             # Compare the build declaration at the release commit, independently
             # of checks and repository metadata. This is a Git history read, not
             # a fallback for the current configuration location.
-            import yaml
             relative = (item.repo_root / (item.contract_path or operations.DEFAULT_CONTRACT)).resolve().relative_to(item.repo_root).as_posix()
             historical = sdlc_results._build_git(
                 item.repo_root, "ls-tree", "-r", "--name-only", source_base, "--",
                 relative, "sdlc/sdlc.yml").decode().splitlines()
             old_path = relative if relative in historical else next(iter(historical), None)
-            previous = (yaml.safe_load(sdlc_results._build_blob(item.repo_root, source_base, old_path, 1024 * 1024)) or {}) if old_path else {}
+            previous = load_contract(item.repo_root / old_path, repo_root=item.repo_root, commit=source_base) if old_path else {}
             old_product = previous.get("deliverables", {}).get(owner[1], {}).get(owner[2], {})
+            if any(old_product.get(key) != product.get(key) for key in ("root-dir", "additional-source-files", "version")):
+                reasons.append("Changed declared build source scope.")
+            if "root-dir" in old_product:
+                old_sources = set(deliverable_source_files(item.repo_root, old_product, commit=source_base))
+                reasons.extend("Changed previous build source: " + name for name in sorted((old_sources - sources) & changes))
             if (old_product.get("actions", {}).get("build") != product["actions"]["build"]
                     or old_product.get("build-after", []) != product.get("build-after", [])):
                 reasons.append("Changed declared build command or settings.")
@@ -462,10 +480,21 @@ def recorded_build(item, inputs, *, supplier_results=(), require_artifacts=True,
     owner = reference.split(".")
     declaration = contract["deliverables"][owner[1]][owner[2]]
     current = set(deliverable_source_files(item.repo_root, declaration))
-    previous = {record["path"] for record in receipt["artifactInputs"] if record["root"] == "git"}
-    for name in sorted(current - previous):
+    if "sourceDefinition" in receipt:
+        old_contract = load_contract(item.repo_root / receipt["sourceDefinition"]["sdlcPath"],
+                                     repo_root=item.repo_root, commit=receipt["preTestCommit"])
+        old_declaration = old_contract["deliverables"][owner[1]][owner[2]]
+        previous_sources = set(deliverable_source_files(item.repo_root, old_declaration, commit=receipt["preTestCommit"]))
+        if any(old_declaration.get(key) != declaration.get(key)
+               for key in ("root-dir", "additional-source-files", "version")):
+            reasons.append("Changed declared build source scope.")
+    else:
+        # Original accepted receipts remain unchanged; their saved paths still
+        # define their source scope. New builds record only the Git reference.
+        previous_sources = {record["path"] for record in receipt["artifactInputs"] if record["root"] == "git"}
+    for name in sorted(current - previous_sources):
         reasons.append("Added build source: " + name)
-    for name in sorted(previous - current):
+    for name in sorted(previous_sources - current):
         reasons.append("Removed build source: " + name)
     changed = reuse_operation_checks._git(
         item.repo_root, "diff", "--name-only", "--no-renames", "-z",
@@ -474,7 +503,7 @@ def recorded_build(item, inputs, *, supplier_results=(), require_artifacts=True,
     untracked = reuse_operation_checks._git(
         item.repo_root, "ls-files", "--others", "--exclude-standard", "-z",
     ).split("\0")
-    for name in sorted((set(changed) | set(untracked)) & (current | previous)):
+    for name in sorted((set(changed) | set(untracked)) & (current | previous_sources)):
         reasons.append("Changed build source: " + name)
     details = collect_build_details(item)
     # An omitted builder-only argument retains its previously accepted value
@@ -785,7 +814,8 @@ def execute_sdlc_operations(
             if key not in build_context["transactions"]:
                 transaction = complete_artifact_builds.read_artifact_build(item.repo_root,
                     repository=identity["repository"], release_bundle=sdlc_results.receipt_storage_key(identity),
-                    version=identity["version"], required_targets=build_context["targets"][reference])
+                    version=identity["version"], required_targets=build_context["targets"][reference],
+                    build_result=pending_result)
                 refreshed = operations.prepare_operations(item.repo_root, [operations.OperationRequest(
                     item.operation, parameters_if_declared=pending_result["parameters"])
                 ], item.contract_path, context=item.handoff_mode, artifacts=available)[0]
@@ -805,7 +835,13 @@ def execute_sdlc_operations(
                 and not (set(item.artifact_references) - {owner})
                 and not (set(producer.artifact_references) - available.keys())
                 and (previous := prepare_build_or_reuse(producer)["result"]) is not None
-                and not previous.get("pending_acceptance")):
+                and (not previous.get("pending_acceptance") or "completed_checks" in previous)):
+            if "completed_checks" in previous:
+                original = next((check for check in previous["completed_checks"]
+                                 if check.get("operation") == item.operation), None)
+                if original is not None:
+                    results.append(original)
+                    return original
             # The original artifact acceptance remains attached to its original
             # check versions. This records a skipped automatic gate, not a new pass.
             automatic_result: dict[str, Any] = {"operation": item.operation, "status": "no_op",
@@ -929,7 +965,13 @@ def execute_sdlc_operations(
                             "pending-build", item.operation, {"target": key[1]}, {
                                 "operation": item.operation, "version": transaction.version,
                                 "source_commit": transaction.pre_test_commit,
-                                "source_paths": list(transaction.declared_input_paths),
+                                "source_definition": {
+                                    "sdlcPath": (item.repo_root / (item.contract_path or operations.DEFAULT_CONTRACT)
+                                                 ).relative_to(item.repo_root).as_posix(),
+                                    "deliverable": reference,
+                                },
+                                **({"completed_checks": result["completed_checks"]}
+                                   if "completed_checks" in result else {}),
                                 "inputs": collect_build_details(item), "dependencies": inputs,
                                 "files": reuse_operation_checks.artifact_inputs(item.repo_root, produced),
                                 "result": result,

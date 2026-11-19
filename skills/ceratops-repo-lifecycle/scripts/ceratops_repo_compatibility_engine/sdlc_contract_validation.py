@@ -275,18 +275,30 @@ def operation_package_names(requirements: Mapping[str, Any]) -> list[str]:
                               if ref.startswith("deliverables.packages.")))
 
 
-def deliverable_source_files(repo_root: pathlib.Path, record: Mapping[str, Any], *, include_deleted=False) -> list[str]:
-    """List current sources, optionally retaining deleted paths for source commits.
+def deliverable_source_files(repo_root: pathlib.Path, record: Mapping[str, Any], *, include_deleted=False,
+                             commit: str | None = None) -> list[str]:
+    """Expand a deliverable's source scope in the checkout or at an exact commit.
 
     A staged deletion is absent from the index, so commit preparation also needs
-    deletions relative to HEAD. Blob inventories retain only existing files.
+    deletions relative to HEAD. Historical paths come from Git, independently of
+    the current checkout. A receipt supplies its SDLC path and deliverable name
+    instead of copying the source list. Expanded names stay in memory.
     """
+    if "sdlcPath" in record:
+        if commit is None:
+            raise SdlcContractError("Recorded build sources require their exact Git commit.")
+        contract = load_contract(repo_root / record["sdlcPath"], repo_root=repo_root, commit=commit)
+        try:
+            record = _deliverable_records(contract)[record["deliverable"]]
+        except KeyError as exc:
+            raise SdlcContractError("Recorded source declaration is absent from its SDLC commit.") from exc
     root = pathlib.PurePosixPath(record["root-dir"])
     version = record.get("version", {})
     patterns = [*record.get("additional-source-files", []),
                 *([version["file"]] if "file" in version else version.get("files", []))]
-    commands = [["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"]]
-    if include_deleted:
+    commands = ([["git", "ls-tree", "-r", "--name-only", "-z", commit, "--"]] if commit else
+                [["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"]])
+    if include_deleted and commit is None:
         commands.append(["git", "diff", "--name-only", "--diff-filter=D", "--no-renames", "-z", "HEAD", "--"])
     names = set()
     for command in commands:
@@ -305,8 +317,9 @@ def deliverable_source_files(repo_root: pathlib.Path, record: Mapping[str, Any],
             or any(fnmatch.fnmatchcase(name, pattern) or
                    (pattern.startswith("**/") and fnmatch.fnmatchcase(name, pattern[3:]))
                    for pattern in patterns)
-        ) and ((repo_root / name).is_file() or include_deleted and not (repo_root / name).exists())
-        and (repo_root / name).resolve().is_relative_to(resolved_root)
+        ) and (commit is not None or (
+            ((repo_root / name).is_file() or include_deleted and not (repo_root / name).exists())
+            and (repo_root / name).resolve().is_relative_to(resolved_root)))
     })
 
 
@@ -674,13 +687,30 @@ def read_contract(
     *,
     schema_path: pathlib.Path | None = None,
     repo_root: pathlib.Path | None = None,
+    commit: str | None = None,
 ) -> tuple[dict[str, Any] | None, list[str]]:
-    """Validate one YAML contract, retaining its version and data without writes."""
+    """Read current SDLC requirements or an accepted build's original declaration.
+
+    Historical declarations describe already accepted work. Read their data at
+    the recorded commit without applying today's schema or checkout requirements.
+    They are never used to execute an operation.
+    """
 
     try:
-        value = yaml.load(path.read_text(encoding="utf-8"), Loader=_ContractLoader)
-    except (OSError, UnicodeError, yaml.YAMLError) as exc:
+        if commit is None:
+            raw = path.read_text(encoding="utf-8")
+        else:
+            from sdlc_results import _build_blob
+
+            if repo_root is None:
+                raise ValueError("Historical SDLC reads require their repository.")
+            relative = path.absolute().relative_to(repo_root.absolute()).as_posix()
+            raw = _build_blob(repo_root, commit, relative, 1024 * 1024).decode("utf-8")
+        value = yaml.load(raw, Loader=_ContractLoader)
+    except (OSError, ValueError, UnicodeError, yaml.YAMLError) as exc:
         return None, [f"invalid YAML: {exc}"]
+    if commit is not None:
+        return (dict(value), []) if isinstance(value, Mapping) else (None, ["SDLC contract must be a mapping"])
     try:
         errors = validation_errors(value, schema_path=schema_path, repo_root=repo_root)
     except SdlcContractError as exc:
@@ -697,10 +727,11 @@ def load_contract(
     *,
     schema_path: pathlib.Path | None = None,
     repo_root: pathlib.Path | None = None,
+    commit: str | None = None,
 ) -> Mapping[str, Any]:
     """Load one valid contract or raise one compact deterministic error."""
 
-    value, errors = read_contract(path, schema_path=schema_path, repo_root=repo_root)
+    value, errors = read_contract(path, schema_path=schema_path, repo_root=repo_root, commit=commit)
     if errors or value is None:
         raise SdlcContractError(
             ("; ".join(errors[:8]) or "invalid SDLC contract")[:4096]

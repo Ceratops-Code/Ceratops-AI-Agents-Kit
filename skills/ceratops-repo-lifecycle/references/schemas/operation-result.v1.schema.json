@@ -1442,7 +1442,6 @@
         },
         "artifactInputs": {
           "type": "array",
-          "minItems": 1,
           "items": {
             "$ref": "#/$defs/receiptNamedFile"
           }
@@ -1509,8 +1508,58 @@
         },
         "commandsAndSettings": {
           "$ref": "#/$defs/commandsAndSettings"
+        },
+        "sourceDefinition": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "id",
+            "sdlcPath",
+            "deliverable"
+          ],
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/receiptLogicalIdentifier"
+            },
+            "sdlcPath": {
+              "$ref": "#/$defs/receiptRelativePath"
+            },
+            "deliverable": {
+              "type": "string",
+              "pattern": "^deliverables\\.(packages|apps|mcp-servers|skills|hooks)\\.[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*$"
+            }
+          }
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "sourceDefinition"
+            ]
+          },
+          "then": {
+            "properties": {
+              "artifactInputs": {
+                "items": {
+                  "properties": {
+                    "root": {
+                      "const": "store"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "artifactInputs": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ]
     },
     "bundleMember": {
       "type": "object",

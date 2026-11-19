@@ -1519,7 +1519,8 @@ def test_explicit_phase_and_group_cli_requests_do_not_guess_group_kind(tmp_path,
 
 
 @pytest.mark.parametrize("change", ["committed", "staged", "unstaged", "new", "deleted", "renamed",
-                                   "covered-readme", "uncovered-readme", "checks-only", "argument", "environment", "preparation"])
+                                   "covered-readme", "uncovered-readme", "checks-only", "scope", "unrelated-commit",
+                                   "argument", "environment", "preparation"])
 def test_build_comparison_and_exact_artifact_groups(tmp_path, monkeypatch, change):
     from run_build_operations import prepare_build_operations, recorded_build
 
@@ -1585,6 +1586,11 @@ def test_build_comparison_and_exact_artifact_groups(tmp_path, monkeypatch, chang
     elif change == "checks-only":
         declaration["deliverables"]["packages"]["claims"]["actions"]["post-build-checks"]["check-groups"]["contents"]["steps"][0]["run"][-1] = "print('different check')"
         path.write_text(json.dumps(declaration))
+    elif change == "scope":
+        declaration["deliverables"]["packages"]["claims"].setdefault("additional-source-files", []).append("future/*.py")
+        path.write_text(json.dumps(declaration))
+    elif change == "unrelated-commit":
+        assert run_git(repository, "commit", "--allow-empty", "-m", "unrelated work").returncode == 0
     elif change == "argument":
         action["steps"][0]["run"].append("--different-package-option")
         path.write_text(json.dumps(declaration))
@@ -1593,7 +1599,7 @@ def test_build_comparison_and_exact_artifact_groups(tmp_path, monkeypatch, chang
     prepared = prepare_build_operations(repository, options["requests"], qualification_level="beta")
     item = next(value for value in prepared if value.category == "build")
     decision = recorded_build(item, {})
-    unchanged = change in {"uncovered-readme", "checks-only"}
+    unchanged = change in {"uncovered-readme", "checks-only", "unrelated-commit"}
     assert bool(decision["result"]) is unchanged, decision
     if unchanged:
         assert decision["result"]["build_tag"] == previous_tag

@@ -20,19 +20,18 @@ from dataclasses import dataclass
 from typing import Any
 
 import sdlc_results
+from ceratops_repo_compatibility_engine.sdlc_contract_validation import deliverable_source_files
 from sdlc_results import StepResultError
 from store_artifacts import (
     ArtifactVersionTransaction,
     OperationError,
     RecoveryRequired,
+    _artifact_tag_exists,
     _build_directory,
     _git_text,
     _inputs_match_commit,
-    _read_transaction_record,
-    _require_build_request,
     _require_transaction_target,
     _validated_commit,
-    _validated_relative_paths,
     _validated_repository,
     _validated_targets,
     _validated_worktree,
@@ -107,7 +106,7 @@ def _verify_output_inventory(
             path = pathlib.Path(parent) / name
             sdlc_results._plain_path(path, label="Artifact file")
             relative = path.relative_to(root).as_posix()
-            if relative not in {"artifact-receipt.json", "build_request.json"} and not relative.startswith(".diagnostics/"):
+            if relative != "artifact-receipt.json" and not relative.startswith(".diagnostics/"):
                 actual.add(relative)
     if actual != expected:
         raise OperationError("Artifact output contains missing or unlisted files.")
@@ -234,7 +233,7 @@ def prepare_versioned_build_receipt(
     prepared_operation=None, command_result=None, completed_results=(),
     check_summaries: Sequence[Mapping[str, Any]] = (),
 ) -> PreparedBuildReceipt:
-    """Verify qualified bytes and write their exact receipt to its Git path.
+    """Record successful checks and package files at their exact Git path.
 
     Artifacts already occupy their final version directory. Repeated calls
     validate and reuse exact files; malformed interrupted receipt bytes are
@@ -250,21 +249,31 @@ def prepare_versioned_build_receipt(
             raise OperationError("Only a completed builder can produce an accepted receipt.")
         if any(result.get("status") not in {"completed", "no_op"} for result in completed_results):
             raise OperationError("Required checks must finish before recording acceptance.")
+        saved_path = transaction.repo_root / transaction.receipt_path(target)
+        if command_result.get("pending_acceptance") and saved_path.is_file():
+            # A retry after the result commit must retain the original summary,
+            # even if today's repository checks now name that later commit.
+            # Incomplete receipt writes still use the normal writer below.
+            sdlc_results._plain_path(saved_path, label="Prepared build receipt")
+            try:
+                saved = sdlc_results.read_committed_build_receipt(saved_path)
+            except StepResultError:
+                pass
+            else:
+                prepared = _prepared_result(transaction, target, saved.raw)
+                _prepared_receipt_set(transaction, [prepared], allow_partial=True)
+                return prepared
         records = [{key: value for key, value in record.items() if key != "deliverable"}
                    for record in command_result.get("artifact_records", [])]
         if not records:
             raise OperationError("Builder returned no measured package files.")
-        product_inputs = []
-        for name in item.build_source_files:
-            # Git-root records describe committed blobs, including Git's text
-            # filters. Working-tree CRLF is not the identity of that Git object.
-            raw_source = _git_bytes(transaction.repo_root,
-                                    ["show", f"{transaction.pre_test_commit}:{name}"], label="read committed build source")
-            product_inputs.append({"root": "git", "path": name, "size": len(raw_source),
-                "sha256": hashlib.sha256(raw_source).hexdigest(),
-                "id": "source-" + hashlib.sha256(name.encode()).hexdigest()[:16]})
         source_checks, artifact_tests, required = [], [], []
         owner = item.operation.split(".actions.", 1)[0]
+        source_definition = {
+            "id": "source", "deliverable": owner,
+            "sdlcPath": (item.repo_root / (item.contract_path or ".ceratops/sdlc/sdlc.yml")
+                         ).relative_to(item.repo_root).as_posix(),
+        }
         for result in completed_results:
             operation = result.get("operation", "")
             if result.get("status") == "no_op" or not (
@@ -280,7 +289,7 @@ def prepare_versioned_build_receipt(
                        or result.get("commit") or transaction.pre_test_commit)
             common: dict[str, Any] = {"id": check_id, "version": version, "status": "passed", "evidence": []}
             if ".pre-build-checks." in operation:
-                source_checks.append({**common, "inputs": [record["id"] for record in product_inputs]})
+                source_checks.append({**common, "inputs": [source_definition["id"]]})
                 required.append({"kind": "source-check", "id": check_id, "version": version})
             else:
                 artifact_tests.append({**common, "artifacts": [
@@ -345,7 +354,8 @@ def prepare_versioned_build_receipt(
                                                       transaction.version, target, transaction.attempt_id),
             "requiredTargets": list(transaction.required_targets), "preTestCommit": transaction.pre_test_commit,
             "acceptance": {"operation": item.operation, "id": transaction.attempt_id},
-            "receiptPath": transaction.receipt_path(target), "artifactInputs": product_inputs, "checkInputs": [],
+            "receiptPath": transaction.receipt_path(target), "sourceDefinition": source_definition,
+            "artifactInputs": [], "checkInputs": [],
             "dependencies": dependencies, "artifacts": records,
             "installationArtifactPath": command_result["installationArtifactPath"],
             "requiredChecks": required, "sourceChecks": source_checks, "artifactTests": artifact_tests,
@@ -370,14 +380,17 @@ def prepare_versioned_build_receipt(
     except StepResultError as exc:
         raise OperationError(str(exc)) from exc
     validated = _validate_prepared_receipt(transaction, target, raw)
-    _require_build_request(transaction)
 
     for record in _receipt_git_inputs(validated):
         sdlc_results._read_git_record(
             transaction.repo_root, transaction.pre_test_commit, record
         )
-    if not _inputs_match_commit(transaction.repo_root, transaction.pre_test_commit,
-                                tuple(record["path"] for record in _receipt_git_inputs(validated))):
+    source_paths = {record["path"] for record in _receipt_git_inputs(validated)}
+    if "sourceDefinition" in validated:
+        source_paths.update(deliverable_source_files(transaction.repo_root, validated["sourceDefinition"],
+                                                     commit=transaction.pre_test_commit))
+        source_paths.add(validated["sourceDefinition"]["sdlcPath"])
+    if not _inputs_match_commit(transaction.repo_root, transaction.pre_test_commit, tuple(source_paths)):
         raise RecoveryRequired("Build source changed after its source commit.")
     _verify_output_inventory(
         transaction.target_output(target), _receipt_store_records(validated)
@@ -499,7 +512,6 @@ def write_versioned_failure_diagnostic(
         "attemptId": transaction.attempt_id,
         "error": str(error)[:4096],
     }
-    _require_build_request(transaction)
     _write_transaction_record(
         destination, value,
         replace=destination.exists() or destination.is_symlink(),
@@ -645,6 +657,11 @@ def _require_unchanged_inputs(
         label="declared input",
     )
     input_paths = set(records) | set(transaction.declared_input_paths)
+    for _item, receipt in prepared.values():
+        if "sourceDefinition" in receipt:
+            input_paths.update(deliverable_source_files(transaction.repo_root, receipt["sourceDefinition"],
+                                                        commit=transaction.pre_test_commit))
+            input_paths.add(receipt["sourceDefinition"]["sdlcPath"])
     overlap = input_paths & result_paths
     if overlap:
         raise OperationError(f"Declared input is also a result path: {min(overlap)}")
@@ -981,9 +998,6 @@ def _remove_completed_build_temp(transaction: ArtifactVersionTransaction) -> Non
     parent = _artifact_store_path(transaction.repo_root, temporary=True) / transaction.release_bundle
     from packaging.version import Version
     from store_artifacts import FULL_VERSION_RE
-    directory = transaction.request_path.parent
-    if directory != parent / transaction.version:
-        raise OperationError("Completed-build cleanup escapes this checkout's temporary directory.")
     if not parent.exists():
         return
     # A success supersedes older failed attempts in this same deliverable folder.
@@ -1024,8 +1038,6 @@ def complete_versioned_artifacts(
     prepared_groups = []
     combined = {}
     for item, supplied in group:
-        if _artifact_tag_commit(item) is None:
-            _require_build_request(item)
         prepared = _prepared_receipt_set(item, supplied)
         prepared_groups.append(prepared)
         combined.update({item.release_bundle + "/" + target: value for target, value in prepared.items()})
@@ -1038,8 +1050,8 @@ def complete_versioned_artifacts(
     for (item, _), prepared in zip(group, prepared_groups, strict=True):
         artifact_paths.extend(_write_version_artifact_receipts(item, prepared, final_commit))
         tags.append(_create_artifact_tag(item, final_commit))
-    # Keep requests until all group tags exist, so interruption cannot strand
-    # an untagged member after its sibling has discarded the group inputs.
+    # Keep tested output until all group tags exist, so interruption cannot
+    # strand an untagged member after its sibling has discarded the files.
     for item, _ in group:
         _remove_completed_build_temp(item)
     return CompletedArtifactVersion(
@@ -1050,18 +1062,18 @@ def complete_versioned_artifacts(
 
 def read_artifact_build(
     repo_root: pathlib.Path, *, repository: str, release_bundle: str, version: str,
-    required_targets: Sequence[str],
+    required_targets: Sequence[str], build_result: Mapping[str, Any] | None = None,
+    allow_partial: bool = False, declared_input_paths: Sequence[str] = (),
 ) -> ArtifactVersionTransaction:
-    """Select an unfinished request or completed receipts without allocating.
+    """Reopen passing receipts and actual output, without allocating or building.
 
-    Completion-only reruns use this entry point. An unfinished build must belong
-    to this registered worktree. Completed receipt/tag chains can outlive it.
+    Untagged receipts describe checked output whose final commit, retained copy
+    or tag still needs completion. An allocated directory alone is insufficient.
+    Completed receipt/tag chains can outlive the original worktree.
+    Allocation supplies the current bundle's version/SDLC paths in memory and
+    compares their Git changes against the receipt's source commit before reuse.
     """
-    from store_artifacts import (
-        LOGICAL_ID_RE,
-        _artifact_store_path,
-        _require_identifier,
-    )
+    from store_artifacts import _artifact_store_path
 
     root = _validated_worktree(repo_root)
     repository = _validated_repository(repository)
@@ -1070,16 +1082,23 @@ def read_artifact_build(
     targets = _validated_targets(required_targets)
     store = _artifact_store_path(root)
     directory = _artifact_store_path(root, temporary=True) / unit / version
-    request = directory / "build_request.json"
     branch = _git_text(root, ["symbolic-ref", "--quiet", "--short", "HEAD"], label="branch")
-    registration = _git_text(root, ["rev-parse", "--absolute-git-dir"], label="Git registration")
     first_target_receipt = None
-    if request.exists() or request.is_symlink():
-        record = _read_transaction_record(request, "Artifact build request")
-        commit = _validated_commit(root, record.get("preTestCommit"))
-        allocation_commit = _validated_commit(root, record.get("allocationCommit"))
-        attempt = _require_identifier(record.get("attemptId"), label="attempt ID", pattern=LOGICAL_ID_RE)
-        paths = _validated_relative_paths(record.get("declaredInputPaths"), label="declared input path")
+    if build_result is not None:
+        # The caller already read these output hashes from the check-result
+        # store and compared them with the files. No saved request is needed.
+        identity = build_result["artifact_identity"]
+        if any(identity.get(key) != value for key, value in (
+                ("repository", repository), ("version", version))) or sdlc_results.receipt_storage_key(identity) != unit:
+            raise OperationError("Completed builder result belongs to a different package.")
+        receipt = {"identity": identity, "preTestCommit": build_result["source_commit"],
+                   "sourceDefinition": build_result["source_definition"], "artifactInputs": [], "checkInputs": []}
+    elif directory.is_dir() and not _artifact_tag_exists(root, unit, version):
+        relative = pathlib.Path(".ceratops/build") / unit / version
+        if len(targets) > 1:
+            relative /= next((target for target in targets
+                              if (root / relative / target / "build_receipt.json").is_file()), targets[0])
+        receipt = sdlc_results.read_committed_build_receipt(root / relative / "build_receipt.json").value
     else:
         first_target_receipt = sdlc_results.read_artifact_receipt_chain(
             root, tag=f"{unit}/{version}", expected=sdlc_results.artifact_identity(repository, unit, version, targets[0]),
@@ -1089,22 +1108,31 @@ def read_artifact_build(
         output = first_target_receipt.receipt_path.parent
         directory = output if len(targets) == 1 else output.parent
         receipt = first_target_receipt.build_receipt.value
-        commit = receipt["preTestCommit"]
-        allocation_commit = commit
-        attempt = receipt["identity"]["attemptId"]
-        paths = tuple(sorted(item["path"] for item in _receipt_git_inputs(receipt)))
+    commit = _validated_commit(root, receipt["preTestCommit"])
+    paths = {item["path"] for item in _receipt_git_inputs(receipt)}
+    if "members" in receipt:
+        paths.update(declared_input_paths)
+    if "sourceDefinition" in receipt:
+        paths.update(deliverable_source_files(root, receipt["sourceDefinition"], commit=commit))
     transaction = ArtifactVersionTransaction(
-        repo_root=root, repository=repository, worktree_registration=registration,
+        repo_root=root, repository=repository,
         branch=branch, release_bundle=unit, version=version, version_class=classification,
-        attempt_id=attempt, allocation_commit=allocation_commit, pre_test_commit=commit,
-        required_targets=targets, declared_input_paths=paths, store=store, request_path=request,
+        attempt_id=receipt["identity"]["attemptId"], pre_test_commit=commit,
+        required_targets=targets, declared_input_paths=tuple(sorted(paths)), store=store,
         version_root=directory, diagnostic_root=directory / ".diagnostics",
         lock_path=store / ".locks/store.lock",
     )
-    if request.exists():
-        _require_build_request(transaction)
-    elif _completed_versioned_result(transaction, first_target_receipt=first_target_receipt) is None:
-        raise RecoveryRequired("Artifact build has neither an owned request nor a completed tag.")
+    if first_target_receipt is not None:
+        _completed_versioned_result(transaction, first_target_receipt=first_target_receipt)
+    elif build_result is None:
+        # Approved historical cleanup: an old complete passing receipt is
+        # authoritative. Its obsolete request file is not an artifact or input.
+        legacy_request = directory / "build_request.json"
+        if "sourceDefinition" not in receipt and legacy_request.exists():
+            sdlc_results._plain_path(legacy_request, label="Obsolete build request")[0].unlink()
+        prepared = [item for target in targets if (root / transaction.receipt_path(target)).is_file()
+                    for item in load_prepared_versioned_receipts(transaction, target=target)] if allow_partial else None
+        _prepared_receipt_set(transaction, prepared, allow_partial=allow_partial)
     return transaction
 
 

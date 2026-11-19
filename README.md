@@ -446,8 +446,11 @@ The runner can still reuse applicable individual test passes.
 directories, relevant parameters and fingerprints of declared environment values.
 `platformAndTools` records the actual OS, architecture and runtime/tool identities
 used by the builder. Unset and empty environment values differ; secret values are
-not stored. `artifactInputs` names source files, while `dependencies` records
+not stored. `sourceDefinition` names the SDLC file and deliverable at
+`preTestCommit`; filenames are expanded in memory from that Git tree.
+`artifactInputs` retains exact non-Git inputs, while `dependencies` records
 consumed artifacts with their original versions and acceptance identities.
+Older accepted receipts keep their original file records and check identities.
 For a build using `--artifacts`, supplied dependency files stay beside their
 completed artifact receipt. Build reads that receipt before running commands and
 records the dependency's original version and acceptance without rebuilding it.
@@ -574,19 +577,22 @@ use the sibling `worktrees/release-local/_in-test/` directory.
 while choosing a repository-wide version and creating its directory. It checks
 only that exact version's paths in the worktree folders; no other worktree's
 history is read or cleaned. Builders and tests run outside that store lock.
+Each task worktree runs one build at a time. Independent worktrees use separate
+temporary directories; release builds retain the existing release lock.
 An occupied directory or version tag advances an alpha/beta number; an occupied
 final version requires a new version choice. There is no reservation file.
 
 The caller prepares source versions and commits them before writing artifacts.
 At the start of each new build, allocation deletes every unfinished build of
 that item from this checkout's `_in-test` folder, including an earlier attempt
-at the same version and output with a damaged request file. It then creates a
-fresh `build_request.json` for this call. A crash leaves temporary output until
+at the same version. Build identity stays in memory; no request file or source
+inventory file is created. A crash leaves temporary output until
 the same checkout next builds that item. Successful completion removes its
 temporary output. Uncommitted receipts for discarded attempts are removed too;
 committed build history keeps its version. Other items, other checkouts and
-accepted artifacts are outside this cleanup. A committed passing receipt can
-finish its missing copy or tags before another build is allocated.
+accepted artifacts are outside this cleanup. Passing receipts and completed
+check outcomes in the existing result store preserve checked packages while
+their receipt, retained copy or tags still need completion.
 
 After the required checks pass, `complete_artifact_builds.py` copies the measured
 files to `worktrees/<checkout>/<unit>/<version>/<target>/` for a task checkout,
@@ -1008,7 +1014,7 @@ policy. These are the runtime paths used by the foundation and update workflow:
 | Runtime path | Class and owner | Rewrite, retention, or cleanup trigger |
 | --- | --- | --- |
 | `<automation-dir>/dependabot-repository-{preflight,finalize}.json` and the selected output's `.<name>.failed.tmp` | One current report per phase and its temporary failure write; the lifecycle skill's dependency queue entrypoint | `--automation-dir` reads the caller-owned repository scopes and binds the independent snapshot/sync adapters. Preflight retires the preceding final report; each phase retires its selected report and partial before execution. Missing results or operational failures produce dated unavailable-state reports. Atomic failure writing and the next ordinary call remove only that report's partial. Explicit output overrides retain unrelated reports. |
-| `<shared-git-directory>/ceratops/artifacts/<unit>/<version>/build_request.json` | Version-local desired inputs; `store_artifacts.py` | Written immediately after exclusive directory creation, then bound to B before output. Same-worktree current-input matches can reuse it. Remove only after receipt/tag completion; retain unfinished or uncertain requests for controlled abandonment/removal cleanup. |
+| `<shared-git-directory>/ceratops/artifacts/worktrees/<checkout>/_in-test/<unit>/<version>/` | Temporary build/test output; `store_artifacts.py` and build completion | One build runs per worktree. Allocation removes unfinished output only for that checkout/item. Passing receipts or saved check outcomes preserve checked files until completion; success removes the temporary copy. |
 | `.ceratops/build/<unit>/<version>/build_receipt.json` with an optional `<target>/` | Direct final worktree result; operation runner | Qualification validates the final artifact/evidence bytes and writes the canonical receipt directly. A byte-identical valid file is reused, an invalid interrupted write is replaced, and a different valid receipt blocks. C commits these exact result paths without including unrelated staged work. Historical versions are read at the exact saved path/hash, including `receipt.json`; no old tag or receipt is rewritten. |
 | Sibling `check_summary.json` | Compact original check outcomes and input facts; build completion | Written directly after required checks pass and committed with the receipt that names its hash. An interrupted partial is repaired from the same accepted outcomes; exact bytes are reused. Git retains completed historical versions. Check reuse reads the tagged blob without needing packages or full logs. |
 | `artifacts/<unit>/<version>/.diagnostics/<target>.json` | One bounded current failure report per version/target; `complete_artifact_builds.py` | Direct writes replace older or interrupted diagnostics. Receipt/tag completion removes resolved reports. No temporary copy or cross-version write lock. |

@@ -326,7 +326,7 @@ def test_worktree_build_commits_selected_source_and_finishes_once(tmp_path, chec
         assert run_git(repository, "add", "unrelated.txt").returncode == 0
     unusual_paths = []
     if checkout == "task-worktree" and schema_version == 5 and deletion == "staged":
-        for index in range(400):
+        for index in range(19790):
             path = repository / "src" / (f"source-{index:04d}-" + "x" * 78 + ".py")
             path.write_text("value = 1\n")
             unusual_paths.append(path.relative_to(repository).as_posix())
@@ -367,8 +367,15 @@ def test_worktree_build_commits_selected_source_and_finishes_once(tmp_path, chec
     assert "src/claims.py" not in {record["path"] for record in selected["receipt"]["artifactInputs"]}
     assert not run_git(repository, "diff", "--name-only", "HEAD", "--", "src/claims.py").stdout
     assert "releaseUnit" not in selected["receipt"]["identity"]
+    assert selected["receipt"]["artifactInputs"] == []
+    assert selected["receipt"]["sourceDefinition"] == {"id": "source",
+        "deliverable": "deliverables.packages.claims", "sdlcPath": ".ceratops/sdlc/sdlc.yml"}
     if unusual_paths:
-        assert set(unusual_paths) <= {record["path"] for record in selected["receipt"]["artifactInputs"]}
+        from ceratops_repo_compatibility_engine.sdlc_contract_validation import deliverable_source_files
+
+        assert len(json.dumps(selected["receipt"]).encode()) < 20000
+        assert set(unusual_paths) <= set(deliverable_source_files(repository,
+            selected["receipt"]["sourceDefinition"], commit=selected["receipt"]["preTestCommit"]))
         assert not run_git(repository, "ls-tree", selected["receipt"]["preTestCommit"], "--", old).stdout
         assert run_git(repository, "show", selected["receipt"]["preTestCommit"] + ":" + unusual_paths[-1]).stdout == "new_value = 2\n"
     again = runner.execute_build(repository, **options)
@@ -536,7 +543,7 @@ def test_worktree_build_failure_preserves_cause_without_receipt_or_tag(tmp_path,
     assert "compiler rejected source" in json.dumps(result)
     assert run_git(repository, "tag", "--list").stdout == ""
     assert not list((repository / ".ceratops/build").glob("**/build_receipt.json"))
-    assert list(storage._artifact_store_path(repository, temporary=True).rglob("build_request.json"))
+    assert not list(storage._artifact_store_path(repository, temporary=True).rglob("build_request.json"))
     assert not list(storage._artifact_store_path(repository, worktree=True).glob("members/*/*/*/*/artifact-receipt.json"))
     temporary = storage._artifact_store_path(repository, temporary=True) / "members/packages/claims"
     previous = next(temporary.iterdir()) / "partial.bin"
@@ -557,7 +564,7 @@ def test_worktree_build_failure_preserves_cause_without_receipt_or_tag(tmp_path,
     assert (repository / ".build-count").read_text() == "x"
 
 
-@pytest.mark.parametrize("effect", ["source-stage", "source-commit", "git-failure", "completion", "temporary-cleanup",
+@pytest.mark.parametrize("effect", ["source-stage", "source-commit", "git-failure", "receipt", "completion", "temporary-cleanup",
                                   "version-write", "pin-write", "lock-write", "lock-failure", "pin-conflict"])
 @pytest.mark.parametrize("timing", ["before", "after"])
 @pytest.mark.parametrize("release", [False, True])
@@ -589,6 +596,8 @@ def test_worktree_build_repeats_commit_and_completion_handoffs(tmp_path, monkeyp
             if effect == "temporary-cleanup" else "complete_versioned_artifacts")
     if effect == 'version-write':
         owner, name = flow, 'write_declared_version'
+    elif effect == 'receipt':
+        owner, name = completion, 'prepare_versioned_build_receipt'
     elif effect == 'pin-write':
         owner, name = flow.os, 'replace'
     elif effect in {'lock-write', 'lock-failure'}:
@@ -634,9 +643,8 @@ def test_worktree_build_repeats_commit_and_completion_handoffs(tmp_path, monkeyp
     assert fired
     result = runner.execute_build(repository, **options)
     assert result["status"] == "completed", result
-    # Before acceptance, a fresh call discards unfinished bytes and builds again.
-    expected_count = "xx" if effect == "completion" and timing == "before" else "x"
-    assert (repository / ".build-count").read_text() == expected_count
+    # Passed checks survive interruption before the receipt or its final commit.
+    assert (repository / ".build-count").read_text() == "x"
     assert not list(storage._artifact_store_path(repository, temporary=True).rglob("partial.bin"))
     if linked:
         import tomllib
@@ -931,7 +939,7 @@ def test_versioned_completion_repeats_before_and_after_each_effect(tmp_path, mon
     done = completion.complete_versioned_artifacts(fresh)
     assert completion.complete_versioned_artifacts(fresh) == done
     assert run_git(repository, "rev-list", "--count", f"{checkpoint}..HEAD").stdout.strip() == "1"
-    assert not fresh.request_path.exists()
+    assert not (storage._artifact_store_path(repository, temporary=True) / transaction.release_bundle / transaction.version).exists()
     assert all(path.is_file() for path in done.artifact_receipts)
 
 
@@ -976,7 +984,7 @@ def test_versioned_completion_commits_only_results_and_binds_every_target(
     assert run_git(repository, "diff", "--cached", "--name-only").stdout.strip() == (
         unrelated.relative_to(repository).as_posix()
     )
-    assert not transaction.request_path.exists()
+    assert not transaction.version_root.exists()
     assert not (transaction.store / ".pending").exists()
     assert not (transaction.store / ".staging").exists()
     assert all(path.is_file() for path in completed.artifact_receipts)
@@ -998,7 +1006,10 @@ def test_versioned_completion_commits_only_results_and_binds_every_target(
 def test_versioned_fresh_instance_discovers_attempt_and_reuses_prepared_results(tmp_path) -> None:
     repository, checkpoint, transaction, prepared, _receipts = _prepared_versioned_completion(tmp_path)
     mtimes = {item.worktree_path: item.worktree_path.stat().st_mtime_ns for item in prepared}
-    request_bytes = transaction.request_path.read_bytes()
+    receipt_bytes = {item.worktree_path: item.raw for item in prepared}
+    # An old interrupted producer may have left its request beside passing files.
+    obsolete_request = transaction.version_root / "build_request.json"
+    obsolete_request.write_bytes(b"obsolete request data")
     fresh = _checkpoint_child(repository,
         "transaction=complete_artifact_builds.read_artifact_build(repo,repository='example/project',release_bundle='claims',"
         "version='1.2.5b1',required_targets=['python-3.14-linux','python-3.14-windows'])\n"
@@ -1007,7 +1018,8 @@ def test_versioned_fresh_instance_discovers_attempt_and_reuses_prepared_results(
         "assert len(prepared)==2\n")
     assert fresh.returncode == 0, fresh.stderr
     assert fresh.stdout.strip() == transaction.attempt_id
-    assert transaction.request_path.read_bytes() == request_bytes
+    assert not obsolete_request.exists()
+    assert all(path.read_bytes() == raw for path, raw in receipt_bytes.items())
     assert all(path.stat().st_mtime_ns == mtime for path, mtime in mtimes.items())
     assert not (transaction.store.parent / "operations/artifact-versions").exists()
     assert not (transaction.store.parent / "locks/artifact-versions").exists()
@@ -1016,16 +1028,16 @@ def test_versioned_fresh_instance_discovers_attempt_and_reuses_prepared_results(
         version=transaction.version, required_targets=transaction.required_targets,
         pre_test_commit=checkpoint,
     )
-    assert repeated.attempt_id != transaction.attempt_id
-    assert not any(path.exists() for path in mtimes)
-    # A fresh build also discards an uncommitted attempt after unrelated commits.
+    assert repeated.attempt_id == transaction.attempt_id
+    assert all(path.exists() for path in mtimes)
+    # An unrelated commit cannot discard the already checked package.
     assert run_git(repository, "commit", "--allow-empty", "-m", "unrelated").returncode == 0
     reused = storage.allocate_artifact_version(
         repository, repository=transaction.repository, release_bundle=transaction.release_bundle,
         version=transaction.version, required_targets=transaction.required_targets,
     )
-    assert reused.attempt_id != repeated.attempt_id
-    assert storage._build_request_record(reused)["preTestCommit"] is None
+    assert reused.attempt_id == repeated.attempt_id
+    assert reused.pre_test_commit == checkpoint
 
 
 def test_versioned_completion_needs_no_checkpoint_directory(tmp_path, monkeypatch) -> None:
@@ -1067,7 +1079,7 @@ def test_versioned_request_may_own_multiple_units_without_premature_cleanup(tmp_
         release_bundle="other-unit", version="1.0.0", required_targets=["any"],
         pre_test_commit=checkpoint, attempt_id="other-unit-attempt")
     completion.complete_versioned_artifacts(transaction, prepared)
-    assert other.request_path.is_file()
+    assert other.target_output("any").is_dir()
     assert not (transaction.store.parent / "operations/artifact-versions").exists()
 
 
@@ -1080,7 +1092,7 @@ def test_versioned_cleanup_failure_retries_without_repeating_completed_effects(t
         with pytest.raises(storage.OperationError, match="cleanup interrupted"):
             completion.complete_versioned_artifacts(transaction, prepared)
     final = run_git(repository, "rev-parse", "HEAD").stdout.strip()
-    assert transaction.request_path.exists()
+    assert transaction.version_root.is_dir()
     retained_root = storage._artifact_store_path(repository, worktree=True) / transaction.release_bundle / transaction.version
     mtimes = {path: path.stat().st_mtime_ns for path in retained_root.rglob("*") if path.is_file()}
     # Completed results are Git data; a cleanup retry must not need the mutable
@@ -1098,9 +1110,8 @@ def test_versioned_cleanup_failure_retries_without_repeating_completed_effects(t
     assert fresh.stdout.strip() == final
     assert run_git(repository, "rev-parse", "HEAD").stdout.strip() == final
     assert prepared[0].worktree_path.read_bytes() == b"unrelated subsequent work"
-    assert all(path.stat().st_mtime_ns == mtime for path, mtime in mtimes.items()
-               if path != transaction.request_path)
-    assert not transaction.request_path.exists()
+    assert all(path.stat().st_mtime_ns == mtime for path, mtime in mtimes.items())
+    assert not transaction.version_root.exists()
     assert not (transaction.store.parent / "operations/artifact-versions").exists()
 
 
@@ -1160,7 +1171,7 @@ def test_versioned_completion_resumes_effects_without_duplicate_commit(
         assert storage._artifact_tag_exists(
             repository, transaction.release_bundle, transaction.version
         )
-        assert transaction.request_path.is_file()
+        assert transaction.version_root.is_dir()
     monkeypatch.setattr(completion, name, original)
 
     completed = completion.complete_versioned_artifacts(transaction)
@@ -1169,7 +1180,7 @@ def test_versioned_completion_resumes_effects_without_duplicate_commit(
     assert run_git(
         repository, "rev-list", "--count", f"{checkpoint}..{transaction.branch}"
     ).stdout.strip() == "1"
-    assert not transaction.request_path.exists()
+    assert not transaction.version_root.exists()
     assert run_git(
         repository, "rev-parse", f"refs/tags/{completed.tag}^{{commit}}"
     ).stdout.strip() == created
@@ -1206,7 +1217,7 @@ def test_versioned_completion_rejects_changed_declared_inputs(tmp_path, change) 
     assert not storage._artifact_tag_exists(
         repository, transaction.release_bundle, transaction.version
     )
-    assert transaction.request_path.is_file()
+    assert transaction.version_root.is_dir()
 
 
 def test_versioned_completion_rejects_changed_prepared_result(tmp_path) -> None:
@@ -1426,6 +1437,8 @@ def test_grouped_completion_interruption(tmp_path, monkeypatch, effect):
         with pytest.raises(KeyboardInterrupt, match="group interrupted"):
             unexpected = runner.execute_build(repository, **options, bundles=["suite"], version_choices={"repository.release-bundles.suite": {"version": "2.0.0b1"}})
             assert unexpected["status"] == "completed", json.dumps(unexpected, indent=2)
+    original_records = {path: (path.read_bytes(), path.stat().st_mtime_ns)
+                        for path in (repository / ".ceratops/build").rglob("*.json")}
     finished = runner.execute_build(repository, **options, bundles=["suite"], version_choices={"repository.release-bundles.suite": {"version": "2.0.0b1"}})
     assert finished["status"] == "completed", finished
     repeated = runner.execute_build(repository, **options, bundles=["suite"], version_choices={"repository.release-bundles.suite": {"version": "2.0.0b1"}})
@@ -1434,6 +1447,8 @@ def test_grouped_completion_interruption(tmp_path, monkeypatch, effect):
         expected=results.artifact_identity(repository.name, "bundles/suite", "2.0.0b1", "python-3.14-windows"))
     assert len(selected.members) == 1
     assert selected.members[0].final_commit == selected.final_commit
-    assert (repository / ".build-count").read_text() == ("xx" if effect == "result-commit" else "x")
+    assert (repository / ".build-count").read_text() == "x"
+    assert all((path.read_bytes(), path.stat().st_mtime_ns) == original
+               for path, original in original_records.items())
     assert len(run_git(repository, "tag", "--list").stdout.splitlines()) == 2
     assert not list((repository / ".git/ceratops/artifacts").rglob("build_request.json"))

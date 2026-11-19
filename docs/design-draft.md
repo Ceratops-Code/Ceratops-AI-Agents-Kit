@@ -793,8 +793,14 @@ Source preparation includes staged/unstaged edits, new files, deletions and both
 rename paths. Git reports paths as NUL-separated output; owned changed paths go
 to `git add` and `git commit` through standard input, keeping large inventories
 off Windows command lines. Unrelated index and working files stay untouched.
-The receipt keeps the complete declared source inventory, with only files present
-in its source commit recorded as Git blobs.
+The receipt records `preTestCommit` and `sourceDefinition`: the SDLC path and
+deliverable name at that commit. Source filenames are derived in memory using
+that historical declaration and Git tree, without per-file hashes or a saved
+inventory. Reuse compares Git changes within the old and current source scope,
+including changes to the scope itself. Other packages' commits do not by
+themselves require rebuilding this package. External inputs and consumed
+packages keep their exact checksums and identities. Existing accepted receipts
+remain readable without rewriting their acceptance or check identities.
 Explicit dependency files suppress their producer's build. Before running the
 consumer, Build reads the artifact receipt beside those exact files and passes
 the supplier's recorded version, file records and acceptance to completion.
@@ -1897,34 +1903,41 @@ collision in an exact version path or existing tag advances alpha/beta; builds
 and tests run outside that short lock. Final-version collisions require another
 version choice. The lock file is `artifacts/.locks/allocation.lock`; retention uses
 `artifacts/.locks/store.lock`. No reservation or file-usage record is created.
-Startup keeps the requested temporary version and at most two predecessors in
-its own deliverable folder. Completion removes that version and older failed
-attempts; later attempts and other checkout folders remain untouched. After a
+Startup removes unfinished attempts in its own deliverable folder, preserving
+checked packages whose final receipt, retained copy or tag still needs completion.
+Completion removes that version and older failed attempts; later attempts and
+other checkout folders remain untouched. After a
 crash, the next build of that item performs this cleanup; there is no background
 sweeper. Completed `release/local` files go directly to
 `artifacts/beta-stable/<unit>/<version>/<target>/`. Only unfinished files use
 `worktrees/release-local/_in-test/`.
 
-Immediately after creation, `build_request.json` records repository, worktree
-path and Git registration, branch, unit/version, all targets, the existing
-receipt attempt identity, allocation commit and declared input paths. B is
-initially null. The caller prepares source versions/pins, commits B, then calls
-`store_artifacts.bind_artifact_inputs` to record that exact commit before artifacts.
-A bound request cannot be rebound. When explicit input paths are omitted, the
-tracked input paths exclude `.build/` result records.
+The current build object carries repository, checkout, item/version, targets and
+acceptance identity in memory. The caller prepares source versions/pins, commits
+the source, then calls `store_artifacts.bind_artifact_inputs` with that exact
+commit before producing artifacts. No `build_request.json` is created or read.
+The source list stays in memory and excludes `.ceratops/build/` and
+`.ceratops/results/`. Each task worktree runs one build at a time without a
+worktree lock. Version allocation uses the existing short shared-store lock;
+release builds retain their existing release lock.
 
 A fresh build removes all unfinished versions of the requested item from this
 checkout's `_in-test` directory before allocating its new output. This includes
-the same requested version and a directory with an incomplete request record.
+the same requested version when it has no completed acceptance.
 Deletion depends on that directory boundary, not saved ownership or usage
 information. A failed deletion stops this build before allocation. Other items,
 other checkouts and accepted versions remain untouched. A crash leaves this
 temporary output for the next build of the same item; success removes it.
 Uncommitted receipts belonging to discarded attempts are removed before their
 temporary bytes. Committed receipt history remains in Git and its version is
-not reassigned to a new attempt. If its passing receipt is already committed and
-its source inputs still match, finish missing copies or tags from those files
-instead of allocating another build.
+not reassigned to a new attempt. Passing receipts need not already be committed:
+their original checks and packages can finish missing commit/copy/tag effects.
+Completed check outcomes also remain in the existing per-checkout result store
+until receipt completion, so an interrupted receipt write does not discard the
+checked package. The pending-build entry is removed after completion or
+abandonment. A historical completed attempt may still have an obsolete request
+file; reopening its passing receipt removes that file from its own temporary
+directory without using its contents.
 
 Prepared receipts remain at
 `.ceratops/build/<unit>/<version>/build_receipt.json`, with
@@ -1936,7 +1949,7 @@ for a task checkout or `beta-stable/<unit>/<version>/<target>/` for
 after the result commit and all required tags exist. Copies retain their original
 checks and identity. Each version/target's bounded latest failure report is
 `<version>/.diagnostics/<target>.json`; receipt preparation ignores these
-producer-owned diagnostics and `build_request.json` as artifact payload.
+producer-owned diagnostics as artifact payload.
 There is no temporary publication tree.
 
 Before creating C, completion checks the exact B inputs and prepared result
@@ -1947,12 +1960,11 @@ Existing identical receipts/tags complete their effects; a malformed partial
 receipt can be rewritten, but a conflicting valid identity is never overwritten.
 No accepted test or build is repeated.
 
-`complete_artifact_builds.read_artifact_build` selects a request or completed
-receipt/tag chain for
-completion-only work without allocation. After the tag exists, completion
-removes resolved diagnostics and `build_request.json`; interruption leaves only
-unmet cleanup. Abandoned output belongs to the dedicated cleanup in 20C/21A,
-not another worktree's normal build.
+`complete_artifact_builds.read_artifact_build` reopens the actual passing receipt
+and package files, or the builder result already read from the result store.
+It reconstructs the in-memory build object without allocating another version.
+After the tag exists, completion removes the temporary output and diagnostics;
+interruption leaves only unmet cleanup in that same checkout's directory.
 
 Only cross-version deletion takes the existing short store lock. Allocation
 tries startup retention without waiting if that lock is busy; completed calls
@@ -2088,8 +2100,8 @@ release/store/destination locks; it adds no startup migration or recurring scan.
 `repository_operation.py` calls directory allocation and input binding in
 `store_artifacts.py`, and receipt/commit/tag completion in
 `complete_artifact_builds.py`. Neither opens an empty checkpoint directory or
-per-worktree lock. Build requests live beside their temporary output; the short
-allocation lock protects version allocation separately from the cleanup lock.
+per-worktree lock. Build identity stays in memory; the short allocation lock
+protects version allocation separately from the cleanup lock.
 Promote/Ship retain their outer
 release lock. A completed receipt/tag chain permits cleanup-only
 retries without mutable worktree receipts, repeated builds/tests, new commits,
@@ -2207,9 +2219,8 @@ they do not rename old files, alter tags or rerun accepted builds/tests.
 | `<destination>/locks/install` | Planned in steps 17–19; use the same helper and unfinished-run flag across source worktrees, through generation production, activation and cleanup. Retain the file; no mandatory OS process groups. |
 | Committed build receipt/evidence | Producer; current record plus at most two predecessors per unit/check group in the checkout; Git commit history supplies historical retrieval without an extra record database |
 | `ceratops/artifacts/<unit>/<version>/` with optional target subdirectory | Artifact store; immutable artifacts, supporting files and artifact receipt. The 4F retention functions keep each unpromoted worktree's latest approved build and the separate shared/destination selections described above. Unconnected callers retain the existing current-plus-two policy per repository/unit/target and version class until their planned adoption. |
-| `ceratops/artifacts/<unit>/<version>/build_request.json` | Artifact allocation and input binding; immediately records the registered worktree and whole target set, then exact B/inputs before artifacts. No allocation lock. Remove after receipt/tag completion; preserve unfinished and uncertain requests. |
 | `.ceratops/build/<unit>/<version>/build_receipt.json` with optional target directory | Operation runner; directly written final result, validated and reused by exact bytes, committed at C with other declared Git evidence and retained historically by Git |
-| `artifacts/<unit>/<version>/` with optional target directory | Direct final output; protected while a build request exists or the immutable tag is absent. Complete target receipts and the tag bind it to C. Directory creation, not a reservation file, allocates the version. |
+| `artifacts/worktrees/<checkout>/_in-test/<unit>/<version>/` with optional target directory | Temporary build/test output; one build runs per worktree. Passing target receipts and saved check outcomes preserve checked work until storage/tag completion. Exclusive directory creation allocates the version. Cleanup removes unfinished output only within that checkout/item. |
 | `artifacts/<unit>/<version>/.diagnostics/<target>.json` | Completion owner; one bounded directly replaced report per version/target, removed after that build completes. Separate from accepted evidence. |
 
 Retention runs at versioned producer startup and after completion. Protected

@@ -805,6 +805,9 @@ def execute_build(
                                    | {str(contract_path or operations.DEFAULT_CONTRACT)})
                     if release:
                         paths = sorted(set(paths) | {item['path'] for item in release['receipt']['artifactInputs'] if item['root'] == 'git'})
+                        if 'sourceDefinition' in release['receipt']:
+                            paths = sorted(set(paths) | set(deliverable_source_files(root,
+                                release['receipt']['sourceDefinition'], commit=release['receipt']['preTestCommit'])))
                     if release:
                         base = release['tag']
                     else:
@@ -915,6 +918,15 @@ def execute_build(
                         continue
                     produced = outcomes[item.operation]
                     checks = [outcomes[name] for name in required]
+                    current = reuse_operation_checks.CheckResultStore(root).current
+                    waiting = next((record for record in current.records("pending-build", target={"target": item.build_target})
+                                    if record["operation"] == item.operation), None)
+                    if waiting is not None and "completed_checks" not in waiting:
+                        # These are completed check outcomes, not an execution
+                        # cursor. Keep their original identities until the final
+                        # receipt/tag is stored, including a failed receipt write.
+                        current.put("pending-build", item.operation, {"target": item.build_target},
+                                    {**waiting, "completed_checks": checks})
                     suppliers = [value for value in result["results"]
                                  if value.get("status") == "completed" and value.get("operation", "").endswith(".build")]
                     build_context["receipts"][key] = complete_artifact_builds.prepare_versioned_build_receipt(
@@ -941,9 +953,8 @@ def execute_build(
                         check_summaries=_summaries(batch),
                     )
                     pending.setdefault(transaction.release_bundle, (transaction, []))[1].append(receipt)
-                # A sibling tag can already exist after an interrupted group
-                # completion. Its remaining owned request identifies unfinished
-                # cleanup; include its actual receipts in the same result commit.
+                # A sibling tag can already exist after interrupted completion.
+                # Finish its remaining retained copy and temporary-file cleanup.
                 for batch in finished:
                     for produced in batch["results"]:
                         if not produced.get("build_tag"):
@@ -952,8 +963,8 @@ def execute_build(
                                        if step.get("result", {}).get("schema") == sdlc_results.COMMITTED_BUILD_RECEIPT_SCHEMA)
                         identity = receipt["identity"]
                         key = sdlc_results.receipt_storage_key(identity)
-                        request = store_artifacts._artifact_store_path(root, temporary=True) / key / identity["version"] / "build_request.json"
-                        if key not in pending and request.is_file():
+                        temporary = store_artifacts._artifact_store_path(root, temporary=True) / key / identity["version"]
+                        if key not in pending and temporary.is_dir():
                             transaction = complete_artifact_builds.read_artifact_build(
                                 root, repository=identity["repository"], release_bundle=key,
                                 version=identity["version"], required_targets=receipt["requiredTargets"])
@@ -997,8 +1008,8 @@ def execute_build(
                             if (name not in bundle_transactions and previous
                                     and previous["receipt"].get("members") == members):
                                 identity = previous["receipt"]["identity"]
-                                request = store_artifacts._artifact_store_path(root, temporary=True) / bundle_key / identity["version"] / "build_request.json"
-                                if request.is_file():
+                                temporary = store_artifacts._artifact_store_path(root, temporary=True) / bundle_key / identity["version"]
+                                if temporary.is_dir():
                                     transaction = complete_artifact_builds.read_artifact_build(
                                         root, repository=identity["repository"], release_bundle=bundle_key,
                                         version=identity["version"], required_targets=previous["receipt"]["requiredTargets"])

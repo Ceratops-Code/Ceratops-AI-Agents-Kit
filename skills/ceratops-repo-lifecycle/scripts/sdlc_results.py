@@ -347,6 +347,12 @@ def _validate_committed_build_receipt(value: Mapping[str, Any]) -> None:
 
     inputs = list(value["artifactInputs"]) + list(value["checkInputs"])
     input_ids = [str(item["id"]) for item in inputs]
+    if "sourceDefinition" in value:
+        source = value["sourceDefinition"]
+        _bundle_relative_path(source["sdlcPath"], label="source SDLC declaration")
+        if source["deliverable"] + ".actions.build" != value["commandsAndSettings"]["operation"]:
+            raise StepResultError("Source declaration does not name this build's deliverable.")
+        input_ids.append(source["id"])
     _require_unique(input_ids, "Committed build receipt has duplicate input IDs.")
 
     dependencies = list(value["dependencies"])
@@ -546,7 +552,7 @@ def _validate_new_receipt(value: Mapping[str, Any], expected_schema: str) -> Non
 
 
 def encode_new_receipt(value: Mapping[str, Any]) -> bytes:
-    """Validate and serialize a v3 build or v1 artifact receipt deterministically."""
+    """Serialize a receipt within the same byte bound enforced by its reader."""
 
     if not isinstance(value, Mapping):
         raise StepResultError("New receipt must be one JSON object.")
@@ -554,7 +560,10 @@ def encode_new_receipt(value: Mapping[str, Any]) -> bytes:
     if not isinstance(schema, str):
         raise StepResultError("New receipt must declare its schema.")
     _validate_new_receipt(value, schema)
-    return _canonical_new_receipt_bytes(value)
+    raw = _canonical_new_receipt_bytes(value)
+    if len(raw) > NEW_RECEIPT_BYTES:
+        raise StepResultError("New receipt exceeds the JSON size limit.")
+    return raw
 
 
 def _parse_new_receipt(
@@ -998,6 +1007,11 @@ def _verify_receipt_inventory(
     ]
     store_paths: dict[tuple[str, str], pathlib.Path] = {}
     git_paths: list[str] = []
+    if "sourceDefinition" in receipt:
+        from ceratops_repo_compatibility_engine.sdlc_contract_validation import deliverable_source_files
+
+        git_paths.extend(deliverable_source_files(repository, receipt["sourceDefinition"],
+                                                   commit=receipt["preTestCommit"]))
     for record in records:
         key = _receipt_file_key(record)
         if record["root"] == "git":
