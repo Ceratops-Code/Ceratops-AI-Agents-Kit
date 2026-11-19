@@ -29,8 +29,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--repo-root", type=pathlib.Path, default=defaults.repo_root)
     parser.add_argument("--repo")
-    parser.add_argument("--diagnostic-output", type=pathlib.Path,
-                        help="Stable task-owned file for complete failure details.")
+    parser.add_argument("--report-directory", type=pathlib.Path,
+                        help="Task temporary directory; the writer chooses files under _operation-reports/<operation>/.")
     parser.add_argument("--diagnostic-repo-root", type=pathlib.Path, help=argparse.SUPPRESS)
     parser.add_argument("--diagnostic-action", default="ship", help=argparse.SUPPRESS)
     parser.add_argument(

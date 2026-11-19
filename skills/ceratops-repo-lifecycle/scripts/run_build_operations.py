@@ -542,7 +542,7 @@ def recorded_build(item, inputs, *, supplier_results=(), require_artifacts=True,
 
 
 def execute_sdlc_operations(
-    prepared: Sequence[Any], *, diagnostic_output=None, diagnostic_owner=None, successful_results=(),
+    prepared: Sequence[Any], *, report_directory=None, diagnostic_owner=None, successful_results=(),
     delivery_baseline=None, build_context=None, run_delivery=True,
 ) -> dict[str, Any]:
     """Run source checks, dependency-ordered builds, output tests, then delivery.
@@ -559,7 +559,7 @@ def execute_sdlc_operations(
         owner, action = diagnostic_owner or (prepared[0].repo_root, "operation")
         failure = report_failure(
             {"status": "result_invalid", "message": message},
-            diagnostic_output=diagnostic_output, repo_root=owner, action=action,
+            report_directory=report_directory, repo_root=owner, action=action,
             failure_id=preparation_id, successful_results=successful_results,
             output_root=prepared[0].repo_root,
         )
@@ -644,7 +644,7 @@ def execute_sdlc_operations(
         if item.test_context is not None:
             item = replace(item, test_context={**item.test_context, "commit": item.commit})
         result = operations.execute_prepared_operation(
-            item, diagnostic_output=diagnostic_output, diagnostic_owner=diagnostic_owner,
+            item, report_directory=report_directory, diagnostic_owner=diagnostic_owner,
             successful_results=(successful_results, results),
         )
         results.append(result)
@@ -686,7 +686,7 @@ def execute_sdlc_operations(
     if prepared:
         owner, action = diagnostic_owner or (prepared[0].repo_root, "operation")
         operations.remove_resolved_failures(
-            preparation_cleanup, diagnostic_output=diagnostic_output, repo_root=owner, action=action,
+            preparation_cleanup, report_directory=report_directory, repo_root=owner, action=action,
             resolved_failures=(preparation_id,),
         )
     source_results = {(value.get("operation"), value.get("check_group")): value
@@ -1036,6 +1036,6 @@ def execute_sdlc_operations(
     if (build_context or {}).get("abandoned_decisions"):
         final_result["answer_not_applied"] = "The pending package changed; the check must report a fresh result before accepting an answer."
     if prepared:
-        operations.remove_operation_failures(final_result, diagnostic_output=diagnostic_output,
+        operations.remove_operation_failures(final_result, report_directory=report_directory,
                                              diagnostic_owner=diagnostic_owner or (prepared[0].repo_root, "operation"))
     return final_result

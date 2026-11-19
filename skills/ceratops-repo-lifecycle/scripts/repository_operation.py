@@ -55,11 +55,11 @@ from github_pr_workflow.command import (
     report_phase,
     retire_handoff_reports_cli,
     run_progress_command,
-    update_ci_failure_evidence,
+    update_failure_export,
     write_operation_report,
 )
 from retain_check_results import check_inputs_match_for_reuse
-from run_build_operations import build_operation_context as build_operation_context  # noqa: PLC0414 -- public import
+from run_build_operations import build_operation_context as build_operation_context
 from run_build_operations import execute_sdlc_operations
 from sdlc_results import StepResultError, capture_step_result
 from store_artifacts import (
@@ -595,7 +595,7 @@ def require_build_result_commit(prepared: PreparedOperation, captured: Mapping[s
 
 
 def execute_prepared_operation(
-    prepared: PreparedOperation, *, diagnostic_output: pathlib.Path | None = None,
+    prepared: PreparedOperation, *, report_directory: pathlib.Path | None = None,
     diagnostic_owner: tuple[pathlib.Path, str] | None = None,
     successful_results: Any = (),
 ) -> dict[str, object]:
@@ -624,11 +624,11 @@ def execute_prepared_operation(
         failure_id = prepared.operation
         owner_root, action = diagnostic_owner or (prepared.repo_root, "operation")
         report_options = {
-            "diagnostic_output": diagnostic_output, "repo_root": owner_root,
+            "report_directory": report_directory, "repo_root": owner_root,
             "action": action, "failure_id": failure_id,
             "successful_results": successful_results, "output_root": prepared.repo_root,
         }
-        remove_resolved_failures(base, diagnostic_output=diagnostic_output,
+        remove_resolved_failures(base, report_directory=report_directory,
                                  repo_root=owner_root, action=action, resolved_failures=())
         if prepared.test_context is not None:
             base["test_context"] = dict(prepared.test_context)
@@ -639,7 +639,7 @@ def execute_prepared_operation(
         if prepared.result_commit_field and not re.fullmatch(r"[0-9a-f]{40}", prepared.commit or ""):
             return report_failure({**base, "status": "result_invalid", "message":
                 f"A commit-reporting build requires an existing 40-character Git HEAD in {prepared.repo_root}."}, **report_options)
-        report_phase(prepared.operation, enabled=diagnostic_output is not None)
+        report_phase(prepared.operation, enabled=report_directory is not None)
         if repository_commit(prepared.repo_root) != prepared.commit:
             return report_failure({
                 **base,
@@ -674,7 +674,7 @@ def execute_prepared_operation(
                     if prepared.check_group:
                         result["check_group"] = prepared.check_group
                     remove_operation_failures(
-                        result, diagnostic_output=diagnostic_output,
+                        result, report_directory=report_directory,
                         diagnostic_owner=(owner_root, action),
                     )
                     return result
@@ -748,7 +748,7 @@ def execute_prepared_operation(
                     expected_commit=prepared.commit
                     if prepared.category in MUTATION_CATEGORIES
                     else None,
-                    diagnostic_output=diagnostic_output,
+                    report_directory=report_directory,
                     diagnostic_owner=diagnostic_owner,
                     failure_id=f"{failure_id}:{step.position}",
                     successful_results=(successful_results, step_results),
@@ -790,7 +790,7 @@ def execute_prepared_operation(
                 if handoff_result["status"] in FAILED_STATUSES - {"handoff_required"}:
                     return report_failure(handoff_result, **report_options)
                 remove_operation_failures(
-                    handoff_result, diagnostic_output=diagnostic_output,
+                    handoff_result, report_directory=report_directory,
                     diagnostic_owner=(owner_root, action),
                 )
                 return handoff_result
@@ -910,7 +910,7 @@ def execute_prepared_operation(
                         },
                     }
                     return report_failure(
-                        failure, diagnostic_output=diagnostic_output,
+                        failure, report_directory=report_directory,
                         repo_root=owner_root, action=action,
                         failure_id=f"{failure_id}:{step.position}",
                         stdout=stdout, stderr=stderr, successful_results=successful_results,
@@ -947,7 +947,7 @@ def execute_prepared_operation(
                 }
                 owner_root, action = diagnostic_owner or (prepared.repo_root, "operation")
                 return report_failure(
-                    failure, diagnostic_output=diagnostic_output,
+                    failure, report_directory=report_directory,
                     repo_root=owner_root, action=action,
                     failure_id=f"{failure_id}:{step.position}",
                     stdout=stdout, stderr=stderr, successful_results=successful_results,
@@ -987,7 +987,7 @@ def execute_prepared_operation(
                 }
                 owner_root, action = diagnostic_owner or (prepared.repo_root, "operation")
                 return report_failure(
-                    failure, diagnostic_output=diagnostic_output,
+                    failure, report_directory=report_directory,
                     repo_root=owner_root, action=action,
                     failure_id=f"{failure_id}:{step.position}",
                     stdout=stdout, stderr=stderr, successful_results=successful_results,
@@ -1007,7 +1007,7 @@ def execute_prepared_operation(
                     "message": "HEAD changed during operation; prepare and validate the new commit.",
                 }, **report_options)
             remove_resolved_failures(
-                base, diagnostic_output=diagnostic_output, repo_root=owner_root,
+                base, report_directory=report_directory, repo_root=owner_root,
                 action=action, resolved_failures=(f"{prepared.operation}:{step.position}",),
             )
         result_value = {
@@ -1016,7 +1016,7 @@ def execute_prepared_operation(
             "steps": completed,
         }
         remove_operation_failures(
-            result_value, diagnostic_output=diagnostic_output,
+            result_value, report_directory=report_directory,
             diagnostic_owner=(owner_root, action),
         )
         return result_value
@@ -1034,7 +1034,7 @@ def execute_prepared_operation(
 
 
 def remove_operation_failures(
-    result: dict[str, Any], *, diagnostic_output: pathlib.Path | None,
+    result: dict[str, Any], *, report_directory: pathlib.Path | None,
     diagnostic_owner: tuple[pathlib.Path, str],
     completed_steps: tuple[int | str, ...] | None = None,
 ) -> None:
@@ -1046,14 +1046,14 @@ def remove_operation_failures(
     """
     for item in result.get("results", []):
         remove_operation_failures(
-            item, diagnostic_output=diagnostic_output,
+            item, report_directory=report_directory,
             diagnostic_owner=diagnostic_owner,
         )
     operation = result.get("operation")
     if operation is None and result.get("status") == "completed":
         completed = completed_operation_report_ids(result)
         repo_root, action = diagnostic_owner
-        remove_resolved_failures(result, diagnostic_output=diagnostic_output, repo_root=repo_root,
+        remove_resolved_failures(result, report_directory=report_directory, repo_root=repo_root,
                                  action=action, resolved_failures=completed,
                                  resolved_prefixes=tuple(key + ":" for key in completed))
         return
@@ -1063,7 +1063,7 @@ def remove_operation_failures(
     positions = result.get("steps", []) if completed_steps is None else completed_steps
     repo_root, action = diagnostic_owner
     remove_resolved_failures(
-        result, diagnostic_output=diagnostic_output, repo_root=repo_root, action=action,
+        result, report_directory=report_directory, repo_root=repo_root, action=action,
         resolved_failures=(operation, *(f"{operation}:{position}" for position in positions)),
         resolved_prefixes=(operation + ":",) if completed_steps is None else (),
     )
@@ -1083,7 +1083,7 @@ def _combined_prerequisites(prepared: Sequence[PreparedOperation]) -> dict[str, 
 
 def execute_prepared_operations(
     prepared: Sequence[PreparedOperation],
-    *, diagnostic_output: pathlib.Path | None = None,
+    *, report_directory: pathlib.Path | None = None,
     diagnostic_owner: tuple[pathlib.Path, str] | None = None,
     successful_results: Any = (),
 ) -> dict[str, Any]:
@@ -1091,7 +1091,7 @@ def execute_prepared_operations(
 
     if any(item.check_phase or item.build_check_groups for item in prepared):
         return execute_sdlc_operations(
-            prepared, diagnostic_output=diagnostic_output,
+            prepared, report_directory=report_directory,
             diagnostic_owner=diagnostic_owner, successful_results=successful_results,
         )
 
@@ -1103,7 +1103,7 @@ def execute_prepared_operations(
         failure = {"status": "result_invalid", "message": str(exc)}
         owner_root, action = diagnostic_owner or (prepared[0].repo_root, "operation")
         failure = report_failure(
-            failure, diagnostic_output=diagnostic_output,
+            failure, report_directory=report_directory,
             repo_root=owner_root, action=action, failure_id=preparation_id,
             successful_results=successful_results, output_root=prepared[0].repo_root,
         )
@@ -1115,13 +1115,13 @@ def execute_prepared_operations(
     if prepared:
         owner_root, action = diagnostic_owner or (prepared[0].repo_root, "operation")
         remove_resolved_failures(
-            batch, diagnostic_output=diagnostic_output,
+            batch, report_directory=report_directory,
             repo_root=owner_root, action=action, resolved_failures=(preparation_id,),
         )
     completed: list[str] = []
     for index, operation in enumerate(prepared):
         result = execute_prepared_operation(
-            operation, diagnostic_output=diagnostic_output,
+            operation, report_directory=report_directory,
             diagnostic_owner=diagnostic_owner,
             successful_results=(successful_results, results),
         )
@@ -1153,7 +1153,7 @@ def execute_prepared_operations(
         ),
     }
     if prepared:
-        remove_operation_failures(final_result, diagnostic_output=diagnostic_output,
+        remove_operation_failures(final_result, report_directory=report_directory,
                                   diagnostic_owner=diagnostic_owner or (prepared[0].repo_root, "operation"))
     return final_result
 
@@ -1202,7 +1202,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--confirm-previous-commands-stopped", action="store_true")
     parser.add_argument("--evidence-file", type=pathlib.Path)
     parser.add_argument("--retire-handoff-reports", type=pathlib.Path, help="Consume completed installer JSON and retire obsolete reports without executing the operation.")
-    parser.add_argument("--diagnostic-output", type=pathlib.Path)
+    parser.add_argument("--report-directory", type=pathlib.Path)
     parser.add_argument("--diagnostic-repo-root", type=pathlib.Path)
     parser.add_argument("--diagnostic-action", default="operation")
     parser.add_argument(
@@ -1271,7 +1271,7 @@ def main(argv: list[str] | None = None) -> int:
                 root, requests, args.sdlc_contract, context=context, artifacts=artifacts,
                 qualification_level=level, expected_commit=args.commit,
                 validation_operations=args.validation_operation, test_context=test_context,
-                diagnostic_output=args.diagnostic_output,
+                report_directory=args.report_directory,
                 diagnostic_owner=(args.diagnostic_repo_root or root, args.diagnostic_action),
                 confirm_stopped=args.confirm_previous_commands_stopped, prepare_only=args.prepare_only,
                 bundles=args.bundle, version_choices=args.version_choices,
@@ -1301,7 +1301,7 @@ def main(argv: list[str] | None = None) -> int:
                 result["prerequisites"] = requirements
         else:
             result = execute_prepared_operations(
-                prepared, diagnostic_output=args.diagnostic_output,
+                prepared, report_directory=args.report_directory,
                 diagnostic_owner=(args.diagnostic_repo_root or root, args.diagnostic_action),
             )
             for source, destination in (("check_result", "check_results"), ("check_summary", "check_summaries")):
@@ -1313,7 +1313,7 @@ def main(argv: list[str] | None = None) -> int:
     except (OperationError, OSError, ValueError) as exc:
         result = report_failure(
             {"status": "error", "message": str(exc)},
-            diagnostic_output=args.diagnostic_output,
+            report_directory=args.report_directory,
             repo_root=args.diagnostic_repo_root or args.repo_root,
             action=args.diagnostic_action,
         )
@@ -1327,20 +1327,18 @@ def finish_operation_request(args, result) -> int:
         result["next_command"] = [sys.executable, str(pathlib.Path(__file__).resolve()),
             *args.command_arguments,
             "--check-answers", json.dumps({result["decision_id"]: "<answer matching answer_schema>"})]
+    if args.report_directory is not None and failed:
+        try:
+            report = write_operation_report(
+                args.report_directory, result, repo_root=args.diagnostic_repo_root or args.repo_root,
+                action=args.diagnostic_action, pending_operations=tuple(args.operation),
+            )
+            result["operation_report"] = str(report)
+        except (OSError, ValueError, CommandError) as exc:
+            result["report_write_error"] = str(exc)
     if args.evidence_file:
         try:
-            if args.ci:
-                update_ci_failure_evidence(args.evidence_file, result, failed=failed)
-            else:
-                if failed:
-                    write_operation_report(
-                        args.evidence_file, result, repo_root=args.diagnostic_repo_root or args.repo_root,
-                        action=args.diagnostic_action, pending_operations=tuple(args.operation),
-                    )
-                remove_operation_failures(
-                    result, diagnostic_output=args.evidence_file,
-                    diagnostic_owner=(args.diagnostic_repo_root or args.repo_root, args.diagnostic_action),
-                )
+            update_failure_export(args.evidence_file, result, failed=failed)
         except (OSError, ValueError, CommandError) as exc:
             result["report_cleanup_error"] = str(exc)
     print(

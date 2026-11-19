@@ -433,7 +433,8 @@ def test_promotion_output_keeps_full_report_across_interruption(
                 module["main"](arguments)
         assert json.loads(report.read_text(encoding="utf-8"))["operations"] == payload["operations"]
         capsys.readouterr()
-    for _ in range(2):
+    for base in (task / "nested-base", tmp_path / "tmp"):
+        monkeypatch.setenv("CERATOPS_TASK_TEMP_ROOT", str(base))
         assert module["main"](arguments) == (1 if failed else 2 if status == "pending_work" else 0)
         observed = capsys.readouterr()
         output = observed.err if failed else observed.out
@@ -756,10 +757,10 @@ def test_repo_owns_installation_result_recording_and_cleanup(
         with monkeypatch.context() as patch:
             patch.setattr(pathlib.Path, "replace", interrupted_replace)
             with pytest.raises(OSError, match="recording"):
-                module["_save_result"](report, result, repo)
+                module["_save_result"](report, result)
         assert report.exists() == after
     # The actual result is still in the caller, not reconstructed by reinstalling.
-    module["_save_result"](report, result, repo)
+    module["_save_result"](report, result)
     digest = hashlib.sha256(report.read_bytes()).hexdigest()
     arguments = ["--repo-root", str(requested), "--finalize-result", "--result-file", str(report),
                  "--task-temp-root", str(task), "--expected-commit", prepared.commit,
@@ -826,7 +827,7 @@ def test_repo_cleanup_keeps_unfinished_installation_report(tmp_path, monkeypatch
     task = repo.parent / "tmp" / repo.name / "pending"
     task.mkdir(parents=True)
     report = task / "promotion.json"
-    module["_save_result"](report, result, repo)
+    module["_save_result"](report, result)
     before = report.read_bytes()
     args = module["build_parser"]().parse_args([
         "--repo-root", str(repo), "--finalize-result", "--result-file", str(report),
@@ -879,7 +880,7 @@ def test_repo_cleanup_retains_mismatched_or_incomplete_shipping_results(tmp_path
     task = repo.parent / "tmp" / repo.name / "shipping-result"
     task.mkdir(parents=True)
     report = task / "shipping.json"
-    module["_save_result"](report, result, repo)
+    module["_save_result"](report, result)
     original = report.read_bytes()
     args = module["build_parser"]().parse_args([
         "--repo-root", str(repo), "--finalize-result", "--result-file", str(report),
@@ -955,7 +956,6 @@ def _prepare_standalone_handoff_reports(
     from tests.repository_lifecycle.test_execute_skill_actions import (
         _registered_skill_fixture,
     )
-
     from tests.repository_lifecycle.test_sdlc_actions import _typed_contract
 
     runner = importlib.import_module("repository_operation")
@@ -986,10 +986,8 @@ def _prepare_standalone_handoff_reports(
                                   "completed_operations": [], "results": [pending]}}
     task = repo.parent / "tmp" / repo.name / "standalone-return"
     task.mkdir(parents=True)
-    previous = task / "_previous-attempt.json"
-    unrelated = task / "_other-operation.json"
-    command.write_operation_report(previous, pending, repo_root=repo, action="promote")
-    command.write_operation_report(unrelated, {
+    previous = command.write_operation_report(task, pending, repo_root=repo, action="promote")
+    unrelated = command.write_operation_report(task, {
         "status": "operation_failed", "operation": "deliverables.skills.other.actions.install",
     }, repo_root=repo, action="operation")
     step = prepared.steps[0]
@@ -1026,6 +1024,9 @@ def test_standalone_handoff_return_retires_reports_without_reinstalling(
     runner, repo, previous, completion, unrelated, accepted, arguments = _prepare_standalone_handoff_reports(
         tmp_path, monkeypatch, outer_result, source_checkout,
     )
+    evidence = completion.with_name("failure-export.json")
+    evidence.write_text(json.dumps({"status": "error", "message": "previous return failed"}))
+    arguments.extend(("--evidence-file", str(evidence)))
     calls = (repo / "calls.jsonl").read_bytes()
     retained = {path: path.read_bytes() for path in (unrelated, accepted)}
     original_unlink = pathlib.Path.unlink
@@ -1051,6 +1052,7 @@ def test_standalone_handoff_return_retires_reports_without_reinstalling(
         assert runner.main(arguments) == 0
         assert not previous.exists()
         assert not completion.exists()
+        assert not evidence.exists()
         assert (repo / "calls.jsonl").read_bytes() == calls
         assert all(path.read_bytes() == content for path, content in retained.items())
 
@@ -1156,9 +1158,13 @@ def test_non_deployment_handoff_does_not_offer_installer_receipt_return(tmp_path
 def test_promotion_passes_accepted_package_to_install(tmp_path, monkeypatch):
     """Plain Promote builds; deployment and standalone Install use that receipt."""
     from unittest.mock import Mock
-    from tests.repository_lifecycle.test_completed_builds import _worktree_build_case, runner
-    from tests.repository_lifecycle.test_operations import INSTALLER_PROBE
+
     from tests.repository_lifecycle.support import run_operation_cli
+    from tests.repository_lifecycle.test_completed_builds import (
+        _worktree_build_case,
+        runner,
+    )
+    from tests.repository_lifecycle.test_operations import INSTALLER_PROBE
 
     repo, _options = _worktree_build_case(tmp_path)
     assert run_git(repo, "restore", "--staged", "--worktree", "unrelated.txt").returncode == 0

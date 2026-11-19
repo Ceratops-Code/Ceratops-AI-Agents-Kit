@@ -457,7 +457,7 @@ def publish_dependency_batch(
                 "--main-branch", base_ref, "--release-branch", "release/local",
                 "--remote-name", "origin", "--ship-after-promotion",
                 "--title", "Update approved dependencies", "--body", body,
-                "--diagnostic-output", str(diagnostics),
+                "--report-directory", str(diagnostics),
             ]
             code, publication = run_command_for_json(invocation, cwd=primary)
             result.update(publication=publication, invocation=invocation)

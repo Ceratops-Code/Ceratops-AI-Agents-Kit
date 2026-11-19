@@ -88,7 +88,7 @@ class ShipOptions:
     review_replies_request: pathlib.Path | None = None
     interval_seconds: int = 10
     confirm_previous_commands_stopped: bool = False
-    diagnostic_output: pathlib.Path | None = None
+    report_directory: pathlib.Path | None = None
     diagnostic_owner: tuple[pathlib.Path, str] | None = None
 
 
@@ -487,12 +487,12 @@ def _checkpointed_operation_batch(
     version_source_commit: str | None = None,
     check_answers: dict[str, Any] | None = None,
     validation_operations: list[str] | None = None,
-    diagnostic_output: pathlib.Path | None = None,
+    report_directory: pathlib.Path | None = None,
     diagnostic_owner: tuple[pathlib.Path, str] | None = None,
 ) -> tuple[int, dict[str, Any], list[pathlib.Path]]:
     """Resume one ordered phase and checkpoint each completed operation."""
 
-    report_phase(phase, enabled=diagnostic_output is not None)
+    report_phase(phase, enabled=report_directory is not None)
     checkpoints: list[pathlib.Path] = []
     identities: list[dict[str, object]] = []
     completed_results: list[dict[str, Any]] = []
@@ -527,7 +527,7 @@ def _checkpointed_operation_batch(
         else:
             completed_results.append(result)
             remove_operation_failures(
-                result, diagnostic_output=diagnostic_output,
+                result, report_directory=report_directory,
                 diagnostic_owner=diagnostic_owner or (repo_root, "ship"),
             )
 
@@ -542,7 +542,7 @@ def _checkpointed_operation_batch(
                 repo_root, [OperationRequest(operation)], contract,
                 expected_commit=synchronized_commit, qualification_level="beta",
                 validation_operations=validation_operations,
-                diagnostic_output=diagnostic_output, diagnostic_owner=diagnostic_owner,
+                report_directory=report_directory, diagnostic_owner=diagnostic_owner,
                 successful_results=completed_results,
                 version_choices=version_choices, version_source_commit=version_source_commit,
                 check_answers=check_answers,
@@ -813,8 +813,8 @@ def _resume_ship_command(
         command.append("--delete-branch")
     if args.reusable_head:
         command.append("--reusable-head")
-    if diagnostic_output := getattr(args, "diagnostic_output", None):
-        command.extend(("--diagnostic-output", str(diagnostic_output)))
+    if report_directory := getattr(args, "report_directory", None):
+        command.extend(("--report-directory", str(report_directory)))
         if owner := getattr(args, "diagnostic_owner", None):
             command.extend(("--diagnostic-repo-root", str(owner[0]), "--diagnostic-action", owner[1]))
     return command
@@ -911,10 +911,10 @@ def _validate_phase(
             repo_root, operations, args.validation_operation, args.sdlc_contract
         ) if operation_category(name) == "pre-build-checks"],
     )
-    if diagnostic_output := getattr(args, "diagnostic_output", None):
+    if report_directory := getattr(args, "report_directory", None):
         owner_root, action = getattr(args, "diagnostic_owner", None) or (args.repo_root, "ship")
         command.extend((
-            "--diagnostic-output", str(diagnostic_output),
+            "--report-directory", str(report_directory),
             "--diagnostic-repo-root", str(owner_root), "--diagnostic-action", action,
         ))
     commit = repository_commit(repo_root)
@@ -933,7 +933,7 @@ def _validate_phase(
     if result.get("status") != "completed":
         raise RepositoryShipError("Validation runner returned an incomplete result.")
     remove_operation_failures(
-        result, diagnostic_output=getattr(args, "diagnostic_output", None),
+        result, report_directory=getattr(args, "report_directory", None),
         diagnostic_owner=getattr(args, "diagnostic_owner", None) or (args.repo_root, "ship"),
     )
     return result
@@ -985,7 +985,7 @@ def _test_selection_phase(
         ], args.sdlc_contract)
         require_clean_commit(repo_root, head)
         result = execute_prepared_operations(
-            prepared, diagnostic_output=getattr(args, "diagnostic_output", None),
+            prepared, report_directory=getattr(args, "report_directory", None),
             diagnostic_owner=getattr(args, "diagnostic_owner", None) or (args.repo_root, "ship"),
         )
         if result["status"] in FAILED_STATUSES:
@@ -1086,7 +1086,7 @@ def ship_repository(args: ShipOptions) -> dict[str, object]:
         operation="Ship", wait_seconds=60,
         confirm_stopped=getattr(args, "confirm_previous_commands_stopped", False),
     ), capture_failure_report(
-        getattr(args, "diagnostic_output", None), repo_root=owner_root, action=action,
+        getattr(args, "report_directory", None), repo_root=owner_root, action=action,
         failure_id="ship_repository",
     ):
         completed_result = None
@@ -1220,7 +1220,7 @@ def ship_repository(args: ShipOptions) -> dict[str, object]:
                         version_choices=args.version_choices, version_source_commit=args.version_source_commit,
                         check_answers=args.check_answers,
                         validation_operations=args.validation_operation,
-                        diagnostic_output=getattr(args, "diagnostic_output", None),
+                        report_directory=getattr(args, "report_directory", None),
                         diagnostic_owner=getattr(args, "diagnostic_owner", None) or (args.repo_root, "ship"),
                     )
                 )
@@ -1264,7 +1264,7 @@ def ship_repository(args: ShipOptions) -> dict[str, object]:
                         version_choices=args.version_choices, version_source_commit=args.version_source_commit,
                         check_answers=args.check_answers,
                         validation_operations=args.validation_operation,
-                        diagnostic_output=getattr(args, "diagnostic_output", None),
+                        report_directory=getattr(args, "report_directory", None),
                         diagnostic_owner=getattr(args, "diagnostic_owner", None) or (args.repo_root, "ship"),
                     )
                 )
@@ -1377,6 +1377,6 @@ def ship_repository(args: ShipOptions) -> dict[str, object]:
         finally:
             if completed_result is not None and completed_result.get("status") in {"shipped", "already_shipped"}:
                 remove_resolved_failures(
-                    completed_result, diagnostic_output=getattr(args, "diagnostic_output", None),
+                    completed_result, report_directory=getattr(args, "report_directory", None),
                     repo_root=owner_root, action=action, resolved_failures=("ship_repository",),
                 )

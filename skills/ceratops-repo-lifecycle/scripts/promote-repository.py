@@ -30,11 +30,11 @@ from github_contract_engine.format_report import sanitize_for_output
 from github_pr_workflow import ship_repository as repository_ship
 from github_pr_workflow.command import (
     CommandError,
+    _write_report_bytes,
     capture_failure_report,
     describe_command_failure,
     failure_excerpt,
     handoff_report_completions,
-    operation_report_root,
     project_task_temp_root,
     release_write_context,
     remove_resolved_failures,
@@ -154,7 +154,7 @@ def _ship_after_promotion(
         check_answers=getattr(args, "check_answers", None),
         publish_operation=_operation_ids(args.publish_operation, "publish"),
         deploy_operation=_operation_ids(args.deploy_operation, "deploy-local"),
-        diagnostic_output=getattr(args, "diagnostic_output", None),
+        report_directory=getattr(args, "report_directory", None),
         diagnostic_owner=(args.repo_root, "promote"),
     )
     try:
@@ -253,7 +253,7 @@ def promote(args: argparse.Namespace, *, timings: dict[str, float] | None = None
         args.repo_root, operation="promotion", wait_seconds=60,
         confirm_stopped=getattr(args, "confirm_previous_commands_stopped", False),
     ), capture_failure_report(
-        getattr(args, "diagnostic_output", None), repo_root=args.repo_root, action="promote",
+        getattr(args, "report_directory", None), repo_root=args.repo_root, action="promote",
     ):
         requested_root, branches, ship_after_promotion, parameters = inputs
         repo_root = git_branches._primary_checkout(requested_root)
@@ -339,7 +339,7 @@ def promote(args: argparse.Namespace, *, timings: dict[str, float] | None = None
         observed_release = release_start
         while True:
             git_branches.merge_release_into_task(task_root, observed_release)
-            with _timed_phase(timings, "checks-and-builds", diagnostic_output=getattr(args, "diagnostic_output", None)):
+            with _timed_phase(timings, "checks-and-builds", report_directory=getattr(args, "report_directory", None)):
                 build_requests = [OperationRequest(name, parameters=parameters) for name in (args.run_operation or [])]
                 validation = execute_build(
                     task_root, build_requests, contract, qualification_level="beta",
@@ -352,7 +352,7 @@ def promote(args: argparse.Namespace, *, timings: dict[str, float] | None = None
                     version_source_commit=getattr(args, "version_source_commit", None),
                     check_answers=getattr(args, "check_answers", None),
                     compare_builds_from=observed_release if not build_requests else None,
-                    diagnostic_output=getattr(args, "diagnostic_output", None),
+                    report_directory=getattr(args, "report_directory", None),
                     diagnostic_owner=(args.repo_root, "promote"),
                 )
             if validation["status"] in {"version_decision_required", "decision_required"}:
@@ -445,7 +445,7 @@ def promote(args: argparse.Namespace, *, timings: dict[str, float] | None = None
                 prepared_operations[index] = replace(item, selected_artifacts={
                     **(item.selected_artifacts or {}), reference: validation["artifacts"][reference]})
         remove_operation_failures(
-            validation, diagnostic_output=getattr(args, "diagnostic_output", None),
+            validation, report_directory=getattr(args, "report_directory", None),
             diagnostic_owner=(args.repo_root, "promote"),
         )
         pending_work_scope = record["pending_work_scope"]
@@ -465,7 +465,7 @@ def promote(args: argparse.Namespace, *, timings: dict[str, float] | None = None
             result["validation_handoffs"] = validation_handoffs
         if args.run_operation is not None:
             return _deploy_completed_promotion(args, CompletedPromotion(result, repo_root, prepared_operations, validation), timings=timings)
-        remove_resolved_failures(result, diagnostic_output=getattr(args, "diagnostic_output", None),
+        remove_resolved_failures(result, report_directory=getattr(args, "report_directory", None),
                                  repo_root=args.repo_root, action="promote", resolved_failures=("promote",))
         return result
 
@@ -516,11 +516,11 @@ def _deploy_completed_promotion(
     validation = accepted.source_checks
     validation_handoffs = accepted.result.get("validation_handoffs", [])
     timings = {} if timings is None else timings
-    with _timed_phase(timings, "deployment", diagnostic_output=getattr(args, "diagnostic_output", None)):
+    with _timed_phase(timings, "deployment", report_directory=getattr(args, "report_directory", None)):
         try:
             require_clean_commit(repo_root, target_commit)
             operations = execute_prepared_operations(
-                prepared_operations, diagnostic_output=getattr(args, "diagnostic_output", None),
+                prepared_operations, report_directory=getattr(args, "report_directory", None),
                 diagnostic_owner=(args.repo_root, "promote"), successful_results=validation.get("results", []),
             )
             if validation_handoffs:
@@ -571,7 +571,7 @@ def _deploy_completed_promotion(
             "remote_mutation": False,
         }) from exc
     result = {**accepted.result, "operations": operations}
-    remove_resolved_failures(result, diagnostic_output=getattr(args, "diagnostic_output", None),
+    remove_resolved_failures(result, report_directory=getattr(args, "report_directory", None),
                             repo_root=args.repo_root, action="promote", resolved_failures=("promote",))
     return result
 
@@ -579,23 +579,27 @@ def _deploy_completed_promotion(
 
 
 @contextmanager
-def _timed_phase(timings: dict[str, float], phase: str, *, diagnostic_output=None):
+def _timed_phase(timings: dict[str, float], phase: str, *, report_directory=None):
     """Record actual elapsed work even when a phase fails; never repeat it."""
     started = time.monotonic()
-    report_phase(phase, enabled=diagnostic_output is not None)
+    report_phase(phase, enabled=report_directory is not None)
     try:
         yield
     finally:
         timings[phase] = round(time.monotonic() - started, 6)
 
 
-def _save_result(path: pathlib.Path, result: dict[str, object], repo_root: pathlib.Path) -> str:
+def _save_result(path: pathlib.Path, result: dict[str, object]) -> str:
     """Publish the complete report and return its exact-byte cleanup digest.
 
     The caller can print only a summary after publication succeeds. The report
     is observational; neither it nor its digest can resume lifecycle effects.
     """
-    return write_operation_report(path, result, repo_root=repo_root, action="promote", retain_external_output=True)
+    # An explicitly requested export never changes handling when the configured
+    # task-temp base changes. Only the caller's finalizer removes this file.
+    data = (json.dumps(result, indent=2) + "\n").encode("utf-8")
+    _write_report_bytes(path, data)
+    return hashlib.sha256(data).hexdigest()
 
 
 def _result_summary(
@@ -608,7 +612,7 @@ def _result_summary(
         key: result[key] for key in (
             "status", "phase", "operation", "release_branch", "head", "commit",
             "replay_required", "remote_mutation", "timings_seconds",
-            "report_cleanup_error",
+            "report_cleanup_error", "report_write_error", "operation_report",
         ) if key in result
     }
     completions = handoff_report_completions(result)
@@ -997,8 +1001,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version-choices", type=json.loads)
     parser.add_argument("--check-answers", type=json.loads)
     parser.add_argument("--version-source-commit")
-    parser.add_argument("--diagnostic-output", type=pathlib.Path,
-                        help="Stable task-owned file for complete failure details.")
+    parser.add_argument("--report-directory", type=pathlib.Path,
+                        help="Task temporary directory; the writer chooses files under _operation-reports/<operation>/.")
     parser.add_argument(
         "--result-file",
         type=pathlib.Path,
@@ -1124,21 +1128,18 @@ def main(argv: list[str] | None = None) -> int:
     started = time.monotonic()
     timings: dict[str, float] = {}
     result_file = None
-    report_repo_root = args.repo_root
     result_digest = None
     failed = False
     try:
-        if (args.result_file is not None and args.diagnostic_output is not None
-                and args.result_file.expanduser().resolve() == args.diagnostic_output.expanduser().resolve()):
-            raise PromotionError("--result-file and --diagnostic-output must be different files.")
         if args.result_file is not None:
             requested = args.result_file.expanduser().resolve()
+            if "_operation-reports" in requested.parts:
+                raise PromotionError("result-file exports must stay outside the reserved _operation-reports directory")
             if requested.is_relative_to(args.repo_root.resolve()):
                 raise PromotionError("result-file must stay outside the repository")
             if requested.exists() and not requested.is_file():
                 raise PromotionError("result-file must name a file")
             result_file = requested
-            report_repo_root = operation_report_root(args.repo_root)
         result = promote(args, timings=timings)
         if result.get("status") == "version_decision_required":
             answer: Any = result["answer_schema"]
@@ -1160,6 +1161,7 @@ def main(argv: list[str] | None = None) -> int:
         failed = True
         if getattr(exc, "release_not_started", False):
             result_file = None  # A competing invocation creates no attempt record.
+            args.report_directory = None
         result = (
             exc.payload
             if isinstance(exc, PromotionError) and exc.payload is not None
@@ -1167,9 +1169,15 @@ def main(argv: list[str] | None = None) -> int:
         )
     timings["total"] = round(time.monotonic() - started, 6)
     result["timings_seconds"] = timings
+    if args.report_directory is not None:
+        try:
+            report = write_operation_report(args.report_directory, result, repo_root=args.repo_root, action="promote")
+            result["operation_report"] = str(report)
+        except (OSError, ValueError, CommandError) as exc:
+            result["report_write_error"] = str(exc)
     if result_file is not None:
         try:
-            result_digest = _save_result(result_file, result, report_repo_root)
+            result_digest = _save_result(result_file, result)
         except (OSError, ValueError, CommandError) as exc:
             # Side effects may already be complete. Retain their exact outcome
             # in the error instead of suggesting a replay to recover a record.

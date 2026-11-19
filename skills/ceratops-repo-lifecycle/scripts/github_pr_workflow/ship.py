@@ -385,7 +385,6 @@ def _pending_work_findings(
     findings: list[dict[str, str]] = []
     for source in scope["sources"]:
         branch = str(source["branch"])
-        source_commit = str(source["commit"])
         source_state = str(source["state"])
         if source_state == "preserved":
             continue
@@ -779,7 +778,7 @@ def run_parallel_gates(
         )
 
     owner_root, action = getattr(args, "diagnostic_owner", None) or (args.repo_root, "ship")
-    diagnostic_output = getattr(args, "diagnostic_output", None)
+    report_directory = getattr(args, "report_directory", None)
     ci_id, review_id = f"github_checks:{repository}:{pr}", f"github_review:{repository}:{pr}"
     ci_result = None
     try:
@@ -803,11 +802,11 @@ def run_parallel_gates(
                 cwd=args.repo_root,
             )
             with capture_failure_report(
-                diagnostic_output, repo_root=owner_root, action=action, failure_id=ci_id,
+                report_directory, repo_root=owner_root, action=action, failure_id=ci_id,
             ):
                 ci_result = ci_future.result()
             with capture_failure_report(
-                diagnostic_output, repo_root=owner_root, action=action, failure_id=review_id,
+                report_directory, repo_root=owner_root, action=action, failure_id=review_id,
             ):
                 review_result = review_future.result()
     finally:
@@ -815,7 +814,7 @@ def run_parallel_gates(
         # CI result can resolve its old failure even if review still needs work.
         if ci_result is not None:
             remove_resolved_failures(
-                ci_result, diagnostic_output=diagnostic_output, repo_root=owner_root,
+                ci_result, report_directory=report_directory, repo_root=owner_root,
                 action=action, resolved_failures=(ci_id,),
             )
     base_branch = ci_result.get("base")
@@ -829,7 +828,7 @@ def run_parallel_gates(
         ci_result.get("review_authorization_required")
     )
     remove_resolved_failures(
-        review_result, diagnostic_output=diagnostic_output, repo_root=owner_root,
+        review_result, report_directory=report_directory, repo_root=owner_root,
         action=action, resolved_failures=(review_id,),
     )
     return {
@@ -1149,10 +1148,10 @@ def ship(args: argparse.Namespace) -> dict[str, Any]:
         operation="Ship", wait_seconds=60,
         confirm_stopped=getattr(args, "confirm_previous_commands_stopped", False),
     ), capture_failure_report(
-        getattr(args, "diagnostic_output", None), repo_root=owner_root, action=action,
+        getattr(args, "report_directory", None), repo_root=owner_root, action=action,
         failure_id="github_ship",
     ):
-        report_phase("github_ship", enabled=getattr(args, "diagnostic_output", None) is not None)
+        report_phase("github_ship", enabled=getattr(args, "report_directory", None) is not None)
         completed_result = None
         try:
             repo_root = args.repo_root.expanduser().resolve(strict=True)
@@ -1382,6 +1381,6 @@ def ship(args: argparse.Namespace) -> dict[str, Any]:
         finally:
             if completed_result is not None and completed_result.get("status") in {"shipped", "already_shipped"}:
                 remove_resolved_failures(
-                    completed_result, diagnostic_output=getattr(args, "diagnostic_output", None),
+                    completed_result, report_directory=getattr(args, "report_directory", None),
                     repo_root=owner_root, action=action, resolved_failures=("github_ship",),
                 )

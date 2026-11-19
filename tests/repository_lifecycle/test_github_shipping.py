@@ -1302,7 +1302,7 @@ def test_ci_inspector_shares_run_metadata_and_selects_job_log_transport(
             raw = command[1] == "api"
             output = ("\x1b[31m" + json.dumps({"noise": "x" * 8000, "status": "mapping-gap",
                        "mapping_gaps": ["missing-map.py"]}) + "\x1b[0m") if raw else (
-                       "##[group]Run python run-tests.py --diagnostic-output pytest-failure.json\n"
+                       "##[group]Run python run-tests.py --report-directory pytest-failure.json\n"
                        "##[endgroup]\nError: Process completed with exit code 1.\n")
             return subprocess.CompletedProcess(command, 0 if raw else log_code, output, "")
         return subprocess.CompletedProcess(

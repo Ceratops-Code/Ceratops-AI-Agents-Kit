@@ -1011,14 +1011,15 @@ def test_incomplete_ownership_blocks_its_check_and_keeps_earlier_results(
     valid = _check(repo)
     invalid = runner.replace(valid, operation=valid.operation + "-invalid",
                              check_results={"product-inputs": ["unknown/*.py"], "check-inputs": ["scripts/check.py"]})
-    report_path = tmp_path / "tmp/repo/repo/_promote_failure.json"
+    monkeypatch.setenv("CERATOPS_TASK_TEMP_ROOT", str(tmp_path / "tmp"))
+    report_path = tmp_path / "tmp" / repo.name / repo.name / "_operation-reports" / "promote" / "failures.json"
     accepted = tmp_path / "accepted.json"
     accepted.write_text("original accepted bytes")
     callbacks = Mock(wraps=runner.run_progress_command)
     monkeypatch.setattr(runner, "run_progress_command", callbacks)
     result = runner.execute_prepared_operations(
         [valid, invalid],
-        diagnostic_output=report_path if report_selected else None,
+        report_directory=report_path.parents[2] if report_selected else None,
         diagnostic_owner=(repo, "promote"),
         successful_results=[{"status": "passed", "path": str(accepted)}],
     )
@@ -1032,7 +1033,7 @@ def test_incomplete_ownership_blocks_its_check_and_keeps_earlier_results(
     if report_selected:
         report = json.loads(report_path.read_text())
         assert result["diagnostic_output"] == str(report_path)
-        assert report["owner"]["action"] == "promote"
+        assert "owner" not in report
         assert str(accepted) in report["successful_result_paths"]
         assert any("ownership" in value["message"] for value in report["failures"].values())
     else:
@@ -1048,7 +1049,8 @@ def test_a_successful_exit_cannot_replace_missing_or_conflicting_producer_eviden
     repo = tmp_path / "repo"
     repo.mkdir()
     _fixture(repo)
-    report_path = tmp_path / "tmp/repo/repo/_promote_failure.json"
+    monkeypatch.setenv("CERATOPS_TASK_TEMP_ROOT", str(tmp_path / "tmp"))
+    report_path = tmp_path / "tmp" / repo.name / repo.name / "_operation-reports" / "promote" / "failures.json"
     accepted = tmp_path / "accepted.json"
     accepted.write_text("original accepted bytes")
     stdout = "first output\n" + "complete stdout\n" * 1000 + "last output"
@@ -1074,7 +1076,7 @@ def test_a_successful_exit_cannot_replace_missing_or_conflicting_producer_eviden
     monkeypatch.setattr(runner, "run_progress_command", execute)
     result = runner.execute_prepared_operation(
         _check(repo),
-        diagnostic_output=report_path if report_selected else None,
+        report_directory=report_path.parents[2] if report_selected else None,
         diagnostic_owner=(repo, "promote"),
         successful_results=[{"status": "passed", "path": str(accepted)}],
     )
@@ -1085,7 +1087,7 @@ def test_a_successful_exit_cannot_replace_missing_or_conflicting_producer_eviden
     if report_selected:
         report = json.loads(report_path.read_text())
         assert result["diagnostic_output"] == str(report_path)
-        assert report["owner"]["action"] == "promote"
+        assert "owner" not in report
         assert report["successful_result_paths"] == [str(accepted)]
         details = report["failures"]["repository.actions.pre-build-checks.check-groups.tests:1"]
         assert len(json.dumps(result)) < 5000

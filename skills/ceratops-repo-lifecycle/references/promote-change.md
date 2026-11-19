@@ -115,15 +115,15 @@ does not change this action's current installation route.
 
 ### Complete failure details
 
-Add `--diagnostic-output FILE` to the promotion command. FILE is one stable
-caller-selected path under
-`<repo-parent>/tmp/<repo-name>/<calling-worktree-name>/`, such as
-`_promote_failure.json`; reuse it on retries. A separate top-level Ship uses a
-different file. Composed Ship receives the original request's path and owner.
-Keep `--result-file` on its own path; its outcome/receipt contract is unchanged.
+Add `--report-directory TASK_TEMP` to the promotion command. TASK_TEMP is
+`<repo-parent>/tmp/<repo-name>/<calling-worktree-name>/`. The writer chooses
+`TASK_TEMP/_operation-reports/promote/failures.json`. Separate top-level Ship
+reports use their own operation directory; composed Ship retains the original
+request's directory and operation. Retries replace the same report.
+`--result-file PATH` is a separate explicit export outside `_operation-reports`.
 
-The direct workflow and both operation execution functions forward this path.
-`command.py` writes complete secret-redacted failure details there before
+The direct workflow and both operation execution functions forward TASK_TEMP.
+`command.py` atomically writes complete secret-redacted failure details before
 returning a short error and `diagnostic_output`. Successful test/build result
 files are referenced, never copied or deleted by report cleanup. Existing
 complete child reports are referenced unchanged; the child's helper owns their
@@ -257,17 +257,17 @@ Use `--result-file PATH` outside the repository to atomically retain the
 JSON outcome, operation receipts and phase durations. The
 helper records successful and failed attempts without replaying operations.
 
-Inside the caller's task temp tree, the shared operation-report writer adds
-`temporary_operation_report` ownership metadata. Reports explicitly retained
-outside that namespace keep their original payload and are not automatically
-deleted.
-Normal successful SDLC operations automatically remove obsolete unsuccessful
-reports with matching operation IDs in that task tree, including reports saved
-under earlier filenames. Partial completion preserves unresolved operations and
-the original error. A newly published failure keeps only its current snapshot
-for the same owner and original requested-operation set. Accepted results and successful
-reports remain outside this automatic retirement; their explicit finalization
-is unchanged. Cleanup never substitutes a model judgment or replays an effect.
+With `--report-directory`, the writer also saves the operation outcome in its
+dedicated directory. Successful outcomes replace `result.json`. Unfinished
+outcomes use `result-<operation-set-digest>.json`, so another attempt for the same
+work replaces that file. No ownership marker or scan of other task files is used.
+Normal successful SDLC operations remove matching unsuccessful reports from
+`_operation-reports` only. Partial completion updates `unresolved_operations`
+and preserves the original error. The writer removes abandoned staging files
+after writers stop. Accepted test/build records remain in their own stores.
+Explicit `--result-file` exports are never included in this automatic cleanup,
+regardless of the temporary-folder setting; their explicit finalizer is unchanged.
+Cleanup never substitutes a model judgment or replays an effect.
 
 When a single-step installation is handed back to the caller, the result's
 `report_completion` descriptor supplies its normal return command and answer

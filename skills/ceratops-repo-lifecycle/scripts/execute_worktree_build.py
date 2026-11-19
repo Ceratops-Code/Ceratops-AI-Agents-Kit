@@ -201,13 +201,14 @@ def prepare_package_versions(root, contract, declarations, versions, *, targets,
     completion; no execution checkpoint or private dependency solver is created.
     """
     import fnmatch
-    import repository_operation as operations
 
+    import repository_operation as operations
+    from ceratops_repo_compatibility_engine.sdlc_contract_validation import (
+        deliverable_source_files,
+    )
     from packaging.requirements import Requirement
     from packaging.utils import canonicalize_name
     from packaging.version import Version
-
-    from ceratops_repo_compatibility_engine.sdlc_contract_validation import deliverable_source_files
 
     if not build_references:
         return {}
@@ -466,7 +467,7 @@ def _summaries(value: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     return found
 
 
-def _finish(transaction, prepared=None, *, diagnostic_output=None, completed=None) -> dict[str, Any]:
+def _finish(transaction, prepared=None, *, report_directory=None, completed=None) -> dict[str, Any]:
     """A completed tag is sufficient to finish missed retention on a fresh call."""
     import repository_operation as operations
 
@@ -497,7 +498,7 @@ def _finish(transaction, prepared=None, *, diagnostic_output=None, completed=Non
     if maintenance:
         result['maintenance_errors'] = maintenance
     operations.remove_resolved_failures(
-        result, diagnostic_output=diagnostic_output, repo_root=transaction.repo_root,
+        result, report_directory=report_directory, repo_root=transaction.repo_root,
         action='build', resolved_failures=(f'worktree-build:{transaction.release_bundle}',),
     )
     return result
@@ -506,7 +507,7 @@ def _finish(transaction, prepared=None, *, diagnostic_output=None, completed=Non
 def execute_build(
     repo_root: pathlib.Path, requests: Sequence[Any], contract_path: pathlib.Path | None = None, *,
     context="skill", artifacts=None, qualification_level="alpha", expected_commit=None,
-    validation_operations=None, diagnostic_output=None, diagnostic_owner=None,
+    validation_operations=None, report_directory=None, diagnostic_owner=None,
     successful_results=(), confirm_stopped=False, prepare_only=False, include_checks=True,
     wait_seconds=60, test_context=None, delivery_baseline=None, run_delivery=True,
     bundles: Sequence[str] = (), version_choices: Mapping[str, Mapping[str, str]] | None = None,
@@ -576,7 +577,7 @@ def execute_build(
                         if item.install_input_file is not None:
                             item.install_input_file.unlink(missing_ok=True)
                     return {"status": "prepared", "operations": requested_operations}
-                return operations.execute_prepared_operations(installs, diagnostic_output=diagnostic_output,
+                return operations.execute_prepared_operations(installs, report_directory=report_directory,
                     diagnostic_owner=diagnostic_owner, successful_results=successful_results)
             reuse_operation_checks.artifact_inputs(root, artifacts or {})
             if not requests and include_checks:
@@ -890,7 +891,7 @@ def execute_build(
                                     test_context=test_context if item.check_phase or item.category == "build" else item.test_context)
                             for item in prepared]
                 result = execute_sdlc_operations(
-                    prepared, diagnostic_output=diagnostic_output, diagnostic_owner=diagnostic_owner,
+                    prepared, report_directory=report_directory, diagnostic_owner=diagnostic_owner,
                     successful_results=(successful_results, finished), delivery_baseline=delivery_baseline,
                     build_context=build_context, run_delivery=False,
                 )
@@ -922,7 +923,7 @@ def execute_build(
                         check_summaries=_summaries({"results": [produced, *checks]}))
                 if result["status"] in operations.FAILED_STATUSES:
                     owner, action = diagnostic_owner or (root, "build")
-                    result = report_failure(result, diagnostic_output=diagnostic_output,
+                    result = report_failure(result, report_directory=report_directory,
                                             repo_root=owner, action=action,
                                             successful_results=(successful_results, finished))
                     break
@@ -962,7 +963,7 @@ def execute_build(
                 if bundle_versions:
                     contract = operations.read_repository_contract(root, contract_path)
                     bundle_declarations = contract.get("repository", {}).get("release-bundles", {})
-                    for name, version in bundle_versions.items():
+                    for name in bundle_versions:
                         declaration = bundle_declarations.get(name)
                         if declaration is None:
                             raise operations.OperationError(f"Unknown release bundle: {name}")
@@ -1075,7 +1076,7 @@ def execute_build(
                                                     for path in paths]
                                         for reference, paths in outcome["artifacts"].items()
                                     }
-                        maintenance = _finish(transaction, diagnostic_output=diagnostic_output,
+                        maintenance = _finish(transaction, report_directory=report_directory,
                                 completed=replace(completed, tag=f"{transaction.release_bundle}/{transaction.version}"))
                         if maintenance.get("maintenance_errors"):
                             result.setdefault("maintenance_errors", []).extend(maintenance["maintenance_errors"])
@@ -1091,7 +1092,7 @@ def execute_build(
                     if outcome.get("artifact_identity") and outcome.get("status") == "completed"
                 ]
                 if run_delivery:
-                    for (target, batch), built in zip(batches, finished, strict=True):
+                    for (_target, batch), built in zip(batches, finished, strict=True):
                         installs = [item for item in batch
                                     if item.category in {"deploy-local", "publish", "verify-publish"}]
                         if not installs:
@@ -1103,7 +1104,7 @@ def execute_build(
                             artifacts=built["artifacts"], accepted_builds=result["accepted_builds"])
                         refreshed = [replace(item, selected_artifacts=built["artifacts"]) for item in refreshed]
                         delivered = execute_sdlc_operations(
-                            refreshed, diagnostic_output=diagnostic_output, diagnostic_owner=diagnostic_owner,
+                            refreshed, report_directory=report_directory, diagnostic_owner=diagnostic_owner,
                             successful_results=finished, delivery_baseline=delivery_baseline)
                         result = {**result, **delivered, "build_results": [
                             value for batch in finished for value in batch["results"] if value["status"] != "no_op"]}
@@ -1126,7 +1127,7 @@ def execute_build(
             {"status": "error", "message": str(exc), **getattr(exc, "payload", {}),
              "completed_operations": [name for batch in finished for name in batch["completed_operations"]],
              "pending_operations": [item.operation for item in requests], "results": finished},
-            diagnostic_output=diagnostic_output, repo_root=owner, action=action,
+            report_directory=report_directory, repo_root=owner, action=action,
             successful_results=(successful_results, finished),
         )
         if cleanup := getattr(exc, "cleanup_errors", None):

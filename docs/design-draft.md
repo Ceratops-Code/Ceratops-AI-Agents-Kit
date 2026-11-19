@@ -1267,35 +1267,31 @@ It never switches execution type by filename.
 #### Failure-report storage and ownership (3B/4B)
 
 All three public parsers (`promote-repository.py`, `ship-repository.py`,
-and `python -m github_pr_workflow ship`) accept `--diagnostic-output FILE`.
-The GitHub Ship parser/output adapter lives in `ship_pull_request.py`; the
-workflow remains `ship.py::ship()`, with no old parser alias.
-The caller chooses one stable path under
-`<repo-parent>/tmp/<repo-name>/<calling-worktree-name>/`. Top-level Promote and
-Ship use distinct files, reused across attempts; no execution UUID or report
-store exists. Promotion's `--result-file` remains a separate unchanged contract.
+and `python -m github_pr_workflow ship`) accept `--report-directory TASK_TEMP`.
+The directory is `<repo-parent>/tmp/<repo-name>/<calling-worktree-name>/`.
+`command.py::operation_report_directory()` chooses the exclusive
+`TASK_TEMP/_operation-reports/<action>/` directory. `write_failure_report()`
+always writes `failures.json` there. Reports contain failures and result
+references, without ownership labels; their location determines their producer.
+No task-wide search opens test fixtures, logs, exported results or other outputs.
 
-`command.py::write_failure_report()` owns the JSON file. Its identity records
-the registered worktree's Git directory and requesting action, not the current
-commit or invocation. `capture_failure_report()` adds the report path to direct
-workflow exceptions without changing their type or cause. The single
-`execute_prepared_operation()` implementation and the ordered
-`execute_prepared_operations()` function pass `diagnostic_output` to the writer.
-When execution uses another checkout, `diagnostic_owner` carries the calling
-worktree/action; the operation CLI forwards these as `--diagnostic-repo-root`
-and `--diagnostic-action`. Generated Ship retry arguments preserve that owner
-too. These values govern diagnostics only, never operation selection.
+The operation executors forward `report_directory`. When execution uses another
+checkout, `diagnostic_owner` carries the calling repository and action;
+`--diagnostic-repo-root` and `--diagnostic-action` pass those values to the
+operation CLI. Generated Ship retry arguments retain the same task directory.
+These values govern reporting only, never which operations execute.
+`capture_failure_report()` retains the original exception type and cause.
 
 Before shortening an error, the helper writes complete captured output and
-structured causes directly to the selected final path, using the existing
+structured causes atomically to its fixed report path, using the existing
 secret-redaction code. Existing successful result paths remain references, not
 copies. Child commands' explicit complete-report paths are returned unchanged,
 including the test runner's `pytest.diagnostic.path`; their files stay under
 their own helper's deletion authority. Expected decision payloads remain
 decisions, without a new failure report. Actual command failures retain their
 causes. No high-level failure receipt is produced. If a write fails or no path
-was supplied, full diagnostics remain in the response. Malformed or foreign
-existing records are not overwritten or removed.
+was supplied, full diagnostics remain in the response. An unreadable unresolved
+failure report is retained with the current failure returned in full.
 
 Retention is one current failure-only document per worktree/requested action.
 Named command/check failures replace only their same-work entries; other
@@ -1308,8 +1304,8 @@ one passing check cannot clear a report containing another unfixed failure.
 Unlock, restart, exception and phase advancement confer no deletion authority.
 Successful/mixed test results, build results, receipts, required acceptance logs,
 other worktrees/actions and unmanaged user-retained files are excluded.
-Lookup of owned temporary reports stays inside the caller's repository/task
-tree, without following redirected directories. No process discovery or repeat
+Report lookup stays inside the task's `_operation-reports` directory, without
+following redirected directories. No process discovery or repeat
 acceptance checks are added.
 
 4B connects success at the code that consumes each result. Promote and
@@ -2293,33 +2289,31 @@ removed names, destination, source commit, transaction ID and runtime-cleanup de
 The MCP installer follows the same separation and also returns the manager's
 complete `maintenance` object (`removed`, `deferred`, `errors`).
 
-`command.py::write_operation_report()` owns caller-selected temporary attempt
-snapshots under the caller's repository/task temp namespace. They retain that
-identity even after shipping removes the task worktree. Promotion's result
-writer and the operation CLI's failure-evidence writer use this same code.
-Explicit caller-retained promotion exports outside that namespace preserve the
-original payload and are never claimed for automatic temporary-report deletion.
-The original outcome fields remain intact, with `temporary_operation_report`
-metadata naming the owner, original requested operations and unresolved IDs.
-A newly published failure replaces older snapshots of the same owner and
-original requested-operation set,
-retaining one current snapshot in that group. Publication is atomic and removes
-its reserved `.<report-name>.operation-report.tmp` staging file after success or
-interruption. A fresh stopped-writer cleanup also removes such unpublished
-staging files; they are neither acceptance nor service-progress records.
-Startup retains at most two interrupted predecessors per group; publication
-makes room for the next snapshot before writing it. Incomplete retention blocks
-another snapshot while preserving the actual operation outcome in the response.
-Normal operation completion
-retires matching unsuccessful snapshots, including an earlier promotion handoff
-after the selected installation genuinely completes through an operation call.
-Partial completion changes only cleanup metadata, preserving the original error.
-The lookup does not cross task boundaries, follow links or use reports to resume
-effects. Successful reports and acceptance records remain outside automatic
-retirement. Cleanup errors preserve completed work and report the affected path.
-Path-scoped `report_cleanup_errors` accompany the compact `report_cleanup_error`
-message, so a successful unrelated suboperation cannot erase outstanding cleanup
-debt from an earlier phase.
+`command.py::write_operation_report()` owns operation snapshots in
+`TASK_TEMP/_operation-reports/<action>/`, including after Ship removes the source
+worktree. Promotion and the operation CLI return their actual `operation_report`
+path. Successful outcomes replace `result.json`; unfinished outcomes replace
+`result-<operation-set-digest>.json`, derived from the original unresolved work.
+Identical retries therefore retain exactly one snapshot per operation set.
+No per-file ownership marker or scan of other task outputs is used.
+
+Atomic publication uses the existing `.<report-name>.operation-report.tmp`
+staging file. It is removed on completion or interruption; the next stopped-writer
+cleanup also removes abandoned staging files in the dedicated directory.
+Successful operations remove matching failed reports there. Partial completion
+updates `unresolved_operations` while retaining the original outcome and error.
+Successful snapshots remain until replaced or the task temp directory is removed.
+Reports never authorize skipping or resuming lifecycle effects. Cleanup failures
+preserve completed work and return path-specific `report_cleanup_errors` plus
+the compact `report_cleanup_error` message.
+
+Promotion's `--result-file` is an explicitly retained export, written without
+ownership metadata regardless of the configured temporary-folder base. It stays
+outside `_operation-reports` and automatic cleanup; the existing explicit result
+finalizer consumes it. `--evidence-file` similarly names the operation CLI's
+explicit failure export, removed by that same CLI after success. Test results,
+accepted build receipts and installer completion inputs retain their own stores
+and lifetimes. They are never inferred to be temporary reports from their JSON.
 
 Single-step MCP installation and skill deployment handoffs expose a
 `report_completion` call descriptor with an `actual_completion_file` answer.

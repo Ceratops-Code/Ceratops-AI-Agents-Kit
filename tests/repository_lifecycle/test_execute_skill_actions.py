@@ -753,13 +753,13 @@ def test_ci_failure_evidence_repeats_after_interrupted_publish_or_deletion(tmp_p
     with monkeypatch.context() as scoped:
         scoped.setattr(pathlib.Path, "replace" if failed else "unlink", interrupt)
         with pytest.raises(KeyboardInterrupt):
-            command.update_ci_failure_evidence(evidence, result, failed=failed)
+            command.update_failure_export(evidence, result, failed=failed)
     assert interrupted
     expected = (current if failed else None) if after else previous
     assert (evidence.read_bytes() if evidence.exists() else None) == expected
     assert peer.read_bytes() == b"accepted work"
     for _ in range(2):
-        command.update_ci_failure_evidence(evidence, result, failed=failed)
+        command.update_failure_export(evidence, result, failed=failed)
         assert (json.loads(evidence.read_bytes()) if evidence.exists() else None) == (result if failed else None)
         assert peer.read_bytes() == b"accepted work"
         assert not list(evidence.parent.glob("*.operation-report.tmp"))
@@ -795,12 +795,12 @@ def test_ci_evidence_retires_interrupted_staging_before_current_outcome(
     with monkeypatch.context() as scoped:
         scoped.setattr(pathlib.Path, "unlink", unlink)
         with pytest.raises(KeyboardInterrupt):
-            command.update_ci_failure_evidence(evidence, result, failed=failed)
+            command.update_failure_export(evidence, result, failed=failed)
     assert interrupted
     assert staging.exists() is not after
     assert evidence.read_bytes() == previous
     for _ in range(2):
-        command.update_ci_failure_evidence(evidence, result, failed=failed)
+        command.update_failure_export(evidence, result, failed=failed)
         assert not staging.exists()
         assert (json.loads(evidence.read_bytes()) if evidence.exists() else None) == (result if failed else None)
         assert peer.read_bytes() == b"accepted work"

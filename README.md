@@ -845,29 +845,29 @@ neither accepts failed work nor deletes checkpoints.
 such as pending-work management or `repository_operation.py`, and reads its JSON.
 It does not dispatch by filename. Existing environment, working-directory and
 GitHub retry behavior remain unchanged; malformed output keeps its captured
-diagnostics. With `--diagnostic-output`, phase events are flushed as JSON lines
+diagnostics. With `--report-directory`, phase events are flushed as JSON lines
 before the terminal result; the JSON command reader forwards those events.
 
 #### Complete failure reports and successful-work cleanup (3B/4B)
 
 `promote-repository.py`, `ship-repository.py` and
-`python -m github_pr_workflow ship` accept `--diagnostic-output FILE`.
-The caller selects a stable file under
-`<shared-temp-base>/<repo-name>/<calling-worktree-name>/`, for example
-`_promote_failure.json` or `_ship_failure.json`. Separate top-level actions use
-separate files; retries reuse the same path. The path is independent of
-promotion's unchanged `--result-file`.
+`python -m github_pr_workflow ship` accept `--report-directory TASK_TEMP`.
+The caller supplies `<shared-temp-base>/<repo-name>/<calling-worktree-name>/`.
+The writer chooses `TASK_TEMP/_operation-reports/<action>/failures.json` and
+replaces it on retries. It owns that dedicated directory and needs no file
+ownership marker. Promotion's `--result-file` names a separate explicit export
+outside `_operation-reports`.
 
 `CERATOPS_TASK_TEMP_ROOT` supplies the shared temporary base. Without it,
 `command.py::project_task_temp_root()` uses `<projects-root>/tmp`, where
 `CERATOPS_PROJECTS_ROOT` overrides the primary checkout's parent directory.
-Reports add the primary repository name and one registered worktree name.
-The report's selected path preserves its owning worktree when execution moves
-to the primary checkout. Invalid, redirected, foreign, or ambiguous paths
-cannot authorize report writes or deletion. The environment does not carry
-worktree identity, and the command runner does not initialize these settings.
+Reports add the primary repository name and calling task's name. The supplied
+task directory stays the same when execution moves to the primary checkout or
+Ship removes the source worktree. Report cleanup looks only inside that task's
+`_operation-reports` directory and does not follow redirected paths. The
+environment does not carry task identity.
 
-`command.py` writes complete secret-redacted failures directly to that file
+`command.py` atomically writes complete secret-redacted failures to that file
 before returning a short error with `diagnostic_output`. It references existing
 successful test/build result files without copying them. An existing complete
 child report is referenced unchanged and remains owned by that child's helper.
@@ -891,8 +891,8 @@ actions' files and user-retained files outside managed storage are not cleanup
 targets. A malformed existing file is retained; the current error stays complete
 in the response.
 
-The direct workflows and both operation execution functions forward the selected
-path. The unnecessary single-operation wrapper is removed. GitHub Ship's CLI
+The direct workflows and both operation execution functions forward the task
+directory. The unnecessary single-operation wrapper is removed. GitHub Ship's CLI
 adapter is now `github_pr_workflow/ship_pull_request.py`; its command is unchanged.
 GitHub check waiting now lives in `github_pr_workflow/wait_pr_checks.py`; its
 behavior is unchanged. Ship retires a matching PR's CI failure after its checks
@@ -1731,23 +1731,24 @@ Lifecycle commands separately retire their own operation reports after consuming
 successful command results. Cleanup preserves the other entries in
 `check_results.json` and never changes completed builds' Git summaries.
 
-`github_pr_workflow.command` also owns temporary operation-attempt snapshots in
-the repository's caller-selected task temp tree. Promotion results and operation
-`--evidence-file` outputs include `temporary_operation_report` ownership and
-unresolved-operation metadata. Normal successful SDLC operations remove matching
-obsolete diagnostics and attempt snapshots throughout that same task tree, even
-when the next call selects another filename. Partial success retains remaining
-failures; a whole-operation success also retires failed steps removed from the
-current contract. New failure publication keeps one current snapshot per owner
-and original requested-operation set. Startup bounds interrupted predecessors
-to two in that group. Successful snapshots, accepted results,
-foreign files, redirected paths and other tasks remain outside automatic
-deletion. Cleanup errors remain observational and do not replay work.
+`github_pr_workflow.command` also writes operation outcomes inside
+`TASK_TEMP/_operation-reports/<action>/`. Successful outcomes replace
+`result.json`; unfinished outcomes replace `result-<operation-set-digest>.json`.
+The digest comes from the original unresolved operation names, so repeated
+attempts for the same work replace one file. Successful SDLC operations remove
+matching failed reports from this directory. Partial success updates
+`unresolved_operations` and retains the original error; a whole-operation
+success also retires failed steps removed from the current contract.
+Successful snapshots stay until replaced or the task temp folder is removed.
+Accepted results and files elsewhere in the task folder are never scanned.
+Cleanup errors remain observational and do not replay work.
 Each report reserves `.<report-name>.operation-report.tmp` for atomic writes;
 stopped-writer startup and completion discard unpublished staging bytes.
 Cleanup errors retain their affected paths across independent suboperations.
-Caller-selected promotion exports outside the task temp namespace retain their
-original payload and remain outside automatic deletion.
+Explicit `--result-file` exports retain their original payload and remain outside
+automatic deletion regardless of the temp-folder setting. The operation CLI's
+`--evidence-file` is likewise an explicit export, replaced on failure and removed
+by that CLI on success. Neither export carries an ownership marker.
 For a single-step installation handed back to the caller, `report_completion`
 provides the normal helper call and answer schema. Compact promotion/shipping
 responses keep these calls in `report_completions`, including nested deployment
