@@ -294,6 +294,21 @@ def test_repository_checks_share_current_file_with_individual_tests(check_writer
     assert shared.records("repository-check") == [stored]
     assert list(current.path.parent.iterdir()) == [current.path]
 
+    current.rewrite_current_results()
+    assert shared.records("pytest")[0]["result_id"] == "original-pass"
+    old = current.path.stat()
+    replacement = json.loads(current.path.read_bytes())
+    test_entry = next(entry for entry in replacement["entries"].values() if entry["kind"] == "pytest")
+    test_entry["record"]["result_id"] = "corrected-test-pass-with-a-larger-record"
+    # Replace the bytes in place to simulate a compacted file getting an old
+    # inode on every test platform, without depending on allocator timing.
+    current.path.write_bytes(check_writer["canonical"](replacement))
+    replaced = current.path.stat()
+    assert replaced.st_ino == old.st_ino and replaced.st_size > old.st_size
+    for store in (current, shared):
+        assert store.records("pytest")[0]["result_id"] == "corrected-test-pass-with-a-larger-record"
+        assert store.records("repository-check") == [stored]
+
 
 def _context(root: pathlib.Path) -> dict[str, Any]:
     (root / "source.py").write_text("source input\n")

@@ -474,7 +474,7 @@ class CurrentCheckResults:
         self.path = result_path(self.common / "ceratops/results/repository-checks" / identity / "check_results.json")
         self.worktree = {"id": identity, "path": str(self.root)}
         self.pending = result_path(self.path.with_name(".check_results.in_process.json"))
-        self._stamp: tuple[int, int, int] | None = None
+        self._stamp: tuple[int, int, int, int] | None = None
         self._offset = 0
         self._incomplete_tail = False
         self.value: dict[str, Any] = {}
@@ -490,19 +490,18 @@ class CurrentCheckResults:
             self.value = {"schema": CURRENT_RESULTS_SCHEMA, "worktree": self.worktree,
                           "inputGroups": {}, "entries": {}}
             return
-        stamp = (info.st_mtime_ns, info.st_size, info.st_ino)
+        stamp = (info.st_mtime_ns, info.st_size, info.st_ino, info.st_ctime_ns)
         if stamp == self._stamp:
             return
         if info.st_size > 64 * 1024 * 1024:
             raise ValueError(f"Current check results exceed 64 MiB: {self.path}")
-        if (self._stamp is None or stamp[2] != self._stamp[2]
-                or stamp[1] <= self._stamp[1]):
-            self._offset = 0
-            self.value = {"schema": CURRENT_RESULTS_SCHEMA, "worktree": self.worktree,
-                          "inputGroups": {}, "entries": {}}
+        # A compacted replacement can be larger and reuse a previous inode.
+        # Only this instance's own writes can advance its cached snapshot.
+        self._offset = 0
+        self.value = {"schema": CURRENT_RESULTS_SCHEMA, "worktree": self.worktree,
+                      "inputGroups": {}, "entries": {}}
         self._incomplete_tail = False
         with self.path.open("rb") as stream:
-            stream.seek(self._offset)
             for raw in stream:
                 if not raw.endswith(b"\n"):
                     # Only the command owner may discard a torn trailing append.
@@ -659,7 +658,7 @@ class CurrentCheckResults:
                 self.value["entries"][key] = entry
         self._offset += len(raw)
         info = self.path.stat()
-        self._stamp = (info.st_mtime_ns, info.st_size, info.st_ino)
+        self._stamp = (info.st_mtime_ns, info.st_size, info.st_ino, info.st_ctime_ns)
 
     def rewrite_current_results(self) -> None:
         """At an owning command boundary, retain current outcomes and recover a torn tail.
@@ -696,7 +695,7 @@ class CurrentCheckResults:
         self.value = value
         self._offset = len(raw)
         self._incomplete_tail = False
-        self._stamp = (info.st_mtime_ns, info.st_size, info.st_ino)
+        self._stamp = (info.st_mtime_ns, info.st_size, info.st_ino, info.st_ctime_ns)
 
 
 def _execution_fields(value: Any, *, completed: bool) -> bool:
