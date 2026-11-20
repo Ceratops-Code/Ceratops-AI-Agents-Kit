@@ -125,7 +125,7 @@ class GHContractStateEngineTests(unittest.TestCase):
                     "parameters": {
                         "strict_required_status_checks_policy": True,
                         "required_status_checks": [
-                            {"context": "validate-repository"}
+                            {"context": "repository-checks"}
                         ],
                     },
                 },
@@ -137,7 +137,7 @@ class GHContractStateEngineTests(unittest.TestCase):
             _ruleset_protection_facts([ruleset], "main"),
             {
                 "strict": True,
-                "required_checks": ["validate-repository"],
+                "required_checks": ["repository-checks"],
                 "approving_reviews": 1,
                 "dismiss_stale_reviews": True,
                 "code_owner_reviews": True,
@@ -267,8 +267,8 @@ class GHContractStateEngineTests(unittest.TestCase):
     def test_local_health_validates_present_deploy_contract_schema(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = pathlib.Path(temporary_directory)
-            contract = root / "sdlc" / "sdlc.yml"
-            contract.parent.mkdir()
+            contract = root / ".ceratops/sdlc" / "sdlc.yml"
+            contract.parent.mkdir(parents=True)
             contract.write_text(
                 json.dumps(
                     {
@@ -354,7 +354,7 @@ class GHContractStateEngineTests(unittest.TestCase):
                 "# Compatible\n\n## Skills\n\n| Skill | Purpose |\n| --- | --- |\n",
                 encoding="utf-8",
             )
-            validator = root / "scripts" / "validate-repository.py"
+            validator = root / "scripts" / "check-custom.py"
             validator.parent.mkdir()
             validator.write_text(
                 "import argparse\n"
@@ -370,7 +370,7 @@ class GHContractStateEngineTests(unittest.TestCase):
                 "jobs:\n"
                 "  validate:\n"
                 "    steps:\n"
-                "      - run: python scripts/validate-repository.py "
+                "      - run: python scripts/check-custom.py "
                 "--evidence-file evidence.log\n",
                 encoding="utf-8",
             )
@@ -404,7 +404,7 @@ class GHContractStateEngineTests(unittest.TestCase):
         ):
             root = pathlib.Path(repository_directory)
             evidence = pathlib.Path(evidence_directory) / "health.log"
-            validator = root / "scripts" / "validate-repository.py"
+            validator = root / "scripts" / "check-custom.py"
             validator.parent.mkdir()
             validator.write_text(
                 "raise SystemExit('health must not run this validator')\n",
@@ -416,22 +416,22 @@ class GHContractStateEngineTests(unittest.TestCase):
                 "jobs:\n"
                 "  validate:\n"
                 "    steps:\n"
-                "      - run: python scripts/validate-repository.py "
+                "      - run: python scripts/check-custom.py "
                 "--evidence-file evidence.log\n",
                 encoding="utf-8",
             )
-            contract = root / "sdlc" / "sdlc.yml"
-            contract.parent.mkdir()
+            contract = root / ".ceratops/sdlc" / "sdlc.yml"
+            contract.parent.mkdir(parents=True)
             contract.write_text(
                 json.dumps(
                     {
-                        "version": 4,
+                        "version": 5,
                         "kind": "ceratops-sdlc",
                         "repository": {
-                            "capabilities": {},
+                            "tools": {},
                             "actions": {"pre-build-checks": {"check-groups": {
                                 action: {
-                                    "requires": {"capabilities": []},
+                                    "requires": {"tools": []},
                                     "no-op": f"No {action} in this fixture.",
                                 }
                                 for action in ("source", "tests")
@@ -463,7 +463,7 @@ class GHContractStateEngineTests(unittest.TestCase):
                 local["repository_validation"],
                 {
                     "applicable": True,
-                    "validator_present": True,
+                    "sdlc_present": True,
                     "workflow_present": True,
                     "valid": True,
                     "errors": [],
@@ -484,7 +484,7 @@ class GHContractStateEngineTests(unittest.TestCase):
 
             facts = local["repository_validation"]
             self.assertFalse(facts["valid"])
-            self.assertFalse(facts["validator_present"])
+            self.assertFalse(facts["sdlc_present"])
             self.assertFalse(facts["workflow_present"])
             self.assertFalse(evidence.exists())
 
@@ -553,8 +553,8 @@ class GHContractStateEngineTests(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as temporary_directory:
             repo_root = pathlib.Path(temporary_directory)
-            sdlc_root = repo_root / "sdlc"
-            sdlc_root.mkdir()
+            sdlc_root = repo_root / ".ceratops/sdlc"
+            sdlc_root.mkdir(parents=True)
             (sdlc_root / "sdlc.yml").write_text(
                 json.dumps(
                     {
@@ -953,7 +953,7 @@ class GHContractStateEngineTests(unittest.TestCase):
             {"owner": "owner", "repo": "repo", "default_branch": "main"},
             repo_subset_ids(self.contracts, "all"),
         )
-        self.assertEqual(len(desired_state["rules"]), 84)
+        self.assertEqual(len(desired_state["rules"]), 85)
         self.assertTrue(all(rule["assertions"] for rule in desired_state["rules"]))
         self.assertTrue(
             any(
@@ -2976,7 +2976,7 @@ class GHContractStateEngineTests(unittest.TestCase):
                                     "parameters": {
                                         "__typename": "RequiredStatusChecksParameters",
                                         "requiredStatusChecks": [
-                                            {"context": "validate-repository"}
+                                            {"context": "repository-checks"}
                                         ],
                                     },
                                 },
@@ -3062,7 +3062,7 @@ class GHContractStateEngineTests(unittest.TestCase):
                     "required_status_checks": [],
                 },
                 {
-                    "required_status_checks": ["validate-repository"],
+                    "required_status_checks": ["repository-checks"],
                 },
                 {
                     "required_approving_review_count": 2,

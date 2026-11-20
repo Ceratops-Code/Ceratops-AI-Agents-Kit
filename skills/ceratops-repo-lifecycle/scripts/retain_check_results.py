@@ -16,6 +16,8 @@ from collections.abc import Iterable, Mapping
 from datetime import datetime
 from typing import Any
 
+from read_check_environment import environment_inputs_for_reuse
+
 RESULT_SCHEMA = "ceratops-repository-check-result.v1"
 CONTEXT_SCHEMA = "ceratops-repository-check-inputs.v1"
 CONTEXT_ENV = "CERATOPS_REPOSITORY_CHECK_CONTEXT"
@@ -38,7 +40,7 @@ _shared = (_bundle / "scripts" if (_bundle / ".runtime-manifest.json").is_file()
            else _bundle.parent / "sections" / "scripts")
 if _shared.is_dir() and str(_shared) not in sys.path:
     sys.path.insert(0, str(_shared))
-from store_check_results import CurrentCheckResults
+from store_check_results import CurrentCheckResults  # noqa: E402 - Bundle path is established above.
 
 
 def canonical(value: Any) -> bytes:
@@ -55,9 +57,9 @@ def fingerprint(context: Mapping[str, Any]) -> str:
 
 
 def _recorded_tools_cover_path_lookup(context: Mapping[str, Any]) -> bool:
-    """Use binary identities only for a complete declared tool inventory.
+    """Ignore PATH only for a complete declared tool inventory.
 
-    The launched command must itself be listed. Missing binaries, omitted tool
+    The launched command must itself be listed. Missing versions, omitted tool
     entries and declarations without tool ownership keep PATH significant.
     This reads existing records without revising their fingerprints or bytes.
     """
@@ -81,32 +83,42 @@ def _recorded_tools_cover_path_lookup(context: Mapping[str, Any]) -> bool:
             or not isinstance(variables.get("PATH"), str)
             or not _SHA.fullmatch(variables["PATH"])
             or not isinstance(declared_variables, list) or "PATH" not in declared_variables
-            or not isinstance(tools, dict) or set(tools) != set(names)):
+            or not isinstance(tools, dict) or (set(tools) - {name for name in tools if pathlib.PureWindowsPath(name).stem.lower() == "git"}) != {name for name in names if pathlib.PureWindowsPath(name).stem.lower() != "git"}):
         return False
-    return all(isinstance(tool, dict)
-               and isinstance(tool.get("sha256"), str)
-               and _SHA.fullmatch(tool["sha256"]) for tool in tools.values())
+    try:
+        environment_inputs_for_reuse({"tools": tools})
+    except ValueError:
+        return False
+    return True
 
 
-def check_inputs_match_for_reuse(recorded: Mapping[str, Any], current: Mapping[str, Any]) -> bool:
-    """Compare applicability while preserving every original result identity.
 
-    PATH text can differ when all declared executables still have identical
-    bytes. Every other environment value, runtime, dependency, check and product
-    input must match. Incomplete tool evidence retains exact PATH matching.
-    The same comparison governs failures and retention, so a PATH-only change
-    cannot hide a newer applicable failure or discard the evidence blocking it.
+def check_inputs_match_for_reuse(recorded: Mapping[str, Any], current: Mapping[str, Any],
+                                 *, differences: list[str] | None = None) -> bool:
+    """Compare source and execution inputs using the shared tool-version policy.
+
+    The same comparison governs failures and retention, so Git or patch upgrades
+    cannot hide a newer applicable failure. Original result records stay intact.
     """
-    if recorded["fingerprint"] == current["fingerprint"]:
-        return True
     # An SDLC route is an address, not the work performed by its command.
     # Compare the owning deliverable and complete execution facts, so moving a
     # command between phase containers preserves its original result identity.
     # Never remove checkGroup/artifacts/target/cwd/worktree from that comparison.
     def work(context: Mapping[str, Any]) -> dict[str, Any]:
         value = {key: item for key, item in context.items()
-                 if key not in {"fingerprint", "workVersion", "qualificationLevel", "environment"}}
+                 if key not in {"fingerprint", "workVersion", "qualificationLevel", "environment", "checkVersion"}}
         scope = dict(value["scope"])
+        rules = dict(scope.get("inputRules", {}))
+        if "tools" in rules:
+            rules["tools"] = sorted(pathlib.PureWindowsPath(name).stem.lower() for name in rules["tools"]
+                                    if pathlib.PureWindowsPath(name).stem.lower() != "git")
+        scope["inputRules"] = rules
+        value["scope"] = scope
+        arguments = list(value.get("arguments", []))
+        declared = context.get("scope", {}).get("inputRules", {}).get("tools", [])
+        if arguments and arguments[0] in declared:
+            arguments[0] = pathlib.PureWindowsPath(arguments[0]).stem.lower()
+            value["arguments"] = arguments
         operation = scope.pop("operation", None)
         if not isinstance(operation, str) or ".actions." not in operation:
             return value  # Unrecognized ownership retains exact comparison.
@@ -118,18 +130,17 @@ def check_inputs_match_for_reuse(recorded: Mapping[str, Any], current: Mapping[s
 
     if work(recorded) != work(current):
         return False
-    if recorded["environment"] == current["environment"]:
-        return True
-    if not _recorded_tools_cover_path_lookup(recorded) or not _recorded_tools_cover_path_lookup(current):
+    try:
+        return environment_inputs_for_reuse(
+            recorded["environment"], ignore_path=_recorded_tools_cover_path_lookup(recorded),
+        ) == environment_inputs_for_reuse(
+            current["environment"], ignore_path=_recorded_tools_cover_path_lookup(current),
+        )
+    except ValueError as exc:
+        if differences is not None:
+            differences.append(str(exc))
         return False
 
-    def effective_environment(context: Mapping[str, Any]) -> dict[str, Any]:
-        environment = dict(context["environment"])
-        environment["variables"] = {name: value for name, value in environment["variables"].items()
-                                    if name != "PATH"}
-        return environment
-
-    return effective_environment(recorded) == effective_environment(current)
 
 
 def _relative_path(value: Any) -> bool:
@@ -205,7 +216,8 @@ def _load(path: pathlib.Path, result_id: str | None = None) -> tuple[dict[str, A
     if path.name == "check_results.json":
         if path.stat().st_size > 64 * 1024 * 1024:
             raise ValueError("Current check results exceed 64 MiB.")
-        document = json.loads(path.read_bytes(), object_pairs_hook=_object)
+        with path.open("rb") as stream:
+            document = json.loads(stream.readline(), object_pairs_hook=_object)
         if (not isinstance(document, dict) or not isinstance(document.get("worktree"), dict)
                 or not isinstance(document["worktree"].get("path"), str)):
             raise ValueError("Current check results lack their worktree identity.")
@@ -230,7 +242,7 @@ def _load(path: pathlib.Path, result_id: str | None = None) -> tuple[dict[str, A
         raise ValueError("Check result exceeds the record size limit.")
     required = {"schema", "result_id", "candidate_id", "check_id", "check_version",
                 "invocation", "status", "exit_code", "inputs", "execution"}
-    if not required.issubset(value) or set(value) - required - {"checks", "check_summary"}:
+    if not required.issubset(value) or set(value) - required - {"children", "childInputs", "childChecks", "check_summary"}:
         raise ValueError("Check result fields differ from the runner contract.")
     if (value.get("schema") != RESULT_SCHEMA or not isinstance(value.get("result_id"), str)
             or not all(isinstance(value.get(key), str) and value[key].strip()
@@ -239,7 +251,7 @@ def _load(path: pathlib.Path, result_id: str | None = None) -> tuple[dict[str, A
         raise ValueError("Check result identity does not match its final path.")
     inputs = check_context(value.get("inputs", {}))
     if "check_summary" in value:
-        summary = value["check_summary"]
+        summary: dict[str, Any] = value["check_summary"]
         if (not isinstance(summary, dict) or set(summary) != {"schema", "inputGroups", "checkGroups", "checks"}
                 or summary["schema"] != "ceratops-check-summary.v1"
                 or not isinstance(summary["inputGroups"], dict)
@@ -273,22 +285,13 @@ def _load(path: pathlib.Path, result_id: str | None = None) -> tuple[dict[str, A
             or (status in {"failed", "interrupted"} and code == 0)):
         raise ValueError("Check outcome and exit code conflict.")
     execution = value.get("execution")
-    if not isinstance(execution, dict) or set(execution) != {
-        "startedAt", "finishedAt", "durationSeconds", "workerPid",
-    }:
+    execution_fields = {"startedAt", "finishedAt", "durationSeconds"}
+    if status == "running":
+        execution_fields.add("workerPid")
+    if not isinstance(execution, dict) or set(execution) != execution_fields:
         raise ValueError("Original check execution is missing.")
-    if "checks" in value and (not isinstance(value["checks"], list)
-                              or any(not isinstance(item, dict) for item in value["checks"])
-                              or any("status" in item and not isinstance(item["status"], str)
-                                     for item in value["checks"])
-                              or any("reusable" in item and type(item["reusable"]) is not bool
-                                     for item in value["checks"])
-                              or (status == "passed" and any(
-                                  item.get("status") in {"failed", "blocked", "interrupted"}
-                                  for item in value["checks"]))):
-        raise ValueError("Reported checks conflict with the terminal outcome.")
     started = _time(execution.get("startedAt"))
-    if type(execution.get("workerPid")) is not int or execution["workerPid"] <= 0:
+    if status == "running" and (type(execution.get("workerPid")) is not int or execution["workerPid"] <= 0):
         raise ValueError("Original check worker identity is missing.")
     if status == "running":
         if execution.get("finishedAt") is not None or execution.get("durationSeconds") is not None:
@@ -300,6 +303,73 @@ def _load(path: pathlib.Path, result_id: str | None = None) -> tuple[dict[str, A
                 or duration < 0
                 or abs((finished - started).total_seconds() - duration) > max(1, duration * .01)):
             raise ValueError("Check execution duration conflicts with its times.")
+    if path.name == "check_results.json":
+        children = value.get("children", [])
+        child_inputs = value.get("childInputs", {})
+        child_checks = value.get("childChecks", {})
+        if not isinstance(children, list) or not isinstance(child_inputs, dict) or not isinstance(child_checks, dict):
+            raise ValueError("Command child references are incomplete.")
+        summary = {"schema": "ceratops-check-summary.v1", "inputGroups": dict(child_inputs),
+                   "checkGroups": dict(child_checks), "checks": []}
+        for table in (child_inputs, child_checks):
+            if any(not isinstance(facts, dict) or identity != hashlib.sha256(canonical(facts).rstrip(b"\n")).hexdigest()
+                   for identity, facts in table.items()):
+                raise ValueError("Command child input facts differ from their recorded identity.")
+        records_by_kind = {
+            kind: {record.get("result_id"): record for record in current.records(kind)}
+            for kind in ("pytest", "reported-check")
+            if any(isinstance(reference, dict) and reference.get("storeKind") == kind for reference in children)
+        }
+        for reference in children:
+            if (not isinstance(reference, dict) or reference.get("storeKind") not in {"pytest", "reported-check"}
+                    or reference.get("result_id") not in records_by_kind.get(reference["storeKind"], {})):
+                raise ValueError("A command child result is missing or has been replaced; run the check again.")
+            child = records_by_kind[reference["storeKind"]][reference["result_id"]]
+            if reference["storeKind"] == "pytest":
+                facts = dict(child["inputs"])
+                test_files = facts.pop("check_inputs")
+                input_group = hashlib.sha256(canonical(facts).rstrip(b"\n")).hexdigest()
+                check_group = hashlib.sha256(canonical(test_files).rstrip(b"\n")).hexdigest()
+                summary["inputGroups"][input_group] = facts
+                summary["checkGroups"][check_group] = test_files
+                outcome: dict[str, Any] = {"kind": "pytest", "id": child["nodeid"], "status": child["outcome"],
+                           "inputGroup": input_group, "checkGroup": check_group,
+                           "check_version": hashlib.sha256(canonical({
+                               "producer": facts.get("producer"), "check_inputs": test_files,
+                           }).rstrip(b"\n")).hexdigest(),
+                           **{key: child[key] for key in ("result_id", "completed_ns", "inputs_digest",
+                                                        "phases", "qualificationLevel") if key in child}}
+            else:
+                outcome = dict(child)
+                if "inputs" in outcome:
+                    facts = outcome.pop("inputs")
+                    input_group = hashlib.sha256(canonical(facts).rstrip(b"\n")).hexdigest()
+                    summary["inputGroups"][input_group] = facts
+                    outcome["inputGroup"] = input_group
+            outcome.update({key: reference[key] for key in (
+                "required", "reused", "applicableInputGroup", "comparisonInputGroup", "comparisonCheckGroup") if key in reference})
+            for field, table_name in (("applicableInputGroup", "inputGroups"), ("comparisonInputGroup", "inputGroups"),
+                                 ("comparisonCheckGroup", "checkGroups")):
+                if field in outcome and outcome[field] not in summary[table_name]:
+                    raise ValueError("Command child names absent comparison inputs.")
+            if status == "passed" and outcome.get("status") in {"failed", "blocked", "interrupted"}:
+                raise ValueError("A passing command references an unsuccessful child result.")
+            summary["checks"].append(outcome)
+        input_group = hashlib.sha256(canonical(inputs).rstrip(b"\n")).hexdigest()
+        summary["inputGroups"][input_group] = inputs
+        summary["checks"].append({
+            "kind": "repository-check", "id": value["check_id"], "status": status, "required": True,
+            "result_id": value["result_id"], "check_version": value["check_version"],
+            "candidate_id": value["candidate_id"], "qualificationLevel": inputs["qualificationLevel"],
+            "completed_ns": int(_time(execution["finishedAt"] or execution["startedAt"]).timestamp() * 1_000_000_000),
+            "inputGroup": input_group, "inputs_digest": inputs["fingerprint"],
+            "reusable": not any(item.get("reusable") is False for item in summary["checks"]),
+            "children": [{"kind": item.get("kind"), "id": item["id"]} for item in summary["checks"]],
+        })
+        value["check_summary"] = summary
+    for outcome in value.get("check_summary", {}).get("checks", []):
+        if "reusable" in outcome and type(outcome["reusable"]) is not bool:
+            raise ValueError("Reported checks conflict with the boolean reuse contract.")
     return value, raw
 
 
@@ -330,7 +400,7 @@ def result_reference(path: pathlib.Path, result_id: str | None = None) -> dict[s
 
 def _nonreusable(record: Mapping[str, Any]) -> bool:
     """A successful outcome can still require fresh child scope execution."""
-    return any(item.get("reusable") is False for item in record.get("checks", []))
+    return any(item.get("reusable") is False for item in record.get("check_summary", {}).get("checks", []))
 
 
 class CheckResultStore:
@@ -346,28 +416,42 @@ class CheckResultStore:
         """A new execution has its own ID, but updates the same current file."""
         return str(uuid.uuid4()), self.current.path
 
-    def _records(self) -> tuple[list[tuple[pathlib.Path, dict[str, Any], bytes]], list[pathlib.Path]]:
+    def _records(self, request: Mapping[str, Any]) -> tuple[list[tuple[pathlib.Path, dict[str, Any], bytes]], list[str]]:
         records = []
+        invalid = []
         for record in self.current.records("repository-check"):
-            value, raw = _load(self.current.path, record["result_id"])
-            records.append((self.current.path, value, raw))
-        return records, []
+            # Commands with other arguments do not supply evidence for this
+            # request. Their owned context formats need not be parsed here.
+            saved = record.get("inputs", {})
+            if (isinstance(saved, dict) and isinstance(saved.get("arguments"), list)
+                    and saved["arguments"] != request["arguments"] and record.get("check_id") != request["group"]):
+                continue
+            if (not isinstance(saved, dict) or not isinstance(saved.get("arguments"), list)) and record.get("check_id") != request["group"]:
+                continue
+            try:
+                value, raw = _load(self.current.path, record.get("result_id"))
+                records.append((self.current.path, value, raw))
+            except ValueError as exc:
+                invalid.append(str(exc))
+        return records, invalid
 
     def select(self, context: Mapping[str, Any], *, check_id: str,
                builds: Iterable[Mapping[str, Any]] = ()) -> dict[str, Any]:
         """Choose original eligible evidence, refusing newer applicable failures."""
         request = check_context(context)
-        records, invalid = self._records()
+        records, invalid = self._records(request)
         decision: dict[str, Any] = {
             "decision": "execute", "reason": "No applicable recorded pass.",
             "record": None, "reference": None,
         }
         if invalid:
-            decision["decision"] = "blocked"
-            decision["reason"] = "Malformed or incomplete durable evidence prevents safe reuse."
+            decision["reason"] = "The requested check needs execution: " + "; ".join(dict.fromkeys(invalid))
             return decision
+        differences: list[str] = []
         matching = [(path, record, raw) for path, record, raw in records
-                    if check_inputs_match_for_reuse(record["inputs"], request)]
+                    if check_inputs_match_for_reuse(record["inputs"], request, differences=differences)]
+        if differences:
+            decision["reason"] = " ".join(dict.fromkeys(differences))
         matching.sort(key=lambda item: _order(item[1]), reverse=True)
         if any(_nonreusable(record) for _, record, _ in matching):
             decision["reason"] = "Unrepresented child scope requires fresh execution."
@@ -381,16 +465,34 @@ class CheckResultStore:
         for build in builds:
             summary = build["summary"]
             for check in summary["checks"]:
-                if (check.get("kind") != "repository-check"
-                        or check.get("status") != "passed" or check.get("reusable") is False
-                        or not {"inputGroup", "result_id", "check_version", "completed_ns"} <= check.keys()):
+                if check.get("kind") != "repository-check":
                     continue
-                original = check_context(summary["inputGroups"][check["inputGroup"]])
+                saved = summary["inputGroups"].get(check.get("inputGroup"))
+                # Matching execution arguments are already required for reuse.
+                # Other commands can own different context/checksum formats in
+                # this shared summary and must not block the requested check.
+                if (isinstance(saved, dict) and isinstance(saved.get("arguments"), list)
+                        and saved["arguments"] != request["arguments"] and check.get("id") != request["group"]):
+                    continue
+                if (not isinstance(saved, dict) or not isinstance(saved.get("arguments"), list)) and check.get("id") != request["group"]:
+                    continue
+                if not {"inputGroup", "result_id", "check_version", "completed_ns"} <= check.keys():
+                    decision["reason"] = "The requested check has incomplete saved execution facts."
+                    return decision
+                try:
+                    original = check_context(saved)
+                except ValueError as exc:
+                    decision["reason"] = "The requested check has unusable saved inputs: " + str(exc)
+                    return decision
                 if (check.get("inputs_digest") != original["fingerprint"]
                         or check["check_version"] != original["checkVersion"]
                         or check.get("qualificationLevel") != original["qualificationLevel"]
                         or type(check["completed_ns"]) is not int):
-                    raise ValueError("Tagged repository check conflicts with its original inputs.")
+                    decision["reason"] = "The requested check's saved outcome conflicts with its original inputs."
+                    return decision
+                if check.get("status") != "passed" or check.get("reusable") is False:
+                    decision["reason"] = "The requested check has no reusable passing outcome in this build."
+                    return decision
                 compared = dict(original)
                 compared["scope"] = dict(original["scope"])
                 if "worktree" in request["scope"]:

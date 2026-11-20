@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import importlib
 import json
 import pathlib
 import subprocess
@@ -9,6 +10,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from functools import partial
 from typing import Any
 from unittest import mock
 
@@ -16,8 +18,10 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 GH_SCRIPTS = ROOT / "skills" / "ceratops-repo-lifecycle" / "scripts"
 sys.path.insert(0, str(GH_SCRIPTS))
 
-from github_pr_workflow import codex_review, merge, readiness
-from github_pr_workflow import dependency_finalization as flow
+codex_review = importlib.import_module("github_pr_workflow.codex_review")
+merge = importlib.import_module("github_pr_workflow.merge")
+readiness = importlib.import_module("github_pr_workflow.readiness")
+flow = importlib.import_module("github_pr_workflow.dependency_finalization")
 
 
 class DependencyFinalizationTests(unittest.TestCase):
@@ -33,7 +37,7 @@ class DependencyFinalizationTests(unittest.TestCase):
             with self.subTest(requested=requested), contextlib.redirect_stderr(None), self.assertRaises(SystemExit):
                 dependency_queue.build_parser().parse_args([
                     "finalize", "--merge-method", requested, "--snapshot-helper", "snapshot.py",
-                    "--sync-helper", "sync.py", "--preflight", "preflight.json", "--snapshot", "snapshot.json",
+                    "--sync-helper", "sync.py", "--review", "review.json", "--snapshot", "snapshot.json",
                     "--sync-output", "sync.json", "--output", "output.json",
                 ])
 
@@ -48,7 +52,7 @@ class DependencyFinalizationTests(unittest.TestCase):
 
     def finalize_case(
         self, approved: list[tuple[str, int]], *, failed: set[int] | None = None,
-        moved: set[int] | None = None, preflight_blockers: list[dict[str, Any]] | None = None,
+        moved: set[int] | None = None, review_blockers: list[dict[str, Any]] | None = None,
         publication_failure: str | None = None, rebase_timeout: bool = False,
         review_failed: set[int] | None = None,
     ) -> tuple[dict[str, Any], list[tuple[str, list[int]]]]:
@@ -74,13 +78,13 @@ class DependencyFinalizationTests(unittest.TestCase):
                     "repo": repo, "checkout": {"status": "found", "path": str(root)},
                     "pull_requests": prs,
                 })
-            preflight = root / "preflight.json"
+            review_path = root / "review.json"
             snapshot = root / "snapshot.json"
             output = root / "finalize.json"
-            preflight.write_text(json.dumps({
-                "outcome": {"blocked": bool(preflight_blockers)},
+            review_path.write_text(json.dumps({
+                "outcome": {"blocked": bool(review_blockers)},
                 "summary": {"org": "owner"}, "repositories": repositories,
-                "blockers": preflight_blockers or [],
+                "blockers": review_blockers or [],
             }), encoding="utf-8")
             final_snapshot = {
                 "outcome": {"blocked": False, "queue_present": False},
@@ -92,7 +96,7 @@ class DependencyFinalizationTests(unittest.TestCase):
                 org=None, admin=False, merge_method="auto", wait_seconds=0, interval_seconds=1,
                 task_name="review", include_unpublished_release=[], workspace_root=root,
                 snapshot_helper=root / "snapshot.py", sync_helper=root / "sync.py",
-                preflight=preflight, snapshot=snapshot, sync_output=root / "sync.json", output=output,
+                review=review_path, snapshot=snapshot, sync_output=root / "sync.json", output=output,
             )
             calls = []
 
@@ -144,15 +148,15 @@ class DependencyFinalizationTests(unittest.TestCase):
         self.assertEqual(payload["summary"]["merged"], 1)
         self.assertEqual(payload["blockers"][0]["pr"], 1)
 
-    def test_changed_approved_head_requires_new_preflight(self):
+    def test_changed_approved_head_requires_new_review(self):
         payload, calls = self.finalize_case([("owner/one", 1), ("owner/one", 2)], moved={1})
         self.assertEqual(calls, [("owner/one", [2])])
-        self.assertEqual(payload["blockers"][0]["check"], "preflight_head")
+        self.assertEqual(payload["blockers"][0]["check"], "review_head")
 
-    def test_scoped_preflight_failure_preserves_independent_work(self):
+    def test_scoped_review_failure_preserves_independent_work(self):
         payload, calls = self.finalize_case(
             [("owner/one", 1), ("owner/one", 2), ("owner/two", 3)],
-            preflight_blockers=[{
+            review_blockers=[{
                 "scope": "pull_request", "repo": "owner/one", "pr": 1,
                 "check": "dependency_tree", "message": "unavailable",
             }],
@@ -189,12 +193,12 @@ class DependencyFinalizationTests(unittest.TestCase):
         for _ in range(2):
             entered = threading.Barrier(2, timeout=5)
 
-            def review(repo, number, checkout, expected_head, **kwargs):
+            def review(repo, number, checkout, expected_head, *, barrier=entered, **kwargs):
                 self.assertEqual((repo, checkout, expected_head),
                                  ("owner/repo", ROOT, str(number) * 40))
                 self.assertEqual(kwargs, {"admin": False, "wait_seconds": 600, "interval_seconds": 15})
                 # A serial caller cannot reach the second source before timeout.
-                entered.wait()
+                barrier.wait()
                 return {"head_oid": expected_head}
 
             with mock.patch.object(flow, "review_dependency_source", side_effect=review):
@@ -362,7 +366,7 @@ class DependencyPublicationTests(unittest.TestCase):
                     or (action == "branch" and not arguments[2].startswith("-"))
                     or arguments[1:3] == ["worktree", "add"]
                 )
-                operation = lambda: original(arguments, cwd=cwd, **kwargs)
+                operation = partial(original, arguments, cwd=cwd, **kwargs)
                 return effect(" ".join(arguments[:3]), operation) if mutation else operation()
 
             def publish(arguments, cwd):

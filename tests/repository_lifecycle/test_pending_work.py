@@ -246,18 +246,12 @@ def test_pending_work_scope_is_selected_generic_and_finalized_late(
         "--target-branch",
         "release/local",
     )
-    assert missing_retained.returncode == 2, missing_retained.stderr
+    assert missing_retained.returncode == 0, missing_retained.stderr
     missing_payload = json.loads(missing_retained.stdout)
-    assert missing_payload["findings"] == [
-        {
-            "kind": "missing_branch",
-            "subject": "missing",
-            "detail": "selected source branch is missing",
-        }
-    ]
+    assert missing_payload["status"] == "ready" and not missing_payload.get("findings")
     assert [source["branch"] for source in json.loads(
         scope_path.read_text(encoding="utf-8")
-    )["sources"]] == ["missing", "selected"]
+    )["sources"]] == ["selected"]
     scope_value["sources"] = [scope_value["sources"][1]]
     scope_path.write_text(
         json.dumps(scope_value), encoding="utf-8", newline="\n"
@@ -534,15 +528,52 @@ def test_pending_work_scope_is_selected_generic_and_finalized_late(
         descendant_target,
     )
 
-    assert prepared.returncode == 2, prepared.stderr
-    assert json.loads(prepared.stdout)["findings"] == [
-        {
-            "kind": "recorded_source_not_in_target",
-            "subject": "already-gone",
-            "detail": "recorded source commit is not in target commit",
-        }
-    ]
-    assert scope_path.is_file()
+    assert prepared.returncode == 0, prepared.stderr
+    assert json.loads(prepared.stdout)["status"] == "ready"
+    assert not scope_path.exists()
+
+    # An absent branch retires only its saved name, regardless of its state or
+    # the availability of its old commit. This does not authorize file cleanup.
+    from unittest.mock import Mock, patch
+    manager = runpy.run_path(str(MANAGE_PENDING_WORK))
+    remove_missing = manager["_remove_missing_source_records"]
+    for state in ("retained", "preserved", "deleting"):
+        record = {"version": 2, "target_branch": "release/local", "target_commit": "f" * 40,
+                  "sources": [{"branch": "already-gone", "commit": "f" * 40, "state": state},
+                              {"branch": "also-gone", "commit": "e" * 40, "state": state}]}
+        scope_path.write_text(json.dumps(record), encoding="utf-8")
+        for _ in range(2):
+            checked = manager["check_pending_work_before_ship"](repo, target_branch="release/local")
+            assert checked["status"] == "ready" and not checked["pending_work_scope"]
+            assert not scope_path.exists()
+        assert unrelated_temp.exists()
+        live = {"branch": "unrelated", "commit": run_git(repo, "rev-parse", "unrelated").stdout.strip(), "state": state}
+        assert isinstance(record["sources"], list)
+        record["sources"].append(live)
+        scope_path.write_text(json.dumps(record), encoding="utf-8")
+        original = scope_path.read_bytes()
+        with patch.object(manager["preserve_check_references"], "write_scope", Mock(side_effect=OSError("interrupted write"))):
+            with pytest.raises(OSError, match="interrupted write"):
+                remove_missing(repo, scope_path, record)
+        assert scope_path.read_bytes() == original
+        # Failure to look up even one remaining ref must preserve the document.
+        command = subprocess.CompletedProcess(["git", "show-ref"], 128, "", "fatal: unreadable refs")
+        with patch.dict(manager["_branch_exists"].__globals__, {"run_command": Mock(return_value=command)}):
+            with pytest.raises(manager["CommandError"]) as failure:
+                remove_missing(repo, scope_path, record)
+            assert failure.value.completed is command
+        assert scope_path.read_bytes() == original
+        with pytest.raises(KeyboardInterrupt):
+            remove_missing(repo, scope_path, record)
+            raise KeyboardInterrupt
+        saved = json.loads(scope_path.read_text())
+        assert saved["sources"] == [live]
+        assert remove_missing(repo, scope_path, saved) == saved
+        assert unrelated_temp.exists()
+    scope_path.unlink()
+    missing_request = run_pending_work(repo, "record", "--target-branch", "release/local",
+                                       "--target-commit", descendant_target, "--source-branch", "typo-branch")
+    assert missing_request.returncode != 0 and not scope_path.exists()
 
     assert run_git(repo, "branch", "legacy-clean", descendant_target).returncode == 0
     assert run_git(repo, "branch", "legacy-dirty", descendant_target).returncode == 0
@@ -916,9 +947,9 @@ def test_pending_work_finalization_persists_partial_cleanup_progress(
         loaded = runpy.run_path(str(MANAGE_PENDING_WORK))
     finally:
         sys.path.remove(lifecycle_scripts)
-    finalize_scope = loaded["finalize_scope"]
+    remove_completed_task_work = loaded["remove_completed_task_work"]
     worktree_cleanup = loaded["_remove_selected_worktree"].__globals__
-    original_require_success = finalize_scope.__globals__["require_success"]
+    original_require_success = remove_completed_task_work.__globals__["require_success"]
     original_run_command = worktree_cleanup["run_command"]
     original_residual_cleanup = worktree_cleanup["_finish_recorded_residual_cleanup"]
     pending_error = loaded["PendingWorkError"]
@@ -956,7 +987,7 @@ def test_pending_work_finalization_persists_partial_cleanup_progress(
         interrupt_residual_cleanup
     )
     with pytest.raises(pending_error, match="residual cleanup interruption"):
-        finalize_scope(
+        remove_completed_task_work(
             repo,
             scope_path,
             target_branch="release/local",
@@ -1089,9 +1120,9 @@ def test_pending_work_finalization_persists_partial_cleanup_progress(
     worktree_cleanup["_run_recorded_residual_cleanup"] = (
         ownership_cleanup
     )
-    finalize_scope.__globals__["require_success"] = fail_second_branch
+    remove_completed_task_work.__globals__["require_success"] = fail_second_branch
     with pytest.raises(pending_error, match="second-branch cleanup failure"):
-        finalize_scope(
+        remove_completed_task_work(
             repo,
             scope_path,
             target_branch="release/local",
@@ -1115,9 +1146,9 @@ def test_pending_work_finalization_persists_partial_cleanup_progress(
     assert run_git(repo, "show-ref", "--verify", "refs/heads/selected-a").returncode != 0
     assert run_git(repo, "show-ref", "--verify", "refs/heads/selected-b").returncode == 0
     monkeypatch.setattr(shutil, "rmtree", original_rmtree)
-    finalize_scope.__globals__["require_success"] = original_require_success
+    remove_completed_task_work.__globals__["require_success"] = original_require_success
 
-    resumed = finalize_scope(
+    resumed = remove_completed_task_work(
         repo,
         scope_path,
         target_branch="release/local",
@@ -1148,7 +1179,7 @@ def test_pending_work_finalization_persists_partial_cleanup_progress(
     crash_scope = pathlib.Path(
         json.loads(crash_recorded.stdout)["pending_work_scope"]
     )
-    original_remove_source = finalize_scope.__globals__["_remove_source_record"]
+    original_remove_source = remove_completed_task_work.__globals__["_remove_source_record"]
 
     def interrupt_after_branch_deletion(
         path: pathlib.Path,
@@ -1158,11 +1189,11 @@ def test_pending_work_finalization_persists_partial_cleanup_progress(
         assert branch == "crash-delete"
         raise pending_error("simulated interruption after branch deletion")
 
-    finalize_scope.__globals__["_remove_source_record"] = (
+    remove_completed_task_work.__globals__["_remove_source_record"] = (
         interrupt_after_branch_deletion
     )
     with pytest.raises(pending_error, match="after branch deletion"):
-        finalize_scope(
+        remove_completed_task_work(
             repo,
             crash_scope,
             target_branch="release/local",
@@ -1183,8 +1214,8 @@ def test_pending_work_finalization_persists_partial_cleanup_progress(
     ]
     crash_temporary = crash_scope.with_suffix(".tmp")
     crash_temporary.write_text("stale", encoding="utf-8", newline="\n")
-    finalize_scope.__globals__["_remove_source_record"] = original_remove_source
-    recovered = finalize_scope(
+    remove_completed_task_work.__globals__["_remove_source_record"] = original_remove_source
+    recovered = remove_completed_task_work(
         repo,
         crash_scope,
         target_branch="release/local",
@@ -1253,7 +1284,7 @@ def test_pending_work_finalization_persists_partial_cleanup_progress(
         original_rmtree(path, *args, **kwargs)
 
     monkeypatch.setattr(shutil, "rmtree", sharing_locked_rmtree)
-    original_finalize_require = finalize_scope.__globals__["require_success"]
+    original_finalize_require = remove_completed_task_work.__globals__["require_success"]
     branch_delete_attempts = 0
 
     def fail_first_sharing_branch_delete(
@@ -1268,9 +1299,9 @@ def test_pending_work_finalization_persists_partial_cleanup_progress(
                 raise pending_error("simulated sharing branch deletion failure")
         return original_finalize_require(command, cwd=cwd)
 
-    finalize_scope.__globals__["require_success"] = fail_first_sharing_branch_delete
+    remove_completed_task_work.__globals__["require_success"] = fail_first_sharing_branch_delete
     with pytest.raises(pending_error, match="sharing branch deletion failure"):
-        finalize_scope(
+        remove_completed_task_work(
             repo,
             sharing_scope,
             target_branch="release/local",
@@ -1287,8 +1318,8 @@ def test_pending_work_finalization_persists_partial_cleanup_progress(
         "refs/heads/sharing-locked",
     ).returncode == 0
 
-    finalize_scope.__globals__["require_success"] = original_finalize_require
-    sharing_finalized = finalize_scope(
+    remove_completed_task_work.__globals__["require_success"] = original_finalize_require
+    sharing_finalized = remove_completed_task_work(
         repo,
         sharing_scope,
         target_branch="release/local",

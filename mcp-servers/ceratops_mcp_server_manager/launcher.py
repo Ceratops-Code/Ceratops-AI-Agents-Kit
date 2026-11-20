@@ -98,7 +98,33 @@ def selected_environment(root):
     identity = root.name
     if not re.fullmatch(r"[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*", identity):
         raise ValueError("invalid MCP server identity")
-    selected = json.loads(checked_path(root, root / "current.json").read_text())
+    selection_path = checked_path(root, root / "current.json")
+    if sys.platform == "win32":
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+
+        # The watcher must not prevent an installer from replacing current.json.
+        # Keep this read bound to its opened file, allowing atomic replacement;
+        # the next observation will then open the newly selected installation.
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                      ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        kernel.CreateFileW.restype = wintypes.HANDLE
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel.CloseHandle.restype = wintypes.BOOL
+        handle = kernel.CreateFileW(str(selection_path), 0x80000000, 0x7, None, 3, 0x80, None)
+        if handle == ctypes.c_void_p(-1).value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            descriptor = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
+        except BaseException:
+            kernel.CloseHandle(handle)
+            raise
+        with os.fdopen(descriptor, "rb") as stream:
+            selected = json.load(stream)
+    else:
+        selected = json.loads(selection_path.read_text())
     if set(selected) != {"schema", "mcp_server_id", "version", "manifest_sha256", "instance", "module"} or selected["schema"] != 1 or selected["mcp_server_id"] != identity:
         raise ValueError("invalid MCP server selection")
     if not isinstance(selected["instance"], str) or not re.fullmatch("[0-9a-f]{32}", selected["instance"]):

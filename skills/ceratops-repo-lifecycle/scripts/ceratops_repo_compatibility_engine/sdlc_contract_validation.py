@@ -34,7 +34,7 @@ OPERATION_RE = re.compile(
     rf"(?:\.check-groups\.(?P<group>{NAME}))?$"
 )
 ACTIONS_BY_KIND = {
-    "packages": CHECK_ACTIONS | {"build", "publish", "verify-publish"},
+    "packages": CHECK_ACTIONS | {"build", "install", "publish", "verify-publish"},
     "apps": CHECK_ACTIONS | {"build", "install", "publish", "verify-publish"},
     "mcp-servers": CHECK_ACTIONS | {"build", "install", "publish", "verify-publish"},
     "skills": CHECK_ACTIONS | {"build", "install"},
@@ -275,16 +275,30 @@ def operation_package_names(requirements: Mapping[str, Any]) -> list[str]:
                               if ref.startswith("deliverables.packages.")))
 
 
-def deliverable_source_files(repo_root: pathlib.Path, record: Mapping[str, Any], *, include_deleted=False) -> list[str]:
-    """List current sources, optionally retaining deleted paths for source commits.
+def deliverable_source_files(repo_root: pathlib.Path, record: Mapping[str, Any], *, include_deleted=False,
+                             commit: str | None = None) -> list[str]:
+    """Expand a deliverable's source scope in the checkout or at an exact commit.
 
     A staged deletion is absent from the index, so commit preparation also needs
-    deletions relative to HEAD. Blob inventories retain only existing files.
+    deletions relative to HEAD. Historical paths come from Git, independently of
+    the current checkout. A receipt supplies its SDLC path and deliverable name
+    instead of copying the source list. Expanded names stay in memory.
     """
+    if "sdlcPath" in record:
+        if commit is None:
+            raise SdlcContractError("Recorded build sources require their exact Git commit.")
+        contract = load_contract(repo_root / record["sdlcPath"], repo_root=repo_root, commit=commit)
+        try:
+            record = _deliverable_records(contract)[record["deliverable"]]
+        except KeyError as exc:
+            raise SdlcContractError("Recorded source declaration is absent from its SDLC commit.") from exc
     root = pathlib.PurePosixPath(record["root-dir"])
-    patterns = record.get("additional-source-files", [])
-    commands = [["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"]]
-    if include_deleted:
+    version = record.get("version", {})
+    patterns = [*record.get("additional-source-files", []),
+                *([version["file"]] if "file" in version else version.get("files", []))]
+    commands = ([["git", "ls-tree", "-r", "--name-only", "-z", commit, "--"]] if commit else
+                [["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"]])
+    if include_deleted and commit is None:
         commands.append(["git", "diff", "--name-only", "--diff-filter=D", "--no-renames", "-z", "HEAD", "--"])
     names = set()
     for command in commands:
@@ -297,13 +311,15 @@ def deliverable_source_files(repo_root: pathlib.Path, record: Mapping[str, Any],
         names.update(result.stdout.decode("utf-8").split("\0"))
     resolved_root = repo_root.resolve()
     return sorted({
-        name for name in names if name and (
+        name for name in names if name and not name.startswith(
+            (".ceratops/build/", ".ceratops/results/")) and (
             pathlib.PurePosixPath(name).is_relative_to(root)
             or any(fnmatch.fnmatchcase(name, pattern) or
                    (pattern.startswith("**/") and fnmatch.fnmatchcase(name, pattern[3:]))
                    for pattern in patterns)
-        ) and ((repo_root / name).is_file() or include_deleted and not (repo_root / name).exists())
-        and (repo_root / name).resolve().is_relative_to(resolved_root)
+        ) and (commit is not None or (
+            ((repo_root / name).is_file() or include_deleted and not (repo_root / name).exists())
+            and (repo_root / name).resolve().is_relative_to(resolved_root)))
     })
 
 
@@ -364,11 +380,35 @@ def _find_sdlc_declaration_errors(
             )
     deliverables = value.get("deliverables", {})
     records = _deliverable_records(value)
+    version_owners = {**records, **{
+        "repository.release-bundles." + name: record
+        for name, record in repository.get("release-bundles", {}).items()
+    }}
+    for reference, record in version_owners.items():
+        version = record.get("version", {})
+        version_files = [version["file"]] if "file" in version else version.get("files", [])
+        for version_file in version_files:
+            if not _relative_path(version_file):
+                errors.append(f"{reference}.version must name repository-relative files")
+            elif repo_root is not None:
+                path = (repo_root / version_file).resolve()
+                if not path.is_relative_to(repo_root.resolve()) or not path.is_file():
+                    errors.append(f"{reference}.version file must exist inside the repository: {version_file}")
+                else:
+                    tracked = subprocess.run(
+                        ["git", "--literal-pathspecs", "ls-files", "--error-unmatch", "--", version_file],
+                        cwd=repo_root, capture_output=True, check=False,
+                    )
+                    if tracked.returncode:
+                        errors.append(f"{reference}.version file must be Git-tracked: {version_file}")
+
     for location, action in operation_entries(value).items():
         match = OPERATION_RE.fullmatch(location)
         assert match is not None
         action_name = match.group("repository") or match.group("action")
         owner = location.split(".actions.", 1)[0]
+        if "temporary_root" in action.get("parameters", []):
+            errors.append(f"{location}.parameters cannot declare temporary_root; SDLC supplies the task temp directory")
         for tool in action["requires"][key]:
             if tool not in tools:
                 errors.append(f"unknown {tool_label} {tool} at {location}.requires.{key}")
@@ -384,6 +424,16 @@ def _find_sdlc_declaration_errors(
         handoff_positions = [position for position, step in enumerate(steps, 1) if "handoff" in step]
         if handoff_positions and handoff_positions != [len(steps)]:
             errors.append(f"handoff must be the single final step at {location}")
+        if action.get("install-inputs") is not None:
+            if action_name != "install" or owner not in records:
+                errors.append(f"{location}.install-inputs is supported only on a deliverable Install action")
+            if (not steps or handoff_positions or action.get("result-schema") != "ceratops-deployment-result.v1"):
+                errors.append(f"{location}.install-inputs requires commands returning ceratops-deployment-result.v1")
+            declared = set(action.get("parameters", []))
+            if not {"target", "destination"}.issubset(declared):
+                errors.append(f"{location}.install-inputs requires target and destination parameters")
+            if declared & {"version", "tag", "artifact_receipt", "package_file", "installer_dependencies", "install_input_file"}:
+                errors.append(f"{location}.install-inputs supplies receipt/package fields and optional version/tag selectors itself")
         groups = action.get("checks", {})
         if groups and action_name != "build":
             errors.append(f"{location}.checks is supported only inside a build")
@@ -637,13 +687,30 @@ def read_contract(
     *,
     schema_path: pathlib.Path | None = None,
     repo_root: pathlib.Path | None = None,
+    commit: str | None = None,
 ) -> tuple[dict[str, Any] | None, list[str]]:
-    """Validate one YAML contract, retaining its version and data without writes."""
+    """Read current SDLC requirements or an accepted build's original declaration.
+
+    Historical declarations describe already accepted work. Read their data at
+    the recorded commit without applying today's schema or checkout requirements.
+    They are never used to execute an operation.
+    """
 
     try:
-        value = yaml.load(path.read_text(encoding="utf-8"), Loader=_ContractLoader)
-    except (OSError, UnicodeError, yaml.YAMLError) as exc:
+        if commit is None:
+            raw = path.read_text(encoding="utf-8")
+        else:
+            from sdlc_results import _build_blob
+
+            if repo_root is None:
+                raise ValueError("Historical SDLC reads require their repository.")
+            relative = path.absolute().relative_to(repo_root.absolute()).as_posix()
+            raw = _build_blob(repo_root, commit, relative, 1024 * 1024).decode("utf-8")
+        value = yaml.load(raw, Loader=_ContractLoader)
+    except (OSError, ValueError, UnicodeError, yaml.YAMLError) as exc:
         return None, [f"invalid YAML: {exc}"]
+    if commit is not None:
+        return (dict(value), []) if isinstance(value, Mapping) else (None, ["SDLC contract must be a mapping"])
     try:
         errors = validation_errors(value, schema_path=schema_path, repo_root=repo_root)
     except SdlcContractError as exc:
@@ -660,10 +727,11 @@ def load_contract(
     *,
     schema_path: pathlib.Path | None = None,
     repo_root: pathlib.Path | None = None,
+    commit: str | None = None,
 ) -> Mapping[str, Any]:
     """Load one valid contract or raise one compact deterministic error."""
 
-    value, errors = read_contract(path, schema_path=schema_path, repo_root=repo_root)
+    value, errors = read_contract(path, schema_path=schema_path, repo_root=repo_root, commit=commit)
     if errors or value is None:
         raise SdlcContractError(
             ("; ".join(errors[:8]) or "invalid SDLC contract")[:4096]

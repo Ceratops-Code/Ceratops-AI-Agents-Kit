@@ -4,6 +4,15 @@ kind: ceratops-sdlc
 # Ceratops records native source checks and reuses applicable passes.
 # Test runners can supply case-level evidence through their result contract.
 # Keep source scans and tests in separate check-groups; each group owns its command.
+# Package-based Install actions use install-inputs: accepted-build, declare
+# target/destination parameters, and return ceratops-deployment-result.v1 with
+# version/destination. Commands receive {artifact_receipt}, {package_file},
+# {installer_dependencies} (JSON array), or {install_input_file} (all values).
+# Versioned deliverables and release bundles declare the same version source:
+# version: {file: path/to/pyproject.toml, field: project.version}
+# or version: {file: path/to/package.json, field: version}
+# or version: {read: [tool, read], write: [tool, write, "{version}"], files: [owned-file]}
+# Without a native version file, use version: {mode: receipt-only}.
 repository:
   tools:
     # Point version-from.file at this target's native version metadata; use key
@@ -21,6 +30,9 @@ repository:
         # validation contract when the repository owns a package lockfile.
     pre-build-checks:
       check-groups:
+        # Compatibility adds one source group for each applicable catalog check:
+        # Ruff, mypy, Actionlint, shellcheck, YAML lint, or package scripts.
+        # Each runs directly and records its own result and input paths.
         tests:
           requires:
             tools: []

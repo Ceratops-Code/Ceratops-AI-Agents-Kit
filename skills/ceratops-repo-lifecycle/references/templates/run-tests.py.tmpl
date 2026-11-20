@@ -23,6 +23,7 @@ import os
 import pathlib
 import platform
 import re
+import runpy
 import secrets
 import shlex
 import shutil
@@ -40,8 +41,15 @@ DEFAULT_TARGETS: list[str] = __TEST_TARGETS__
 
 def test_support():
     """Load delivered test support only when executing tests, never for result readers."""
-    sys.path.insert(0, str(ROOT / "scripts/testing"))
-    return importlib.import_module("reuse_test_results")
+    previous = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        location = str(ROOT / "scripts/testing")
+        if location not in sys.path:
+            sys.path.insert(0, location)
+        return importlib.import_module("reuse_test_results")
+    finally:
+        sys.dont_write_bytecode = previous
 def without_basetemp(arguments: list[str]) -> list[str]:
     """Remove inherited locations before pytest validates every occurrence."""
     options = iter(arguments)
@@ -125,10 +133,10 @@ CURRENT_RESULTS_SCHEMA = "ceratops-current-check-results.v1"
 class CurrentCheckResults:
     """Keep one latest outcome per check/target in this worktree's single file.
 
-    The calling thread serializes commands in its worktree; there is no worktree
-    lock. A fixed in-process file protects previously saved outcomes while the
-    next complete JSON document is flushed and replaced. Inputs are deduplicated
-    inside this document, never in additional manifest or history files.
+    The owning command serializes writes within its worktree. Each durable JSON
+    line changes only named entries; a null entry explicitly deletes that key.
+    Command boundaries compact current entries through an atomic replacement.
+    Read-only instances never clean temporary files or repair incomplete writes.
     """
 
     def __init__(self, root: pathlib.Path) -> None:
@@ -149,10 +157,9 @@ class CurrentCheckResults:
         self.path = result_path(self.common / "ceratops/results/repository-checks" / identity / "check_results.json")
         self.worktree = {"id": identity, "path": str(self.root)}
         self.pending = result_path(self.path.with_name(".check_results.in_process.json"))
-        # A partial replacement is never acceptance. The last complete file
-        # remains authoritative until os.replace succeeds.
-        self.pending.unlink(missing_ok=True)
-        self._stamp: tuple[int, int, int] | None = None
+        self._stamp: tuple[int, int, int, int] | None = None
+        self._offset = 0
+        self._incomplete_tail = False
         self.value: dict[str, Any] = {}
         self._refresh()
 
@@ -161,29 +168,52 @@ class CurrentCheckResults:
             info = self.path.stat()
         except FileNotFoundError:
             self._stamp = None
+            self._offset = 0
+            self._incomplete_tail = False
             self.value = {"schema": CURRENT_RESULTS_SCHEMA, "worktree": self.worktree,
                           "inputGroups": {}, "entries": {}}
             return
-        stamp = (info.st_mtime_ns, info.st_size, info.st_ino)
+        stamp = (info.st_mtime_ns, info.st_size, info.st_ino, info.st_ctime_ns)
         if stamp == self._stamp:
             return
         if info.st_size > 64 * 1024 * 1024:
             raise ValueError(f"Current check results exceed 64 MiB: {self.path}")
-        value = read_result(self.path)[1]
-        if (not isinstance(value, dict) or set(value) != {"schema", "worktree", "inputGroups", "entries"}
-                or value["schema"] != CURRENT_RESULTS_SCHEMA or value["worktree"] != self.worktree
-                or not isinstance(value["inputGroups"], dict) or not isinstance(value["entries"], dict)):
-            raise ValueError(f"Current check results are incomplete or belong to another worktree: {self.path}")
-        for key, inputs in value["inputGroups"].items():
-            if not isinstance(inputs, dict) or key != hashlib.sha256(canonical(inputs)).hexdigest():
-                raise ValueError(f"Saved check inputs changed: {self.path}")
-        for key, entry in value["entries"].items():
-            if (not isinstance(entry, dict) or set(entry) != {"kind", "check_id", "target", "record"}
-                    or key != self._key(entry["kind"], entry["check_id"], entry["target"])
-                    or not isinstance(entry["record"], dict)):
-                raise ValueError(f"Saved check entry is incomplete: {self.path}")
-            self._expand(entry["record"], value["inputGroups"])
-        self.value, self._stamp = value, stamp
+        # A compacted replacement can be larger and reuse a previous inode.
+        # Only this instance's own writes can advance its cached snapshot.
+        self._offset = 0
+        self.value = {"schema": CURRENT_RESULTS_SCHEMA, "worktree": self.worktree,
+                      "inputGroups": {}, "entries": {}}
+        self._incomplete_tail = False
+        with self.path.open("rb") as stream:
+            for raw in stream:
+                if not raw.endswith(b"\n"):
+                    # Only the command owner may discard a torn trailing append.
+                    self._incomplete_tail = True
+                    break
+                try:
+                    value = json.loads(raw, object_pairs_hook=_object, parse_constant=_nonfinite)
+                except (ValueError, UnicodeError, RecursionError) as exc:
+                    raise ValueError(f"Malformed complete check-results record at byte {self._offset}: {self.path}") from exc
+                if (not isinstance(value, dict) or set(value) != {"schema", "worktree", "inputGroups", "entries"}
+                        or value["schema"] != CURRENT_RESULTS_SCHEMA or value["worktree"] != self.worktree
+                        or not isinstance(value["inputGroups"], dict) or not isinstance(value["entries"], dict)):
+                    raise ValueError(f"Current check results are incomplete or belong to another worktree: {self.path}")
+                for key, inputs in value["inputGroups"].items():
+                    if not isinstance(inputs, dict) or key != hashlib.sha256(canonical(inputs)).hexdigest():
+                        raise ValueError(f"Saved check inputs changed: {self.path}")
+                self.value["inputGroups"].update(value["inputGroups"])
+                for key, entry in value["entries"].items():
+                    if entry is None:
+                        self.value["entries"].pop(key, None)
+                        continue
+                    if (not isinstance(entry, dict) or set(entry) != {"kind", "check_id", "target", "record"}
+                            or key != self._key(entry["kind"], entry["check_id"], entry["target"])
+                            or not isinstance(entry["record"], dict)):
+                        raise ValueError(f"Saved check entry is incomplete: {self.path}")
+                    self._expand(entry["record"], self.value["inputGroups"])
+                    self.value["entries"][key] = entry
+                self._offset += len(raw)
+        self._stamp = stamp
 
     @staticmethod
     def _key(kind: str, check_id: str, target: Mapping[str, Any]) -> str:
@@ -194,21 +224,29 @@ class CurrentCheckResults:
     @staticmethod
     def _expand(record: Mapping[str, Any], groups: Mapping[str, Any]) -> dict[str, Any]:
         expanded = copy.deepcopy(dict(record))
-        for field, name in (("inputGroup", "inputs"), ("checkGroup", "check_inputs")):
+        for field, name in (("inputGroup", "inputs"), ("comparisonGroup", "comparison_inputs"),
+                            ("invocationGroup", "invocation"), ("checkGroup", "check_inputs")):
             if field not in expanded:
                 continue
             key = expanded.pop(field)
             if key not in groups:
                 raise ValueError("Current result names missing saved inputs.")
-            if name == "inputs":
-                expanded[name] = copy.deepcopy(groups[key])
-            else:
+            if name == "check_inputs":
                 expanded["inputs"][name] = copy.deepcopy(groups[key])
+            else:
+                expanded[name] = copy.deepcopy(groups[key])
+        for field, name in (("inputParts", "inputs"), ("comparisonParts", "comparison_inputs")):
+            for part, key in expanded.pop(field, {}).items():
+                if key not in groups:
+                    raise ValueError("Current result names missing saved inputs.")
+                expanded[name][part] = copy.deepcopy(groups[key])
         return expanded
 
     def records(self, kind: str, *, target: Mapping[str, Any] | None = None) -> list[dict[str, Any]]:
         """Read only current outcomes, preserving each original result identity."""
         self._refresh()
+        if self._incomplete_tail:
+            raise ValueError(f"Unfinished trailing check-results record; the next owning command must repair it: {self.path}")
         return [self._expand(entry["record"], self.value["inputGroups"])
                 for entry in self.value["entries"].values()
                 if entry["kind"] == kind and (target is None or entry["target"] == target)]
@@ -218,38 +256,110 @@ class CurrentCheckResults:
         self.put_many([(kind, check_id, target, record)])
 
     def put_many(self, outcomes: list[tuple[str, str, dict[str, Any], Mapping[str, Any]]]) -> None:
-        """Save an explicit import together; ordinary tests still save individually."""
+        """Append one atomic record for these outcomes and their new shared facts."""
         self._refresh()
-        groups = dict(self.value["inputGroups"])
-        entries = dict(self.value["entries"])
+        groups: dict[str, Any] = {}
+        entries: dict[str, Any] = {}
         for kind, check_id, target, record in outcomes:
             encoded = copy.deepcopy(dict(record))
-            inputs = encoded.pop("inputs", None)
-            if inputs is not None:
+            for name, field, parts_field in (("inputs", "inputGroup", "inputParts"),
+                                             ("comparison_inputs", "comparisonGroup", "comparisonParts"),
+                                             ("invocation", "invocationGroup", None)):
+                inputs = encoded.pop(name, None)
+                if inputs is None:
+                    continue
                 inputs = dict(inputs)
-                checks = inputs.pop("check_inputs", None)
-                for field, facts in (("inputGroup", inputs), ("checkGroup", checks)):
-                    if facts is not None:
-                        key = hashlib.sha256(canonical(facts)).hexdigest()
-                        groups[key] = facts
-                        encoded[field] = key
+                parts = {}
+                if parts_field is not None:
+                    for part, facts in list(inputs.items()):
+                        if isinstance(facts, dict):
+                            key = hashlib.sha256(canonical(facts)).hexdigest()
+                            if key not in self.value["inputGroups"]:
+                                groups[key] = facts
+                            parts[part] = key
+                            del inputs[part]
+                    if parts:
+                        encoded[parts_field] = parts
+                key = hashlib.sha256(canonical(inputs)).hexdigest()
+                if key not in self.value["inputGroups"]:
+                    groups[key] = inputs
+                encoded[field] = key
             entries[self._key(kind, check_id, target)] = {
                 "kind": kind, "check_id": check_id, "target": dict(target), "record": encoded,
             }
-        self._save(entries, groups)
+        if entries:
+            self._append_results(entries, groups)
 
     def remove_deleted(self, kind: str, deleted_ids: set[str], target: dict[str, Any]) -> None:
         """Remove explicitly deleted checks, never merely unselected checks."""
         self._refresh()
-        entries = {key: entry for key, entry in self.value["entries"].items()
-                   if not (entry["kind"] == kind and entry["target"] == target
-                           and entry["check_id"] in deleted_ids)}
-        if entries != self.value["entries"]:
-            self._save(entries, self.value["inputGroups"])
+        entries = {key: None for key, entry in self.value["entries"].items()
+                   if entry["kind"] == kind and entry["target"] == target
+                   and entry["check_id"] in deleted_ids}
+        if entries:
+            self._append_results(entries, {})
 
-    def _save(self, entries: dict[str, Any], groups: Mapping[str, Any]) -> None:
+    def _append_results(self, entries: dict[str, Any], groups: Mapping[str, Any]) -> None:
+        """Flush a finished outcome before acknowledging it; never rewrite peers."""
+        if self._incomplete_tail:
+            raise ValueError(f"Unfinished trailing check-results record: {self.path}")
+        value: dict[str, Any] = {"schema": CURRENT_RESULTS_SCHEMA, "worktree": self.worktree,
+                 "entries": entries, "inputGroups": dict(groups)}
+        raw = canonical(value)
+        if self._offset + len(raw) > 64 * 1024 * 1024:
+            previous_groups = self.value["inputGroups"]
+            self.rewrite_current_results()
+            # Compaction may remove a previously unused group needed by this
+            # new entry. Keep that group's original contents in this append.
+            for entry in entries.values():
+                if entry is None:
+                    continue
+                record = entry["record"]
+                used = {record[name] for name in ("inputGroup", "checkGroup", "comparisonGroup", "invocationGroup")
+                        if name in record}
+                used.update(key for name in ("inputParts", "comparisonParts") for key in record.get(name, {}).values())
+                for key in used - self.value["inputGroups"].keys() - value["inputGroups"].keys():
+                    value["inputGroups"][key] = previous_groups[key]
+            raw = canonical(value)
+        if self._offset + len(raw) > 64 * 1024 * 1024:
+            raise ValueError(f"Current check results exceed 64 MiB: {self.path}")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.pending.unlink(missing_ok=True)
+        try:
+            with self.path.open("ab") as stream:
+                stream.write(raw)
+                stream.flush()
+                os.fsync(stream.fileno())
+        except BaseException:
+            self._stamp = None
+            raise
+        self.value["inputGroups"].update(value["inputGroups"])
+        for key, entry in entries.items():
+            if entry is None:
+                self.value["entries"].pop(key, None)
+            else:
+                self.value["entries"][key] = entry
+        self._offset += len(raw)
+        info = self.path.stat()
+        self._stamp = (info.st_mtime_ns, info.st_size, info.st_ino, info.st_ctime_ns)
+
+    def rewrite_current_results(self) -> None:
+        """At an owning command boundary, retain current outcomes and recover a torn tail.
+
+        Only incomplete bytes after the last newline may be discarded. Complete
+        malformed records always block this operation. The old file remains
+        authoritative until the compacted contents have been flushed and replaced.
+        """
+        self._refresh()
+        self.pending.unlink(missing_ok=True)
+        if not self.path.exists():
+            return
+        entries, groups = self.value["entries"], self.value["inputGroups"]
         used = {entry["record"][name] for entry in entries.values()
-                for name in ("inputGroup", "checkGroup") if name in entry["record"]}
+                for name in ("inputGroup", "checkGroup", "comparisonGroup", "invocationGroup")
+                if name in entry["record"]}
+        used.update(key for entry in entries.values() for name in ("inputParts", "comparisonParts")
+                    for key in entry["record"].get(name, {}).values())
         value = {"schema": CURRENT_RESULTS_SCHEMA, "worktree": self.worktree,
                  "entries": entries, "inputGroups": {key: groups[key] for key in sorted(used)}}
         raw = canonical(value)
@@ -266,15 +376,18 @@ class CurrentCheckResults:
             self.pending.unlink(missing_ok=True)
         info = self.path.stat()
         self.value = value
-        self._stamp = (info.st_mtime_ns, info.st_size, info.st_ino)
+        self._offset = len(raw)
+        self._incomplete_tail = False
+        self._stamp = (info.st_mtime_ns, info.st_size, info.st_ino, info.st_ctime_ns)
 
 
 def _execution_fields(value: Any, *, completed: bool) -> bool:
-    if not isinstance(value, dict) or set(value) != {
-        "startedAt", "finishedAt", "durationSeconds", "workerPid",
-    }:
+    fields = {"startedAt", "finishedAt", "durationSeconds"}
+    if not completed:
+        fields.add("workerPid")
+    if not isinstance(value, dict) or set(value) != fields:
         return False
-    if type(value["workerPid"]) is not int or value["workerPid"] <= 0:
+    if not completed and (type(value["workerPid"]) is not int or value["workerPid"] <= 0):
         return False
     try:
         start = datetime.datetime.fromisoformat(value["startedAt"])
@@ -391,33 +504,6 @@ def _check_inventory(root: pathlib.Path, patterns: list[str], files: list[str]) 
     return {name: _check_file_digest(root, name) for name in sorted(names)}
 
 
-def _check_environment_value(value: str | None, root: pathlib.Path) -> str | None:
-    """Keep owned checkout relocation out of declared environment identities."""
-    if value is None:
-        return None
-    resolved = str(root.resolve())
-    prefixes = sorted({resolved, resolved.replace("\\", "/"), resolved.replace("/", "\\")},
-                      key=len, reverse=True)
-    pattern = "(?:" + "|".join(re.escape(prefix) for prefix in prefixes) + r")(?=[\\/;:]|$)"
-    flags = re.IGNORECASE if os.name == "nt" else 0
-    return re.sub(pattern, lambda _match: "${REPO_ROOT}", value, flags=flags)
-
-
-def _check_environment_file(value: str | None, root: pathlib.Path) -> str | None:
-    """Bind the explicitly declared event-file pointer to its current bytes."""
-    if not value:
-        return None
-    path = pathlib.Path(value)
-    path = path if path.is_absolute() else root / path
-    if not path.exists():
-        return None
-    path = path.resolve(strict=True)
-    if not path.is_file():
-        raise ValueError("declared environment file must be a regular file")
-    with path.open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
-
-
 def check_current_inputs(context: Mapping[str, Any], root: pathlib.Path) -> None:
     """Reject edits, new/deleted owned files and execution-scope drift.
 
@@ -449,50 +535,16 @@ def check_current_inputs(context: Mapping[str, Any], root: pathlib.Path) -> None
     dependencies = {name: _check_file_digest(root, name) for name in rules.get("dependencies", [])}
     if dependencies != context["dependencies"] or any(value is None for value in dependencies.values()):
         raise ValueError("repository check dependencies changed before completion")
+    helper_path = pathlib.Path(__file__).resolve().parent / "testing/read_check_environment.py"
+    if pathlib.Path(__file__).suffix == ".tmpl":
+        helper_path = pathlib.Path(__file__).resolve().parents[1] / "scripts/testing/read_check_environment.py"
+    helper = runpy.run_path(str(helper_path))
     recorded = context["environment"]
-    variables = {
-        name: hashlib.sha256(canonical(_check_environment_value(os.environ.get(name), root))).hexdigest()
-        for name in rules.get("environment", [])
-    }
-    if (recorded.get("variables") != variables or recorded.get("platform") != platform.system()
-            or recorded.get("architecture") != platform.machine()):
+    current = helper["read_environment"](root, rules, runtime=bool(recorded.get("runtime")))
+    if helper["environment_inputs_for_reuse"](recorded, ignore_path=True, allow_unknown=True) != helper[
+        "environment_inputs_for_reuse"
+    ](current, ignore_path=True, allow_unknown=True):
         raise ValueError("repository check environment changed before completion")
-    if "files" in recorded:
-        environment_files = {
-            name: _check_environment_file(os.environ.get(name), root)
-            for name in rules.get("environment", []) if name == "GITHUB_EVENT_PATH"
-        }
-        if environment_files != recorded["files"]:
-            raise ValueError("repository check environment file changed before completion")
-    tools: dict[str, dict[str, str | None]] = {}
-    for name in rules.get("tools", []):
-        expanded = re.sub(r"\$\{([^}]+)\}", lambda match: os.environ.get(match[1], ""), name)
-        path: pathlib.Path | None
-        if "/" in expanded or "\\" in expanded:
-            path = pathlib.Path(expanded)
-            path = path if path.is_absolute() else root / path
-        else:
-            found = shutil.which(expanded)
-            path = pathlib.Path(found) if found else None
-        if path is not None and not path.exists():
-            path = None
-        if path is not None:
-            path = path.resolve(strict=True)
-        if path is not None and (path.is_symlink() or path.is_junction() or not path.is_file()):
-            raise ValueError("repository check tool must be a regular file")
-        tools[name] = {"sha256": hashlib.sha256(path.read_bytes()).hexdigest() if path is not None else None}
-    if recorded.get("tools") != tools:
-        raise ValueError("repository check tools changed before completion")
-    if recorded.get("runtime"):
-        runtime = {
-            "python": platform.python_version(), "implementation": platform.python_implementation(),
-            "packages": sorted(
-                [dist.metadata["Name"].lower(), dist.version]
-                for dist in importlib.metadata.distributions()
-            ),
-        }
-        if runtime != recorded["runtime"]:
-            raise ValueError("repository check locked runtime differs from the selected runtime")
 
 
 
@@ -600,7 +652,8 @@ def read_build_check_summary(root: pathlib.Path, tag: str, receipt_path: str) ->
     if not isinstance(key, str) or not re.fullmatch(rf"(?:{slug}|members/{slug}/{slug}|bundles/{slug})", key):
         raise ValueError("Receipt storage key has invalid path segments.")
     expected_tag = key + "/" + identity["version"]
-    parent = f'.build/{key}/{identity["version"]}'
+    directory = ".build" if receipt_path.startswith(".build/") else ".ceratops/build"
+    parent = f'{directory}/{key}/{identity["version"]}'
     expected_paths = {parent + "/build_receipt.json",
                       parent + "/" + identity["target"] + "/build_receipt.json"}
     if (receipt.get("schema") != "ceratops-build-result.v4" or receipt.get("status") != "passed"
@@ -627,7 +680,7 @@ def select_build_check_summaries(
     root: pathlib.Path, *, qualification_level: str = "alpha",
     unit: str | None = None, target: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Choose the newest eligible version in this checkout's .build records.
+    """Choose the newest eligible version in this checkout's .ceratops/build records.
 
     Git tags prove completion; the checkout supplies only selection identities.
     No ancestry walk, other checkout, deployment history or artifact-store scan.
@@ -639,10 +692,10 @@ def select_build_check_summaries(
     levels = ("alpha", "beta", "rc", "final")
     if qualification_level not in levels:
         raise ValueError("Unsupported build qualification level.")
-    history = root / ".build"
+    history = root / ".ceratops/build"
     if not history.is_dir():
         return []
-    candidates: list[tuple[Any, str, str, pathlib.Path, str]] = []
+    candidates: list[tuple[Any, str, str, pathlib.Path, str, str]] = []
     for pattern in ("*/*/build_receipt.json", "*/*/*/build_receipt.json",
                     "members/*/*/*/build_receipt.json", "members/*/*/*/*/build_receipt.json",
                     "bundles/*/*/build_receipt.json", "bundles/*/*/*/build_receipt.json"):
@@ -666,18 +719,18 @@ def select_build_check_summaries(
                 tag = name + "/" + version
                 if receipt.get("status") != "passed" or receipt.get("tag", tag) != tag:
                     continue
-                candidates.append((Version(version), name, destination, path, tag))
+                candidates.append((Version(version), name, destination, path, tag, receipt["receiptPath"]))
             except (ValueError, KeyError, TypeError, InvalidVersion):
                 continue  # Interrupted local preparation is not a completed build.
     chosen: dict[tuple[str, str], dict[str, Any]] = {}
-    for _version, name, destination, path, tag in sorted(candidates, key=lambda row: (row[0], str(row[3])), reverse=True):
+    for _version, name, destination, _path, tag, recorded_path in sorted(candidates, key=lambda row: (row[0], str(row[3])), reverse=True):
         if (name, destination) in chosen:
             continue
         # An absent tag is an unfinished preparation, not an accepted baseline.
         if not _build_git(root, "rev-parse", "--verify", "--quiet", "--end-of-options",
                           "refs/tags/" + tag, missing=True):
             continue
-        selected = read_build_check_summary(root, tag, path.relative_to(root).as_posix())
+        selected = read_build_check_summary(root, tag, recorded_path)
         identity = selected["receipt"]["identity"]
         if (identity.get("storageKey", identity.get("releaseBundle")), identity["target"]) != (name, destination):
             raise ValueError("Local build selector differs from the tagged identity.")
@@ -739,99 +792,183 @@ def run_recorded_check(
 
     The shared operation owner allocates identity, inputs, path and retention;
     this producer never invents acceptance from Git metadata or another runner.
-    Without result arguments the existing disposable invocation is preserved.
+    The command compacts its worktree file at startup and on exit. Individual
+    outcomes remain durable even when forced termination skips this finalizer.
     """
     supplied = [getattr(args, "result_file", None) is not None,
                 *(getattr(args, field, None) is not None for field in IDENTITY_FIELDS)]
-    if not any(supplied):
-        if getattr(args, "repair_unaccepted_result", False) or getattr(args, "probe_command", None):
-            print("repair-unaccepted-result and probe-command require result arguments", file=sys.stderr)
-            return 2
-        return callback()
     path: pathlib.Path | None = None
+    owner: CurrentCheckResults | None = None
+    code = 2
     try:
-        if not all(supplied):
-            raise ValueError("result-file, result-id, candidate-id, check-id and check-version must be supplied together")
-        if any(not getattr(args, field).strip() for field in IDENTITY_FIELDS):
-            raise ValueError("result identities must not be empty")
-        context = check_result_context(args.check_version)
-        expected = {
-            "schema": CHECK_RESULT_SCHEMA,
-            **{field: getattr(args, field) for field in IDENTITY_FIELDS},
-            "invocation": dict(invocation),
-        }
-        started = datetime.datetime.now(datetime.UTC)
-        monotonic_start = time.monotonic()
-        execution = {
-            "startedAt": started.isoformat(), "finishedAt": None,
-            "durationSeconds": None, "workerPid": os.getpid(),
-        } if context is not None else None
-        if context is not None:
-            expected["inputs"] = context
-        root = (repo_root or pathlib.Path.cwd()).resolve()
-        if context is not None:
-            check_current_inputs(context, root)
-        path = result_path(args.result_file)
-        prepare: dict[str, Any] = {"repair_unaccepted": getattr(args, "repair_unaccepted_result", False)}
-        if execution is not None:
-            prepare["execution"] = execution
-        current = CurrentCheckResults(root) if context is not None else None
-        if current is not None and path != current.path:
-            current = None  # Explicit caller-selected output keeps the public probe contract.
-        target = {key: value for key, value in context["scope"].items()
-                  if key not in {"worktree", "inputRules", "artifacts"}} if current is not None and context is not None else {}
-        saved = next((item for item in current.records("repository-check", target=target)
-                      if item["result_id"] == args.result_id), None) if current is not None else None
-        if saved is not None:
-            if (not all(saved.get(key) == value for key, value in expected.items())
-                    or saved.get("status") != "passed" or saved.get("exit_code") != 0):
-                raise ValueError("Saved result ID does not identify this successful check.")
-            print("OK")
-            return 0
-        if current is None and prepare_result(path, expected, **prepare):
-            print("OK")
-            return 0
-        running = {**expected, "status": "running", "exit_code": None}
-        if execution is not None:
-            running["execution"] = execution
-        failure: BaseException | None = None
         try:
-            if context is not None:
-                check_current_inputs(context, root)
-            code = callback()
-            if context is not None:
-                check_current_inputs(context, root)
-            if type(code) is not int:
-                raise ValueError("check callback must return an integer exit code")
-            code = code if code >= 0 else 1
-            status = "passed" if code == 0 else "failed"
-        except KeyboardInterrupt:
-            code, status = 130, "interrupted"
-        except SystemExit as exc:
-            code = exc.code if type(exc.code) is int else (0 if exc.code is None else 1)
-            code = code if code >= 0 else 1
-            status = "passed" if code == 0 else "failed"
-        except BaseException as exc:
-            code, status, failure = 1, "failed", exc
-        completed = {**expected, "status": status, "exit_code": code}
-        if execution is not None:
-            completed["execution"] = {
-                **execution, "finishedAt": datetime.datetime.now(datetime.UTC).isoformat(),
-                "durationSeconds": max(0.0, time.monotonic() - monotonic_start),
+            root = (repo_root or pathlib.Path.cwd()).resolve()
+            if (root / ".git").exists() and (not getattr(args, "probe_command", None) or os.environ.get(CHECK_CONTEXT_ENV)):
+                owner = CurrentCheckResults(root)
+                owner.rewrite_current_results()
+            if not any(supplied):
+                if getattr(args, "repair_unaccepted_result", False) or getattr(args, "probe_command", None):
+                    raise ValueError("repair-unaccepted-result and probe-command require result arguments")
+                code = callback()
+                return code
+            if not all(supplied):
+                raise ValueError("result-file, result-id, candidate-id, check-id and check-version must be supplied together")
+            if any(not getattr(args, field).strip() for field in IDENTITY_FIELDS):
+                raise ValueError("result identities must not be empty")
+            context = check_result_context(args.check_version)
+            expected = {
+                "schema": CHECK_RESULT_SCHEMA,
+                **{field: getattr(args, field) for field in IDENTITY_FIELDS},
+                "invocation": dict(invocation),
             }
-        if checks is not None:
-            completed["checks"] = checks()
-        if context is not None or summary is not None:
-            completed["check_summary"] = summarize_check_result(completed, summary() if summary else None)
-        if current is not None:
-            current.put("repository-check", args.check_id, target, completed)
-        else:
-            if read_result(path)[1] != running:
-                raise ValueError("running result changed; refusing to overwrite it")
-            write_result(path, completed, exclusive=False)
-        if failure is not None:
-            raise failure
-        return code
+            started = datetime.datetime.now(datetime.UTC)
+            monotonic_start = time.monotonic()
+            execution = {
+                "startedAt": started.isoformat(), "finishedAt": None,
+                "durationSeconds": None, "workerPid": os.getpid(),
+            } if context is not None else None
+            if context is not None:
+                expected["inputs"] = context
+            if context is not None:
+                check_current_inputs(context, root)
+            path = result_path(args.result_file)
+            prepare: dict[str, Any] = {"repair_unaccepted": getattr(args, "repair_unaccepted_result", False)}
+            if execution is not None:
+                prepare["execution"] = execution
+            current = owner if context is not None else None
+            if current is not None and path != current.path:
+                current = None  # Explicit caller-selected output keeps the public probe contract.
+            target = {key: value for key, value in context["scope"].items()
+                      if key not in {"worktree", "inputRules", "artifacts"}} if current is not None and context is not None else {}
+            saved = next((item for item in current.records("repository-check", target=target)
+                          if item["result_id"] == args.result_id), None) if current is not None else None
+            if saved is not None:
+                assert current is not None
+                if (not all(saved.get(key) == value for key, value in expected.items())
+                        or saved.get("status") != "passed" or saved.get("exit_code") != 0):
+                    raise ValueError("Saved result ID does not identify this successful check.")
+                child_ids = {
+                    kind: {item.get("result_id") for item in current.records(kind)}
+                    for kind in {item["storeKind"] for item in saved.get("children", [])}
+                }
+                if any(item["result_id"] not in child_ids[item["storeKind"]]
+                       for item in saved.get("children", [])):
+                    raise ValueError("Saved command has a replaced child result; request a new check result.")
+                print("OK")
+                code = 0
+                return 0
+            if current is None and prepare_result(path, expected, **prepare):
+                print("OK")
+                code = 0
+                return 0
+            running = {**expected, "status": "running", "exit_code": None}
+            if execution is not None:
+                running["execution"] = execution
+            failure: BaseException | None = None
+            try:
+                if context is not None:
+                    check_current_inputs(context, root)
+                code = callback()
+                if context is not None:
+                    check_current_inputs(context, root)
+                if type(code) is not int:
+                    raise ValueError("check callback must return an integer exit code")
+                code = code if code >= 0 else 1
+                status = "passed" if code == 0 else "failed"
+            except KeyboardInterrupt:
+                code, status = 130, "interrupted"
+            except SystemExit as exc:
+                code = exc.code if type(exc.code) is int else (0 if exc.code is None else 1)
+                code = code if code >= 0 else 1
+                status = "passed" if code == 0 else "failed"
+            except BaseException as exc:
+                code, status, failure = 1, "failed", exc
+            completed = {**expected, "status": status, "exit_code": code}
+            if execution is not None:
+                completed["execution"] = {
+                    **{key: value for key, value in execution.items() if key != "workerPid"},
+                    "finishedAt": datetime.datetime.now(datetime.UTC).isoformat(),
+                    "durationSeconds": max(0.0, time.monotonic() - monotonic_start),
+                }
+            if checks is not None:
+                completed["checks"] = checks()
+            if context is not None or summary is not None:
+                completed["check_summary"] = summarize_check_result(completed, summary() if summary else None)
+            if current is not None:
+                report = completed.pop("check_summary", {"inputGroups": {}, "checkGroups": {}, "checks": []})
+                completed.pop("checks", None)
+                completed["children"] = []
+                completed["childInputs"] = {}
+                completed["childChecks"] = {}
+                existing = {item.get("result_id"): item for item in current.records("pytest")}
+                pytest_target = {"platform": platform.system(), "architecture": platform.machine()}
+                latest_by_check = {item["nodeid"]: item for item in current.records("pytest", target=pytest_target)}
+                pending_children: list[tuple[str, str, dict[str, Any], Mapping[str, Any]]] = []
+                for outcome in report["checks"]:
+                    if outcome.get("kind") == "repository-check" and outcome["id"] == args.check_id:
+                        continue
+                    child = dict(outcome)
+                    child.pop("path", None)
+                    child.pop("sha256", None)
+                    child_inputs = dict(report["inputGroups"][child.pop("inputGroup")]) if "inputGroup" in child else None
+                    if "checkGroup" in child:
+                        if child_inputs is None:
+                            raise ValueError("Child check names test files without its original inputs.")
+                        child_inputs["check_inputs"] = report["checkGroups"][child.pop("checkGroup")]
+                    reference = {"required": child.pop("required", True), "reused": child.pop("reused", False)}
+                    for field in ("applicableInputGroup", "comparisonInputGroup"):
+                        if field in child:
+                            key = child.pop(field)
+                            completed["childInputs"][key] = report["inputGroups"][key]
+                            reference[field] = key
+                    if "comparisonCheckGroup" in child:
+                        key = child.pop("comparisonCheckGroup")
+                        completed["childChecks"][key] = report["checkGroups"][key]
+                        reference["comparisonCheckGroup"] = key
+                    if child_inputs is not None:
+                        child["inputs"] = child_inputs
+                    identity = child.get("result_id")
+                    if not identity:
+                        identity = hashlib.sha256(canonical([args.result_id, child.get("kind"), child["id"]])).hexdigest()
+                        child["result_id"] = identity
+                    if child.get("kind") == "pytest" and child_inputs is not None:
+                        reference.update(storeKind="pytest", result_id=identity)
+                        if identity not in existing:
+                            observed = {"nodeid": child["id"], "outcome": child["status"],
+                                        "inputs": child_inputs,
+                                        **{key: child[key] for key in (
+                                            "result_id", "completed_ns", "inputs_digest", "phases", "qualificationLevel"
+                                        ) if key in child}}
+                            latest = latest_by_check.get(child["id"], {})
+                            if latest.get("completed_ns", 0) > child.get("completed_ns", 0):
+                                raise ValueError("A newer child outcome replaced the result reported by this command.")
+                            pending_children.append(("pytest", child["id"], pytest_target, observed))
+                    else:
+                        reference.update(storeKind="reported-check", result_id=identity)
+                        child_target = {**target, "parent": args.check_id}
+                        pending_children.append(("reported-check", str(child.get("kind", "check")) + ":" + child["id"],
+                                                 child_target, child))
+                    completed["children"].append(reference)
+                current.put_many(pending_children)
+                current.put("repository-check", args.check_id, target, completed)
+            else:
+                if "check_summary" in completed:
+                    completed.pop("checks", None)
+                if read_result(path)[1] != running:
+                    raise ValueError("running result changed; refusing to overwrite it")
+                write_result(path, completed, exclusive=False)
+            if failure is not None:
+                raise failure
+            return code
+        finally:
+            active_error = sys.exception()
+            if owner is not None:
+                try:
+                    owner.rewrite_current_results()
+                except (OSError, ValueError) as exc:
+                    print(f"Check-results cleanup failed: {exc}", file=sys.stderr)
+                    if active_error is None and code == 0:
+                        raise
     except (OSError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
@@ -1143,7 +1280,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--pytest-arg", action="append", default=[], help="Repeat using --pytest-arg=VALUE.")
     parser.add_argument("--check-group", help="One suite ID from tests/test-impact.json.")
     parser.add_argument("--temporary-root", type=pathlib.Path,
-                        help="Required for execution. Parent for owned test files; relative to the repository.")
+                        help="Required for execution. Parent for owned test files; SDLC supplies the external task temp directory.")
     parser.add_argument("--artifacts", default="{}", help="JSON mapping deliverable references to selected file-path arrays.")
     parser.add_argument("--diagnostic-output", type=pathlib.Path,
                         help="Full failure report; files outside .build/test-diagnostics are caller-retained.")

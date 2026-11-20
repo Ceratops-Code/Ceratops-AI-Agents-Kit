@@ -36,10 +36,12 @@ owns timing.
   commit; a caller-supplied `--commit` must match it. An absent scope skips checks
   of selected sources; repository-wide cleanup still runs. Each version-2 source
   persists its branch, exact recorded tip,
-  and helper-owned `retained`, `preserved`, or `deleting` state. A missing
-  `retained` source remains blocking. Only a missing `deleting` source whose
-  recorded commit exists and is an ancestor of the recorded target may be
-  atomically retired as completed interrupted helper cleanup. Before normal
+  and helper-owned `retained`, `preserved`, or `deleting` state. The
+  pending-work manager removes saved entries for absent branches
+  automatically, regardless of saved state or old commit availability. This
+  removes bookkeeping only; it never authorizes filesystem cleanup.
+  A Git lookup failure leaves the record unchanged
+  and remains an error. Before normal
   validation, the scope manager atomically converts an exact version-1 record
   to version 2. A missing legacy source is retired; a clean source still
   contained in the legacy target becomes `retained`; a dirty, unavailable, or
@@ -87,17 +89,18 @@ reported; saved requests and unrelated locks are untouched.
 
 ### Complete failure details
 
-Add `--diagnostic-output FILE` to `ship-repository.py`. The direct
-`ShipOptions` field is `diagnostic_output`. The lower-level
+Add `--report-directory TASK_TEMP` to `ship-repository.py`. The direct
+`ShipOptions` field is `report_directory`. The lower-level
 `python -m github_pr_workflow ship` parser accepts the same flag; that CLI
 adapter now lives in `github_pr_workflow/ship_pull_request.py`.
-FILE is one stable caller-selected path under
-`<repo-parent>/tmp/<repo-name>/<calling-worktree-name>/`, such as
-`_ship_failure.json`, distinct from a separate top-level Promote report.
-Retries reuse FILE. Composed Ship retains its requesting workflow's path/owner.
+TASK_TEMP is `<repo-parent>/tmp/<repo-name>/<calling-worktree-name>/`.
+The writer chooses `_operation-reports/ship/failures.json` beneath it; the
+lower-level GitHub Ship uses the same `ship` directory for the same task.
+Retries replace those files. Composed Ship retains its requesting workflow's
+directory and operation. Cleanup stays inside `_operation-reports`.
 
-Direct workflow calls and both operation execution functions forward the path.
-`command.py` writes complete secret-redacted diagnostics directly to FILE
+Direct workflow calls and both operation execution functions forward TASK_TEMP.
+`command.py` atomically writes complete secret-redacted diagnostics
 before returning a short error and `diagnostic_output`, with references to
 existing successful test/build result files. It references a complete child
 report unchanged instead of copying it; the child helper retains deletion
@@ -177,7 +180,7 @@ Owner diagnostics do not replace interrupted-operation recovery requirements.
 3. Before the first remote push, the scope manager atomically normalizes an
    exact version-1 record, then the helper checks the canonical version-2 scope.
    Prevalidate all selected entries, parameters, exact argv and
-   repository-bounded working directories from `sdlc/sdlc.yml`, then run
+   repository-bounded working directories from `.ceratops/sdlc/sdlc.yml`, then run
    applicable validation and tests. Reject SDLC v1-v3 before executing any
    operation; v4/v5 preserve declared commands, handoffs, and reasoned no-ops.
    Only `validate` and `test` entries may be selected as checks; missing

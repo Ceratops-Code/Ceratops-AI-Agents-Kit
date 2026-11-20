@@ -35,7 +35,7 @@ deployment operations or the independent bootstrap installer.
 
 - Enter through `$ceratops-repo-lifecycle` for promotion or shipping; run its
   repository `deploy` operation first when declared.
-- Never invoke `sdlc/sdlc.yml` or `scripts/deploy-skills.py` from
+- Never invoke `.ceratops/sdlc/sdlc.yml` or `scripts/deploy-skills.py` from
   this action.
 - For SDLC, inspect the named skill's returned package prerequisites and
   verify the exact required artifact before installation. A package build

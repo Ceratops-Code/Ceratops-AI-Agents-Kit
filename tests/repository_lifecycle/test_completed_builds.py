@@ -9,11 +9,168 @@ import os
 import pathlib
 import runpy
 import shutil
+import subprocess
 import sys
 from dataclasses import replace
+from typing import Any
 from unittest.mock import DEFAULT, Mock
 
 import pytest
+
+
+@pytest.mark.parametrize("mode", ["json", "toml", "command", "shell", "receipt-only"])
+@pytest.mark.parametrize("owner", ["deliverables.packages.claims", "repository.release-bundles.suite"])
+def test_declared_version_source_and_decision(tmp_path, capsys, mode, owner):
+    flow = importlib.import_module("execute_worktree_build")
+    if mode == "shell" and not shutil.which("pwsh"):
+        pytest.skip("PowerShell declaration requires pwsh")
+    root, _ = _worktree_build_case(tmp_path)
+    path = root / "version.json"
+    path.write_text('{"release":{"version":"1.2.3b1"},"unrelated":42}\n', encoding="utf-8")
+    declaration = {"version": {"file": path.name, "field": "release.version"}}
+    if mode == "toml":
+        path = root / "release.toml"
+        path.write_text('# retained comment\n[release]\nversion="1.2.3b1"\nother=42\n', encoding="utf-8")
+        declaration["version"] = {"file": path.name, "field": "release.version"}
+    elif mode in {"command", "shell"}:
+        if mode == "command":
+            (root / "scripts/version.py").write_text(
+                "import json,pathlib,sys\np=pathlib.Path('version.json'); d=json.loads(p.read_text())\n"
+                "if sys.argv[1]=='write':\n d['release']['version']=sys.argv[2]; p.write_text(json.dumps(d))\n"
+                "else: print(d['release']['version'])\n", encoding="utf-8")
+            read = ["{python}", "scripts/version.py", "read"]
+            write = ["{python}", "scripts/version.py", "write", "{version}"]
+        else:
+            (root / "scripts/version.ps1").write_text(
+                "param([string]$Version)\n$d=Get-Content -Raw version.json | ConvertFrom-Json\n"
+                "$d.release.version=$Version; $d | ConvertTo-Json -Depth 5 | Set-Content version.json\n")
+            read = ["pwsh", "-NoProfile", "-Command",
+                    "(Get-Content -Raw version.json | ConvertFrom-Json).release.version"]
+            write = ["pwsh", "-NoProfile", "-File", "scripts/version.ps1", "{version}"]
+        declaration["version"] = {"read": read, "write": write, "files": [path.name]}
+    elif mode == "receipt-only":
+        declaration["version"] = {"mode": "receipt-only"}
+        assert flow.read_declared_version(root, declaration, reference=owner) is None
+        assert flow.write_declared_version(root, declaration, "2.0.0b1", reference=owner) == []
+        return
+    assert flow.read_declared_version(root, declaration, reference=owner) == "1.2.3b1"
+    assert flow.write_declared_version(root, declaration, "2.0.0b1", reference=owner) == [path.name]
+    first = path.read_bytes()
+    flow.write_declared_version(root, declaration, "2.0.0b1", reference=owner)
+    assert path.read_bytes() == first
+    assert flow.read_declared_version(root, declaration, reference=owner) == "2.0.0b1"
+    assert b"42" in first
+    for version in ("3.7.10-autopsy.17", "26.1103.3517.0"):
+        flow.write_declared_version(root, declaration, version, reference=owner)
+        assert flow.read_declared_version(root, declaration, reference=owner) == version
+    if mode == "toml":
+        assert b"# retained comment" in first
+    if mode == 'json' and owner == 'deliverables.packages.claims':
+        (root / 'pyproject.toml').write_text('[project]\nname="claims"\nversion="1.2.20a7"\n')
+        assert run_git(root, 'add', 'pyproject.toml').returncode == 0
+        assert run_git(root, 'commit', '--only', '-m', 'alpha source', '--', 'pyproject.toml').returncode == 0
+        task = tmp_path / 'beta-task'
+        assert run_git(root, 'worktree', 'add', '-b', 'beta-task', str(task)).returncode == 0
+        request = runner.OperationRequest(owner + '.actions.build', {'target': 'native'})
+        alpha = runner.execute_build(task, [request], qualification_level='alpha')
+        assert alpha['status'] == 'completed', alpha
+        assert alpha['version'] == '1.2.20a7'
+        original_alpha = pathlib.Path(alpha['build_receipts'][0]).read_bytes()
+        head = run_git(task, 'rev-parse', 'HEAD').stdout.strip()
+        rejected = runner.execute_build(task, [runner.OperationRequest(request.operation,
+            {'version': '1.2.20a8', 'target': 'native'})], qualification_level='beta')
+        assert rejected['status'] == 'version_decision_required', rejected
+        assert rejected['version_decisions'][0]['requested_version'] == '1.2.20a8'
+        assert run_git(task, 'rev-parse', 'HEAD').stdout.strip() == head
+        assert (task / '.build-count').read_text() == 'x'
+        assert run_git(task, 'tag', 'members/packages/claims/1.2.20b1').returncode == 0
+        beta = runner.execute_build(task, [request], qualification_level='beta')
+        assert beta['status'] == 'completed', beta
+        assert beta['version'] == '1.2.20b2'
+        assert pathlib.Path(alpha['build_receipts'][0]).read_bytes() == original_alpha
+        assert (task / '.build-count').read_text() == 'xx'
+        for version in ('1.2.21rc1', '1.2.21'):
+            accepted = runner.execute_build(task, [runner.OperationRequest(request.operation,
+                {'version': version, 'target': 'native'})], qualification_level='beta')
+            assert accepted['status'] == 'completed', accepted
+            assert accepted['version'] == version
+            count = (task / '.build-count').read_text()
+            repeated = runner.execute_build(task, [request], qualification_level='beta')
+            assert repeated['status'] == 'completed', repeated
+            assert repeated['final_commit'] == accepted['final_commit']
+            assert (task / '.build-count').read_text() == count
+    if mode != "toml" or owner != "deliverables.packages.claims":
+        return
+    # The initial version question must handle a complete source inventory
+    # larger than Windows can carry in one process command line.
+    for index in range(400):
+        (root / "src" / (f"source-{index:04d}-" + "x" * 78 + ".py")).write_text("value = 1\n")
+    assert sum(len(path.relative_to(root).as_posix()) + 3 for path in (root / "src").iterdir()) > 32767
+    ref = "deliverables.packages.claims"
+    original_head = run_git(root, "rev-parse", "HEAD").stdout.strip()
+    manifest = (root / "pyproject.toml").read_bytes()
+    argv = ["--repo-root", str(root), "--operation", ref + ".actions.build",
+            "--qualification-level", "beta", "--parameter", "target=native"]
+    assert runner.main(argv) == 2
+    decision = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert decision["status"] == "version_decision_required"
+    assert decision["version_decisions"][0]["current_version"] == "1.2.19"
+    assert decision["version_decisions"][0]["changed_files"]
+    assert len(decision["version_decisions"][0]["new_files"]) == 400
+    assert "unrelated.txt" not in decision["version_decisions"][0]["diff"]
+    assert "next_command" in decision
+    assert run_git(root, "rev-parse", "HEAD").stdout.strip() == original_head
+    assert (root / "pyproject.toml").read_bytes() == manifest
+    assert not (root / ".build-count").exists()
+    assert not list(storage._artifact_store_path(root, temporary=True).rglob("build_request.json"))
+    choice = json.dumps({ref: {"version": "2.0.0b1"}})
+    assert runner.main([*argv, "--version-source-commit", original_head, "--version-choices", choice]) == 0
+    completed = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert completed["status"] == "completed", completed
+    assert "2.0.0b1" in (root / "pyproject.toml").read_text()
+    assert (root / ".build-count").read_text() == "x"
+    assert run_git(root, "diff", "--cached", "--name-only").stdout.strip() == "unrelated.txt"
+    assert runner.main([*argv, "--version-choices", choice]) == 0
+    capsys.readouterr()
+    assert (root / ".build-count").read_text() == "x"
+    assert runner.main([*argv, "--version-choices", json.dumps({ref: {"version": "3.0.0b1"}})]) == 0
+    capsys.readouterr()
+    assert (root / ".build-count").read_text() == "xx"
+
+
+@pytest.mark.parametrize("mode", ["json", "command"])
+@pytest.mark.parametrize("timing", ["before", "after"])
+def test_version_write_repeats_after_interruption(tmp_path, monkeypatch, mode, timing):
+    flow = importlib.import_module("execute_worktree_build")
+    path = tmp_path / "package.json"
+    path.write_text('{"version":"1.0.0","kept":true}\n')
+    source = {"file": path.name, "field": "version"}
+    if mode == "command":
+        source = {"read": [sys.executable, "-c", "import json; print(json.load(open('package.json'))['version'])"],
+                  "write": [sys.executable, "-c", "import json,pathlib,sys; p=pathlib.Path('package.json'); "
+                            "d=json.loads(p.read_text()); d['version']=sys.argv[1]; p.write_text(json.dumps(d))",
+                            "{version}"], "files": [path.name]}
+    declaration = {"version": source}
+    with monkeypatch.context() as patch:
+        if timing == "after":
+            patch.setattr(flow, "read_declared_version", Mock(side_effect=KeyboardInterrupt))
+        elif mode == "json":
+            patch.setattr(flow.os, "replace", Mock(side_effect=KeyboardInterrupt))
+        else:
+            patch.setattr(flow.release_lock_module(), "run_protected_command", Mock(side_effect=KeyboardInterrupt))
+        with pytest.raises(KeyboardInterrupt):
+            flow.write_declared_version(tmp_path, declaration, "2.0.0", reference="repository.release-bundles.suite")
+    assert json.loads(path.read_text())["version"] == ("2.0.0" if timing == "after" else "1.0.0")
+    unfinished = path.with_name(".package.json.in_process")
+    if mode == "json":
+        unfinished.write_bytes(b"interrupted partial JSON")
+    flow.write_declared_version(tmp_path, declaration, "2.0.0", reference="repository.release-bundles.suite")
+    assert json.loads(path.read_text()) == {"version": "2.0.0", "kept": True}
+    assert not unfinished.exists()
+    repeated = path.read_bytes()
+    flow.write_declared_version(tmp_path, declaration, "2.0.0", reference="repository.release-bundles.suite")
+    assert path.read_bytes() == repeated
+
 
 from tests.repository_lifecycle.test_sdlc_handoffs import (
     _bound_test_build,
@@ -32,7 +189,8 @@ from tests.repository_lifecycle.test_sdlc_handoffs import (
 )
 
 
-def _tag_summary(repository, version, summary, *, target="python-3.14-windows", tagged=True, key="claims"):
+def _tag_summary(repository, version, summary, *, target="python-3.14-windows", tagged=True,
+                 key="claims", receipt_root=".ceratops/build"):
     """Create committed receipt bytes without packages, receipts in a store or logs."""
     fixture = repository / ".git/receipt-fixture"
     fixture.mkdir(parents=True, exist_ok=True)
@@ -42,7 +200,7 @@ def _tag_summary(repository, version, summary, *, target="python-3.14-windows", 
         receipt["identity"].pop("releaseBundle")
         receipt["identity"]["storageKey"] = key
         old_path = receipt["receiptPath"]
-        receipt["receiptPath"] = old_path.replace(".build/claims/", f".build/{key}/")
+        receipt["receiptPath"] = old_path.replace(".ceratops/build/claims/", f".ceratops/build/{key}/")
         receipt["committedResultPaths"] = [receipt["receiptPath"] if name == old_path else name
                                            for name in receipt["committedResultPaths"]]
     if key.startswith("bundles/"):
@@ -51,7 +209,7 @@ def _tag_summary(repository, version, summary, *, target="python-3.14-windows", 
             "deliverable": "deliverables.packages.claims",
             "identity": {**receipt["identity"], "storageKey": member_key},
             "tag": member_key + "/" + version,
-            "buildReceipt": {"root": "git", "path": f".build/{member_key}/{version}/build_receipt.json",
+            "buildReceipt": {"root": "git", "path": f".ceratops/build/{member_key}/{version}/build_receipt.json",
                              "size": 1, "sha256": "0" * 64},
             "artifacts": receipt["artifacts"], "dependencies": receipt["dependencies"],
         }]
@@ -61,6 +219,7 @@ def _tag_summary(repository, version, summary, *, target="python-3.14-windows", 
                      "sourceChecks", "artifactTests", "supportingFiles"):
             receipt[name] = []
         receipt["committedResultPaths"] = [receipt["receiptPath"]]
+    receipt = json.loads(json.dumps(receipt).replace(".ceratops/build/", receipt_root + "/"))
     path = repository / receipt["receiptPath"]
     path.parent.mkdir(parents=True, exist_ok=True)
     if summary is not None:
@@ -71,7 +230,7 @@ def _tag_summary(repository, version, summary, *, target="python-3.14-windows", 
                                              "size": len(raw), "sha256": hashlib.sha256(raw).hexdigest()})
         receipt["committedResultPaths"].append(receipt["checkSummary"]["path"])
     path.write_bytes(results.encode_new_receipt(receipt))
-    assert run_git(repository, "add", ".build").returncode == 0
+    assert run_git(repository, "add", receipt_root).returncode == 0
     committed = run_git(repository, "-c", "user.name=Build Tests", "-c", "user.email=builds@example.invalid",
                         "commit", "--no-gpg-sign", "-m", "completed " + version)
     assert committed.returncode == 0, committed.stderr
@@ -84,7 +243,7 @@ def _empty_summary():
     return {"schema": "ceratops-check-summary.v1", "inputGroups": {}, "checkGroups": {}, "checks": []}
 
 
-def _worktree_build_case(tmp_path):
+def _worktree_build_case(tmp_path, *, linked=False):
     repository, commit = _versioned_repository(tmp_path)
     version, target = "1.2.20b1", "python-3.14-windows"
     code = (
@@ -99,20 +258,39 @@ def _worktree_build_case(tmp_path):
     )
     _write_fixture_bytes(repository, "scripts/build.py", code.encode())
     _write_fixture_bytes(repository, "pyproject.toml", b'[project]\nname="claims"\nversion="1.2.19"\n')
+    # The receipt fixture's placeholder is not a native uv lockfile. Build
+    # cases either have no lock or create a real one for their local workspace.
+    (repository / 'uv.lock').unlink()
     _write_fixture_bytes(repository, "unrelated.txt", b"original")
     _write_fixture_bytes(repository, ".gitignore", b".build-count\n.fail-build\n")
     check = {"requires": {"tools": []}, "steps": [{"run": [sys.executable, "-c", "print('OK')"]}]}
-    contract = {"version": 5, "kind": "ceratops-sdlc", "repository": {"tools": {}, "actions": {
+    contract: dict[str, Any] = {"version": 5, "kind": "ceratops-sdlc", "repository": {"tools": {}, "actions": {
         "pre-build-checks": {"check-groups": {"source": check}}}},
         "deliverables": {"packages": {"claims": {
             "root-dir": "src", "additional-source-files": ["pyproject.toml", "scripts/build.py"],
             "project": "pyproject.toml", "build-after": [],
+            "version": {"file": "pyproject.toml", "field": "project.version"},
             "artifact": {"type": "python-wheel", "distribution": "claims", "output-directory": "dist", "filename-pattern": "*.whl"},
             "actions": {"build": {"requires": {"tools": []}, "result-schema": "ceratops-builder-output",
                 "parameters": ["version", "artifact_directory", "target"],
                 "steps": [{"run": [sys.executable, "scripts/build.py", "{artifact_directory}", "{version}"]}]},
                 "post-build-checks": {"check-groups": {"contents": check}}}
         }}}}
+    if linked:
+        with (repository / 'pyproject.toml').open('a') as stream:
+            stream.write('requires-python=">=3.11"\n[project.optional-dependencies]\nreports=[]\n'
+                         '[tool.uv.workspace]\nmembers=["runtime", "mcp"]\n')
+        for name, requirement in [('runtime', 'claims==1.2.19'), ('mcp', "claims[reports]==1.2.19; python_version >= '3.11'")]:
+            _write_fixture_bytes(repository, name + '/pyproject.toml', (
+                '[project]\nname="' + name + '"\nversion="9.0.0"\nrequires-python=">=3.11"\n'
+                'dependencies=[' + json.dumps(requirement) + ']\n'
+                '[project.optional-dependencies]\nrange=["claims>=1.2,<2"]\n'
+                '[tool.uv.sources]\nclaims={workspace=true}\n').encode())
+        locked = subprocess.run(['uv', 'lock', '--offline', '--project', str(repository)],
+                                capture_output=True, text=True, check=False)
+        assert locked.returncode == 0, locked.stderr
+        contract['deliverables']['packages']['claims']['additional-source-files'].append('uv.lock')
+        check['steps'] = [{'run': ['uv', 'lock', '--offline', '--check']}]
     _write_fixture_bytes(repository, runner.DEFAULT_CONTRACT.as_posix(), json.dumps(contract).encode())
     assert run_git(repository, "add", ".").returncode == 0
     assert run_git(repository, "commit", "-m", "build fixture").returncode == 0
@@ -125,8 +303,19 @@ def _worktree_build_case(tmp_path):
 
 @pytest.mark.parametrize("checkout", ["primary", "release-local", "task-worktree"])
 @pytest.mark.parametrize("deletion", ["unstaged", "staged"])
-def test_worktree_build_commits_selected_source_and_finishes_once(tmp_path, checkout, deletion):
+@pytest.mark.parametrize("schema_version", [4, 5])
+def test_worktree_build_commits_selected_source_and_finishes_once(tmp_path, checkout, deletion, schema_version):
     repository, options = _worktree_build_case(tmp_path)
+    if schema_version == 4:
+        contract_path = repository / runner.DEFAULT_CONTRACT
+        contract = json.loads(contract_path.read_text())
+        contract["version"] = schema_version
+        contract["repository"]["capabilities"] = contract["repository"].pop("tools")
+        for action in runner.operation_entries(contract).values():
+            action["requires"]["capabilities"] = action["requires"].pop("tools")
+        contract_path.write_text(json.dumps(contract))
+        assert run_git(repository, "add", ".ceratops/sdlc/sdlc.yml").returncode == 0
+        assert run_git(repository, "commit", "--only", "-m", "declared build version", "--", ".ceratops/sdlc/sdlc.yml").returncode == 0
     if checkout == "release-local":
         assert run_git(repository, "branch", "-m", "release/local").returncode == 0
     elif checkout == "task-worktree":
@@ -135,6 +324,20 @@ def test_worktree_build_commits_selected_source_and_finishes_once(tmp_path, chec
         assert run_git(source, "worktree", "add", "-b", "task", str(repository)).returncode == 0
         (repository / "unrelated.txt").write_bytes(b"keep staged change")
         assert run_git(repository, "add", "unrelated.txt").returncode == 0
+    unusual_paths = []
+    if checkout == "task-worktree" and schema_version == 5 and deletion == "staged":
+        for index in range(19790):
+            path = repository / "src" / (f"source-{index:04d}-" + "x" * 78 + ".py")
+            path.write_text("value = 1\n")
+            unusual_paths.append(path.relative_to(repository).as_posix())
+        assert sum(len(path) + 3 for path in unusual_paths) > 32767
+        assert run_git(repository, "add", "src").returncode == 0
+        assert run_git(repository, "commit", "--only", "-m", "large source inventory", "--", "src").returncode == 0
+        old = unusual_paths.pop(0)
+        renamed = "src/-[moved] caf\u00e9.py"
+        (repository / old).rename(repository / renamed)
+        unusual_paths.extend([renamed, "src/new [literal] \u03bb.py"])
+        (repository / unusual_paths[-1]).write_text("new_value = 2\n")
     (repository / "src/claims.py").unlink()
     if deletion == "staged":
         assert run_git(repository, "add", "src/claims.py").returncode == 0
@@ -164,6 +367,17 @@ def test_worktree_build_commits_selected_source_and_finishes_once(tmp_path, chec
     assert "src/claims.py" not in {record["path"] for record in selected["receipt"]["artifactInputs"]}
     assert not run_git(repository, "diff", "--name-only", "HEAD", "--", "src/claims.py").stdout
     assert "releaseUnit" not in selected["receipt"]["identity"]
+    assert selected["receipt"]["artifactInputs"] == []
+    assert selected["receipt"]["sourceDefinition"] == {"id": "source",
+        "deliverable": "deliverables.packages.claims", "sdlcPath": ".ceratops/sdlc/sdlc.yml"}
+    if unusual_paths:
+        from ceratops_repo_compatibility_engine.sdlc_contract_validation import deliverable_source_files
+
+        assert len(json.dumps(selected["receipt"]).encode()) < 20000
+        assert set(unusual_paths) <= set(deliverable_source_files(repository,
+            selected["receipt"]["sourceDefinition"], commit=selected["receipt"]["preTestCommit"]))
+        assert not run_git(repository, "ls-tree", selected["receipt"]["preTestCommit"], "--", old).stdout
+        assert run_git(repository, "show", selected["receipt"]["preTestCommit"] + ":" + unusual_paths[-1]).stdout == "new_value = 2\n"
     again = runner.execute_build(repository, **options)
     assert again["status"] == "completed" and again["final_commit"] == result["final_commit"], again
     assert (repository / ".build-count").read_text() == "x"
@@ -174,7 +388,7 @@ def test_release_build_consumes_existing_tagged_receipt_without_starting_builder
     contract_path = repository / runner.DEFAULT_CONTRACT
     contract = json.loads(contract_path.read_text())
     reference = "deliverables.packages.claims"
-    contract["repository"]["release-bundles"] = {"claims": {"members": [reference]}}
+    contract["repository"]["release-bundles"] = {"claims": {"version": {"mode": "receipt-only"}, "members": [reference]}}
     action = contract["deliverables"]["packages"]["claims"]["actions"]["build"]
     action["steps"][0]["run"].append("{target}")
     contract_path.write_text(json.dumps(contract))
@@ -200,15 +414,136 @@ def test_release_build_consumes_existing_tagged_receipt_without_starting_builder
     assert builds.recorded_build(replace(prepared, parameters=(*prepared.parameters, ("mode", "debug"))), {})["result"] is None
 
 
-def test_worktree_build_failure_preserves_cause_without_receipt_or_tag(tmp_path):
+@pytest.mark.parametrize("failure", ["compiler", "decision", "changed-package", "changed-check",
+                                      "malformed-answer", "rejected-answer", "repeated-decision", "decision-cli",
+                                      "missing-tool", "tool-version-failed"])
+def test_worktree_build_failure_preserves_cause_without_receipt_or_tag(tmp_path, failure):
     repository, options = _worktree_build_case(tmp_path)
+    if failure in {"missing-tool", "tool-version-failed"}:
+        contract_path = repository / runner.DEFAULT_CONTRACT
+        contract = json.loads(contract_path.read_text())
+        executable = repository / "scripts" / ("version-tool.cmd" if os.name == "nt" else "version-tool")
+        if failure == "tool-version-failed":
+            executable.write_text("@echo off\necho probe output\necho probe failure 1>&2\nexit /b 7\n"
+                                  if os.name == "nt" else
+                                  "#!/bin/sh\necho probe output\necho probe failure >&2\nexit 7\n")
+            executable.chmod(0o755)
+        contract["repository"]["tools"] = {"builder": {"executable": str(executable)}}
+        contract["deliverables"]["packages"]["claims"]["actions"]["build"]["requires"]["tools"] = ["builder"]
+        contract_path.write_text(json.dumps(contract))
+        for _ in range(2):
+            failed = runner.execute_build(repository, **options)
+            assert failed["status"] in runner.FAILED_STATUSES, failed
+            assert "Cannot read required build tool builder" in failed["message"]
+            assert run_git(repository, "tag", "--list").stdout == ""
+            assert not list((repository / ".ceratops/build").glob("**/build_receipt.json"))
+            details = failed["tool_failure"]
+            assert details["version"] is None and details["tool"] == "builder"
+            if failure == "tool-version-failed":
+                assert details["exit_code"] == 7
+                assert details["command"] == [str(executable), "--version"]
+                assert "probe output" in details["stdout"] and "probe failure" in details["stderr"]
+            else:
+                assert "not installed" in details["error"]
+        contract["repository"]["tools"]["builder"]["executable"] = sys.executable
+        contract_path.write_text(json.dumps(contract))
+        repaired = runner.execute_build(repository, **options)
+        assert repaired["status"] == "completed", repaired
+        assert list((repository / ".ceratops/build").glob("**/build_receipt.json"))
+        return
+    if failure != "compiler":
+        check_path = repository / "scripts/review.py"
+        check_path.write_text(
+            "import json,os,pathlib,sys\n"
+            "count=pathlib.Path('.git/review-count'); count.write_text(count.read_text()+'x' if count.exists() else 'x')\n"
+            "answer=json.loads(os.environ.get('CERATOPS_CHECK_ANSWER','null'))\n"
+            "if answer is not None and not pathlib.Path('.git/ask-again').exists(): sys.exit(0 if answer['answer']['approve'] else 6)\n"
+            "print(json.dumps({'schema':'ceratops-check-decision','status':'decision_required',"
+            "'question':'Accept these observed changes?', 'answer_schema':{'type':'object','required':['approve'],"
+            "'properties':{'approve':{'type':'boolean'}},'additionalProperties':False},"
+            "'payload':{'details':{'tests':['one','two']},'report':'review.txt'}}))\n"
+        )
+        contract_path = repository / runner.DEFAULT_CONTRACT
+        contract = json.loads(contract_path.read_text())
+        check = contract["deliverables"]["packages"]["claims"]["actions"]["post-build-checks"]["check-groups"]["contents"]
+        check.update(steps=[{"run": [sys.executable, "scripts/review.py"]}],
+            **{"check-results": {"result-owner": "operation", "product-inputs": ["src/**", "pyproject.toml"],
+                                 "check-inputs": ["scripts/review.py"]}})
+        contract_path.write_text(json.dumps(contract))
+        assert run_git(repository, "add", "scripts/review.py", runner.DEFAULT_CONTRACT.as_posix()).returncode == 0
+        assert run_git(repository, "commit", "--only", "-m", "declare package review", "--",
+                       "scripts/review.py", runner.DEFAULT_CONTRACT.as_posix()).returncode == 0
+        if failure == "decision-cli":
+            request = options["requests"][0]
+            command = [sys.executable, runner.__file__, "--repo-root", str(repository),
+                       "--operation", request.operation, "--qualification-level", "beta"]
+            for name, value in request.parameters.items():
+                command.extend(["--parameter", name + "=" + value])
+            waiting_process = subprocess.run(command, capture_output=True, text=True, check=False)
+            assert waiting_process.returncode == 2, (waiting_process.stdout, waiting_process.stderr)
+            waiting = json.loads(waiting_process.stdout.splitlines()[-1])
+        else:
+            waiting = runner.execute_build(repository, **options)
+        assert waiting["status"] == "decision_required", waiting
+        assert waiting["payload"] == {"details": {"tests": ["one", "two"]}, "report": "review.txt"}
+        assert run_git(repository, "tag", "--list").stdout == ""
+        assert (repository / ".build-count").read_text() == "x"
+        again = runner.execute_build(repository, **options)
+        assert again["status"] == "decision_required" and again["decision_id"] == waiting["decision_id"], again
+        assert (repository / ".build-count").read_text() == "x"
+        assert (repository / ".git/review-count").read_text() == "x"
+        if failure == "changed-package":
+            package = next(storage._artifact_store_path(repository, temporary=True).rglob("*.whl"))
+            package.write_bytes(b"changed after the question")
+        elif failure == "changed-check":
+            check_path.write_text(check_path.read_text() + "# new check input\n")
+        answers = {waiting["decision_id"]: {"approve": True}}
+        if failure == "malformed-answer":
+            malformed = runner.execute_build(repository, **options, check_answers={waiting["decision_id"]: {"approve": "yes"}})
+            assert malformed["status"] in runner.FAILED_STATUSES, malformed
+            assert (repository / ".git/review-count").read_text() == "x"
+            assert (repository / ".build-count").read_text() == "x"
+            assert run_git(repository, "tag", "--list").stdout == ""
+        elif failure == "rejected-answer":
+            rejected = runner.execute_build(repository, **options, check_answers={waiting["decision_id"]: {"approve": False}})
+            assert rejected["status"] in runner.FAILED_STATUSES, rejected
+            assert run_git(repository, "tag", "--list").stdout == ""
+            current = runner.reuse_operation_checks.CheckResultStore(repository).current
+            assert not current.records("check-decision")
+            return
+        elif failure == "repeated-decision":
+            (repository / ".git/ask-again").touch()
+        if failure == "decision-cli":
+            command = waiting["next_command"]
+            command[-1] = json.dumps(answers)
+            answered_process = subprocess.run(command, capture_output=True, text=True, check=False)
+            assert answered_process.returncode == 0, (answered_process.stdout, answered_process.stderr)
+            answered = json.loads(answered_process.stdout.splitlines()[-1])
+        else:
+            answered = runner.execute_build(repository, **options, check_answers=answers)
+        if failure in {"changed-package", "changed-check", "repeated-decision"}:
+            assert answered["status"] == "decision_required", answered
+            if failure != "repeated-decision":
+                assert "answer_not_applied" in json.dumps(answered)
+            else:
+                (repository / ".git/ask-again").unlink()
+            assert answered["decision_id"] != waiting["decision_id"], answered
+            answers = {answered["decision_id"]: {"approve": True}}
+            answered = runner.execute_build(repository, **options, check_answers=answers)
+        assert answered["status"] == "completed", answered
+        expected_builds = "xx" if failure == "changed-package" else "x"
+        assert (repository / ".build-count").read_text() == expected_builds
+        assert not list(storage._artifact_store_path(repository, temporary=True).rglob("*.whl"))
+        current = runner.reuse_operation_checks.CheckResultStore(repository).current
+        assert not current.records("check-decision") and not current.records("pending-build")
+        return
     (repository / ".fail-build").touch()
     result = runner.execute_build(repository, **options)
     assert result["status"] in runner.FAILED_STATUSES, result
     assert "compiler rejected source" in json.dumps(result)
     assert run_git(repository, "tag", "--list").stdout == ""
-    assert not list((repository / ".build").glob("**/build_receipt.json"))
-    assert list(storage._artifact_store_path(repository, temporary=True).rglob("build_request.json"))
+    assert not list((repository / ".ceratops/build").glob("**/build_receipt.json"))
+    assert not list(storage._artifact_store_path(repository, temporary=True).rglob("build_request.json"))
     assert not list(storage._artifact_store_path(repository, worktree=True).glob("members/*/*/*/*/artifact-receipt.json"))
     temporary = storage._artifact_store_path(repository, temporary=True) / "members/packages/claims"
     previous = next(temporary.iterdir()) / "partial.bin"
@@ -229,17 +564,44 @@ def test_worktree_build_failure_preserves_cause_without_receipt_or_tag(tmp_path)
     assert (repository / ".build-count").read_text() == "x"
 
 
-@pytest.mark.parametrize("effect", ["source-commit", "completion", "temporary-cleanup"])
+@pytest.mark.parametrize("effect", ["source-stage", "source-commit", "git-failure", "receipt", "completion", "temporary-cleanup",
+                                  "version-write", "pin-write", "lock-write", "lock-failure", "pin-conflict"])
 @pytest.mark.parametrize("timing", ["before", "after"])
 @pytest.mark.parametrize("release", [False, True])
 def test_worktree_build_repeats_commit_and_completion_handoffs(tmp_path, monkeypatch, effect, timing, release):
-    repository, options = _worktree_build_case(tmp_path)
+    linked = effect in {'source-commit', 'version-write', 'pin-write', 'lock-write', 'lock-failure', 'pin-conflict'}
+    repository, options = _worktree_build_case(tmp_path, linked=linked)
+    if linked:
+        options['version_source_commit'] = run_git(repository, 'rev-parse', 'HEAD').stdout.strip()
     if release:
         assert run_git(repository, "branch", "-m", "release/local").returncode == 0
     flow = importlib.import_module("execute_worktree_build")
-    owner = flow if effect == "source-commit" else storage if effect == "temporary-cleanup" else completion
-    name = ("_git" if effect == "source-commit" else "_remove_versioned_tree"
+    if effect == 'pin-conflict':
+        source = repository / 'runtime/pyproject.toml'
+        before = source.read_bytes()
+        source.write_bytes(before + b'[tool.uv]\nconstraint-dependencies=["claims<1.2.20"]\n')
+        head = run_git(repository, 'rev-parse', 'HEAD').stdout.strip()
+        failed = runner.execute_build(repository, **options)
+        assert failed['status'] == 'version_decision_required', failed
+        assert failed['version_decisions'][0]['requirement'] == 'claims<1.2.20'
+        assert run_git(repository, 'rev-parse', 'HEAD').stdout.strip() == head
+        assert not (repository / '.build-count').exists()
+        source.write_bytes(before)
+        result = runner.execute_build(repository, **options)
+        assert result['status'] == 'completed', result
+        return
+    source_effect = effect in {"source-stage", "source-commit", "git-failure"}
+    owner = flow if source_effect else storage if effect == "temporary-cleanup" else completion
+    name = ("_git" if source_effect else "_remove_versioned_tree"
             if effect == "temporary-cleanup" else "complete_versioned_artifacts")
+    if effect == 'version-write':
+        owner, name = flow, 'write_declared_version'
+    elif effect == 'receipt':
+        owner, name = completion, 'prepare_versioned_build_receipt'
+    elif effect == 'pin-write':
+        owner, name = flow.os, 'replace'
+    elif effect in {'lock-write', 'lock-failure'}:
+        owner, name = flow.release_lock_module(), 'run_protected_command'
     if effect == "temporary-cleanup":
         stale = storage._artifact_store_path(repository, temporary=True) / "members/packages/claims/1.1.0b1"
         stale.mkdir(parents=True)
@@ -249,9 +611,18 @@ def test_worktree_build_repeats_commit_and_completion_handoffs(tmp_path, monkeyp
 
     def interrupted(*args, **kwargs):
         nonlocal fired
-        match = not fired and (effect != "source-commit" or "commit" in args[1:])
+        match = not fired and (not source_effect or ("add" if effect == "source-stage" else "commit") in args[1:])
+        if effect == 'pin-write':
+            match = not fired and pathlib.Path(args[1]) == repository / 'mcp/pyproject.toml'
+        elif effect in {'lock-write', 'lock-failure'}:
+            match = not fired and args[0][:2] == ['uv', 'lock'] and '--check' not in args[0]
         if match:
             fired = True
+        if match and effect in {"git-failure", 'lock-failure'}:
+            if timing == "after":
+                original(*args, **kwargs)
+            return subprocess.CompletedProcess(args[0] if linked else ["git", *args[1:]], 7,
+                                               "preparation output", "preparation failed")
         if match and timing == "before":
             raise KeyboardInterrupt("test interruption")
         result = original(*args, **kwargs)
@@ -261,15 +632,36 @@ def test_worktree_build_repeats_commit_and_completion_handoffs(tmp_path, monkeyp
 
     with monkeypatch.context() as scoped:
         scoped.setattr(owner, name, interrupted)
-        with pytest.raises(KeyboardInterrupt, match="test interruption"):
-            runner.execute_build(repository, **options)
+        if effect in {"git-failure", 'lock-failure'}:
+            failed = runner.execute_build(repository, **options)
+            assert failed["status"] in runner.FAILED_STATUSES, failed
+            assert "preparation failed" in json.dumps(failed) and "preparation output" in json.dumps(failed)
+            assert not (repository / ".build-count").exists()
+        else:
+            with pytest.raises(KeyboardInterrupt, match="test interruption"):
+                runner.execute_build(repository, **options)
     assert fired
     result = runner.execute_build(repository, **options)
     assert result["status"] == "completed", result
-    # Before acceptance, a fresh call discards unfinished bytes and builds again.
-    expected_count = "xx" if effect == "completion" and timing == "before" else "x"
-    assert (repository / ".build-count").read_text() == expected_count
+    # Passed checks survive interruption before the receipt or its final commit.
+    assert (repository / ".build-count").read_text() == "x"
     assert not list(storage._artifact_store_path(repository, temporary=True).rglob("partial.bin"))
+    if linked:
+        import tomllib
+        for name in ('runtime', 'mcp'):
+            manifest = tomllib.loads((repository / name / 'pyproject.toml').read_text())
+            assert manifest['project']['version'] == '9.0.0'
+            assert '==1.2.20b1' in manifest['project']['dependencies'][0]
+            assert manifest['project']['optional-dependencies']['range'] == ['claims>=1.2,<2']
+        assert '[reports]' in (repository / 'mcp/pyproject.toml').read_text()
+        assert "python_version >= '3.11'" in (repository / 'mcp/pyproject.toml').read_text()
+        locked = subprocess.run(['uv', 'lock', '--offline', '--check', '--project', str(repository)],
+                                capture_output=True, text=True, check=False)
+        assert locked.returncode == 0, locked.stderr
+        repeated = runner.execute_build(repository, **options)
+        assert repeated['status'] == 'completed', repeated
+        assert (repository / '.build-count').read_text() == 'x'
+        assert run_git(repository, 'diff', '--cached', '--name-only').stdout.strip() == 'unrelated.txt'
 
 
 @pytest.fixture(params=["installed", "portable", "generated", "reference"])
@@ -303,14 +695,24 @@ def test_build_selection_uses_checkout_records_and_levels_not_other_tags(tmp_pat
     assert build_reader["select_build_check_summaries"](repository, target="absent") == []
 
 
-def test_git_summary_survives_missing_logs_and_ignores_checkout_summary_edits(tmp_path, build_reader):
+@pytest.mark.parametrize("moved", [False, True])
+def test_git_summary_survives_missing_logs_and_ignores_checkout_summary_edits(tmp_path, build_reader, moved):
     repository, _ = _versioned_repository(tmp_path)
     summary = _empty_summary()
     summary["checks"] = [{"kind": "source-check", "id": "original", "status": "passed", "result_id": "stable-original"}]
-    tag, path = _tag_summary(repository, "1.2.9b1", summary)
+    tag, path = _tag_summary(repository, "1.2.9b1", summary,
+                             receipt_root=".build" if moved else ".ceratops/build")
+    if moved:
+        original = path.read_bytes()
+        relative = path.relative_to(repository / ".build")
+        (repository / ".ceratops").mkdir(exist_ok=True)
+        (repository / ".build").rename(repository / ".ceratops/build")
+        path = repository / ".ceratops/build" / relative
+        assert path.read_bytes() == original
     path.with_name("check_summary.json").write_text("broken local bytes")
     selected = build_reader["select_build_check_summaries"](repository)[0]
     assert selected["summary"] == summary and selected["tag"] == tag
+    assert selected["receiptPath"].startswith(".build/" if moved else ".ceratops/build/")
     assert not (repository / ".git/ceratops/artifacts").exists()
     _tag_summary(repository, "1.2.9b2", None)
     selected = build_reader["select_build_check_summaries"](repository)[0]
@@ -321,7 +723,7 @@ def test_tagged_summary_hash_mismatch_blocks_reuse(tmp_path, build_reader):
     repository, _ = _versioned_repository(tmp_path)
     tag, path = _tag_summary(repository, "1.2.9b1", _empty_summary(), tagged=False)
     path.with_name("check_summary.json").write_text(json.dumps({**_empty_summary(), "checks": []}) + "\n\n")
-    assert run_git(repository, "add", ".build").returncode == 0
+    assert run_git(repository, "add", ".ceratops/build").returncode == 0
     assert run_git(repository, "commit", "-m", "broken summary link").returncode == 0
     assert run_git(repository, "tag", tag).returncode == 0
     with pytest.raises(ValueError, match="differs from its receipt"):
@@ -496,7 +898,7 @@ def test_versioned_receipt_rejects_changed_tested_artifact(tmp_path) -> None:
         required_targets=[target],
         attempt_id="attempt-beta-002",
     )
-    assert receipt["receiptPath"] == ".build/claims/1.2.4b1/build_receipt.json"
+    assert receipt["receiptPath"] == ".ceratops/build/claims/1.2.4b1/build_receipt.json"
     _write_versioned_outputs(repository, transaction, receipt)
     measured = storage.measure_versioned_artifact(
         transaction,
@@ -537,7 +939,7 @@ def test_versioned_completion_repeats_before_and_after_each_effect(tmp_path, mon
     done = completion.complete_versioned_artifacts(fresh)
     assert completion.complete_versioned_artifacts(fresh) == done
     assert run_git(repository, "rev-list", "--count", f"{checkpoint}..HEAD").stdout.strip() == "1"
-    assert not fresh.request_path.exists()
+    assert not (storage._artifact_store_path(repository, temporary=True) / transaction.release_bundle / transaction.version).exists()
     assert all(path.is_file() for path in done.artifact_receipts)
 
 
@@ -582,7 +984,7 @@ def test_versioned_completion_commits_only_results_and_binds_every_target(
     assert run_git(repository, "diff", "--cached", "--name-only").stdout.strip() == (
         unrelated.relative_to(repository).as_posix()
     )
-    assert not transaction.request_path.exists()
+    assert not transaction.version_root.exists()
     assert not (transaction.store / ".pending").exists()
     assert not (transaction.store / ".staging").exists()
     assert all(path.is_file() for path in completed.artifact_receipts)
@@ -604,7 +1006,10 @@ def test_versioned_completion_commits_only_results_and_binds_every_target(
 def test_versioned_fresh_instance_discovers_attempt_and_reuses_prepared_results(tmp_path) -> None:
     repository, checkpoint, transaction, prepared, _receipts = _prepared_versioned_completion(tmp_path)
     mtimes = {item.worktree_path: item.worktree_path.stat().st_mtime_ns for item in prepared}
-    request_bytes = transaction.request_path.read_bytes()
+    receipt_bytes = {item.worktree_path: item.raw for item in prepared}
+    # An old interrupted producer may have left its request beside passing files.
+    obsolete_request = transaction.version_root / "build_request.json"
+    obsolete_request.write_bytes(b"obsolete request data")
     fresh = _checkpoint_child(repository,
         "transaction=complete_artifact_builds.read_artifact_build(repo,repository='example/project',release_bundle='claims',"
         "version='1.2.5b1',required_targets=['python-3.14-linux','python-3.14-windows'])\n"
@@ -613,7 +1018,8 @@ def test_versioned_fresh_instance_discovers_attempt_and_reuses_prepared_results(
         "assert len(prepared)==2\n")
     assert fresh.returncode == 0, fresh.stderr
     assert fresh.stdout.strip() == transaction.attempt_id
-    assert transaction.request_path.read_bytes() == request_bytes
+    assert not obsolete_request.exists()
+    assert all(path.read_bytes() == raw for path, raw in receipt_bytes.items())
     assert all(path.stat().st_mtime_ns == mtime for path, mtime in mtimes.items())
     assert not (transaction.store.parent / "operations/artifact-versions").exists()
     assert not (transaction.store.parent / "locks/artifact-versions").exists()
@@ -622,25 +1028,49 @@ def test_versioned_fresh_instance_discovers_attempt_and_reuses_prepared_results(
         version=transaction.version, required_targets=transaction.required_targets,
         pre_test_commit=checkpoint,
     )
-    assert repeated.attempt_id != transaction.attempt_id
-    assert not any(path.exists() for path in mtimes)
-    # A fresh build also discards an uncommitted attempt after unrelated commits.
+    assert repeated.attempt_id == transaction.attempt_id
+    assert all(path.exists() for path in mtimes)
+    # An unrelated commit cannot discard the already checked package.
     assert run_git(repository, "commit", "--allow-empty", "-m", "unrelated").returncode == 0
     reused = storage.allocate_artifact_version(
         repository, repository=transaction.repository, release_bundle=transaction.release_bundle,
         version=transaction.version, required_targets=transaction.required_targets,
     )
-    assert reused.attempt_id != repeated.attempt_id
-    assert storage._build_request_record(reused)["preTestCommit"] is None
+    assert reused.attempt_id == repeated.attempt_id
+    assert reused.pre_test_commit == checkpoint
 
 
-def test_versioned_completion_needs_no_checkpoint_directory(tmp_path) -> None:
-    _repository, _checkpoint, transaction, prepared, _receipts = _prepared_versioned_completion(tmp_path)
+def test_versioned_completion_needs_no_checkpoint_directory(tmp_path, monkeypatch) -> None:
+    repository, _checkpoint, transaction, prepared, receipts = _prepared_versioned_completion(tmp_path)
     first = completion.complete_versioned_artifacts(transaction, prepared)
     second = completion.complete_versioned_artifacts(transaction, prepared)
     assert first == second
     assert not (transaction.store.parent / "operations/artifact-versions").exists()
     assert not (transaction.store.parent / "locks/artifact-versions").exists()
+    for _ in range(2):
+        reads = Mock(wraps=results.read_artifact_receipt_chain)
+        with monkeypatch.context() as patch:
+            patch.setattr(results, "read_artifact_receipt_chain", reads)
+            fresh = completion.read_artifact_build(
+                repository, repository=transaction.repository, release_bundle=transaction.release_bundle,
+                version=transaction.version, required_targets=transaction.required_targets,
+            )
+        assert [call.kwargs["expected"]["target"] for call in reads.call_args_list] == list(transaction.required_targets)
+        assert completion.complete_versioned_artifacts(fresh) == first
+    # No loaded record survives a later call. Damage to either target's retained
+    # bytes must still stop reopening, including the target read first.
+    for target in transaction.required_targets:
+        artifact = transaction.artifact_receipt(target).parent / receipts[target]["artifacts"][0]["path"]
+        original = artifact.read_bytes()
+        artifact.write_bytes(b"changed retained output")
+        try:
+            with pytest.raises(results.StepResultError, match="(size|SHA-256) mismatch"):
+                completion.read_artifact_build(
+                    repository, repository=transaction.repository, release_bundle=transaction.release_bundle,
+                    version=transaction.version, required_targets=transaction.required_targets,
+                )
+        finally:
+            artifact.write_bytes(original)
 
 
 def test_versioned_request_may_own_multiple_units_without_premature_cleanup(tmp_path) -> None:
@@ -649,7 +1079,7 @@ def test_versioned_request_may_own_multiple_units_without_premature_cleanup(tmp_
         release_bundle="other-unit", version="1.0.0", required_targets=["any"],
         pre_test_commit=checkpoint, attempt_id="other-unit-attempt")
     completion.complete_versioned_artifacts(transaction, prepared)
-    assert other.request_path.is_file()
+    assert other.target_output("any").is_dir()
     assert not (transaction.store.parent / "operations/artifact-versions").exists()
 
 
@@ -662,7 +1092,7 @@ def test_versioned_cleanup_failure_retries_without_repeating_completed_effects(t
         with pytest.raises(storage.OperationError, match="cleanup interrupted"):
             completion.complete_versioned_artifacts(transaction, prepared)
     final = run_git(repository, "rev-parse", "HEAD").stdout.strip()
-    assert transaction.request_path.exists()
+    assert transaction.version_root.is_dir()
     retained_root = storage._artifact_store_path(repository, worktree=True) / transaction.release_bundle / transaction.version
     mtimes = {path: path.stat().st_mtime_ns for path in retained_root.rglob("*") if path.is_file()}
     # Completed results are Git data; a cleanup retry must not need the mutable
@@ -680,9 +1110,8 @@ def test_versioned_cleanup_failure_retries_without_repeating_completed_effects(t
     assert fresh.stdout.strip() == final
     assert run_git(repository, "rev-parse", "HEAD").stdout.strip() == final
     assert prepared[0].worktree_path.read_bytes() == b"unrelated subsequent work"
-    assert all(path.stat().st_mtime_ns == mtime for path, mtime in mtimes.items()
-               if path != transaction.request_path)
-    assert not transaction.request_path.exists()
+    assert all(path.stat().st_mtime_ns == mtime for path, mtime in mtimes.items())
+    assert not transaction.version_root.exists()
     assert not (transaction.store.parent / "operations/artifact-versions").exists()
 
 
@@ -742,7 +1171,7 @@ def test_versioned_completion_resumes_effects_without_duplicate_commit(
         assert storage._artifact_tag_exists(
             repository, transaction.release_bundle, transaction.version
         )
-        assert transaction.request_path.is_file()
+        assert transaction.version_root.is_dir()
     monkeypatch.setattr(completion, name, original)
 
     completed = completion.complete_versioned_artifacts(transaction)
@@ -751,7 +1180,7 @@ def test_versioned_completion_resumes_effects_without_duplicate_commit(
     assert run_git(
         repository, "rev-list", "--count", f"{checkpoint}..{transaction.branch}"
     ).stdout.strip() == "1"
-    assert not transaction.request_path.exists()
+    assert not transaction.version_root.exists()
     assert run_git(
         repository, "rev-parse", f"refs/tags/{completed.tag}^{{commit}}"
     ).stdout.strip() == created
@@ -788,7 +1217,7 @@ def test_versioned_completion_rejects_changed_declared_inputs(tmp_path, change) 
     assert not storage._artifact_tag_exists(
         repository, transaction.release_bundle, transaction.version
     )
-    assert transaction.request_path.is_file()
+    assert transaction.version_root.is_dir()
 
 
 def test_versioned_completion_rejects_changed_prepared_result(tmp_path) -> None:
@@ -832,54 +1261,117 @@ def test_receipt_identities_require_release_bundle_without_an_old_name_alias(
         read(wrong)
 
 
-def test_build_recipe_and_independent_member_versions(tmp_path, capsys):
-    repository, _ = _worktree_build_case(tmp_path)
+@pytest.mark.parametrize("target,implicit_engine,second_target", [
+    ("native", False, None), ("android-arm64", True, None), ("linux", True, "windows"),
+])
+def test_build_recipe_and_independent_member_versions(tmp_path, capsys, target, implicit_engine, second_target):
+    repository, _ = _worktree_build_case(tmp_path, linked=target == 'native')
     path = repository / runner.DEFAULT_CONTRACT
     contract = json.loads(path.read_text())
     tool = contract["deliverables"]["packages"]["claims"]
+    contract["repository"]["tools"] = {
+        "python": {"executable": sys.executable}, "git": {"executable": "git"},
+    }
+    tool["actions"]["build"]["requires"]["tools"] = ["python", "git"]
     engine = json.loads(json.dumps(tool))
     engine.update({"root-dir": "engine", "project": "engine/pyproject.toml",
                    "additional-source-files": ["scripts/engine.py"]})
+    engine["version"] = {"file": "engine/pyproject.toml", "field": "project.version"}
     engine["actions"]["build"]["steps"][0]["run"][1] = "scripts/engine.py"
     contract["deliverables"]["packages"]["engine"] = engine
-    contract["repository"]["release-bundles"] = {"suite": {"members": [
+    contract["repository"]["release-bundles"] = {"suite": {"version": {"file": "suite.json", "field": "version"}, "members": [
         "deliverables.packages.claims", "deliverables.packages.engine"]}}
+    _write_fixture_bytes(repository, "suite.json", b'{"version":"2.0.0","kept":true}\n')
     _write_fixture_bytes(repository, "engine/pyproject.toml", b'[project]\nname="engine"\nversion="3.2.0"\n')
     engine_code = (repository / "scripts/build.py").read_text().replace(
         "pyproject.toml", "engine/pyproject.toml").replace(".build-count", ".engine-count")
     _write_fixture_bytes(repository, "scripts/engine.py", engine_code.encode())
+    if target == 'native':
+        _write_fixture_bytes(repository, 'engine/pyproject.toml',
+            b'[project]\nname="engine"\nversion="3.1.0"\nrequires-python=">=3.11"\n'
+            b'dependencies=["claims>=1.2,<2"]\n[tool.uv.sources]\nclaims={workspace=true}\n')
+        manifest = (repository / 'pyproject.toml').read_text().replace(
+            'version="1.2.19"', 'version="1.2.19"\ndependencies=["engine==3.1.0"]')
+        manifest = manifest.replace('members=["runtime", "mcp"]',
+                                    'members=["runtime", "mcp", "engine"]\n[tool.uv.sources]\nengine={workspace=true}')
+        (repository / 'pyproject.toml').write_text(manifest)
+        _write_fixture_bytes(repository, 'older/pyproject.toml',
+            b'[project]\nname="older"\nversion="1.0.0"\nrequires-python=">=3.11"\ndependencies=["claims==1.0.0"]\n')
+        contract['repository']['tools']['older-python'] = {'executable': sys.executable,
+            'version-from': {'file': 'older/pyproject.toml', 'key': 'project.requires-python'}}
+        locked = subprocess.run(['uv', 'lock', '--offline', '--project', str(repository)],
+                                capture_output=True, text=True, check=False)
+        assert locked.returncode == 0, locked.stderr
     with (repository / ".gitignore").open("a") as output:
         output.write(".engine-count\n")
     path.write_text(json.dumps(contract))
     assert run_git(repository, "add", ".").returncode == 0
     assert run_git(repository, "commit", "-m", "two independently versioned packages").returncode == 0
     requests = [
-        runner.OperationRequest("deliverables.packages.claims.actions.build", {"version": "1.4.0", "target": "native"}),
-        runner.OperationRequest("deliverables.packages.engine.actions.build", {"version": "3.2.0", "target": "native"}),
+        runner.OperationRequest("deliverables.packages.claims.actions.build", {"version": "1.4.0", "target": target}),
     ]
-    first = runner.execute_build(repository, requests, qualification_level="final", bundle_versions={"suite": "2.0.0"})
+    if not implicit_engine:
+        requests.append(runner.OperationRequest("deliverables.packages.engine.actions.build", {"version": "3.2.0", "target": target}))
+    if second_target:
+        requests.append(runner.OperationRequest(requests[0].operation, {"version": "1.4.0", "target": second_target}))
+    review = runner.execute_build(repository, requests, qualification_level="final", bundles=["suite"])
+    assert review["status"] == "version_decision_required", review
+    assert [item["reference"] for item in review["version_decisions"]] == [
+        *(["deliverables.packages.engine"] if implicit_engine else []), "repository.release-bundles.suite"]
+    assert not (repository / ".build-count").exists()
+    choices = {"repository.release-bundles.suite": {"version": "2.0.0"}}
+    if implicit_engine:
+        choices["deliverables.packages.engine"] = {"version": "3.2.0"}
+    first = runner.execute_build(repository, requests, qualification_level="final", bundles=["suite"], version_choices=choices)
     assert first["status"] == "completed", first
+    if target == 'native':
+        assert 'engine==3.2.0' in (repository / 'pyproject.toml').read_text()
+        assert 'claims==1.4.0' in (repository / 'runtime/pyproject.toml').read_text()
+        assert 'claims==1.0.0' in (repository / 'older/pyproject.toml').read_text()
+        source_commit = json.loads(pathlib.Path(first['build_receipts'][0]).read_text())['preTestCommit']
+        for name in ('pyproject.toml', 'engine/pyproject.toml', 'runtime/pyproject.toml', 'mcp/pyproject.toml', 'uv.lock'):
+            assert run_git(repository, 'show', source_commit + ':' + name).returncode == 0
     bundle = results.read_artifact_receipt_chain(repository, tag="bundles/suite/2.0.0",
-        expected=results.artifact_identity(repository.name, "bundles/suite", "2.0.0", "native"))
+        expected=results.artifact_identity(repository.name, "bundles/suite", "2.0.0", target))
     assert [member.identity["version"] for member in bundle.members] == ["1.4.0", "3.2.0"]
     original_engine = bundle.members[1].build_receipt.raw
     assert len({value.final_commit for value in bundle.members} | {bundle.final_commit}) == 1
     recipe = bundle.members[0].build_receipt.value
     assert recipe["commandsAndSettings"]["operation"] == requests[0].operation
     assert recipe["platformAndTools"]["runtimes"][0]["version"]
+    assert recipe["platformAndTools"]["tools"] == [
+        {"id": "step-1-tool-python", "version": recipe["platformAndTools"]["runtimes"][0]["version"]},
+    ]
     assert recipe["installationArtifactPath"] == recipe["artifacts"][0]["path"]
+    if second_target:
+        other = results.read_artifact_receipt_chain(repository, tag="bundles/suite/2.0.0",
+            expected=results.artifact_identity(repository.name, "bundles/suite", "2.0.0", second_target))
+        assert [member.identity["version"] for member in other.members] == ["1.4.0", "3.2.0"]
+        assert {member.identity["target"] for member in other.members} == {second_target}
+        repeated = runner.execute_build(repository, requests, qualification_level="final", bundles=["suite"])
+        assert repeated["status"] == "completed", repeated
+        assert (repository / ".engine-count").read_text() == "xx"
+        assert (repository / ".build-count").read_text() == "xx"
+        return
 
     (repository / "src/claims.py").write_text("VALUE = 'changed package'\n")
-    requests[0] = runner.OperationRequest(requests[0].operation, {"version": "1.4.1", "target": "native"})
-    second = runner.execute_build(repository, requests, qualification_level="final", bundle_versions={"suite": "2.0.1"})
+    requests[0] = runner.OperationRequest(requests[0].operation, {"version": "1.4.1", "target": target})
+    second = runner.execute_build(repository, requests, qualification_level="final", bundles=["suite"], version_choices={"repository.release-bundles.suite": {"version": "2.0.1"}})
     assert second["status"] == "completed", second
     newer = results.read_artifact_receipt_chain(repository, tag="bundles/suite/2.0.1",
-        expected=results.artifact_identity(repository.name, "bundles/suite", "2.0.1", "native"))
+        expected=results.artifact_identity(repository.name, "bundles/suite", "2.0.1", target))
     assert [member.identity["version"] for member in newer.members] == ["1.4.1", "3.2.0"]
     assert newer.members[1].build_receipt.raw == original_engine
     assert (repository / ".engine-count").read_text() == "x"
     assert (repository / ".build-count").read_text() == "xx"
-    repeated = runner.execute_build(repository, requests, qualification_level="final", bundle_versions={"suite": "2.0.1"})
+    assert json.loads((repository / "suite.json").read_text()) == {"version": "2.0.1", "kept": True}
+    bumped = runner.execute_build(repository, requests, qualification_level="final", bundles=["suite"],
+                                 version_choices={"repository.release-bundles.suite": {"bump": "minor"}})
+    assert bumped["status"] == "completed", bumped
+    assert bumped["bundles"][0]["version"] == "2.1.0"
+    assert (repository / ".engine-count").read_text() == "x"
+    assert (repository / ".build-count").read_text() == "xx"
+    repeated = runner.execute_build(repository, requests, qualification_level="final", bundles=["suite"])
     assert repeated["status"] == "completed", repeated
     assert repeated["bundles"][0]["decision"] == "reused"
     assert (repository / ".engine-count").read_text() == "x"
@@ -890,10 +1382,10 @@ def test_build_recipe_and_independent_member_versions(tmp_path, capsys):
     reference = "deliverables.packages.engine"
     tool["actions"]["build"]["uses-artifacts"] = [reference]
     path.write_text(json.dumps(contract))
-    assert run_git(repository, "add", "sdlc/sdlc.yml").returncode == 0
-    assert run_git(repository, "commit", "--only", "-m", "consume engine", "--", "sdlc/sdlc.yml").returncode == 0
+    assert run_git(repository, "add", ".ceratops/sdlc/sdlc.yml").returncode == 0
+    assert run_git(repository, "commit", "--only", "-m", "consume engine", "--", ".ceratops/sdlc/sdlc.yml").returncode == 0
     files = {reference: first["artifacts"][reference]}
-    request = runner.OperationRequest(requests[0].operation, {"version": "1.4.2", "target": "native"})
+    request = runner.OperationRequest(requests[0].operation, {"version": "1.4.2", "target": target})
     supplied = runner.execute_build(repository, [request], artifacts=files, qualification_level="final")
     assert supplied["status"] == "completed", supplied
     assert reference + ".actions.build" not in supplied["completed_operations"]
@@ -910,7 +1402,7 @@ def test_build_recipe_and_independent_member_versions(tmp_path, capsys):
     # the consumer and its explicitly supplied dependency.
     argv = ["--repo-root", str(repository), "--operation", request.operation,
             "--artifacts", json.dumps(files), "--parameter", "version=1.4.2",
-            "--parameter", "target=native", "--qualification-level", "final"]
+            "--parameter", "target=" + target, "--qualification-level", "final"]
     capsys.readouterr()
     for _ in range(2):
         assert runner.main(argv) == 0
@@ -931,10 +1423,10 @@ def test_grouped_completion_interruption(tmp_path, monkeypatch, effect):
     path = repository / runner.DEFAULT_CONTRACT
     contract = json.loads(path.read_text())
     contract["repository"]["release-bundles"] = {
-        "suite": {"members": ["deliverables.packages.claims"]}}
+        "suite": {"version": {"mode": "receipt-only"}, "members": ["deliverables.packages.claims"]}}
     path.write_text(json.dumps(contract))
-    assert run_git(repository, "add", "sdlc/sdlc.yml").returncode == 0
-    assert run_git(repository, "commit", "--only", "-m", "bundle", "--", "sdlc/sdlc.yml").returncode == 0
+    assert run_git(repository, "add", ".ceratops/sdlc/sdlc.yml").returncode == 0
+    assert run_git(repository, "commit", "--only", "-m", "bundle", "--", ".ceratops/sdlc/sdlc.yml").returncode == 0
     name = {"result-commit": "_create_result_commit", "artifact-receipt": "_write_version_artifact_receipts",
             "first-tag": "_create_artifact_tag", "second-tag": "_create_artifact_tag",
             "cleanup": "_remove_completed_build_temp"}[effect]
@@ -943,16 +1435,20 @@ def test_grouped_completion_interruption(tmp_path, monkeypatch, effect):
     with monkeypatch.context() as patch:
         patch.setattr(completion, name, Mock(wraps=getattr(completion, name), side_effect=sequence))
         with pytest.raises(KeyboardInterrupt, match="group interrupted"):
-            unexpected = runner.execute_build(repository, **options, bundle_versions={"suite": "2.0.0b1"})
+            unexpected = runner.execute_build(repository, **options, bundles=["suite"], version_choices={"repository.release-bundles.suite": {"version": "2.0.0b1"}})
             assert unexpected["status"] == "completed", json.dumps(unexpected, indent=2)
-    finished = runner.execute_build(repository, **options, bundle_versions={"suite": "2.0.0b1"})
+    original_records = {path: (path.read_bytes(), path.stat().st_mtime_ns)
+                        for path in (repository / ".ceratops/build").rglob("*.json")}
+    finished = runner.execute_build(repository, **options, bundles=["suite"], version_choices={"repository.release-bundles.suite": {"version": "2.0.0b1"}})
     assert finished["status"] == "completed", finished
-    repeated = runner.execute_build(repository, **options, bundle_versions={"suite": "2.0.0b1"})
+    repeated = runner.execute_build(repository, **options, bundles=["suite"], version_choices={"repository.release-bundles.suite": {"version": "2.0.0b1"}})
     assert repeated["status"] == "completed", repeated
     selected = results.read_artifact_receipt_chain(repository, tag="bundles/suite/2.0.0b1",
         expected=results.artifact_identity(repository.name, "bundles/suite", "2.0.0b1", "python-3.14-windows"))
     assert len(selected.members) == 1
     assert selected.members[0].final_commit == selected.final_commit
-    assert (repository / ".build-count").read_text() == ("xx" if effect == "result-commit" else "x")
+    assert (repository / ".build-count").read_text() == "x"
+    assert all((path.read_bytes(), path.stat().st_mtime_ns) == original
+               for path, original in original_records.items())
     assert len(run_git(repository, "tag", "--list").stdout.splitlines()) == 2
     assert not list((repository / ".git/ceratops/artifacts").rglob("build_request.json"))

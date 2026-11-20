@@ -27,8 +27,8 @@
       "$ref": "#/$defs/text"
     },
     "test_temporary_root": {
-      "description": "Repository-relative scratch parent passed explicitly to the generated Python test command.",
-      "$ref": "#/$defs/path"
+      "description": "SDLC parameter for the external task scratch parent passed explicitly to the generated Python test command.",
+      "const": "{temporary_root}"
     },
     "ruff_policy": {
       "description": "Required Ruff settings consumed by python_tool_configuration during generation and compatibility checks. Ruff expands selectors and ignores using the selected tool runtime.",
@@ -53,7 +53,7 @@
       "items": {"$ref": "#/$defs/coverageRequirement"}
     },
     "checks": {
-      "description": "Executable check selection and command data consumed by generate_repository_checks.contract_checks and the generated repository validator.",
+      "description": "Executable check selection, command and result input data used to generate individual SDLC source groups.",
       "type": "array",
       "minItems": 1,
       "items": {"$ref": "#/$defs/check"}
@@ -136,7 +136,10 @@
         "unless": {"type": "array", "items": {"$ref": "#/$defs/condition"}},
         "command": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/text"}},
         "cwd": {"$ref": "#/$defs/path"},
-        "exclusive": {"type": "boolean"}
+        "result-inputs": {
+          "type": "array", "minItems": 1, "uniqueItems": true,
+          "items": {"$ref": "#/$defs/path"}
+        }
       }
     }
   }

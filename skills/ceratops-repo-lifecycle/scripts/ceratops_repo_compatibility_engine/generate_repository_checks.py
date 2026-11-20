@@ -6,13 +6,12 @@ vendored/generated files are identified by Git attributes, never directory names
 """
 
 # Malformed target contracts are reported as RuntimeError to the transaction.
-# ruff: noqa: TRY004
 from __future__ import annotations
 
 import json
 import os
 import pathlib
-import pprint
+import re
 import shlex
 import subprocess
 import tomllib
@@ -287,7 +286,7 @@ def contract_checks(
                     "cwd": _safe_validation_path(
                         check["cwd"], "validation check cwd"
                     ).as_posix(),
-                    "exclusive": check.get("exclusive", False),
+                    "result-inputs": check.get("result-inputs", ["**"]),
                 }
             )
             tool = check["id"]
@@ -341,10 +340,7 @@ def contract_checks(
                         "--config-file",
                         configuration,
                     ]
-    exclusive_checks = [check for check in selected if check["exclusive"]]
-    if len(exclusive_checks) > 1:
-        raise RuntimeError("multiple exclusive repository validators matched")
-    return exclusive_checks or selected
+    return selected
 
 
 def default_markdown_files(repo_root: pathlib.Path) -> dict[str, str]:
@@ -443,10 +439,53 @@ def repository_workflow(
     *,
     markdown_files: Mapping[str, str],
     sdlc: Mapping[str, Any],
+    dependency_policy_only: bool = False,
 ) -> str | None:
-    """Maintain the generated steps while preserving repository-owned workflow sections."""
+    """Render commands and their working directories as native GitHub steps.
+
+    The generated workflow needs no SDLC runner. Repository-owned sections stay
+    intact, and an omitted command directory means the repository root even if
+    the workflow has a different job-wide default.
+    """
     workflow = repo_root / surface_path("workflow")
     previous = workflow.read_bytes().decode("utf-8") if workflow.is_file() else None
+    if dependency_policy_only:
+        # This job owns only the policy files. Preserve the application's steps
+        # and YAML bytes; an ambiguous jobs layout stops before any write.
+        if previous is None:
+            raise RuntimeError("Dependency refresh requires an existing repository workflow")
+        document = yaml.safe_load(previous)
+        jobs = document.get("jobs") if isinstance(document, dict) else None
+        if not isinstance(jobs, dict) or not jobs:
+            raise RuntimeError("Dependency refresh requires a nonempty workflow jobs mapping")
+        if any(isinstance(job, dict) and any(isinstance(step, dict) and step.get("id") == "renovate_node"
+               for step in job.get("steps", [])) for job in jobs.values()):
+            return None
+        if "dependency-configuration" in jobs:
+            raise RuntimeError("The workflow already owns a dependency-configuration job")
+        template = template_path("workflow").read_text(encoding="utf-8")
+        template = template.replace("__RENOVATE_VERSION__", load_compatibility_contract()["dependency_maintenance"]["renovate_version"])
+        policy_start = template.index("      - name: Set up Node.js for Renovate configuration checks")
+        policy_end = template.index("      - name: Upload validation evidence", policy_start)
+        checkout = next(line.strip() for line in template.splitlines()
+                        if line.strip().startswith("uses: actions/checkout@"))
+        job = ("  dependency-configuration:\n"
+               "    name: Dependency configuration\n"
+               "    runs-on: ubuntu-latest\n"
+               "    timeout-minutes: 90\n"
+               "    permissions:\n      contents: read\n"
+               "    steps:\n"
+               + "      - " + checkout + "\n"
+               + template[policy_start:policy_end].rstrip() + "\n")
+        source = previous.replace("\r\n", "\n")
+        match = re.search(r"(?m)^jobs:[ \t]*(?:#.*)?$", source)
+        if match is None:
+            raise RuntimeError("Dependency refresh requires block-style workflow jobs")
+        following = re.search(r"(?m)^[^ \t\r\n#][^\n]*:", source[match.end():])
+        jobs_end = match.end() + following.start() if following else len(source)
+        rendered = source[:jobs_end].rstrip() + "\n\n" + job + source[jobs_end:]
+        yaml.safe_load(rendered)
+        return rendered
     begin = "      # Begin generated repository steps"
     end = "      # End generated repository steps"
     if previous is not None and begin not in previous and end not in previous:
@@ -485,6 +524,7 @@ def repository_workflow(
             steps.extend([
                 f"      - name: {location.removeprefix(prefix)}",
                 "        shell: bash",
+                f"        working-directory: {json.dumps(step.get('cwd', '.'))}",
                 "        run: |",
                 f'          {command} 2>&1 | tee -a "$RUNNER_TEMP/repository-validation.log"',
             ])
@@ -565,6 +605,7 @@ def repository_workflow(
         ])
     runner = "windows-latest" if "{pwsh}" in commands else "ubuntu-latest"
     template = template_path("workflow").read_text(encoding="utf-8")
+    template = template.replace("__RENOVATE_VERSION__", load_compatibility_contract()["dependency_maintenance"]["renovate_version"])
     markers = ("__RUNNER__", "      # __SETUP_STEPS__", "      # __CHECK_STEPS__")
     if any(template.count(marker) != 1 for marker in markers):
         raise RuntimeError("CI workflow template markers are invalid")
@@ -584,6 +625,30 @@ def repository_workflow(
         raise RuntimeError("Generated repository step markers are out of order")
     generated_steps = rendered.split(begin + "\n", 1)[1].split(end + "\n", 1)[0]
     updated = previous[:start] + generated_steps.replace("\n", newline) + previous[stop:]
+    # These two named steps are owned by setup as well as the marked command
+    # block. Refresh them in place, keeping unrelated workflow text and comments.
+    # Missing steps are inserted immediately after the managed command block.
+    rendered_lines = rendered.splitlines(keepends=True)
+    for name in reversed(("Set up Node.js for Renovate configuration checks", "Check Renovate configuration")):
+        header = "      - name: " + name
+        source_start = next(index for index, line in enumerate(rendered_lines) if line.rstrip() == header)
+        source_end = next((index for index in range(source_start + 1, len(rendered_lines))
+                           if rendered_lines[index].startswith("      - ")
+                           or (rendered_lines[index].strip() and len(rendered_lines[index]) - len(rendered_lines[index].lstrip()) < 6)), len(rendered_lines))
+        block = "".join(rendered_lines[source_start:source_end]).replace("\n", newline)
+        lines = updated.splitlines(keepends=True)
+        locations = [index for index, line in enumerate(lines) if line.rstrip() == header]
+        if len(locations) > 1:
+            raise RuntimeError(f"Generated CI step is duplicated: {name}")
+        if locations:
+            target_start = locations[0]
+            target_end = next((index for index in range(target_start + 1, len(lines))
+                               if lines[index].startswith("      - ")
+                               or (lines[index].strip() and len(lines[index]) - len(lines[index].lstrip()) < 6)), len(lines))
+            updated = "".join(lines[:target_start]) + block + "".join(lines[target_end:])
+        else:
+            position = updated.index(end + newline) + len(end + newline)
+            updated = updated[:position] + newline + block + updated[position:]
     return updated if updated != previous else None
 
 
@@ -624,51 +689,35 @@ def direct_source_check(check: dict[str, object]) -> tuple[str, list[str]]:
     return tool, [tool, *arguments]
 
 
+def source_check_results(check: dict[str, object], tool: str) -> dict[str, object]:
+    """Bind generated check receipts to the files and tools the command reads."""
+    return {
+        "result-owner": "operation",
+        "product-inputs": check["result-inputs"],
+        "check-inputs": [".ceratops/sdlc/sdlc.yml", ".gitattributes"],
+        "dependencies": ["scripts/pyproject.toml", "scripts/uv.lock"] if tool == "uv" else [],
+        "tools": ["node", tool] if tool in {"npm", "pnpm"} else [tool],
+    }
+
+
 def validation_surfaces(
     repo_root: pathlib.Path,
-    *,
-    legacy_validator: bool = True,
-) -> tuple[str | None, list[str], dict[str, str]]:
-    """Plan generated repository checks and the files that support them."""
+) -> tuple[list[dict[str, object]], dict[str, str]]:
+    """Plan direct source checks and their supporting repository files."""
 
-    validator = repo_root / surface_path("validator")
     workflow = repo_root / surface_path("workflow")
-    for path, label in (
-        (validator, "repository validator"),
-        (workflow, "CI validation workflow"),
-    ):
-        if path.is_symlink() or (path.exists() and not path.is_file()):
-            raise RuntimeError(f"existing {label} must be a regular file: {path}")
+    if workflow.is_symlink() or (workflow.exists() and not workflow.is_file()):
+        raise RuntimeError(f"existing CI workflow must be a regular file: {workflow}")
 
     planned_paths = (
         {surface_path("workflow").as_posix()} if not workflow.is_file() else set()
     )
     checks = contract_checks(repo_root, planned_paths=planned_paths)
-    markdown_files = (
-        default_markdown_files(repo_root)
-        if not validator.is_file()
-        and not workflow.is_file()
-        and not any(check["exclusive"] for check in checks)
-        else {}
-    )
+    markdown_files = default_markdown_files(repo_root) if not workflow.is_file() else {}
     if markdown_files:
         checks = contract_checks(
             repo_root,
             package=json.loads(markdown_files["scripts/package.json"]),
             planned_paths=planned_paths,
         )
-    validator_text = None
-    if legacy_validator and not validator.is_file():
-        template = template_path("validator").read_text(encoding="utf-8")
-        marker = "__CHECK_DEFINITIONS__"
-        if template.count(marker) != 1:
-            raise RuntimeError("repository validator template marker is invalid")
-        validator_text = template.replace(
-            marker,
-            pprint.pformat(checks, sort_dicts=False, width=72),
-        )
-    # Report only checks we generated; preserved validators own their internals.
-    generated_checks = (
-        [str(check["id"]) for check in checks] if validator_text is not None or not legacy_validator else []
-    )
-    return validator_text, generated_checks, markdown_files
+    return checks, markdown_files

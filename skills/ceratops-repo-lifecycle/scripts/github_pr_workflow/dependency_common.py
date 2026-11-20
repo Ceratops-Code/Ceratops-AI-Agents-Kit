@@ -7,8 +7,9 @@ import pathlib
 import re
 import subprocess
 import sys
-from datetime import datetime, timezone
-from typing import Any, Iterable, cast
+from collections.abc import Iterable
+from datetime import UTC, datetime
+from typing import Any, cast
 
 RELEASE_BRANCH = "release/local"
 PR_FIELDS = ",".join(
@@ -74,7 +75,7 @@ class WorkflowError(RuntimeError):
 
 
 def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
 def run_command(
@@ -185,7 +186,7 @@ def scoped_blocker(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {
             "scope": "global",
-            "check": "preflight_blocker",
+            "check": "review_blocker",
             "message": "invalid blocker record",
         }
     result = dict(value)
@@ -194,7 +195,7 @@ def scoped_blocker(value: Any) -> dict[str, Any]:
 
 
 def blocker_applies_to_pr(value: Any, repo: str, number: int) -> bool:
-    """Return whether a validated preflight blocker gates one PR merge."""
+    """Return whether a validated review blocker gates one PR merge."""
 
     scope = blocker_scope(value)
     if scope == "global":

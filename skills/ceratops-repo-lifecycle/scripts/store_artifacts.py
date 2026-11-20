@@ -32,10 +32,9 @@ REPOSITORY_ID_RE = re.compile(
 )
 FULL_VERSION_RE = re.compile(
     r"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
-    r"(?:(?P<class>a|b)(?:0|[1-9][0-9]*))?"
+    r"(?:(?P<class>a|b|rc)(?:0|[1-9][0-9]*))?"
     r"(?:\+[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)*)?$"
 )
-ARTIFACT_REQUEST_SCHEMA = "ceratops-artifact-build-request.v1"
 
 
 class OperationError(RuntimeError):
@@ -52,23 +51,20 @@ class RecoveryRequired(OperationError):
 class ArtifactVersionAllocation:
     """Private temporary directory allocated before source versions are prepared.
 
-    The request describes this call's inputs. A later build of the same item
-    clears its unfinished directory before allocating fresh temporary output.
+    Identity stays in this object. A later build clears unfinished output of
+    the same item; completed receipts preserve work awaiting final publication.
     """
 
     repo_root: pathlib.Path
     repository: str
-    worktree_registration: str
     branch: str
     release_bundle: str
     version: str
     version_class: str
     attempt_id: str
-    allocation_commit: str
     required_targets: tuple[str, ...]
     declared_input_paths: tuple[str, ...]
     store: pathlib.Path
-    request_path: pathlib.Path
     version_root: pathlib.Path
     diagnostic_root: pathlib.Path
     lock_path: pathlib.Path
@@ -83,7 +79,7 @@ class ArtifactVersionAllocation:
 
     def receipt_path(self, target: str) -> str:
         _require_transaction_target(self, target)
-        base = f".build/{self.release_bundle}/{self.version}"
+        base = f".ceratops/build/{self.release_bundle}/{self.version}"
         return (
             f"{base}/build_receipt.json"
             if len(self.required_targets) == 1
@@ -92,7 +88,7 @@ class ArtifactVersionAllocation:
 
     def artifact_receipt(self, target: str) -> pathlib.Path:
         _require_transaction_target(self, target)
-        if self.version_root == self.request_path.parent:
+        if self.version_root == _artifact_store_path(self.repo_root, temporary=True) / self.release_bundle / self.version:
             retained = (self.store / "beta-stable" if self.branch == "release/local"
                         else _artifact_store_path(self.repo_root, worktree=True))
             return retained / self.release_bundle / self.version / target / "artifact-receipt.json"
@@ -268,7 +264,7 @@ def _validated_repository(value: object) -> str:
     return repository
 
 
-def _version_classification(version: object) -> tuple[str, str]:
+def _version_classification(version: object, *, qualification_level: str | None = None) -> tuple[str, str]:
     value = _require_identifier(
         version,
         label="full version",
@@ -276,6 +272,14 @@ def _version_classification(version: object) -> tuple[str, str]:
     )
     match = FULL_VERSION_RE.fullmatch(value)
     assert match is not None
+    if qualification_level is not None:
+        levels = ("alpha", "beta", "rc", "final")
+        current = {"a": "alpha", "b": "beta", "rc": "rc"}.get(match.group("class"), "final")
+        if levels.index(current) < levels.index(qualification_level):
+            suffix = {"alpha": "a1", "beta": "b1", "rc": "rc1", "final": ""}[qualification_level]
+            value = re.sub(r"(?:a|b|rc)\d+(?=\+|$)", suffix, value)
+            match = FULL_VERSION_RE.fullmatch(value)
+            assert match is not None
     return value, {"a": "alpha", "b": "beta"}.get(
         match.group("class"), "stable"
     )
@@ -378,25 +382,6 @@ def _store_relative(store: pathlib.Path, path: pathlib.Path) -> str:
     return path.relative_to(store).as_posix()
 
 
-def _read_transaction_record(path: pathlib.Path, label: str) -> dict[str, Any]:
-    try:
-        checked, info = sdlc_results._plain_path(path, label=label)
-        if info.st_size > sdlc_results.NEW_RECEIPT_BYTES:
-            raise RecoveryRequired(f"{label} is oversized.")
-        raw = checked.read_bytes()
-        value = json.loads(
-            raw,
-            object_pairs_hook=sdlc_results._unique_result_object,
-        )
-        if not isinstance(value, dict) or raw != canonical_json(value):
-            raise RecoveryRequired(f"{label} is not canonical JSON.")
-        return value
-    except RecoveryRequired:
-        raise
-    except (OSError, UnicodeError, ValueError, RecursionError, StepResultError) as exc:
-        raise RecoveryRequired(f"{label} is unreadable.") from exc
-
-
 def _write_transaction_record(
     path: pathlib.Path,
     value: Mapping[str, Any],
@@ -439,32 +424,6 @@ def _validated_relative_paths(values: object, *, label: str) -> tuple[str, ...]:
     return tuple(sorted(paths))
 
 
-def _build_request_record(allocation: ArtifactVersionAllocation) -> dict[str, Any]:
-    return {
-        "schema": ARTIFACT_REQUEST_SCHEMA,
-        "repository": allocation.repository,
-        "worktree": str(allocation.repo_root),
-        "worktreeRegistration": allocation.worktree_registration,
-        "branch": allocation.branch,
-        "releaseBundle": allocation.release_bundle,
-        "version": allocation.version,
-        "attemptId": allocation.attempt_id,
-        "allocationCommit": allocation.allocation_commit,
-        "preTestCommit": (
-            allocation.pre_test_commit
-            if isinstance(allocation, ArtifactVersionTransaction) else None
-        ),
-        "requiredTargets": list(allocation.required_targets),
-        "declaredInputPaths": list(allocation.declared_input_paths),
-    }
-
-
-def _require_build_request(allocation: ArtifactVersionAllocation) -> None:
-    record = _read_transaction_record(allocation.request_path, "Artifact build request")
-    if record != _build_request_record(allocation):
-        raise RecoveryRequired("Artifact build request no longer matches its inputs.")
-
-
 def _input_paths(repo_root: pathlib.Path, declared: Sequence[str]) -> tuple[str, ...]:
     if declared:
         return _validated_relative_paths(declared, label="declared input path")
@@ -476,33 +435,41 @@ def _input_paths(repo_root: pathlib.Path, declared: Sequence[str]) -> tuple[str,
         raise OperationError(f"Git could not list build inputs: {result.stderr.strip()}")
     # Result receipts are not source inputs for the next build.
     return tuple(sorted(path for path in result.stdout.split("\0")
-                        if path and not path.startswith(".build/")))
+                        if path and not path.startswith((".ceratops/build/", ".ceratops/results/"))))
 
 
 def _inputs_match_commit(root: pathlib.Path, commit: str, paths: Sequence[str]) -> bool:
     if not paths:
         return True
-    specifications = [f":(literal){path}" for path in paths]
-    dirty = False
+    owned = set(paths)
+    changed_paths: set[str] = set()
     for flags in ([], ["--cached"]):
         changed = subprocess.run(
-            ["git", "-C", str(root), "diff", *flags, "--quiet", commit, "--", *specifications],
-            capture_output=True, text=True, check=False,
+            ["git", "-C", str(root), "diff", *flags, "--name-only", "--no-renames", "-z", commit, "--"],
+            capture_output=True, text=True, encoding="utf-8", check=False,
         )
-        if changed.returncode not in {0, 1}:
+        if changed.returncode:
             raise OperationError(f"Git could not compare build inputs: {changed.stderr.strip()}")
-        dirty = dirty or changed.returncode == 1
+        changed_paths.update(changed.stdout.split("\0"))
     untracked = subprocess.run(
-        ["git", "-C", str(root), "ls-files", "--others", "--exclude-standard", "-z",
-         "--", *specifications], capture_output=True, text=True, check=False,
+        ["git", "-C", str(root), "ls-files", "--others", "--exclude-standard", "-z"],
+        capture_output=True, text=True, encoding="utf-8", check=False,
     )
     if untracked.returncode:
         raise OperationError(f"Git could not inspect build inputs: {untracked.stderr.strip()}")
-    return not dirty and not untracked.stdout
+    changed_paths.update(untracked.stdout.split("\0"))
+    # Literal Git pathspecs include directory descendants. Preserve that scope
+    # while keeping the command bounded, including deleted and new children.
+    return not any(
+        str(ancestor) in owned
+        for value in changed_paths if value
+        for path in (pathlib.PurePosixPath(value),)
+        for ancestor in (path, *path.parents)
+    )
 
 
 def _next_prerelease(version: str) -> str:
-    match = re.fullmatch(r"(.+[ab])(\d+)(\+.*)?", version)
+    match = re.fullmatch(r"(.+(?:a|b|rc))(\d+)(\+.*)?", version)
     if match is None:
         raise OperationError(
             f"Final artifact version {version} is occupied; choose another final version."
@@ -513,45 +480,39 @@ def _next_prerelease(version: str) -> str:
 def allocate_artifact_version(
     repo_root: pathlib.Path, *, repository: str, release_bundle: str, version: str,
     required_targets: Sequence[str], attempt_id: str | None = None,
-    declared_input_paths: Sequence[str] = (),
+    declared_input_paths: Sequence[str] = (), qualification_level: str | None = None,
 ) -> ArtifactVersionAllocation:
     """Allocate temporary output inside this checkout before preparing source versions.
 
     Exclusive mkdir is the allocation primitive. Only a collision increments an
-    alpha/beta number. Permission/I/O errors propagate. Before allocating, remove
+    prerelease number. Permission/I/O errors propagate. Before allocating, remove
     every unfinished build of this item in this checkout. A short allocation lock
     covers cleanup and allocation; other checkouts' directories are never removed.
     """
     root = _validated_worktree(pathlib.Path(repo_root))
     repository = _validated_repository(repository)
     unit = sdlc_results.receipt_storage_key({"storageKey": release_bundle})
-    version, classification = _version_classification(version)
+    version, classification = _version_classification(version, qualification_level=qualification_level)
     targets = _validated_targets(required_targets)
     paths = _input_paths(root, declared_input_paths)
     if attempt_id is not None:
         _require_identifier(attempt_id, label="attempt ID", pattern=LOGICAL_ID_RE)
     branch = _git_text(root, ["symbolic-ref", "--quiet", "--short", "HEAD"], label="branch")
-    registration = _git_text(root, ["rev-parse", "--absolute-git-dir"], label="Git registration")
-    head = _git_text(root, ["rev-parse", "HEAD"], label="allocation commit")
     store, lock_path = _artifact_infrastructure(root)
     temporary = _artifact_store_path(root, temporary=True)
     _build_directory(temporary / unit)
     with _locked_artifact_store(lock_path.with_name("allocation.lock")):
-        # A committed passing receipt means testing finished. Its remaining tags
+        # A passing receipt means testing finished. Its remaining commit, tags
         # or retained copy can still need completion after interruption; that is
         # completion of finished work, not another build of unfinished output.
-        result_directory = f".build/{unit}/{version}"
-        committed = set(_git_text(
-            root, ["ls-tree", "-r", "--name-only", "HEAD", "--", result_directory],
-            label="committed build results", single_line=False,
-        ).splitlines())
+        result_directory = f".ceratops/build/{unit}/{version}"
         receipt_paths = ({f"{result_directory}/build_receipt.json"} if len(targets) == 1 else
                          {f"{result_directory}/{target}/build_receipt.json" for target in targets})
-        if receipt_paths <= committed and (temporary / unit / version / "build_request.json").is_file():
+        if any((root / path).is_file() for path in receipt_paths) and (temporary / unit / version).is_dir():
             from complete_artifact_builds import read_artifact_build
             finished = read_artifact_build(
                 root, repository=repository, release_bundle=unit, version=version,
-                required_targets=targets,
+                required_targets=targets, allow_partial=True, declared_input_paths=paths,
             )
             if (finished.declared_input_paths == paths
                     and _inputs_match_commit(root, finished.pre_test_commit, paths)):
@@ -561,7 +522,7 @@ def allocate_artifact_version(
             # them would make a new build read results for bytes just removed.
             # Committed history stays in Git and occupies its original version.
             if FULL_VERSION_RE.fullmatch(obsolete.name):
-                records = root / ".build" / unit / obsolete.name
+                records = root / ".ceratops/build" / unit / obsolete.name
                 if records.exists() and not _artifact_tag_exists(root, unit, obsolete.name):
                     result_path = records.relative_to(root).as_posix()
                     committed_results = _git_text(
@@ -575,21 +536,21 @@ def allocate_artifact_version(
                             root, ["reset", "--quiet", "HEAD", "--", result_path],
                             label="discarded staged build results", single_line=False,
                         )
-                        _remove_versioned_tree(records, root / ".build" / unit,
+                        _remove_versioned_tree(records, root / ".ceratops/build" / unit,
                                                label="Uncommitted unfinished build results")
             _remove_versioned_tree(obsolete, temporary / unit, label="Unfinished build output")
         while True:
             directory = temporary / unit / version
             allocation = ArtifactVersionAllocation(
-                repo_root=root, repository=repository, worktree_registration=registration,
+                repo_root=root, repository=repository,
                 branch=branch, release_bundle=unit, version=version, version_class=classification,
-                attempt_id=attempt_id or str(uuid.uuid4()), allocation_commit=head, required_targets=targets,
-                declared_input_paths=paths, store=store, request_path=directory / "build_request.json",
+                attempt_id=attempt_id or str(uuid.uuid4()), required_targets=targets,
+                declared_input_paths=paths, store=store,
                 version_root=directory, diagnostic_root=directory / ".diagnostics",
                 lock_path=lock_path,
             )
             if (_artifact_tag_exists(root, unit, version)
-                    or (root / ".build" / unit / version).exists()):
+                    or (root / ".ceratops/build" / unit / version).exists()):
                 version = _next_prerelease(version)
                 continue
             # Tags name versions repository-wide. Reserve by directory under the
@@ -610,19 +571,14 @@ def allocate_artifact_version(
             except FileExistsError:
                 version = _next_prerelease(version)
                 continue
-            _write_transaction_record(
-                allocation.request_path, _build_request_record(allocation),
-                replace=False, label="artifact build request",
-            )
             return allocation
 
 
 def bind_artifact_inputs(
     allocation: ArtifactVersionAllocation, *, pre_test_commit: str,
 ) -> ArtifactVersionTransaction:
-    """Record committed checkpoint B before exposing any target output directory."""
+    """Bind the source commit in memory before exposing target output directories."""
     checkpoint = _validated_commit(allocation.repo_root, pre_test_commit)
-    _require_build_request(allocation)
     if isinstance(allocation, ArtifactVersionTransaction):
         if checkpoint != allocation.pre_test_commit:
             raise RecoveryRequired("Bound build inputs cannot be changed for this version.")
@@ -633,10 +589,6 @@ def bind_artifact_inputs(
         transaction = ArtifactVersionTransaction(**allocation.__dict__, pre_test_commit=checkpoint)
         if not _inputs_match_commit(allocation.repo_root, checkpoint, allocation.declared_input_paths):
             raise OperationError("Build inputs must be committed before writing artifacts.")
-        _write_transaction_record(
-            allocation.request_path, _build_request_record(transaction),
-            replace=True, label="artifact build request",
-        )
     for target in transaction.required_targets:
         _build_directory(transaction.target_output(target))
     return transaction
@@ -701,7 +653,6 @@ def measure_versioned_artifact(
     """Measure one owned artifact before tests consume its exact bytes."""
 
     _require_transaction_target(transaction, target)
-    _require_build_request(transaction)
     measured = measure_build_file(transaction.target_output(target), descriptor)
     if transaction.version not in pathlib.PurePosixPath(measured["path"]).name:
         raise OperationError("Artifact filename must contain the full version.")

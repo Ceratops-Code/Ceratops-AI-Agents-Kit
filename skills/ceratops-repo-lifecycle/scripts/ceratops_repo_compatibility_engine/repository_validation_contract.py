@@ -3,7 +3,7 @@
 Compatibility application and contract review use this same loader. It validates
 every entry before repository-specific selection, including unmatched conditions
 and source-registry references. Commands remain data until the compatibility
-apply helper renders the target validator and CI workflow.
+apply helper renders the target SDLC groups and CI workflow.
 """
 
 # Contract validation reports malformed data as RuntimeError to its callers.
@@ -43,15 +43,6 @@ def _relative_path(value: str) -> bool:
     )
 
 
-def is_test_temporary_root(value: str) -> bool:
-    """Accept a literal subdirectory of the checkout, never a glob or variable."""
-    return bool(
-        _relative_path(value) and pathlib.PurePosixPath(value.replace("\\", "/")).parts
-        and value == value.strip() and not value.startswith("-")
-        and not any(character in value for character in "*?{}$%")
-    )
-
-
 def load_validation_contract() -> dict[str, Any]:
     """Validate the contract schema, unique IDs, safe paths, and evidence scopes."""
 
@@ -69,8 +60,6 @@ def load_validation_contract() -> dict[str, Any]:
         error = errors[0]
         pointer = "/" + "/".join(str(part) for part in error.absolute_path)
         raise RuntimeError(f"{CONTRACT_PATH.name} {pointer}: {error.message}")
-    if not is_test_temporary_root(contract["test_temporary_root"]):
-        raise RuntimeError("test_temporary_root must name a literal repository subdirectory")
     coverage_seen: set[str] = set()
     for requirement in contract["coverage_requirements"]:
         requirement_id = requirement["id"]
@@ -94,7 +83,7 @@ def load_validation_contract() -> dict[str, Any]:
         if check_id in seen:
             raise RuntimeError(f"duplicate repository-validation check id: {check_id}")
         seen.add(check_id)
-        paths = [check["cwd"]]
+        paths = [check["cwd"], *check.get("result-inputs", [])]
         for condition in [*check["when"], *check.get("unless", [])]:
             if condition["kind"] == "path-any":
                 paths.extend(condition["value"])

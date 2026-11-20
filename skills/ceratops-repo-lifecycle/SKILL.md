@@ -9,7 +9,7 @@ description: Route Ceratops repository lifecycle work to action references for r
 
 Route repository compatibility, local Git, GitHub, release publication, and
 deployment lifecycle work to the narrowest action reference. Keep repository
-state transitions in the skill while `sdlc/sdlc.yml` describes repository
+state transitions in the skill while `.ceratops/sdlc/sdlc.yml` describes repository
 setup, validation and tests, plus deliverable validation, tests, deployment
 and publication.
 
@@ -63,6 +63,14 @@ and publication.
   The operation runner completes or reuses required builds for the requested
   action. A structured `steps.handoff` is pending work for the named lifecycle,
   not evidence that validation, installation, or publication completed.
+- When Build, Promote or Ship returns `version_decision_required`, recommend
+  each requested deliverable or bundle version from its current version and
+  returned Git diff, stating the resulting version and reason. Ask the user only
+  when compatibility intent is unclear. Run the returned `next_command`,
+  replacing version placeholders with the recommendations; keep its
+  `--version-source-commit` and pass choices through `--version-choices`.
+  Let the command write version files.
+  This status requests a model decision; report command failures separately.
 - Reject SDLC v1 through v3 in the shared loader and require the repository to
   upgrade its contract before any operation executes. Installer release-number
   differences alone do not establish incompatibility.

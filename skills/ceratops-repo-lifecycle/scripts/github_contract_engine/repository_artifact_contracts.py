@@ -17,7 +17,7 @@ from ceratops_repo_compatibility_engine.sdlc_contract_validation import (
     load_contract,
 )
 
-SDLC_CONTRACT = pathlib.Path("sdlc/sdlc.yml")
+SDLC_CONTRACT = pathlib.Path(".ceratops/sdlc/sdlc.yml")
 ARTIFACT_IDENTITY_SCHEMA = (
     pathlib.Path(__file__).resolve().parents[2]
     / "references"
@@ -90,9 +90,9 @@ def resolve_repository_artifact_contracts(
     if not contract_path.exists():
         return explicit
     if contract_path.is_symlink() or not contract_path.is_file():
-        raise ValueError("sdlc/sdlc.yml must be a regular file")
+        raise ValueError(".ceratops/sdlc/sdlc.yml must be a regular file")
     try:
         load_contract(contract_path)
     except SdlcContractError as exc:
-        raise ValueError(f"invalid sdlc/sdlc.yml: {exc}") from exc
+        raise ValueError(f"invalid .ceratops/sdlc/sdlc.yml: {exc}") from exc
     return explicit

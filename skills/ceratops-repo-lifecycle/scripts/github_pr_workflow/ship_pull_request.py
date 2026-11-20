@@ -22,8 +22,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--repo-root", type=pathlib.Path, default=pathlib.Path.cwd())
     parser.add_argument("--repo", help="OWNER/REPO; inferred from the checkout")
-    parser.add_argument("--diagnostic-output", type=pathlib.Path,
-                        help="Stable task-owned file for complete failure details.")
+    parser.add_argument("--report-directory", type=pathlib.Path,
+                        help="Task temporary directory; the writer chooses files under _operation-reports/<operation>/.")
     parser.add_argument("--head-branch", required=True)
     parser.add_argument("--base-branch", default="main")
     parser.add_argument("--remote-name", default="origin")

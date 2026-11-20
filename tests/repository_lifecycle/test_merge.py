@@ -152,7 +152,7 @@ def test_dependency_rebase_wait_batches_and_reuses_commit_comparisons(
     monkeypatch.setattr(queue.time, "sleep", lambda seconds: now.__setitem__(0, now[0] + seconds))
     monkeypatch.setattr(queue, "branch_freshness", compare)
     monkeypatch.setattr(queue, "fetch_pr_batch", refresh)
-    result, blockers = queue.wait_for_dependabot_rebases(
+    result, blockers = queue.wait_for_dependency_rebases(
         details, wait_seconds=30, interval_seconds=15
     )
     assert now[0] <= 30
@@ -182,7 +182,7 @@ def test_dependency_rebase_wait_skips_sleep_for_current_or_failed_evidence(
             queue, "branch_freshness",
             lambda *_, status=status, **kwargs: {"status": status, "message": "comparison unavailable"},
         )
-        _, blockers = queue.wait_for_dependabot_rebases({
+        _, blockers = queue.wait_for_dependency_rebases({
             ("owner/repo", 1): {"state": "OPEN", "author": "dependabot[bot]"},
         })
         assert bool(blockers) == (status == "failed")
@@ -1075,7 +1075,7 @@ def dependency_automation(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatc
     return queue, root, report, call
 
 
-@pytest.mark.parametrize("phase", ["preflight", "finalize"])
+@pytest.mark.parametrize("phase", ["review", "finalize"])
 @pytest.mark.parametrize("custom", [False, True])
 def test_dependency_automation_public_entrypoint_keeps_scope_options_and_reports(dependency_automation: Any, monkeypatch: pytest.MonkeyPatch, phase: str, custom: bool) -> None:
     queue, root, report, call = dependency_automation
@@ -1085,7 +1085,7 @@ def test_dependency_automation_public_entrypoint_keeps_scope_options_and_reports
     if phase == "finalize":
         options += ["--approved-pr", "https://github.com/scope-owner/repo/pull/1", "--admin", "--wait-seconds", "7"]
     elif custom:
-        options.append("--retarget-dependabot-prs")
+        options.append("--retarget-dependency-prs")
     def handler(args: argparse.Namespace) -> int:
         assert args.org == "scope-owner" and args.output == selected
         assert args.snapshot_helper == root / "dependabot-repository-queue-snapshot.py"
@@ -1096,20 +1096,20 @@ def test_dependency_automation_public_entrypoint_keeps_scope_options_and_reports
             assert args.sync_helper == root / "sync-local-repo-checkouts.py"
         else:
             assert not final.exists()
-            assert args.retarget_dependabot_prs
+            assert args.retarget_dependency_prs
         selected.write_text(json.dumps(report(phase)))
         return 0
-    monkeypatch.setattr(queue, phase, handler)
+    monkeypatch.setattr(queue, "prepare_dependency_review" if phase == "review" else phase, handler)
     for _ in range(2):
         selected.write_text("stale selected result")
         queue.failure_partial_path(selected).write_text("stale partial")
-        if phase == "preflight":
+        if phase == "review":
             final.write_text("stale final result")
         assert call(phase, *options) == 0
         assert json.loads(selected.read_text()) == report(phase)
 
 
-@pytest.mark.parametrize("phase", ["preflight", "finalize"])
+@pytest.mark.parametrize("phase", ["review", "finalize"])
 @pytest.mark.parametrize("failure", ["absent", "malformed", "error", "blocked", "before", "after", "scope", "arguments", "unwritable"])
 def test_dependency_automation_failure_boundaries_preserve_current_results(dependency_automation: Any, monkeypatch: pytest.MonkeyPatch, phase: str, failure: str, capsys: pytest.CaptureFixture[str]) -> None:
     queue, root, report, call = dependency_automation
@@ -1126,7 +1126,7 @@ def test_dependency_automation_failure_boundaries_preserve_current_results(depen
         if failure == "error":
             raise OSError("specific failure evidence")
         return 1 if failure == "blocked" else 0
-    monkeypatch.setattr(queue, phase, handler)
+    monkeypatch.setattr(queue, "prepare_dependency_review" if phase == "review" else phase, handler)
     if failure == "scope":
         (root / "github-repository-scopes.json").write_text("{}")
     if failure == "unwritable":
@@ -1146,7 +1146,7 @@ def test_dependency_automation_failure_boundaries_preserve_current_results(depen
         assert not queue.failure_partial_path(output).exists()
 
 
-@pytest.mark.parametrize("phase", ["preflight", "finalize"])
+@pytest.mark.parametrize("phase", ["review", "finalize"])
 @pytest.mark.parametrize("target_name", ["output", "partial", "final", "final_partial"])
 @pytest.mark.parametrize("after", [False, True])
 def test_dependency_automation_interrupted_retirement_converges(dependency_automation: Any, monkeypatch: pytest.MonkeyPatch, phase: str, target_name: str, after: bool) -> None:
@@ -1166,7 +1166,7 @@ def test_dependency_automation_interrupted_retirement_converges(dependency_autom
                 original(path, *args, **kwargs)
             raise KeyboardInterrupt
         original(path, *args, **kwargs)
-    monkeypatch.setattr(queue, phase, lambda args: 0)
+    monkeypatch.setattr(queue, "prepare_dependency_review" if phase == "review" else phase, lambda args: 0)
     with monkeypatch.context() as scoped:
         scoped.setattr(pathlib.Path, "unlink", unlink)
         assert call(phase) == 130
@@ -1220,7 +1220,7 @@ def test_contract_requires_merge_only_and_remediates_exact_flags(
     for name, value in expected.items():
         assertion = next(a for a in rule["assertions"] if a["path"].endswith("/" + name))
         assert assertion["expected"] is value and "when" not in assertion
-    repo = {"fork": True, "archived": False, **expected}
+    repo = {"fork": True, "archived": False, "delete_branch_on_merge": False, **expected}
     observed = {"repo": repo, "repository": {"repo": repo}}
     assert compare_states(observed, desired)["findings"][0]["level"] == "PASS"
     repo[setting] = not expected[setting]

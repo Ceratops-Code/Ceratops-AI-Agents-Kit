@@ -1,6 +1,6 @@
 """Structural compatibility and explicit runner result and scratch probes.
 
-The structural checker never runs the repository aggregate or tests. Ruff's
+The structural checker never runs the repository's check groups or tests. Ruff's
 read-only settings commands enforce the shared rule and Python-target policy. Optional
 result probes run controlled commands only in a caller-owned result directory;
 structural success alone is not acceptance of reusable test results.
@@ -25,6 +25,7 @@ import tomllib
 from collections.abc import Mapping
 from typing import Any, TypedDict
 
+import psutil
 import yaml
 
 from .compatibility_contract import load_compatibility_contract, template_path
@@ -35,11 +36,9 @@ from .generate_repository_checks import (
 )
 from .generate_test_script import discover_python_tests
 from .python_tool_configuration import ruff_policy_errors
-from .repository_validation_contract import (
-    is_test_temporary_root,
-    load_validation_contract,
-)
+from .repository_validation_contract import load_validation_contract
 from .sdlc_contract_validation import (
+    latest_sdlc_version,
     operation_category,
     operation_entries,
     read_contract,
@@ -58,11 +57,12 @@ class CompatibilityResult(TypedDict):
 
 
 def _test_temporary_root_errors(
-    root: pathlib.Path, entries: Mapping[str, Mapping[str, Any]], runner: str,
+    entries: Mapping[str, Mapping[str, Any]], runner: str,
 ) -> list[str]:
     """Check the declared Python runner arguments without running tests."""
     errors = []
     option = "--temporary-root"
+    expected = load_validation_contract()["test_temporary_root"]
     for location, operation in entries.items():
         if operation_category(location) not in {"pre-build-checks", "post-build-checks"}:
             continue
@@ -75,11 +75,10 @@ def _test_temporary_root_errors(
                 for index, arg in enumerate(argv)
                 if arg == option or arg.startswith(option + "=")
             ]
-            if len(values) == 1 and is_test_temporary_root(values[0]):
-                path = root / values[0].replace("\\", "/")
-                if not any(part.is_symlink() or part.is_junction() for part in (path, *path.parents) if part != root):
-                    continue
-            errors.append(f"{location}: {runner} requires one {option} naming a directory inside the checkout.")
+            # Whole-argument substitution supplies this path at execution time.
+            if values == [expected] and option in argv:
+                continue
+            errors.append(f"{location}: {runner} requires one {option} followed by {expected} as a separate argument.")
     return errors
 
 
@@ -162,20 +161,23 @@ def _direct_source_errors(root: pathlib.Path, entries: Mapping[str, Mapping[str,
     for check in contract_checks(root):
         name = check["id"]
         _, command = direct_source_check(check)
-        # Required default commands or configured variants identified by their
-        # actual module, package script or script filename, not their group name.
-        identity = command[command.index("python") + 1:] if "python" in command else command
-        if identity[0] == "-m":
-            identity = identity[:2]
-        elif identity[0] in {"npm", "pnpm"}:
-            identity = [identity[0], *identity[-2:]]
+        # Permit target-specific flags and scan paths after the check identity.
+        # Executable and ordered arguments must both identify the real check.
+        if command[0] == "uv":
+            entrypoint = command.index("python") + 1
+            identity_length = entrypoint + (2 if command[entrypoint] == "-m" else 1)
+            if name == "ruff":
+                identity_length += 1
+        elif "-File" in command:
+            identity_length = command.index("-File") + 2
         else:
-            identity = identity[:1]
+            identity_length = len(command) if command[0] in {"npm", "pnpm"} else 1
+        identity = command[:identity_length]
         if not any(
             name in group.get("validation-tools", [])
             and group.get("check-results", {}).get("result-owner") == "operation"
             and len(group.get("steps", [])) == 1
-            and all(token in group["steps"][0].get("run", []) for token in identity)
+            and group["steps"][0].get("run", [])[:len(identity)] == identity
             for group in groups
         ):
             errors.append(f"SDLC v5 requires a recorded source check for {name}")
@@ -493,8 +495,6 @@ def validate_ceratops_compatibility(
             and bool(python_tests)
             and test_runner_selected
         )
-        if name == "validator" and sdlc and sdlc["version"] >= 5:
-            continue
         if (required or name in present) and (error := _regular_file_error(root, paths[name])):
             errors.append(error)
     if not _regular_file_error(root, paths["workflow"]):
@@ -551,40 +551,22 @@ def validate_ceratops_compatibility(
     if "sdlc" in present and not _regular_file_error(root, paths["sdlc"]):
         errors.extend(sdlc_errors)
         if sdlc:
-            # The shared loader has already accepted a schema-valid supported
-            # SDLC declaration; compatibility requirements are version-neutral.
             errors.extend(_validation_coverage_errors(root, sdlc, validation_contract))
-            errors.extend(_test_temporary_root_errors(root, entries, test_runner_relative))
-            expected = load_compatibility_contract()["runtime"]["project"]
-            # uv supports project discovery from the script path and explicit
-            # project selection for existing repository commands.
-            validator_commands = [
-                ["uv", "run", "--locked", surfaces["validator"]["path"]],
-                ["uv", "run", "--project", expected, "--locked", "python", surfaces["validator"]["path"]],
-            ]
-            commands = [
-                step["run"]
-                for name, entry in entries.items()
-                if operation_category(name) == "pre-build-checks"
-                for step in entry.get("steps", [])
-                if "run" in step
-            ]
-            if sdlc["version"] >= 5:
+            errors.extend(_test_temporary_root_errors(entries, test_runner_relative))
+            if sdlc["version"] == latest_sdlc_version():
                 errors.extend(_direct_source_errors(root, entries))
-                if any(surfaces["validator"]["path"] in command for command in commands):
-                    errors.append("SDLC v5 source checks must declare their commands directly.")
-            elif not any(command in commands for command in validator_commands):
-                errors.append("SDLC must invoke the repository validator through its locked uv project")
+            else:
+                errors.append("Ceratops compatibility requires the current SDLC version.")
             tests = [
                 entry
                 for name, entry in entries.items()
                 if operation_category(name) in {"pre-build-checks", "post-build-checks"}
+                and not entry.get("validation-tools")
             ]
             if not tests:
                 errors.append("SDLC must declare repository tests or an explicit no-op")
             if python_tests and not any(
-                "run" in step and step["run"] not in validator_commands
-                and not entry.get("validation-tools")
+                "run" in step
                 for entry in tests for step in entry.get("steps", [])
             ):
                 errors.append("detected Python tests require an executable SDLC tests operation")
@@ -625,33 +607,15 @@ def _probe_command_evidence(root: pathlib.Path, result: subprocess.CompletedProc
     return detail
 
 
-def _wait_for_scratch_probe_worker(pid: int) -> None:
-    """Wait for the probe's own worker to release every inherited handle."""
+def _wait_for_scratch_probe_processes(pid: int | None, windows_children: list[psutil.Process]) -> None:
+    """Wait for the probe's worker and its Windows launchers to close their handles."""
     if sys.platform == "win32":
-        import ctypes
-        from ctypes import wintypes
-
-        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-        open_process = kernel.OpenProcess
-        open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-        open_process.restype = wintypes.HANDLE
-        wait = kernel.WaitForSingleObject
-        wait.argtypes = [wintypes.HANDLE, wintypes.DWORD]
-        wait.restype = wintypes.DWORD
-        close = kernel.CloseHandle
-        close.argtypes = [wintypes.HANDLE]
-        close.restype = wintypes.BOOL
-        handle = open_process(0x00100000, False, pid)  # SYNCHRONIZE only.
-        if not handle:
-            error = ctypes.get_last_error()
-            if error == 87:  # The known worker already exited.
-                return
-            raise ctypes.WinError(error)
-        try:
-            if wait(handle, 10_000) != 0:
-                raise TimeoutError(f"Scratch probe worker {pid} did not exit")
-        finally:
-            close(handle)
+        _, alive = psutil.wait_procs(windows_children, timeout=10)
+        if alive:
+            owners = ", ".join(str(process.pid) for process in alive)
+            raise TimeoutError(f"Scratch probe processes did not exit: {owners}")
+        return
+    if pid is None:
         return
 
     deadline = time.monotonic() + 10
@@ -743,6 +707,7 @@ def _probe_test_scratch(root: pathlib.Path, probe: pathlib.Path, runner_relative
 
     child = [sys.executable, "-c", worker, str(ready), str(release)]
     interrupted = invocation("scratch-interrupted", child)
+    windows_children: list[psutil.Process] = []
     with subprocess.Popen(
         interrupted, cwd=root, env=environment,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -751,6 +716,14 @@ def _probe_test_scratch(root: pathlib.Path, probe: pathlib.Path, runner_relative
             deadline = time.monotonic() + 10
             while not ready.is_file() and launcher.poll() is None and time.monotonic() < deadline:
                 time.sleep(0.02)
+            if sys.platform == "win32" and launcher.poll() is None:
+                # A venv redirector can still hold scratch handles after its
+                # Python worker exits. Capture this probe's tree before killing
+                # the launcher, when Windows still reports their relationship.
+                try:
+                    windows_children = psutil.Process(launcher.pid).children(recursive=True)
+                except psutil.NoSuchProcess:
+                    pass
             if not ready.is_file():
                 launcher.kill()
                 stdout, stderr = launcher.communicate(timeout=5)
@@ -768,9 +741,8 @@ def _probe_test_scratch(root: pathlib.Path, probe: pathlib.Path, runner_relative
             if launcher.poll() is None:
                 launcher.kill()
             launcher.wait(timeout=5)
-            if ready.is_file():
-                _, pid = json.loads(ready.read_text(encoding="utf-8"))
-                _wait_for_scratch_probe_worker(pid)
+            worker_pid = json.loads(ready.read_text(encoding="utf-8"))[1] if ready.is_file() else None
+            _wait_for_scratch_probe_processes(worker_pid, windows_children)
     start_fresh("scratch-worker-exited")
     if scratch.exists() or sentinel.read_text(encoding="utf-8") != "keep":
         raise ValueError(f"Managed runner did not reclaim only abandoned scratch: {scratch}")

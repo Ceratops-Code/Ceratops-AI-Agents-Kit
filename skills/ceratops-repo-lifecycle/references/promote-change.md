@@ -115,15 +115,15 @@ does not change this action's current installation route.
 
 ### Complete failure details
 
-Add `--diagnostic-output FILE` to the promotion command. FILE is one stable
-caller-selected path under
-`<repo-parent>/tmp/<repo-name>/<calling-worktree-name>/`, such as
-`_promote_failure.json`; reuse it on retries. A separate top-level Ship uses a
-different file. Composed Ship receives the original request's path and owner.
-Keep `--result-file` on its own path; its outcome/receipt contract is unchanged.
+Add `--report-directory TASK_TEMP` to the promotion command. TASK_TEMP is
+`<repo-parent>/tmp/<repo-name>/<calling-worktree-name>/`. The writer chooses
+`TASK_TEMP/_operation-reports/promote/failures.json`. Separate top-level Ship
+reports use their own operation directory; composed Ship retains the original
+request's directory and operation. Retries replace the same report.
+`--result-file PATH` is a separate explicit export outside `_operation-reports`.
 
-The direct workflow and both operation execution functions forward this path.
-`command.py` writes complete secret-redacted failure details there before
+The direct workflow and both operation execution functions forward TASK_TEMP.
+`command.py` atomically writes complete secret-redacted failure details before
 returning a short error and `diagnostic_output`. Successful test/build result
 files are referenced, never copied or deleted by report cleanup. Existing
 complete child reports are referenced unchanged; the child's helper owns their
@@ -191,7 +191,23 @@ abandonment/replacement and worktree removal rather than matching-work success.
    The helper accepts only `deliverables.<kind>.<name>.actions.install`,
    prepares the requested work, completes its checks/builds in the task worktree,
    and installs only after the guarded release update. Installation uses the
-   accepted commit and exact returned artifacts.
+   accepted commit and exact returned artifacts. For an Install action
+   declaring `install-inputs: accepted-build`, Build also returns the accepted
+   receipt identity. Promotion passes it to Install automatically along with
+   `--parameter target=TARGET --parameter destination=DESTINATION`; these values
+   come from the requested build platform and installation directory. The
+   installer receives that receipt's package and recorded dependency files.
+   A standalone installation of the same version uses `uv run --no-project
+   --python "PYTHON_RUNTIME" python "SKILL_ROOT/scripts/repository_operation.py"
+   --repo-root REPO --operation INSTALL --parameter version=VERSION
+   --parameter target=TARGET --parameter destination=DESTINATION`, with
+   `PYTHON_RUNTIME` from this skill's runtime manifest, `INSTALL` from the
+   repository's Install declaration, and `VERSION` from the requested completed
+   build. `--parameter tag=TAG` can replace `version=VERSION`. This path consumes
+   accepted files without invoking a builder or test runner. An unavailable or
+   mismatched receipt stops before the destination changes. Installer results
+   include the installed version and destination; failure to report them does
+   not establish that installation failed.
    Explicit missing locations are errors;
    v4/v5 tests require declared commands, handoffs, or reasoned no-ops.
 4. For composed shipping, use `--ship-after-promotion`, one optional
@@ -212,10 +228,12 @@ abandonment/replacement and worktree removal rather than matching-work success.
    and helper-owned state. When a recorded target diverges from the new target,
    preserve every prior unselected source without cleanup authority and begin
    the new scope; a same-name source explicitly selected at the new target may
-   replace its old record after the normal containment checks. Recover a
-   missing source automatically only when its `deleting` state and recorded
-   commit ancestry prove an interrupted helper deletion; a missing `retained`
-   source blocks.
+   replace its old record after the normal containment checks. The
+   pending-work manager removes saved entries for absent branches
+   automatically, without warnings or filesystem cleanup. Existing changed or
+   dirty branches retain their current checks.
+   A Git lookup failure leaves the record unchanged
+   and remains an error.
 7. On a shipping blocker, retain the scope, branches, worktrees, and checkpoints
    for resume. Terminal shipping owns finalization and selected-work cleanup;
    it leaves a worktree and branch untouched when the worktree's parent chain
@@ -239,17 +257,17 @@ Use `--result-file PATH` outside the repository to atomically retain the
 JSON outcome, operation receipts and phase durations. The
 helper records successful and failed attempts without replaying operations.
 
-Inside the caller's task temp tree, the shared operation-report writer adds
-`temporary_operation_report` ownership metadata. Reports explicitly retained
-outside that namespace keep their original payload and are not automatically
-deleted.
-Normal successful SDLC operations automatically remove obsolete unsuccessful
-reports with matching operation IDs in that task tree, including reports saved
-under earlier filenames. Partial completion preserves unresolved operations and
-the original error. A newly published failure keeps only its current snapshot
-for the same owner and original requested-operation set. Accepted results and successful
-reports remain outside this automatic retirement; their explicit finalization
-is unchanged. Cleanup never substitutes a model judgment or replays an effect.
+With `--report-directory`, the writer also saves the operation outcome in its
+dedicated directory. Successful outcomes replace `result.json`. Unfinished
+outcomes use `result-<operation-set-digest>.json`, so another attempt for the same
+work replaces that file. No ownership marker or scan of other task files is used.
+Normal successful SDLC operations remove matching unsuccessful reports from
+`_operation-reports` only. Partial completion updates `unresolved_operations`
+and preserves the original error. The writer removes abandoned staging files
+after writers stop. Accepted test/build records remain in their own stores.
+Explicit `--result-file` exports are never included in this automatic cleanup,
+regardless of the temporary-folder setting; their explicit finalizer is unchanged.
+Cleanup never substitutes a model judgment or replays an effect.
 
 When a single-step installation is handed back to the caller, the result's
 `report_completion` descriptor supplies its normal return command and answer
@@ -308,6 +326,11 @@ artifacts, and pending-work state. Success prints `OK`; failure reports
   reasons.
 
 ### Output Contract
+
+The promotion result carries checks from the existing runner: each check
+names its operation, status and original saved result reference. Reused local
+results retain their original result identity and execution date. A ready
+promotion-only result confirms the release update; it does not claim installation.
 
 Report only:
 

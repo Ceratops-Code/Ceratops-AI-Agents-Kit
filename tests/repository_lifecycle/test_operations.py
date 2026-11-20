@@ -71,7 +71,7 @@ RECEIPT = {
                     {
                         "id": "unit",
                         "status": "passed",
-                        "path": ".test-results/groups/unit.json",
+                        "path": ".ceratops/results/groups/unit.json",
                         "sha256": "2" * 64,
                     }
                 ],
@@ -131,7 +131,7 @@ def test_canonical_operation_result_rejects_incomplete_artifact() -> None:
 
 
 def test_live_sdlc_selects_validation_and_tests_for_every_install() -> None:
-    document = contracts.load_contract(ROOT / "sdlc/sdlc.yml")
+    document = contracts.load_contract(ROOT / ".ceratops/sdlc/sdlc.yml")
     assert document["version"] in contracts.sdlc_schema_paths()
     installs = (
         "deliverables.skills.ceratops-repo-lifecycle.actions.install",
@@ -153,13 +153,15 @@ def test_live_sdlc_selects_validation_and_tests_for_every_install() -> None:
         assert operation.check_results is not None
         assert operation.check_results["result-owner"] == "operation"
         assert len(operation.steps) == 1
-    assert operations[-1].steps[0].argv == (
+    assert operations[-1].steps[0].argv[:-2] == (
         "uv",
         "run", "--project", "scripts",
         "--locked", "python",
         "scripts/testing/run-tests.py",
         "--auto",
     )
+    assert operations[-1].steps[0].argv[-2] == "--temporary-root"
+    assert pathlib.Path(operations[-1].steps[0].argv[-1]).is_absolute()
 
 
 def _step(script: str, *arguments: str) -> dict[str, object]:
@@ -179,7 +181,7 @@ def _app(actions: dict[str, object]) -> dict[str, object]:
     complete = {"pre-build-checks": {"check-groups": {"source": _no_op()}}, "install": _no_op(), **actions}
     return {
         "root-dir": ".",
-        "manifest": "sdlc/sdlc.yml",
+        "manifest": ".ceratops/sdlc/sdlc.yml",
         "build-after": [],
         "actions": complete,
     }
@@ -206,7 +208,7 @@ def test_sdlc_template_is_a_schema_valid_empty_skeleton(tmp_path: pathlib.Path) 
     assert list(groups) == ["tests"]
     assert "no-op" in groups["tests"]
     assert "deliverables" not in document
-    live = contracts.load_contract(ROOT / "sdlc" / "sdlc.yml")
+    live = contracts.load_contract(ROOT / ".ceratops/sdlc" / "sdlc.yml")
     assert live["version"] == 5
     entries = contracts.operation_entries(live)
     expected = {
@@ -249,6 +251,7 @@ def test_sdlc_template_is_a_schema_valid_empty_skeleton(tmp_path: pathlib.Path) 
                 "--locked", "python",
                 "scripts/testing/run-tests.py",
                 "--auto",
+                "--temporary-root", "{temporary_root}",
             ]
         },
     ]
@@ -260,7 +263,7 @@ def test_sdlc_template_is_a_schema_valid_empty_skeleton(tmp_path: pathlib.Path) 
     assert "repository.actions.pre-build-checks.check-groups.tests" in validation
 
 
-def test_absent_sdlc_section_is_a_successful_no_op(tmp_path: pathlib.Path) -> None:
+def test_optional_operation_requires_an_existing_sdlc_contract(tmp_path: pathlib.Path) -> None:
     result = subprocess.run(
         [
             sys.executable,
@@ -273,8 +276,8 @@ def test_absent_sdlc_section_is_a_successful_no_op(tmp_path: pathlib.Path) -> No
         text=True,
         check=False,
     )
-    assert result.returncode == 0, result.stderr
-    assert all(item["status"] == "no_op" for item in json.loads(result.stdout)["results"])
+    assert result.returncode == 1
+    assert "Required SDLC contract is missing" in json.loads(result.stderr)["message"]
     write_sdlc_contract(tmp_path)
     missing_operation = "deliverables.apps.missing.actions.install"
     missing = run_operation_cli(tmp_path, missing_operation)
@@ -330,6 +333,10 @@ def test_deploy_operation_requires_and_expands_exact_declared_parameters(
         **_step("parameter.py", "{base_revision}"),
         "parameters": ["base_revision"],
     }
+    values = runner._collect_operation_parameters(strict, runner.OperationRequest(
+        "deliverables.apps.strict.actions.install", {"base_revision": "a b;literal"}))
+    assert runner._substitute_command_parameters(["tool", "{base_revision}", "prefix-{base_revision}"], values) == (
+        "tool", "a b;literal", "prefix-{base_revision}")
     write_sdlc_contract(
         tmp_path,
         deliverables={
@@ -342,6 +349,7 @@ def test_deploy_operation_requires_and_expands_exact_declared_parameters(
     for parameters, conditional, message in (
         ((), (), "missing base_revision"),
         (("base_revision=x", "unexpected=x"), (), "unexpected unexpected"),
+        (("base_revision=x", "temporary_root=outside"), (), "unexpected temporary_root"),
         (("base_revision=x",), ("base_revision=y",), "supplied more than once"),
         (("base_revision=x", "base_revision=y"), (), "Duplicate"),
     ):
@@ -373,6 +381,12 @@ def test_deploy_operation_requires_and_expands_exact_declared_parameters(
     )
     assert result.returncode == 0
     assert (tmp_path / "value.txt").read_text() == "literal"
+    write_sdlc_contract(tmp_path, deliverables={"apps": {"strict": _app({"install": {
+        **_step("parameter.py", "{temporary_root}"), "parameters": ["temporary_root"],
+    }})}})
+    result = run_operation_cli(tmp_path, "deliverables.apps.strict.actions.install",
+                               parameters=("temporary_root=outside",))
+    assert result.returncode == 1 and "cannot declare temporary_root" in result.stderr
 
 
 @pytest.mark.parametrize(
@@ -1028,7 +1042,7 @@ def test_repository_bootstrap_resolves_platform_launcher_and_preserves_exit_stat
     executable.chmod(0o755)
     prepare_script_environment(tmp_path)
     if source == "live":
-        contract = contracts.load_contract(ROOT / "sdlc" / "sdlc.yml")
+        contract = contracts.load_contract(ROOT / ".ceratops/sdlc" / "sdlc.yml")
     else:
         materializer = importlib.import_module(
             "ceratops_repo_compatibility_engine.apply_ceratops_compatibility"
@@ -1647,3 +1661,162 @@ def test_repository_path_rename_saves_a_failure_report_before_returning(
     assert retained["message"] == "simulated write failure"
     assert (repo / "old.py").read_bytes() == b"source"
     assert not (repo / "new.py").exists()
+
+
+
+INSTALLER_PROBE = """import hashlib,json,os,pathlib,sys
+if sys.argv[1] == 'file':
+    values=json.loads(pathlib.Path(sys.argv[2]).read_text())
+else:
+    values=dict(zip(('artifact_receipt','package_file','installer_dependencies','destination','version','tag','target'),sys.argv[2:],strict=True))
+    values['installer_dependencies']=json.loads(values['installer_dependencies'])
+    values['operation']='deliverables.packages.claims.actions.install'
+fault=os.environ.get('CERATOPS_TEST_INSTALL_FAILURE')
+if fault == 'before':
+    print('interrupted before installation',file=sys.stderr); sys.exit(17)
+package=pathlib.Path(values['package_file']); content=package.read_bytes()
+assert pathlib.Path(values['artifact_receipt']).is_file()
+assert all(pathlib.Path(name).is_file() for name in values['installer_dependencies'])
+destination=pathlib.Path(values['destination']); destination.mkdir(parents=True,exist_ok=True)
+installed=destination/'installed.bin'
+if not installed.exists() or installed.read_bytes() != content:
+    installed.write_bytes(content)
+    count=destination/'effects'; count.write_text(count.read_text()+'x' if count.exists() else 'x')
+(destination/'inputs.json').write_text(json.dumps(values,sort_keys=True))
+if fault == 'after':
+    print('interrupted after installation',file=sys.stderr); sys.exit(18)
+if fault == 'report':
+    print('{interrupted report'); sys.exit(0)
+print(json.dumps({'schema':'ceratops-deployment-result.v1','status':'passed',
+    'version':values['version'],'destination':str(destination),'target':values['target'],
+    'artifact':{'type':'python-wheel','path':package.name,'size':len(content),'sha256':hashlib.sha256(content).hexdigest()}}))
+"""
+
+
+@pytest.mark.parametrize("input_mode", ["arguments", "file"])
+@pytest.mark.parametrize("entrypoint", ["callable", "cli"])
+def test_accepted_package_install_inputs(tmp_path, monkeypatch, input_mode, entrypoint):
+    """Install consumes the requested receipt, including dependencies, without Build."""
+    import hashlib
+    from unittest.mock import Mock, patch
+    from tests.repository_lifecycle.test_sdlc_handoffs import (
+        _new_receipt_fixtures, _versioned_repository, _write_fixture_bytes,
+    )
+
+    repo, _commit = _versioned_repository(tmp_path)
+    reference = "deliverables.packages.claims"
+    operation = reference + ".actions.install"
+    key, target = "members/packages/claims", "python-3.14-windows"
+    _write_fixture_bytes(repo, "scripts/install.py", INSTALLER_PROBE.encode())
+    arguments = (["{install_input_file}"] if input_mode == "file" else [
+        "{artifact_receipt}", "{package_file}", "{installer_dependencies}",
+        "{destination}", "{version}", "{tag}", "{target}"])
+    forbidden = {"requires": {"tools": []}, "steps": [{"run": [sys.executable, "-c", "raise SystemExit('Install must not build or test')"]}]}
+    install = {"requires": {"tools": []}, "install-inputs": "accepted-build",
+               "parameters": ["target", "destination"], "result-schema": "ceratops-deployment-result.v1",
+               "steps": [{"run": [sys.executable, "scripts/install.py", input_mode, *arguments]}]}
+    contract = {"version": 5, "kind": "ceratops-sdlc", "repository": {"tools": {},
+                "actions": {"pre-build-checks": {"check-groups": {"source": forbidden}}}},
+                "deliverables": {"packages": {"claims": {
+                    "root-dir": "src", "project": "pyproject.toml", "build-after": [],
+                    "artifact": {"type": "python-wheel", "distribution": "claims", "output-directory": "dist", "filename-pattern": "*.whl"},
+                    "actions": {"build": forbidden, "post-build-checks": {"check-groups": {"contents": forbidden}}, "install": install}}}}}
+    _write_fixture_bytes(repo, ".ceratops/sdlc/sdlc.yml", json.dumps(contract).encode())
+    assert not contracts.validation_errors(contract)
+    for field, value in [("install-inputs", True), ("parameters", ["target"]), ("result-schema", "ceratops-builder-output")]:
+        changed = json.loads(json.dumps(contract))
+        changed["deliverables"]["packages"]["claims"]["actions"]["install"][field] = value
+        assert contracts.validation_errors(changed)
+    assert run_git(repo, "add", ".").returncode == 0
+    assert run_git(repo, "commit", "-m", "package installer").returncode == 0
+    accepted = []
+    for version in ("1.2.3b1", "1.2.4b1"):
+        source = tmp_path / version
+        source.mkdir()
+        _, build, _, _, artifact, _ = _new_receipt_fixtures(source, version=version, target=target, required_targets=[target])
+        for identity in (build["identity"], artifact["identity"]):
+            identity.pop("releaseBundle")
+            identity["storageKey"] = key
+        old_path = build["receiptPath"]
+        build["receiptPath"] = old_path.replace(".ceratops/build/claims/", f".ceratops/build/{key}/")
+        build["committedResultPaths"] = [build["receiptPath"] if name == old_path else name for name in build["committedResultPaths"]]
+        build["preTestCommit"] = run_git(repo, "rev-parse", "HEAD").stdout.strip()
+        encoded = results.encode_new_receipt(build)
+        _write_fixture_bytes(repo, build["receiptPath"], encoded)
+        _write_fixture_bytes(repo, build["supportingFiles"][0]["path"], b'{"status":"passed"}\n')
+        assert run_git(repo, "add", ".").returncode == 0
+        assert run_git(repo, "commit", "-m", "accepted " + version).returncode == 0
+        artifact["finalCommit"] = run_git(repo, "rev-parse", "HEAD").stdout.strip()
+        artifact["buildReceipt"].update(path=build["receiptPath"], size=len(encoded), sha256=hashlib.sha256(encoded).hexdigest())
+        store = runner.store_artifacts._artifact_store_path(repo, worktree=True) / key / version / target
+        for name, content in {
+            build["artifacts"][0]["path"]: f"claims-{version}-py3-none-any.whl".encode(),
+            build["dependencies"][0]["artifacts"][0]["path"]: b"converter-0.4.0.whl",
+            build["supportingFiles"][1]["path"]: b'{"installed":true,"status":"passed"}\n',
+            build["supportingFiles"][2]["path"]: b"sanitized fixture log\n",
+        }.items():
+            _write_fixture_bytes(store, name, content)
+        _write_fixture_bytes(store, "artifact-receipt.json", results.encode_new_receipt(artifact))
+        tag = key + "/" + version
+        assert run_git(repo, "tag", tag).returncode == 0
+        accepted.append({"operation": reference + ".actions.build", "identity": build["identity"], "tag": tag})
+
+    older = accepted[0]
+    destination = tmp_path / "installed version with spaces"
+    parameters = {"target": target, "destination": str(destination), "version": older["identity"]["version"]}
+    request = runner.OperationRequest(operation, parameters)
+    prepared = runner.prepare_operations(repo, [request])[0]
+    expected = dict(prepared.installation)
+    assert expected["tag"] == older["tag"] and len(expected["installer_dependencies"]) == 1
+    assert expected == runner.prepare_operations(repo, [runner.OperationRequest(operation, {
+        "target": target, "destination": str(destination)})], accepted_builds=[older])[0].installation
+    # An interrupted command-input write is discarded on fresh preparation.
+    if prepared.install_input_file:
+        prepared.install_input_file.write_bytes(b'{unfinished')
+        prepared = runner.prepare_operations(repo, [request])[0]
+        assert json.loads(prepared.install_input_file.read_text()) == expected
+        with patch.object(runner, "run_progress_command", Mock(side_effect=KeyboardInterrupt)):
+            with pytest.raises(KeyboardInterrupt):
+                runner.execute_prepared_operation(prepared)
+        assert not prepared.install_input_file.exists() and not destination.exists()
+
+    for fault in ("before", "after", "report", "none", "none"):
+        monkeypatch.setenv("CERATOPS_TEST_INSTALL_FAILURE", fault)
+        if entrypoint == "cli":
+            command = run_operation_cli(repo, operation, parameters=tuple(f"{name}={value}" for name, value in parameters.items()))
+            outcome = json.loads(command.stdout if command.returncode == 0 else command.stderr)
+        else:
+            outcome = runner.execute_build(repo, [request])
+        wanted = "completed" if fault == "none" else "result_invalid" if fault == "report" else "operation_failed"
+        assert outcome["status"] == wanted, outcome
+        if fault == "before":
+            assert not destination.exists()
+        else:
+            assert json.loads((destination / "inputs.json").read_text()) == expected
+            assert (destination / "effects").read_text() == "x"
+        if input_mode == "file":
+            assert not prepared.install_input_file.exists()
+    missing_destination = tmp_path / "must not be created"
+    base = {"target": target, "destination": str(missing_destination)}
+    with pytest.raises((runner.OperationError, results.StepResultError), match="explicit version"):
+        runner.prepare_operations(repo, [runner.OperationRequest(operation, base)])
+    with pytest.raises((runner.OperationError, results.StepResultError)):
+        runner.prepare_operations(repo, [runner.OperationRequest(operation, {**base, "version": "9.9.9b1"})])
+    with pytest.raises(runner.OperationError, match="differs"):
+        runner.prepare_operations(repo, [request], accepted_builds=[accepted[1]])
+    with pytest.raises(runner.OperationError, match="files differ"):
+        runner.prepare_operations(repo, [request], artifacts={reference: ["unrelated.txt"]})
+    package = pathlib.Path(expected["package_file"])
+    original = package.read_bytes()
+    package.write_bytes(b"changed package")
+    with pytest.raises(results.StepResultError):
+        runner.prepare_operations(repo, [runner.OperationRequest(operation, {**base, "tag": older["tag"]})])
+    package.write_bytes(original)
+    receipt = pathlib.Path(expected["artifact_receipt"])
+    original = receipt.read_bytes()
+    receipt.unlink()
+    with pytest.raises(results.StepResultError):
+        runner.prepare_operations(repo, [runner.OperationRequest(operation, {**base, "tag": older["tag"]})])
+    receipt.write_bytes(original)
+    assert not missing_destination.exists()
+    assert (destination / "effects").read_text() == "x"

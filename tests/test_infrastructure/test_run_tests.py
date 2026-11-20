@@ -20,8 +20,8 @@ HEAD = "2" * 40
 @pytest.mark.parametrize(
     "target",
     [
-        "tests/test_infrastructure/test_repository_validator.py::test_runtime_dependencies_supply_timezones_without_an_os_database",
-        "tests/test_infrastructure/test_repository_validator.py",
+        "tests/test_infrastructure/test_repository_entrypoints.py::test_runtime_dependencies_supply_timezones_without_an_os_database",
+        "tests/test_infrastructure/test_repository_entrypoints.py",
     ],
 )
 def test_explicit_targets_collect_and_run_only_requested_cases(
@@ -233,7 +233,7 @@ def test_sdlc_passes_requested_test_context_to_checks(
     monkeypatch.setenv("GITHUB_ACTIONS", "false")
     repo = tmp_path / "repo"
     repo.mkdir()
-    (repo / "sdlc").mkdir()
+    (repo / ".ceratops/sdlc").mkdir(parents=True)
     record = tmp_path / "test-context.json"
     contract = {
         "version": 4,
@@ -271,7 +271,7 @@ def test_sdlc_passes_requested_test_context_to_checks(
                 }}}, },
         },
     }
-    (repo / "sdlc/sdlc.yml").write_text(json.dumps(contract), encoding="utf-8")
+    (repo / ".ceratops/sdlc/sdlc.yml").write_text(json.dumps(contract), encoding="utf-8")
     for command in (
         ["git", "init", "-b", "release/local"],
         ["git", "add", "."],
@@ -1307,7 +1307,7 @@ def test_committed_diff_reports_unmapped_retired_configuration(
     """A mapped addition does not conceal an unknown deleted input."""
     runner = test_runner_module
     execution = DeterministicExecution(
-        runner, b"D\0deploy/deploy.yml\0A\0sdlc/sdlc.yml\0"
+        runner, b"D\0deploy/deploy.yml\0A\0.ceratops/sdlc/sdlc.yml\0"
     )
     managed = ROOT / runner.DEFAULT_DIAGNOSTIC_PATH
     existing = managed.read_bytes() if managed.exists() else None
@@ -1331,7 +1331,7 @@ def test_committed_diff_reports_unmapped_retired_configuration(
         "repository-operations", "repository-promotion", "repository-shipping",
         "sdlc-handoffs",
     ]
-    assert {item["path"] for item in result["selections"]} == {"sdlc/sdlc.yml"}
+    assert {item["path"] for item in result["selections"]} == {".ceratops/sdlc/sdlc.yml"}
     assert not execution.final_pytest
 
 

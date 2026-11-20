@@ -145,7 +145,7 @@ VALIDATION_EXECUTABLE_FIELDS = frozenset(
         "def:check.unless",
         "def:check.command",
         "def:check.cwd",
-        "def:check.exclusive",
+        "def:check.result-inputs",
         "def:packageScript.kind",
         "def:packageScript.manager",
         "def:packageScript.value",

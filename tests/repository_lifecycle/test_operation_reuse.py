@@ -15,6 +15,7 @@ import sys
 import time
 import xml.etree.ElementTree as ET
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 
@@ -79,7 +80,7 @@ print(json.dumps({'schema':'ceratops-builder-output','status':'passed',
     'installationArtifactPath':destination.name, 'check_summary':summary}))
 '''.replace('REFERENCES', repr(references)).replace('DEPENDENCIES', repr(dependencies))
     (root / "scripts/product.py").write_text(source)
-    (root / "pyproject.toml").write_text('[project]\nname="fixture"\nversion="1.0.0"\n'.replace("\n", chr(10)))
+    (root / "pyproject.toml").write_text('[project]\nname="fixture"\nversion="1.0.0b1"\n'.replace("\n", chr(10)))
     (root / ".gitignore").write_text(".order\n.outputs/\n.fault\n")
 
     def action(verb, name):
@@ -103,11 +104,12 @@ print(json.dumps({'schema':'ceratops-builder-output','status':'passed',
         record: dict[str, Any] = {"root-dir": name, "additional-source-files": ["scripts/product.py"], "build-after": [references["bridge"]] if name == "desktop" else [],
                   "artifact": {"type": "archive", "output-directory": ".outputs", "filename-pattern": "*.bin"},
                   "actions": {"pre-build-checks": {"check-groups": {'source': fixture_with_tools(_no_op()), 'tests': fixture_with_tools(_no_op())}}, "build": build}}
+        record["version"] = {"file": f"{name}/pyproject.toml", "field": "project.version"}
         (root / name).mkdir()
-        (root / name / "pyproject.toml").write_text(f'[project]\nname="{name}"\nversion="1.0.0"\n'.replace("\n", chr(10)))
+        (root / name / "pyproject.toml").write_text(f'[project]\nname="{name}"\nversion="1.0.0b1"\n'.replace("\n", chr(10)))
         if kind == "packages":
             record["project"] = f"{name}/pyproject.toml"
-            (root / record["project"]).write_text(f'[project]\nname="{name}"\nversion="1.0.0"\n')
+            (root / record["project"]).write_text(f'[project]\nname="{name}"\nversion="1.0.0b1"\n')
         else:
             record["actions"]["install"] = action("install", name) if name == "desktop" else fixture_with_tools(_no_op())
         if kind == "mcp-servers":
@@ -120,7 +122,7 @@ print(json.dumps({'schema':'ceratops-builder-output','status':'passed',
                     "lifecycle": "ceratops-skill-lifecycle", "action": name_of_action, "inputs": {"skill": name}}}]}
         if kind in {"apps", "mcp-servers"}:
             record["manifest"] = f"{name}/pyproject.toml"
-            (root / record["manifest"]).write_text(f'[project]\nname="{name}"\nversion="1.0.0"\n')
+            (root / record["manifest"]).write_text(f'[project]\nname="{name}"\nversion="1.0.0b1"\n')
         data["deliverables"].setdefault(kind, {})[name] = record
     (root / runner.DEFAULT_CONTRACT).write_text(json.dumps(data))
     assert run_git(root, "add", ".").returncode == 0
@@ -144,8 +146,22 @@ def test_release_builds_expand_all_kinds_and_pass_exact_outputs(tmp_path, monkey
         result = json.loads(process.stdout if process.returncode == 0 else process.stderr)
         assert process.returncode == 0, result
     elif entry == "promotion":
+        path = tmp_path / runner.DEFAULT_CONTRACT
+        document = json.loads(path.read_text())
+        engine = document["deliverables"]["packages"]["engine"]
+        document["deliverables"]["packages"]["lifecycle"] = {
+            **engine,
+            "actions": {**engine["actions"], "pre-build-checks": {"check-groups": {
+                "tests": {"requires": {"tools": []}, "steps": [{"run": [sys.executable, "-c", "pass"]}]},
+            }}},
+        }
+        path.write_text(json.dumps(document))
+        assert run_git(tmp_path, "add", str(path)).returncode == 0
+        assert run_git(tmp_path, "commit", "-m", "declare independent lifecycle tests").returncode == 0
+        lifecycle = "deliverables.packages.lifecycle.actions.pre-build-checks.check-groups.tests"
         module = runpy.run_path(str(ROOT / "skills/ceratops-repo-lifecycle/scripts/promote-repository.py"))
-        built = runner.execute_build(tmp_path, [runner.OperationRequest(name, {"target": "one"})], run_delivery=False)
+        built = runner.execute_build(tmp_path, [runner.OperationRequest(name, {"target": "one"})],
+                                     run_delivery=False, validation_operations=[lifecycle])
         assert built["status"] == "completed", built
         prepared = runner.prepare_operations(tmp_path, [runner.OperationRequest(name, {"target": "one"})],
                                              artifacts=built["artifacts"])
@@ -153,7 +169,9 @@ def test_release_builds_expand_all_kinds_and_pass_exact_outputs(tmp_path, monkey
         accepted = module["CompletedPromotion"](
             {"status": "ready", "head": runner.repository_commit(tmp_path), "pending_work_scope": "fixture"},
             tmp_path, prepared, built)
-        args = module["build_parser"]().parse_args(["--repo-root", str(tmp_path)])
+        args = module["build_parser"]().parse_args([
+            "--repo-root", str(tmp_path), "--validation-operation", lifecycle,
+        ])
         from github_pr_workflow.command import release_write_context
         with release_write_context(tmp_path):
             promoted = module["_deploy_completed_promotion"](args, accepted)
@@ -161,6 +179,10 @@ def test_release_builds_expand_all_kinds_and_pass_exact_outputs(tmp_path, monkey
         module["_completed_deployment"](promoted, accepted.result["head"], repo_root=tmp_path)
         assert [item["operation"] for item in result["results"]] == [name]
         assert any(item["operation"].endswith(".actions.build") for item in result["build_results"])
+        assert any(item["operation"] == lifecycle and item["status"] == "completed"
+                   for item in result["build_results"])
+        assert not any(item["operation"] == "deliverables.packages.lifecycle.actions.build"
+                       for item in result["build_results"])
     elif entry == "ship":
         # Ship has no per-operation parameter arguments. Bind this repository's
         # target in its commands, keeping the same declared build graph.
@@ -212,9 +234,9 @@ def test_release_build_failure_ignores_stale_output_and_can_repeat(tmp_path, mon
     result = runner.execute_build(tmp_path, [request])
     assert result["status"] == "completed", result
     order = (tmp_path / ".order").read_text().splitlines()
-    # No result commit/tag accepted the failed batch. Its temporary files are
-    # discarded before the next build, including its unfinished dependencies.
-    assert order.count("build:engine:one") == order.count("build:core:one") == 2
+    # Finished dependencies retain their passing receipts even when a later
+    # producer fails; that failure does not discard their completed work.
+    assert order.count("build:engine:one") == order.count("build:core:one") == 1
     assert order.count("build:bridge:one") == 2
     assert order[-1] == "install:desktop:one"
 
@@ -270,6 +292,8 @@ def _fixture(root: pathlib.Path):
     (root / ".gitignore").write_text("source-checks.txt\nartifact-checks.txt\nwheel.bin\n")
     template = ROOT / "skills/ceratops-repo-lifecycle/references/templates/run-tests.py.tmpl"
     (root / "scripts/check.py").write_text(template.read_text().replace("__TEST_TARGETS__", "[]"))
+    (root / "scripts/testing").mkdir()
+    shutil.copy2(ROOT / "scripts/testing/read_check_environment.py", root / "scripts/testing/read_check_environment.py")
     probe = "from pathlib import Path; p=Path('source-checks.txt'); p.write_text(p.read_text()+'x' if p.exists() else 'x')"
     check = {
         "requires": {"capabilities": []},
@@ -364,7 +388,8 @@ elif a.check_group == 'unit-tests':
         "checks": {"compiler-check": {"uses-artifacts": []}},
     }
     document["deliverables"]["packages"]["sample"]["project"] = "pyproject.toml"
-    (root / "pyproject.toml").write_text('[project]\nname="sample"\nversion="1.0.0"\n')
+    document["deliverables"]["packages"]["sample"]["version"] = {"file": "pyproject.toml", "field": "project.version"}
+    (root / "pyproject.toml").write_text('[project]\nname="sample"\nversion="1.0.0b1"\n')
     contract.write_text(json.dumps(document))
     assert run_git(root, "add", ".").returncode == 0
     assert run_git(root, "commit", "-m", "phases").returncode == 0
@@ -455,7 +480,7 @@ def test_check_phases_public_cli_reports_first_source_failure(tmp_path, source_f
 @pytest.mark.parametrize("damage", [None, "missing", "changed"])
 @pytest.mark.parametrize("public_cli", [False, True])
 def test_check_phases_pass_every_stored_artifact_and_block_partial_output(tmp_path, damage, public_cli):
-    requests = _phased_repository(tmp_path)
+    _phased_repository(tmp_path)
     contract_path = tmp_path / runner.DEFAULT_CONTRACT
     document = json.loads(contract_path.read_text())
     build = document["deliverables"]["packages"]["sample"]["actions"]["build"]
@@ -507,6 +532,8 @@ def test_build_action_accepts_current_build_reports(tmp_path, contract_version, 
     if contract_version == 5:
         document = fixture_with_tools(document)
     document["version"] = contract_version
+    if schema == "ceratops-builder-output":
+        document["deliverables"]["packages"]["sample"]["version"] = {"mode": "receipt-only"}
     document["deliverables"]["packages"]["sample"]["actions"]["build"]["result-schema"] = schema
     path.write_text(json.dumps(fixture_with_tools(document) if document["version"] == 5 else document))
     prepared = runner.prepare_operations(tmp_path, [
@@ -624,7 +651,7 @@ raise SystemExit(int(pathlib.Path('source.txt').read_text()))
     data["repository"]["actions"]["pre-build-checks"]["check-groups"] = {
         "scan": {"requires": {"tools": []}, "steps": [{"run": [sys.executable, "-c", source]}],
                  "check-results": {"result-owner": "operation", "product-inputs": ["source.txt"],
-                                   "check-inputs": ["sdlc/sdlc.yml"]}},
+                                   "check-inputs": [".ceratops/sdlc/sdlc.yml"]}},
     }
     path.write_text(json.dumps(fixture_with_tools(data) if data["version"] == 5 else data))
     request = runner.OperationRequest("repository.actions.pre-build-checks.check-groups.scan")
@@ -684,6 +711,32 @@ def test_moving_a_check_keeps_its_original_success_and_result_id(tmp_path):
         assert result["check_decision"] == "reused", result
         assert result["check_result"] == original["check_result"]
         assert path.read_bytes() == saved
+    assert (tmp_path / "source-checks.txt").read_text() == "x"
+
+    store = reuse.CheckResultStore(tmp_path).current
+    original_entry = next(iter(store.value["entries"].values()))
+    record = store.records("repository-check")[0]
+    for retired in ("repository.actions.retired-check", "deliverables.packages.other.actions.retired-check"):
+        stored = {**record, "check_id": retired, "result_id": retired,
+                  "inputs": {**record["inputs"], "arguments": ["retired-command"]}}
+        store.put("repository-check", retired, original_entry["target"], stored)
+    # The command owner recovers a torn last append without losing completed
+    # results. A single-group request cannot retire another group's record.
+    with path.open("ab") as output:
+        output.write(b'{"schema":')
+    partial = runner.execute_build(tmp_path, [runner.OperationRequest(current.operation)],
+                                   qualification_level="beta", include_checks=False)
+    assert partial["status"] == "completed", partial
+    assert "repository.actions.retired-check" in {
+        value["check_id"] for value in store.records("repository-check")}
+    for _ in range(2):
+        complete = runner.execute_build(tmp_path, [runner.OperationRequest("repository.actions.pre-build-checks")],
+                                        qualification_level="beta", include_checks=False)
+        assert complete["status"] == "completed", complete
+        names = {value["check_id"] for value in store.records("repository-check")}
+        assert "repository.actions.retired-check" not in names
+        assert "deliverables.packages.other.actions.retired-check" in names
+        assert previous.operation in names
     assert (tmp_path / "source-checks.txt").read_text() == "x"
 
 
@@ -797,7 +850,17 @@ def test_git_build_summary_supplies_public_cli_check_without_original_log(tmp_pa
     original = runner.execute_prepared_operation(_check(tmp_path))
     assert original["status"] == "completed" and original["check_decision"] == "executed"
     reference = original["check_result"]
-    tag, _ = _tag_summary(tmp_path, "1.0.0b1", original["check_summary"])
+    summary = json.loads(json.dumps(original["check_summary"]))
+    own = summary["checks"][0]
+    unrelated = {**summary["inputGroups"][own["inputGroup"]],
+                 "group": "python-runner", "arguments": ["python", "other-tests.py"],
+                 "fingerprint": "0" * 64}
+    unrelated_group = hashlib.sha256(json.dumps(unrelated, sort_keys=True,
+                                                separators=(",", ":")).encode()).hexdigest()
+    summary["inputGroups"][unrelated_group] = unrelated
+    summary["checks"].insert(0, {**own, "id": "python-runner",
+                                 "inputGroup": unrelated_group, "inputs_digest": "0" * 64})
+    tag, _ = _tag_summary(tmp_path, "1.0.0b1", summary)
     (tmp_path / ".git" / reference["path"]).unlink()
     argv = [sys.executable, str(ROOT / "skills/ceratops-repo-lifecycle/scripts/repository_operation.py"),
             "--repo-root", str(tmp_path), "--operation", "repository.actions.pre-build-checks.check-groups.tests", "--qualification-level", "beta"]
@@ -939,38 +1002,40 @@ def test_unrelated_changes_keep_original_provenance_and_changed_inputs_execute(t
 
 
 @pytest.mark.parametrize("report_selected", [False, True])
-def test_incomplete_ownership_blocks_the_batch_before_any_callback(
+def test_incomplete_ownership_blocks_its_check_and_keeps_earlier_results(
     tmp_path, monkeypatch, report_selected,
 ):
     repo = tmp_path / "repo"
     repo.mkdir()
     _fixture(repo)
     valid = _check(repo)
-    invalid = runner.replace(valid, check_results={"product-inputs": ["unknown/*.py"], "check-inputs": ["scripts/check.py"]})
-    report_path = tmp_path / "tmp/repo/repo/_promote_failure.json"
+    invalid = runner.replace(valid, operation=valid.operation + "-invalid",
+                             check_results={"product-inputs": ["unknown/*.py"], "check-inputs": ["scripts/check.py"]})
+    monkeypatch.setenv("CERATOPS_TASK_TEMP_ROOT", str(tmp_path / "tmp"))
+    report_path = tmp_path / "tmp" / repo.name / repo.name / "_operation-reports" / "promote" / "failures.json"
     accepted = tmp_path / "accepted.json"
     accepted.write_text("original accepted bytes")
-    callbacks = []
-    monkeypatch.setattr(runner, "run_progress_command", lambda *args, **kw: callbacks.append(args))
+    callbacks = Mock(wraps=runner.run_progress_command)
+    monkeypatch.setattr(runner, "run_progress_command", callbacks)
     result = runner.execute_prepared_operations(
         [valid, invalid],
-        diagnostic_output=report_path if report_selected else None,
+        report_directory=report_path.parents[2] if report_selected else None,
         diagnostic_owner=(repo, "promote"),
         successful_results=[{"status": "passed", "path": str(accepted)}],
     )
     assert result["status"] == "result_invalid"
-    assert "ownership" in result["message"]
-    assert callbacks == []
-    assert result["completed_operations"] == []
-    assert result["pending_operations"] == [valid.operation, invalid.operation]
-    assert result["successful_result_paths"] == [str(accepted)]
+    assert "ownership" in result["results"][-1]["message"]
+    assert callbacks.call_count == 1
+    assert result["completed_operations"] == [valid.operation]
+    assert result["pending_operations"] == [invalid.operation]
+    assert str(accepted) in result["successful_result_paths"]
+    assert (repo / "source-checks.txt").read_text() == "x"
     if report_selected:
         report = json.loads(report_path.read_text())
         assert result["diagnostic_output"] == str(report_path)
-        assert report["owner"]["action"] == "promote"
-        assert report["successful_result_paths"] == [str(accepted)]
-        preparation_id = f"operation_preparation:{valid.operation},{invalid.operation}"
-        assert "ownership" in report["failures"][preparation_id]["message"]
+        assert "owner" not in report
+        assert str(accepted) in report["successful_result_paths"]
+        assert any("ownership" in value["message"] for value in report["failures"].values())
     else:
         assert not report_path.exists()
     assert accepted.read_text() == "original accepted bytes"
@@ -984,7 +1049,8 @@ def test_a_successful_exit_cannot_replace_missing_or_conflicting_producer_eviden
     repo = tmp_path / "repo"
     repo.mkdir()
     _fixture(repo)
-    report_path = tmp_path / "tmp/repo/repo/_promote_failure.json"
+    monkeypatch.setenv("CERATOPS_TASK_TEMP_ROOT", str(tmp_path / "tmp"))
+    report_path = tmp_path / "tmp" / repo.name / repo.name / "_operation-reports" / "promote" / "failures.json"
     accepted = tmp_path / "accepted.json"
     accepted.write_text("original accepted bytes")
     stdout = "first output\n" + "complete stdout\n" * 1000 + "last output"
@@ -1010,7 +1076,7 @@ def test_a_successful_exit_cannot_replace_missing_or_conflicting_producer_eviden
     monkeypatch.setattr(runner, "run_progress_command", execute)
     result = runner.execute_prepared_operation(
         _check(repo),
-        diagnostic_output=report_path if report_selected else None,
+        report_directory=report_path.parents[2] if report_selected else None,
         diagnostic_owner=(repo, "promote"),
         successful_results=[{"status": "passed", "path": str(accepted)}],
     )
@@ -1021,7 +1087,7 @@ def test_a_successful_exit_cannot_replace_missing_or_conflicting_producer_eviden
     if report_selected:
         report = json.loads(report_path.read_text())
         assert result["diagnostic_output"] == str(report_path)
-        assert report["owner"]["action"] == "promote"
+        assert "owner" not in report
         assert report["successful_result_paths"] == [str(accepted)]
         details = report["failures"]["repository.actions.pre-build-checks.check-groups.tests:1"]
         assert len(json.dumps(result)) < 5000
@@ -1059,7 +1125,7 @@ def test_pass_survives_interruption_before_build_and_a_fresh_request_reuses_it(t
 ])
 def test_sdlc_refuses_unsafe_or_unconsumed_check_declarations(tmp_path, declaration):
     _fixture(tmp_path)
-    path = tmp_path / "sdlc/sdlc.yml"
+    path = tmp_path / ".ceratops/sdlc/sdlc.yml"
     data = json.loads(path.read_text())
     data["repository"]["actions"]["pre-build-checks"]["check-groups"]["tests"]["check-results"] = declaration
     path.write_text(json.dumps(fixture_with_tools(data) if data["version"] == 5 else data))
@@ -1081,16 +1147,31 @@ def test_saved_corruption_blocks_a_fresh_call_without_repeating_the_check(tmp_pa
     assert path.read_bytes() == before
 
 
-def test_an_earlier_callback_cannot_make_a_preflight_reuse_decision_stale(tmp_path):
+@pytest.mark.parametrize("entry", ["operation-batch", "build-batch"])
+def test_check_reuse_is_decided_once_after_earlier_operations(tmp_path, monkeypatch, entry):
     commit = _fixture(tmp_path)
     assert runner.execute_prepared_operation(_check(tmp_path))["status"] == "completed"
     setup = runner.PreparedOperation(
         tmp_path, "repository.actions.bootstrap", "bootstrap", commit,
         (runner.PreparedStep(1, (sys.executable, "-c", "from pathlib import Path; Path('source.py').write_text('value = 3\\n')"), tmp_path),), {},
     )
-    result = runner.execute_prepared_operations([setup, _check(tmp_path)])
-    assert result["status"] == "completed", result
-    assert result["results"][-1]["check_decision"] == "executed"
+    check = _check(tmp_path)
+    if entry == "operation-batch":
+        check = runner.replace(check, check_phase=None, check_group=None)
+    collected = Mock(wraps=reuse.collect_check_inputs)
+    decisions = Mock(wraps=reuse.decide_check_reuse)
+    summaries = Mock(wraps=reuse.select_build_check_summaries)
+    monkeypatch.setattr(reuse, "collect_check_inputs", collected)
+    monkeypatch.setattr(reuse, "decide_check_reuse", decisions)
+    monkeypatch.setattr(reuse, "select_build_check_summaries", summaries)
+    monkeypatch.setattr(runner.sdlc_results, "select_build_check_summaries", summaries)
+    for attempt, outcome in enumerate(("executed", "reused"), 1):
+        result = runner.execute_prepared_operations([setup, check])
+        assert result["status"] == "completed", result
+        assert result["results"][-1]["check_decision"] == outcome
+        assert collected.call_count == summaries.call_count == attempt
+        assert sum(call.args[0].check_results is not None for call in decisions.call_args_list) == attempt
+        assert summaries.call_args.kwargs["requested_check"]["group"] == check.operation
     assert (tmp_path / "source-checks.txt").read_text() == "xx"
 
 
@@ -1125,19 +1206,44 @@ def _path_scoped_operation(root, *, tools=None):
     (root / ".git/dependency.lock").write_text("locked dependency")
     declaration = {
         **operation.check_results, "environment": ["PATH", "CHECK_MODE"],
-        "tools": tools if tools is not None else [sys.executable, "git", ".git/tool.bin"],
+        "tools": tools if tools is not None else [sys.executable, "git"],
         "dependencies": [".git/dependency.lock"],
     }
     return runner.replace(operation, check_results=declaration)
 
 
-def test_path_folder_change_reuses_original_pass_without_rewriting_it(tmp_path, monkeypatch):
+@pytest.mark.parametrize("upgrade", ["path", "git", "tool-patch", "tool-minor", "python-patch", "python-minor", "old-hash", "missing"])
+def test_path_folder_change_reuses_original_pass_without_rewriting_it(tmp_path, monkeypatch, upgrade):
     operation = _path_scoped_operation(tmp_path)
     first = runner.execute_prepared_operation(operation)
     assert first["status"] == "completed", first
     reference = first["check_result"]
     path = reuse.CheckResultStore(tmp_path).current.path
     original = path.read_bytes()
+    # Compare the same recorded check through the public reuse decision without
+    # replacing installed runtimes or rewriting the accepted record.
+    old_inputs = reuse.read_check_result(path, reference["result_id"])["inputs"]
+    import copy
+
+    from retain_check_results import check_inputs_match_for_reuse, fingerprint
+    changed_inputs = copy.deepcopy(old_inputs)
+    tool = sys.executable
+    old_inputs["environment"]["tools"][tool] = {"version": "3.13.4", "sha256": "a" * 64}
+    changed_inputs["environment"]["tools"][tool] = {"version": "3.13.99", "sha256": "b" * 64}
+    old_inputs["environment"]["tools"]["git"] = {"sha256": "a" * 64}
+    changed_inputs["environment"]["tools"]["git"] = {"version": "999.0.0"}
+    if upgrade == "tool-minor":
+        changed_inputs["environment"]["tools"][tool]["version"] = "3.14.0"
+    elif upgrade == "old-hash":
+        old_inputs["environment"]["tools"][tool] = {"sha256": "a" * 64}
+    elif upgrade == "missing":
+        changed_inputs["environment"]["tools"][tool] = {"version": None}
+    elif upgrade in {"python-patch", "python-minor"}:
+        old_inputs["environment"]["runtime"] = {"python": "3.13.4"}
+        changed_inputs["environment"]["runtime"] = {"python": "3.13.5" if upgrade == "python-patch" else "3.14.0"}
+    old_inputs["fingerprint"] = fingerprint(old_inputs)
+    changed_inputs["fingerprint"] = fingerprint(changed_inputs)
+    assert check_inputs_match_for_reuse(old_inputs, changed_inputs) is (upgrade not in {"tool-minor", "python-minor", "old-hash", "missing"})
     empty = tmp_path / ".git/empty-path-folder"
     empty.mkdir()
     monkeypatch.setenv("PATH", str(empty) + os.pathsep + os.environ["PATH"])
@@ -1176,7 +1282,7 @@ def test_path_equivalence_does_not_hide_other_changed_inputs(tmp_path, monkeypat
     elif change == "dependency":
         (tmp_path / ".git/dependency.lock").write_text("changed lock")
     elif change == "tool":
-        (tmp_path / ".git/tool.bin").write_bytes(b"changed tool")
+        operation = runner.replace(operation, check_results={**operation.check_results, "tools": [sys.executable, "unavailable-test-command"]})
     elif change == "variable":
         monkeypatch.setenv("CHECK_MODE", "changed")
     else:
@@ -1220,7 +1326,7 @@ if mode == 'failed':
 print('{' if mode == 'partial' else json.dumps(payload))
 '''
     (root / "scripts/build.py").write_text(producer, encoding="utf-8")
-    contract = root / "sdlc/sdlc.yml"
+    contract = root / ".ceratops/sdlc/sdlc.yml"
     data = json.loads(contract.read_text())
     build = data["deliverables"]["packages"]["sample"]["actions"]["build"]
     build["steps"] = [{"run": [sys.executable, "scripts/build.py"]}]
@@ -1257,7 +1363,7 @@ def test_declared_build_reports_final_commit_and_repeats_without_new_effects(tmp
 
 def test_sdlc_v5_build_reports_its_clean_final_commit(tmp_path, capsys):
     _committing_build(tmp_path)
-    contract = tmp_path / "sdlc/sdlc.yml"
+    contract = tmp_path / ".ceratops/sdlc/sdlc.yml"
     data = json.loads(contract.read_text())
     data = fixture_with_tools(data)
     data["version"] = 5
@@ -1283,7 +1389,7 @@ def test_commit_reporting_requires_starting_git_before_any_build_effect(tmp_path
         "version": 4, "kind": "ceratops-sdlc",
         "repository": {"capabilities": {}, "actions": {"pre-build-checks": {"check-groups": {'source': _no_op(), 'tests': _no_op()}}, }},
         "deliverables": {"packages": {"sample": {
-            "root-dir": ".", "project": "sdlc/sdlc.yml", "build-after": [],
+            "root-dir": ".", "project": ".ceratops/sdlc/sdlc.yml", "build-after": [],
             "artifact": {"type": "python-wheel", "distribution": "sample",
                          "output-directory": "dist", "filename-pattern": "*.whl"},
             "actions": {"pre-build-checks": {"check-groups": {'source': _no_op(), 'tests': _no_op()}}, "build": build},
@@ -1358,7 +1464,7 @@ def test_returned_commit_must_descend_from_prepared_commit(tmp_path, monkeypatch
 @pytest.mark.parametrize("change", ["non-build", "handoff", "bad-field", "later-operation"])
 def test_commit_declaration_blocks_unsafe_flow_before_effects(tmp_path, version, change):
     _committing_build(tmp_path)
-    path = tmp_path / "sdlc/sdlc.yml"
+    path = tmp_path / ".ceratops/sdlc/sdlc.yml"
     data = json.loads(path.read_text())
     if version == 5:
         data = fixture_with_tools(data)
@@ -1413,10 +1519,12 @@ def test_explicit_phase_and_group_cli_requests_do_not_guess_group_kind(tmp_path,
 
 
 @pytest.mark.parametrize("change", ["committed", "staged", "unstaged", "new", "deleted", "renamed",
-                                   "covered-readme", "uncovered-readme", "checks-only", "argument", "environment", "preparation"])
+                                   "covered-readme", "uncovered-readme", "checks-only", "scope", "unrelated-commit",
+                                   "argument", "environment", "preparation"])
 def test_build_comparison_and_exact_artifact_groups(tmp_path, monkeypatch, change):
-    from tests.repository_lifecycle.test_completed_builds import _worktree_build_case
     from run_build_operations import prepare_build_operations, recorded_build
+
+    from tests.repository_lifecycle.test_completed_builds import _worktree_build_case
     repository, options = _worktree_build_case(tmp_path)
     path = repository / runner.DEFAULT_CONTRACT
     declaration = json.loads(path.read_text())
@@ -1426,6 +1534,7 @@ def test_build_comparison_and_exact_artifact_groups(tmp_path, monkeypatch, chang
         (repository / "src/package.json").write_text('{"name":"other","version":"1.0.0b1"}')
         declaration["deliverables"]["packages"]["other"] = {
             "root-dir": "src", "project": "src/package.json", "build-after": [],
+            "version": {"file": "src/package.json", "field": "version"},
             "artifact": {"type": "python-wheel", "distribution": "other",
                          "output-directory": "dist", "filename-pattern": "*.whl"},
             "actions": {"build": {
@@ -1441,8 +1550,8 @@ def test_build_comparison_and_exact_artifact_groups(tmp_path, monkeypatch, chang
         assert run_git(repository, "add", "src/package.json").returncode == 0
         assert run_git(repository, "commit", "--only", "-m", "shared package metadata", "--", "src/package.json").returncode == 0
     path.write_text(json.dumps(declaration))
-    assert run_git(repository, "add", "sdlc/sdlc.yml").returncode == 0
-    assert run_git(repository, "commit", "--only", "-m", "builder environment", "--", "sdlc/sdlc.yml").returncode == 0
+    assert run_git(repository, "add", ".ceratops/sdlc/sdlc.yml").returncode == 0
+    assert run_git(repository, "commit", "--only", "-m", "builder environment", "--", ".ceratops/sdlc/sdlc.yml").returncode == 0
     first = runner.execute_build(repository, **options)
     assert first["status"] == "completed", first
     previous_tag = first["tag"]
@@ -1477,6 +1586,11 @@ def test_build_comparison_and_exact_artifact_groups(tmp_path, monkeypatch, chang
     elif change == "checks-only":
         declaration["deliverables"]["packages"]["claims"]["actions"]["post-build-checks"]["check-groups"]["contents"]["steps"][0]["run"][-1] = "print('different check')"
         path.write_text(json.dumps(declaration))
+    elif change == "scope":
+        declaration["deliverables"]["packages"]["claims"].setdefault("additional-source-files", []).append("future/*.py")
+        path.write_text(json.dumps(declaration))
+    elif change == "unrelated-commit":
+        assert run_git(repository, "commit", "--allow-empty", "-m", "unrelated work").returncode == 0
     elif change == "argument":
         action["steps"][0]["run"].append("--different-package-option")
         path.write_text(json.dumps(declaration))
@@ -1485,7 +1599,7 @@ def test_build_comparison_and_exact_artifact_groups(tmp_path, monkeypatch, chang
     prepared = prepare_build_operations(repository, options["requests"], qualification_level="beta")
     item = next(value for value in prepared if value.category == "build")
     decision = recorded_build(item, {})
-    unchanged = change in {"uncovered-readme", "checks-only"}
+    unchanged = change in {"uncovered-readme", "checks-only", "unrelated-commit"}
     assert bool(decision["result"]) is unchanged, decision
     if unchanged:
         assert decision["result"]["build_tag"] == previous_tag

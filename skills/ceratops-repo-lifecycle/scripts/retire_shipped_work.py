@@ -782,7 +782,7 @@ def finalize_shipping(
         "pending_work_scope": "",
     }
     if scope is not None:
-        selected = manager["finalize_scope"](
+        selected = manager["remove_completed_task_work"](
             repo,
             scope,
             target_branch=target_branch,

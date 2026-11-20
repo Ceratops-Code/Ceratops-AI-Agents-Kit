@@ -190,7 +190,7 @@ def repo_subset_ids(
             "code": {
                 item
                 for item in ids["code"]
-                if item == "security.dependabot_config_file"
+                if item in {"security.dependabot_config_file", "security.dependency_maintenance_policy"}
             },
             "artifact": set(),
         }

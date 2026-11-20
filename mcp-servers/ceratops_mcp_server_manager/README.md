@@ -127,7 +127,8 @@ needs no Git. Otherwise Git enumerates tracked and non-ignored untracked
 servers require `--mcp-server-name`; duplicate names, absent matches, and
 failed queries stop before building. Ignored environments are excluded.
 
-The manager does not read `sdlc/sdlc.yml`. Repository lifecycle hands the
+The manager does not read `.ceratops/sdlc/sdlc.yml`. Repository lifecycle hands
+the
 selected MCP server and any package prerequisite to `ceratops-mcp-server-lifecycle/install`.
 That action builds and validates a declared package wheel, then passes its
 wheel and canonical lockfile to the manager. The selected MCP server source
@@ -287,6 +288,8 @@ without dispatch to another version. An incompatible replacement reports an
 error without silently
 using an older version or replaying a request.
 Every successful activation installs or refreshes that MCP server's stable launcher.
+On Windows, its selection reads allow atomic replacement of `current.json`, so
+the idle watcher cannot block an installer from switching versions.
 The gateway advertises `capabilities.tools.listChanged = true`, including when
 the initial version has no tools. Its existing one-second idle poll reads
 `current.json` and sends `notifications/tools/list_changed` once per observed

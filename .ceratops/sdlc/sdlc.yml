@@ -72,7 +72,7 @@ repository:
             product-inputs:
               - '**/*.md'
             check-inputs:
-              - sdlc/sdlc.yml
+              - .ceratops/sdlc/sdlc.yml
               - scripts/package.json
               - scripts/.markdownlint.json
             dependencies:
@@ -96,7 +96,7 @@ repository:
               - .github/workflows/*.yaml
               - .github/actions/**
             check-inputs:
-              - sdlc/sdlc.yml
+              - .ceratops/sdlc/sdlc.yml
               - scripts/pyproject.toml
               - scripts/run-actionlint.py
               - .github/actionlint.yaml
@@ -129,7 +129,7 @@ repository:
               - '**/*.yml'
               - skills/ceratops-repo-lifecycle/references/templates/sdlc.yml.tmpl
             check-inputs:
-              - sdlc/sdlc.yml
+              - .ceratops/sdlc/sdlc.yml
               - scripts/pyproject.toml
               - scripts/.yamllint.yml
             dependencies:
@@ -169,7 +169,7 @@ repository:
               - mcp-servers/**/*.py
               - skills/ceratops-repo-lifecycle/references/templates/deploy-skills.py.tmpl
             check-inputs:
-              - sdlc/sdlc.yml
+              - .ceratops/sdlc/sdlc.yml
               - scripts/pyproject.toml
               - .gitignore
               - '**/.gitignore'
@@ -214,7 +214,7 @@ repository:
               - '**/*.pyi'
               - skills/ceratops-repo-lifecycle/references/templates/deploy-skills.py.tmpl
             check-inputs:
-              - sdlc/sdlc.yml
+              - .ceratops/sdlc/sdlc.yml
               - scripts/pyproject.toml
               - .gitignore
               - '**/.gitignore'
@@ -258,7 +258,7 @@ repository:
               - '**/*.pyi'
               - skills/ceratops-repo-lifecycle/references/templates/deploy-skills.py.tmpl
             check-inputs:
-              - sdlc/sdlc.yml
+              - .ceratops/sdlc/sdlc.yml
               - scripts/pyproject.toml
               - .gitignore
               - '**/.gitignore'
@@ -292,7 +292,7 @@ repository:
               - skills/**
               - tools/**
               - mcp-servers/**
-              - sdlc/**
+              - .ceratops/sdlc/**
               - docs/result_records.py.tmpl
               - README.md
               - AGENTS.md
@@ -314,7 +314,6 @@ repository:
               - UV_OFFLINE
             tools:
               - uv
-              - git
               - node
               - npm
               - powershell
@@ -322,11 +321,14 @@ repository:
             tools:
               - uv
           steps:
-            - run: [uv, run, --project, scripts, --locked, python, scripts/testing/run-tests.py, --auto]
+            - run: [uv, run, --project, scripts, --locked, python, scripts/testing/run-tests.py, --auto, --temporary-root, '{temporary_root}']
 
 deliverables:
   mcp-servers:
     ceratops-mcp-server-manager:
+      version:
+        file: "mcp-servers/ceratops_mcp_server_manager/pyproject.toml"
+        field: "project.version"
       root-dir: mcp-servers/ceratops_mcp_server_manager
       manifest: mcp-servers/ceratops_mcp_server_manager/mcp-server.json
       build-after: []
@@ -349,6 +351,9 @@ deliverables:
             - run: [uv, run, --project, scripts, --locked, python, scripts/deploy-mcp-server-manager.py]
 
     source_search_mcp:
+      version:
+        file: "tools/pyproject.toml"
+        field: "project.version"
       root-dir: tools
       manifest: tools/mcp-server.json
       build-after: []

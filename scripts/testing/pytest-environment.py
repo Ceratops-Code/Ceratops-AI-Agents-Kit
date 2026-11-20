@@ -352,6 +352,7 @@ def isolated_environment(
     *,
     environ: Mapping[str, str] | None = None,
     windows: bool | None = None,
+    temporary_root: pathlib.Path | None = None,
 ) -> Iterator[PytestEnvironment]:
     """Yield child-only defaults and clean up on success, failure or interruption.
 
@@ -366,13 +367,14 @@ def isolated_environment(
     # redirect fixture writes or cleanup into the caller's real directories.
     for variable in ("CERATOPS_PROJECTS_ROOT", "CERATOPS_TASK_TEMP_ROOT"):
         child.pop(variable, None)
-    parent = pathlib.Path(child.get("PYTEST_DEBUG_TEMPROOT") or tempfile.gettempdir())
+    parent = temporary_root or pathlib.Path(child.get("PYTEST_DEBUG_TEMPROOT") or tempfile.gettempdir())
     parent = (cwd / parent).resolve()
     # Inherited pytest temp points into the enclosing run. Nested runs use
     # sibling leases so an abandoned outer run cannot remove live nested work.
     inherited_parent = child.get("CERATOPS_PYTEST_SCRATCH_PARENT")
-    if inherited_parent and child.get("CERATOPS_PYTEST_SCRATCH_ROOT") == str(parent):
+    if temporary_root is None and inherited_parent and child.get("CERATOPS_PYTEST_SCRATCH_ROOT") == str(parent):
         parent = pathlib.Path(inherited_parent).resolve()
+    parent.mkdir(parents=True, exist_ok=True)
     with _owned_test_scratch(parent, ".aa") as scratch:
         root = scratch.path
         child["CERATOPS_PYTEST_SCRATCH_ROOT"] = str(root)

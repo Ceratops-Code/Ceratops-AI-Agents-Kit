@@ -19,16 +19,16 @@ first.
 - (D) PR readiness contract check, run from the same folder:
   `python -m github_pr_workflow validate
   --pr NUMBER_OR_URL --cwd PATH`
-- (D) Dependency-queue preflight, when the caller owns a complete snapshot
-  adapter: `python -m github_pr_workflow dependency-preflight --org ORG
+- (D) Dependency-queue review, when the caller owns a complete snapshot
+  adapter: `python -m github_pr_workflow dependency-review --org ORG
   --snapshot-helper PATH --snapshot PATH --output PATH
   --workspace-root PATH [--checkout OWNER/REPO=PATH]`
 - (D) Dependency-queue finalization: `python -m github_pr_workflow
   dependency-finalize --snapshot-helper PATH --sync-helper PATH
-  --preflight PATH --snapshot PATH --sync-output PATH --output PATH
+  --review PATH --snapshot PATH --sync-output PATH --output PATH
   [--approved-pr PR] [--admin]`
-- (D) Automation preflight, from this skill's root:
-  `python scripts/github_pr_workflow/__main__.py dependency-preflight
+- (D) Automation review, from this skill's root:
+  `python scripts/github_pr_workflow/__main__.py dependency-review
   --automation-dir PATH`.
 - (D) Automation finalization, from this skill's root:
   `python scripts/github_pr_workflow/__main__.py dependency-finalize
@@ -37,12 +37,13 @@ first.
   reads its repository-scope configuration and binds its independent adapters;
   explicit options override defaults. It owns current-report retirement and
   dated unavailable-state reports, preserving genuine blocked queue results.
-- Preflight with `--retarget-dependabot-prs` moves eligible open Dependabot PRs
+- Review with `--retarget-dependency-prs` moves eligible open Dependabot
+  and Renovate PRs
   from the default branch to the repository's published `release/local`.
   It refreshes the moved PRs before collecting readiness evidence. Use this
   option when the caller authorizes the target changes.
-  The automation entrypoint enables this option during preflight.
-- Queue preflight owns dependency and exact-CI evidence. Finalization binds
+  The automation entrypoint enables this option during review.
+- Queue review owns dependency and exact-CI evidence. Finalization binds
   each approval to its exact PR head, stages eligible updates through
   `release/local`, and delegates publication to the repository's shipping
   workflow. It preserves readiness and review gates, refreshes the queue,
@@ -80,7 +81,7 @@ first.
   credentials.
 - Build an update queue from live dependency-bot PRs, alerts, alert-linked
   update PRs, and local manifests; classify each update by risk.
-- When a caller supplies a complete queue-snapshot adapter, use its preflight
+- When a caller supplies a complete queue-snapshot adapter, use its review
   as the queue and evidence gate for repository edits and PR finalization.
 - Block only actions whose required evidence is missing, invalid, or failed;
   continue authorized independent actions whose evidence passes. When the
@@ -112,9 +113,9 @@ first.
   through its Ship result and retained worktree.
 - Pass every model-approved PR to queue finalization. Process all eligible
   updates without a per-repository merge limit; changed PR heads require fresh
-  preflight and approval.
+  review and approval.
 - Include unrelated unpublished work only with explicit authorization bound
-  to that repository's release commit. Repeat preflight, decisions, and
+  to that repository's release commit. Repeat review, decisions, and
   finalization while actionable work remains.
 - Include live repo dependency selection only when the queue changes or
   explicitly verifies GitHub dependency/security posture.

@@ -34,13 +34,13 @@ from .compatibility_contract import (
 from .generate_test_script import (
     discover_python_tests,
     generated_test_runner,
+    generated_support_errors,
     record_generated_runner,
     test_operation,
 )
 from .sdlc_contract_validation import (
     latest_sdlc_version,
     load_contract,
-    tools_key,
     validation_errors,
 )
 from .validate_ceratops_compatibility import (
@@ -114,7 +114,6 @@ class CompatibilityPlan:
     skill_updates: dict[pathlib.Path, tuple[str, str]]
     canonical_sources: dict[str, pathlib.Path]
     sdlc_contract: dict[str, object] | None
-    validator_text: str | None
     workflow_text: str | None
     markdown_files: dict[str, str]
     validation_checks: list[str]
@@ -122,15 +121,35 @@ class CompatibilityPlan:
     updated_markers: list[str]
     runtime_files: dict[pathlib.Path, str]
     python_tests: list[str]
+    test_support_only: bool = False
+    dependency_policy_only: bool = False
 
 
-def require_linked_worktree(repo_root: pathlib.Path) -> None:
-    """Reject primary checkouts so compatibility writes stay task-isolated."""
+def require_authorized_checkout(
+    repo_root: pathlib.Path, *, allow_primary_checkout: bool = False,
+) -> None:
+    """Keep task isolation unless the caller explicitly permits a primary checkout."""
 
-    if not (repo_root / ".git").is_file():
-        raise RuntimeError(
-            f"target repository must be a linked task worktree: {repo_root}"
-        )
+    marker = repo_root / ".git"
+    if marker.is_file():
+        return
+    if not allow_primary_checkout or not marker.is_dir():
+        raise RuntimeError(f"target repository must be a linked task worktree: {repo_root}")
+    # The exception permits an actual primary checkout, not a nested folder,
+    # detached revision or arbitrary branch. It never changes the branch.
+    for arguments, expected in (
+        (["rev-parse", "--show-toplevel"], {repo_root.resolve().as_posix().casefold()}),
+        (["symbolic-ref", "--short", "HEAD"], {"main", "release/local"}),
+    ):
+        command = ["git", "-C", str(repo_root), *arguments]
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        actual = result.stdout.strip().replace("\\", "/").casefold()
+        if result.returncode or actual not in expected:
+            raise RuntimeError(
+                f"primary-checkout request rejected: {command!r}; "
+                f"exit={result.returncode}; stdout={result.stdout or '<empty>'}; "
+                f"stderr={result.stderr or '<empty>'}"
+            )
 
 
 def runtime_source_id(
@@ -201,10 +220,10 @@ def prepare_sdlc_configuration(
     generated_checks: list[dict[str, object]] | None = None,
     planned_markdown: bool = False,
 ) -> dict[str, object]:
-    """Preserve target capabilities and apply the supported typed lifecycle.
+    """Preserve target tools and apply the current typed lifecycle.
 
     The template supplies new configurations using the newest installed schema.
-    Existing supported declarations keep their version and data. The compatibility
+    Existing current declarations keep their data. The compatibility
     contract owns named skill action routing. Existing actions retain their
     definitions, including target-native version-from references. New executable
     capabilities remain unversioned unless the target declares a requirement;
@@ -222,56 +241,30 @@ def prepare_sdlc_configuration(
         load_contract(target, repo_root=repo_root) if target.is_file()
         else {**reusable, "version": latest_sdlc_version()}
     )
-    # The versioned loader is the supported-format authority. Preserve its
-    # accepted version so an ordinary update cannot downgrade or rewrite its data.
+    if contract["version"] != latest_sdlc_version():
+        raise RuntimeError("Update the repository's SDLC to the current version before applying compatibility.")
     candidate = dict(contract)
     repository = dict(candidate.get("repository", {}))
-    key = tools_key(int(candidate["version"]))
+    key = "tools"
     capabilities = dict(repository.get(key, {}))
     capabilities.setdefault("uv", {"executable": "uv"})
     actions = dict(repository.get("actions", {}))
     checks = dict(actions.get("pre-build-checks", {}).get("check-groups", {}))
-    if key == "capabilities":
-        existing_validation = checks.get("source")
-        template_validation = {"requires": {key: ["uv"]}, "steps": [{"run": [
-            "uv", "run", "--locked", surface_path("validator").as_posix(),
-        ]}]}
-        project = load_compatibility_contract()["runtime"]["project"]
-        owned_validation = {**template_validation, "steps": [{"run": [
-            "uv", "run", "--project", project, "--locked", "python", surface_path("validator").as_posix(),
-        ]}]}
-        if any(item["id"] == "shellcheck" for item in repository_checks.contract_checks(repo_root)):
-            capabilities.setdefault("shellcheck", {"executable": "shellcheck"})
-            owned_validation["requires"] = {key: ["uv", "shellcheck"]}
-            owned_validation[f"validation-{key}"] = ["shellcheck"]
-        if existing_validation is None or existing_validation == template_validation or isinstance(existing_validation, dict) and "no-op" in existing_validation:
-            checks["source"] = owned_validation
-        elif existing_validation != owned_validation:
-            # A custom wrapper may carry arguments or setup that cannot safely be
-            # replaced or duplicated. Its owner must integrate that behavior.
-            raise RuntimeError(
-                "custom repository validation operation requires explicit integration with the uv validator command"
-            )
-        checks = {"source": checks["source"], **checks}
-    else:
-        for check in generated_checks if generated_checks is not None else repository_checks.contract_checks(repo_root):
-            name = str(check["id"])
-            if any(name in group.get("validation-tools", []) for group in checks.values()):
-                continue
-            tool, command = repository_checks.direct_source_check(check)
-            check_tools = ["node", tool] if tool in {"npm", "pnpm"} else [tool]
-            for check_tool in check_tools:
-                capabilities.setdefault(check_tool, {"executable": check_tool})
-            checks[f"source-{name}"] = {
-                "requires": {key: check_tools},
-                "validation-tools": [name],
-                "steps": [{"run": command}],
-                # Default tooling can discover new files anywhere in the checkout.
-                "check-results": {"result-owner": "operation", "product-inputs": ["**"],
-                                  "check-inputs": ["sdlc/sdlc.yml", "scripts/pyproject.toml", "scripts/uv.lock"],
-                                  "tools": check_tools.copy()},
-            }
-        checks = {**{name: group for name, group in checks.items() if group.get("validation-tools")}, **checks}
+    for check in generated_checks if generated_checks is not None else repository_checks.contract_checks(repo_root):
+        name = str(check["id"])
+        if any(name in group.get("validation-tools", []) for group in checks.values()):
+            continue
+        tool, command = repository_checks.direct_source_check(check)
+        check_tools = ["node", tool] if tool in {"npm", "pnpm"} else [tool]
+        for check_tool in check_tools:
+            capabilities.setdefault(check_tool, {"executable": check_tool})
+        checks[f"source-{name}"] = {
+            "requires": {key: check_tools},
+            "validation-tools": [name],
+            "steps": [{"run": command}],
+            "check-results": repository_checks.source_check_results(check, tool),
+        }
+    checks = {**{name: group for name, group in checks.items() if group.get("validation-tools")}, **checks}
     bootstrap = {**reusable["repository"]["actions"]["bootstrap"], "requires": {key: ["uv"]}}
     actions.setdefault("bootstrap", bootstrap)
     if key == "tools" and actions["bootstrap"] == bootstrap:
@@ -513,8 +506,81 @@ def plan_ceratops_compatibility(
     existing: Mapping[str, object],
     *,
     apply_sdlc_contract: bool,
+    test_support_only: bool = False,
+    dependency_policy_only: bool = False,
 ) -> CompatibilityPlan:
     """Validate target evidence and compose writes without changing files."""
+
+    if dependency_policy_only:
+        contract = load_compatibility_contract()
+        policy_files = runtime_files(repo_root, BUNDLE_ROOT, contract, [],
+                                source_id=source_id, dependency_policy_only=True)
+        policy_workflow = repository_checks.repository_workflow(
+            repo_root, [], markdown_files={}, sdlc={}, dependency_policy_only=True)
+        if policy_workflow is not None:
+            policy_files[repo_root / surface_path("workflow")] = policy_workflow
+        return CompatibilityPlan(
+            manifest=None, skill_updates={}, canonical_sources={}, sdlc_contract=None,
+            workflow_text=None, markdown_files={}, validation_checks=[], skills=[],
+            updated_markers=[], runtime_files=policy_files, python_tests=[], dependency_policy_only=True,
+        )
+
+    if test_support_only:
+        contract = load_compatibility_contract()
+        project = repo_root / surface_path("validation_project")
+        if not project.is_file():
+            raise RuntimeError(f"test support refresh requires the existing tooling project: {project}")
+        sdlc_path = repo_root / surface_path("sdlc")
+        sdlc = yaml.safe_load(sdlc_path.read_text(encoding="utf-8")) if sdlc_path.is_file() else {}
+        if not isinstance(sdlc, dict):
+            raise RuntimeError("test support refresh requires an SDLC mapping")
+        targets = discover_python_tests(repo_root, contract["python_test_detection"])
+        content = generated_test_runner(repo_root, contract, sdlc, targets)
+        outputs: dict[pathlib.Path, str] = {}
+        record_generated_runner(repo_root, contract, content, outputs, support_only=True)
+        if content is not None:
+            # A refreshed managed runner requires an explicit scratch parent.
+            # Update only its existing invocations in the same transaction.
+            pending = [sdlc]
+            changed = False
+            while pending:
+                node = pending.pop()
+                if isinstance(node, dict):
+                    argv = node.get("run")
+                    if (isinstance(argv, list) and "scripts/run-tests.py" in argv
+                            and "--temporary-root" not in argv):
+                        argv.extend(["--temporary-root", "{temporary_root}"])
+                        changed = True
+                    pending.extend(node.values())
+                elif isinstance(node, list):
+                    pending.extend(node)
+            if changed:
+                outputs[sdlc_path] = yaml.safe_dump(sdlc, sort_keys=False, allow_unicode=True)
+            for workflow in sorted((repo_root / ".github/workflows").glob("*.y*ml")):
+                workflow_source = workflow.read_text(encoding="utf-8")
+                updated_workflow = workflow_source
+                pending = [yaml.safe_load(workflow_source)]
+                while pending:
+                    node = pending.pop()
+                    if isinstance(node, dict):
+                        command = node.get("run")
+                        if (isinstance(command, str) and "scripts/run-tests.py" in command
+                                and "--temporary-root" not in command):
+                            replacement = command.replace("scripts/run-tests.py", 'scripts/run-tests.py --temporary-root "${{ runner.temp }}/ceratops-tests"')
+                            if command not in updated_workflow:
+                                raise RuntimeError(f"Cannot update managed test command without rewriting its workflow: {workflow}")
+                            updated_workflow = updated_workflow.replace(command, replacement)
+                        pending.extend(node.values())
+                    elif isinstance(node, list):
+                        pending.extend(node)
+                if updated_workflow != workflow_source:
+                    outputs[workflow] = updated_workflow
+        return CompatibilityPlan(
+            manifest=None, skill_updates={}, canonical_sources={}, sdlc_contract=None,
+            workflow_text=None, markdown_files={}, validation_checks=[], skills=[],
+            updated_markers=[], runtime_files=outputs, python_tests=targets,
+            test_support_only=True,
+        )
 
     skill_paths = sorted((repo_root / "skills").glob("*/SKILL.md"))
     skill_names = {path.parent.name for path in skill_paths}
@@ -660,17 +726,8 @@ def plan_ceratops_compatibility(
         action_errors = action_assignment_errors(repo_root, manifest)
         if action_errors:
             raise RuntimeError("; ".join(action_errors))
-    target_sdlc = repo_root / surface_path("sdlc")
-    version = load_contract(target_sdlc, repo_root=repo_root)["version"] if target_sdlc.is_file() else latest_sdlc_version()
-    validator_text, validation_checks, markdown_files = repository_checks.validation_surfaces(
-        repo_root, legacy_validator=version < 5,
-    )
-    workflow_path = surface_path("workflow")
-    planned_paths = {workflow_path.as_posix()} if not (repo_root / workflow_path).is_file() else set()
-    source_checks = repository_checks.contract_checks(
-        repo_root, package=json.loads(markdown_files["scripts/package.json"]) if markdown_files else None,
-        planned_paths=planned_paths,
-    )
+    source_checks, markdown_files = repository_checks.validation_surfaces(repo_root)
+    validation_checks = [str(check["id"]) for check in source_checks]
     sdlc_contract = prepare_sdlc_configuration(
         repo_root, skill_names=sorted(skill_names), apply_contract=apply_sdlc_contract,
         generated_checks=source_checks, planned_markdown=bool(markdown_files),
@@ -700,6 +757,7 @@ def plan_ceratops_compatibility(
         planned_files=markdown_files,
         has_python_skills=bool(python_skills),
         generate_python_test_runner=test_script is not None,
+        source_id=source_id,
     )
     markdown_files.pop(".gitignore", None)
     require_skill_runtime_project(
@@ -713,7 +771,6 @@ def plan_ceratops_compatibility(
         skill_updates=skill_updates,
         canonical_sources=canonical_sources,
         sdlc_contract=sdlc_contract,
-        validator_text=validator_text,
         workflow_text=workflow_text,
         markdown_files=markdown_files,
         validation_checks=validation_checks,
@@ -740,6 +797,8 @@ def apply_compatibility_plan(
         destination.write_text(
             content.replace("\r\n", "\n"), encoding="utf-8", newline=newline
         )
+    if plan.test_support_only or plan.dependency_policy_only:
+        return
     for relative, text in plan.markdown_files.items():
         (repo_root / relative).write_text(text, encoding="utf-8", newline="")
     if plan.canonical_sources:
@@ -779,14 +838,6 @@ def apply_compatibility_plan(
             encoding="utf-8",
             newline=newline,
         )
-    if plan.validator_text is not None:
-        validator_path = repo_root / surface_path("validator")
-        validator_path.parent.mkdir(parents=True, exist_ok=True)
-        validator_path.write_text(
-            plan.validator_text,
-            encoding="utf-8",
-            newline="\n",
-        )
     if plan.workflow_text is not None:
         workflow_path = repo_root / surface_path("workflow")
         workflow_path.parent.mkdir(parents=True, exist_ok=True)
@@ -805,7 +856,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--target-repo-root", required=True, type=pathlib.Path)
     parser.add_argument("--runtime-source-id")
+    parser.add_argument("--allow-primary-checkout", action="store_true",
+                        help="Permit an explicitly authorized primary main or release/local checkout.")
+    parser.add_argument("--test-support-only", action="store_true",
+                        help="Refresh owned test support without changing application, skill or CI configuration.")
+    parser.add_argument("--dependency-policy-only", action="store_true",
+                        help="Update dependency declarations and their CI checks without changing application layout.")
     args = parser.parse_args(argv)
+    if args.test_support_only and args.dependency_policy_only:
+        parser.error("choose one narrow refresh mode")
     repo_root = args.target_repo_root.resolve()
     phase = "preflight"
     rollback = "not_started"
@@ -816,17 +875,19 @@ def main(argv: list[str] | None = None) -> int:
     runtime = {}
     try:
         runtime = load_compatibility_contract()["runtime"]
-        require_linked_worktree(repo_root)
-        template = repository_checks.load_mapping(template_path("skill_manifest"))
-        validate_template(template)
+        require_authorized_checkout(repo_root, allow_primary_checkout=args.allow_primary_checkout)
         existing_path = repo_root / surface_path("skill_manifest")
-        existing = repository_checks.load_mapping(existing_path) if existing_path.is_file() else {}
-        has_source_skills = any((repo_root / "skills").glob("*/SKILL.md"))
-        source_id = (
-            runtime_source_id(repo_root, args.runtime_source_id, existing)
-            if has_source_skills
-            else None
-        )
+        template = {}
+        existing = {}
+        source_id = None
+        if args.dependency_policy_only:
+            source_id = runtime_source_id(repo_root, args.runtime_source_id, {})
+        elif not args.test_support_only:
+            template = repository_checks.load_mapping(template_path("skill_manifest"))
+            validate_template(template)
+            existing = repository_checks.load_mapping(existing_path) if existing_path.is_file() else {}
+            if any((repo_root / "skills").glob("*/SKILL.md")):
+                source_id = runtime_source_id(repo_root, args.runtime_source_id, existing)
         phase = "compatibility_planning"
         plan = plan_ceratops_compatibility(
             repo_root,
@@ -834,6 +895,8 @@ def main(argv: list[str] | None = None) -> int:
             template,
             existing,
             apply_sdlc_contract=True,
+            test_support_only=args.test_support_only,
+            dependency_policy_only=args.dependency_policy_only,
         )
         skill_paths = sorted((repo_root / "skills").glob("*/SKILL.md"))
         mutable_paths = [
@@ -842,6 +905,8 @@ def main(argv: list[str] | None = None) -> int:
             *plan.runtime_files,
             repo_root / runtime["lockfile"],
         ]
+        if plan.test_support_only or plan.dependency_policy_only:
+            mutable_paths = list(plan.runtime_files)
         mutable_paths.extend(repo_root / name for name in plan.markdown_files)
         mutable_paths.extend(
             repo_root / "skills" / "sections" / f"{section_name}.md"
@@ -851,8 +916,6 @@ def main(argv: list[str] | None = None) -> int:
             mutable_paths.append(repo_root / surface_path("skill_bootstrap"))
         if plan.sdlc_contract is not None:
             mutable_paths.append(repo_root / surface_path("sdlc"))
-        if plan.validator_text is not None:
-            mutable_paths.append(repo_root / surface_path("validator"))
         if plan.workflow_text is not None:
             mutable_paths.append(repo_root / surface_path("workflow"))
         snapshots = [snapshot_file(path) for path in dict.fromkeys(mutable_paths)]
@@ -862,7 +925,7 @@ def main(argv: list[str] | None = None) -> int:
                 repo_root / "skills",
                 repo_root / "skills" / "sections",
                 repo_root / "scripts",
-                repo_root / "sdlc",
+                repo_root / ".ceratops/sdlc",
                 repo_root / ".github",
                 repo_root / ".github" / "workflows",
             )
@@ -871,7 +934,6 @@ def main(argv: list[str] | None = None) -> int:
             and (
                 path.name not in {"scripts"}
                 or bool(plan.skills)
-                or plan.validator_text is not None
             )
             and (path.name not in {"sdlc"} or plan.sdlc_contract is not None)
             and (
@@ -879,6 +941,8 @@ def main(argv: list[str] | None = None) -> int:
                 or plan.workflow_text is not None
             )
         ]
+        if plan.test_support_only or plan.dependency_policy_only:
+            created_dirs = []
         # Include every new ancestor before writing payloads. Rollback removes
         # only empty directories after restoring files and the owned environment.
         new_directories = set(created_dirs)
@@ -906,13 +970,32 @@ def main(argv: list[str] | None = None) -> int:
         mutation_started = True
         apply_compatibility_plan(repo_root, plan)
         bootstrap_status = "skipped"
+        if plan.dependency_policy_only:
+            print(json.dumps({
+                "status": "ok", "scope": "dependency-policy", "rollback": "not_needed",
+                "files": [path.relative_to(repo_root).as_posix() for path in plan.runtime_files],
+            }, sort_keys=True))
+            return 0
+        if plan.test_support_only:
+            phase = "test_support_files"
+            support_errors = generated_support_errors(repo_root, load_compatibility_contract())
+            if support_errors:
+                raise RuntimeError("; ".join(support_errors))
+            print(json.dumps({
+                "status": "ok", "scope": "test-support", "rollback": "not_needed",
+                "files": [path.relative_to(repo_root).as_posix() for path in plan.runtime_files],
+                "runner": "refreshed" if test_runner in plan.runtime_files else "preserved",
+            }, sort_keys=True))
+            return 0
         if plan.skills:
             phase = "bootstrap_synchronization"
             from .bootstrap_installer_synchronization import (
                 synchronize_bootstrap_installer,
             )
 
-            bootstrap = synchronize_bootstrap_installer(repo_root)
+            bootstrap = synchronize_bootstrap_installer(
+                repo_root, allow_primary_checkout=args.allow_primary_checkout,
+            )
             bootstrap_status_value = (
                 bootstrap.get("status") if isinstance(bootstrap, Mapping) else None
             )
@@ -944,7 +1027,7 @@ def main(argv: list[str] | None = None) -> int:
         ):
             detail = "; ".join(compatibility["errors"]) or "not applicable"
             raise RuntimeError(f"repository compatibility failed: {detail}")
-    except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
+    except (OSError, RuntimeError, ValueError, json.JSONDecodeError, yaml.YAMLError) as exc:
         reason = str(exc)
         if mutation_started:
             try:
@@ -952,7 +1035,8 @@ def main(argv: list[str] | None = None) -> int:
                     remove_created_environment(repo_root, runtime["environment"])
                 restore_snapshots(snapshots, created_dirs)
                 if (
-                    not environment_created
+                    not (args.test_support_only or args.dependency_policy_only)
+                    and not environment_created
                     and (repo_root / runtime["lockfile"]).is_file()
                 ):
                     setup_runtime(repo_root, runtime)
@@ -986,20 +1070,12 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 "repository_validation": {
                     "checks": plan.validation_checks,
-                    "validator": (
-                        "applied" if plan.validator_text is not None
-                        else "preserved" if (repo_root / surface_path("validator")).is_file()
-                        else "not_configured"
-                    ),
                     "workflow": (
                         "applied" if plan.workflow_text is not None else "preserved"
                     ),
                 },
                 "python_tests": plan.python_tests,
                 "validator_environment": runtime["environment"],
-                "custom_validation_review_required": (
-                    plan.validator_text is None and (repo_root / surface_path("validator")).is_file()
-                ),
                 "markers_removed": plan.updated_markers,
                 "rollback": "not_needed",
                 "runtime_source_id": source_id,

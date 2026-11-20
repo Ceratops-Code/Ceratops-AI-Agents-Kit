@@ -93,7 +93,7 @@ def _new_receipt_fixtures(
 ):
     required_targets = required_targets or [target, "python-3.14-linux"]
     target_suffix = f"/{target}" if len(required_targets) > 1 else ""
-    receipt_path = f".build/claims/{version}{target_suffix}/{receipt_name}"
+    receipt_path = f".ceratops/build/claims/{version}{target_suffix}/{receipt_name}"
 
     def digest(content: bytes) -> str:
         return hashlib.sha256(content).hexdigest()
@@ -198,8 +198,8 @@ def _new_receipt_fixtures(
         "requiredChecks": [
             {
                 "kind": "source-check",
-                "id": "repository-validation",
-                "version": "validate-repository.v5",
+                "id": "ruff",
+                "version": "ruff-0.12.0+fixture-v1",
             },
             {
                 "kind": "artifact-test",
@@ -209,14 +209,14 @@ def _new_receipt_fixtures(
         ],
         "sourceChecks": [
             {
-                "id": "repository-validation",
-                "version": "validate-repository.v5",
+                "id": "ruff",
+                "version": "ruff-0.12.0+fixture-v1",
                 "status": "passed",
                 "inputs": ["source", "dependency-lock", "tests", "test-config"],
                 "evidence": [
                     {
                         "root": "git",
-                        "path": f".build/claims/{version}{target_suffix}/evidence/validation.json",
+                        "path": f".ceratops/build/claims/{version}{target_suffix}/evidence/validation.json",
                         "size": len(validation),
                         "sha256": digest(validation),
                     }
@@ -255,7 +255,7 @@ def _new_receipt_fixtures(
             {
                 "type": "source-check-evidence",
                 "root": "git",
-                "path": f".build/claims/{version}{target_suffix}/evidence/validation.json",
+                "path": f".ceratops/build/claims/{version}{target_suffix}/evidence/validation.json",
                 "size": len(validation),
                 "sha256": digest(validation),
             },
@@ -276,7 +276,7 @@ def _new_receipt_fixtures(
         ],
         "committedResultPaths": [
             receipt_path,
-            f".build/claims/{version}{target_suffix}/evidence/validation.json",
+            f".ceratops/build/claims/{version}{target_suffix}/evidence/validation.json",
         ],
     }
     build_bytes = results.encode_new_receipt(build_receipt)
@@ -400,22 +400,22 @@ def _bound_test_build(repo_root, *, pre_test_commit, **selection):
     return storage.bind_artifact_inputs(allocation, pre_test_commit=pre_test_commit)
 
 
-@pytest.mark.parametrize("stage", ["mkdir", "request", "binding"])
+@pytest.mark.parametrize("stage", ["mkdir", "binding"])
 @pytest.mark.parametrize("timing", ["before", "after"])
-def test_versioned_allocation_repeats_after_directory_and_request_effects(tmp_path, monkeypatch, stage, timing):
+def test_versioned_allocation_repeats_after_directory_effects(tmp_path, monkeypatch, stage, timing):
     repository, commit = _versioned_repository(tmp_path)
     selection = dict(repository="example/project", release_bundle="claims", version="1.2.3b1",
                      required_targets=["linux", "windows"], attempt_id="attempt-interruption")
     allocation = None
     if stage == "binding":
         allocation = storage.allocate_artifact_version(repository, **selection)
-    method = pathlib.Path.mkdir if stage == "mkdir" else storage._write_transaction_record
+    method = pathlib.Path.mkdir
     fired = False
 
     def interrupted(*args, **kwargs):
         nonlocal fired
         path = args[0]
-        selected = (path.name == "1.2.3b1" if stage == "mkdir" else path.name == "build_request.json")
+        selected = path.name == ("1.2.3b1" if stage == "mkdir" else "linux")
         if selected and not fired:
             fired = True
             if timing == "after":
@@ -424,10 +424,7 @@ def test_versioned_allocation_repeats_after_directory_and_request_effects(tmp_pa
         return method(*args, **kwargs)
 
     with monkeypatch.context() as patch:
-        if stage == "mkdir":
-            patch.setattr(pathlib.Path, "mkdir", interrupted)
-        else:
-            patch.setattr(storage, "_write_transaction_record", interrupted)
+        patch.setattr(pathlib.Path, "mkdir", interrupted)
         with pytest.raises(OSError, match="interrupted allocation"):
             if allocation is None:
                 storage.allocate_artifact_version(repository, **selection)
@@ -437,11 +434,12 @@ def test_versioned_allocation_repeats_after_directory_and_request_effects(tmp_pa
     fresh = storage.allocate_artifact_version(repository, **selection)
     assert fresh.version == "1.2.3b1"
     bound = storage.bind_artifact_inputs(fresh, pre_test_commit=commit)
-    assert json.loads(bound.request_path.read_text())["preTestCommit"] == commit
+    assert bound.pre_test_commit == commit
+    assert not (bound.version_root / "build_request.json").exists()
     assert all(bound.target_output(target).is_dir() for target in bound.required_targets)
     repeated = storage.allocate_artifact_version(repository, **{**selection, "version": bound.version})
-    assert storage._build_request_record(repeated)["preTestCommit"] is None
-    assert repeated.request_path == bound.request_path
+    assert not isinstance(repeated, storage.ArtifactVersionTransaction)
+    assert repeated.version_root == bound.version_root
 
 
 def test_versioned_allocation_precedes_embedded_versions_and_commit_b(tmp_path):
@@ -450,8 +448,8 @@ def test_versioned_allocation_precedes_embedded_versions_and_commit_b(tmp_path):
                      required_targets=["linux", "windows"], attempt_id="attempt-before-b",
                      declared_input_paths=["src", "version.txt"])
     allocation = storage.allocate_artifact_version(repository, **selection)
-    record = json.loads(allocation.request_path.read_text())
-    assert record["allocationCommit"] == before and record["preTestCommit"] is None
+    assert not isinstance(allocation, storage.ArtifactVersionTransaction)
+    assert not (allocation.version_root / "build_request.json").exists()
     assert not allocation.target_output("linux").exists()
     (repository / "version.txt").write_text(allocation.version)
     assert run_git(repository, "add", "version.txt").returncode == 0
@@ -462,7 +460,7 @@ def test_versioned_allocation_precedes_embedded_versions_and_commit_b(tmp_path):
     assert (repository / "version.txt").read_text() == bound.version
     fresh = storage.allocate_artifact_version(repository, **selection)
     assert fresh.version == bound.version
-    assert storage._build_request_record(fresh)["preTestCommit"] is None
+    assert not isinstance(fresh, storage.ArtifactVersionTransaction)
 
 
 @pytest.mark.parametrize("change", ["worktree", "index", "new-file"])
@@ -510,7 +508,7 @@ def test_versioned_allocation_propagates_permission_errors_and_requires_final_ve
     assert run_git(repository, "tag", "claims/1.2.3").returncode == 0
     with pytest.raises(storage.OperationError, match="choose another final version"):
         storage.allocate_artifact_version(repository, **{**selection, "version": "1.2.3", "attempt_id": "another"})
-    assert not first.request_path.exists()
+    assert not first.version_root.exists()
 
 
 def test_versioned_competing_processes_allocate_while_retention_is_busy(tmp_path):
@@ -531,7 +529,7 @@ def test_versioned_competing_processes_allocate_while_retention_is_busy(tmp_path
         "subprocess.run(['git','-C',str(root),'commit','-m','embed version'],check=True,capture_output=True)\n"
         "b=subprocess.check_output(['git','-C',str(root),'rev-parse','HEAD'],text=True).strip()\n"
         "t=store_artifacts.bind_artifact_inputs(a,pre_test_commit=b)\n"
-        "print(json.dumps({'version':t.version,'commit':b}),flush=True)\n"
+        "print(json.dumps({'version':t.version,'commit':t.pre_test_commit,'targets':t.required_targets}),flush=True)\n"
     )
     workers = [subprocess.Popen([sys.executable, "-c", program, str(REPOSITORY_LIFECYCLE_SCRIPTS), str(path)],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -552,9 +550,11 @@ def test_versioned_competing_processes_allocate_while_retention_is_busy(tmp_path
             record = json.loads(output)
             versions.add(record["version"])
             assert (path / "version.txt").read_text() == record["version"]
-            saved = json.loads((storage._artifact_store_path(path, temporary=True) / "claims" / record["version"] / "build_request.json").read_text())
-            assert saved["preTestCommit"] == record["commit"]
-            assert saved["requiredTargets"] == ["linux", "windows"]
+            output_directory = storage._artifact_store_path(path, temporary=True) / "claims" / record["version"]
+            assert not (output_directory / "build_request.json").exists()
+            assert record["commit"] == run_git(path, "rev-parse", "HEAD").stdout.strip()
+            assert record["targets"] == ["linux", "windows"]
+            assert all((output_directory / target).is_dir() for target in record["targets"])
         assert versions == {"1.2.3b1", "1.2.3b2"}
     finally:
         for worker in workers:
@@ -564,7 +564,7 @@ def test_versioned_competing_processes_allocate_while_retention_is_busy(tmp_path
 
 
 @pytest.mark.parametrize("stage_results", [False, True])
-def test_versioned_requests_clear_only_same_checkout_and_item(tmp_path, stage_results) -> None:
+def test_versioned_attempts_clear_only_same_checkout_and_item(tmp_path, stage_results) -> None:
     repository, commit = _versioned_repository(tmp_path)
     targets = ["python-3.14-windows", "python-3.14-linux"]
     selection = dict(repository="example/project", release_bundle="claims", version="1.2.3a1",
@@ -583,13 +583,13 @@ def test_versioned_requests_clear_only_same_checkout_and_item(tmp_path, stage_re
     assert foreign.version == "1.2.3a2"
     foreign_file = foreign.target_output(targets[0]) / "keep.bin"
     foreign_file.write_bytes(b"another checkout")
-    unfinished_path = ".build/claims/1.2.3a1/build_receipt.json"
+    unfinished_path = ".ceratops/build/claims/1.2.3a1/build_receipt.json"
     unfinished = repository / unfinished_path
     unfinished.parent.mkdir(parents=True)
     unfinished.write_text("{}", encoding="utf-8")
     if stage_results:
         assert run_git(repository, "add", "--", unfinished_path).returncode == 0
-    unrelated_result_path = ".build/other/1.0.0a1/build_receipt.json"
+    unrelated_result_path = ".ceratops/build/other/1.0.0a1/build_receipt.json"
     unrelated_result = repository / unrelated_result_path
     unrelated_result.parent.mkdir(parents=True)
     unrelated_result.write_text("{}", encoding="utf-8")
@@ -609,7 +609,7 @@ def test_versioned_requests_clear_only_same_checkout_and_item(tmp_path, stage_re
     assert diagnostic.parent == repeated.version_root / ".diagnostics"
     completion.write_versioned_failure_diagnostic(repeated, targets[0], "replacement failure")
     assert json.loads(diagnostic.read_text())["error"] == "replacement failure"
-    repeated.request_path.write_bytes(b"interrupted request")
+    (repeated.version_root / "build_request.json").write_bytes(b"obsolete interrupted request")
     replacement = _bound_test_build(repository, pre_test_commit=commit, **selection)
     assert replacement.version == "1.2.3a1"
     assert not diagnostic.exists()
@@ -896,7 +896,7 @@ def test_artifact_receipt_reader_rejects_malformed_records(tmp_path, problem) ->
     if problem == "wrong-root":
         receipt["buildReceipt"]["root"] = "store"
     elif problem == "wrong-build-path":
-        receipt["buildReceipt"]["path"] = ".build/other/1.2.3b1/build_receipt.json"
+        receipt["buildReceipt"]["path"] = ".ceratops/build/other/1.2.3b1/build_receipt.json"
     elif problem == "unsafe-artifact":
         receipt["artifactPaths"][0] = "../claims.whl"
     elif problem == "self-artifact":

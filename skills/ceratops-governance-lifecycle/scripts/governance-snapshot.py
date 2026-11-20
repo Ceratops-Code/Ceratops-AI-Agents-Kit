@@ -19,12 +19,14 @@ import sys
 import tempfile
 import tomllib
 from collections import Counter
-from datetime import datetime, timezone
-from typing import Any, Iterable, cast
+from collections.abc import Iterable
+from datetime import UTC, datetime
+from typing import Any, cast
 
 from rule_graph import (
     load_history_source,
     parse_rule_source,
+    parse_rule_text,
     rule_source_summary,
     validate_rule_stack,
 )
@@ -80,7 +82,7 @@ REFERENCE_RE = re.compile(
 
 
 def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
 def default_codex_home() -> pathlib.Path:
@@ -128,12 +130,38 @@ def reference_inventory(prompt: str) -> dict[str, list[str]]:
     }
 
 
-def parse_automation(path: pathlib.Path, root: pathlib.Path) -> dict[str, object]:
-    data = tomllib.loads(read_text(path))
+def parse_automation(
+    path: pathlib.Path, root: pathlib.Path, *,
+    data: dict[str, Any] | None = None, codex_home: pathlib.Path | None = None,
+) -> dict[str, object]:
+    data = tomllib.loads(read_text(path)) if data is None else data
     prompt = str(data.get("prompt", ""))
     references = reference_inventory(prompt)
     memory_contract = classify_memory_contract(prompt)
     inbox_contract = classify_inbox_contract(prompt)
+    helper_fingerprints: dict[str, str | None] = {}
+    helper_errors: dict[str, str] = {}
+    codex_home = (codex_home or default_codex_home()).resolve()
+    for reference in references["helper_refs"]:
+        expanded = reference.replace("$CODEX_HOME", codex_home.as_posix())
+        helper = pathlib.Path(os.path.expandvars(expanded)).expanduser()
+        if helper.is_absolute() and helper.is_relative_to(codex_home / "automations"):
+            # Source and runtime use the corresponding copy of an automation
+            # helper, even when the prompt spells its installed path.
+            helper = root / helper.relative_to(codex_home / "automations")
+        elif not helper.is_absolute():
+            candidates = [candidate for candidate in (path.parent / helper, root.parent / helper)
+                          if candidate.is_file()]
+            if len(set(candidates)) != 1 or "$" in expanded:
+                helper_fingerprints[reference] = None
+                helper_errors[reference] = "helper reference is missing or ambiguous"
+                continue
+            helper = candidates[0]
+        try:
+            helper_fingerprints[reference] = hashlib.sha256(helper.read_bytes()).hexdigest()
+        except OSError as exc:
+            helper_fingerprints[reference] = None
+            helper_errors[reference] = f"{helper}: {type(exc).__name__}: {exc}"
     return {
         "path": maybe_rel(path, root),
         "id": data.get("id"),
@@ -144,6 +172,9 @@ def parse_automation(path: pathlib.Path, root: pathlib.Path) -> dict[str, object
         "reasoning_effort": data.get("reasoning_effort"),
         "cwds": data.get("cwds", []),
         "prompt_chars": len(prompt),
+        "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        "helper_fingerprints": helper_fingerprints,
+        "helper_errors": helper_errors,
         **references,
         "memory_contract": memory_contract["contract"],
         "memory_mention_count": memory_contract["mention_count"],
@@ -217,9 +248,16 @@ def classify_inbox_contract(prompt: str) -> str:
     return "mentioned"
 
 
-def automations_inventory(automation_root: pathlib.Path) -> dict[str, object]:
-    paths = sorted(automation_root.glob("*/automation.toml"))
-    items = [parse_automation(path, automation_root) for path in paths]
+def automations_inventory(
+    automation_root: pathlib.Path, *,
+    documents: dict[pathlib.Path, dict[str, Any]] | None = None,
+    codex_home: pathlib.Path | None = None,
+) -> dict[str, object]:
+    documents = ({path: tomllib.loads(read_text(path))
+                  for path in sorted(automation_root.glob("*/automation.toml"))}
+                 if documents is None else documents)
+    items = [parse_automation(path, automation_root, data=data, codex_home=codex_home)
+             for path, data in documents.items()]
     schedules = Counter(str(item["schedule"]) for item in items)
     models = Counter(str(item["model"]) for item in items)
     return {
@@ -431,6 +469,15 @@ def repo_git_state(repo: pathlib.Path, kind: str) -> dict[str, object]:
     if upstream_error and "no upstream configured" not in upstream_error.lower():
         errors.append(upstream_error)
 
+    _release_ref, release_error = run_git(root, "show-ref", "--verify", "--quiet", "refs/heads/release/local")
+    release_commits: list[str] = []
+    if release_error is None:
+        commits, error = run_git(root, "log", "--format=%H", "refs/heads/main..refs/heads/release/local")
+        if error:
+            errors.append(error)
+        else:
+            release_commits = (commits or "").splitlines()
+
     return {
         "kind": kind,
         "path": str(root),
@@ -439,6 +486,7 @@ def repo_git_state(repo: pathlib.Path, kind: str) -> dict[str, object]:
         "head": head,
         "upstream": upstream,
         "active_release_branch": bool(branch and branch.startswith("release/")),
+        "release_local_commits_outside_main": release_commits,
         "dirty": bool(status_lines),
         "changed_count": len(status_lines),
         "changed_paths": changed_paths[:20],
@@ -450,11 +498,14 @@ def repo_git_state(repo: pathlib.Path, kind: str) -> dict[str, object]:
 def git_inventory(
     automation_source_repo: pathlib.Path,
     projects_root: pathlib.Path,
+    *, project_agents: list[pathlib.Path] | None = None,
 ) -> dict[str, object]:
     """Collect compact Git state for the automation repo and AGENTS projects."""
     candidates = [
         ("automation", automation_source_repo),
-        *(("project", path.parent) for path in iter_project_agents(projects_root)),
+        *(("project", path.parent) for path in (
+            iter_project_agents(projects_root) if project_agents is None else project_agents
+        )),
     ]
     targets: list[tuple[str, pathlib.Path]] = []
     seen_roots: set[pathlib.Path] = set()
@@ -474,9 +525,20 @@ def git_inventory(
 
 
 def classify_force_definitions(text: str) -> dict[str, bool]:
+    enforcement = {
+        match.group(1): " ".join(match.group(2).split())
+        for match in re.finditer(r"(?ms)^- \[(ENF-0[123])\]\s*(.*?)(?=^- \[|\Z)", text)
+    }
+    split_enforcement = (
+        "mandatory" in enforcement.get("ENF-01", "")
+        and "block work" in enforcement.get("ENF-02", "")
+        and "completion" in enforcement.get("ENF-02", "")
+    )
     return {
-        "all_instruction_bullets_mandatory_blocking": bool(ALL_BULLETS_FORCE_RE.search(text)),
-        "d_label_preserves_force": bool(D_FORCE_PRESERVATION_RE.search(text)),
+        "all_instruction_bullets_mandatory_blocking": bool(ALL_BULLETS_FORCE_RE.search(text)) or split_enforcement,
+        "d_label_preserves_force": bool(D_FORCE_PRESERVATION_RE.search(text)) or (
+            split_enforcement and "does not change mandatory status" in enforcement.get("ENF-03", "")
+        ),
     }
 
 
@@ -555,12 +617,15 @@ def _project_scope_root(
 
 
 def agents_rule_graph_inventory(
-    projects_root: pathlib.Path, codex_home: pathlib.Path
+    projects_root: pathlib.Path, codex_home: pathlib.Path, *,
+    agent_texts: dict[pathlib.Path, str] | None = None,
 ) -> dict[str, object]:
     """Validate global and complete project AGENTS scopes with one parser."""
-    paths = list(iter_agents(projects_root, codex_home))
     global_path = (codex_home / "AGENTS.md").resolve()
-    parsed = {path.resolve(): parse_rule_source(path) for path in paths}
+    parsed = ({path.resolve(): parse_rule_source(path) for path in iter_agents(projects_root, codex_home)}
+              if agent_texts is None else {
+                  path.resolve(): parse_rule_text(text, str(path.resolve())) for path, text in agent_texts.items()
+              })
     local_paths = sorted(path for path in parsed if path != global_path)
     project_root_by_path = {
         path: _project_scope_root(path, projects_root)
@@ -668,16 +733,20 @@ def agents_rule_graph_inventory(
     }
 
 
-def agents_inventory(projects_root: pathlib.Path, codex_home: pathlib.Path) -> dict[str, object]:
+def agents_inventory(
+    projects_root: pathlib.Path, codex_home: pathlib.Path, *,
+    agent_texts: dict[pathlib.Path, str] | None = None,
+) -> dict[str, object]:
     items = []
     repeated_lines: Counter[str] = Counter()
-    global_path = codex_home / "AGENTS.md"
-    global_force = classify_force_definitions(read_text(global_path)) if global_path.exists() else {
+    agent_texts = ({path.resolve(): read_text(path) for path in iter_agents(projects_root, codex_home)}
+                   if agent_texts is None else agent_texts)
+    global_path = (codex_home / "AGENTS.md").resolve()
+    global_force = classify_force_definitions(agent_texts[global_path]) if global_path in agent_texts else {
         "all_instruction_bullets_mandatory_blocking": False,
         "d_label_preserves_force": False,
     }
-    for path in iter_agents(projects_root, codex_home):
-        text = read_text(path)
+    for path, text in agent_texts.items():
         lines = text.splitlines()
         declared_force = classify_force_definitions(text)
         effective_force = {
@@ -779,12 +848,16 @@ def d_rule_brevity_inventory(
     automation_source_root: pathlib.Path,
     projects_root: pathlib.Path,
     codex_home: pathlib.Path,
+    *, agent_texts: dict[pathlib.Path, str] | None = None,
+    automation_documents: dict[pathlib.Path, dict[str, Any]] | None = None,
 ) -> dict[str, object]:
     candidates: list[dict[str, object]] = []
     sources_checked = 0
 
-    for path in sorted(automation_source_root.glob("*/automation.toml")):
-        data = tomllib.loads(read_text(path))
+    automation_documents = ({path: tomllib.loads(read_text(path))
+                             for path in sorted(automation_source_root.glob("*/automation.toml"))}
+                            if automation_documents is None else automation_documents)
+    for path, data in automation_documents.items():
         prompt = str(data.get("prompt", ""))
         sources_checked += 1
         candidates.extend(
@@ -795,9 +868,11 @@ def d_rule_brevity_inventory(
             )
         )
 
-    for path in iter_agents(projects_root, codex_home):
+    agent_texts = ({path.resolve(): read_text(path) for path in iter_agents(projects_root, codex_home)}
+                   if agent_texts is None else agent_texts)
+    for path, text in agent_texts.items():
         sources_checked += 1
-        candidates.extend(collect_overlong_d_rules(read_text(path), str(path), "agents_file"))
+        candidates.extend(collect_overlong_d_rules(text, str(path), "agents_file"))
 
     candidates.sort(
         key=lambda item: (
@@ -826,8 +901,12 @@ def build_snapshot(args: argparse.Namespace) -> dict[str, object]:
     runtime_root = args.automation_root.resolve()
     source_repo = resolve_automation_source_repo(args)
     source_root = source_repo / "automations"
-    runtime_inventory = automations_inventory(runtime_root)
-    source_inventory = automations_inventory(source_root)
+    projects_root, codex_home = args.projects_root.resolve(), args.codex_home.resolve()
+    agent_texts = {path.resolve(): read_text(path) for path in iter_agents(projects_root, codex_home)}
+    source_documents = {path: tomllib.loads(read_text(path))
+                        for path in sorted(source_root.glob("*/automation.toml"))}
+    runtime_inventory = automations_inventory(runtime_root, codex_home=codex_home)
+    source_inventory = automations_inventory(source_root, documents=source_documents, codex_home=codex_home)
     return {
         "schema": "global-governance-consistency-audit/snapshot.v4",
         "generated_at": utc_now(),
@@ -837,16 +916,19 @@ def build_snapshot(args: argparse.Namespace) -> dict[str, object]:
             runtime_inventory,
             source_inventory,
         ),
-        "agents": agents_inventory(args.projects_root.resolve(), args.codex_home.resolve()),
+        "agents": agents_inventory(projects_root, codex_home, agent_texts=agent_texts),
         "agents_rule_graph": agents_rule_graph_inventory(
-            args.projects_root.resolve(), args.codex_home.resolve()
+            projects_root, codex_home, agent_texts=agent_texts,
         ),
-        "git": git_inventory(source_repo, args.projects_root.resolve()),
+        "git": git_inventory(source_repo, projects_root, project_agents=[
+            path for path in agent_texts if path != codex_home / "AGENTS.md"
+        ]),
         "automation_gitignore": gitignore_inventory(source_repo),
         "d_rule_brevity": d_rule_brevity_inventory(
             source_root,
             args.projects_root.resolve(),
             args.codex_home.resolve(),
+            agent_texts=agent_texts, automation_documents=source_documents,
         ),
     }
 
@@ -1019,6 +1101,7 @@ def build_review_clusters(snapshot: dict[str, Any]) -> dict[str, object]:
         "id", "name", "status", "schedule", "model", "reasoning_effort",
         "cwds", "helper_refs", "control_refs", "artifact_refs",
         "memory_contract", "inbox_contract",
+        "prompt_sha256", "helper_fingerprints",
     )
     for scope, section in sections.items():
         by_path = {}
@@ -1044,6 +1127,10 @@ def build_review_clusters(snapshot: dict[str, Any]) -> dict[str, object]:
                 for field in fields
                 if source is None or runtime is None or source.get(field) != runtime.get(field)
             },
+            "unresolved_helpers": {
+                scope: entry.get("helper_errors", {})
+                for scope, entry in entries.items() if entry and entry.get("helper_errors")
+            },
         }
         pairs.append(row)
     mismatches = []
@@ -1068,7 +1155,8 @@ def build_review_clusters(snapshot: dict[str, Any]) -> dict[str, object]:
                                    if entry["classification_review_required"]],
         "git": [entry for entry in snapshot["git"]["items"]
                 if not entry["is_git_repo"] or entry.get("dirty")
-                or entry.get("errors") or entry.get("active_release_branch")],
+                or entry.get("errors") or entry.get("active_release_branch")
+                or entry.get("release_local_commits_outside_main")],
     }
 
 

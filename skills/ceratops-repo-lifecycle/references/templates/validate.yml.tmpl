@@ -9,10 +9,10 @@ permissions:
   contents: read
 
 jobs:
-  validate-repository:
-    timeout-minutes: 90
-    name: validate-repository
+  repository-checks:
+    name: repository-checks
     runs-on: __RUNNER__
+    timeout-minutes: 90
     steps:
       - name: Check pull request source for main
         if: github.event_name == 'pull_request' && github.base_ref == 'main'
@@ -79,7 +79,7 @@ jobs:
             fi
           done
           # This offline check does not inspect Mend jobs or fetch private presets.
-          npm exec --yes --package=renovate@44.240.0 -- \
+          npm exec --yes --package=renovate@__RENOVATE_VERSION__ -- \
             renovate-config-validator --no-global --strict "${config_files[@]}"
 
       - name: Upload validation evidence

@@ -24,20 +24,29 @@ Infer the source identity from stable repository evidence before asking.
 
 - Keep compatibility and SDLC execution code and schemas in this skill.
   Target repositories receive declarations and repository-specific entrypoints.
-  CI invokes this skill's pinned GitHub action and never dispatches handoffs.
+  CI runs repository-owned commands and never dispatches lifecycle handoffs.
 - (D) `ceratops_repo_compatibility_engine.validate_ceratops_compatibility`
   exposes `validate_ceratops_compatibility(repo_root)` returning
   `{applicable, valid, errors}`. It performs read-only manifest, deployment,
   and validation-wiring checks. It never runs skill-source validation.
 - (D) Apply Ceratops compatibility: `python -m
   ceratops_repo_compatibility_engine apply --target-repo-root
-  <task-worktree> [--runtime-source-id <stable-id>]`; it performs the
+  <target-repo> [--runtime-source-id <stable-id>]
+  [--allow-primary-checkout]
+  [--test-support-only | --dependency-policy-only]`; it performs the
   compatibility transaction and emits one compact result.
-  Every compatible repository receives the current SDLC format with separate
-  validation and tests. Existing supported formats remain executable outside
-  this compatibility application.
+  Full application updates the repository's compatibility declarations.
+  `--test-support-only` refreshes generated result and reuse support while
+  preserving custom runners and application configuration. For managed runners,
+  it also updates their existing SDLC and CI commands when a required runner
+  argument changes. Its result describes only this narrower scope.
+  `--dependency-policy-only` updates dependency-bot configuration and adds
+  its configuration checks to the existing workflow. It preserves application
+  checks, SDLC, runners and package layout. Both narrow modes use the same
+  transaction rollback as full application; choose one mode per call.
 - (D) Bootstrap-only repair: `python -m ceratops_repo_compatibility_engine
-  synchronize-bootstrap --target-repo-root <task-worktree>`; it only compares
+  synchronize-bootstrap --target-repo-root <target-repo>
+  [--allow-primary-checkout]`; it only compares
   parsed installer versions and copies a missing or lower version.
 - (D) `ceratops_repo_compatibility_engine.sdlc_contract_validation` reads and
   validates SDLC contracts for compatibility application, execution, and
@@ -59,7 +68,9 @@ Infer the source identity from stable repository evidence before asking.
 
 - Use this action only when an existing repository does not yet satisfy the
   `ceratops-compatible` profile.
-- Work only in the target repository's task-specific linked worktree.
+- Use a linked task worktree by default. For an explicitly authorized direct
+  edit, pass `--allow-primary-checkout`; the target must be the primary
+  checkout on `main` or `release/local`. The command never switches branches.
 - Do not add Ceratops naming, branding, icons, or Ceratops-only contracts to a
   compatible repository unless that repository independently requires them.
 - Do not create the requested new skill in this action; return to `create` after
@@ -115,10 +126,11 @@ Infer the source identity from stable repository evidence before asking.
 - Generate `scripts/run-tests.py` when compatibility infers repository test
   ownership and selects that runner in SDLC. Preserve explicit SDLC test
   ownership without creating an unused runner; generated Python test commands
-  use the scripts project and pass `--temporary-root .build/test-tmp`. The
-  runner requires this option for execution. SDLC commands using the standard
-  runner path must supply a directory inside the checkout. CI runs source
-  checks and tests without executing skill handoffs.
+  use the scripts project and pass `--temporary-root "{temporary_root}"`. The
+  runner requires this option for execution. SDLC supplies the external
+  project/task temp directory; the runner owns its per-run folders and cleanup.
+  CI uses the same parameter and runs source checks and tests without executing
+  skill handoffs.
 - Review custom validators and configuration-defined scripts to ensure they
   never run tests. Move test execution into SDLC test operations without losing
   target behavior before claiming compatibility. Detection cannot prove this
@@ -160,8 +172,9 @@ Infer the source identity from stable repository evidence before asking.
   source skills exist, write `skills/skill-sections.json`, copy canonical shared
   sections to `skills/sections/`, and remove generated section blocks from
   source skills.
-- Create or update `sdlc/sdlc.yml` from the owned template, preserving target
-  capabilities and separate source/test commands in `pre-build-checks`
+- Create or update the current `.ceratops/sdlc/sdlc.yml` from the owned
+  template, preserving
+  target tools and separate source/test commands in `pre-build-checks`
   groups. For each source skill, add `deliverables.skills.<name>` with
   `actions.pre-build-checks.check-groups.source` handing off to
   `ceratops-skill-lifecycle/source-validate` and `actions.install` handing off
@@ -171,16 +184,17 @@ Infer the source identity from stable repository evidence before asking.
   `skills/<name>/agents/openai.yaml`, and align the README Skills table without
   changing skill behavior.
 
-### 3. Create repository validation and bootstrap
+### 3. Set up source checks, CI and bootstrap
 
 - Generate Ruff and mypy defaults in the scripts project from its template.
-  Generated validation uses those defaults unless the repository supplies its
-  own configuration; preserve existing settings and custom validators.
+  Generated check groups use those defaults unless the repository supplies its
+  own configuration. Preserve existing settings and target-owned checks.
 
-- Create a missing `scripts/validate-repository.py` and
-  `.github/workflows/validate.yml` for every repository, including repositories
-  with no skills. Generate CI from the declared repository check and test
-  commands. Preserve existing workflows and report missing check coverage.
+- Generate one SDLC group per applicable source check from the repository
+  check contract. Create a missing `.github/workflows/validate.yml` for every
+  repository, including repositories with no skills. Generate CI from the
+  declared repository check and test commands. Preserve repository-owned
+  workflows and report missing command coverage.
 - When skills exist, the compatibility apply helper synchronizes the
   independent `scripts/deploy-skills.py`. Retain a same- or
   higher-version bootstrap and replace only a missing or lower version.
@@ -200,7 +214,7 @@ Infer the source identity from stable repository evidence before asking.
   every applicable result to be valid with no errors.
 - Resolve every applicable compatibility review check before claiming full
   compatibility; keep its result distinct from the read-only structural result.
-- Commit the validated compatibility change in the task worktree.
+- Commit the checked compatibility change in the selected checkout.
 - If only local release staging was requested, return to the parent skill and
   select `promote`; if deployment was requested, select `promote-and-deploy`;
   otherwise stop at committed source compatibility.

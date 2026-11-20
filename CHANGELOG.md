@@ -14,7 +14,8 @@
   and cross-ecosystem discovery sources, and corrected pytest configuration
   detection together with unittest exclusions.
 - Unified repository setup and validation with deliverable capabilities in
-  version-2 `sdlc/sdlc.yml`. Lifecycle actions retain flow ownership; one runner
+  version-2 `.ceratops/sdlc/sdlc.yml`. Lifecycle actions retain flow ownership;
+  one runner
   executes ordered operations and advisory handoffs, blocks later mutations on
   failed checks, and supports local repair and committed retry. Publication
   identity belongs to its deliverable, with per-operation shipping checkpoints.

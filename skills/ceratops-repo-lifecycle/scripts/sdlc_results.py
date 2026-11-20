@@ -89,8 +89,8 @@ def _unique_result_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return value
 
 
-@lru_cache(maxsize=1)
-def _operation_result_validator() -> jsonschema.Draft202012Validator:
+@lru_cache(maxsize=2)
+def _operation_result_validator(definition: str | None = None) -> jsonschema.Draft202012Validator:
     """Load the installed canonical operation-result schema once per process."""
 
     try:
@@ -103,6 +103,8 @@ def _operation_result_validator() -> jsonschema.Draft202012Validator:
         jsonschema.SchemaError,
     ) as exc:
         raise StepResultError(f"Operation-result schema is invalid: {exc}") from exc
+    if definition is not None:
+        schema = {"$ref": "#/$defs/" + definition, "$defs": schema["$defs"]}
     return jsonschema.Draft202012Validator(schema)
 
 
@@ -310,11 +312,12 @@ def artifact_identity(repository, key, version, target, attempt_id=None):
         value["attemptId"] = attempt_id
     return value
 
-def _expected_build_receipt_paths(identity: Mapping[str, Any]) -> set[str]:
+def _expected_build_receipt_paths(identity: Mapping[str, Any], recorded_path: str = "") -> set[str]:
     # Saved records bind their exact historical path. New producers use only
     # build_receipt.json; accepting the recorded old path does not search for,
     # copy, rename, or create an alias for an existing committed receipt.
-    base = f".build/{receipt_storage_key(identity)}/{identity['version']}"
+    directory = ".build" if recorded_path.startswith(".build/") else ".ceratops/build"
+    base = f"{directory}/{receipt_storage_key(identity)}/{identity['version']}"
     return {
         f"{base}/build_receipt.json",
         f"{base}/{identity['target']}/build_receipt.json",
@@ -333,7 +336,7 @@ def _validate_committed_build_receipt(value: Mapping[str, Any]) -> None:
 
     receipt_path = str(value["receiptPath"])
     _bundle_relative_path(receipt_path, label="committed build receipt")
-    if receipt_path not in _expected_build_receipt_paths(identity):
+    if receipt_path not in _expected_build_receipt_paths(identity, receipt_path):
         raise StepResultError("Committed build receipt path does not match its identity.")
     summary = value.get("checkSummary")
     if summary is not None:
@@ -344,6 +347,12 @@ def _validate_committed_build_receipt(value: Mapping[str, Any]) -> None:
 
     inputs = list(value["artifactInputs"]) + list(value["checkInputs"])
     input_ids = [str(item["id"]) for item in inputs]
+    if "sourceDefinition" in value:
+        source = value["sourceDefinition"]
+        _bundle_relative_path(source["sdlcPath"], label="source SDLC declaration")
+        if source["deliverable"] + ".actions.build" != value["commandsAndSettings"]["operation"]:
+            raise StepResultError("Source declaration does not name this build's deliverable.")
+        input_ids.append(source["id"])
     _require_unique(input_ids, "Committed build receipt has duplicate input IDs.")
 
     dependencies = list(value["dependencies"])
@@ -408,7 +417,8 @@ def _validate_committed_build_receipt(value: Mapping[str, Any]) -> None:
             if (receipt_storage_key(member["identity"]) != member_key
                     or member["tag"] != member_key + "/" + member["identity"]["version"]
                     or member["buildReceipt"]["root"] != "git"
-                    or member["buildReceipt"]["path"] not in _expected_build_receipt_paths(member["identity"])):
+                    or member["buildReceipt"]["path"] not in _expected_build_receipt_paths(
+                        member["identity"], member["buildReceipt"]["path"])):
                 raise StepResultError("Bundle member reference disagrees with its identity.")
     else:
         installation = value["installationArtifactPath"]
@@ -514,7 +524,7 @@ def _validate_artifact_receipt(value: Mapping[str, Any]) -> None:
     _bundle_relative_path(str(build_receipt["path"]), label="artifact receipt")
     if build_receipt["root"] != "git":
         raise StepResultError("Artifact receipt must link a Git build receipt.")
-    if build_receipt["path"] not in _expected_build_receipt_paths(identity):
+    if build_receipt["path"] not in _expected_build_receipt_paths(identity, build_receipt["path"]):
         raise StepResultError("Artifact receipt build path does not match its identity.")
     for path in value["artifactPaths"]:
         _bundle_relative_path(str(path), label="artifact receipt")
@@ -542,7 +552,7 @@ def _validate_new_receipt(value: Mapping[str, Any], expected_schema: str) -> Non
 
 
 def encode_new_receipt(value: Mapping[str, Any]) -> bytes:
-    """Validate and serialize a v3 build or v1 artifact receipt deterministically."""
+    """Serialize a receipt within the same byte bound enforced by its reader."""
 
     if not isinstance(value, Mapping):
         raise StepResultError("New receipt must be one JSON object.")
@@ -550,7 +560,10 @@ def encode_new_receipt(value: Mapping[str, Any]) -> bytes:
     if not isinstance(schema, str):
         raise StepResultError("New receipt must declare its schema.")
     _validate_new_receipt(value, schema)
-    return _canonical_new_receipt_bytes(value)
+    raw = _canonical_new_receipt_bytes(value)
+    if len(raw) > NEW_RECEIPT_BYTES:
+        raise StepResultError("New receipt exceeds the JSON size limit.")
+    return raw
 
 
 def _parse_new_receipt(
@@ -994,6 +1007,11 @@ def _verify_receipt_inventory(
     ]
     store_paths: dict[tuple[str, str], pathlib.Path] = {}
     git_paths: list[str] = []
+    if "sourceDefinition" in receipt:
+        from ceratops_repo_compatibility_engine.sdlc_contract_validation import deliverable_source_files
+
+        git_paths.extend(deliverable_source_files(repository, receipt["sourceDefinition"],
+                                                   commit=receipt["preTestCommit"]))
     for record in records:
         key = _receipt_file_key(record)
         if record["root"] == "git":
@@ -1013,7 +1031,7 @@ def _verify_receipt_inventory(
     )
 
 
-def parse_check_summary(raw: bytes) -> dict[str, Any]:
+def parse_check_summary(raw: bytes, *, requested_check: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Read self-contained check facts; missing historical facts grant no reuse."""
     if len(raw) > 16 * 1024 * 1024:
         raise ValueError("Check summary exceeds the size limit.")
@@ -1023,6 +1041,43 @@ def parse_check_summary(raw: bytes) -> dict[str, Any]:
             or value["schema"] != "ceratops-check-summary.v1"
             or not isinstance(value["checks"], list)):
         raise ValueError("Check summary has incomplete fields.")
+    if requested_check is not None:
+        # Different runners can own different input formats in one summary.
+        # Inspect only the requested command and the children it recorded.
+        groups = value.get("inputGroups", {})
+        requested = []
+        for check in value["checks"]:
+            if not isinstance(check, dict) or check.get("kind") != "repository-check":
+                continue
+            key = check.get("inputGroup")
+            inputs = groups.get(key, {}) if isinstance(groups, dict) and isinstance(key, str) else {}
+            arguments = inputs.get("arguments") if isinstance(inputs, dict) else None
+            if (arguments == requested_check["arguments"]
+                    or (not isinstance(arguments, list) and check.get("id") == requested_check["group"])):
+                children = check.get("children", [])
+                if (not isinstance(check.get("id"), str) or not isinstance(children, list)
+                        or any(not isinstance(child, dict) or not isinstance(child.get("id"), str)
+                               or child.get("kind") is not None and not isinstance(child["kind"], str)
+                               for child in children)):
+                    raise ValueError("The requested check has malformed child identities.")
+                requested.append(check)
+        included = {(check.get("kind"), check.get("id")) for check in requested}
+        included.update((child.get("kind"), child.get("id"))
+                        for check in requested for child in check.get("children", []) if isinstance(child, dict))
+        value["checks"] = [check for check in value["checks"] if isinstance(check, dict)
+                           and isinstance(check.get("id"), str)
+                           and (check.get("kind") is None or isinstance(check["kind"], str))
+                           and (check.get("kind"), check.get("id")) in included]
+        for table_name, fields in (("inputGroups", ("inputGroup", "applicableInputGroup", "comparisonInputGroup")),
+                                   ("checkGroups", ("checkGroup", "comparisonCheckGroup"))):
+            if any(not isinstance(check[field], str) for check in value["checks"] for field in fields if field in check):
+                raise ValueError("The requested check has malformed input references.")
+            referenced = {check[field] for check in value["checks"] for field in fields if field in check}
+            table = value.get(table_name, {})
+            value[table_name] = {key: facts for key, facts in table.items() if key in referenced} if isinstance(table, dict) else table
+    errors = list(_operation_result_validator("checkSummary").iter_errors(value))
+    if errors:
+        raise ValueError("Check summary fields differ from the result contract: " + errors[0].message)
     for name in ("inputGroups", "checkGroups"):
         table = value[name]
         if not isinstance(table, dict):
@@ -1043,7 +1098,8 @@ def parse_check_summary(raw: bytes) -> dict[str, Any]:
             raise ValueError("Check summary repeats one check.")
         identities.add(identity)
         for field, table in (("inputGroup", "inputGroups"), ("checkGroup", "checkGroups"),
-                             ("applicableInputGroup", "inputGroups"), ("comparisonInputGroup", "inputGroups")):
+                             ("applicableInputGroup", "inputGroups"), ("comparisonInputGroup", "inputGroups"),
+                             ("comparisonCheckGroup", "checkGroups")):
             if field in check and check[field] not in value[table]:
                 raise ValueError("Check summary names an absent input group.")
     return value
@@ -1104,7 +1160,8 @@ def _build_blob(root: pathlib.Path, commit: str, path: str, limit: int) -> bytes
     return _build_git(root, "cat-file", "blob", oid)
 
 
-def read_build_check_summary(root: pathlib.Path, tag: str, receipt_path: str) -> dict[str, Any]:
+def read_build_check_summary(root: pathlib.Path, tag: str, receipt_path: str,
+                           *, requested_check: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Read only the tagged receipt and summary; never open packages or full logs."""
     _build_git(root, "check-ref-format", "refs/tags/" + tag)
     commit = _build_git(root, "rev-parse", "--verify", "--end-of-options",
@@ -1113,9 +1170,7 @@ def read_build_check_summary(root: pathlib.Path, tag: str, receipt_path: str) ->
     receipt = parse_committed_build_receipt(raw).value
     identity = receipt["identity"]
     expected_tag = receipt_storage_key(identity) + "/" + identity["version"]
-    parent = f'.build/{receipt_storage_key(identity)}/{identity["version"]}'
-    expected_paths = {parent + "/build_receipt.json",
-                      parent + "/" + identity["target"] + "/build_receipt.json"}
+    expected_paths = _expected_build_receipt_paths(identity, receipt_path)
     if (receipt.get("schema") != COMMITTED_BUILD_RECEIPT_SCHEMA or receipt.get("status") != "passed"
             or receipt.get("receiptPath") != receipt_path or receipt_path not in expected_paths
             or tag != expected_tag or receipt.get("tag", tag) != tag):
@@ -1131,7 +1186,7 @@ def read_build_check_summary(root: pathlib.Path, tag: str, receipt_path: str) ->
         content = _build_blob(root, commit, expected, 16 * 1024 * 1024)
         if len(content) != reference["size"] or hashlib.sha256(content).hexdigest() != reference["sha256"]:
             raise ValueError("Committed check summary differs from its receipt.")
-        summary = parse_check_summary(content)
+        summary = parse_check_summary(content, requested_check=requested_check)
     return {"tag": tag, "commit": commit, "receiptPath": receipt_path,
             "receipt": receipt, "summary": summary}
 
@@ -1139,8 +1194,9 @@ def read_build_check_summary(root: pathlib.Path, tag: str, receipt_path: str) ->
 def select_build_check_summaries(
     root: pathlib.Path, *, qualification_level: str = "alpha",
     unit: str | None = None, target: str | None = None,
+    requested_check: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Choose the newest eligible version in this checkout's .build records.
+    """Choose the newest eligible version in this checkout's .ceratops/build records.
 
     Git tags prove completion; the checkout supplies only selection identities.
     No ancestry walk, other checkout, deployment history or artifact-store scan.
@@ -1152,10 +1208,10 @@ def select_build_check_summaries(
     levels = ("alpha", "beta", "rc", "final")
     if qualification_level not in levels:
         raise ValueError("Unsupported build qualification level.")
-    history = root / ".build"
+    history = root / ".ceratops/build"
     if not history.is_dir():
         return []
-    candidates: list[tuple[Any, str, str, pathlib.Path, str]] = []
+    candidates: list[tuple[Any, str, str, pathlib.Path, str, str]] = []
     for pattern in ("*/*/build_receipt.json", "*/*/*/build_receipt.json",
                     "members/*/*/*/build_receipt.json", "members/*/*/*/*/build_receipt.json",
                     "bundles/*/*/build_receipt.json", "bundles/*/*/*/build_receipt.json"):
@@ -1178,18 +1234,18 @@ def select_build_check_summaries(
                 tag = name + "/" + version
                 if receipt.get("status") != "passed" or receipt.get("tag", tag) != tag:
                     continue
-                candidates.append((Version(version), name, destination, path, tag))
+                candidates.append((Version(version), name, destination, path, tag, receipt["receiptPath"]))
             except (ValueError, KeyError, TypeError, InvalidVersion):
                 continue  # Interrupted local preparation is not a completed build.
     chosen: dict[tuple[str, str], dict[str, Any]] = {}
-    for _version, name, destination, path, tag in sorted(candidates, key=lambda row: (row[0], str(row[3])), reverse=True):
+    for _version, name, destination, _path, tag, recorded_path in sorted(candidates, key=lambda row: (row[0], str(row[3])), reverse=True):
         if (name, destination) in chosen:
             continue
         # An absent tag is an unfinished preparation, not an accepted baseline.
         if not _build_git(root, "rev-parse", "--verify", "--quiet", "--end-of-options",
                           "refs/tags/" + tag, missing=True):
             continue
-        selected = read_build_check_summary(root, tag, path.relative_to(root).as_posix())
+        selected = read_build_check_summary(root, tag, recorded_path, requested_check=requested_check)
         identity = selected["receipt"]["identity"]
         if (receipt_storage_key(identity), identity["target"]) != (name, destination):
             raise ValueError("Local build selector differs from the tagged identity.")

@@ -523,7 +523,11 @@ def parse_body_updates(
     files: list[dict[str, Any]],
     alerts: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Parse one or more unique exact Dependabot body update records."""
+    """Read Dependabot update text and Renovate's Package/Change table.
+
+    Changed or ambiguous table layouts leave the update unknown. No package
+    manager is run and a PR title alone never supplies a missing old version.
+    """
 
     records: list[tuple[str, str, str]] = []
     seen: dict[str, tuple[str, str]] = {}
@@ -531,6 +535,33 @@ def parse_body_updates(
         package = match.group("package").strip()
         current = match.group("current")
         target = match.group("target")
+        key = package.lower()
+        versions = (current, target)
+        if key in seen:
+            if seen[key] != versions:
+                return []
+            continue
+        seen[key] = versions
+        records.append((package, current, target))
+    columns: list[str] = []
+    for line in body.splitlines():
+        if not line.strip().startswith("|"):
+            columns = []
+            continue
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if "Package" in cells and "Change" in cells:
+            columns = cells
+            continue
+        if not columns or len(cells) != len(columns) or all(re.fullmatch(r"[-: ]+", cell) for cell in cells):
+            continue
+        package_cell = cells[columns.index("Package")]
+        change = cells[columns.index("Change")]
+        package_match = re.fullmatch(r"\[([^\]]+)\]\([^\s)]+\)(?:\s*\([^)]*\))?", package_cell)
+        package = (package_match[1] if package_match else package_cell).strip("` ")
+        version_match = re.fullmatch(r"`([^`]+)`\s*(?:→|->|&rarr;)\s*`([^`]+)`", change)
+        if not package or not version_match or any(character.isspace() for character in package):
+            return []
+        current, target = version_match.groups()
         key = package.lower()
         versions = (current, target)
         if key in seen:
@@ -608,7 +639,7 @@ def fetch_url_json(url: str, *, release_version: str | None = None) -> dict[str,
 
     request = urllib.request.Request(
         url,
-        headers={"Accept": "application/json", "User-Agent": "codex-dependabot-preflight/1"},
+        headers={"Accept": "application/json", "User-Agent": "codex-dependabot-review/1"},
     )
     with urllib.request.urlopen(request, timeout=20) as response:
         value = json.loads(response.read().decode("utf-8"))
@@ -640,7 +671,7 @@ def android_gradle_plugin_registry_evidence(target: str) -> dict[str, Any]:
         f"{version}/gradle-{version}.pom"
     )
     request = urllib.request.Request(url, headers={
-        "Accept": "application/xml", "User-Agent": "codex-dependabot-preflight/1",
+        "Accept": "application/xml", "User-Agent": "codex-dependabot-review/1",
     })
     with urllib.request.urlopen(request, timeout=20) as response:
         data = response.read(1024 * 1024 + 1)
@@ -1301,4 +1332,11 @@ def queued_repositories(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
         metadata = dict(repositories.get(repo.lower(), {}))
         metadata.update(item)
         result.append(metadata)
+    included = {str(item.get("repo", "")).lower() for item in result}
+    extra = {str(item.get("repo", "")).lower() for item in snapshot.get("open_dependency_prs", [])}
+    extra.update(snapshot.get("dependency_processing", {}))
+    for key in sorted(extra - included):
+        extra_metadata = repositories.get(key)
+        if extra_metadata:
+            result.append({**extra_metadata, "repo": extra_metadata["full_name"]})
     return result

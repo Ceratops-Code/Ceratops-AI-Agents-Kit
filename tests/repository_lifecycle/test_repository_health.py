@@ -74,6 +74,42 @@ class RepositoryHealthTests(unittest.TestCase):
         targets.write_text('{}', encoding='utf-8')
         return health_targets.load_config(targets, scopes)
 
+    def test_health_warns_when_active_repositories_auto_delete_branches(self) -> None:
+        scripts = HEALTH_TARGETS_PATH.parent
+        with mock.patch.object(sys, "path", [str(scripts), *sys.path]):
+            from github_contract_engine.compare_states import compare_states
+            from github_contract_engine.compose_desired_state import compose_desired_state, repo_subset_ids
+
+        contract_path = scripts.parent / "references" / "contracts" / "github-repo-deterministic-contract.json"
+        contract = json.loads(contract_path.read_text(encoding="utf-8"))
+        desired = compose_desired_state(
+            {"repo": str(contract_path)},
+            {"owner": "example", "repo": "project", "default_branch": "main"},
+            repo_subset_ids({"repo": contract}, "health"),
+        )
+        desired["rules"] = [rule for rule in desired["rules"] if rule["id"] == "repo.merge_settings"]
+        self.assertEqual(len(desired["rules"]), 1)
+
+        for archived, fork, enabled, warns in (
+            (False, False, False, False),
+            (False, False, True, True),
+            (False, True, False, False),
+            (False, True, True, True),
+            (True, False, True, False),
+        ):
+            with self.subTest(archived=archived, fork=fork, enabled=enabled):
+                observed = {
+                    "repo": {"archived": archived, "fork": fork, "visibility": "public"},
+                    "repository": {"repo": {"delete_branch_on_merge": enabled}},
+                }
+                result = compare_states(observed, desired)
+                levels = [
+                    finding["level"]
+                    for finding in result["findings"]
+                    if finding["path"] == "/repository/repo/delete_branch_on_merge"
+                ]
+                self.assertEqual(levels, ["WARN"] if warns else [])
+
     def test_health_queue_keeps_archived_evidence_out_of_empty_batch(self) -> None:
         scope_config = repository_scopes.RepositoryScopeConfig(
             path=pathlib.Path("scope.json"),

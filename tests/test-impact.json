@@ -10,7 +10,6 @@
         "pyyaml"
       ],
       "tools": [
-        "git",
         "uv"
       ],
       "environment": [
@@ -35,7 +34,6 @@
         "jsonschema"
       ],
       "tools": [
-        "git",
         "uv"
       ],
       "environment": [
@@ -55,7 +53,6 @@
       "depends_on": [],
       "packages": [],
       "tools": [
-        "git",
         "uv"
       ],
       "environment": [
@@ -79,7 +76,6 @@
         "markdown-it-py"
       ],
       "tools": [
-        "git",
         "uv"
       ],
       "environment": [
@@ -102,7 +98,6 @@
         "jsonschema"
       ],
       "tools": [
-        "git",
         "uv"
       ],
       "environment": [
@@ -129,7 +124,6 @@
         "tomlkit"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -154,7 +148,6 @@
         "pyyaml"
       ],
       "tools": [
-        "git",
         "uv"
       ],
       "environment": [
@@ -181,7 +174,6 @@
         "tomlkit"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -212,7 +204,6 @@
         "tomlkit"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -242,7 +233,6 @@
         "tomlkit"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -260,7 +250,8 @@
     },
     "github-contracts": {
       "pytest": [
-        "tests/repository_lifecycle/test_contract_engine.py"
+        "tests/repository_lifecycle/test_contract_engine.py",
+        "tests/repository_lifecycle/test_code_scanning.py"
       ],
       "depends_on": [],
       "packages": [
@@ -271,7 +262,6 @@
         "tomlkit"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -301,7 +291,6 @@
         "tomlkit"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -330,7 +319,6 @@
         "tomlkit"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -361,7 +349,6 @@
         "tomlkit"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -390,7 +377,6 @@
         "tomlkit"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -419,7 +405,6 @@
         "tomlkit"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -449,7 +434,6 @@
         "tomlkit"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -479,7 +463,6 @@
         "tomlkit"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -508,7 +491,6 @@
         "tomlkit"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -537,7 +519,6 @@
         "tomlkit"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -571,7 +552,6 @@
         "tzdata"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -604,7 +584,6 @@
         "tzdata"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -622,7 +601,7 @@
     },
     "repository-lint": {
       "pytest": [
-        "tests/test_infrastructure/test_repository_validator.py"
+        "tests/test_infrastructure/test_repository_entrypoints.py"
       ],
       "depends_on": [],
       "packages": [
@@ -637,7 +616,6 @@
         "tzdata"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -671,7 +649,6 @@
         "tzdata"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -704,7 +681,6 @@
         "tzdata"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -734,7 +710,6 @@
         "tomlkit"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -763,7 +738,6 @@
         "tomlkit"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -786,7 +760,6 @@
       "depends_on": [],
       "packages": [],
       "tools": [
-        "git",
         "uv"
       ],
       "environment": [
@@ -823,7 +796,6 @@
         "tomlkit"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -867,7 +839,6 @@
         "tomlkit"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -896,7 +867,6 @@
         "tomlkit"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -925,7 +895,6 @@
         "tomlkit"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -954,7 +923,6 @@
         "tomlkit"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -987,7 +955,6 @@
         "tzdata"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -1020,7 +987,6 @@
         "tzdata"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -1049,7 +1015,6 @@
         "tomlkit"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -1078,7 +1043,6 @@
         "tomlkit"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -1109,7 +1073,6 @@
         "tomlkit"
       ],
       "tools": [
-        "git",
         "uv",
         "node",
         "npm",
@@ -1570,7 +1533,6 @@
         "skills/ceratops-repo-lifecycle/references/templates/run-actionlint.py.tmpl",
         "skills/ceratops-repo-lifecycle/references/templates/sdlc.yml.tmpl",
         "skills/ceratops-repo-lifecycle/references/templates/skill-sections.json.tmpl",
-        "skills/ceratops-repo-lifecycle/references/templates/validate-repository.py.tmpl",
         "skills/ceratops-repo-lifecycle/references/templates/validate.yml.tmpl",
         "skills/ceratops-repo-lifecycle/references/templates/validation-pyproject.toml.tmpl"
       ],
@@ -1664,7 +1626,7 @@
     {
       "id": "repository-sdlc",
       "paths": [
-        "sdlc/**"
+        ".ceratops/sdlc/**"
       ],
       "suites": [
         "repository-lint",

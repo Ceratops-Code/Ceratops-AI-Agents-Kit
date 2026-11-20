@@ -190,7 +190,7 @@ class RuleGraphTests(unittest.TestCase):
                     self.assertEqual(json.loads(output), decision)
                     self.assertEqual(evidence.read_bytes(), original)
                 for boundary in ("before", "after"):
-                    def interrupted_print(*args, **kwargs):
+                    def interrupted_print(*args, boundary=boundary, **kwargs):
                         if boundary == "after":
                             print(*args, **kwargs)
                         raise KeyboardInterrupt(boundary)
@@ -219,6 +219,47 @@ class RuleGraphTests(unittest.TestCase):
             for invalid_path in ("../escape.toml", ""):
                 with self.assertRaises(ValueError):
                     path_join(str(root), invalid_path)
+
+            # Equal prompt lengths and unchanged helper names are insufficient
+            # evidence that source and installed automation behavior matches.
+            parser = GOVERNANCE_SNAPSHOT["parse_automation"]
+            source_path = source_root / "routine-audit/automation.toml"
+            runtime_path = runtime_root / "routine-audit/automation.toml"
+            for path in (source_path, runtime_path):
+                path.write_text(path.read_text().replace("Audit deterministically.", "Run `probe.py`."))
+                (path.parent / "probe.py").write_text("print('first')\n")
+            source_before = parser(source_path, source_root)
+            runtime_before = parser(runtime_path, runtime_root)
+            self.assertEqual(source_before["prompt_sha256"], runtime_before["prompt_sha256"])
+            self.assertEqual(source_before["helper_fingerprints"], runtime_before["helper_fingerprints"])
+            source_path.write_text(source_path.read_text().replace("Run `probe.py`.", "Use `probe.py`."))
+            changed = parser(source_path, source_root)
+            self.assertEqual(changed["prompt_chars"], source_before["prompt_chars"])
+            self.assertNotEqual(changed["prompt_sha256"], source_before["prompt_sha256"])
+            helper = source_path.parent / "probe.py"
+            helper.write_text("print('other')\n")
+            changed_helper = parser(source_path, source_root)
+            self.assertEqual(changed_helper["prompt_sha256"], changed["prompt_sha256"])
+            self.assertNotEqual(changed_helper["helper_fingerprints"], changed["helper_fingerprints"])
+            helper.unlink()
+            self.assertIn("probe.py", parser(source_path, source_root)["helper_errors"])
+            with mock.patch.object(pathlib.Path, "read_bytes", side_effect=PermissionError("locked")):
+                self.assertIn("probe.py", parser(runtime_path, runtime_root)["helper_errors"])
+
+            enforcement = (
+                "- [ENF-01] All instruction bullets in this file are mandatory wherever they apply.\n"
+                "- [ENF-02] When an applicable instruction is unmet, block work that depends on it and any claim of completion.\n"
+                "- [ENF-03] Add a (D) label only to exact commands; the label does not change mandatory status.\n"
+            )
+            global_agents = (codex_home / "AGENTS.md").resolve()
+            local_agents = (projects_root / "sample/AGENTS.md").resolve()
+            force = GOVERNANCE_SNAPSHOT["agents_inventory"](
+                projects_root, codex_home, agent_texts={global_agents: enforcement, local_agents: "- (D) python check.py\n"},
+            )
+            self.assertTrue(all(item["classification_complete"] for item in force["items"]))
+            self.assertFalse(GOVERNANCE_SNAPSHOT["classify_force_definitions"](
+                enforcement.split("- [ENF-02]", 1)[0],
+            )["all_instruction_bullets_mandatory_blocking"])
 
     def test_reference_inventory_classifies_supported_helper_suffixes(self):
         helper_names = [
@@ -751,6 +792,15 @@ class RuleGraphTests(unittest.TestCase):
                 newline="",
             )
 
+            # A release ref can contain unpublished work while main stays
+            # checked out. Inspect that ref without enumerating task worktrees.
+            tree = run_git(main_project, "rev-parse", "HEAD^{tree}").stdout.strip()
+            parent = run_git(main_project, "rev-parse", "HEAD").stdout.strip()
+            release = run_git(main_project, "commit-tree", tree, "-p", parent, "-m", "pending release")
+            self.assertEqual(release.returncode, 0, release.stderr)
+            update = run_git(main_project, "update-ref", "refs/heads/release/local", release.stdout.strip())
+            self.assertEqual(update.returncode, 0, update.stderr)
+
             snapshot_run_git = GOVERNANCE_SNAPSHOT["run_git"]
             observed_git_arguments = []
 
@@ -764,6 +814,8 @@ class RuleGraphTests(unittest.TestCase):
             ):
                 inventory = agents_rule_graph_inventory(projects_root, codex_home)
                 git_state = repo_git_state(main_project, "project")
+                self.assertEqual(git_state["branch"], "main")
+                self.assertEqual(git_state["release_local_commits_outside_main"], [release.stdout.strip()])
 
         reported_paths = {stack["path"] for stack in inventory["stacks"]}
         self.assertEqual(

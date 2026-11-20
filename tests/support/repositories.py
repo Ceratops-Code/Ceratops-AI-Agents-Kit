@@ -72,15 +72,15 @@ def prepare_skill_python_project(repo: pathlib.Path) -> None:
 def run_repository_ci_checks(
     repo: pathlib.Path, evidence: pathlib.Path,
 ) -> subprocess.CompletedProcess[str]:
-    """Run native check steps with the shell flags GitHub uses for Bash."""
+    """Run native checks in separate shells with GitHub's flags and directories."""
     workflow = yaml.safe_load((repo / ".github/workflows/validate.yml").read_text(encoding="utf-8"))
-    commands = [
-        step["run"]
+    steps = [
+        step
         for job in workflow["jobs"].values()
         for step in job["steps"]
         if step.get("shell") == "bash" and "run" in step and "if" not in step
     ]
-    assert commands, "workflow declares no native checks"
+    assert steps, "workflow declares no native checks"
     environment = dict(os.environ)
     environment.pop("UV_PROJECT_ENVIRONMENT", None)
     environment["RUNNER_TEMP"] = str(evidence.parent)
@@ -89,10 +89,18 @@ def run_repository_ci_checks(
         if os.name == "nt"
         else pathlib.Path(shutil.which("bash") or "bash")
     )
-    return subprocess.run(
-        [str(bash), "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", "\n".join(commands)],
-        cwd=repo, env=environment, capture_output=True, text=True, check=False,
-    )
+    stdout, stderr = "", ""
+    for step in steps:
+        result = subprocess.run(
+            [str(bash), "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", step["run"]],
+            cwd=repo / step.get("working-directory", "."), env=environment,
+            capture_output=True, text=True, check=False,
+        )
+        stdout += result.stdout
+        stderr += result.stderr
+        if result.returncode:
+            break
+    return subprocess.CompletedProcess(result.args, result.returncode, stdout, stderr)
 
 
 def run_git(repo: pathlib.Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -106,6 +114,44 @@ def run_git(repo: pathlib.Path, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def prepare_linked_worktree(repo: pathlib.Path) -> None:
+    """Create real linked Git metadata while preserving every fixture byte.
+
+    The caller supplies a disposable pytest directory. Its primary Git directory
+    and temporary holding directory stay beside it under the same test-run root;
+    pytest's run-directory cleanup removes them with the fixture. Original files
+    are moved back even when Git fails, and never pass through Git's checkout
+    filters. No user checkout or global Git configuration is changed.
+    """
+    repo = repo.resolve()
+    if (repo / ".git").exists():
+        result = run_git(repo, "rev-parse", "--is-inside-work-tree")
+        assert (repo / ".git").is_file() and result.returncode == 0, result.stderr
+        return
+    primary = repo.with_name("_" + repo.name + "-primary")
+    holding = repo.with_name("_" + repo.name + "-files")
+    assert primary.resolve().parent == holding.resolve().parent == repo.parent
+    assert not primary.exists() and not holding.exists()
+    primary.mkdir()
+    for args in (
+        ("init", "--quiet", "--initial-branch=main"),
+        ("config", "core.autocrlf", "false"),
+        ("-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
+         "-c", "commit.gpgsign=false", "commit", "--quiet", "--allow-empty", "-m", "Fixture"),
+    ):
+        result = run_git(primary, *args)
+        assert result.returncode == 0, result.stderr
+    repo.rename(holding)
+    try:
+        result = run_git(primary, "worktree", "add", "--quiet", "-b", "codex/test", str(repo))
+        assert result.returncode == 0, result.stderr
+    finally:
+        repo.mkdir(exist_ok=True)
+        for original in holding.iterdir():
+            original.rename(repo / original.name)
+        holding.rmdir()
+
+
 def write_sdlc_contract(
     repo: pathlib.Path,
     *,
@@ -114,7 +160,7 @@ def write_sdlc_contract(
 ) -> pathlib.Path:
     """Write or extend one native v4 capability contract."""
 
-    contract = repo / "sdlc" / "sdlc.yml"
+    contract = repo / ".ceratops/sdlc" / "sdlc.yml"
     contract.parent.mkdir(parents=True, exist_ok=True)
     document: dict[str, object] = {
         "version": 4,

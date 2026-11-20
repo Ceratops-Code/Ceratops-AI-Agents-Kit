@@ -60,7 +60,7 @@ def attempt(check_store: Any, inputs: dict[str, Any], *,
         "execution": {"startedAt": start.isoformat(),
                       "finishedAt": None if running else (start + timedelta(seconds=2)).isoformat(),
                       "durationSeconds": None if running else 2,
-                      "workerPid": os.getpid()},
+                      **({"workerPid": os.getpid()} if running else {})},
     }
     target = {key: item for key, item in inputs["scope"].items() if key not in {"worktree", "inputRules"}}
     check_store.current.put("repository-check", check, target, value)
@@ -76,12 +76,12 @@ def test_qualification_matrix_keeps_original_identity(check_store, earlier, cand
     eligible = store.LEVELS.index(earlier) >= store.LEVELS.index(candidate)
     assert selected["decision"] == ("reuse" if eligible else "execute")
     if eligible:
-        assert selected["record"] == original
+        assert {key: selected["record"][key] for key in original} == original
         assert selected["reference"]["result_id"] == original["result_id"]
         assert selected["reference"]["qualificationLevel"] == earlier
         assert selected["reference"]["candidate_id"] == "1" * 40
         assert selected["reference"]["check_version"] == "2" * 64
-        assert store.read_check_result(path, original["result_id"]) == original
+        assert {key: store.read_check_result(path, original["result_id"])[key] for key in original} == original
 
 
 @pytest.mark.parametrize(("field", "changed"), [
@@ -92,10 +92,14 @@ def test_qualification_matrix_keeps_original_identity(check_store, earlier, cand
     ("environment", {"platform": "other", "python": "3.14"}),
     ("scope", {"stage": "other"}), ("group", "other"),
 ])
-def test_relevant_inputs_block_reuse(check_store, field, changed):
+def test_reuse_compares_facts_and_preserves_recorded_check_version(check_store, field, changed):
     attempt(check_store, context())
-    assert check_store.select(context(**{field: changed}),
-                              check_id="repository.actions.pre-build-checks.check-groups.tests")["decision"] == "execute"
+    result = check_store.select(context(**{field: changed}),
+                                check_id="repository.actions.pre-build-checks.check-groups.tests")
+    # The derived version identifies the original run; files and argv decide reuse.
+    assert result["decision"] == ("reuse" if field == "checkVersion" else "execute")
+    if field == "checkVersion":
+        assert result["reference"]["check_version"] == context()["checkVersion"]
 
 
 def test_newer_failure_only_resolves_with_matching_later_pass(check_store):
@@ -147,8 +151,13 @@ def test_malformed_or_conflicting_evidence_blocks_selection(check_store, damage)
         else:
             record["check_version"] = "0" * 64
         check_store.current.put("repository-check", record["check_id"], {"stage": "tests"}, record)
-    with pytest.raises((ValueError, TypeError, KeyError)):
-        check_store.select(context(), check_id="repository.actions.pre-build-checks.check-groups.tests")
+    if damage == "corrupt":
+        with pytest.raises((ValueError, TypeError, KeyError)):
+            check_store.select(context(), check_id="repository.actions.pre-build-checks.check-groups.tests")
+    else:
+        selected = check_store.select(context(), check_id="repository.actions.pre-build-checks.check-groups.tests")
+        assert selected["decision"] == "execute"
+        assert selected["record"] is None
 
 
 def test_absent_and_unknown_ownership_do_not_invent_evidence(check_store):
@@ -173,7 +182,7 @@ def test_record_schema_preserves_original_provenance_and_historical_receipts(che
 
 def test_large_aggregate_retains_complete_original_test_references(check_store):
     path, record = attempt(check_store, context())
-    record["checks"] = [{
+    checks: list[dict[str, Any]] = [{
         "id": f"tests/test_matrix.py::test_original_result[{index}]", "status": "passed",
         "provenance": {"result_id": str(uuid.UUID(int=index + 1)),
                        "candidate_id": "1" * 40, "check_id": f"check-{index}",
@@ -181,11 +190,19 @@ def test_large_aggregate_retains_complete_original_test_references(check_store):
                        "path": f"ceratops/results/repository-checks/{uuid.UUID(int=index + 1)}.json",
                        "sha256": "3" * 64},
     } for index in range(5000)]
+    record["children"] = []
+    for check in checks:
+        child = {"kind": "reported-check", "id": check["id"], "status": check["status"],
+                 "result_id": check["provenance"]["result_id"], "provenance": check["provenance"]}
+        check_store.current.put("reported-check", child["id"], {}, child)
+        record["children"].append({"storeKind": "reported-check", "result_id": child["result_id"]})
     raw = store.canonical(record)
-    assert 1024 * 1024 < len(raw) < store.MAX_RECORD_BYTES
+    assert len(raw) < store.MAX_RECORD_BYTES
     check_store.current.put("repository-check", record["check_id"], {"stage": "tests"}, record)
-    assert store.read_check_result(path) == record
-    assert check_store.select(context(), check_id="repository.actions.pre-build-checks.check-groups.tests")["record"] == record
+    loaded = store.read_check_result(path)
+    assert {key: loaded[key] for key in record} == record
+    assert [child["provenance"] for child in loaded["check_summary"]["checks"][:-1]] == [check["provenance"] for check in checks]
+    assert check_store.select(context(), check_id="repository.actions.pre-build-checks.check-groups.tests")["record"] == loaded
     assert store.result_reference(path)["sha256"] == hashlib.sha256(raw).hexdigest()
 
 

@@ -31,7 +31,7 @@ procedures. Repository-specific tests and dependencies remain with the repo.
 | Ceratops compatibility deterministic contract and schema | Define mechanically checkable compatibility requirements and the reusable files needed to satisfy them. Executable fields require a runtime or validator consumer. |
 | Ceratops compatibility nondeterministic contract | Guide review of whether the repository's choices satisfy the internal Ceratops intent. External evidence is not invented for this internal concept. |
 | Repository dependency declarations and lockfiles | Own the packages and versions needed to execute repository commands successfully. |
-| Repository `sdlc/sdlc.yml` | Declare operations, tests, and skill/action handoffs for this repository and its deliverables. |
+| Repository `.ceratops/sdlc/sdlc.yml` | Declare operations, tests, and skill/action handoffs for this repository and its deliverables. |
 | Installed lifecycle skills | Own reusable execution, validation gates, deployment routing, and their domain helpers. |
 | Repository test runner and tests | Own repository-specific test execution and implementation. |
 
@@ -62,7 +62,7 @@ surfaces while preserving repository-owned choices. Template changes belong
 with their generators and consumers so other repositories receive the same
 behavior.
 
-The recorded template set includes `validate-repository.py.tmpl`,
+The template set includes `validate.yml.tmpl`,
 `run-actionlint.py.tmpl`, `run-tests.py.tmpl`, `deploy-skills.py.tmpl`,
 `sdlc.yml.tmpl`, and `skill-sections.json.tmpl`. Compatible repositories receive
 the pinned actionlint runner, while repositories with Python tests receive the
@@ -168,7 +168,7 @@ places tests and other repository scripts under the same scripts project.
 
 ## Operations, tests, and CI
 
-SDLC here means the repository's lifecycle configuration in `sdlc/sdlc.yml`.
+SDLC here means the repository's lifecycle configuration in `.ceratops/sdlc/sdlc.yml`.
 An operation is an entry such as a deliverable's validation or local deployment
 command. A handoff names an installed skill and action that owns the next step.
 `execute_skill_actions.py` reads that installed skill's action declaration and
@@ -275,6 +275,99 @@ artifact receipt to its tagged Git receipt and checks recorded files against
 their sizes and hashes. Returning the installation path reuses the already read
 artifact entry. It does not run acceptance checks.
 
+Versioned builders declare `version` on their deliverable; release bundles use
+the same declaration under `repository.release-bundles.NAME.version`. A native
+field uses `{file: packages/tool/pyproject.toml, field: project.version}`, or
+`{file: packages/tool/package.json, field: version}`. A repository command uses
+`read` and `write` argument arrays and a `files` array naming the tracked files
+the writer owns. `write` receives a separate `{version}` argument; `{python}`
+means the current Python environment. Explicit shell commands are supported.
+`version: {mode: receipt-only}` uses completed Git receipts when no native file
+owns the version.
+
+Every supported SDLC schema accepts these deliverable version declarations and
+requires one for a `ceratops-builder-output` build. Reading the contract rejects
+a missing declaration before preparing or running commands; Build does not guess
+a native manifest. Release bundles add each missing member for every requested
+target, using that member's own version. An omitted target means `native`, and
+an explicit `native` request belongs to the same batch.
+
+`read_declared_version()` reads that source for either a member or a bundle.
+`write_declared_version()` updates it and returns its owned paths. JSON/TOML
+writes replace the file after flushing one adjacent `.in_process` file; the
+writer removes that temporary file after success or at its next write.
+Repository write commands must finish all their declared files on repeated
+calls. `prepare_build_or_reuse()` first reuses applicable accepted output; only
+new output gets an allocated version and a commit of its relevant source files.
+
+The public Build command accepts repeated `--bundle NAME` arguments. A bundle
+versions its member list independently; an unchanged member keeps its original
+version and accepted output. `--version-choices` is a JSON object keyed by
+`deliverables.KIND.NAME` or `repository.release-bundles.NAME`, with either
+`{"version":"2.0.0b1"}` or `{"bump":"minor","base_version":"1.4.2"}` per entry.
+A missing choice returns `version_decision_required`, current versions and the
+changes since each previous final release, before allocation or file edits.
+The returned `next_command` accepts the model's answer together with
+`--version-source-commit`. Unchanged builds reuse accepted versions; a new
+candidate on an already chosen alpha/beta base increments its suffix.
+
+A declared check can pause for an answer by printing a JSON result with
+`schema: "ceratops-check-decision"`, `status: "decision_required"`, `question`
+and an `answer_schema` (JSON Schema), then exiting successfully. Its optional
+`payload` is returned unchanged. It declares `check-results` so the question
+is bound to its source, package and check inputs, and must not save a passing
+result while awaiting an answer. Build, Promote and Ship return the question,
+`decision_id` and `next_command`, with exit code 2 and no release update or
+installation. This is a pending decision, not a failed assertion.
+
+Run that same command with `--check-answers '{"DECISION_ID":{"approve":true}}'`,
+using the answer shape the check requested. The check receives
+`CERATOPS_CHECK_ANSWER` containing `decision_id` and `answer`. An unchanged
+question is returned without running the check again until its answer arrives.
+The package stays in this checkout's `_in-test` directory; its current record
+and question use `pending-build` and `check-decision` entries in this checkout's
+existing results file. Matching packages are reused on continuation. Changed
+package bytes or relevant inputs cause a fresh question before an old answer
+can be applied. Required checks must pass before the package is accepted.
+Completion removes the pending entries and temporary package; abandonment
+lets the next build replace only that item's unfinished output.
+
+An Install action opts into package consumption with `install-inputs:
+accepted-build`. It declares `target` and `destination` in `parameters` and
+returns the existing `ceratops-deployment-result.v1` result with `version` and
+`destination`. `target` identifies the built platform; `destination` identifies
+where to install it. Package deliverables can declare this Install action too.
+The action's commands can use these whole-argument placeholders:
+
+| Argument | Value supplied by `prepare_operations()` |
+| --- | --- |
+| `{artifact_receipt}` | The retained receipt for the requested accepted build. |
+| `{package_file}` | Its `installationArtifactPath` file. |
+| `{installer_dependencies}` | A JSON array of the receipt's recorded dependency file paths. |
+| `{version}`, `{tag}`, `{target}` | The accepted build's exact version, tag and platform. |
+| `{destination}` | The requested installation directory, made absolute from the repository root. |
+| `{install_input_file}` | Optional JSON file containing these same values and the operation name. |
+
+`execute_build()` returns accepted receipt identities alongside output paths.
+After advancing `release/local`, Promote passes those identities to the same
+`prepare_operations()` call used by standalone Install. Standalone callers pass
+`--parameter version=VERSION` or `--parameter tag=TAG`, plus `target` and
+`destination`. No caller searches for the newest package. A wrong deliverable,
+target, tag or package file stops preparation before an installer writes its
+destination. The existing receipt reader checks the saved files once at this
+boundary; it does not repeat their tests.
+
+The optional command-input file has one stable location per checkout/action:
+`<git-common>/ceratops/install-inputs/<checkout-hash>/<operation-hash>.json`.
+The operation runner owns it. Preparation replaces any interrupted document;
+execution removes it in `finally`, including failed commands. Prepare-only
+removes it before returning. It is neither history nor recovery progress.
+Installer commands inspect their destination on each call and finish missing
+effects. An unsuccessful or malformed result reports that installation may have
+completed; the runner never repeats the command merely to recover its report.
+Current source-based skill/MCP installer declarations remain unchanged until
+their package producers and installers adopt this interface together.
+
 The final direction removes generated repository `sdlc.py`, a local copy of the
 operation engine, and `scripts/runtime`. Those proposed extra layers were
 rejected. Installed skill bindings remain in the skills; target repositories
@@ -352,7 +445,8 @@ here-strings are outside that contract. Direct searches and the existing
 The MCP lifecycle skill and manager own release packaging, installation,
 version selection, and bounded retention. Codex registration selects the stable
 launcher and startup boundary. Hook deployment is independently declared in
-`sdlc/sdlc.yml` as `deliverables.hooks.codex-hooks.actions.install`; it copies
+`.ceratops/sdlc/sdlc.yml` as `deliverables.hooks.codex-hooks.actions.install`;
+it copies
 definitions without granting trust or restarting Codex. Register and connect
 the MCP server before relying on the guard, then review changed hook trust as
 required by the client. An installed or registered server is not evidence that
@@ -516,16 +610,30 @@ Partial runs keep unselected entries. Complete collection of a selected group
 can remove its deleted tests; filtered collection cannot do so.
 
 One thread owns a worktree, and its commands save serially without a worktree
-lock. The writer flushes/fsyncs the fixed sibling
-`.check_results.in_process.json`, then replaces `check_results.json`.
-An interrupted write leaves earlier saved outcomes intact; the next call removes
-the unfinished sibling. There are no timestamped generations or per-test files.
+lock. Each finished outcome appends one complete JSON record and newline, then
+flushes it to disk. The existing envelope surrounds each record; explicit
+deletions have null entries. Readers apply records in order and read only newly
+appended bytes. A command's startup and `finally` cleanup rewrite current entries
+and referenced input tables through `.check_results.in_process.json`, flush it,
+and atomically replace `check_results.json`. Read-only callers never tidy it.
+The next owning command discards only an unfinished trailing append after a
+crash. A malformed complete record remains an error. Cleanup also runs before
+the file reaches 64 MiB; current outcomes exceeding that limit report an error
+without discarding saved results. Cleanup failure retains the command's original
+failure. There are no timestamped generations or per-test files.
+Completed commands save their own outcome and original child result IDs, not
+copies of every child's summary. Reported non-Python checks use the same store.
+A replaced child makes its old parent inapplicable; individual unchanged passes
+remain reusable. Exported build summaries contain each result and input table
+once, without links requiring the mutable worktree store. Completed records do
+not retain a process ID.
 Git build summaries remain immutable and independent of this working file.
 Completing a build never clears it. Normal calls touch only their worktree;
 dedicated worktree retirement removes it in step 20C. Old-file conversion is an
 explicit `run-tests.py --consolidate-results` call, not startup discovery.
 
-Previous-build selection still reads this worktree's `.build` records and the
+Previous-build selection still reads this worktree's `.ceratops/build` records
+and the
 eligible tag's `check_summary.json`, never another worktree or artifact storage.
 An applicable current failure blocks an older tagged pass. Local calls record
 alpha unless a declared level applies; `release/local` requests at least beta.
@@ -556,6 +664,14 @@ own support modules. The repository's existing test-impact map remains the one
 dependency declaration. Missing maps allow execution but no individual-test reuse.
 Custom runners are preserved; their support files are managed only when the
 scripts project declares `tool.ceratops.test-support.managed = true`.
+The compatibility command's `--test-support-only` mode can make that opt-in
+without applying unrelated repository layout, CI or skill changes. When refreshing
+a managed runner, it updates existing SDLC and CI calls with the required temporary
+directory argument inside the same rollback boundary. It records
+`result-module = "scripts/write_check_results.py"` for a custom runner's new
+shared writer, preserving application-specific result modules. Existing declared
+writer paths remain authoritative. The same snapshot and rollback code owns all
+generated files; the mode neither creates another environment nor changes locks.
 
 `repository_operation.prepare_operations()` expands phase actions into their
 individual `check-groups`. Each group owns its `steps`, `requires`, optional
@@ -572,8 +688,11 @@ The repository-operation CLI takes explicit `--operation` phase or group
 locations. A direct group request does not run its siblings. Promote and Ship
 derive their required pre-build group locations from the SDLC declaration;
 build and delivery calls still bring in their prerequisite checks and builds.
-Generated workflows run the commands from the repository's pre-build check
-groups. Checks that require a lifecycle handoff belong to an external gate.
+Saved build summaries can contain results from several producers. The result
+reader selects matching commands before checking their saved input records,
+so an unrelated result cannot block execution or reuse of a requested check.
+Generated workflows run commands from repository pre-build check groups.
+Checks requiring a lifecycle handoff belong to the external lifecycle gate.
 
 `operation_prerequisites()` returns ordering references in `build-after` and
 the builder's file references in `build-uses-artifacts`. The
@@ -657,8 +776,31 @@ SDLC results; no caller-supplied second receipt exists. One result commit contai
 all required targets and bundle/member receipts, followed by member and bundle
 tags. A fresh call finishes missing effects from current files and Git state.
 Unrelated staged files remain outside the source/result commits.
-Source preparation includes staged and unstaged deletions under the declared
-source paths; the receipt's blob list contains only files present in that commit.
+`prepare_package_versions()` writes the requested package versions, their linked
+local Python requirements and native lockfiles before any check or builder runs.
+Promotion requests beta even in a task worktree: alpha source moves to the next
+available beta version. Suitable beta, release-candidate and final packages retain
+their existing versions and acceptance when their build sources still match.
+An explicitly incompatible stage returns a version question before source writes.
+Native TOML and requirement readers preserve compatible ranges, extras, markers
+and independent older consumers. `uv lock` resolves each affected lock once;
+only then does one source commit include the complete prepared change. A failed
+write or lock operation restores this call's metadata before any source commit.
+After a completed commit, a repeat uses its current files and allocated version.
+Each metadata writer owns its adjacent `.in_process` file and removes it after
+success or an exception; it never stores execution progress there.
+Source preparation includes staged/unstaged edits, new files, deletions and both
+rename paths. Git reports paths as NUL-separated output; owned changed paths go
+to `git add` and `git commit` through standard input, keeping large inventories
+off Windows command lines. Unrelated index and working files stay untouched.
+The receipt records `preTestCommit` and `sourceDefinition`: the SDLC path and
+deliverable name at that commit. Source filenames are derived in memory using
+that historical declaration and Git tree, without per-file hashes or a saved
+inventory. Reuse compares Git changes within the old and current source scope,
+including changes to the scope itself. Other packages' commits do not by
+themselves require rebuilding this package. External inputs and consumed
+packages keep their exact checksums and identities. Existing accepted receipts
+remain readable without rewriting their acceptance or check identities.
 Explicit dependency files suppress their producer's build. Before running the
 consumer, Build reads the artifact receipt beside those exact files and passes
 the supplier's recorded version, file records and acceptance to completion.
@@ -698,7 +840,8 @@ bind the summary to the intended `<unit>/<version>` tag. Receipt and summary ent
 the same result-only commit; artifact binding follows, and tag creation is last.
 
 `sdlc_results.select_build_check_summaries()` discovers only the current worktree's
-`.build/<unit>/<version>/[<target>/]build_receipt.json` records. It chooses the
+`.ceratops/build/<unit>/<version>/[<target>/]build_receipt.json` records. It
+chooses the
 highest completed eligible version for each requested unit/target and reads exact
 receipt and summary blobs at that tag. It neither walks commit ancestry nor reads
 other worktrees, deployments, packages or full logs. The portable reader is part
@@ -783,9 +926,10 @@ test-runner acceptance follows the 1e.3 protocol below, not this reference's
 mutable latest-test-result layout.
 
 The template keeps current validation and test JSON under tracked
-`.test-results/`, raw screenshots and logs under ignored
+`.ceratops/results/`, raw screenshots and logs under ignored
 `.test-results/evidence/`, tracked build metadata and approvals under
-`.build/builds/`, and package bytes under ignored `.build/artifacts/`. Records
+`.ceratops/build/builds/`, and package bytes under ignored `.build/artifacts/`.
+Records
 bind to source bytes, the latest commit that changed non-result files, execution
 context, and exact artifact bytes. An immutable source tag is the build version;
 its resolved commit is traceability metadata. Evidence retention is bounded to
@@ -1129,35 +1273,31 @@ It never switches execution type by filename.
 #### Failure-report storage and ownership (3B/4B)
 
 All three public parsers (`promote-repository.py`, `ship-repository.py`,
-and `python -m github_pr_workflow ship`) accept `--diagnostic-output FILE`.
-The GitHub Ship parser/output adapter lives in `ship_pull_request.py`; the
-workflow remains `ship.py::ship()`, with no old parser alias.
-The caller chooses one stable path under
-`<repo-parent>/tmp/<repo-name>/<calling-worktree-name>/`. Top-level Promote and
-Ship use distinct files, reused across attempts; no execution UUID or report
-store exists. Promotion's `--result-file` remains a separate unchanged contract.
+and `python -m github_pr_workflow ship`) accept `--report-directory TASK_TEMP`.
+The directory is `<repo-parent>/tmp/<repo-name>/<calling-worktree-name>/`.
+`command.py::operation_report_directory()` chooses the exclusive
+`TASK_TEMP/_operation-reports/<action>/` directory. `write_failure_report()`
+always writes `failures.json` there. Reports contain failures and result
+references, without ownership labels; their location determines their producer.
+No task-wide search opens test fixtures, logs, exported results or other outputs.
 
-`command.py::write_failure_report()` owns the JSON file. Its identity records
-the registered worktree's Git directory and requesting action, not the current
-commit or invocation. `capture_failure_report()` adds the report path to direct
-workflow exceptions without changing their type or cause. The single
-`execute_prepared_operation()` implementation and the ordered
-`execute_prepared_operations()` function pass `diagnostic_output` to the writer.
-When execution uses another checkout, `diagnostic_owner` carries the calling
-worktree/action; the operation CLI forwards these as `--diagnostic-repo-root`
-and `--diagnostic-action`. Generated Ship retry arguments preserve that owner
-too. These values govern diagnostics only, never operation selection.
+The operation executors forward `report_directory`. When execution uses another
+checkout, `diagnostic_owner` carries the calling repository and action;
+`--diagnostic-repo-root` and `--diagnostic-action` pass those values to the
+operation CLI. Generated Ship retry arguments retain the same task directory.
+These values govern reporting only, never which operations execute.
+`capture_failure_report()` retains the original exception type and cause.
 
 Before shortening an error, the helper writes complete captured output and
-structured causes directly to the selected final path, using the existing
+structured causes atomically to its fixed report path, using the existing
 secret-redaction code. Existing successful result paths remain references, not
 copies. Child commands' explicit complete-report paths are returned unchanged,
 including the test runner's `pytest.diagnostic.path`; their files stay under
 their own helper's deletion authority. Expected decision payloads remain
 decisions, without a new failure report. Actual command failures retain their
 causes. No high-level failure receipt is produced. If a write fails or no path
-was supplied, full diagnostics remain in the response. Malformed or foreign
-existing records are not overwritten or removed.
+was supplied, full diagnostics remain in the response. An unreadable unresolved
+failure report is retained with the current failure returned in full.
 
 Retention is one current failure-only document per worktree/requested action.
 Named command/check failures replace only their same-work entries; other
@@ -1170,8 +1310,8 @@ one passing check cannot clear a report containing another unfixed failure.
 Unlock, restart, exception and phase advancement confer no deletion authority.
 Successful/mixed test results, build results, receipts, required acceptance logs,
 other worktrees/actions and unmanaged user-retained files are excluded.
-Lookup of owned temporary reports stays inside the caller's repository/task
-tree, without following redirected directories. No process discovery or repeat
+Report lookup stays inside the task's `_operation-reports` directory, without
+following redirected directories. No process discovery or repeat
 acceptance checks are added.
 
 4B connects success at the code that consumes each result. Promote and
@@ -1308,7 +1448,7 @@ only optional command supervision remains deferred.
 
 | Record | Authoritative content | Storage and creation |
 | --- | --- | --- |
-| Build receipt | Attempt ID, pre-test B, unit/version/target and required targets, declared build inputs, artifacts and dependencies by digest, original required checks and completed outcomes, and evidence digests | Written after checks and committed at `.build/<unit>/<version>/build_receipt.json`; add `<target>` below the version for separately qualified targets; it contains neither its own hash nor C |
+| Build receipt | Attempt ID, pre-test B, unit/version/target and required targets, declared build inputs, artifacts and dependencies by digest, original required checks and completed outcomes, and evidence digests | Written after checks and committed at `.ceratops/build/<unit>/<version>/build_receipt.json`; add `<target>` below the version for separately qualified targets; it contains neither its own hash nor C |
 | Artifact receipt | Final C, repository-relative build-receipt path, hash of its exact committed bytes, store-relative artifact locations and completed acceptance reference | Stored alongside immutable artifacts in the Git common directory after closure passes |
 | Promotion/deployment completion record | Selected artifact receipts, integrated release commit, version/target, expected old and resulting refs, successful completed effects | Existing owning lifecycle result; it does not duplicate test acceptance or record aggregate failure; essential unfinished-request data stays in checkpoints |
 
@@ -1763,36 +1903,44 @@ collision in an exact version path or existing tag advances alpha/beta; builds
 and tests run outside that short lock. Final-version collisions require another
 version choice. The lock file is `artifacts/.locks/allocation.lock`; retention uses
 `artifacts/.locks/store.lock`. No reservation or file-usage record is created.
-Startup keeps the requested temporary version and at most two predecessors in
-its own deliverable folder. Completion removes that version and older failed
-attempts; later attempts and other checkout folders remain untouched. After a
+Startup removes unfinished attempts in its own deliverable folder, preserving
+checked packages whose final receipt, retained copy or tag still needs completion.
+Completion removes that version and older failed attempts; later attempts and
+other checkout folders remain untouched. After a
 crash, the next build of that item performs this cleanup; there is no background
 sweeper. Completed `release/local` files go directly to
 `artifacts/beta-stable/<unit>/<version>/<target>/`. Only unfinished files use
 `worktrees/release-local/_in-test/`.
 
-Immediately after creation, `build_request.json` records repository, worktree
-path and Git registration, branch, unit/version, all targets, the existing
-receipt attempt identity, allocation commit and declared input paths. B is
-initially null. The caller prepares source versions/pins, commits B, then calls
-`store_artifacts.bind_artifact_inputs` to record that exact commit before artifacts.
-A bound request cannot be rebound. When explicit input paths are omitted, the
-tracked input paths exclude `.build/` result records.
+The current build object carries repository, checkout, item/version, targets and
+acceptance identity in memory. The caller prepares source versions/pins, commits
+the source, then calls `store_artifacts.bind_artifact_inputs` with that exact
+commit before producing artifacts. No `build_request.json` is created or read.
+The source list stays in memory and excludes `.ceratops/build/` and
+`.ceratops/results/`. Each task worktree runs one build at a time without a
+worktree lock. Version allocation uses the existing short shared-store lock;
+release builds retain their existing release lock.
 
 A fresh build removes all unfinished versions of the requested item from this
 checkout's `_in-test` directory before allocating its new output. This includes
-the same requested version and a directory with an incomplete request record.
+the same requested version when it has no completed acceptance.
 Deletion depends on that directory boundary, not saved ownership or usage
 information. A failed deletion stops this build before allocation. Other items,
 other checkouts and accepted versions remain untouched. A crash leaves this
 temporary output for the next build of the same item; success removes it.
 Uncommitted receipts belonging to discarded attempts are removed before their
 temporary bytes. Committed receipt history remains in Git and its version is
-not reassigned to a new attempt. If its passing receipt is already committed and
-its source inputs still match, finish missing copies or tags from those files
-instead of allocating another build.
+not reassigned to a new attempt. Passing receipts need not already be committed:
+their original checks and packages can finish missing commit/copy/tag effects.
+Completed check outcomes also remain in the existing per-checkout result store
+until receipt completion, so an interrupted receipt write does not discard the
+checked package. The pending-build entry is removed after completion or
+abandonment. A historical completed attempt may still have an obsolete request
+file; reopening its passing receipt removes that file from its own temporary
+directory without using its contents.
 
-Prepared receipts remain at `.build/<unit>/<version>/build_receipt.json`, with
+Prepared receipts remain at
+`.ceratops/build/<unit>/<version>/build_receipt.json`, with
 a target subdirectory for separately qualified targets. Artifacts are produced
 inside that checkout's temporary directory. After their required checks pass,
 completion copies them to `worktrees/<checkout>/<unit>/<version>/<target>/`
@@ -1801,7 +1949,7 @@ for a task checkout or `beta-stable/<unit>/<version>/<target>/` for
 after the result commit and all required tags exist. Copies retain their original
 checks and identity. Each version/target's bounded latest failure report is
 `<version>/.diagnostics/<target>.json`; receipt preparation ignores these
-producer-owned diagnostics and `build_request.json` as artifact payload.
+producer-owned diagnostics as artifact payload.
 There is no temporary publication tree.
 
 Before creating C, completion checks the exact B inputs and prepared result
@@ -1812,12 +1960,11 @@ Existing identical receipts/tags complete their effects; a malformed partial
 receipt can be rewritten, but a conflicting valid identity is never overwritten.
 No accepted test or build is repeated.
 
-`complete_artifact_builds.read_artifact_build` selects a request or completed
-receipt/tag chain for
-completion-only work without allocation. After the tag exists, completion
-removes resolved diagnostics and `build_request.json`; interruption leaves only
-unmet cleanup. Abandoned output belongs to the dedicated cleanup in 20C/21A,
-not another worktree's normal build.
+`complete_artifact_builds.read_artifact_build` reopens the actual passing receipt
+and package files, or the builder result already read from the result store.
+It reconstructs the in-memory build object without allocating another version.
+After the tag exists, completion removes the temporary output and diagnostics;
+interruption leaves only unmet cleanup in that same checkout's directory.
 
 Only cross-version deletion takes the existing short store lock. Allocation
 tries startup retention without waiting if that lock is busy; completed calls
@@ -1953,8 +2100,8 @@ release/store/destination locks; it adds no startup migration or recurring scan.
 `repository_operation.py` calls directory allocation and input binding in
 `store_artifacts.py`, and receipt/commit/tag completion in
 `complete_artifact_builds.py`. Neither opens an empty checkpoint directory or
-per-worktree lock. Build requests live beside their temporary output; the short
-allocation lock protects version allocation separately from the cleanup lock.
+per-worktree lock. Build identity stays in memory; the short allocation lock
+protects version allocation separately from the cleanup lock.
 Promote/Ship retain their outer
 release lock. A completed receipt/tag chain permits cleanup-only
 retries without mutable worktree receipts, repeated builds/tests, new commits,
@@ -2072,9 +2219,8 @@ they do not rename old files, alter tags or rerun accepted builds/tests.
 | `<destination>/locks/install` | Planned in steps 17–19; use the same helper and unfinished-run flag across source worktrees, through generation production, activation and cleanup. Retain the file; no mandatory OS process groups. |
 | Committed build receipt/evidence | Producer; current record plus at most two predecessors per unit/check group in the checkout; Git commit history supplies historical retrieval without an extra record database |
 | `ceratops/artifacts/<unit>/<version>/` with optional target subdirectory | Artifact store; immutable artifacts, supporting files and artifact receipt. The 4F retention functions keep each unpromoted worktree's latest approved build and the separate shared/destination selections described above. Unconnected callers retain the existing current-plus-two policy per repository/unit/target and version class until their planned adoption. |
-| `ceratops/artifacts/<unit>/<version>/build_request.json` | Artifact allocation and input binding; immediately records the registered worktree and whole target set, then exact B/inputs before artifacts. No allocation lock. Remove after receipt/tag completion; preserve unfinished and uncertain requests. |
-| `.build/<unit>/<version>/build_receipt.json` with optional target directory | Operation runner; directly written final result, validated and reused by exact bytes, committed at C with other declared Git evidence and retained historically by Git |
-| `artifacts/<unit>/<version>/` with optional target directory | Direct final output; protected while a build request exists or the immutable tag is absent. Complete target receipts and the tag bind it to C. Directory creation, not a reservation file, allocates the version. |
+| `.ceratops/build/<unit>/<version>/build_receipt.json` with optional target directory | Operation runner; directly written final result, validated and reused by exact bytes, committed at C with other declared Git evidence and retained historically by Git |
+| `artifacts/worktrees/<checkout>/_in-test/<unit>/<version>/` with optional target directory | Temporary build/test output; one build runs per worktree. Passing target receipts and saved check outcomes preserve checked work until storage/tag completion. Exclusive directory creation allocates the version. Cleanup removes unfinished output only within that checkout/item. |
 | `artifacts/<unit>/<version>/.diagnostics/<target>.json` | Completion owner; one bounded directly replaced report per version/target, removed after that build completes. Separate from accepted evidence. |
 
 Retention runs at versioned producer startup and after completion. Protected
@@ -2154,33 +2300,31 @@ removed names, destination, source commit, transaction ID and runtime-cleanup de
 The MCP installer follows the same separation and also returns the manager's
 complete `maintenance` object (`removed`, `deferred`, `errors`).
 
-`command.py::write_operation_report()` owns caller-selected temporary attempt
-snapshots under the caller's repository/task temp namespace. They retain that
-identity even after shipping removes the task worktree. Promotion's result
-writer and the operation CLI's failure-evidence writer use this same code.
-Explicit caller-retained promotion exports outside that namespace preserve the
-original payload and are never claimed for automatic temporary-report deletion.
-The original outcome fields remain intact, with `temporary_operation_report`
-metadata naming the owner, original requested operations and unresolved IDs.
-A newly published failure replaces older snapshots of the same owner and
-original requested-operation set,
-retaining one current snapshot in that group. Publication is atomic and removes
-its reserved `.<report-name>.operation-report.tmp` staging file after success or
-interruption. A fresh stopped-writer cleanup also removes such unpublished
-staging files; they are neither acceptance nor service-progress records.
-Startup retains at most two interrupted predecessors per group; publication
-makes room for the next snapshot before writing it. Incomplete retention blocks
-another snapshot while preserving the actual operation outcome in the response.
-Normal operation completion
-retires matching unsuccessful snapshots, including an earlier promotion handoff
-after the selected installation genuinely completes through an operation call.
-Partial completion changes only cleanup metadata, preserving the original error.
-The lookup does not cross task boundaries, follow links or use reports to resume
-effects. Successful reports and acceptance records remain outside automatic
-retirement. Cleanup errors preserve completed work and report the affected path.
-Path-scoped `report_cleanup_errors` accompany the compact `report_cleanup_error`
-message, so a successful unrelated suboperation cannot erase outstanding cleanup
-debt from an earlier phase.
+`command.py::write_operation_report()` owns operation snapshots in
+`TASK_TEMP/_operation-reports/<action>/`, including after Ship removes the source
+worktree. Promotion and the operation CLI return their actual `operation_report`
+path. Successful outcomes replace `result.json`; unfinished outcomes replace
+`result-<operation-set-digest>.json`, derived from the original unresolved work.
+Identical retries therefore retain exactly one snapshot per operation set.
+No per-file ownership marker or scan of other task outputs is used.
+
+Atomic publication uses the existing `.<report-name>.operation-report.tmp`
+staging file. It is removed on completion or interruption; the next stopped-writer
+cleanup also removes abandoned staging files in the dedicated directory.
+Successful operations remove matching failed reports there. Partial completion
+updates `unresolved_operations` while retaining the original outcome and error.
+Successful snapshots remain until replaced or the task temp directory is removed.
+Reports never authorize skipping or resuming lifecycle effects. Cleanup failures
+preserve completed work and return path-specific `report_cleanup_errors` plus
+the compact `report_cleanup_error` message.
+
+Promotion's `--result-file` is an explicitly retained export, written without
+ownership metadata regardless of the configured temporary-folder base. It stays
+outside `_operation-reports` and automatic cleanup; the existing explicit result
+finalizer consumes it. `--evidence-file` similarly names the operation CLI's
+explicit failure export, removed by that same CLI after success. Test results,
+accepted build receipts and installer completion inputs retain their own stores
+and lifetimes. They are never inferred to be temporary reports from their JSON.
 
 Single-step MCP installation and skill deployment handoffs expose a
 `report_completion` call descriptor with an `actual_completion_file` answer.
@@ -2409,7 +2553,7 @@ means the thread's decision is recorded, not that the whole system was audited.
   "owners": ["Unassigned in the thread; confirm for a full design"],
   "source_of_truth": [
     {"path": "README.md", "role": "Repository usage documentation"},
-    {"path": "sdlc/sdlc.yml", "role": "This repository's operation declarations"},
+    {"path": ".ceratops/sdlc/sdlc.yml", "role": "This repository's operation declarations"},
     {"path": "skills/ceratops-repo-lifecycle/references/contracts/repository-validation-contract.json", "role": "Reusable validation behavior"},
     {"path": "skills/ceratops-repo-lifecycle/references/contracts/ceratops-compatibility-deterministic-contract.json", "role": "Mechanically checked compatibility requirements"},
     {"path": "skills/ceratops-repo-lifecycle/references/contracts/ceratops-compatibility-nondeterministic-contract.json", "role": "Internal compatibility review"},
@@ -2516,8 +2660,70 @@ interruption finishes the edit without touching test results or source branches.
 Local results use the worktree's current file; completed builds use their Git summary.
 
 `read_check_environment.py` observes the declared locked child interpreter,
-including uv's PATH activation, package identities and resolved tool bytes.
+including uv's PATH activation, package identities and actual tool versions.
+The runner generator copies this same source into repository
+`scripts/testing/read_check_environment.py`. Whole-command reuse, individual-test
+reuse and command completion use its collection and comparison functions. Git is
+excluded. Other declared tools and language runtimes compare major/minor versions;
+patch changes retain passes. Product-library versions and manifest contents remain
+exact inputs. A saved executable hash without a readable tool version cannot
+establish reuse and returns that reason. Full observed versions and original
+result identities stay in the saved records.
 Declared values are hashed with owned checkout prefixes represented by
 `${REPO_ROOT}`. A declared `GITHUB_EVENT_PATH` also binds the event file's bytes,
 so a different PR selection cannot borrow the prior event's pass. Repository
 writers compare the same inputs before and after their actual callback.
+
+`github_pr_workflow/dependency_queue.py::prepare_dependency_review()` serves
+the `dependency-review` command. It extends the caller's existing repository
+scope with Renovate PRs and dashboard problems, alongside Dependabot PRs and
+alerts. Both providers use the existing PR evidence and approval handling.
+GitHub activity does not establish a successful hosted Renovate job. Repository
+health's existing local collector invokes the pinned Renovate CLI to read JSON,
+JSONC or JSON5 and apply shared presets. It returns the resulting settings,
+detected dependency files, and native errors. It does not implement another
+preset or package-version resolver, and it does not read hosted job logs.
+
+`collect_dependency_coverage()` extends the previous Dependabot collection. Setup,
+health and dependency review use the same root `renovate.json` ownership scope.
+Forks need explicit owned paths; upstream alerts remain visible as upstream
+maintenance. A Dependabot entry cannot narrow updates to one file inside a
+directory or exclude members of a workspace. Setup stops before changing such
+an entry when it would also update upstream-owned files. New entries cover the
+actual manifest/workspace directories and group minor/patch updates while
+preserving existing schedules and custom groups. Shared defaults and the native
+Renovate version live in the compatibility contract. New root Renovate configs
+reference the owner's preset; they do not copy that policy into every repository.
+The workflow generator also refreshes its two named native Renovate CI steps
+from the template, including the pinned tool version. Other workflow steps and
+comments remain repository-owned.
+
+The compatibility command's `--dependency-policy-only` mode calls that same
+dependency collection and policy writer without preparing skills, SDLC,
+environments or test support. Its workflow update appends the configuration job
+from the maintained template, preserving existing application jobs. The command
+uses the existing file snapshots and rollback on a caught write failure. Repeating
+the request preserves the current configuration and avoids duplicate CI jobs.
+
+Renovate's local read uses this checkout's Git-directory cache under
+`ceratops/renovate-cache`. npm manages its downloaded CLI cache; Renovate manages
+its temporary extraction cache with repository caching disabled and a one-hour
+hard cache lifetime. The reader keeps one empty global config and its native
+lock in that folder. Atomic replacement removes its one temporary file on
+success and at the next locked initialization after interruption. No result
+history is saved there. This prevents ambient JavaScript configuration from
+running. npm retrieves the pinned Renovate CLI; dependency installation, other
+tool downloads and repository scripts are disabled. Failures
+retain the invocation, exit status and redacted output streams in the caller's
+report; successful configuration reads never imply a successful hosted job.
+
+The recurring dependency review reads only the newest dashboard and current bot
+PRs. It requests a native local lookup for a reported problem, a stale or missing
+dashboard, or failed configuration loading. The report preserves actual
+dashboard problems and failed configuration or lookup results. It does not
+report a placeholder hosted-job status, collect portal links, or block review
+because access to Mend's separate job service is missing. Hosted-job monitoring
+is separate future work; successful local diagnostics do not establish that a
+hosted job succeeded. The same existing PR route handles both bots and leaves
+PRs outside the declared owned paths for review. Alerts keep their package, manifest,
+published fix information and next action, including alerts without a fix PR.

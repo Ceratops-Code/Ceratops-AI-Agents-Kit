@@ -1,4 +1,4 @@
-"""Prepare and finalize caller-scoped Dependabot dependency queues."""
+"""Prepare and finalize one review of dependency alerts and both update bots."""
 
 from __future__ import annotations
 
@@ -13,6 +13,10 @@ import time
 from collections import defaultdict
 from typing import Any
 
+from github_contract_engine.collectors.local_repository import (
+    collect_dependency_coverage,
+    read_renovate_configuration,
+)
 from github_contract_engine.github_api import run_gh_api
 
 from .dependency_common import (
@@ -89,14 +93,14 @@ def aggregate_package_evidence(
 
 
 def package_failure_message(update: dict[str, Any], evidence: dict[str, Any]) -> str:
-    """Return one bounded package-qualified preflight failure."""
+    """Return one bounded package-qualified review failure."""
 
     package = str(update.get("package") or "unparsed dependency")
     reason = evidence.get("error") or evidence.get("errors") or evidence.get("reason")
     return f"{package}: {reason or 'evidence unavailable'}"[:360]
 
 
-def wait_for_dependabot_rebases(
+def wait_for_dependency_rebases(
     details: dict[tuple[str, int], dict[str, Any]],
     *,
     wait_seconds: float = 180,
@@ -107,14 +111,14 @@ def wait_for_dependabot_rebases(
     One queue-wide wait budget avoids per-PR sleeps. Immutable comparisons are
     reused while base/head stay unchanged; each network query also has a timeout.
     Expiry permits manual repair but never approval of the stale head. Query
-    failures remain preflight blockers, rather than being called rebase failures.
+    failures remain review blockers, rather than being called rebase failures.
     """
 
     pending = {
         key for key, live in details.items()
         if str(live.get("state")).upper() == "OPEN"
         and str(live.get("author")).lower() in {
-            "dependabot", "dependabot[bot]", "app/dependabot",
+            "dependabot", "dependabot[bot]", "app/dependabot", "renovate", "renovate[bot]", "app/renovate",
         }
     }
     started = time.monotonic()
@@ -152,7 +156,7 @@ def wait_for_dependabot_rebases(
             for key in pending:
                 details[key]["rebase_wait"] = {
                     "status": "timed_out",
-                    "message": "Dependabot branch is still behind; repair and refresh preflight",
+                    "message": "Dependency bot branch is still behind; repair and refresh review",
                 }
             break
         time.sleep(min(max(1, interval_seconds), remaining))
@@ -172,18 +176,18 @@ def wait_for_dependabot_rebases(
                 ):
                     blockers.append({
                         "repo": key[0], "pr": key[1], "check": "pr_query",
-                        "message": "PR missing during Dependabot rebase wait",
+                        "message": "PR missing during dependency bot rebase wait",
                     })
             else:
                 details[key] = refreshed[key]
     return details, blockers
 
 
-def retarget_dependabot_prs(
+def retarget_dependency_prs(
     snapshot: dict[str, Any],
     live_details: dict[tuple[str, int], dict[str, Any]],
 ) -> tuple[dict[tuple[str, int], dict[str, Any]], list[dict[str, Any]]]:
-    """Route open same-repository Dependabot PRs before collecting acceptance evidence."""
+    """Route open same-repository dependency-bot PRs before collecting acceptance evidence."""
     repositories = {
         str(repo.get("repo") or repo.get("full_name")).lower(): repo
         for repo in queued_repositories(snapshot)
@@ -198,11 +202,11 @@ def retarget_dependabot_prs(
             continue
         default = repository.get("default_branch")
         base = live.get("base_ref")
-        is_bot = live.get("author") in {"app/dependabot", "dependabot[bot]"}
+        is_bot = live.get("author") in {"app/dependabot", "dependabot[bot]", "app/renovate", "renovate[bot]", "renovate"}
         same_repo = live.get("is_cross_repository") is False
         problem: str | None
         if not (is_bot and same_repo):
-            problem = "live PR is not an open same-repository Dependabot update"
+            problem = "live PR is not an open same-repository dependency-bot update"
         elif base == RELEASE_BRANCH:
             continue
         elif not default or base != default:
@@ -228,11 +232,11 @@ def retarget_dependabot_prs(
                     author = as_object(pull.get("user"))
                     if (
                         not current.ok or pull.get("state") != "open"
-                        or author.get("login") != "dependabot[bot]"
+                        or author.get("login") not in {"dependabot[bot]", "renovate[bot]", "renovate"}
                         or str(source_repo.get("full_name") or "").lower() != repo
                         or str(target_repo.get("full_name") or "").lower() != repo
                     ):
-                        problem = f"could not confirm the same open Dependabot PR: {current.message or current.status}"
+                        problem = f"could not confirm the same open dependency-bot PR: {current.message or current.status}"
                     elif target.get("ref") == RELEASE_BRANCH:
                         changed[repo].add(number)
                         continue
@@ -249,7 +253,7 @@ def retarget_dependabot_prs(
             except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
                 problem = f"retarget could not be confirmed: {exc}"
         blockers.append(scoped_blocker({
-            "repo": repo, "pr": number, "check": "dependabot_release_target", "message": problem,
+            "repo": repo, "pr": number, "check": "dependency_release_target", "message": problem,
         }))
 
     if changed:
@@ -264,13 +268,13 @@ def retarget_dependabot_prs(
                     live_details[key] = observed
                 else:
                     blockers.append(scoped_blocker({
-                        "repo": repo, "pr": number, "check": "dependabot_release_target",
+                        "repo": repo, "pr": number, "check": "dependency_release_target",
                         "message": f"live PR target did not confirm {RELEASE_BRANCH}",
                     }))
     return live_details, blockers
 
 
-def preflight(args: argparse.Namespace) -> int:
+def prepare_dependency_review(args: argparse.Namespace) -> int:
     """Build queue evidence after any scheduled or explicitly requested retargeting."""
 
     workspace_root = args.workspace_root.resolve()
@@ -282,15 +286,110 @@ def preflight(args: argparse.Namespace) -> int:
         args.snapshot,
     )
     snapshot_blocked = bool(snapshot.get("outcome", {}).get("blocked")) or snapshot_process.returncode != 0
+    # The existing caller adapter owns repository enumeration and GitHub alerts.
+    # Extend that exact scope with Renovate's current GitHub evidence. No second
+    # scope scan, background monitor or fabricated hosted-job success is added.
+    processing: dict[str, dict[str, Any]] = {}
+    dependency_prs = [{**item, "provider": "dependabot"} for item in snapshot.get("open_dependabot_prs", [])]
+    processing_blockers = []
+    dependency_configurations: dict[str, dict[str, Any]] = {}
+    for repository in snapshot.get("repositories", []):
+        full_name = repository.get("full_name") if isinstance(repository, dict) else None
+        if not full_name or repository.get("archived"):
+            continue
+        checkout = resolve_checkout(repository, workspace_root, checkout_overrides)
+        configured = checkout.get("status") == "found" and any(
+            (pathlib.Path(str(checkout["path"])) / name).is_file()
+            for name in ("renovate.json", "renovate.jsonc", "renovate.json5", ".github/renovate.json", ".github/renovate.jsonc", ".github/renovate.json5", ".renovaterc", ".renovaterc.json", ".renovaterc.jsonc", ".renovaterc.json5")
+        )
+        # Read the actual settings once for this review; the same root scope is
+        # used below for alert ownership. A local diagnostic cannot establish
+        # whether the hosted bot has successfully processed this repository.
+        configuration: dict[str, Any] = (read_renovate_configuration(pathlib.Path(str(checkout["path"])))
+                         if checkout.get("status") == "found" else
+                         {"status": "unavailable", "errors": ["Local checkout is unavailable"]})
+        dependency_configurations[full_name.lower()] = configuration
+        observed = run_gh_api("GET", f"repos/{full_name}/issues?state=open&per_page=100&sort=updated&direction=desc", paginate=True)
+        if not observed.ok or not isinstance(observed.data, list):
+            processing_blockers.append({"repo": full_name, "check": "renovate_processing",
+                                        "message": "Renovate GitHub evidence is unavailable.", "evidence": observed.state()})
+            continue
+        bot_issues = [item for item in observed.data if isinstance(item, dict)
+                      and str(as_object(item.get("user")).get("login", "")).lower() in {"renovate[bot]", "renovate"}]
+        for item in bot_issues:
+            if "pull_request" in item:
+                dependency_prs.append({"repo": full_name, "number": item["number"], "title": item.get("title"),
+                                       "url": item.get("html_url"), "provider": "renovate"})
+        dashboards = [item for item in bot_issues if "pull_request" not in item
+                      and ("dashboard" in str(item.get("title", "")).lower()
+                           or "<!-- renovate" in str(item.get("body", "")).lower())]
+        if not bot_issues and not configured:
+            continue
+        latest = None
+        for item in dashboards:
+            if latest is None or str(item.get("updated_at", "")) > str(latest.get("updated_at", "")):
+                latest = item
+        details: dict[str, Any] = {"provider": "renovate", "dashboard": None, "problems": []}
+        if latest:
+            body = str(latest.get("body") or "")
+            sections = re.split(r"(?m)^## ", body)
+            details["dashboard"] = {"url": latest.get("html_url"), "updated_at": latest.get("updated_at")}
+            details["problems"] = [section[:4000] for section in sections
+                                   if re.search(r"(?i)^(?:configuration|repository|package lookup|dependency lookup).*(?:error|warning|problem)", section)]
+        details["configuration"] = configuration
+        # Only the newest dashboard is read. Expand into native lookup when the
+        # dashboard reports a problem, configuration failed, or no current
+        # dashboard supplies even recent activity. No historical-job scan.
+        updated = str((latest or {}).get("updated_at") or "")
+        try:
+            from datetime import UTC, datetime, timedelta
+            stale = not updated or datetime.fromisoformat(updated) < datetime.now(UTC) - timedelta(days=7)
+        except ValueError:
+            stale = True
+        details["dashboard_stale"] = stale
+        if configured and (details["problems"] or stale or configuration.get("status") != "ok"):
+            details["local_lookup"] = read_renovate_configuration(pathlib.Path(str(checkout["path"])), lookup=True)
+        processing[full_name.lower()] = details
+        # Report observed failures; access to Mend's separate job service is not
+        # a prerequisite for reviewing dependency PRs and GitHub alerts.
+        failures = {name: details[name] for name in ("configuration", "local_lookup")
+                    if name in details and details[name].get("status") not in {"ok", "not_configured"}}
+        if details["problems"] or failures:
+            processing_blockers.append({
+                "repo": full_name, "check": "renovate_processing",
+                "message": "Renovate reported dependency-processing problems.",
+                "problems": details["problems"], "evidence": failures,
+            })
+    snapshot["open_dependency_prs"] = dependency_prs
+    snapshot["dependency_processing"] = processing
     requested: dict[str, set[int]] = defaultdict(set)
-    for item in snapshot.get("open_dependabot_prs", []):
+    for item in snapshot.get("open_dependency_prs", []):
         if isinstance(item, dict) and isinstance(item.get("repo"), str) and isinstance(item.get("number"), int):
             requested[item["repo"]].add(item["number"])
     live_details, blockers = fetch_pr_batch(requested)
-    if getattr(args, "retarget_dependabot_prs", False) and not snapshot_blocked:
-        live_details, target_blockers = retarget_dependabot_prs(snapshot, live_details)
-        blockers.extend(target_blockers)
-    live_details, rebase_blockers = wait_for_dependabot_rebases(live_details)
+    blockers.extend(processing_blockers)
+    if getattr(args, "retarget_dependency_prs", False) and not snapshot_blocked:
+        eligible = {}
+        repos = {str(item.get("full_name") or item.get("repo") or "").lower(): item
+                 for item in snapshot.get("repositories", [])}
+        for identity, observed_pr in live_details.items():
+            repository = repos.get(identity[0].lower(), {})
+            configuration = dependency_configurations.get(identity[0].lower(), {"status": "not_configured"})
+            changed = [str(item.get("path") or "") for item in observed_pr.get("files", []) if isinstance(item, dict)]
+            coverage = collect_dependency_coverage({"files": changed, "renovate": configuration}, is_fork=repository.get("fork") is True)
+            declared_scope = as_object(as_object(configuration.get("declarations")).get("renovate.json")).get("includePaths")
+            if not coverage["ownership_known"] or declared_scope and (not changed or coverage["outside_owned_scope"]):
+                blockers.append(scoped_blocker({"repo": identity[0], "pr": identity[1], "check": "dependency_ownership",
+                    "message": "PR changes are outside the declared owned dependency scope or ownership is unknown; retargeting was skipped"}))
+            else:
+                eligible[identity] = observed_pr
+        if eligible:
+            refreshed, target_blockers = retarget_dependency_prs(snapshot, eligible)
+            for identity in eligible:
+                live_details.pop(identity, None)
+            live_details.update(refreshed)
+            blockers.extend(target_blockers)
+    live_details, rebase_blockers = wait_for_dependency_rebases(live_details)
     blockers.extend(rebase_blockers)
     if snapshot_blocked:
         snapshot_blockers = []
@@ -329,7 +428,7 @@ def preflight(args: argparse.Namespace) -> int:
         if isinstance(alert, dict):
             alerts_by_repo[str(alert.get("repo") or "").lower()].append(alert)
     prs_by_repo: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for pr in snapshot.get("open_dependabot_prs", []):
+    for pr in snapshot.get("open_dependency_prs", []):
         if isinstance(pr, dict):
             prs_by_repo[str(pr.get("repo") or "").lower()].append(pr)
 
@@ -357,23 +456,41 @@ def preflight(args: argparse.Namespace) -> int:
             repo_blockers.append(
                 {
                     "repo": full_name,
-                    "check": "exact_ci_preflight",
+                    "check": "exact_ci_review",
                     "message": str(ci.get("error") or ci.get("errors"))[:360],
                 }
             )
         enriched_alerts = []
         repo_alerts = alerts_by_repo.get(key, [])
+        configuration = dependency_configurations.get(key, {"status": "not_configured"})
+        coverage = collect_dependency_coverage({
+            "files": [str(alert.get("manifest_path") or "") for alert in repo_alerts],
+            "renovate": configuration,
+        }, is_fork=repo.get("fork") is True)
+        scope_known = coverage["ownership_known"]
         # GitHub alerts describe published default-branch content. A local
         # release checkout may intentionally contain a different dependency tree.
         default_source = (
             fetch_default_branch_head(full_name, repo.get("default_branch"))
-            if repo_alerts and checkout.get("status") == "found" else None
+            if scope_known and coverage["owned_files"] and checkout.get("status") == "found" else None
         )
         # Multiple advisories often name the same package and manifest. Their
-        # immutable default-commit tree is read once per fresh preflight call.
+        # immutable default-commit tree is read once per fresh review call.
         alert_trees: dict[tuple[str, str, str], dict[str, Any]] = {}
         for alert in repo_alerts:
             alert_number = alert.get("number")
+            owned = str(alert.get("manifest_path") or "") in coverage["owned_files"]
+            if not scope_known or not owned:
+                disposition = "ownership_unknown" if not scope_known else "upstream_maintenance"
+                enriched_alerts.append({**alert, "review": {
+                    "disposition": disposition, "owned": False,
+                    "next_action": "Declare the fork's owned dependency files" if not scope_known else
+                                   "Keep the alert open and route its fix to upstream maintenance",
+                }})
+                if not scope_known:
+                    repo_blockers.append({"repo": full_name, "alert": alert_number, "check": "dependency_ownership",
+                                          "message": "Fork ownership scope is missing; no local dependency repair is authorized by this report"})
+                continue
             update = {
                 "package": alert.get("package"),
                 "current_version": None,
@@ -416,7 +533,7 @@ def preflight(args: argparse.Namespace) -> int:
                         "check": (
                             "alert_patch_availability"
                             if registry.get("reason") == "no_patched_version_listed"
-                            else "alert_registry_preflight"
+                            else "alert_registry_review"
                         ),
                         "message": str(registry.get("error") or registry.get("reason") or "registry metadata unavailable")[:360],
                     }
@@ -426,7 +543,7 @@ def preflight(args: argparse.Namespace) -> int:
                     {
                         "repo": full_name,
                         "alert": alert_number,
-                        "check": "alert_dependency_tree_preflight",
+                        "check": "alert_dependency_tree_review",
                         "message": str(
                             dependency_tree.get("errors")
                             or dependency_tree.get("reason")
@@ -437,7 +554,12 @@ def preflight(args: argparse.Namespace) -> int:
             enriched_alerts.append(
                 {
                     **alert,
-                    "preflight": {
+                    "review": {
+                        "disposition": "fix_pr_review" if update.get("target_version") else "blocked_no_published_fix",
+                        "owned": True,
+                        "candidate_pull_requests": [],
+                        "next_action": "Review a compatible parent/package upgrade and keep the alert open until the default branch is fixed"
+                            if update.get("target_version") else "Keep the alert open and recheck parent-package releases on the next review",
                         "update": update,
                         "registry": registry,
                         "dependency_tree": dependency_tree,
@@ -454,7 +576,7 @@ def preflight(args: argparse.Namespace) -> int:
                     {
                         "repo": full_name,
                         "pr": number,
-                        "check": "pr_preflight",
+                        "check": "pr_review",
                         "message": "live projected PR evidence is unavailable",
                     }
                 )
@@ -463,7 +585,7 @@ def preflight(args: argparse.Namespace) -> int:
             ci_annotations = fetch_ci_annotations(full_name, str(live.get("head_oid") or ""))
             if ci_annotations["status"] != "ok":
                 repo_blockers.append({
-                    "repo": full_name, "pr": number, "check": "ci_annotations_preflight",
+                    "repo": full_name, "pr": number, "check": "ci_annotations_review",
                     "message": ci_annotations.get("error") or "CI annotations unavailable",
                 })
             title = str(live.get("title") or pr.get("title") or "")
@@ -487,7 +609,7 @@ def preflight(args: argparse.Namespace) -> int:
                         {
                             "repo": full_name,
                             "pr": number,
-                            "check": "pr_body_preflight",
+                            "check": "pr_body_review",
                             "message": str(body_probe.get("error") or "PR body unavailable")[
                                 :360
                             ],
@@ -506,7 +628,7 @@ def preflight(args: argparse.Namespace) -> int:
                         {
                             "repo": full_name,
                             "pr": number,
-                            "check": "registry_preflight",
+                            "check": "registry_review",
                             "message": package_failure_message(update, registry_item),
                         }
                     )
@@ -530,7 +652,7 @@ def preflight(args: argparse.Namespace) -> int:
                         {
                             "repo": full_name,
                             "pr": number,
-                            "check": "dependency_tree_preflight",
+                            "check": "dependency_tree_review",
                             "message": package_failure_message(
                                 update, dependency_tree_item
                             ),
@@ -586,6 +708,21 @@ def preflight(args: argparse.Namespace) -> int:
                     },
                 }
             )
+        for alert in enriched_alerts:
+            review = alert.get("review", {})
+            if not review.get("owned"):
+                continue
+            candidates = []
+            for pull in enriched_prs:
+                updates = pull["update"].get("updates", [pull["update"]])
+                paths = {item.get("path") for item in pull["live"].get("files", []) if isinstance(item, dict)}
+                if alert.get("manifest_path") in paths and any(
+                    update.get("package") == alert.get("package") for update in updates
+                ):
+                    candidates.append(pull["number"])
+            review["candidate_pull_requests"] = candidates
+            if candidates:
+                review["next_action"] = "Check the candidate PR's resulting dependency tree against this advisory; a package-name match alone does not prove a fix"
         scoped_repo_blockers = [scoped_blocker(item) for item in repo_blockers]
         blockers.extend(scoped_repo_blockers)
         repositories.append(
@@ -596,6 +733,7 @@ def preflight(args: argparse.Namespace) -> int:
                 "checkout": checkout,
                 "alerts": enriched_alerts,
                 "pull_requests": enriched_prs,
+                "dependency_processing": processing.get(key),
                 "exact_ci": ci,
                 "blockers": scoped_repo_blockers,
             }
@@ -615,11 +753,13 @@ def preflight(args: argparse.Namespace) -> int:
                 "open_dependabot_prs",
             )
         },
-        "preflight_blockers": len(blockers),
-        "global_preflight_blockers": sum(
+        "open_renovate_prs": sum(item.get("provider") == "renovate" for item in dependency_prs),
+        "open_dependency_prs": len(dependency_prs),
+        "review_blockers": len(blockers),
+        "global_review_blockers": sum(
             blocker_scope(item) == "global" for item in blockers
         ),
-        "scoped_preflight_blockers": sum(
+        "scoped_review_blockers": sum(
             blocker_scope(item) != "global" for item in blockers
         ),
         "ci_warning_annotations": sum(
@@ -635,10 +775,11 @@ def preflight(args: argparse.Namespace) -> int:
             for repo in repositories for pr in repo["pull_requests"]
         ),
     }
-    queue_present = bool(snapshot.get("outcome", {}).get("queue_present"))
+    # Observing a healthy dashboard/configuration does not create dependency work.
+    queue_present = bool(snapshot.get("outcome", {}).get("queue_present")) or bool(dependency_prs)
     blocked = snapshot_blocked or bool(blockers)
     payload = {
-        "schema": "ceratops-repo-lifecycle/dependency-preflight.v1",
+        "schema": "ceratops-repo-lifecycle/dependency-review.v1",
         "generated_at": utc_now(),
         "outcome": {
             "routine": not queue_present and not blocked,
@@ -651,6 +792,7 @@ def preflight(args: argparse.Namespace) -> int:
         "snapshot": {"path": str(args.snapshot), "summary": snapshot.get("summary"), "outcome": snapshot.get("outcome")},
         "workspace_root": str(workspace_root),
         "repositories": repositories,
+        "dependency_processing": processing,
         "blockers": blockers,
     }
     write_json(args.output, payload)
@@ -661,28 +803,28 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="action", required=True)
 
-    preflight_parser = subparsers.add_parser(
-        "preflight",
+    review_parser = subparsers.add_parser(
+        "review",
         help="Build the snapshot and pre-edit dependency evidence.",
     )
-    preflight_parser.add_argument("--automation-dir", type=pathlib.Path, help="Supply scope and required adapter/output paths from this directory; explicit options override defaults.")
-    preflight_parser.add_argument(
-        "--retarget-dependabot-prs", action="store_true",
+    review_parser.add_argument("--automation-dir", type=pathlib.Path, help="Supply scope and required adapter/output paths from this directory; explicit options override defaults.")
+    review_parser.add_argument(
+        "--retarget-dependency-prs", action="store_true",
         help="Move eligible open Dependabot PRs to published release/local before collecting PR evidence. Enabled by --automation-dir.",
     )
-    preflight_parser.add_argument("--org", required=True)
-    preflight_parser.add_argument("--exclude-repo", action="append", default=[])
-    preflight_parser.add_argument(
+    review_parser.add_argument("--org", required=True)
+    review_parser.add_argument("--exclude-repo", action="append", default=[])
+    review_parser.add_argument(
         "--checkout",
         action="append",
         default=[],
         metavar="OWNER/REPO=PATH",
     )
-    preflight_parser.add_argument("--workspace-root", type=pathlib.Path, default=default_workspace_root())
-    preflight_parser.add_argument("--snapshot-helper", type=pathlib.Path, required=True)
-    preflight_parser.add_argument("--snapshot", type=pathlib.Path, required=True)
-    preflight_parser.add_argument("--output", type=pathlib.Path, required=True)
-    preflight_parser.set_defaults(handler=preflight)
+    review_parser.add_argument("--workspace-root", type=pathlib.Path, default=default_workspace_root())
+    review_parser.add_argument("--snapshot-helper", type=pathlib.Path, required=True)
+    review_parser.add_argument("--snapshot", type=pathlib.Path, required=True)
+    review_parser.add_argument("--output", type=pathlib.Path, required=True)
+    review_parser.set_defaults(handler=prepare_dependency_review)
 
     finalize_parser = subparsers.add_parser(
         "finalize",
@@ -700,7 +842,7 @@ def build_parser() -> argparse.ArgumentParser:
     finalize_parser.add_argument("--workspace-root", type=pathlib.Path, default=default_workspace_root())
     finalize_parser.add_argument("--snapshot-helper", type=pathlib.Path, required=True)
     finalize_parser.add_argument("--sync-helper", type=pathlib.Path, required=True)
-    finalize_parser.add_argument("--preflight", type=pathlib.Path, required=True)
+    finalize_parser.add_argument("--review", type=pathlib.Path, required=True)
     finalize_parser.add_argument("--snapshot", type=pathlib.Path, required=True)
     finalize_parser.add_argument("--sync-output", type=pathlib.Path, required=True)
     finalize_parser.add_argument("--output", type=pathlib.Path, required=True)
@@ -711,7 +853,7 @@ def build_parser() -> argparse.ArgumentParser:
 def automation_arguments(arguments: list[str], root: pathlib.Path) -> list[str]:
     """Bind caller-owned scope and adapter paths inside an automation directory.
 
-    The skill owns execution and preflight routing. The automation supplies
+    The skill owns execution and review routing. The automation supplies
     data and independent snapshot/sync adapters. Explicit CLI options follow
     these defaults and win.
     No installed skill discovery, subprocess launch, or Python path changes occur.
@@ -726,16 +868,16 @@ def automation_arguments(arguments: list[str], root: pathlib.Path) -> list[str]:
         "--snapshot-helper", str(root / "dependabot-repository-queue-snapshot.py"),
         "--snapshot", str(root / "dependabot-repository-queue-snapshot.json"),
     ]
-    if arguments[0] == "preflight":
+    if arguments[0] == "review":
         defaults += [
-            "--retarget-dependabot-prs",
-            "--output", str(root / "dependabot-repository-preflight.json"),
+            "--retarget-dependency-prs",
+            "--output", str(root / "dependabot-repository-review.json"),
         ]
     else:
         defaults += [
             "--task-name", root.name,
             "--sync-helper", str(root / "sync-local-repo-checkouts.py"),
-            "--preflight", str(root / "dependabot-repository-preflight.json"),
+            "--review", str(root / "dependabot-repository-review.json"),
             "--sync-output", str(root / "local-checkout-sync.json"),
             "--output", str(root / "dependabot-repository-finalize.json"),
         ]
@@ -809,7 +951,7 @@ def run_automation(arguments: list[str], root: pathlib.Path, output: pathlib.Pat
     handler_started = False
     error = ""
     try:
-        if action == "preflight":
+        if action == "review":
             clear_automation_report(root / "dependabot-repository-finalize.json")
         clear_automation_report(output)
         args = build_parser().parse_args(automation_arguments(arguments, root))
@@ -838,7 +980,7 @@ def main(argv: list[str] | None = None) -> int:
     # Help remains a read-only operation even when the preset directory is absent.
     if not any(value in {"-h", "--help"} for value in arguments):
         probe = argparse.ArgumentParser(add_help=False)
-        probe.add_argument("action", choices=("preflight", "finalize"))
+        probe.add_argument("action", choices=("review", "finalize"))
         probe.add_argument("--automation-dir", type=pathlib.Path)
         probe.add_argument("--output", type=pathlib.Path)
         preset, _ = probe.parse_known_args(arguments)

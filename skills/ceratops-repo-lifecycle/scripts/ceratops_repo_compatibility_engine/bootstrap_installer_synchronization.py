@@ -41,21 +41,17 @@ def installer_version(path: pathlib.Path) -> int | None:
     return versions[0] if len(versions) == 1 and versions[0] > 0 else None
 
 
-def require_linked_worktree(repo_root: pathlib.Path) -> None:
-    """Reject primary checkouts so synchronization cannot bypass task isolation."""
+def synchronize_bootstrap_installer(
+    repo_root: pathlib.Path, *, allow_primary_checkout: bool = False,
+) -> dict[str, object]:
+    """Synchronize one authorized checkout installer and return its compact result."""
 
-    git_marker = repo_root / ".git"
-    if not git_marker.is_file():
-        raise RuntimeError(f"target repository must be a linked task worktree: {repo_root}")
-
-
-def synchronize_bootstrap_installer(repo_root: pathlib.Path) -> dict[str, object]:
-    """Synchronize one task-worktree installer and return its compact result."""
+    from .apply_ceratops_compatibility import require_authorized_checkout
 
     root = repo_root.resolve()
     target = root / surface_path("skill_bootstrap")
     template = template_path("skill_bootstrap")
-    require_linked_worktree(root)
+    require_authorized_checkout(root, allow_primary_checkout=allow_primary_checkout)
     source_version = installer_version(template)
     if source_version is None:
         raise RuntimeError(
@@ -80,10 +76,13 @@ def main(argv: list[str] | None = None) -> int:
         description="Synchronize a compatible-repo bootstrap by version."
     )
     parser.add_argument("--target-repo-root", required=True, type=pathlib.Path)
+    parser.add_argument("--allow-primary-checkout", action="store_true")
     args = parser.parse_args(argv)
 
     try:
-        result = synchronize_bootstrap_installer(args.target_repo_root)
+        result = synchronize_bootstrap_installer(
+            args.target_repo_root, allow_primary_checkout=args.allow_primary_checkout,
+        )
     except (OSError, RuntimeError) as exc:
         print(str(exc), file=sys.stderr)
         return 1

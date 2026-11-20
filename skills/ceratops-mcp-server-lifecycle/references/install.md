@@ -26,7 +26,7 @@ validation.
 
 ## SDLC execution
 
-`sdlc/sdlc.yml` routes MCP server installation to this action; the manager
+`.ceratops/sdlc/sdlc.yml` routes MCP server installation to this action; the manager
 itself reads MCP server `pyproject.toml` and `mcp-server.json`, not SDLC.
 Earlier SDLC bindings use `--source` to build an MCP server directly. SDLC
 returns the selected MCP server and its package prerequisite records to this

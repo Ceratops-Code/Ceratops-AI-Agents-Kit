@@ -14,7 +14,6 @@ from unittest.mock import Mock
 import pytest
 
 from tests.repository_lifecycle.support import (
-    MANAGE_PENDING_WORK,
     PROMOTE_REPOSITORY,
     prepare_divergent_promotion_repo,
     prepare_repository_lifecycle_repo,
@@ -285,6 +284,9 @@ def test_promote_repository_runs_explicit_operation_ids_in_order(
         ["--run-operation", "deliverables.apps.sample.actions.install"],
         "execution options",
     )
+    rejected(["--bundle", "sample"], "execution options")
+    rejected(["--version-choices", "{}"], "execution options")
+    rejected(["--version-source-commit", result["head"]], "execution options")
     rejected(["--task-temp-root", str(tmp_path)], "one existing task directory")
 
     # Even an acknowledged file must describe a complete deployment. These
@@ -559,7 +561,7 @@ def test_promote_repository_routes_linked_repo_root_without_branch_drift(
             "--source-branch",
             "task-runner",
             "--sdlc-contract",
-            str(task_worktree / "sdlc/sdlc.yml"),
+            str(task_worktree / ".ceratops/sdlc/sdlc.yml"),
             "--no-run-operation",
         ],
         capture_output=True,
@@ -648,7 +650,8 @@ def test_release_preparation_failure_restores_original_checkout_and_refs(
     assert run_git(repo, "status", "--porcelain").stdout == ""
 
 
-def test_failed_checks_leave_release_unchanged(tmp_path: pathlib.Path) -> None:
+@pytest.mark.parametrize("status", ["validation_failed", "decision_required"])
+def test_unfinished_checks_leave_release_unchanged(tmp_path: pathlib.Path, status: str) -> None:
     repo, approved_head, _, _ = prepare_repository_lifecycle_repo(tmp_path)
     original_main = run_git(repo, "rev-parse", "main").stdout.strip()
     assert run_git(repo, "switch", "main").returncode == 0
@@ -657,11 +660,16 @@ def test_failed_checks_leave_release_unchanged(tmp_path: pathlib.Path) -> None:
     loaded = runpy.run_path(str(PROMOTE_REPOSITORY))
     promote = loaded["promote"]
     promote.__globals__["execute_build"] = Mock(return_value={
-        "status": "validation_failed", "message": "forced failure"})
+        "status": status, "message": "forced failure", "question": "Review this package?",
+        "decision_id": "review-package", "answer_schema": {"type": "boolean"}})
     args = loaded["build_parser"]().parse_args([
         "--repo-root", str(task), "--source-branch", "approved", "--no-run-operation"])
-    with pytest.raises(loaded["PromotionError"], match="forced failure"):
-        promote(args)
+    if status == "decision_required":
+        outcome = promote(args)
+        assert outcome["status"] == status and outcome["decision_id"] == "review-package", outcome
+    else:
+        with pytest.raises(loaded["PromotionError"], match="forced failure"):
+            promote(args)
     assert run_git(repo, "branch", "--show-current").stdout.strip() == "release/local"
     assert run_git(repo, "rev-parse", "release/local").stdout.strip() == original_main
     assert run_git(task, "rev-parse", "HEAD").stdout.strip() == approved_head
@@ -899,7 +907,7 @@ def test_promotion_checks_corrected_task_and_blocks_later_changes(
     if gate == "tests":
         import yaml
 
-        path = repo / "sdlc/sdlc.yml"
+        path = repo / ".ceratops/sdlc/sdlc.yml"
         document = yaml.safe_load(path.read_text())
         groups = document["repository"]["actions"]["pre-build-checks"]["check-groups"]
         groups["tests"] = groups["source"]
@@ -1149,10 +1157,38 @@ def test_task_merge_preserves_main_merges_and_reports_conflicts(
     assert run_git(source, "status", "--porcelain").stdout == ""
 
 
-@pytest.mark.parametrize("case", ["success", "failure", "outside-writer", "interrupted-checkout"])
-def test_checks_finish_before_release_moves(tmp_path, case):
+@pytest.mark.parametrize("case", ["success", "failure", "outside-writer", "interrupted-checkout",
+                                 "metadata-only", "product-change", "install-required",
+                                 "missing-contract", "invalid-contract", "unreadable-contract",
+                                 "missing-result", "lost-check", "empty-scope", "alpha-package"])
+def test_checks_finish_before_release_moves(tmp_path, case, monkeypatch):
     fails = case == "failure"
     repo, task, submitted, release_head, _ = prepare_divergent_promotion_repo(tmp_path / "checked")
+    optional_builder = None
+    if case in {"metadata-only", "product-change", "install-required"}:
+        (repo / "product").mkdir()
+        (repo / "product/value.txt").write_text("product source")
+        optional_builder = {
+            "root-dir": "product", "manifest": "product/value.txt", "build-after": [],
+            "actions": {
+                "pre-build-checks": {"check-groups": {"source": {
+                    "requires": {"tools": []}, "no-op": "Repository checks cover this product."
+                }}},
+                "build": {"requires": {"tools": []}, "parameters": ["build_dir"],
+                          "steps": [{"run": [sys.executable, "-c", "raise AssertionError('builder was invoked')", "{build_dir}"]}]},
+                "install": {"requires": {"tools": []}, "no-op": "No installation side effect in this case."},
+            },
+        }
+        write_sdlc_contract(repo, deliverables={"apps": {"sample": optional_builder}})
+        assert run_git(repo, "add", ".").returncode == 0
+        assert run_git(repo, "commit", "-m", "declare native product build").returncode == 0
+        release_head = run_git(repo, "rev-parse", "HEAD").stdout.strip()
+        assert run_git(task, "merge", "--no-edit", "release/local").returncode == 0
+        if case == "product-change":
+            (task / "product/value.txt").write_text("changed product")
+        else:
+            (task / ".github/ISSUE_TEMPLATE").mkdir(parents=True, exist_ok=True)
+            (task / ".github/ISSUE_TEMPLATE/bug_report.yml").write_text("name: Bug\n")
     log = tmp_path / "checks.log"
     code = (
         "import json,os,pathlib,subprocess,sys\n"
@@ -1160,6 +1196,9 @@ def test_checks_finish_before_release_moves(tmp_path, case):
         "assert context['trigger']=='promotion'\n"
         "assert context['branch']==subprocess.check_output(['git','branch','--show-current'],text=True).strip()\n"
         "assert context['commit']==subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()\n"
+        "if sys.argv[5]=='alpha-package':\n"
+        "    import tomllib\n"
+        "    assert tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version']=='1.2.20b1'\n"
         "root=pathlib.Path(sys.argv[1]); p=pathlib.Path(sys.argv[3])\n"
         "head=subprocess.check_output(['git','-C',str(root),'rev-parse','release/local'],text=True).strip()\n"
         "if sys.argv[5]=='outside-writer' and p.exists():\n"
@@ -1173,13 +1212,13 @@ def test_checks_finish_before_release_moves(tmp_path, case):
         "p.write_text((p.read_text() if p.exists() else '')+'x')\n"
         "sys.exit(int(sys.argv[4]))"
     )
-    path = task / "sdlc/sdlc.yml"
+    path = task / ".ceratops/sdlc/sdlc.yml"
     contract = {
         "version": 5, "kind": "ceratops-sdlc",
         "repository": {"tools": {}, "actions": {"pre-build-checks": {"check-groups": {"release-still-unchanged": {
             "requires": {"tools": []},
             "check-results": {"result-owner": "operation", "product-inputs": ["*.md"],
-                              "check-inputs": ["sdlc/sdlc.yml"]},
+                              "check-inputs": [".ceratops/sdlc/sdlc.yml"]},
             "steps": [{"run": [sys.executable, "-c", code, str(repo), release_head, str(log), str(int(fails)), case]}],
         }}}}}, "deliverables": {"apps": {"sample": {
             "root-dir": ".", "manifest": "README.md", "build-after": [],
@@ -1188,13 +1227,64 @@ def test_checks_finish_before_release_moves(tmp_path, case):
             }}}, "install": {"requires": {"tools": []}, "no-op": "No installation in this check fixture."}}
         }}},
     }
+    if optional_builder is not None:
+        contract["deliverables"] = {"apps": {"sample": optional_builder}}
+    if case == 'alpha-package':
+        from tests.repository_lifecycle.test_completed_builds import _worktree_build_case
+        (tmp_path / 'package-fixture').mkdir()
+        fixture, _ = _worktree_build_case(tmp_path / 'package-fixture')
+        contract['deliverables'] = json.loads((fixture / '.ceratops/sdlc/sdlc.yml').read_text())['deliverables']
+        for relative in ('src/claims.py', 'scripts/build.py', 'pyproject.toml'):
+            target = task / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes((fixture / relative).read_bytes())
+        (task / 'pyproject.toml').write_text('[project]\nname="claims"\nversion="1.2.20a3"\n')
+        with (task / '.gitignore').open('a') as stream:
+            stream.write('\n.build-count\n')
+    assert isinstance(contract["repository"], dict)
+    if case == "empty-scope":
+        contract["repository"]["actions"]["pre-build-checks"]["check-groups"] = {
+            "not-needed": {"requires": {"tools": []}, "no-op": "This fixture requires no checks."}}
+    if case == "missing-result":
+        contract["repository"]["actions"]["pre-build-checks"]["check-groups"]["release-still-unchanged"]["check-results"].pop("result-owner")
     path.write_text(json.dumps(contract))
-    assert run_git(task, "add", "sdlc/sdlc.yml").returncode == 0
+    if case == "missing-contract":
+        path.unlink()
+    elif case == "invalid-contract":
+        path.write_text("not: [valid yaml")
+    assert run_git(task, "add", ".").returncode == 0
     assert run_git(task, "commit", "-m", "checks must precede release movement").returncode == 0
     selected = run_git(task, "rev-parse", "HEAD").stdout.strip()
     module = runpy.run_path(str(PROMOTE_REPOSITORY))
     args = module["build_parser"]().parse_args([
-        "--repo-root", str(task), "--source-branch", "approved", "--no-run-operation"])
+        "--repo-root", str(task), "--source-branch", "approved", *(
+            ["--run-operation", "deliverables.apps.sample.actions.install"]
+            if case == "install-required" else ["--no-run-operation"])])
+    if case == "unreadable-contract":
+        from unittest.mock import Mock
+        import repository_operation
+        monkeypatch.setattr(repository_operation, "load_contract", Mock(side_effect=PermissionError("contract cannot be read")))
+    if case == "lost-check":
+        from unittest.mock import Mock
+        import repository_operation
+        monkeypatch.setattr(repository_operation, "prepare_operations", Mock(return_value=[]))
+    if case in {"missing-contract", "invalid-contract", "unreadable-contract", "missing-result", "lost-check"}:
+        for _ in range(2):
+            with pytest.raises(module["PromotionError"]) as error:
+                module["promote"](args)
+            assert ("contract" in str(error.value).lower() or "check" in str(error.value).lower()
+                    or "yaml" in str(error.value).lower())
+            assert run_git(repo, "rev-parse", "release/local").stdout.strip() == release_head
+        if case != "missing-result":
+            assert not log.exists()
+        return
+    if case in {"product-change", "install-required"}:
+        for _ in range(2):
+            with pytest.raises(module["PromotionError"], match="build_dir"):
+                module["promote"](args)
+            assert run_git(repo, "rev-parse", "release/local").stdout.strip() == release_head
+        assert not log.exists()
+        return
     if fails:
         with pytest.raises(module["PromotionError"]):
             module["promote"](args)
@@ -1208,6 +1298,16 @@ def test_checks_finish_before_release_moves(tmp_path, case):
     assert head == run_git(task, "rev-parse", "HEAD").stdout.strip()
     assert result["submitted_commits"] == {"approved": selected}
     assert result["tested_commit"] == result["accepted_commit"] == head
+    if case == 'alpha-package':
+        assert (task / '.build-count').read_text() == 'x'
+        assert '1.2.20b1' in (repo / 'pyproject.toml').read_text()
+    if case != "empty-scope":
+        check = next(value for value in result["checks"] if value["operation"].startswith("repository."))
+        assert check["check_outcome"]["status"] == "passed"
+        assert check["check_outcome"]["result_id"] == check["check_result"]["result_id"]
+        assert check["check_outcome"]["execution"]["finishedAt"]
+    else:
+        assert all(value["status"] == "no_op" for value in result["checks"])
     for ancestor in (submitted, selected, release_head):
         assert run_git(task, "merge-base", "--is-ancestor", ancestor, head).returncode == 0
     if case == "interrupted-checkout":
@@ -1221,7 +1321,12 @@ def test_checks_finish_before_release_moves(tmp_path, case):
         head = next_head
     again = module["promote"](args)
     assert again["status"] == "ready" and again["head"] == head
-    assert log.read_text() == ("xx" if case == "outside-writer" else "x")
+    if case == "empty-scope":
+        assert not log.exists()
+    else:
+        assert log.read_text() == ("xx" if case == "outside-writer" else "x")
+        reused = next(value for value in again["checks"] if value["operation"].startswith("repository."))
+        assert reused["check_outcome"] == check["check_outcome"]
     assert run_git(repo, "status", "--porcelain").stdout == ""
     if case == "interrupted-checkout":
         assert (repo / "extra.txt").read_text() == "next source file"

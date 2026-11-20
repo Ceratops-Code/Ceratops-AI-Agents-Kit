@@ -5,11 +5,6 @@
   "non_deterministic_review_file": "ceratops-compatibility-nondeterministic-contract.json",
   "managed_python_test_scratch_recovery": true,
   "surfaces": {
-    "validator": {
-      "path": "scripts/validate-repository.py",
-      "template": "validate-repository.py.tmpl",
-      "required": "always"
-    },
     "workflow": {
       "path": ".github/workflows/validate.yml",
       "template": "validate.yml.tmpl",
@@ -26,7 +21,7 @@
       "required": "always"
     },
     "sdlc": {
-      "path": "sdlc/sdlc.yml",
+      "path": ".ceratops/sdlc/sdlc.yml",
       "template": "sdlc.yml.tmpl",
       "required": "always"
     },
@@ -210,5 +205,28 @@
     "schedule": {
       "interval": "weekly"
     }
+  },
+  "dependency_maintenance": {
+    "renovate_version": "44.240.0",
+    "renovate_expected_settings": {
+      "baseBranchPatterns": [
+        "release/local"
+      ],
+      "vulnerabilityAlerts": {
+        "enabled": false
+      },
+      "osvVulnerabilityAlerts": false,
+      "dependencyDashboard": {"enabled": true}
+    },
+    "compatible_update_groups": {
+      "compatible-updates": {
+        "update-types": [
+          "minor",
+          "patch"
+        ]
+      }
+    },
+    "require_explicit_fork_scope": true,
+    "renovate_preset_repository": "renovate-config"
   }
 }

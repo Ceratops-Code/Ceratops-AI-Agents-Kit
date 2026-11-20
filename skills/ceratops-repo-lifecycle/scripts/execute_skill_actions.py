@@ -159,7 +159,7 @@ def execute_handoff(
     inputs: Mapping[str, Any] | None = None,
     mcp_package_context: Mapping[str, Any] | None = None,
     expected_commit: str | None = None,
-    diagnostic_output: pathlib.Path | None = None,
+    report_directory: pathlib.Path | None = None,
     diagnostic_owner: tuple[pathlib.Path, str] | None = None,
     failure_id: str | None = None,
     successful_results: Any = (),
@@ -453,7 +453,7 @@ def execute_handoff(
                 }
                 owner_root, action = diagnostic_owner or (repo_root, "operation")
                 return report_failure(
-                    failure, diagnostic_output=diagnostic_output,
+                    failure, report_directory=report_directory,
                     repo_root=owner_root, action=action,
                     failure_id=failure_id or f"{route}:{position}",
                     stdout=stdout, stderr=stderr,

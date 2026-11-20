@@ -42,9 +42,9 @@ def parse_pr_identifier(value: str) -> tuple[str, int] | None:
     return f"{match.group('owner')}/{match.group('repo')}", int(match.group("number"))
 
 
-def preflight_pr_index(preflight_result: dict[str, Any]) -> dict[tuple[str, int], dict[str, Any]]:
+def review_pr_index(review_result: dict[str, Any]) -> dict[tuple[str, int], dict[str, Any]]:
     index: dict[tuple[str, int], dict[str, Any]] = {}
-    for repo in preflight_result.get("repositories", []):
+    for repo in review_result.get("repositories", []):
         if not isinstance(repo, dict):
             continue
         full_name = str(repo.get("repo") or "")
@@ -54,7 +54,7 @@ def preflight_pr_index(preflight_result: dict[str, Any]) -> dict[tuple[str, int]
     return index
 
 
-def preflight_approved_head(approved_item: dict[str, Any]) -> str | None:
+def review_approved_head(approved_item: dict[str, Any]) -> str | None:
     """Return the exact PR head whose dependency evidence was approved."""
 
     pr = approved_item.get("pr")
@@ -69,17 +69,17 @@ def head_binding_blocker(
     approved_head: str,
     live: dict[str, Any],
 ) -> dict[str, Any] | None:
-    """Block live dependency content that differs from preflight approval."""
+    """Block live dependency content that differs from review approval."""
 
     live_head = live.get("head_oid")
     if live_head != approved_head:
-        return {"repo": repo, "pr": number, "check": "preflight_head", "message": (
-            f"PR head changed from preflight-approved commit {approved_head!r} "
-            f"to {live_head!r}; run a new preflight and approval"
+        return {"repo": repo, "pr": number, "check": "review_head", "message": (
+            f"PR head changed from review-approved commit {approved_head!r} "
+            f"to {live_head!r}; run a new review and approval"
         )}
     if live.get("base_ref") != RELEASE_BRANCH:
         return {"repo": repo, "pr": number, "check": "dependabot_release_target", "message": (
-            f"PR targets {live.get('base_ref')!r}; retarget to {RELEASE_BRANCH} and run preflight again"
+            f"PR targets {live.get('base_ref')!r}; retarget to {RELEASE_BRANCH} and run review again"
         )}
     return None
 
@@ -198,7 +198,7 @@ def snapshot_open_pr_keys(
     """Return open Dependabot PR keys, or ``None`` when evidence is malformed.
 
     A missing or malformed membership list must never prove that an approved PR
-    was resolved. Callers conservatively require another preflight in that case.
+    was resolved. Callers conservatively require another review in that case.
     """
 
     raw = snapshot.get("open_dependabot_prs")
@@ -457,7 +457,7 @@ def publish_dependency_batch(
                 "--main-branch", base_ref, "--release-branch", "release/local",
                 "--remote-name", "origin", "--ship-after-promotion",
                 "--title", "Update approved dependencies", "--body", body,
-                "--diagnostic-output", str(diagnostics),
+                "--report-directory", str(diagnostics),
             ]
             code, publication = run_command_for_json(invocation, cwd=primary)
             result.update(publication=publication, invocation=invocation)
@@ -565,7 +565,7 @@ def selected_worktree_cleanup(
         if not branch or not base_ref or branch == base_ref:
             raise WorkflowError("cleanup requires a selected source branch and a distinct base")
         if _git_value(worktree, "rev-parse", "HEAD") != approved_head:
-            raise WorkflowError("selected worktree is not at the preflight-approved PR head")
+            raise WorkflowError("selected worktree is not at the review-approved PR head")
         registered = _git_value(
             primary, "for-each-ref", "--format=%(worktreepath)", f"refs/heads/{branch}"
         )
@@ -628,7 +628,7 @@ def finalize_worktree_cleanup(
             raise WorkflowError("selected worktree is not ready for cleanup; see recorded findings")
         if recorded.get("source_branches") != [plan["branch"]]:
             raise WorkflowError("pending-work selection changed during recording; cleanup preserved")
-        finalized = manager["finalize_scope"](
+        finalized = manager["remove_completed_task_work"](
             primary, scope, target_branch=base, target_commit=target,
             current_branch=base, current_commit=target,
         )
@@ -652,27 +652,27 @@ def finalize(args: argparse.Namespace) -> int:
     """Finalize only explicitly approved PRs and persist every blocker."""
 
     workspace_root = args.workspace_root.resolve()
-    preflight_result = load_json(args.preflight)
-    preflight_blockers = [
+    review_result = load_json(args.review)
+    review_blockers = [
         scoped_blocker(item)
-        for item in as_list(preflight_result.get("blockers"))
+        for item in as_list(review_result.get("blockers"))
     ]
     if (
-        bool(as_object(preflight_result.get("outcome")).get("blocked"))
-        and not preflight_blockers
+        bool(as_object(review_result.get("outcome")).get("blocked"))
+        and not review_blockers
     ):
-        preflight_blockers.append(
+        review_blockers.append(
             scoped_blocker(
                 {
-                    "check": "preflight_gate",
-                    "message": "blocked preflight has no scoped blocker records",
+                    "check": "review_gate",
+                    "message": "blocked review has no scoped blocker records",
                 }
             )
         )
-    preflight_index = preflight_pr_index(preflight_result)
+    review_index = review_pr_index(review_result)
     previous = prior_fingerprints(args.output)
     approved: list[tuple[str, int]] = []
-    blockers: list[dict[str, Any]] = list(preflight_blockers)
+    blockers: list[dict[str, Any]] = list(review_blockers)
     seen: set[tuple[str, int]] = set()
     for raw in args.approved_pr:
         parsed = parse_pr_identifier(raw)
@@ -684,11 +684,11 @@ def finalize(args: argparse.Namespace) -> int:
             approved.append(parsed)
             seen.add(key)
 
-    preflight_summary = as_object(preflight_result.get("summary"))
-    org = str(preflight_summary.get("org") or args.org)
+    review_summary = as_object(review_result.get("summary"))
+    org = str(review_summary.get("org") or args.org)
     if not org:
-        raise WorkflowError("organization is absent from preflight and --org")
-    snapshot_meta = as_object(preflight_result.get("snapshot"))
+        raise WorkflowError("organization is absent from review and --org")
+    snapshot_meta = as_object(review_result.get("snapshot"))
     snapshot_summary = as_object(snapshot_meta.get("summary"))
     exclusions = snapshot_summary.get("excluded_repositories")
     exclusion_list = [str(item) for item in exclusions] if isinstance(exclusions, list) else []
@@ -701,45 +701,45 @@ def finalize(args: argparse.Namespace) -> int:
 
     for repo, number in approved:
         key = (repo.lower(), number)
-        applicable_preflight_blockers = [
+        applicable_review_blockers = [
             item
-            for item in preflight_blockers
+            for item in review_blockers
             if blocker_applies_to_pr(item, repo, number)
         ]
-        if applicable_preflight_blockers:
+        if applicable_review_blockers:
             scopes = sorted(
-                {str(item.get("scope") or "global") for item in applicable_preflight_blockers}
+                {str(item.get("scope") or "global") for item in applicable_review_blockers}
             )
             blocker = {
                 "scope": "pull_request",
                 "repo": repo,
                 "pr": number,
-                "check": "preflight_gate",
+                "check": "review_gate",
                 "message": (
-                    f"{len(applicable_preflight_blockers)} applicable preflight "
+                    f"{len(applicable_review_blockers)} applicable review "
                     f"blocker(s): {', '.join(scopes)}"
                 ),
             }
             results.append({**blocker, "status": "blocked"})
             continue
-        approved_item = preflight_index.get(key)
+        approved_item = review_index.get(key)
         if approved_item is None:
             blocker = {
                 "repo": repo,
                 "pr": number,
                 "check": "approved_pr",
-                "message": "PR was not present in the current preflight queue",
+                "message": "PR was not present in the current review queue",
             }
             blockers.append(blocker)
             results.append({**blocker, "status": "blocked"})
             continue
-        approved_head = preflight_approved_head(approved_item)
+        approved_head = review_approved_head(approved_item)
         if approved_head is None:
             blocker = {
                 "repo": repo,
                 "pr": number,
-                "check": "preflight_head",
-                "message": "preflight approval is missing an exact PR head",
+                "check": "review_head",
+                "message": "review approval is missing an exact PR head",
             }
             blockers.append(blocker)
             results.append({**blocker, "status": "blocked"})
@@ -749,7 +749,7 @@ def finalize(args: argparse.Namespace) -> int:
         if as_object(approved_live.get("rebase_wait")).get("status") == "timed_out":
             blocker = {
                 "repo": repo, "pr": number, "check": "dependabot_rebase",
-                "message": "preflight rebase wait expired; repair and run a new preflight and approval",
+                "message": "review rebase wait expired; repair and run a new review and approval",
             }
             blockers.append(blocker)
             results.append({**blocker, "status": "blocked"})
@@ -797,7 +797,7 @@ def finalize(args: argparse.Namespace) -> int:
         if head_blocker is None and approved_live.get("base_ref") != RELEASE_BRANCH:
             head_blocker = {
                 "repo": repo, "pr": number, "check": "dependabot_release_target",
-                "message": "approval is missing preflight evidence against release/local",
+                "message": "approval is missing review evidence against release/local",
             }
         if head_blocker:
             blockers.append(head_blocker)
@@ -990,7 +990,7 @@ def finalize(args: argparse.Namespace) -> int:
             ),
         },
         "summary": summary,
-        "preflight": str(args.preflight),
+        "review": str(args.review),
         "snapshot": {"path": str(args.snapshot), "outcome": final_snapshot.get("outcome"), "summary": final_summary},
         "sync": {"path": str(args.sync_output), "result": sync_result},
         "pull_requests": results,

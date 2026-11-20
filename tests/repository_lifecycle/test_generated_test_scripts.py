@@ -3,16 +3,15 @@ from __future__ import annotations
 import hashlib
 import importlib
 import importlib.util
-import io
 import json
+import os
 import pathlib
 import runpy
 import shutil
 import subprocess
 import sys
-import tomllib
-import zipfile
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 import yaml
@@ -20,21 +19,17 @@ import yaml
 from tests.repository_lifecycle.support import (
     REPOSITORY_LIFECYCLE_SCRIPTS,
     REPOSITORY_LIFECYCLE_SOURCE,
-    SDLC_CONTRACT_TEMPLATE,
-    SECTION_MANIFEST_TEMPLATE,
+    run_operation_cli,
 )
-from tests.skill_lifecycle.support import add_action_sections
 from tests.support.processes import (
     run_compatibility_engine,
 )
 from tests.support.repositories import (
     ROOT,
-    create_compatible_repo,
+    prepare_linked_worktree,
     run_git,
+    write_sdlc_contract,
 )
-
-
-from tests.repository_lifecycle.test_compatibility import _write_current_sdlc
 
 
 def _write_generated_runner(root, targets):
@@ -56,7 +51,7 @@ def _write_generated_runner(root, targets):
     return root / "scripts/run-tests.py"
 
 @pytest.mark.parametrize("managed", [False, True])
-def test_custom_runner_keeps_behavior_and_can_select_generated_support(tmp_path, managed):
+def test_custom_runner_keeps_behavior_and_can_select_generated_support(tmp_path, managed, monkeypatch, capsys):
     generator = importlib.import_module("ceratops_repo_compatibility_engine.generate_test_script")
     contract = importlib.import_module("ceratops_repo_compatibility_engine.compatibility_contract").load_compatibility_contract()
     scripts = tmp_path / "scripts"
@@ -76,8 +71,67 @@ def test_custom_runner_keeps_behavior_and_can_select_generated_support(tmp_path,
     assert support.exists() is managed
     assert generator.generated_support_errors(tmp_path, contract) == []
     if managed:
+        records = runpy.run_path(str(scripts / "result_records.py"))
+        result = scripts / "result.json"
+        records["write_result"](result, {"status": "passed"}, exclusive=True)
+        assert records["read_result"](result) == (True, {"status": "passed"})
+        environment = runpy.run_path(str(scripts / "testing/read_check_environment.py"))
+        compare = environment["environment_inputs_for_reuse"]
+        before = {"tools": {"git": {"sha256": "a" * 64}, "uv": "uv 1.2.3"}, "runtime": {"python": "3.13.4"}}
+        after = {"tools": {"uv": {"version": "1.2.99"}}, "runtime": {"python": "3.13.99"}}
+        assert compare(before) == compare(after)
+        after["runtime"] = {"python": "3.14.0"}
+        assert compare(before) != compare(after)
+        with pytest.raises(ValueError, match="major/minor"):
+            compare({"tools": {"uv": {"sha256": "a" * 64}}})
         support.unlink()
         assert any("reuse_test_results.py" in error for error in generator.generated_support_errors(tmp_path, contract))
+
+    # Narrow refresh owns only declared support, even in a custom application
+    # whose unrelated layout, manifest and CI do not satisfy full compatibility.
+    application = importlib.import_module("ceratops_repo_compatibility_engine.apply_ceratops_compatibility")
+    prepare_linked_worktree(tmp_path)
+    project = scripts / "pyproject.toml"
+    project.write_text('[project]\nname="custom"\nversion="1.0"\n')
+    custom = scripts / "result_records.py"
+    custom.write_text("PACKAGE_FORMAT = 'native-app'\n")
+    manifest = tmp_path / "skills/skill-sections.json"
+    manifest.parent.mkdir(exist_ok=True)
+    manifest.write_text('{"custom": true}\n')
+    sdlc = tmp_path / ".ceratops/sdlc/sdlc.yml"
+    sdlc.parent.mkdir(parents=True)
+    sdlc.write_text('version: 5\nrepository:\n  actions: {}\n')
+    baseline = {path: path.read_bytes() for path in tmp_path.rglob('*') if path.is_file()}
+    arguments = ["--target-repo-root", str(tmp_path), "--test-support-only"]
+    monkeypatch.setattr(application, "setup_runtime", Mock(side_effect=AssertionError("unrelated environment setup")))
+    monkeypatch.setattr(application.repository_checks, "validation_surfaces", Mock(side_effect=AssertionError("unrelated checks")))
+    for boundary in ("apply_compatibility_plan", "generated_support_errors"):
+        with monkeypatch.context() as patch:
+            patch.setattr(application, boundary, Mock(side_effect=RuntimeError("interrupted refresh")))
+            assert application.main(arguments) == 1
+            outcome = json.loads(capsys.readouterr().out)
+            assert outcome["rollback"] == "completed"
+            assert {path: path.read_bytes() for path in tmp_path.rglob('*') if path.is_file()} == baseline
+    previous = None
+    for _ in range(2):
+        assert application.main(arguments) == 0
+        outcome = json.loads(capsys.readouterr().out)
+        assert outcome["scope"] == "test-support" and outcome["runner"] == "preserved"
+        assert script.read_bytes() == baseline[script]
+        assert custom.read_bytes() == baseline[custom]
+        assert manifest.read_bytes() == baseline[manifest]
+        current = {path: path.read_bytes() for path in tmp_path.rglob('*') if path.is_file()}
+        if previous is not None:
+            assert current == previous
+        previous = current
+    records = runpy.run_path(str(scripts / "write_check_results.py"))
+    result = scripts / "narrow-result.json"
+    records["write_result"](result, {"status": "passed"}, exclusive=True)
+    assert records["read_result"](result) == (True, {"status": "passed"})
+    assert generator.generated_support_errors(tmp_path, contract) == []
+    project.write_text('[tool.ceratops.test-support]\nmanaged = false\n')
+    with pytest.raises(RuntimeError, match="explicitly unmanaged"):
+        generator.record_generated_runner(tmp_path, contract, None, {}, support_only=True)
 
 
 @pytest.mark.parametrize("inherited_form", ["joined", "separate"])
@@ -98,32 +152,52 @@ def test_generated_python_runner_cleans_owned_temp_even_with_overrides(
     link = f"    (tmp_path / 'linked-object').hardlink_to(pathlib.Path({str(external)!r}))\n" if readonly else ""
     (repo / "test_probe.py").write_text(
         "import json, pathlib, tempfile\n"
-        "def test_probe(tmp_path):\n"
-        f"    pathlib.Path({str(marker)!r}).write_text(json.dumps([str(tmp_path), tempfile.gettempdir()]))\n"
+        "def test_probe(tmp_path, pytestconfig):\n"
+        f"    pathlib.Path({str(marker)!r}).write_text(json.dumps([str(tmp_path), tempfile.gettempdir(), str(pytestconfig.cache._cachedir)]))\n"
         f"{link}"
         "    assert False\n"
     )
     runner = _write_generated_runner(repo, ["test_probe.py"])
+    support_loader = runpy.run_path(str(runner))["test_support"]
+    for previous in (False, True):
+        with monkeypatch.context() as patch:
+            patch.setattr(sys, "dont_write_bytecode", previous)
+            imported = Mock(return_value=object())
+            patch.setattr(importlib, "import_module", imported)
+            for _ in range(2):
+                assert support_loader() is imported.return_value
+                assert sys.dont_write_bytecode is previous
+            imported.side_effect = ImportError("support unavailable")
+            with pytest.raises(ImportError, match="support unavailable"):
+                support_loader()
+            assert sys.dont_write_bytecode is previous
     templates = REPOSITORY_LIFECYCLE_SOURCE / "references/templates"
     (repo / "scripts/pyproject.toml").write_text(
         (templates / "validation-pyproject.toml.tmpl").read_text().replace("__DEPENDENCIES__", '["pytest"]')
     )
     subprocess.run(["uv", "lock", "--project", str(repo / "scripts")], check=True, capture_output=True)
     outside = tmp_path / "caller-temp"
+    task_temp = tmp_path / "task-temp"
+    junit = tmp_path / "junit.xml"
     inherited = f'--basetemp="{tmp_path}"' if inherited_form == "joined" else f'--basetemp "{tmp_path}"'
     monkeypatch.setenv("PYTEST_ADDOPTS", "-q " + inherited)
     try:
         result = subprocess.run([
             "uv", "run", "--locked", str(runner), "--pytest-arg=--basetemp", "--pytest-arg=" + str(outside),
-            "--pytest-arg=--basetemp=" + str(repo), "--temporary-root", ".build/selected",
+            "--pytest-arg=--basetemp=" + str(repo), "--temporary-root", str(task_temp),
+            "--pytest-arg=--junitxml=" + str(junit),
         ], cwd=repo, capture_output=True, text=True, check=False)
         assert result.returncode == 1, result.stderr
-        observed, process_temp = map(pathlib.Path, json.loads(marker.read_text()))
+        observed, process_temp, cache = map(pathlib.Path, json.loads(marker.read_text()))
         assert observed.is_relative_to(process_temp)
-        assert process_temp.is_relative_to(repo / ".build/selected")
+        assert cache.is_relative_to(process_temp)
+        assert process_temp.is_relative_to(task_temp)
+        assert junit.is_file()
         assert not process_temp.exists()
         assert not observed.exists()
         assert not outside.exists()
+        assert not list((repo / "scripts/testing").rglob("__pycache__"))
+        assert not (repo / ".pytest_cache").exists()
         assert external.read_bytes() == b"git object"
         assert external.stat().st_mode == original_mode and external.stat().st_nlink == 1
     finally:
@@ -151,22 +225,93 @@ def _run_result_runner(root: pathlib.Path, runner: pathlib.Path, args: list[str]
     return subprocess.run(
         [sys.executable, str(runner), "--temporary-root", ".build/test-tmp", *args],
         cwd=root, capture_output=True, text=True, check=False,
+        # A parent test-name filter does not describe this fixture's tests.
+        env={name: value for name, value in os.environ.items() if name != "PYTEST_ADDOPTS"},
     )
 
 
-def test_generated_runner_requires_explicit_temporary_root(tmp_path):
-    root, runner, output = _result_runner(tmp_path)
+@pytest.mark.parametrize("linked", [False, True])
+@pytest.mark.parametrize("ci", [False, True])
+def test_generated_runner_requires_explicit_temporary_root(tmp_path, monkeypatch, linked, ci):
+    root, script, output = _result_runner(tmp_path)
     result_file = output / "result.json"
     marker = output / "executed"
     args = [*_result_arguments(result_file), "--probe-command",
             json.dumps([sys.executable, "-c", "from pathlib import Path; import sys; Path(sys.argv[1]).touch()",
                         str(marker)])]
-    missing = subprocess.run([sys.executable, str(runner), *args], cwd=root, capture_output=True,
+    missing = subprocess.run([sys.executable, str(script), *args], cwd=root, capture_output=True,
                              text=True, check=False)
     assert missing.returncode == 2 and "--temporary-root is required" in missing.stderr
     assert not result_file.exists() and not marker.exists()
-    assert _run_result_runner(root, runner, args).returncode == 0
-    assert marker.exists() and json.loads(result_file.read_bytes())["status"] == "passed"
+    primary = root
+    operation = "repository.actions.pre-build-checks.check-groups.tests"
+    probe = (
+        "import json, pathlib, subprocess, sys, tempfile; "
+        "scratch = pathlib.Path(tempfile.mkdtemp()); "
+        "before = subprocess.run(['git', 'rev-parse', '--show-toplevel'], cwd=scratch, capture_output=True); "
+        "assert before.returncode != 0, before.stdout; "
+        "subprocess.run(['git', 'init', str(scratch)], check=True, capture_output=True); "
+        "found = subprocess.run(['git', 'rev-parse', '--show-toplevel'], cwd=scratch, "
+        "check=True, capture_output=True, text=True); "
+        "assert pathlib.Path(found.stdout.strip()).resolve() == scratch.resolve(); "
+        "pathlib.Path(sys.argv[1]).write_text(json.dumps([tempfile.gettempdir(), str(scratch)]))"
+    )
+    write_sdlc_contract(root, repository={"capabilities": {}, "actions": {
+        "pre-build-checks": {"check-groups": {"tests": {
+            "requires": {"capabilities": []}, "steps": [{"run": [
+                sys.executable, "scripts/run-tests.py", "--temporary-root", "{temporary_root}",
+                *_result_arguments(result_file), "--probe-command",
+                json.dumps([sys.executable, "-c", probe, str(marker)]),
+            ]}],
+        }}},
+    }})
+    for arguments in (("init",), ("add", "."),
+                      ("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "fixture")):
+        git = run_git(root, *arguments)
+        assert git.returncode == 0, git.stderr
+    if linked:
+        root = tmp_path / "worktrees" / primary.name / "linked-task"
+        git = run_git(primary, "worktree", "add", "-b", "linked-task", str(root))
+        assert git.returncode == 0, git.stderr
+    monkeypatch.delenv("CERATOPS_PROJECTS_ROOT", raising=False)
+    monkeypatch.delenv("CERATOPS_TASK_TEMP_ROOT", raising=False)
+    base = tmp_path / ("ci-temp" if ci else "tmp")
+    if ci:
+        monkeypatch.setenv("CERATOPS_TASK_TEMP_ROOT", str(base))
+    expected = base / primary.name / root.name
+    expected.mkdir(parents=True)
+    unrelated = expected / "caller-owned.txt"
+    unrelated.write_text("keep")
+    previous = None
+    for attempt in range(2):
+        if attempt:
+            # A distinct request must execute; an identical request reuses its pass.
+            contract_path = root / ".ceratops/sdlc/sdlc.yml"
+            declaration = yaml.safe_load(contract_path.read_text())
+            command = declaration["repository"]["actions"]["pre-build-checks"]["check-groups"]["tests"]["steps"][0]["run"]
+            result_file = output / "second-result.json"
+            command[command.index("--result-file") + 1] = str(result_file)
+            command[command.index("--result-id") + 1] = "result-2"
+            command[-1] = json.dumps([sys.executable, "-c", probe, str(marker), "second"])
+            contract_path.write_text(yaml.safe_dump(declaration))
+        result = run_operation_cli(root, operation, ci=ci)
+        assert result.returncode == 0, result.stderr
+        assert json.loads(result_file.read_bytes())["status"] == "passed"
+        process_temp, nested_repo = map(pathlib.Path, json.loads(marker.read_text()))
+        assert process_temp.is_relative_to(expected)
+        assert not process_temp.is_relative_to(root)
+        assert process_temp != previous
+        assert not process_temp.exists() and not nested_repo.exists()
+        assert unrelated.read_text() == "keep"
+        previous = process_temp
+    result = run_operation_cli(root, operation, ci=ci)
+    assert result.returncode == 0, result.stderr
+    assert pathlib.Path(json.loads(marker.read_text())[0]) == previous
+    # A caller's base setting must not put scratch back inside either checkout.
+    monkeypatch.setenv("CERATOPS_TASK_TEMP_ROOT", str(root / "scratch"))
+    result = run_operation_cli(root, operation, ci=ci)
+    assert result.returncode == 1 and "checkout" in result.stderr
+    assert not (root / "scratch").exists()
 
 
 def _mapped_generated_runner(tmp_path):
@@ -203,10 +348,19 @@ def _current_test_records(root, script):
 
 def test_generated_script_reuses_each_test_and_reruns_only_changed_inputs(tmp_path):
     root, script = _mapped_generated_runner(tmp_path)
+    manifest_path = root / "tests/test-impact.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["reuse_inputs"] = {
+        "tests/test_a.py::test_value": {"paths": ["a.data"], "packages": [], "tools": ["uv"]},
+        "tests/test_b.py::test_value": {"paths": ["b.data"], "packages": []},
+    }
+    manifest_path.write_text(json.dumps(manifest))
     for _ in range(2):
         result = _run_result_runner(root, script, ["tests"])
         assert result.returncode == 0, result.stdout + result.stderr
     first = _current_test_records(root, script)
+    assert first["tests/test_a.py::test_value"]["inputs"]["tools"]["uv"]["version"]
+    assert first["tests/test_b.py::test_value"]["inputs"]["tools"] == {}
     assert (tmp_path / "a-calls").read_text() == (tmp_path / "b-calls").read_text() == "x"
     (root / "a.data").write_text("bad")
     failed = _run_result_runner(root, script, ["tests"])
@@ -539,9 +693,22 @@ def test_managed_runner_qualification_rejects_scratch_cleanup_while_worker_is_li
     root, runner, output = _result_runner(tmp_path)
     original = runner.with_name("original_runner.py")
     runner.rename(original)
+    # Windows keeps a launcher's working directory busy until that launcher
+    # exits, even when the worker it started has already exited.
+    windows_launcher = (
+        "import os, pathlib, subprocess, sys, time\n"
+        "os.chdir(pathlib.Path(os.environ['PYTHONPYCACHEPREFIX']).parent)\n"
+        "result = subprocess.run(sys.argv[1:], check=False)\n"
+        "time.sleep(.5)\n"
+        "raise SystemExit(result.returncode)\n"
+    )
     runner.write_text(
         "from contextlib import nullcontext\n"
-        "import runpy\n"
+        "import json, runpy, sys\n"
+        "if sys.platform == 'win32' and 'scratch-interrupted' in sys.argv:\n"
+        "    index = sys.argv.index('--probe-command') + 1\n"
+        "    worker = json.loads(sys.argv[index])\n"
+        f"    sys.argv[index] = json.dumps([sys.executable, '-c', {windows_launcher!r}, *worker])\n"
         f"main = runpy.run_path({str(original)!r})['main']\n"
         "main.__globals__['_TestScratch'].child_options = lambda self: nullcontext({})\n"
         "raise SystemExit(main())\n",
@@ -618,12 +785,30 @@ def test_runner_ownership_is_explicit_and_custom_sources_are_preserved(tmp_path:
     assert declared.returncode == 0
     assert json.loads(declared.stdout)["result_schema"] == "ceratops-repository-check-result.v1"
 
+    (root / "test_probe.py").write_text("assert True\n", encoding="utf-8")
+    application = importlib.import_module("ceratops_repo_compatibility_engine.apply_ceratops_compatibility")
+    sdlc_path = root / ".ceratops/sdlc/sdlc.yml"
+    sdlc_path.parent.mkdir(parents=True, exist_ok=True)
+    sdlc_path.write_text(json.dumps(sdlc), encoding="utf-8")
+    workflow = root / ".github/workflows/tests.yml"
+    workflow.parent.mkdir(parents=True)
+    workflow.write_text("jobs:\n  tests:\n    steps:\n      - run: uv run --locked scripts/run-tests.py\n      - run: echo application-owned\n", encoding="utf-8")
+    for _ in range(2):
+        plan = application.plan_ceratops_compatibility(root, None, {}, {}, apply_sdlc_contract=False, test_support_only=True)
+        application.apply_compatibility_plan(root, plan)
+        observed = application.yaml.safe_load(sdlc_path.read_text(encoding="utf-8"))
+        argv = observed["repository"]["actions"]["pre-build-checks"]["check-groups"]["tests"]["steps"][0]["run"]
+        assert argv.count("--temporary-root") == 1 and argv[-1] == "{temporary_root}"
+        jobs = application.yaml.safe_load(workflow.read_text(encoding="utf-8"))
+        assert jobs["jobs"]["tests"]["steps"][0]["run"].count("--temporary-root") == 1
+        assert jobs["jobs"]["tests"]["steps"][1]["run"] == "echo application-owned"
+
 
 
 def test_missing_uv_rolls_back_generated_files_before_compatibility_claim(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     generator = importlib.import_module("ceratops_repo_compatibility_engine.apply_ceratops_compatibility")
     runtime = importlib.import_module("ceratops_repo_compatibility_engine.validation_environment")
-    (tmp_path / ".git").write_text("gitdir: test\n")
+    prepare_linked_worktree(tmp_path)
     monkeypatch.setattr(runtime.shutil, "which", lambda name: None)
     assert generator.main(["--target-repo-root", str(tmp_path)]) == 1
     outcome = json.loads(capsys.readouterr().out)
@@ -637,7 +822,7 @@ def test_compatibility_qualifies_scratch_before_writing_a_new_runner(
 ) -> None:
     application = importlib.import_module("ceratops_repo_compatibility_engine.apply_ceratops_compatibility")
     original = application.qualify_generated_runner_scratch
-    (tmp_path / ".git").write_text("gitdir: test\n", encoding="utf-8")
+    prepare_linked_worktree(tmp_path)
     (tmp_path / "test_probe.py").write_text("def test_example(): pass\n", encoding="utf-8")
 
     def interrupt_after_probe(content, probe, contract):
@@ -728,8 +913,8 @@ def test_result_records_template_binds_source_artifact_and_bounds_evidence(
             "-C",
             str(tmp_path),
             "add",
-            ".build/builds",
-            ".test-results/validation.json",
+            ".ceratops/build",
+            ".ceratops/results/validation.json",
         ],
         check=True,
     )

@@ -3,8 +3,9 @@
 The operation owner launches this stdlib-only reader in the declared locked
 project. uv adjusts PATH and the Python environment when launching the actual
 runner; observing its parent would give a different scope. Input is the owned
-declaration on stdin. Output contains hashes of selected values/binaries, never
-the raw environment. Missing tools remain explicit so skip behavior is bound.
+declaration on stdin. Output contains versions of declared tools and hashes of
+selected environment values, never the raw environment. Repository runners receive
+this same module through the existing generator; they do not import installed skills.
 """
 
 from __future__ import annotations
@@ -17,7 +18,9 @@ import pathlib
 import platform
 import re
 import shutil
+import subprocess
 import sys
+from collections.abc import Mapping
 from typing import Any
 
 
@@ -52,9 +55,18 @@ def environment_files(declaration: dict[str, Any], root: pathlib.Path) -> dict[s
 
 
 def read_environment(root: pathlib.Path, declaration: dict[str, Any], *, runtime: bool) -> dict[str, Any]:
-    tools: dict[str, dict[str, str | None]] = {}
+    """Observe the actual executables; requirements are not installed versions.
+
+    Tool probing never installs or chooses a runtime. A failed version command is
+    recorded explicitly and cannot establish reuse, even if its binary is equal.
+    Git still discovers source files but has no entry in these execution inputs.
+    """
+    tools: dict[str, dict[str, Any]] = {}
     for name in declaration.get("tools", []):
         expanded = re.sub(r"\$\{([^}]+)\}", lambda match: os.environ.get(match[1], ""), name)
+        identity = pathlib.PureWindowsPath(expanded).stem.lower()
+        if identity == "git":
+            continue
         path: pathlib.Path | None
         if "/" in expanded or "\\" in expanded:
             path = pathlib.Path(expanded)
@@ -62,17 +74,28 @@ def read_environment(root: pathlib.Path, declaration: dict[str, Any], *, runtime
         else:
             found = shutil.which(expanded)
             path = pathlib.Path(found) if found else None
-        if path is not None and not path.exists():
-            path = None
-        if path is not None:
-            path = path.resolve(strict=True)
-        if path is not None and not path.is_file():
-            raise ValueError("Declared tool must be a regular file.")
-        if path is None:
-            tools[name] = {"sha256": None}
-        else:
-            with path.open("rb") as stream:
-                tools[name] = {"sha256": hashlib.file_digest(stream, "sha256").hexdigest()}
+        if path is None or not path.is_file():
+            tools[name] = {"version": None, "error": "Tool is not installed or not a regular file."}
+            continue
+        arguments = [str(path), "--version"]
+        if identity in {"powershell", "pwsh"}:
+            arguments = [str(path), "-NoProfile", "-NonInteractive", "-Command", "$PSVersionTable.PSVersion.ToString()"]
+        elif identity in {"java", "javac"}:
+            arguments[-1] = "-version"
+        try:
+            result = subprocess.run(arguments, cwd=root, capture_output=True, text=True,
+                                    encoding="utf-8", errors="replace", check=False, timeout=15)
+        except (OSError, subprocess.SubprocessError) as exc:
+            tools[name] = {"version": None, "error": type(exc).__name__ + ": " + str(exc)}
+            continue
+        output = result.stdout + "\n" + result.stderr
+        match = re.search(r"(?<![\w.])v?(\d+\.\d+(?:\.\d+)*(?:[-+._a-zA-Z0-9]*))", output)
+        tools[name] = {"version": match[1] if result.returncode == 0 and match else None}
+        if tools[name]["version"] is None:
+            tools[name].update({"error": "Tool did not report a readable version.",
+                               "command": arguments, "exit_code": result.returncode,
+                               "stdout": result.stdout[-2000:] or "<absent>",
+                               "stderr": result.stderr[-2000:] or "<absent>"})
     return {
         "platform": platform.system(), "architecture": platform.machine(),
         "variables": {name: hashlib.sha256(canonical(scoped_variable(os.environ.get(name), root))).hexdigest()
@@ -85,6 +108,58 @@ def read_environment(root: pathlib.Path, declaration: dict[str, Any], *, runtime
                                for dist in importlib.metadata.distributions()),
         } if runtime else {},
     }
+
+
+def environment_inputs_for_reuse(environment: Mapping[str, Any], *, ignore_path: bool = False,
+                                 allow_unknown: bool = False) -> dict[str, Any]:
+    """Compare existing facts without rewriting their recorded identities.
+
+    Both whole checks and individual tests use this policy. Unknown versions cannot prove reuse; the
+    completion boundary may compare explicit unknown states to detect changes
+    while still recording the actual outcome of a command that ran.
+    """
+    projected = dict(environment)
+    # No declared file inputs and an omitted empty inventory describe the same work.
+    projected.setdefault("files", {})
+    if ignore_path and isinstance(projected.get("variables"), dict):
+        projected["variables"] = {key: value for key, value in projected["variables"].items() if key != "PATH"}
+    tools: dict[str, Any] = {}
+    versions = []
+    for name, value in environment.get("tools", {}).items():
+        identity = pathlib.PureWindowsPath(name).stem.lower()
+        if identity == "git":
+            continue
+        version = value.get("version") if isinstance(value, dict) else value
+        versions.append((tools, identity, version, "Tool " + identity))
+    projected["tools"] = tools
+    runtime = dict(environment.get("runtime", {}))
+    # Older individual-test records stored an executable hash next to sys.version.
+    # Keep the original record; compare the readable version, never that hash.
+    if "version" in runtime:
+        runtime.pop("python", None)
+        versions.append((runtime, "version", runtime["version"], "Python"))
+    elif "python" in runtime:
+        versions.append((runtime, "python", runtime["python"], "Python"))
+    if "packages" in runtime:
+        packages = dict(runtime["packages"])
+        tool_packages = {"pytest", "ruff", "mypy", "yamllint", "uv", "pip", "setuptools", "wheel", "build",
+                         "coverage", "pytest-cov"} | {item[1] for item in versions}
+        for name, version in list(packages.items()):
+            if name.lower().replace("_", "-") in tool_packages:
+                versions.append((packages, name, version, "Tool package " + name))
+        runtime["packages"] = packages
+    for destination, key, version, label in versions:
+        match = re.search(r"(?<![\w.])v?(\d+)\.(\d+)", version) if isinstance(version, str) else None
+        if match is None:
+            if not allow_unknown:
+                raise ValueError(label + " lacks a recorded readable major/minor version.")
+            destination[key] = None
+        else:
+            destination[key] = [int(match[1]), int(match[2])]
+    if isinstance(runtime.get("packages"), dict):
+        runtime["packages"] = sorted(runtime["packages"].items())
+    projected["runtime"] = runtime
+    return projected
 
 
 if __name__ == "__main__":

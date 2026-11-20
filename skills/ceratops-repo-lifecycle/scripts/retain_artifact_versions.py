@@ -218,18 +218,11 @@ def _sha256(path: pathlib.Path) -> str:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def _same_file(
-    path: pathlib.Path, record: Mapping[str, Any], *, source: pathlib.Path | bytes | None = None,
-) -> bool:
+def _file_contents_match(path: pathlib.Path, record: Mapping[str, Any]) -> bool:
     if not os.path.lexists(path):
         return False
     _, info = _plain_path(path, label="Retained file")
-    if info.st_size != record["size"] or _sha256(path) != record["sha256"]:
-        return False
-    if isinstance(source, pathlib.Path):
-        _, original = _plain_path(source, label="Accepted package file")
-        return stat.S_IMODE(info.st_mode) == stat.S_IMODE(original.st_mode)
-    return True
+    return info.st_size == record["size"] and _sha256(path) == record["sha256"]
 
 
 def _inventory(value: RetentionVersion, *, installed: bool = False) -> tuple[dict[str, dict[str, Any]], dict[str, pathlib.Path | bytes]]:
@@ -311,16 +304,18 @@ def _foreign_files(root: pathlib.Path, records: Mapping[str, Any]) -> list[str]:
 
 
 def _copy_file(source: pathlib.Path | bytes, destination: pathlib.Path, record: Mapping[str, Any]) -> None:
-    if _same_file(destination, record, source=source):
+    if _file_contents_match(destination, record):
+        # Matching bytes need no second hash to decide a permissions-only repair.
+        if isinstance(source, pathlib.Path):
+            _, original = _plain_path(source, label="Accepted package file")
+            _, retained = _plain_path(destination, label="Retained file")
+            if stat.S_IMODE(original.st_mode) != stat.S_IMODE(retained.st_mode):
+                shutil.copymode(source, destination, follow_symlinks=False)
         return
     if isinstance(source, pathlib.Path) and source == destination:
         # An original build is already in its final directory. Opening that
         # same file for writing would destroy the only remaining evidence.
         raise ValueError(f"Original accepted file is missing or changed: {source}")
-    if isinstance(source, pathlib.Path) and _same_file(destination, record):
-        # Repair permissions on an older copy without rewriting accepted bytes.
-        shutil.copymode(source, destination, follow_symlinks=False)
-        return
     _make_directory(destination.parent)
     if isinstance(source, bytes):
         raw_hash = hashlib.sha256(source).hexdigest()
@@ -439,7 +434,7 @@ def retain_artifact_versions(
             raise ValueError("Release replacement is not in the selected beta-stable pool.")
         # This is availability/integrity, not another acceptance test.
         records, _sources = _inventory(release_replacement)
-        if not all(_same_file(replacement / name, item) for name, item in records.items()):
+        if not all(_file_contents_match(replacement / name, item) for name, item in records.items()):
             raise ValueError("Complete release replacement is unavailable; retain worktree output.")
         selected = {}
     elif not selected:

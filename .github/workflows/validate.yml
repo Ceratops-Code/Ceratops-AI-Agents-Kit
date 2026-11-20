@@ -14,8 +14,8 @@ permissions:
   contents: read
 
 jobs:
-  validate-repository:
-    name: validate-repository
+  repository-checks:
+    name: repository-checks
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:

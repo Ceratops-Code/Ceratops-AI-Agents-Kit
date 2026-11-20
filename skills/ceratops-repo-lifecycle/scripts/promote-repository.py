@@ -24,16 +24,17 @@ from typing import Any, NamedTuple
 
 import git_branch_operations as git_branches
 from check_deployment_receipts import check_deployment_receipt
+from execute_worktree_build import execute_build
 from git_branch_operations import PromotionError, SourceState
 from github_contract_engine.format_report import sanitize_for_output
 from github_pr_workflow import ship_repository as repository_ship
 from github_pr_workflow.command import (
     CommandError,
+    _write_report_bytes,
     capture_failure_report,
     describe_command_failure,
     failure_excerpt,
     handoff_report_completions,
-    operation_report_root,
     project_task_temp_root,
     release_write_context,
     remove_resolved_failures,
@@ -45,27 +46,23 @@ from github_pr_workflow.command import (
     write_operation_report,
 )
 from github_pr_workflow.dependency_common import normalize_github_repo
-from execute_worktree_build import execute_build
-from ceratops_repo_compatibility_engine.sdlc_contract_validation import operation_entries
 from repository_operation import (
     OperationError,
     OperationRequest,
     PreparedOperation,
     execute_prepared_operations,
-    read_repository_contract,
     operation_category,
     parse_parameters,
     prepare_operations,
     remove_operation_failures,
     require_clean_commit,
-    validation_operations,
 )
 from sdlc_results import _unique_result_object
 
 SCRIPT_ROOT = pathlib.Path(__file__).resolve().parent
 PENDING_MANAGER = SCRIPT_ROOT / "manage-pending-work.py"
 RELEASE_BRANCH = "release/local"
-DEFAULT_SDLC_CONTRACT = pathlib.Path("sdlc/sdlc.yml")
+DEFAULT_SDLC_CONTRACT = pathlib.Path(".ceratops/sdlc/sdlc.yml")
 
 
 class CompletedPromotion(NamedTuple):
@@ -152,15 +149,20 @@ def _ship_after_promotion(
         title=getattr(args, "title", None),
         body=getattr(args, "body", None),
         validation_operation=args.validation_operation,
+        version_choices=getattr(args, "version_choices", None),
+        version_source_commit=getattr(args, "version_source_commit", None),
+        check_answers=getattr(args, "check_answers", None),
         publish_operation=_operation_ids(args.publish_operation, "publish"),
         deploy_operation=_operation_ids(args.deploy_operation, "deploy-local"),
-        diagnostic_output=getattr(args, "diagnostic_output", None),
+        report_directory=getattr(args, "report_directory", None),
         diagnostic_owner=(args.repo_root, "promote"),
     )
     try:
         shipped = repository_ship.ship_repository(request)
     except (repository_ship.RepositoryShipError, CommandError, OperationError, OSError, ValueError) as exc:
         raise PromotionError(str(exc), describe_command_failure(exc)) from exc
+    if shipped.get("status") in {"version_decision_required", "decision_required"}:
+        return shipped
     if shipped.get("status") == "pending_work":
         if not isinstance(shipped.get("findings"), list):
             raise PromotionError("Shipping returned an incomplete pending-work blocker.")
@@ -251,7 +253,7 @@ def promote(args: argparse.Namespace, *, timings: dict[str, float] | None = None
         args.repo_root, operation="promotion", wait_seconds=60,
         confirm_stopped=getattr(args, "confirm_previous_commands_stopped", False),
     ), capture_failure_report(
-        getattr(args, "diagnostic_output", None), repo_root=args.repo_root, action="promote",
+        getattr(args, "report_directory", None), repo_root=args.repo_root, action="promote",
     ):
         requested_root, branches, ship_after_promotion, parameters = inputs
         repo_root = git_branches._primary_checkout(requested_root)
@@ -337,21 +339,26 @@ def promote(args: argparse.Namespace, *, timings: dict[str, float] | None = None
         observed_release = release_start
         while True:
             git_branches.merge_release_into_task(task_root, observed_release)
-            with _timed_phase(timings, "checks-and-builds", diagnostic_output=getattr(args, "diagnostic_output", None)):
+            with _timed_phase(timings, "checks-and-builds", report_directory=getattr(args, "report_directory", None)):
                 build_requests = [OperationRequest(name, parameters=parameters) for name in (args.run_operation or [])]
-                if not build_requests:
-                    declaration = read_repository_contract(task_root, contract)
-                    build_requests = [OperationRequest(name) for name in operation_entries(declaration)
-                                      if name.endswith(".actions.build")]
                 validation = execute_build(
                     task_root, build_requests, contract, qualification_level="beta",
                     test_context={"trigger": "promotion", "branch": task_branch,
                                   "commit": git_branches._branch_head(task_root, task_branch)},
                     validation_operations=args.validation_operation, run_delivery=False,
                     successful_results=previous_results,
-                    diagnostic_output=getattr(args, "diagnostic_output", None),
+                    bundles=getattr(args, "bundle", ()) or (),
+                    version_choices=getattr(args, "version_choices", None),
+                    version_source_commit=getattr(args, "version_source_commit", None),
+                    check_answers=getattr(args, "check_answers", None),
+                    compare_builds_from=observed_release if not build_requests else None,
+                    report_directory=getattr(args, "report_directory", None),
                     diagnostic_owner=(args.repo_root, "promote"),
                 )
+            if validation["status"] in {"version_decision_required", "decision_required"}:
+                return {**validation, "release_branch": args.release_branch,
+                        "head": observed_release, "task_worktree": str(task_root),
+                        "remote_mutation": False}
             if validation["status"] != "completed" or validation.get("deferred_handoffs"):
                 failed_commit = git_branches._branch_head(task_root, task_branch)
                 matching_sources = [name for name, state in source_states.items() if state.head == failed_commit]
@@ -404,11 +411,32 @@ def promote(args: argparse.Namespace, *, timings: dict[str, float] | None = None
         if record_code:
             raise PromotionError(str(record.get("message", "Scope recording failed.")))
 
-        prepared_operations = prepare_operations(
-            repo_root, [OperationRequest(name, parameters=parameters) for name in (args.run_operation or [])],
-            _remap_repo_owned_path(contract, requested_root=task_root, effective_root=repo_root),
-            context="skill", artifacts=validation.get("artifacts", {}),
-        ) if args.run_operation else []
+        result: dict[str, object] = {
+            "status": "ready",
+            "release_branch": args.release_branch,
+            "head": target_commit,
+            "submitted_commits": {name: state.head for name, state in source_states.items()},
+            "tested_commit": target_commit, "accepted_commit": target_commit,
+            "release_start": release_start,
+            "merged_branches": merged,
+            "pending_work_scope": record["pending_work_scope"],
+            "operations": None,
+            "checks": validation.get("checks", []),
+        }
+        try:
+            prepared_operations = prepare_operations(
+                repo_root, [OperationRequest(name, parameters=parameters) for name in (args.run_operation or [])],
+                _remap_repo_owned_path(contract, requested_root=task_root, effective_root=repo_root),
+                context="skill", artifacts=validation.get("artifacts", {}),
+                accepted_builds=validation.get("accepted_builds", ()),
+            ) if args.run_operation else []
+        except (OperationError, OSError, ValueError) as exc:
+            raise PromotionError(str(exc), {
+                "status": "error", "phase": "deployment", "remote_mutation": False,
+                "promotion": result, "pending_work_scope": record["pending_work_scope"],
+                "operations": {"status": "error", "message": str(exc), "completed_operations": [],
+                               "pending_operations": list(args.run_operation or []), "results": []},
+            }) from exc
         prepared_operations = [replace(item, qualification_level="beta") for item in prepared_operations
                                if item.category in {"deploy-local", "publish", "verify-publish"}]
         for index, item in enumerate(prepared_operations):
@@ -417,7 +445,7 @@ def promote(args: argparse.Namespace, *, timings: dict[str, float] | None = None
                 prepared_operations[index] = replace(item, selected_artifacts={
                     **(item.selected_artifacts or {}), reference: validation["artifacts"][reference]})
         remove_operation_failures(
-            validation, diagnostic_output=getattr(args, "diagnostic_output", None),
+            validation, report_directory=getattr(args, "report_directory", None),
             diagnostic_owner=(args.repo_root, "promote"),
         )
         pending_work_scope = record["pending_work_scope"]
@@ -430,17 +458,6 @@ def promote(args: argparse.Namespace, *, timings: dict[str, float] | None = None
                 target_commit=target_commit,
                 pending_work_scope=pending_work_scope,
             )
-        result: dict[str, object] = {
-            "status": "ready",
-            "release_branch": args.release_branch,
-            "head": target_commit,
-            "submitted_commits": {name: state.head for name, state in source_states.items()},
-            "tested_commit": target_commit, "accepted_commit": target_commit,
-            "release_start": release_start,
-            "merged_branches": merged,
-            "pending_work_scope": pending_work_scope,
-            "operations": None,
-        }
         if record.get("preserved_sources"):
             result["preserved_sources"] = record["preserved_sources"]
         validation_handoffs = validation.get("deferred_handoffs", [])
@@ -448,7 +465,7 @@ def promote(args: argparse.Namespace, *, timings: dict[str, float] | None = None
             result["validation_handoffs"] = validation_handoffs
         if args.run_operation is not None:
             return _deploy_completed_promotion(args, CompletedPromotion(result, repo_root, prepared_operations, validation), timings=timings)
-        remove_resolved_failures(result, diagnostic_output=getattr(args, "diagnostic_output", None),
+        remove_resolved_failures(result, report_directory=getattr(args, "report_directory", None),
                                  repo_root=args.repo_root, action="promote", resolved_failures=("promote",))
         return result
 
@@ -499,11 +516,11 @@ def _deploy_completed_promotion(
     validation = accepted.source_checks
     validation_handoffs = accepted.result.get("validation_handoffs", [])
     timings = {} if timings is None else timings
-    with _timed_phase(timings, "deployment", diagnostic_output=getattr(args, "diagnostic_output", None)):
+    with _timed_phase(timings, "deployment", report_directory=getattr(args, "report_directory", None)):
         try:
             require_clean_commit(repo_root, target_commit)
             operations = execute_prepared_operations(
-                prepared_operations, diagnostic_output=getattr(args, "diagnostic_output", None),
+                prepared_operations, report_directory=getattr(args, "report_directory", None),
                 diagnostic_owner=(args.repo_root, "promote"), successful_results=validation.get("results", []),
             )
             if validation_handoffs:
@@ -554,7 +571,7 @@ def _deploy_completed_promotion(
             "remote_mutation": False,
         }) from exc
     result = {**accepted.result, "operations": operations}
-    remove_resolved_failures(result, diagnostic_output=getattr(args, "diagnostic_output", None),
+    remove_resolved_failures(result, report_directory=getattr(args, "report_directory", None),
                             repo_root=args.repo_root, action="promote", resolved_failures=("promote",))
     return result
 
@@ -562,34 +579,40 @@ def _deploy_completed_promotion(
 
 
 @contextmanager
-def _timed_phase(timings: dict[str, float], phase: str, *, diagnostic_output=None):
+def _timed_phase(timings: dict[str, float], phase: str, *, report_directory=None):
     """Record actual elapsed work even when a phase fails; never repeat it."""
     started = time.monotonic()
-    report_phase(phase, enabled=diagnostic_output is not None)
+    report_phase(phase, enabled=report_directory is not None)
     try:
         yield
     finally:
         timings[phase] = round(time.monotonic() - started, 6)
 
 
-def _save_result(path: pathlib.Path, result: dict[str, object], repo_root: pathlib.Path) -> str:
+def _save_result(path: pathlib.Path, result: dict[str, object]) -> str:
     """Publish the complete report and return its exact-byte cleanup digest.
 
     The caller can print only a summary after publication succeeds. The report
     is observational; neither it nor its digest can resume lifecycle effects.
     """
-    return write_operation_report(path, result, repo_root=repo_root, action="promote", retain_external_output=True)
+    # An explicitly requested export never changes handling when the configured
+    # task-temp base changes. Only the caller's finalizer removes this file.
+    data = (json.dumps(result, indent=2) + "\n").encode("utf-8")
+    _write_report_bytes(path, data)
+    return hashlib.sha256(data).hexdigest()
 
 
 def _result_summary(
     result: dict[str, object], path: pathlib.Path, digest: str, *, failed: bool,
 ) -> dict[str, object]:
     """Point to a published outcome without duplicating checks or receipts."""
+    if result.get("status") in {"version_decision_required", "decision_required"}:
+        return {**result, "result_file": str(path), "result_sha256": digest}
     summary: dict[str, object] = {
         key: result[key] for key in (
             "status", "phase", "operation", "release_branch", "head", "commit",
             "replay_required", "remote_mutation", "timings_seconds",
-            "report_cleanup_error",
+            "report_cleanup_error", "report_write_error", "operation_report",
         ) if key in result
     }
     completions = handoff_report_completions(result)
@@ -863,6 +886,10 @@ def finalize_result(args: argparse.Namespace) -> None:
         args.publish_operation,
         args.deploy_operation,
         args.parameter,
+        getattr(args, "bundle", None),
+        getattr(args, "version_choices", None),
+        getattr(args, "version_source_commit", None),
+        getattr(args, "check_answers", None),
         args.title,
         args.body,
     )
@@ -970,8 +997,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--repo-root", type=pathlib.Path, default=pathlib.Path.cwd())
     parser.add_argument("--source-branch", action="append")
-    parser.add_argument("--diagnostic-output", type=pathlib.Path,
-                        help="Stable task-owned file for complete failure details.")
+    parser.add_argument("--bundle", action="append")
+    parser.add_argument("--version-choices", type=json.loads)
+    parser.add_argument("--check-answers", type=json.loads)
+    parser.add_argument("--version-source-commit")
+    parser.add_argument("--report-directory", type=pathlib.Path,
+                        help="Task temporary directory; the writer chooses files under _operation-reports/<operation>/.")
     parser.add_argument(
         "--result-file",
         type=pathlib.Path,
@@ -1097,22 +1128,28 @@ def main(argv: list[str] | None = None) -> int:
     started = time.monotonic()
     timings: dict[str, float] = {}
     result_file = None
-    report_repo_root = args.repo_root
     result_digest = None
     failed = False
     try:
-        if (args.result_file is not None and args.diagnostic_output is not None
-                and args.result_file.expanduser().resolve() == args.diagnostic_output.expanduser().resolve()):
-            raise PromotionError("--result-file and --diagnostic-output must be different files.")
         if args.result_file is not None:
             requested = args.result_file.expanduser().resolve()
+            if "_operation-reports" in requested.parts:
+                raise PromotionError("result-file exports must stay outside the reserved _operation-reports directory")
             if requested.is_relative_to(args.repo_root.resolve()):
                 raise PromotionError("result-file must stay outside the repository")
             if requested.exists() and not requested.is_file():
                 raise PromotionError("result-file must name a file")
             result_file = requested
-            report_repo_root = operation_report_root(args.repo_root)
         result = promote(args, timings=timings)
+        if result.get("status") == "version_decision_required":
+            answer: Any = result["answer_schema"]
+            result["next_command"] = [sys.executable, str(pathlib.Path(__file__).resolve()),
+                *(argv if argv is not None else sys.argv[1:]), "--version-source-commit",
+                result["source_commit"], "--version-choices", json.dumps(answer["version_choices"])]
+        if result.get("status") == "decision_required":
+            result["next_command"] = [sys.executable, str(pathlib.Path(__file__).resolve()),
+                *(argv if argv is not None else sys.argv[1:]), "--check-answers",
+                json.dumps({result["decision_id"]: "<answer matching answer_schema>"})]
     except (
         CommandError,
         OperationError,
@@ -1124,6 +1161,7 @@ def main(argv: list[str] | None = None) -> int:
         failed = True
         if getattr(exc, "release_not_started", False):
             result_file = None  # A competing invocation creates no attempt record.
+            args.report_directory = None
         result = (
             exc.payload
             if isinstance(exc, PromotionError) and exc.payload is not None
@@ -1131,9 +1169,15 @@ def main(argv: list[str] | None = None) -> int:
         )
     timings["total"] = round(time.monotonic() - started, 6)
     result["timings_seconds"] = timings
+    if args.report_directory is not None:
+        try:
+            report = write_operation_report(args.report_directory, result, repo_root=args.repo_root, action="promote")
+            result["operation_report"] = str(report)
+        except (OSError, ValueError, CommandError) as exc:
+            result["report_write_error"] = str(exc)
     if result_file is not None:
         try:
-            result_digest = _save_result(result_file, result, report_repo_root)
+            result_digest = _save_result(result_file, result)
         except (OSError, ValueError, CommandError) as exc:
             # Side effects may already be complete. Retain their exact outcome
             # in the error instead of suggesting a replay to recover a record.
@@ -1152,7 +1196,7 @@ def main(argv: list[str] | None = None) -> int:
         json.dumps(public_result, separators=(",", ":")),
         file=sys.stderr if failed else sys.stdout,
     )
-    return 1 if failed else (2 if result.get("status") == "pending_work" else 0)
+    return 1 if failed else (2 if result.get("status") in {"pending_work", "version_decision_required", "decision_required"} else 0)
 
 
 if __name__ == "__main__":

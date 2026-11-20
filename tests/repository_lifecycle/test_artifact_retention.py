@@ -320,6 +320,17 @@ def test_retained_permissions_survive_copy_repair_and_interruption(
         assert not _run(scope, **selection).deferred
     assert target.stat().st_mtime_ns == before
 
+    # Permissions-only repair reads the retained bytes once, even when the
+    # content matches but the file is not executable yet.
+    set_mode(target, 0o644)
+    records, _ = retention._inventory(value, installed=kind == "runnable")
+    read_hash = Mock(wraps=retention._sha256)
+    with monkeypatch.context() as context:
+        context.setattr(retention, "_sha256", read_hash)
+        retention._copy_file(source, target, records[relative.as_posix()])
+    read_hash.assert_called_once_with(target)
+    assert mode(target) == 0o755 and target.stat().st_mtime_ns == before
+
 
 @pytest.mark.parametrize("effect", ["copy", "owner", "selection", "record-replace", "delete"])
 @pytest.mark.parametrize("timing", ["before", "after"])

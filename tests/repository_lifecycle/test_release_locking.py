@@ -417,11 +417,11 @@ def test_local_promotion_executes_declared_selected_skill_installer(tmp_path, mo
     repo, _, log, _ = prepare_repository_lifecycle_repo(
         tmp_path, handoff="ceratops-skill-lifecycle/deploy",
     )
-    contract = repo / "sdlc/sdlc.yml"
+    contract = repo / ".ceratops/sdlc/sdlc.yml"
     document = yaml.safe_load(contract.read_text())
     document["deliverables"]["apps"]["sample"]["actions"]["install"]["steps"][-1]["handoff"]["inputs"] = {"skill": "example"}
     contract.write_text(yaml.safe_dump(document))
-    assert run_git(repo, "add", "sdlc/sdlc.yml").returncode == 0
+    assert run_git(repo, "add", ".ceratops/sdlc/sdlc.yml").returncode == 0
     assert run_git(repo, "commit", "-m", "Select installation").returncode == 0
     head = run_git(repo, "rev-parse", "HEAD").stdout.strip()
     assert run_git(repo, "switch", "main").returncode == 0
@@ -490,7 +490,7 @@ def test_promotion_never_turns_an_unexecuted_handoff_into_success(tmp_path, monk
     monkeypatch.setitem(deploy.__globals__, "execute_prepared_operations", Mock(return_value=operations))
     accepted = module["CompletedPromotion"]({"status": "ready", "head": head, "pending_work_scope": "fixture"},
                                            repo, [], {"results": []})
-    args = argparse.Namespace(repo_root=repo, sdlc_contract=pathlib.Path("sdlc/sdlc.yml"))
+    args = argparse.Namespace(repo_root=repo, sdlc_contract=pathlib.Path(".ceratops/sdlc/sdlc.yml"))
     for _ in range(2):
         with pytest.raises(module["PromotionError"]) as raised:
             deploy(args, accepted)
@@ -1097,7 +1097,7 @@ def test_promote_repository_ship_after_promotion_composes_terminal_workflow(
     assert request.base_branch == "main"
     assert request.remote_name == "origin"
     assert request.commit == approved_head
-    assert request.sdlc_contract == pathlib.Path("sdlc/sdlc.yml")
+    assert request.sdlc_contract == pathlib.Path(".ceratops/sdlc/sdlc.yml")
     assert not request.publish_operation and not request.deploy_operation
     assert request.validation_operation is None
     assert request.reusable_head
